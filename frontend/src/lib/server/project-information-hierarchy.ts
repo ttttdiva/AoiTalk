@@ -272,7 +272,9 @@ async function assertProjectWriteAccessInTransaction(
     .from(users)
     .where(eq(users.id, userId))
     .limit(1)
-    .for("update");
+    // Role reads serialize ACL decisions with account changes while still
+    // allowing knowledge_revisions.created_by's FK KEY SHARE check.
+    .for("no key update");
   if (actor?.role === "admin" || project.ownerId === userId) return;
   const [membership] = await tx
     .select({ permissions: projectMembers.permissions })

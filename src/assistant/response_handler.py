@@ -65,7 +65,16 @@ def _strongest_bounded_privacy_mode(*values: Any) -> str:
 class ResponseHandler:
     """Handles response generation and task management"""
     
-    def __init__(self, llm_client, tts_manager=None, player=None, character_name: str = "Assistant", voice_chat_mode=None):
+    def __init__(
+        self,
+        llm_client,
+        tts_manager=None,
+        player=None,
+        character_name: str = "Assistant",
+        voice_chat_mode=None,
+        *,
+        register_character_callback: bool = True,
+    ):
         """Initialize response handler
         
         Args:
@@ -108,7 +117,8 @@ class ResponseHandler:
         self.status_callback: Optional[callable] = None
         
         # Register character switch callback
-        self._register_character_switch_callback()
+        if register_character_callback:
+            self._register_character_switch_callback()
         
     def _register_character_switch_callback(self):
         """Register callback for character switching"""
@@ -288,11 +298,13 @@ class ResponseHandler:
             suppress_automatic_context = bool(
                 get_turn_context().suppress_automatic_context
             )
+            agent_turn = get_turn_context().agent_execution_binding is not None
         except Exception:
             # Lightweight/legacy callers may not bind a TurnContext. Preserve
             # historical memory behaviour for those ordinary turns while
             # never making a malformed context an authorization signal.
             suppress_automatic_context = False
+            agent_turn = False
         max_interrupts = 8
         cancellation_handle = get_current_generation_cancellation()
         generation_run_id = (
@@ -802,7 +814,7 @@ class ResponseHandler:
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
 
-            if not suppress_automatic_context:
+            if not suppress_automatic_context and not agent_turn:
                 dreaming_context = self._capture_dreaming_memory_context()
                 dreaming_user_input = (
                     evidence_user_input if evidence_user_input is not None else text

@@ -336,8 +336,24 @@ def validate_session_llm_settings(
             )
 
             effort = str(main_route.get("effort") or "").strip().lower()
+            # A model switch that does not name an effort must not carry the
+            # previous model's effort into a model that cannot accept it
+            # (for example LFM ``always`` -> Qwen).  Only that inherited value
+            # falls back to the new model's default; an explicitly requested
+            # invalid effort is still rejected below.
+            route_patch = patch.get("main_route") if isinstance(patch.get("main_route"), dict) else {}
+            previous_route = read_session_llm_settings(context).get("main_route") or {}
+            effort_inherited = bool(effort) and not (
+                "effort" in route_patch or "reasoning_effort" in route_patch
+            ) and (
+                str(previous_route.get("provider") or "").strip().lower() != provider
+                or str(previous_route.get("model") or "").strip() != model
+            )
             effort_metadata = llama_cpp_reasoning_effort_metadata(model)
             if effort_metadata:
+                if effort_inherited and effort not in effort_metadata["options"]:
+                    effort = ""
+                    settings["main_route"]["effort"] = ""
                 if not effort:
                     # Session route defaults are materialized in the session
                     # projection only; global config remains untouched.
@@ -351,6 +367,23 @@ def validate_session_llm_settings(
                     warnings.append(
                         f"Invalid reasoning effort for {provider}/{model}: {effort}"
                     )
+            else:
+                from src.llm.openai_compatible_local_profiles import (
+                    managed_local_runtime_for_model,
+                )
+                from src.llm.provider_mode_adapters import FAST_THINKING_MODE_OPTIONS
+
+                if managed_local_runtime_for_model(config, model) == "strata":
+                    if effort_inherited and effort not in FAST_THINKING_MODE_OPTIONS:
+                        effort = ""
+                        settings["main_route"]["effort"] = ""
+                    if effort and effort not in FAST_THINKING_MODE_OPTIONS:
+                        warnings.append(
+                            f"Invalid reasoning effort for {provider}/{model}: {effort}"
+                        )
+                    elif effort:
+                        settings["main_route"]["effort"] = effort
+                        settings["main_route"]["reasoning_effort"] = effort
             # Persist the session route, but surface a canonical managed
             # runtime diagnostic immediately.  The turn builder repeats this
             # preflight against its request-scoped target config and refuses

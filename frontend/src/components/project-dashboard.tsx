@@ -177,41 +177,80 @@ const CHART_TOOLTIP_CURSOR = {
   fillOpacity: 0.35,
 };
 
-type DrillCategory = "total" | "closed" | "in_progress" | "time";
+type DrillCategory = "total" | "remaining" | "closed" | "in_progress" | "time";
 type DashboardScope =
   | { type: "project"; id: string }
   | { type: "space"; id: string };
 
-export function ProjectDashboard({ scope }: { scope: DashboardScope }) {
+export function ProjectDashboard({
+  scope,
+  compact = false,
+  taskBrowseOnly = false,
+}: {
+  scope: DashboardScope;
+  compact?: boolean;
+  taskBrowseOnly?: boolean;
+}) {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
+  const requestController = useRef<AbortController | null>(null);
   const summaryHasAnimatedRef = useRef(false);
   const [drillCategory, setDrillCategory] = useState<DrillCategory | null>(
     null,
   );
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const taskBrowseScope = useMemo(
+    () => taskBrowseOnly && scope.type === "project"
+      ? { kind: "project" as const, id: scope.id }
+      : null,
+    [taskBrowseOnly, scope.type, scope.id],
+  );
 
   const fetchDashboard = useCallback(async () => {
+    requestController.current?.abort();
+    const controller = new AbortController();
+    requestController.current = controller;
     setLoading(true);
+    setData(null);
     try {
       const url =
         scope.type === "project"
           ? `/api/projects/${scope.id}/dashboard`
           : `/api/spaces/${scope.id}/dashboard`;
-      const res = await fetch(url, { credentials: "include" });
-      if (res.ok) {
-        setData(await res.json());
-      }
+      const res = await fetch(url, {
+        credentials: "include",
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error("ダッシュボード取得失敗");
+      const next: DashboardData = await res.json();
+      if (!controller.signal.aborted) setData(next);
     } catch (err) {
-      console.error("ダッシュボード取得失敗:", err);
+      if (!controller.signal.aborted)
+        console.error("ダッシュボード取得失敗:", err);
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [scope.id, scope.type]);
 
   useEffect(() => {
-    fetchDashboard();
+    void fetchDashboard();
+    return () => requestController.current?.abort();
   }, [fetchDashboard]);
+
+  if (loading && compact) {
+    return (
+      <section
+        aria-label="現在のタスク"
+        aria-busy="true"
+        className="min-w-0 rounded-lg border border-border bg-card p-3"
+      >
+        <h3 className="text-sm font-semibold">現在のタスク</h3>
+        <p role="status" className="mt-2 text-xs text-muted-foreground">
+          タスク集計を読み込み中…
+        </p>
+      </section>
+    );
+  }
 
   if (loading) {
     return (
@@ -231,18 +270,30 @@ export function ProjectDashboard({ scope }: { scope: DashboardScope }) {
 
   if (!data) {
     return (
-      <p className="rounded-md border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
-        データの取得に失敗しました
-      </p>
+      <section
+        aria-label={compact ? "現在のタスク" : "タスク集計"}
+        className="min-w-0 rounded-lg border border-dashed border-border bg-card p-3"
+      >
+        <p role="alert" className="text-sm text-muted-foreground">
+          現在のタスクを取得できませんでした
+        </p>
+        <button
+          type="button"
+          className="mt-2 rounded-sm text-xs text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => void fetchDashboard()}
+        >
+          再取得
+        </button>
+      </section>
     );
   }
 
   // 集計値
   const statusMap = new Map(data.status_counts.map((s) => [s.status, s.count]));
-  const totalTasks =
-    (statusMap.get("todo") || 0) +
-    (statusMap.get("in_progress") || 0) +
-    (statusMap.get("closed") || 0);
+  const totalTasks = data.status_counts.reduce(
+    (total, item) => total + item.count,
+    0,
+  );
   const closedTasks = statusMap.get("closed") || 0;
   const inProgressTasks = statusMap.get("in_progress") || 0;
   const remainingTasks = totalTasks - closedTasks;
@@ -285,63 +336,206 @@ export function ProjectDashboard({ scope }: { scope: DashboardScope }) {
     totalTasks > 0 ? Math.round((closedTasks / totalTasks) * 100) : 0;
 
   return (
-    <div className="space-y-4 px-1 pb-2">
-      {/* サマリーカード */}
-      <BlurFade
-        initial={summaryHasAnimatedRef.current ? false : "hidden"}
-        onAnimationStart={() => {
-          summaryHasAnimatedRef.current = true;
-        }}
-        duration={0.3}
-        blur="4px"
-        offset={8}
-      >
-        <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-          <SummaryCard
-            icon={<ListTodo className="size-4" />}
-            label="総タスク"
-            value={totalTasks}
-            sub={`完了率 ${completionRate}%`}
-            color="text-foreground"
-            onClick={() => setDrillCategory("total")}
-          />
-          <SummaryCard
-            icon={<CheckCircle2 className="size-4" />}
-            label="完了"
-            value={closedTasks}
-            color="text-primary"
-            onClick={() => setDrillCategory("closed")}
-          />
-          <SummaryCard
-            icon={<PlayCircle className="size-4" />}
-            label="進行中"
-            value={inProgressTasks}
-            sub={
-              data.active_timer_count > 0
-                ? `${data.active_timer_count}件計測中`
-                : undefined
-            }
-            color="text-primary"
-            onClick={() => setDrillCategory("in_progress")}
-          />
-          <SummaryCard
-            icon={<Clock className="size-4" />}
-            label="合計時間"
-            value={formatTime(data.total_time_seconds)}
-            sub={
-              data.effort_tracking.project_estimated_hours
-                ? `見積 ${data.effort_tracking.project_estimated_hours}h / 残 ${remainingTasks}件`
-                : `残タスク ${remainingTasks}件`
-            }
-            color="text-muted-foreground"
-            isText
-            onClick={() => setDrillCategory("time")}
-          />
-        </div>
-      </BlurFade>
+    <div className={compact ? "min-w-0 space-y-3" : "space-y-4 px-1 pb-2"}>
+      {compact ? (
+        <section
+          aria-label="現在のタスク"
+          className="min-w-0 rounded-lg border border-border bg-card p-3"
+        >
+          <h3 className="flex items-center gap-2 text-sm font-semibold">
+            <ListTodo className="size-4" />
+            タスク集計（補助）
+          </h3>
+          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+            タスク一覧から取得した現在の集計
+          </p>
+          {totalTasks > 0 ? (
+            <div className="my-3 grid min-w-0 grid-cols-3 divide-x divide-border rounded-md bg-muted/40 py-2">
+              {(
+                [
+                  {
+                    label: "未完了",
+                    count: remainingTasks,
+                    category: "remaining",
+                  },
+                  {
+                    label: "進行中",
+                    count: inProgressTasks,
+                    category: "in_progress",
+                  },
+                  { label: "完了", count: closedTasks, category: "closed" },
+                ] as const
+              ).map((item) => (
+                <button
+                  key={item.category}
+                  type="button"
+                  className="min-w-0 rounded-sm px-1 text-center hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => setDrillCategory(item.category)}
+                >
+                  <span className="block text-[11px] text-muted-foreground">
+                    {item.label}
+                  </span>
+                  <span className="mt-1 block text-xl font-semibold tabular-nums">
+                    {item.count}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="my-3 text-xs text-muted-foreground">
+              タスクはまだありません
+            </p>
+          )}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2 text-xs">
+            <span className="text-muted-foreground">
+              総タスク {totalTasks}件
+              {data.active_timer_count > 0
+                ? ` · ${data.active_timer_count}件計測中`
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="rounded-sm text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => setDrillCategory("total")}
+            >
+              タスク一覧を開く
+            </button>
+          </div>
+          {data.total_time_seconds > 0 ? (
+            <button
+              type="button"
+              className="mt-2 rounded-sm text-xs text-muted-foreground hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => setDrillCategory("time")}
+            >
+              合計時間 {formatTime(data.total_time_seconds)}
+            </button>
+          ) : null}
+          {statusData.length > 0 ? (
+            <div
+              className="mt-3 border-t border-border pt-2"
+              data-testid="project-task-status-chart"
+            >
+              <h4 className="text-xs font-medium">ステータス分布</h4>
+              <div
+                className="h-40 min-w-0"
+                role="img"
+                aria-label={statusData
+                  .map((item) => `${item.name} ${item.value}件`)
+                  .join("、")}
+              >
+                <RechartsResponsiveContainer width="100%" height="100%">
+                  <RechartsPieChart>
+                    <RechartsPie
+                      data={statusData}
+                      cx="50%"
+                      cy="45%"
+                      innerRadius={34}
+                      outerRadius={52}
+                      dataKey="value"
+                      nameKey="name"
+                      stroke="var(--card)"
+                    >
+                      {statusData.map((item) => (
+                        <RechartsCell key={item.name} fill={item.color} />
+                      ))}
+                    </RechartsPie>
+                    <RechartsTooltip
+                      contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
+                      itemStyle={CHART_TOOLTIP_ITEM_STYLE}
+                    />
+                    <RechartsLegend
+                      iconSize={7}
+                      wrapperStyle={{ fontSize: "10px" }}
+                    />
+                  </RechartsPieChart>
+                </RechartsResponsiveContainer>
+              </div>
+            </div>
+          ) : null}
+          {tagData.length > 0 ? (
+            <div className="mt-2 border-t border-border pt-2">
+              <h4 className="text-xs font-medium">タグ別の実績時間</h4>
+              <ul className="mt-1 space-y-1">
+                {tagData.slice(0, 4).map((tag) => (
+                  <li
+                    key={tag.name}
+                    className="flex min-w-0 justify-between gap-2 text-[11px]"
+                  >
+                    <span className="truncate">{tag.name}</span>
+                    <span className="shrink-0 tabular-nums">
+                      {formatTime(tag.seconds)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {data.effort_tracking.project_estimated_hours ||
+          data.effort_tracking.task_estimated_hours_total > 0 ? (
+            <div className="mt-3">
+              <EffortTrackingSection effort={data.effort_tracking} compact />
+            </div>
+          ) : null}
+        </section>
+      ) : (
+        /* サマリーカード */
+        <BlurFade
+          initial={summaryHasAnimatedRef.current ? false : "hidden"}
+          onAnimationStart={() => {
+            summaryHasAnimatedRef.current = true;
+          }}
+          duration={0.3}
+          blur="4px"
+          offset={8}
+        >
+          <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+            <SummaryCard
+              icon={<ListTodo className="size-4" />}
+              label="総タスク"
+              value={totalTasks}
+              sub={`完了率 ${completionRate}%`}
+              color="text-foreground"
+              onClick={() => setDrillCategory("total")}
+            />
+            <SummaryCard
+              icon={<CheckCircle2 className="size-4" />}
+              label="完了"
+              value={closedTasks}
+              color="text-primary"
+              onClick={() => setDrillCategory("closed")}
+            />
+            <SummaryCard
+              icon={<PlayCircle className="size-4" />}
+              label="進行中"
+              value={inProgressTasks}
+              sub={
+                data.active_timer_count > 0
+                  ? `${data.active_timer_count}件計測中`
+                  : undefined
+              }
+              color="text-primary"
+              onClick={() => setDrillCategory("in_progress")}
+            />
+            <SummaryCard
+              icon={<Clock className="size-4" />}
+              label="合計時間"
+              value={formatTime(data.total_time_seconds)}
+              sub={
+                data.effort_tracking.project_estimated_hours
+                  ? `見積 ${data.effort_tracking.project_estimated_hours}h / 残 ${remainingTasks}件`
+                  : `残タスク ${remainingTasks}件`
+              }
+              color="text-muted-foreground"
+              isText
+              onClick={() => setDrillCategory("time")}
+            />
+          </div>
+        </BlurFade>
+      )}
 
       <TaskDrillDialog
         scope={scope}
+        taskBrowseOnly={taskBrowseOnly}
         category={drillCategory}
         onOpenChange={(open) => {
           if (!open) setDrillCategory(null);
@@ -356,255 +550,321 @@ export function ProjectDashboard({ scope }: { scope: DashboardScope }) {
           if (!open) setSelectedTaskId(null);
         }}
         onTaskUpdated={fetchDashboard}
+        readOnly={taskBrowseOnly}
+        browseScope={taskBrowseScope}
       />
 
-      {/* チャート行1: タグ別時間 + ステータス分布 */}
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-5">
-        {/* タグ別作業時間 */}
-        <Card className="border-border bg-card shadow-none xl:col-span-3">
-          <CardHeader className="border-b border-border pb-3">
-            <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
-              <Timer className="size-3.5" />
-              タグ別作業時間
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-4">
-            {tagData.length > 0 ? (
-              <div className="h-56">
-                <RechartsResponsiveContainer width="100%" height="100%">
-                  <RechartsBarChart
-                    data={tagData}
-                    layout="vertical"
-                    margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
-                  >
-                    <RechartsXAxis
-                      type="number"
-                      tickFormatter={(v: number) => formatTime(v)}
-                      tick={{ fontSize: 11 }}
-                    />
-                    <RechartsYAxis
-                      type="category"
-                      dataKey="name"
-                      width={80}
-                      tick={{ fontSize: 11 }}
-                    />
-                    <RechartsTooltip
-                      formatter={(value: unknown) => [
-                        formatTimeTooltip(Number(value) || 0),
-                        "作業時間",
-                      ]}
-                      contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-                      itemStyle={CHART_TOOLTIP_ITEM_STYLE}
-                      labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-                      cursor={CHART_TOOLTIP_CURSOR}
-                    />
-                    <RechartsBar dataKey="seconds" radius={[0, 4, 4, 0]}>
-                      {tagData.map((entry, index) => (
-                        <RechartsCell key={index} fill={entry.color} />
-                      ))}
-                    </RechartsBar>
-                  </RechartsBarChart>
-                </RechartsResponsiveContainer>
-              </div>
-            ) : (
-              <div className="h-56 flex items-center justify-center text-sm text-muted-foreground">
-                タグ付きの作業記録がありません
-              </div>
-            )}
-          </CardContent>
-        </Card>
+      {!compact ? (
+        <div className="min-w-0 space-y-3">
+          {/* チャート行1: タグ別時間 + ステータス分布 */}
+          <div
+            className={
+              compact
+                ? "grid min-w-0 grid-cols-1 gap-3"
+                : "grid grid-cols-1 gap-3 xl:grid-cols-5"
+            }
+          >
+            {/* タグ別作業時間 */}
+            <Card
+              className={
+                compact
+                  ? "min-w-0 border-border bg-card shadow-none"
+                  : "border-border bg-card shadow-none xl:col-span-3"
+              }
+            >
+              <CardHeader className="border-b border-border pb-3">
+                <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
+                  <Timer className="size-3.5" />
+                  タグ別作業時間
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-4">
+                {tagData.length > 0 ? (
+                  <div className="h-56">
+                    <RechartsResponsiveContainer width="100%" height="100%">
+                      <RechartsBarChart
+                        data={tagData}
+                        layout="vertical"
+                        margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
+                      >
+                        <RechartsXAxis
+                          type="number"
+                          tickFormatter={(v: number) => formatTime(v)}
+                          tick={{ fontSize: 11 }}
+                        />
+                        <RechartsYAxis
+                          type="category"
+                          dataKey="name"
+                          width={80}
+                          tick={{ fontSize: 11 }}
+                        />
+                        <RechartsTooltip
+                          formatter={(value: unknown) => [
+                            formatTimeTooltip(Number(value) || 0),
+                            "作業時間",
+                          ]}
+                          contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
+                          itemStyle={CHART_TOOLTIP_ITEM_STYLE}
+                          labelStyle={CHART_TOOLTIP_LABEL_STYLE}
+                          cursor={CHART_TOOLTIP_CURSOR}
+                        />
+                        <RechartsBar dataKey="seconds" radius={[0, 4, 4, 0]}>
+                          {tagData.map((entry, index) => (
+                            <RechartsCell key={index} fill={entry.color} />
+                          ))}
+                        </RechartsBar>
+                      </RechartsBarChart>
+                    </RechartsResponsiveContainer>
+                  </div>
+                ) : (
+                  <div className="h-56 flex items-center justify-center text-sm text-muted-foreground">
+                    タグ付きの作業記録がありません
+                  </div>
+                )}
+              </CardContent>
+            </Card>
 
-        {/* ステータス分布 */}
-        <Card className="border-border bg-card shadow-none xl:col-span-2">
-          <CardHeader className="border-b border-border pb-3">
-            <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
-              <TrendingUp className="size-3.5" />
-              ステータス分布
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-4">
-            {statusData.length > 0 ? (
-              <div className="h-56">
-                <RechartsResponsiveContainer width="100%" height="100%">
-                  <RechartsPieChart>
-                    <RechartsPie
-                      data={statusData}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={50}
-                      outerRadius={80}
-                      dataKey="value"
-                      nameKey="name"
-                      strokeWidth={2}
-                      stroke="var(--card)"
-                    >
-                      {statusData.map((entry, index) => (
-                        <RechartsCell key={index} fill={entry.color} />
-                      ))}
-                    </RechartsPie>
-                    <RechartsTooltip
-                      formatter={(value: unknown, name: unknown) => [
-                        `${value}件`,
-                        String(name),
-                      ]}
-                      contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-                      itemStyle={CHART_TOOLTIP_ITEM_STYLE}
-                      labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-                      cursor={CHART_TOOLTIP_CURSOR}
-                    />
-                    <RechartsLegend
-                      iconSize={8}
-                      wrapperStyle={{ fontSize: "11px" }}
-                    />
-                  </RechartsPieChart>
-                </RechartsResponsiveContainer>
-              </div>
-            ) : (
-              <div className="h-56 flex items-center justify-center text-sm text-muted-foreground">
-                タスクがありません
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+            {/* ステータス分布 */}
+            <Card
+              className={
+                compact
+                  ? "min-w-0 border-border bg-card shadow-none"
+                  : "border-border bg-card shadow-none xl:col-span-2"
+              }
+            >
+              <CardHeader className="border-b border-border pb-3">
+                <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
+                  <TrendingUp className="size-3.5" />
+                  ステータス分布
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-4">
+                {statusData.length > 0 ? (
+                  <div className="h-56">
+                    <RechartsResponsiveContainer width="100%" height="100%">
+                      <RechartsPieChart>
+                        <RechartsPie
+                          data={statusData}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={50}
+                          outerRadius={80}
+                          dataKey="value"
+                          nameKey="name"
+                          strokeWidth={2}
+                          stroke="var(--card)"
+                        >
+                          {statusData.map((entry, index) => (
+                            <RechartsCell key={index} fill={entry.color} />
+                          ))}
+                        </RechartsPie>
+                        <RechartsTooltip
+                          formatter={(value: unknown, name: unknown) => [
+                            `${value}件`,
+                            String(name),
+                          ]}
+                          contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
+                          itemStyle={CHART_TOOLTIP_ITEM_STYLE}
+                          labelStyle={CHART_TOOLTIP_LABEL_STYLE}
+                          cursor={CHART_TOOLTIP_CURSOR}
+                        />
+                        <RechartsLegend
+                          iconSize={8}
+                          wrapperStyle={{ fontSize: "11px" }}
+                        />
+                      </RechartsPieChart>
+                    </RechartsResponsiveContainer>
+                  </div>
+                ) : (
+                  <div className="h-56 flex items-center justify-center text-sm text-muted-foreground">
+                    タスクがありません
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
 
-      {/* 工数予実管理 */}
-      {(data.effort_tracking.project_estimated_hours ||
-        data.effort_tracking.task_estimated_hours_total > 0) && (
-        <EffortTrackingSection effort={data.effort_tracking} />
-      )}
+          {/* 工数予実管理 */}
+          {(data.effort_tracking.project_estimated_hours ||
+            data.effort_tracking.task_estimated_hours_total > 0) && (
+            <EffortTrackingSection
+              effort={data.effort_tracking}
+              compact={compact}
+            />
+          )}
 
-      {/* チャート行2: 優先度別 + 最近完了 */}
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-5">
-        {/* 優先度別タスク */}
-        <Card className="border-border bg-card shadow-none xl:col-span-3">
-          <CardHeader className="border-b border-border pb-3">
-            <CardTitle className="text-sm font-semibold">優先度別タスク</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {priorityData.length > 0 ? (
-              <div className="h-40">
-                <RechartsResponsiveContainer width="100%" height="100%">
-                  <RechartsBarChart
-                    data={priorityData}
-                    margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
-                  >
-                    <RechartsXAxis dataKey="name" tick={{ fontSize: 11 }} />
-                    <RechartsYAxis
-                      tick={{ fontSize: 11 }}
-                      allowDecimals={false}
-                    />
-                    <RechartsTooltip
-                      formatter={(value: unknown) => [`${value}件`, "タスク数"]}
-                      contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-                      itemStyle={CHART_TOOLTIP_ITEM_STYLE}
-                      labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-                      cursor={CHART_TOOLTIP_CURSOR}
-                    />
-                    <RechartsBar dataKey="count" radius={[4, 4, 0, 0]}>
-                      {priorityData.map((entry, index) => (
-                        <RechartsCell key={index} fill={entry.color} />
-                      ))}
-                    </RechartsBar>
-                  </RechartsBarChart>
-                </RechartsResponsiveContainer>
-              </div>
-            ) : (
-              <div className="h-40 flex items-center justify-center text-sm text-muted-foreground">
-                タスクがありません
-              </div>
-            )}
-          </CardContent>
-        </Card>
+          {/* チャート行2: 優先度別 + 最近完了 */}
+          <div
+            className={
+              compact
+                ? "grid min-w-0 grid-cols-1 gap-3"
+                : "grid grid-cols-1 gap-3 xl:grid-cols-5"
+            }
+          >
+            {/* 優先度別タスク */}
+            <Card
+              className={
+                compact
+                  ? "min-w-0 border-border bg-card shadow-none"
+                  : "border-border bg-card shadow-none xl:col-span-3"
+              }
+            >
+              <CardHeader className="border-b border-border pb-3">
+                <CardTitle className="text-sm font-semibold">
+                  優先度別タスク
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {priorityData.length > 0 ? (
+                  <div className="h-40">
+                    <RechartsResponsiveContainer width="100%" height="100%">
+                      <RechartsBarChart
+                        data={priorityData}
+                        margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
+                      >
+                        <RechartsXAxis dataKey="name" tick={{ fontSize: 11 }} />
+                        <RechartsYAxis
+                          tick={{ fontSize: 11 }}
+                          allowDecimals={false}
+                        />
+                        <RechartsTooltip
+                          formatter={(value: unknown) => [
+                            `${value}件`,
+                            "タスク数",
+                          ]}
+                          contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
+                          itemStyle={CHART_TOOLTIP_ITEM_STYLE}
+                          labelStyle={CHART_TOOLTIP_LABEL_STYLE}
+                          cursor={CHART_TOOLTIP_CURSOR}
+                        />
+                        <RechartsBar dataKey="count" radius={[4, 4, 0, 0]}>
+                          {priorityData.map((entry, index) => (
+                            <RechartsCell key={index} fill={entry.color} />
+                          ))}
+                        </RechartsBar>
+                      </RechartsBarChart>
+                    </RechartsResponsiveContainer>
+                  </div>
+                ) : (
+                  <div className="h-40 flex items-center justify-center text-sm text-muted-foreground">
+                    タスクがありません
+                  </div>
+                )}
+              </CardContent>
+            </Card>
 
-        {/* 最近完了したタスク */}
-        <Card className="border-border bg-card shadow-none xl:col-span-2">
-          <CardHeader className="border-b border-border pb-3">
-            <CardTitle className="text-sm font-semibold">最近の完了タスク</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {data.recent_completed.length > 0 ? (
-              <div className="space-y-2">
-                {data.recent_completed.map((task) => (
-                  <div key={task.id} className="flex items-start gap-2 text-sm">
-                    <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-primary" />
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate">{task.title}</p>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        {task.priority && task.priority !== "medium" && (
-                          <Badge
-                            variant="outline"
-                            className="text-[10px] px-1 py-0"
-                            style={{
-                              borderColor:
-                                PRIORITY_COLORS[task.priority] || undefined,
-                              color:
-                                PRIORITY_COLORS[task.priority] || undefined,
-                            }}
-                          >
-                            {PRIORITY_LABELS[task.priority] || task.priority}
-                          </Badge>
-                        )}
-                        {task.completed_at && (
-                          <span className="text-xs text-muted-foreground">
-                            {new Date(task.completed_at).toLocaleDateString(
-                              "ja-JP",
-                              { month: "short", day: "numeric" },
+            {/* 最近完了したタスク */}
+            <Card
+              className={
+                compact
+                  ? "min-w-0 border-border bg-card shadow-none"
+                  : "border-border bg-card shadow-none xl:col-span-2"
+              }
+            >
+              <CardHeader className="border-b border-border pb-3">
+                <CardTitle className="text-sm font-semibold">
+                  最近の完了タスク
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {data.recent_completed.length > 0 ? (
+                  <div className="space-y-2">
+                    {data.recent_completed.map((task) => (
+                      <div
+                        key={task.id}
+                        className="flex items-start gap-2 text-sm"
+                      >
+                        <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-primary" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate">{task.title}</p>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            {task.priority && task.priority !== "medium" && (
+                              <Badge
+                                variant="outline"
+                                className="text-[10px] px-1 py-0"
+                                style={{
+                                  borderColor:
+                                    PRIORITY_COLORS[task.priority] || undefined,
+                                  color:
+                                    PRIORITY_COLORS[task.priority] || undefined,
+                                }}
+                              >
+                                {PRIORITY_LABELS[task.priority] ||
+                                  task.priority}
+                              </Badge>
                             )}
-                          </span>
-                        )}
+                            {task.completed_at && (
+                              <span className="text-xs text-muted-foreground">
+                                {new Date(task.completed_at).toLocaleDateString(
+                                  "ja-JP",
+                                  { month: "short", day: "numeric" },
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                    </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            ) : (
-              <div className="h-32 flex items-center justify-center text-sm text-muted-foreground">
-                完了タスクがありません
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+                ) : (
+                  <div className="h-32 flex items-center justify-center text-sm text-muted-foreground">
+                    完了タスクがありません
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
 
-      {/* タグ別タスク数テーブル */}
-      {data.tag_stats.length > 0 && (
-        <Card className="border-border bg-card shadow-none">
-          <CardHeader className="border-b border-border pb-3">
-            <CardTitle className="text-sm font-semibold">タグ別サマリー</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-              {data.tag_stats
-                .filter((t) => t.task_count > 0)
-                .sort((a, b) => b.task_count - a.task_count)
-                .map((tag, i) => (
-                  <div
-                    key={tag.id}
-                    className="flex items-center gap-2 rounded border border-border px-3 py-2"
-                  >
-                    <div
-                      className="size-2.5 rounded-full shrink-0"
-                      style={{
-                        backgroundColor:
-                          tag.color ||
-                          DEFAULT_TAG_COLORS[i % DEFAULT_TAG_COLORS.length],
-                      }}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs font-medium truncate">{tag.name}</p>
-                      <p className="text-[10px] text-muted-foreground">
-                        {tag.task_count}件
-                        {tag.total_seconds > 0 &&
-                          ` / ${formatTime(tag.total_seconds)}`}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+          {/* タグ別タスク数テーブル */}
+          {data.tag_stats.length > 0 && (
+            <Card className="border-border bg-card shadow-none">
+              <CardHeader className="border-b border-border pb-3">
+                <CardTitle className="text-sm font-semibold">
+                  タグ別サマリー
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div
+                  className={
+                    compact
+                      ? "grid min-w-0 grid-cols-1 gap-2"
+                      : "grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4"
+                  }
+                >
+                  {data.tag_stats
+                    .filter((t) => t.task_count > 0)
+                    .sort((a, b) => b.task_count - a.task_count)
+                    .map((tag, i) => (
+                      <div
+                        key={tag.id}
+                        className="flex items-center gap-2 rounded border border-border px-3 py-2"
+                      >
+                        <div
+                          className="size-2.5 rounded-full shrink-0"
+                          style={{
+                            backgroundColor:
+                              tag.color ||
+                              DEFAULT_TAG_COLORS[i % DEFAULT_TAG_COLORS.length],
+                          }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-medium truncate">
+                            {tag.name}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {tag.task_count}件
+                            {tag.total_seconds > 0 &&
+                              ` / ${formatTime(tag.total_seconds)}`}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -651,7 +911,9 @@ function SummaryCard({
       <CardContent className="px-4 pb-3 pt-4">
         <div className="mb-2 flex items-center gap-2">
           <span className={`${color}`}>{icon}</span>
-          <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">{label}</span>
+          <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+            {label}
+          </span>
         </div>
         <p className={`text-3xl font-semibold tracking-tight ${color}`}>
           {typeof value === "number" && !isText ? (
@@ -671,6 +933,7 @@ function SummaryCard({
 }
 
 const DRILL_TITLES: Record<DrillCategory, string> = {
+  remaining: "未完了タスク",
   total: "総タスク",
   closed: "完了タスク",
   in_progress: "進行中タスク",
@@ -679,11 +942,13 @@ const DRILL_TITLES: Record<DrillCategory, string> = {
 
 function TaskDrillDialog({
   scope,
+  taskBrowseOnly,
   category,
   onOpenChange,
   onSelectTask,
 }: {
   scope: DashboardScope;
+  taskBrowseOnly: boolean;
   category: DrillCategory | null;
   onOpenChange: (open: boolean) => void;
   onSelectTask: (taskId: string) => void;
@@ -701,7 +966,7 @@ function TaskDrillDialog({
       try {
         const res = await taskApi.listTasks(
           scope.type === "project"
-            ? { project_id: scope.id }
+            ? taskBrowseOnly ? { browse_project_id: scope.id } : { project_id: scope.id }
             : { space_id: scope.id },
         );
         if (!cancelled) setTasks(res);
@@ -716,17 +981,23 @@ function TaskDrillDialog({
     return () => {
       cancelled = true;
     };
-  }, [scope.id, scope.type, category]);
+  }, [scope.id, scope.type, category, taskBrowseOnly]);
 
   const filtered = useMemo(() => {
     if (category === null) return [];
+    const rootTasks = tasks.filter((task) => !task.parent_task_id);
     if (category === "total") {
-      return [...tasks].sort(
+      return [...rootTasks].sort(
         (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0),
       );
     }
+    if (category === "remaining") {
+      return rootTasks
+        .filter((task) => task.status !== "closed")
+        .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+    }
     if (category === "closed") {
-      return tasks
+      return rootTasks
         .filter((t) => t.status === "closed")
         .sort((a, b) => {
           const ta = a.completed_at ? Date.parse(a.completed_at) : 0;
@@ -735,7 +1006,7 @@ function TaskDrillDialog({
         });
     }
     if (category === "in_progress") {
-      return tasks
+      return rootTasks
         .filter((t) => t.status === "in_progress")
         .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
     }
@@ -749,7 +1020,10 @@ function TaskDrillDialog({
 
   return (
     <Dialog open={category !== null} onOpenChange={onOpenChange}>
-      <DialogContent size="2xl" className="max-h-[80vh] overflow-hidden flex flex-col">
+      <DialogContent
+        size="2xl"
+        className="max-h-[80vh] overflow-hidden flex flex-col"
+      >
         <DialogHeader>
           <DialogTitle>
             {category ? DRILL_TITLES[category] : ""}
@@ -835,7 +1109,13 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
-function EffortTrackingSection({ effort }: { effort: EffortTracking }) {
+function EffortTrackingSection({
+  effort,
+  compact = false,
+}: {
+  effort: EffortTracking;
+  compact?: boolean;
+}) {
   const estimatedHours = effort.project_estimated_hours || 0;
   const actualHours = effort.actual_hours;
   const taskEstTotal = effort.task_estimated_hours_total;
@@ -873,9 +1153,21 @@ function EffortTrackingSection({ effort }: { effort: EffortTracking }) {
   });
 
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-5">
+    <div
+      className={
+        compact
+          ? "grid min-w-0 grid-cols-1 gap-3"
+          : "grid grid-cols-1 gap-3 xl:grid-cols-5"
+      }
+    >
       {/* 工数予実 */}
-      <Card className="border-border bg-card shadow-none xl:col-span-3">
+      <Card
+        className={
+          compact
+            ? "min-w-0 border-border bg-card shadow-none"
+            : "border-border bg-card shadow-none xl:col-span-3"
+        }
+      >
         <CardHeader className="border-b border-border pb-3">
           <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
             <Gauge className="size-3.5" />
@@ -978,7 +1270,13 @@ function EffortTrackingSection({ effort }: { effort: EffortTracking }) {
       </Card>
 
       {/* メンバー別工数 */}
-      <Card className="border-border bg-card shadow-none xl:col-span-2">
+      <Card
+        className={
+          compact
+            ? "min-w-0 border-border bg-card shadow-none"
+            : "border-border bg-card shadow-none xl:col-span-2"
+        }
+      >
         <CardHeader className="border-b border-border pb-3">
           <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
             <Users className="size-3.5" />

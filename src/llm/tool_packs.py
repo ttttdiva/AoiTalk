@@ -30,11 +30,6 @@ from ..services.project_context import (
 
 LOAD_TOOL_PACK_TOOL_NAME = "load_tool_pack"
 
-# ``None`` means a trusted resolver completed and found no Story session.  A
-# private sentinel keeps that state distinct from a caller that did not supply
-# a request-local Story result and therefore needs the compatibility resolver.
-_STORY_CONTEXT_UNSET = object()
-
 CHARACTER_TOOL_OWNER = "character"
 WORKSPACE_MANIFEST_TOOL_PREFIX = "ws_"
 APPS_TOOL_OWNER = "apps"
@@ -61,6 +56,7 @@ def _strict_config_bool(value: Any, *, default: bool) -> bool:
 APPS_BOOTSTRAP_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "create_app",
+        "update_app",
         "list_apps",
     }
 )
@@ -70,6 +66,7 @@ APP_BOOTSTRAP_TOOL_NAMES = APPS_BOOTSTRAP_TOOL_NAMES
 APPS_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "create_app",
+        "update_app",
         "list_apps",
         "get_app",
         "get_app_context",
@@ -79,6 +76,7 @@ APPS_TOOL_NAMES: frozenset[str] = frozenset(
         "write_app_file",
         "delete_app_file",
         "validate_app_manifest",
+        "validate_app_runtime_contract",
         "update_app_manifest",
         "app_git_status",
         "app_git_history",
@@ -91,6 +89,11 @@ APPS_TOOL_NAMES: frozenset[str] = frozenset(
         "stop_app_job",
         "read_app_job_logs",
         "create_app_release",
+        "get_app_runtime",
+        "run_app_action",
+        "activate_app_release",
+        "release_and_activate_app",
+        "open_app_runtime",
         "export_app_release",
         "import_app_source_bundle",
         "fork_app",
@@ -175,8 +178,8 @@ DEFERRED_TOOL_PACKS: tuple[ToolPack, ...] = (
     ToolPack(
         pack_id="browser",
         summary="選択した接続PCのEdgeとWindowsデスクトップを操作する",
-        tool_names=frozenset({"browser_agent", "computer_use"}),
-        prompt_fragment="browser_agentは既存Edgeの拡張接続を使う。現在のタブの作業ではstart_url省略可。Jevは任意で、利用不能なら現在のLLMへ切り替わる。返却された観測で結果を説明する。",
+        tool_names=frozenset({"browser_agent", "browser_agent_dedicated", "computer_observe", "computer_use"}),
+        prompt_fragment="Windowsの画面の読み取りにはcomputer_observe、操作にはcomputer_useを使う。browser_agentは選択PCのBridgeで明示選択した既存Edge targetを操作する。接続や候補判断の失敗時は停止する。返された観測に基づいて結果を説明する。",
     ),
     ToolPack(
         # App Development tools are registered alongside the root registry but
@@ -281,37 +284,12 @@ DEFERRED_TOOL_PACKS_BY_ID: dict[str, ToolPack] = {
 }
 
 
-def _client_story_context_active(
-    client: Any,
-    *,
-    story_context: Any = _STORY_CONTEXT_UNSET,
-) -> bool:
-    """Return Story activation from the server-backed structured context.
-
-    Natural-language input is intentionally not consulted here.  Providers
-    expose ``_get_story_chat_context_sync`` only after resolving the current
-    ``StoryWritingSession`` for the conversation, which makes this a trusted
-    per-request signal shared by Team activation and tool exposure.
-    """
-
-    if story_context is not _STORY_CONTEXT_UNSET:
-        return bool(story_context)
-    getter = getattr(client, "_get_story_chat_context_sync", None)
-    if not callable(getter):
-        return False
-    try:
-        return bool(getter())
-    except Exception:  # noqa: BLE001 - compatibility resolver has no context
-        return False
-
-
 def contextual_agent_team_scope(
     config: Any,
     *,
     client: Any = None,
     project_context: dict[str, Any] | None = None,
     loaded_team_ids: Iterable[str] = (),
-    story_context: Any = _STORY_CONTEXT_UNSET,
 ) -> dict[str, Any]:
     """Resolve canonical Team activation for the current request.
 
@@ -365,17 +343,10 @@ def contextual_agent_team_scope(
                 metadata.pop(key, None)
             project_for_tags["metadata"] = metadata
 
-    story_active = _client_story_context_active(
-        client,
-        story_context=story_context,
-    )
-    story_mode = "writing" if story_active else None
     tags = agent_team_v3_context_tags(
         project=project_for_tags,
-        session={"story_mode": story_mode} if story_mode else None,
         app_target_id=app_target_id if app_identity else None,
         development_status=development_status if app_identity else None,
-        story_mode=story_mode,
     )
     scope = agent_team_scope_active(
         config,
@@ -383,7 +354,6 @@ def contextual_agent_team_scope(
         context_tags=tags,
         app_target_id=app_target_id if app_identity else None,
         development_status=development_status if app_identity else None,
-        story_mode=story_mode,
         loaded_team_ids=loaded_team_ids,
     )
 
@@ -418,7 +388,6 @@ def contextual_agent_team_scope(
             and "app_development" in tags
             and bool(active_team_ids & app_development_team_ids)
         ),
-        "story_active": "story" in tags,
         "active_team_ids": sorted(active_team_ids),
         "active_subagent_ids": sorted(
             {
@@ -655,9 +624,6 @@ def auto_load_contextual_packs(
         pack_ids.append(APPS_TOOL_PACK_ID)
         if agent_team_v3_delegation_enabled(effective_config):
             pack_ids.append("agent_team")
-    if scope.get("story_active") and agent_team_v3_delegation_enabled(effective_config):
-        if "agent_team" not in pack_ids:
-            pack_ids.append("agent_team")
     return session.load_many(pack_ids)
 
 
@@ -700,7 +666,12 @@ def available_packs_for_registry(
     contextual_scope: Mapping[str, Any] | None = None,
 ) -> tuple[ToolPack, ...]:
     """レジストリに実際に登録されている pack だけを返す。"""
-    tools = _registry_tools(registry)
+    from .tool_exposure import runtime_tool_capability_status
+
+    tools = [
+        tool for tool in _registry_tools(registry)
+        if runtime_tool_capability_status(tool, client=client, config=config) is None
+    ]
     available: list[ToolPack] = []
     for pack in DEFERRED_TOOL_PACKS:
         if not pack.manual_load:
@@ -730,6 +701,251 @@ def pack_tool_names_in_registry(pack: ToolPack, registry: Any) -> tuple[str, ...
             str(getattr(tool, "owner", "")),
         )
     )
+
+
+def browser_pack_prompt(pack: ToolPack, config: Any) -> str:
+    if pack.pack_id != "browser":
+        return pack.prompt_fragment
+    from ..services.browser_agent_models import BrowserAgentSettings
+    try:
+        settings = BrowserAgentSettings.from_config(config)
+    except (ValueError, TypeError):
+        return ""
+    if not settings.enabled:
+        return ""
+    prompt = pack.prompt_fragment
+    if settings.jev_enabled:
+        prompt += "候補判断には既存のJev経路を利用する。"
+    if settings.dedicated_enabled:
+        prompt += "browser_agent_dedicatedは同じPCのBridgeが所有する専用ブラウザを使う。ログインはユーザーへ引き継ぎ、最終送信・予約の確認は別に行う。"
+    return prompt
+
+
+def _bounded_decision_flag(config: Any, name: str, *, default: bool = True) -> bool:
+    if config is None:
+        return False
+    value: Any = None
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            value = getter(f"decision_layer.{name}", None)
+        except Exception:
+            value = None
+        if value is None:
+            try:
+                layer = getter("decision_layer", {}) or {}
+            except Exception:
+                layer = {}
+            if isinstance(layer, Mapping):
+                value = layer.get(name)
+    elif isinstance(config, Mapping):
+        layer = config.get("decision_layer", {}) or {}
+        if isinstance(layer, Mapping):
+            value = layer.get(name)
+    return _strict_config_bool(value, default=default)
+
+
+async def pre_route_tool_pack_for_request(
+    registry: Any,
+    client: Any,
+    request_text: str,
+    *,
+    config: Any = None,
+    project_context: dict[str, Any] | None = None,
+    contextual_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Optionally pre-load one Host-authorized deferred pack via bounded Jev choice.
+
+    This is only a convenience pre-route. Explicit command capabilities and
+    trusted contextual auto-loads remain authoritative, and ``load_tool_pack``
+    stays available as the deterministic fallback when Jev abstains or fails.
+    """
+    session = tool_pack_session_for_client(client)
+    effective_config = config if config is not None else getattr(client, "config", None)
+
+    # Preserve the existing always-on/browser and trusted contextual behavior
+    # before semantic routing. Jev never gets to revoke or replace these loads.
+    session.load("browser")
+    trusted_loaded = auto_load_contextual_packs(
+        session,
+        client=client,
+        config=effective_config,
+        project_context=project_context,
+        contextual_scope=contextual_scope,
+    )
+
+    try:
+        from .tool_policy import (
+            command_capabilities_from_text,
+            sanitize_command_capabilities,
+        )
+
+        capabilities = set(
+            sanitize_command_capabilities(
+                getattr(client, "current_command_capabilities", ()) or ()
+            )
+        )
+        capabilities |= command_capabilities_from_text(str(request_text or ""))
+    except Exception:
+        capabilities = set()
+
+    if capabilities:
+        explicit_loaded = auto_load_packs_for_command_capabilities(
+            session, capabilities
+        )
+        return {
+            "status": "host_explicit",
+            "loaded": list(explicit_loaded),
+            "trusted_loaded": list(trusted_loaded),
+            "decision_engine": "host",
+            "validation_result": "explicit_request_preserved",
+        }
+
+    if not _bounded_decision_flag(
+        effective_config, "jev_tool_pack_prerouting_enabled", default=True
+    ):
+        return {
+            "status": "skipped",
+            "reason": "jev_tool_pack_prerouting_disabled",
+            "trusted_loaded": list(trusted_loaded),
+        }
+
+    packs = tuple(
+        pack
+        for pack in available_packs_for_registry(
+            registry,
+            client=client,
+            config=effective_config,
+            project_context=project_context,
+            contextual_scope=contextual_scope,
+        )
+        if not session.is_loaded(pack.pack_id)
+    )
+    if not packs or not str(request_text or "").strip():
+        return {
+            "status": "skipped",
+            "reason": "no_bounded_pack_candidates",
+            "trusted_loaded": list(trusted_loaded),
+        }
+
+    # Import lazily to keep Tool Pack definition loading free of service cycles.
+    from ..services.candidate_decision_service import (
+        CandidateDecisionError,
+        CandidateDecisionRouter,
+    )
+    from ..services.jev_decision_service import JevDecisionService
+    from ..services.decision_receipt_service import finalize_decision_receipt
+    from ..services.outbound_privacy_service import (
+        ExternalProviderBlocked,
+        OutboundPrivacyGateway,
+        PrivacyError,
+        current_effective_privacy_mode,
+    )
+
+    async def _never_llm(*_args: Any, **_kwargs: Any) -> str:
+        return "none"
+
+    candidates = {
+        pack.pack_id: {
+            "summary": str(pack.summary or "")[:600],
+            "tools": list(pack_tool_names_in_registry(pack, registry)[:16]),
+        }
+        for pack in packs
+    }
+    router = CandidateDecisionRouter(
+        llm_choose=_never_llm,
+        jev=JevDecisionService(
+            OutboundPrivacyGateway(effective_config),
+            timeout_seconds=5,
+            max_retries=0,
+            purpose="tool_pack",
+        ),
+        jev_enabled=True,
+        local_only=current_effective_privacy_mode(effective_config) == "local_only",
+        minimum_confidence=0.70,
+        allow_llm_fallback=False,
+        allow_abstain=True,
+    )
+    try:
+        choice = await router.choose(
+            {"request": str(request_text)[:3000]},
+            (
+                "Choose at most one optional tool pack that is materially needed "
+                "for the trusted user request. Choose none when core/currently "
+                "loaded tools are sufficient."
+            ),
+            candidates,
+            decision_kind="tool_pack",
+            candidate_metadata={"candidate_count": len(candidates)},
+        )
+    except (CandidateDecisionError, ExternalProviderBlocked, PrivacyError) as exc:
+        return {
+            "status": "fallback",
+            "reason": str(exc)[:120] or type(exc).__name__,
+            "trusted_loaded": list(trusted_loaded),
+        }
+
+    if choice.choice == "none":
+        receipt = finalize_decision_receipt(getattr(choice, "receipt", None), outcome="abstained", host_action="no_load")
+        return {
+            "status": "abstained",
+            "decision_id": receipt.decision_id if receipt else None,
+            "reason": choice.reason,
+            "decision_engine": choice.engine,
+            "confidence": choice.confidence,
+            "latency_ms": choice.latency_ms,
+            "trusted_loaded": list(trusted_loaded),
+        }
+
+    # Host-side revalidation is authoritative. Availability/context may have
+    # changed while Jev was evaluating, and a stale choice never grants access.
+    current = {
+        pack.pack_id: pack
+        for pack in available_packs_for_registry(
+            registry,
+            client=client,
+            config=effective_config,
+            project_context=project_context,
+            contextual_scope=contextual_scope,
+        )
+    }
+    if choice.choice not in current or not contextual_tool_pack_allowed(
+        choice.choice,
+        client=client,
+        config=effective_config,
+        project_context=project_context,
+        contextual_scope=contextual_scope,
+    ):
+        receipt = finalize_decision_receipt(getattr(choice, "receipt", None), outcome="stale", validation_result="host_revalidation_failed", host_action="no_load")
+        return {
+            "status": "stale",
+            "decision_id": receipt.decision_id if receipt else None,
+            "choice": choice.choice,
+            "decision_engine": choice.engine,
+            "validation_result": "host_revalidation_failed",
+            "trusted_loaded": list(trusted_loaded),
+        }
+
+    try:
+        loaded = session.load(choice.choice)
+    except Exception:
+        finalize_decision_receipt(getattr(choice, "receipt", None), outcome="failed", validation_result="host_revalidated", host_action="load_tool_pack")
+        raise
+    receipt = finalize_decision_receipt(
+        getattr(choice, "receipt", None), outcome="loaded" if loaded else "already_loaded",
+        validation_result="host_revalidated", host_action="load_tool_pack", host_candidate=choice.choice,
+    )
+    return {
+        "status": "loaded" if loaded else "already_loaded",
+        "decision_id": receipt.decision_id if receipt else None,
+        "choice": choice.choice,
+        "decision_engine": choice.engine,
+        "confidence": choice.confidence,
+        "fallback_reason": choice.reason,
+        "latency_ms": choice.latency_ms,
+        "validation_result": "host_revalidated",
+        "trusted_loaded": list(trusted_loaded),
+    }
 
 
 def build_load_tool_pack_description(packs: Iterable[ToolPack]) -> str:
@@ -800,7 +1016,7 @@ def build_load_tool_pack_tool(
                 header,
                 f"Tools now available: {', '.join(tool_names) or '(none)'}",
                 "",
-                target.prompt_fragment,
+                browser_pack_prompt(target, getattr(client, "config", None)),
             ]
         )
 

@@ -31,6 +31,8 @@ MAX_LIST_ITEMS = 32
 MAX_PROCEDURE_ITEMS = 24
 MAX_OPTIONS = 4
 MAX_SEMANTIC_KEY_CHARS = 240
+MIN_SEMANTIC_KEY_CHARS = 3
+SEMANTIC_KEY_FORBIDDEN_CHAR_LABELS = {"\\": "backslash", "/": "slash", "\x00": "NUL"}
 MAX_BLOCKING_FACT_CHARS = 120
 MAX_QUESTION_ROUNDS = 2
 
@@ -93,13 +95,118 @@ _SENSITIVE_VALUE_RE = re.compile(
 class ResolutionKnowledgeValidationError(ValueError):
     """The curator proposal is not safe to use."""
 
-    def __init__(self, message: str, *, field: str = "output") -> None:
+    def __init__(self, message: str, *, field: str = "output", code: str = "schema_validation_failed") -> None:
         self.field = field
+        self.code = code
         super().__init__(f"{field}: {message}")
 
 
 class SensitiveKnowledgeError(ResolutionKnowledgeValidationError):
     """A proposal contains material that must not become reusable knowledge."""
+
+
+def semantic_key_model_instructions() -> str:
+    """Explain the reusable identity rules owned by normalize_semantic_key."""
+
+    forbidden = ", ".join(SEMANTIC_KEY_FORBIDDEN_CHAR_LABELS.values())
+    return (
+        "Use a reusable concept identity, not an incident identifier. "
+        "Normalize with Unicode NFKC, casefold and collapsed whitespace. "
+        f"A nonempty normalized key must have {MIN_SEMANTIC_KEY_CHARS} to {MAX_SEMANTIC_KEY_CHARS} characters. "
+        f"Never include {forbidden}, secret-like values or incident UUIDs. "
+        "The root and draft semantic_key must match after normalization. "
+        "Use an empty root key only when worth_capturing=false and draft=null."
+    )
+
+
+def resolution_knowledge_output_schema() -> dict[str, Any]:
+    """Describe the validator's wire structure for the untrusted curator.
+
+    This is a prompt contract, not a replacement for semantic/evidence
+    validation. Required keys and limits share the validator's constants.
+    """
+
+    def obj(keys: frozenset[str], properties: dict[str, Any]) -> dict[str, Any]:
+        if set(properties) != keys:
+            raise RuntimeError("curator schema does not match contract keys")
+        return {"type": "object", "required": sorted(keys), "additionalProperties": False, "properties": properties}
+
+    def text_schema(limit: int, *, nullable: bool = False) -> dict[str, Any]:
+        return {"type": ["string", "null"] if nullable else "string", "maxLength": limit}
+
+    def array(items: dict[str, Any], limit: int = MAX_LIST_ITEMS) -> dict[str, Any]:
+        return {"type": "array", "items": items, "maxItems": limit}
+
+    strings = array(text_schema(MAX_SHORT_TEXT_CHARS))
+    semantic_key = {
+        "type": "string", "maxLength": MAX_SEMANTIC_KEY_CHARS,
+        "description": semantic_key_model_instructions(),
+        "anyOf": [{"const": ""}, {"minLength": MIN_SEMANTIC_KEY_CHARS}],
+    }
+    ids = array({"type": "string", "description": "An exact ID from the supplied evidence registry; never invent IDs."})
+    publication = obj(PUBLICATION_KEYS, {
+        "action": {"enum": sorted(PUBLICATION_ACTIONS)},
+        "target_node_id": {"type": ["string", "null"]},
+        "target_revision_id": {"type": ["string", "null"]},
+    })
+    publication["description"] = "create requires null targets; update requires a server-allowlisted target and current revision."
+    fact = obj(FACT_KEYS, {"text": text_schema(MAX_TEXT_CHARS), "evidence_ids": ids})
+    procedure = obj(PROCEDURE_KEYS, {"step": {"type": "integer", "minimum": 1}, "text": text_schema(MAX_TEXT_CHARS), "evidence_ids": ids})
+    procedure["description"] = "Consecutive steps starting at 1; each step cites strong user-authored local success evidence."
+    draft = obj(DRAFT_KEYS, {
+        "schema_version": {"const": RESOLUTION_KNOWLEDGE_SCHEMA_VERSION},
+        "title": text_schema(MAX_TITLE_CHARS),
+        "semantic_key": {**semantic_key, "minLength": MIN_SEMANTIC_KEY_CHARS},
+        "knowledge_kind": {"enum": sorted(KNOWLEDGE_KINDS)},
+        "problem": text_schema(MAX_TEXT_CHARS),
+        "preconditions": strings,
+        "symptoms": strings,
+        "root_cause": text_schema(MAX_TEXT_CHARS, nullable=True),
+        "resolution": text_schema(MAX_TEXT_CHARS),
+        "procedure": {**array(procedure, MAX_PROCEDURE_ITEMS), "minItems": 1},
+        "verification": {**array(fact), "minItems": 1, "description": "Each verification cites strong user-authored local success evidence."},
+        "pitfalls": array(fact),
+        "environment_constraints": strings,
+        "known_uncertainty": strings,
+        "source_evidence_ids": ids,
+        "publication": publication,
+    })
+    option = obj(QUESTION_OPTION_KEYS, {"id": {"enum": sorted(QUESTION_OPTION_IDS)}, "label": text_schema(MAX_SHORT_TEXT_CHARS)})
+    question = obj(QUESTION_KEYS, {
+        "title": text_schema(MAX_TITLE_CHARS),
+        "message": text_schema(MAX_SHORT_TEXT_CHARS),
+        "blocking_fact_key": text_schema(MAX_BLOCKING_FACT_CHARS),
+        "options": {**array(option, MAX_OPTIONS), "minItems": 2},
+        "evidence_ids": ids,
+    })
+    return obj(TOP_LEVEL_KEYS, {
+        "value": obj(VALUE_KEYS, {
+            "worth_capturing": {"type": "boolean"},
+            "reuse_score": {"type": "integer", "minimum": 0, "maximum": 100},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reason": text_schema(MAX_SHORT_TEXT_CHARS),
+            "knowledge_kind": {"enum": sorted(KNOWLEDGE_KINDS)},
+        }),
+        "semantic_key": semantic_key,
+        "research": obj(RESEARCH_KEYS, {"sufficient": {"type": "boolean"}, "missing_facts": strings, "blocking_unknowns": strings}),
+        "draft": {"anyOf": [draft, {"type": "null"}]},
+        "questions": array(question, 1),
+        "publication": publication,
+    })
+
+
+def safe_resolution_validation_diagnostic(exc: ResolutionKnowledgeValidationError) -> dict[str, str]:
+    """Return only canonical field paths and fixed codes, never model text."""
+
+    field = str(exc.field)
+    segments = re.sub(r"\[\d+\]", "", field).split(".")
+    known = TOP_LEVEL_KEYS | VALUE_KEYS | RESEARCH_KEYS | DRAFT_KEYS | PROCEDURE_KEYS | FACT_KEYS | QUESTION_KEYS | QUESTION_OPTION_KEYS | PUBLICATION_KEYS | {"output", "question_rounds"}
+    if len(field) > 160 or not re.fullmatch(r"[a-z_]+(?:\[\d+\])?(?:\.[a-z_]+(?:\[\d+\])?)*", field) or any(part not in known for part in segments):
+        field = "output"
+    code = "sensitive_output" if isinstance(exc, SensitiveKnowledgeError) else (
+        "malformed_json" if exc.code == "malformed_json" else "schema_validation_failed"
+    )
+    return {"code": code, "field": field}
 
 
 def _text(value: Any, *, field: str, limit: int, required: bool = True) -> str:
@@ -156,12 +263,12 @@ def normalize_semantic_key(value: Any) -> str:
         return ""
     if contains_secret_like_text(text) or _UUID_RE.search(text):
         raise ResolutionKnowledgeValidationError("contains a secret or incident UUID", field="semantic_key")
-    if any(char in text for char in "\\/\x00"):
+    if any(char in text for char in SEMANTIC_KEY_FORBIDDEN_CHAR_LABELS):
         raise ResolutionKnowledgeValidationError("contains a path-like value", field="semantic_key")
     normalized = " ".join(text.casefold().split())
     if not normalized or len(normalized) > MAX_SEMANTIC_KEY_CHARS:
         raise ResolutionKnowledgeValidationError("is empty or too long", field="semantic_key")
-    if len(normalized) < 3:
+    if len(normalized) < MIN_SEMANTIC_KEY_CHARS:
         raise ResolutionKnowledgeValidationError("is too short", field="semantic_key")
     return normalized
 
@@ -624,6 +731,9 @@ __all__ = [
     "normalize_semantic_key",
     "normalize_resolution_knowledge_output",
     "redact_sensitive_text",
+    "resolution_knowledge_output_schema",
+    "safe_resolution_validation_diagnostic",
+    "semantic_key_model_instructions",
     "validate_resolution_knowledge_output",
     "validate_resolution_knowledge_v1",
 ]

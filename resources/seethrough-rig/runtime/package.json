@@ -1,0 +1,22 @@
+{
+  "name": "@aoitalk/seethrough-rig-runtime",
+  "version": "0.4.0",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Canonical See-through Rig playback with pinned historical engine support",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
+    "./model": {
+      "import": "./web/js/core/model.js",
+      "default": "./web/js/core/model.js"
+    }
+  },
+  "sideEffects": false
+}

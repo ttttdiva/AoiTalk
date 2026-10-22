@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -32,6 +33,7 @@ _NONCE_LEN = 12
 _MAX_LOCAL_KEY_FILE_BYTES = 4096
 _MAX_KEY_PROVIDER_OUTPUT_BYTES = 8192
 _KEY_PROVIDER_READ_TIMEOUT_SECONDS = 10.0
+_DATA_KEY_ACCESS = threading.local()
 _ASCII_WHITESPACE = b"\t\n\v\f\r "
 _LOCAL_KEY_LINUX_ONLY_ERROR = (
     "local field crypto key-file fallback is supported only on Linux"
@@ -198,7 +200,7 @@ def _run_key_command(command: str) -> bytes:
     return _run_key_provider(command, shell=True, provider="field crypto key command")
 
 
-def _run_windows_dpapi_helper() -> bytes:
+def _run_windows_dpapi_helper(*, create: bool = True) -> bytes:
     script = _repo_root() / "scripts" / "field_crypto_key.ps1"
     if not script.exists():
         raise FieldCryptoError(f"field crypto key helper not found: {script}")
@@ -211,7 +213,7 @@ def _run_windows_dpapi_helper() -> bytes:
             "-File",
             str(script),
             "-Action",
-            "GetOrCreateDataKey",
+            "GetOrCreateDataKey" if create else "GetExistingDataKey",
         ],
         shell=False,
         provider="field crypto DPAPI helper",
@@ -374,13 +376,15 @@ def _walk_local_key_parent(parent_path: Path, *, create_missing: bool) -> _Posix
         raise
 
 
-def _open_local_key_parent(key_path: Path) -> tuple[Path, _PosixParentContext]:
+def _open_local_key_parent(
+    key_path: Path, *, create: bool = True,
+) -> tuple[Path, _PosixParentContext]:
     if not sys.platform.startswith("linux") or os.name == "nt":
         raise FieldCryptoError(_LOCAL_KEY_LINUX_ONLY_ERROR)
     absolute_key_path = Path(os.path.abspath(os.fspath(key_path)))
     return absolute_key_path, _walk_local_key_parent(
         absolute_key_path.parent,
-        create_missing=True,
+        create_missing=create,
     )
 
 
@@ -630,7 +634,7 @@ def _initialize_local_key_file(key_path: Path, parent: _PosixParentContext) -> b
     return result
 
 
-def _local_key_file() -> bytes:
+def _local_key_file(*, create: bool = True) -> bytes:
     if not sys.platform.startswith("linux") or os.name == "nt":
         raise FieldCryptoError(_LOCAL_KEY_LINUX_ONLY_ERROR)
     if os.getenv("AOITALK_FIELD_CRYPTO_ALLOW_LOCAL_KEY_FILE", "").lower() not in {
@@ -649,12 +653,14 @@ def _local_key_file() -> bytes:
             str(Path.home() / ".config" / "aoitalk" / "field-crypto.key"),
         )
     )
-    key_path, parent = _open_local_key_parent(configured_key_path)
+    key_path, parent = _open_local_key_parent(configured_key_path, create=create)
     primary_error: Optional[BaseException] = None
     try:
         try:
             return _read_local_key_file(key_path, parent)
         except FileNotFoundError:
+            if not create:
+                raise FieldCryptoError("local field crypto key is unavailable") from None
             return _initialize_local_key_file(key_path, parent)
     except BaseException as exc:
         primary_error = exc
@@ -678,6 +684,7 @@ def get_data_key() -> bytes:
 
     key_command = os.getenv("AOITALK_FIELD_CRYPTO_KEY_COMMAND")
     env_key = os.getenv("AOITALK_FIELD_CRYPTO_KEY_B64")
+    readonly = getattr(_DATA_KEY_ACCESS, "readonly", False)
     if key_command:
         # Docker may expose the optional compatibility B64 secret as a
         # mounted file while production is configured with a KMS/keyring
@@ -695,9 +702,9 @@ def get_data_key() -> bytes:
             )
         key = base64.b64decode(env_key)
     elif sys.platform.startswith("win"):
-        key = _run_windows_dpapi_helper()
+        key = _run_windows_dpapi_helper(create=False) if readonly else _run_windows_dpapi_helper()
     elif sys.platform.startswith("linux"):
-        key = _local_key_file()
+        key = _local_key_file(create=False) if readonly else _local_key_file()
     else:
         raise FieldCryptoError(
             "No field crypto key provider is configured; "
@@ -707,6 +714,60 @@ def get_data_key() -> bytes:
     if len(key) != 32:
         raise FieldCryptoError("field crypto data key must be 32 bytes")
     return key
+
+
+@contextmanager
+def _readonly_data_key_access():
+    """Disallow local/DPAPI initialization for the current key reader thread.
+
+    The thread-local guard keeps the existing cache and its ``cache_clear``
+    contract. Even a concurrent cache clear cannot turn this read into a
+    GetOrCreate/mkdir call; a concurrent normal initializer keeps its own mode.
+    Configured key commands retain their existing keyring/KMS read contract.
+    """
+
+    previous = getattr(_DATA_KEY_ACCESS, "readonly", False)
+    _DATA_KEY_ACCESS.readonly = True
+    try:
+        yield
+    finally:
+        _DATA_KEY_ACCESS.readonly = previous
+
+
+def _get_existing_data_key() -> bytes:
+    """Reuse the process key cache, with read-existing mode on any miss."""
+
+    with _readonly_data_key_access():
+        return get_data_key()
+
+
+def _probe_key_usable(key: bytes) -> bool:
+    """Exercise encryption/authenticated decryption without retaining output."""
+
+    if len(key) != 32:
+        raise FieldCryptoError("field crypto data key must be 32 bytes")
+    cipher = AESGCM(key)
+    nonce = os.urandom(_NONCE_LEN)
+    plaintext = b"aoitalk:existing-key-probe:v1"
+    aad = b"aoitalk:existing-key-probe"
+    encrypted = cipher.encrypt(nonce, plaintext, aad)
+    if cipher.decrypt(nonce, encrypted, aad) != plaintext:
+        raise FieldCryptoError("field crypto data key is unusable")
+    return True
+
+
+def probe_data_key_readonly() -> bool:
+    """Return True only when an existing key can encrypt and decrypt in memory.
+
+    This never initializes a local/DPAPI key or changes its directory, mode or
+    ACL. Missing/unreadable keys and provider failures are sanitized errors;
+    key material, ciphertext and filesystem paths are never returned.
+    """
+
+    try:
+        return _probe_key_usable(_get_existing_data_key())
+    except Exception:
+        raise FieldCryptoError("field crypto data key is unavailable") from None
 
 
 def _aad_bytes(aad: Optional[str]) -> bytes:

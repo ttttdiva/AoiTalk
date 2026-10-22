@@ -7,6 +7,7 @@ from typing import Any, MutableMapping, Optional
 
 
 IRODORI_TTS_CHECKPOINT = "Aratako/Irodori-TTS-v4.1-Small"
+IRODORI_V4_LARGE_CHECKPOINT = "Aratako/Irodori-TTS-v4-Large"
 IRODORI_V4_1_ANIME_CHECKPOINT = "phasefield-audio/Irodori-TTS-v4.1-Anime"
 IRODORI_V3_CHECKPOINT = "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 
@@ -15,10 +16,12 @@ IRODORI_V3_CHECKPOINT = "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 # cannot drift apart.  The selector intentionally uses lower-case ASCII so it
 # can safely live in the existing JSON ``voice_parameters`` column.
 IRODORI_MODEL_V4_1_SMALL = "v4.1-small"
+IRODORI_MODEL_V4_LARGE = "v4-large"
 IRODORI_MODEL_V4_1_ANIME = "v4.1-anime"
 IRODORI_MODEL_V3_VOICE_DESIGN = "v3-voice-design"
 IRODORI_MODEL_CHECKPOINTS = {
     IRODORI_MODEL_V4_1_SMALL: IRODORI_TTS_CHECKPOINT,
+    IRODORI_MODEL_V4_LARGE: IRODORI_V4_LARGE_CHECKPOINT,
     IRODORI_MODEL_V4_1_ANIME: IRODORI_V4_1_ANIME_CHECKPOINT,
     IRODORI_MODEL_V3_VOICE_DESIGN: IRODORI_V3_CHECKPOINT,
 }
@@ -40,6 +43,11 @@ def normalize_irodori_model(value: Any) -> Optional[str]:
         "v4.1": IRODORI_MODEL_V4_1_SMALL,
         "v4.1 small": IRODORI_MODEL_V4_1_SMALL,
         "irodori-tts-v4.1-small": IRODORI_MODEL_V4_1_SMALL,
+        "large": IRODORI_MODEL_V4_LARGE,
+        "v4 large": IRODORI_MODEL_V4_LARGE,
+        "irodori-tts v4 large": IRODORI_MODEL_V4_LARGE,
+        "irodori-tts-v4-large": IRODORI_MODEL_V4_LARGE,
+        "aratako/irodori-tts-v4-large": IRODORI_MODEL_V4_LARGE,
         "v4.1 anime": IRODORI_MODEL_V4_1_ANIME,
         "irodori-tts v4.1 anime": IRODORI_MODEL_V4_1_ANIME,
         "irodori-tts-v4.1-anime": IRODORI_MODEL_V4_1_ANIME,
@@ -150,9 +158,11 @@ def normalize_irodori_settings(settings: MutableMapping[str, Any]) -> bool:
 
 __all__ = [
     "IRODORI_TTS_CHECKPOINT",
+    "IRODORI_V4_LARGE_CHECKPOINT",
     "IRODORI_V4_1_ANIME_CHECKPOINT",
     "IRODORI_V3_CHECKPOINT",
     "IRODORI_MODEL_V4_1_SMALL",
+    "IRODORI_MODEL_V4_LARGE",
     "IRODORI_MODEL_V4_1_ANIME",
     "IRODORI_MODEL_V3_VOICE_DESIGN",
     "IRODORI_MODEL_CHECKPOINTS",

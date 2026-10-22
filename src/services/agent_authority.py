@@ -111,10 +111,10 @@ def _required_project_permission(capability: str | None) -> str:
     """Map a catalog capability to the least project ACL it requires.
 
     The old resolver special-cased three write names and treated every other
-    capability as read.  That made newly added write-family capabilities such
-    as ``story_import`` accidentally executable with a read-only grant.  The
-    canonical Team catalog is the authority for access class; unknown values
-    remain read-only here and are rejected by the capability validator.
+    capability as read.  That made newly added write-family capabilities
+    accidentally executable with a read-only grant.  The canonical Team
+    catalog is the authority for access class; unknown values remain
+    read-only here and are rejected by the capability validator.
     """
 
     normalized = str(capability or "").strip()
@@ -176,7 +176,8 @@ class AgentAuthorityResolver:
         try:
             for item in agent_team_v3_teams(self.config):
                 if isinstance(item, Mapping) and item.get("team_id"):
-                    result[str(item["team_id"])] = dict(item)
+                    team = dict(item)
+                    result[str(team["team_id"])] = team
         except Exception:
             pass
         return result
@@ -186,7 +187,7 @@ class AgentAuthorityResolver:
         team = teams.get(str(revision.agent_team_id or ""))
         if not team or not team.get("enabled", True):
             return set()
-        subagents = {str(item.get("subagent_id")): item for item in agent_team_v3_subagents(self.config) if isinstance(item, Mapping)}
+        subagents = {str(item.get("subagent_id")): item for item in agent_team_v3_subagents(self.config, include_disabled=True) if isinstance(item, Mapping)}
         if not subagents:
             subagents = dict(AGENT_TEAM_SUBAGENT_CATALOG)
         # The employee Team is a code-owned opt-in definition available to
@@ -683,7 +684,7 @@ class AgentAuthorityResolver:
                 if catalog_entry.get("access") == "write" and not Features.autonomous_agent_runtime():
                     reasons.append("autonomous_runtime_disabled")
                 family = str(catalog_entry.get("family") or "")
-                if family in {"project", "docs", "story"} and pid is None:
+                if family in {"project", "docs"} and pid is None:
                     reasons.append("project_scope_required")
                 if family in {"media", "spotify"} and personaid is None:
                     reasons.append("persona_scope_required")

@@ -68,7 +68,11 @@ export const initialChatTimelineState: ChatTimelineState = {
 export function getMessageClientId(
   message: ConversationMessage,
 ): string | null {
-  const value = message.metadata?.client_message_id;
+  const metadataValue = message.metadata?.client_message_id;
+  if (typeof metadataValue === "string" && metadataValue.length > 0) {
+    return metadataValue;
+  }
+  const value = message.client_message_id;
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 

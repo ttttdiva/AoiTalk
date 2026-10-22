@@ -21,14 +21,20 @@ from ..native_runtime import (
     AgentDefinition as Agent,
     DEFAULT_MAX_TOOL_ROUNDS,
     NativeModelSettings as ModelSettings,
+    begin_timing_id,
+    emit_timing_event,
+    reset_timing_id,
 )
 from ..conversation_context import (
     PromptMessages,
     ProviderState,
+    canonical_model_transcript_for_history,
     compact_model_transcript_for_history,
+    project_prompt_cache_key,
     stable_cache_key,
 )
 from ..generation_policy import GenerationProfile, get_client_generation_policy
+from ..provider_terminal import FAILED_TERMINAL_STATES, sanitize_terminal_evidence
 from ..agentic_completion import (
     AUTHORITATIVE_TASK_MUTATION_TOOLS,
     DETERMINISTIC_TASK_MUTATION_TOOLS,
@@ -43,10 +49,14 @@ from ..agentic_completion import (
     requested_deterministic_task_mutation_tools,
     required_project_mutation_tools_missing,
     run_agentic_completion_loop_async,
+    tool_names_can_write_files,
     successful_empty_task_search,
     _simple_task_has_unexpected_successful_mutation,
     _simple_task_post_create_has_blocked_work,
     tool_loop_completion_confirmed,
+    generation_failure_is_terminal,
+    generation_failure_from_stopped_reason,
+    generation_failure_kind,
 )
 from ..agent_runtime import build_tool_hint_context_async
 from ..context_snapshot import (
@@ -54,8 +64,14 @@ from ..context_snapshot import (
     context_manifest_metadata,
     sanitized_snapshot_series,
 )
+from ...assistant.direct_social_turn import is_direct_social_turn
+from ...assistant.post_response_work import schedule_deferred_session_index
 from ..tool_exposure import filtered_registry_for_client
-from ..tool_packs import ensure_load_tool_pack_tool, tool_pack_session_for_client
+from ..tool_packs import (
+    ensure_load_tool_pack_tool,
+    pre_route_tool_pack_for_request,
+    tool_pack_session_for_client,
+)
 from ..tool_policy import (
     _docs_agent_delegation_available,
     command_capability_active,
@@ -70,6 +86,7 @@ from ..generation_policy import (
     set_current_generation_policy,
 )
 from ..tool_policy import (
+    get_current_user_input,
     reset_current_user_input,
     set_current_user_input,
 )
@@ -88,7 +105,6 @@ from ...services.agent_team_service import (
     reset_current_continuation_state,
     set_current_continuation_state,
 )
-from ...services.story_chat_context import StoryChatContextBuildError
 from ...services.turn_context import get_turn_context
 from ...services.outbound_privacy_service import (
     OutboundPrivacyGateway,
@@ -96,11 +112,16 @@ from ...services.outbound_privacy_service import (
     set_privacy_policy_context,
 )
 from ..generation_cancellation import (
+    AgentDialogueInputPending,
     GenerationInterrupted,
     reset_current_generation_mutation_gate,
     set_current_generation_mutation_gate,
 )
 from ..runtime_tool_registry import build_runtime_tool_registry
+from ..unified_turn_runtime import (
+    ToolNoProgressGuard,
+    activate_tool_no_progress_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +149,169 @@ _NATIVE_GENERATION_LOCK_INIT = threading.Lock()
 
 StreamCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
 SteeringCallback = Callable[[], Awaitable[List[str]]]
+
+_OWNER_PROGRESS_EVENTS = frozenset(
+    {
+        "assistant_text",
+        "thinking",
+        "tool_start",
+        "tool_end",
+        "llm_timing",
+    }
+)
+_OWNER_PROGRESS_EVENT_KEYS: dict[str, frozenset[str]] = {
+    "assistant_text": frozenset({"text", "round"}),
+    "thinking": frozenset({"text", "kind", "round"}),
+    "tool_start": frozenset(
+        {"tool", "tool_args", "operation_id", "tool_call_id", "message"}
+    ),
+    "tool_end": frozenset(
+        {
+            "tool",
+            "tool_args",
+            "operation_id",
+            "tool_call_id",
+            "tool_result",
+            "message",
+            "executed",
+            "synthetic",
+            "not_executed",
+        }
+    ),
+    "llm_timing": frozenset(
+        {
+            "stage",
+            "phase",
+            "request_id",
+            "request_type",
+            "elapsed_ms",
+            "response_present",
+            "response_id_present",
+            "response_type",
+            "choices_type",
+            "choices_is_none",
+            "choice_count",
+            "finish_reason",
+            "finish_reason_present",
+            "finish_reason_known",
+            "tool_call_count",
+            "usage_present",
+            "timings_present",
+            "content_length",
+            "reasoning_length",
+            "reasoning_close_retry_effective",
+            "reasoning_close_retry_provenance",
+            "diagnostic_failed",
+            "model",
+            "provider",
+            "evidence_kind",
+            "run_id",
+            "turn_role",
+            "request_ordinal",
+            "sender_attempt_ordinal",
+            "catalog_channel",
+            "sorted_tool_names",
+            "catalog_names_sha256",
+            "read_chat_session_present",
+            "expected_control_names",
+            "missing_control_names",
+            "total_name_count",
+            "list_truncated",
+            "catalog_complete",
+            "proof_status",
+            "expected_controls_known",
+            "actual_sender_entered",
+            "sdk_call_boundary_reached",
+            "round",
+            "tool_count",
+            "input_chars",
+            "message_count",
+            "tool",
+            "tool_call_id",
+            "success",
+            "error_code",
+            "input_tokens",
+            "output_tokens",
+        }
+    ),
+}
+_OWNER_TOOL_RESULT_KEYS = frozenset(
+    {
+        "tool",
+        "arguments",
+        "output",
+        "error",
+        "success",
+        "mutation_confirmed",
+        "tool_call_id",
+        "executed",
+        "synthetic",
+        "not_executed",
+    }
+)
+_OWNER_PROGRESS_TEXT_LIMIT = 12_000
+
+
+def _owner_progress_payload(
+    event_type: str,
+    payload: Any,
+) -> dict[str, Any] | None:
+    """Project native work progress before it crosses the outer callback."""
+
+    if event_type not in _OWNER_PROGRESS_EVENTS:
+        return None
+    source = payload if isinstance(payload, dict) else {}
+    allowed = _OWNER_PROGRESS_EVENT_KEYS[event_type]
+    projected: dict[str, Any] = {}
+    for key in allowed:
+        if key not in source:
+            continue
+        value = source[key]
+        if key in {"tool_args", "arguments"}:
+            projected[key] = dict(value) if isinstance(value, dict) else {}
+        elif key == "tool_result":
+            result = value if isinstance(value, dict) else {}
+            projected_result: dict[str, Any] = {}
+            for result_key, result_value in result.items():
+                if result_key not in _OWNER_TOOL_RESULT_KEYS:
+                    continue
+                if result_key == "arguments":
+                    if isinstance(result_value, dict):
+                        projected_result[result_key] = dict(result_value)
+                    continue
+                if result_key in {"executed", "synthetic", "not_executed"}:
+                    if isinstance(result_value, bool):
+                        projected_result[result_key] = result_value
+                    continue
+                if result_key in {"output", "error"} and result_value is not None:
+                    projected_result[result_key] = str(result_value)[
+                        :_OWNER_PROGRESS_TEXT_LIMIT
+                    ]
+                else:
+                    projected_result[result_key] = result_value
+            projected[key] = projected_result
+        elif key in {"executed", "synthetic", "not_executed"}:
+            if isinstance(value, bool):
+                projected[key] = value
+        elif key in {
+            "sorted_tool_names",
+            "expected_control_names",
+            "missing_control_names",
+        }:
+            if isinstance(value, (list, tuple)):
+                if all(isinstance(item, str) for item in value):
+                    projected[key] = [
+                        item.strip()[:128]
+                        for item in value[:128]
+                        if item.strip()
+                    ]
+                else:
+                    projected[key] = None
+        elif isinstance(value, str):
+            projected[key] = value[:_OWNER_PROGRESS_TEXT_LIMIT]
+        elif isinstance(value, (bool, int, float)) or value is None:
+            projected[key] = value
+    return projected
 
 
 def _configure_turn_context_snapshot(client: Any, runner: Any) -> None:
@@ -883,7 +1067,7 @@ class TurnExecutionMixin:
                 "name": str(getattr(tool, "name", "")),
                 # Request-local contextual delegates keep the same function
                 # name/JSON parameters while their roster description changes
-                # with General/App/Story activation.  Include that text in
+                # with General/App activation.  Include that text in
                 # the cache fingerprint so a prior turn cannot reuse a stale
                 # Team roster prompt.
                 "description": str(getattr(tool, "description", "") or ""),
@@ -891,7 +1075,7 @@ class TurnExecutionMixin:
             }
             for tool in cache_tools
         ]
-        cache_key = stable_cache_key(
+        prompt_cache_key = project_prompt_cache_key(
             user_id=effective_user_id,
             session_id=effective_session_id,
             project_id=effective_project_id,
@@ -900,7 +1084,31 @@ class TurnExecutionMixin:
             system_prompt=str(agent.instructions or ""),
             tool_schemas=tool_schemas,
             provider=self.provider_label,
+            stable_context=(
+                []
+                if suppress_automatic_context
+                else getattr(self, "_current_prompt_stable_context", [])
+            ),
+            context_revision=getattr(self, "_current_project_cache_revision", ""),
             branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+            summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+            server_instance=str(getattr(self, "session_metadata", {}).get("server_instance") or "default-instance"),
+        )
+        state_fingerprint = stable_cache_key(
+            user_id=effective_user_id,
+            session_id=effective_session_id,
+            project_id=effective_project_id,
+            character=self.character_name,
+            model=str(agent.model or self.model_name),
+            system_prompt=str(agent.instructions or ""),
+            tool_schemas=tool_schemas,
+            provider=self.provider_label,
+            # Provider-managed previous_response_id must never bridge an OFF,
+            # ACL/revision, model, tool, or stable-prefix boundary.
+            branch_fingerprint=(
+                f"{getattr(self, 'current_edit_message_id', None) or 'default-branch'}"
+                f":{prompt_cache_key}"
+            ),
             summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
             server_instance=str(getattr(self, "session_metadata", {}).get("server_instance") or "default-instance"),
         )
@@ -964,12 +1172,12 @@ class TurnExecutionMixin:
                 ),
                 fingerprint=self._provider_state.get("fingerprint"),
             )
-            if state.fingerprint and state.fingerprint != cache_key:
+            if state.fingerprint and state.fingerprint != state_fingerprint:
                 state.reset()
-            state.fingerprint = cache_key
+            state.fingerprint = state_fingerprint
             self._turn_runner.conversation_state_mode = state_mode_before
             self._turn_runner.provider_state = state
-            self._turn_runner.prompt_cache_key = cache_key
+            self._turn_runner.prompt_cache_key = prompt_cache_key
             self._turn_runner.prompt_cache_retention = (
                 str(_config_get(self.config, "openai.prompt_cache_retention", "") or "").strip()
                 or None
@@ -1003,6 +1211,7 @@ class TurnExecutionMixin:
             ]
             if turn_snapshot is not None:
                 turn_snapshot["usage_metadata"] = {
+                    "agent_run_id": get_current_agent_run_id(),
                     "provider_label": str(
                         getattr(self, "provider_label", "openai") or "openai"
                     ),
@@ -1026,17 +1235,9 @@ class TurnExecutionMixin:
             # runner is in its tool loop.  Resolve the effective registry on
             # every provider round so a newly loaded pack (for example the
             # Agent Team delegate) is exposed as an actual function schema.
-            # Required-tool turns intentionally keep their narrow allowlist.
-            dynamic_story_context = (
-                None
-                if suppress_automatic_context or required_tool_name is not None
-                else self._get_story_chat_context_sync()
-            )
 
             def _native_tools_provider(_agent: Agent):
-                return self._get_effective_tools_for_current_session(
-                    dynamic_story_context
-                )
+                return self._get_effective_tools_for_current_session()
 
             run_kwargs: dict[str, Any] = {
                 "stream_callback": stream_callback,
@@ -1066,12 +1267,17 @@ class TurnExecutionMixin:
             # previous turn cannot leak its failure into this one.
             if not suppress_automatic_context:
                 self._last_generation_failure = None
+                self._last_provider_terminal_evidence = None
+                self._last_provider_failure = None
             try:
                 result = await self._turn_runner.run(
                     agent,
                     context,
                     **run_kwargs,
                 )
+            except AgentDialogueInputPending as pending:
+                await self._persist_native_pending_usage(pending, agent)
+                raise
             finally:
                 if previous_max_tool_rounds is not None:
                     self._turn_runner.max_tool_rounds = previous_max_tool_rounds
@@ -1151,8 +1357,17 @@ class TurnExecutionMixin:
             "generation_failure",
             None,
         )
+        if result_generation_failure is None:
+            result_generation_failure = generation_failure_from_stopped_reason(
+                getattr(result, "stopped_reason", None)
+            )
+        result_provider_terminal = sanitize_terminal_evidence(
+            getattr(result, "provider_terminal", None)
+        )
         if not suppress_automatic_context:
             self._last_generation_failure = result_generation_failure
+            self._last_provider_terminal_evidence = result_provider_terminal
+            self._last_provider_failure = getattr(result, "provider_failure", None)
         result_tool_records = list(getattr(result, "tool_calls", None) or [])
         result_tool_rounds_exhausted = bool(
             getattr(result, "tool_rounds_exhausted", False)
@@ -1169,11 +1384,15 @@ class TurnExecutionMixin:
                 else None
             ),
         )
-        result_model_transcript = [
-            dict(message)
-            for message in (getattr(result, "messages", None) or [])
-            if isinstance(message, dict) and message.get("role") in {"user", "assistant", "tool"}
-        ]
+        result_model_transcript = canonical_model_transcript_for_history(
+            [
+                dict(message)
+                for message in (getattr(result, "messages", None) or [])
+                if isinstance(message, dict)
+                and message.get("role") in {"user", "assistant", "tool"}
+            ],
+            current_user_input=get_current_user_input(),
+        )
         # Publish a per-turn immutable-ish result before the usage repository
         # await.  The outer review callback can then continue to use this
         # turn's evidence even when another task completes and updates the
@@ -1193,6 +1412,7 @@ class TurnExecutionMixin:
                     # failure, but must never treat a failed provider sample
                     # as authoritative completion.
                     "generation_failure": result_generation_failure,
+                    "provider_terminal": result_provider_terminal,
                     "usage_records": [
                         dict(item)
                         for item in (getattr(result, "usage_records", None) or [])
@@ -1235,6 +1455,10 @@ class TurnExecutionMixin:
             # Branch/provider resets can legitimately produce a disjoint
             # transcript; in that case the result itself is the new checkpoint.
             last_model_transcript = result_model_transcript
+        last_model_transcript = canonical_model_transcript_for_history(
+            last_model_transcript,
+            current_user_input=get_current_user_input(),
+        )
         active_model_transcript = compact_model_transcript_for_history(
             last_model_transcript,
             getattr(self, "config", None),
@@ -1300,6 +1524,9 @@ class TurnExecutionMixin:
 
     async def _record_native_usage(self, result: Any, agent: Agent) -> None:
         """Native runtimeの各provider request usageを永続化する。"""
+        # A direct low-level call without a turn snapshot may use the trusted
+        # task-local value captured before the first write.
+        ambient_agent_run_id = get_current_agent_run_id()
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             # Help is a read-only controller projection; its provider usage is
             # deliberately not attributed to the user's ordinary chat ledger.
@@ -1329,6 +1556,15 @@ class TurnExecutionMixin:
         )
         if not isinstance(usage_metadata, dict):
             usage_metadata = {}
+        # A snapshot is the immutable boundary for native usage attribution:
+        # its explicit ``None`` (and a missing key in a legacy snapshot) must
+        # remain NULL.  Only a direct low-level call without any snapshot may
+        # inherit the ambient task context captured above.
+        agent_run_id = (
+            ambient_agent_run_id
+            if turn_snapshot is None
+            else usage_metadata.get("agent_run_id")
+        )
         provider_label = str(
             usage_metadata.get("provider_label")
             or getattr(self, "provider_label", "openai")
@@ -1387,8 +1623,11 @@ class TurnExecutionMixin:
                 session_id=session_id,
                 user_id=user_id,
                 project_id=project_id,
+                agent_run_id=agent_run_id,
                 agent_name=agent_name,
                 request_type="chat",
+                quota_reservation_id=usage.get("quota_reservation_id"),
+                billing_scope_id=usage.get("billing_scope_id"),
             )
 
     def _required_command_tool_name(self, user_input: str) -> Optional[str]:
@@ -1442,12 +1681,31 @@ class TurnExecutionMixin:
         if _native_turn_result_snapshot.get() is None:
             snapshot_token = _native_turn_result_snapshot.set({})
         try:
-            return await self._run_agentic_completion_loop_impl(
-                agent,
-                context,
-                stream_callback,
-                user_input,
-            )
+            # One logical owner turn spans its initial work attempt and every
+            # review/continuation retry.  Bind a fresh no-progress guard here
+            # so a child Native attempt reuses this turn's state while a
+            # concurrent root turn receives an independent guard.
+            async def forward_with_terminal(event_type: str, payload: dict[str, Any]) -> None:
+                if stream_callback is None:
+                    return
+                if event_type == "stream_end":
+                    turn_snapshot = _native_turn_result_snapshot.get()
+                    terminal = sanitize_terminal_evidence(
+                        (turn_snapshot or {}).get("provider_terminal")
+                    )
+                    if terminal is not None:
+                        payload = {**payload, "provider_terminal": terminal}
+                value = stream_callback(event_type, payload)
+                if inspect.isawaitable(value):
+                    await value
+
+            with activate_tool_no_progress_guard(ToolNoProgressGuard()):
+                return await self._run_agentic_completion_loop_impl(
+                    agent,
+                    context,
+                    forward_with_terminal if stream_callback is not None else None,
+                    user_input,
+                )
         finally:
             if snapshot_token is not None:
                 _native_turn_result_snapshot.reset(snapshot_token)
@@ -1457,6 +1715,59 @@ class TurnExecutionMixin:
         if turn_snapshot is not None and "tool_records" in turn_snapshot:
             return list(turn_snapshot.get("tool_records") or [])
         return list(getattr(self, "_last_turn_tool_records", None) or [])
+
+    async def _persist_native_pending_usage(
+        self,
+        pending: AgentDialogueInputPending,
+        agent: Agent,
+    ) -> None:
+        """Publish and account provider receipts before a durable pause exits.
+
+        The native runner cannot return ``NativeRunResult`` after the durable
+        question transaction raises its control signal. Preserve the normal
+        run-keyed publication/accounting path here while keeping the signal
+        itself untouched. An absent receipt remains unknown and is therefore
+        intentionally left to the existing fail-closed budget guard.
+        """
+
+        records = [
+            dict(item)
+            for item in (getattr(pending, "_native_usage_records", None) or [])
+            if isinstance(item, dict)
+        ]
+        tool_records = [
+            dict(item)
+            for item in (getattr(pending, "_native_tool_records", None) or [])
+            if isinstance(item, dict)
+        ]
+        if not records and not tool_records:
+            return
+        try:
+            self._publish_native_agent_run_state(
+                get_current_agent_run_id(),
+                tool_records=tool_records,
+                usage_records=records,
+            )
+        except Exception:
+            # Never replace the durable question control flow with an
+            # observability failure.
+            logger.warning(
+                "Failed to publish native usage for dialogue input pause",
+                exc_info=True,
+            )
+        if records:
+            try:
+                await self._record_native_usage(
+                    SimpleNamespace(usage_records=records),
+                    agent,
+                )
+            except Exception:
+                # The run-keyed snapshot still lets the terminal failure path carry
+                # the receipt to AgentRun/Dialogue accounting; preserve pause.
+                logger.warning(
+                    "Failed to persist native usage for dialogue input pause",
+                    exc_info=True,
+                )
 
     def _publish_native_agent_run_state(
         self,
@@ -1490,11 +1801,25 @@ class TurnExecutionMixin:
             lock = threading.Lock()
             setattr(self, "_native_completed_agent_run_states_lock", lock)
 
-        usage: dict[str, int] = {}
+        usage: dict[str, Any] = {}
+        output_includes_reasoning_values: list[bool] = []
+        total_sources: list[str] = []
         for item in usage_records or ():
             if not isinstance(item, dict):
                 continue
-            for key in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+            if isinstance(item.get("output_includes_reasoning"), bool):
+                output_includes_reasoning_values.append(
+                    item["output_includes_reasoning"]
+                )
+            if item.get("total_tokens_source") in {"reported", "derived"}:
+                total_sources.append(item["total_tokens_source"])
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "total_tokens",
+            ):
                 value = item.get(key)
                 if value is None:
                     continue
@@ -1503,9 +1828,29 @@ class TurnExecutionMixin:
                 except (TypeError, ValueError):
                     continue
         if usage:
+            if output_includes_reasoning_values and len(
+                set(output_includes_reasoning_values)
+            ) == 1:
+                usage["output_includes_reasoning"] = (
+                    output_includes_reasoning_values[0]
+                )
+            if total_sources and len(set(total_sources)) == 1:
+                usage["total_tokens_source"] = total_sources[0]
+            # A provider's explicit total is authoritative.  For a derived
+            # record, only add reasoning when the reported output is visible
+            # output rather than an already reasoning-inclusive completion.
+            reasoning_is_separate = not bool(
+                usage.get("output_includes_reasoning", False)
+            )
             usage.setdefault(
                 "total_tokens",
-                usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                usage.get("input_tokens", 0)
+                + usage.get("output_tokens", 0)
+                + (
+                    usage.get("reasoning_tokens", 0)
+                    if reasoning_is_separate
+                    else 0
+                ),
             )
         failure_text = ""
         if failure is not None:
@@ -1705,6 +2050,23 @@ class TurnExecutionMixin:
                 if turn_snapshot is not None
                 else None
             )
+            provider_terminal = sanitize_terminal_evidence(
+                (turn_snapshot or {}).get("provider_terminal")
+            )
+            if (
+                provider_terminal is not None
+                and provider_terminal["state"] in FAILED_TERMINAL_STATES
+            ):
+                # The provider attempt ended unsuccessfully. Treat this specific
+                # evidence as terminal so review cannot replay tools or writes.
+                latest_attempt_generation_failure = {
+                    "kind": generation_failure_kind(latest_attempt_generation_failure)
+                    or "output_incomplete",
+                    "user_message": getattr(
+                        latest_attempt_generation_failure, "user_message", ""
+                    ),
+                    "terminal": True,
+                }
             latest_attempt_tool_rounds_exhausted = bool(
                 turn_snapshot is not None
                 and turn_snapshot.get("tool_rounds_exhausted", False)
@@ -1806,6 +2168,13 @@ class TurnExecutionMixin:
                 "latest_attempt_generation_failed": (
                     latest_attempt_generation_failure is not None
                 ),
+                "latest_attempt_generation_failure_kind": (
+                    generation_failure_kind(latest_attempt_generation_failure)
+                    or None
+                ),
+                "latest_attempt_generation_failure_terminal": (
+                    generation_failure_is_terminal(latest_attempt_generation_failure)
+                ),
                 "latest_attempt_tool_rounds_exhausted": bool(
                     latest_attempt_tool_rounds_exhausted
                 ),
@@ -1828,8 +2197,26 @@ class TurnExecutionMixin:
             "_last_tool_loop_messages",
             "_last_tool_loop_completion_confirmed",
             "_last_agentic_completion_evidence",
+            "_last_generation_failure",
+            "_last_provider_terminal_evidence",
+            "_last_provider_failure",
         )
         response_state: dict[str, str] = {"value": ""}
+
+        async def _forward_work_progress(
+            event_type: str,
+            payload: dict[str, Any],
+        ) -> None:
+            """Forward audited work progress while hiding nested lifecycle text."""
+
+            if stream_callback is None:
+                return
+            projected = _owner_progress_payload(event_type, payload)
+            if projected is None:
+                return
+            result = stream_callback(event_type, projected)
+            if inspect.isawaitable(result):
+                await result
 
         async def _run_once(prompt: str) -> str:
             nonlocal initial_context_pending
@@ -1842,7 +2229,7 @@ class TurnExecutionMixin:
             response = await self._run_once_with_agent(
                 agent,
                 run_context,
-                None,
+                _forward_work_progress if stream_callback is not None else None,
                 generation_policy=run_generation_policy,
             )
             response_state["value"] = str(response or "")
@@ -1915,14 +2302,18 @@ class TurnExecutionMixin:
                 response = await self._run_once_with_agent(
                     continuation_agent,
                     prompt,
-                    None,
+                    _forward_work_progress
+                    if stream_callback is not None
+                    else None,
                     generation_policy=run_generation_policy,
                 )
             else:
                 response = await self._run_once_with_agent(
                     continuation_agent,
                     prompt,
-                    None,
+                    _forward_work_progress
+                    if stream_callback is not None
+                    else None,
                     required_tool_name=required_tool_name,
                     generation_policy=run_generation_policy,
                 )
@@ -1938,6 +2329,12 @@ class TurnExecutionMixin:
             run_once=_run_once,
             run_review_once=_run_review_once,
             run_continuation_once=_run_continuation_once,
+            # A turn without file-write tools is never sent back to retry a
+            # write it cannot make (for example a general Chat answer).
+            write_tools_available=tool_names_can_write_files(
+                str(getattr(tool, "name", "") or "")
+                for tool in getattr(agent, "tools", ()) or ()
+            ),
             context=review_context,
             stream_callback=stream_callback,
             user_input=user_input,
@@ -1958,6 +2355,11 @@ class TurnExecutionMixin:
             completion_evidence_provider=lambda: _completion_evidence(
                 response_state.get("value")
             ),
+            # This callback is attempt-local and reads the native turn
+            # snapshot captured by ``capture_latest_work_tool_records``.  Do
+            # not fall back to the client's shared ``_last_*`` fields: a
+            # concurrent turn may replace them while this review loop awaits.
+            generation_failure_provider=lambda: latest_attempt_generation_failure,
         )
         final_completion_evidence = _completion_evidence(response)
         self._last_turn_tool_records = list(latest_work_tool_records)
@@ -2048,6 +2450,9 @@ class TurnExecutionMixin:
         continuation_state_token = set_current_continuation_state(None)
         project_token = None
         privacy_policy_token = None
+        direct_social = False
+        previous_native_tools = getattr(self, "_native_tools_enabled", True)
+        external_persistence = False
         specialist_provider_token = set_runtime_specialist_provider(
             self.provider_label
         )
@@ -2061,8 +2466,16 @@ class TurnExecutionMixin:
         native_generation_policy_token = _native_generation_policy_snapshot.set(
             generation_policy
         )
+        native_timing_id_token = begin_timing_id()
 
         try:
+            input_started_at = time.monotonic()
+            await emit_timing_event(
+                stream_callback,
+                "input",
+                "start",
+                model=str(getattr(self, "model_name", "") or "") or None,
+            )
             # Capture the profile above before this first await.  A turn that
             # waits for another native runner must keep its original policy
             # even if the shared client is switched to chat meanwhile.
@@ -2070,6 +2483,7 @@ class TurnExecutionMixin:
                 # Do not let a new turn clear another task's compatibility
                 # metadata while that task is still in its runner/review loop.
                 self._last_context_snapshots = []
+                self._last_memory_selection_observation = None
                 # A provider exception can occur before _run_once_with_agent
                 # publishes a new snapshot.  Clear all legacy evidence at the
                 # turn boundary so TerminalMode cannot mistake the previous
@@ -2091,6 +2505,13 @@ class TurnExecutionMixin:
             suppress_automatic_context = bool(
                 getattr(get_turn_context(), "suppress_automatic_context", False)
             )
+            direct_social = (
+                not suppress_automatic_context
+                and is_direct_social_turn(user_input)
+                and not self._required_command_tool_name(user_input)
+            )
+            if direct_social:
+                self._native_tools_enabled = False
             project_context = (
                 None
                 if suppress_automatic_context
@@ -2105,8 +2526,10 @@ class TurnExecutionMixin:
                 if suppress_automatic_context
                 else str((project_context or {}).get("id") or "") or None
             )
-            if not suppress_automatic_context and (
-                project_context or previous_registry_project is not None
+            if (
+                not suppress_automatic_context
+                and not direct_social
+                and (project_context or previous_registry_project is not None)
             ):
                 # ロード済み pack はレジストリ再構築後も同じ session オブジェクトを
                 # 渡すことで維持される。
@@ -2139,9 +2562,9 @@ class TurnExecutionMixin:
             self._runtime_registry_project_id = registry_project
             self._current_context_bundle = (
                 None
-                if suppress_automatic_context
+                if suppress_automatic_context or direct_social
                 else await self._build_context_bundle_for_prompt(
-                    user_input, project_context
+                    user_input, project_context, stream_callback
                 )
             )
 
@@ -2190,6 +2613,32 @@ class TurnExecutionMixin:
                 project_metadata=self._privacy_project_metadata,
             )
 
+            # Pre-routing is advisory only: the Host builds the currently
+            # authorized pack set, Jev may select one ID, and the Host
+            # revalidates before mutating ToolPackSession. Explicit/trusted
+            # auto-loads and the normal load_tool_pack fallback remain intact.
+            self._last_tool_pack_pre_route = {}
+            if not suppress_automatic_context and not direct_social:
+                try:
+                    self._last_tool_pack_pre_route = (
+                        await pre_route_tool_pack_for_request(
+                            self._tool_registry,
+                            self,
+                            user_input,
+                            config=self.config,
+                            project_context=project_context,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A decision-layer outage must never break the existing
+                    # provider/tool exposure path.
+                    self._last_tool_pack_pre_route = {
+                        "status": "fallback",
+                        "reason": type(exc).__name__,
+                    }
+
             external_persistence = bool(
                 getattr(self, "external_persistence_enabled", False)
             )
@@ -2209,6 +2658,7 @@ class TurnExecutionMixin:
                             branch_from_message_id=getattr(
                                 self, "current_edit_message_id", None
                             ),
+                            defer_cross_session_index=True,
                         )
                 except Exception as e:
                     print(
@@ -2245,6 +2695,26 @@ class TurnExecutionMixin:
                 tool_hint_context=tool_hint_context,
                 memory_recall=memory_recall,
                 project_context=project_context,
+            )
+            try:
+                context_chars = len(
+                    json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+                    if isinstance(context, list)
+                    else str(context or "")
+                )
+                context_messages = len(context) if isinstance(context, list) else 1
+            except Exception:
+                context_chars = len(str(context or ""))
+                context_messages = 1
+            await emit_timing_event(
+                stream_callback,
+                "input",
+                "end",
+                started_at=input_started_at,
+                model=str(getattr(self, "model_name", "") or "") or None,
+                input_chars=context_chars,
+                message_count=context_messages,
+                tool_hint_chars=len(str(tool_hint_context or "")),
             )
             response: Optional[str] = None
             required_tool_name = (
@@ -2330,6 +2800,7 @@ class TurnExecutionMixin:
                                 role="assistant",
                                 content=response,
                                 metadata=self._get_memory_metadata(),
+                                defer_cross_session_index=True,
                             )
                     except Exception as e:
                         print(
@@ -2350,30 +2821,6 @@ class TurnExecutionMixin:
                 return response
 
             try:
-                try:
-                    story_chat_context = (
-                        None
-                        if suppress_automatic_context
-                        else self._get_story_chat_context_sync()
-                    )
-                except StoryChatContextBuildError as story_context_error:
-                    error_message = (
-                        "執筆文脈の構築に失敗しました。Story Studio の設定や章データを確認してから再試行してください。"
-                        f"（{story_context_error}）"
-                    )
-                    if stream_callback:
-                        await stream_callback(
-                            "stream_start",
-                            {"status": "error", "message": error_message},
-                        )
-                        await stream_callback(
-                            "stream_end",
-                            {"content": error_message},
-                        )
-                    if not suppress_automatic_context:
-                        async with self._native_runner_lock_scope():
-                            self.history_manager.add_message("assistant", error_message)
-                    return error_message
                 # An explicit specialist-role request is a routing contract,
                 # not merely a hint for the model.  In particular an
                 # ambiguous Docs mutation must still run through the
@@ -2393,17 +2840,9 @@ class TurnExecutionMixin:
                     pack_session = tool_pack_session_for_client(self)
                     pack_session.load("agent_team")
                 effective_agent = Agent(
-                    name=(
-                        story_chat_context.agent_name
-                        if story_chat_context
-                        else self.agent.name
-                    ),
-                    instructions=self._build_effective_instructions(
-                        story_chat_context
-                    ),
-                    tools=self._get_effective_tools_for_current_session(
-                        story_chat_context
-                    ),
+                    name=self.agent.name,
+                    instructions=self._build_effective_instructions(),
+                    tools=self._get_effective_tools_for_current_session(),
                     model=self.model_name,
                     model_settings=self.agent.model_settings,
                 )
@@ -2531,6 +2970,7 @@ class TurnExecutionMixin:
                             content=response,
                             metadata=self._get_memory_metadata(),
                             message_id=assistant_message_id,
+                            defer_cross_session_index=True,
                         )
                 except Exception as e:
                     print(
@@ -2582,6 +3022,15 @@ class TurnExecutionMixin:
             # response handler builds the retry prompt from that snapshot.
             raise
         finally:
+            if direct_social:
+                self._native_tools_enabled = previous_native_tools
+            if not external_persistence and not getattr(
+                self, "_hold_cross_session_index", False
+            ):
+                schedule_deferred_session_index(
+                    getattr(self, "memory_manager", None),
+                    getattr(self, "current_session_id", None),
+                )
             _native_turn_result_snapshot.reset(native_turn_snapshot_token)
             _native_generation_policy_snapshot.reset(native_generation_policy_token)
             reset_current_generation_policy(generation_policy_token)
@@ -2593,8 +3042,12 @@ class TurnExecutionMixin:
                 reset_runtime_project_context(project_token)
             if privacy_policy_token is not None:
                 reset_privacy_policy_context(privacy_policy_token)
+            reset_timing_id(native_timing_id_token)
             capture_context_manifest_before_context_clear(self)
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
 
     async def _run_streamed_with_callback(
         self, agent: Agent, context: str, callback: StreamCallback
@@ -2696,6 +3149,7 @@ class TurnExecutionMixin:
                 turn_snapshot = _native_turn_result_snapshot.get()
                 if turn_snapshot is not None:
                     turn_snapshot["usage_metadata"] = {
+                        "agent_run_id": get_current_agent_run_id(),
                         "provider_label": str(
                             getattr(self, "provider_label", "openai") or "openai"
                         ),
@@ -2717,17 +3171,25 @@ class TurnExecutionMixin:
                     )
                 if not suppress_automatic_context:
                     self._last_generation_failure = None
+                    self._last_provider_terminal_evidence = None
+                    self._last_provider_failure = None
                 try:
                     result = await self._turn_runner.run(
                         agent,
                         context,
                         stream_callback=callback,
                     )
+                except AgentDialogueInputPending as pending:
+                    await self._persist_native_pending_usage(pending, agent)
+                    raise
                 finally:
                     if previous_max_tool_rounds is not None:
                         self._turn_runner.max_tool_rounds = previous_max_tool_rounds
             result_context_snapshots = list(
                 getattr(result, "context_snapshots", None) or []
+            )
+            result_provider_terminal = sanitize_terminal_evidence(
+                getattr(result, "provider_terminal", None)
             )
             if not suppress_automatic_context:
                 self._last_generation_failure = getattr(
@@ -2735,6 +3197,8 @@ class TurnExecutionMixin:
                     "generation_failure",
                     None,
                 )
+                self._last_provider_terminal_evidence = result_provider_terminal
+                self._last_provider_failure = getattr(result, "provider_failure", None)
             result_tool_records = list(getattr(result, "tool_calls", None) or [])
             turn_snapshot = _native_turn_result_snapshot.get()
             if turn_snapshot is not None:
@@ -2750,6 +3214,7 @@ class TurnExecutionMixin:
                             "generation_failure",
                             None,
                         ),
+                        "provider_terminal": result_provider_terminal,
                         "usage_records": [
                             dict(item)
                             for item in (getattr(result, "usage_records", None) or [])
@@ -2811,6 +3276,12 @@ class TurnExecutionMixin:
         manifest = context_manifest_metadata(self)
         if manifest is not None:
             metadata["context_manifest"] = manifest
+        from ...services.memory_selection_observation import observation_for_current_turn
+        memory_observation = observation_for_current_turn(
+            getattr(self, "_last_memory_selection_observation", None)
+        )
+        if memory_observation is not None:
+            metadata["memory_selection_observation"] = memory_observation
         if self._last_model_transcript:
             metadata["model_transcript"] = redact_sensitive_model_transcript(
                 [

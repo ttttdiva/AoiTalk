@@ -21,20 +21,14 @@ import {
 
 const LAST_SESSION_KEY = "aoitalk_last_session_id";
 
-function isStoryWorkflowSession(session: ConversationSession) {
-  const characterName = session.character_name || "";
-  return (
-    characterName.startsWith("story_") ||
-    session.title?.startsWith("[執筆]")
-  );
-}
-
 type UseActiveChatSessionArgs = {
   searchParamSessionId: string | null;
   /** A route-created session requested by the shared ChatSessionProvider. */
   requestedSessionId?: string | null;
   onRequestedSessionConsumed?: () => void;
   suppressLastSessionRestore?: boolean;
+  /** A durable blank-chat draft makes the blank route the user's active work. */
+  hasUnsavedNewChatDraft?: boolean;
   router: ReturnType<typeof useRouter>;
   allProjects: Array<{ id: string; name: string }>;
   sessions: ConversationSession[];
@@ -50,12 +44,22 @@ export function useActiveChatSession({
   requestedSessionId = null,
   onRequestedSessionConsumed,
   suppressLastSessionRestore = false,
+  hasUnsavedNewChatDraft = false,
   router,
   allProjects,
   sessions,
 }: UseActiveChatSessionArgs) {
   const [activeSessionId, setActiveSessionId] = useState(searchParamSessionId);
   const activeSessionIdRef = useRef(activeSessionId);
+  // Restore the last session only for the initial blank Chat entry. A route
+  // that becomes blank later is an explicit new-chat/back destination and
+  // must stay blank instead of being redirected to the session just visited.
+  const canRestoreLastSessionRef = useRef(
+    !searchParamSessionId &&
+      !suppressLastSessionRestore &&
+      !requestedSessionId &&
+      !hasUnsavedNewChatDraft,
+  );
 
   useEffect(() => {
     const handleSessionShortcut = (event: KeyboardEvent) => {
@@ -128,9 +132,18 @@ export function useActiveChatSession({
     setActiveSessionId(sessionId);
   }, []);
 
-  // 最後の通常チャットセッションIDを復元（Story系は専用導線からのみ復元）
+  // 最後の通常チャットセッションIDを復元
   useEffect(() => {
-    if (activeSessionId || suppressLastSessionRestore) return;
+    if (activeSessionId || !canRestoreLastSessionRef.current) return;
+    if (
+      suppressLastSessionRestore ||
+      requestedSessionId ||
+      hasUnsavedNewChatDraft
+    ) {
+      canRestoreLastSessionRef.current = false;
+      return;
+    }
+    canRestoreLastSessionRef.current = false;
 
     const lastId = safeLocalStorageGetItem(LAST_SESSION_KEY);
     if (!lastId) return;
@@ -140,13 +153,8 @@ export function useActiveChatSession({
     (async () => {
       try {
         // ここでは存在確認と再開だけでよく、履歴本文は chat persistence が取得する。
-        const data = await chatApi.resumeSession(lastId, false);
+        await chatApi.resumeSession(lastId, false);
         if (cancelled) return;
-
-        if (isStoryWorkflowSession(data.session)) {
-          safeLocalStorageRemoveItem(LAST_SESSION_KEY);
-          return;
-        }
 
         router.replace(`/chat?s=${lastId}`);
       } catch {
@@ -159,7 +167,13 @@ export function useActiveChatSession({
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId, router, suppressLastSessionRestore]);
+  }, [
+    activeSessionId,
+    hasUnsavedNewChatDraft,
+    requestedSessionId,
+    router,
+    suppressLastSessionRestore,
+  ]);
 
   return {
     activeSessionId,

@@ -87,6 +87,14 @@ _PERSONAL_SELF_DISCLOSURE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_PERSONAL_INTEREST_MEMORY_RE = re.compile(
+    r"(?:"
+    r"\bhobb(?:y|ies)\b|\bpersonal (?:interest|activity)\b|"
+    r"\benjoys?\b|\blikes?\b|\bis interested in\b|"
+    r"趣味|個人的な(?:興味|活動)|好き|楽しんで|興味がある"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _coerce_uuid(value: str) -> uuid.UUID:
@@ -252,6 +260,7 @@ def _normalize_candidate(
     source_type: str = DREAMING_AUTO_SOURCE,
     project_id: Optional[str] = None,
     routed_scope: str = DREAMING_SCOPE_TYPE,
+    cross_session_corroborated: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(item, dict):
         return None
@@ -329,9 +338,13 @@ def _normalize_candidate(
                 return None
             if (
                 project_id
-                and memory_type == "fact"
+                and memory_type in {"fact", "preference", "relationship"}
                 and not _DURABLE_USER_SCOPE_RE.search(combined_scope_text)
                 and not _PERSONAL_SELF_DISCLOSURE_RE.search(evidence_span)
+                and not (
+                    cross_session_corroborated
+                    and _PERSONAL_INTEREST_MEMORY_RE.search(content)
+                )
             ):
                 return None
         if action in {"upsert", "update"} and _looks_like_transient_external_fact(

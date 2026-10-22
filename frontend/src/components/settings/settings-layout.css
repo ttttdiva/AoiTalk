@@ -1,0 +1,35 @@
+/* Center settings in the main pane, independently of the navigation rails. */
+.settings-page {
+  --settings-standard-width: 65rem;
+  --settings-wide-width: 85rem;
+  max-width: calc(var(--settings-wide-width) + 3rem);
+  margin-inline: auto;
+}
+
+.settings-page-header,
+.settings-page-status,
+.settings-group-heading,
+.settings-section-stack > * {
+  width: 100%;
+  min-width: 0;
+  max-width: var(--settings-standard-width);
+  margin-inline: auto;
+}
+
+.settings-section-stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+/* Closed headers keep the same edges; only content that needs room expands. */
+.settings-section-stack > [data-settings-width="wide"]:has([aria-expanded="true"]) {
+  max-width: var(--settings-wide-width);
+}
+
+/* Column count follows the available content width, including inline rails. */
+.settings-integrations-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  align-items: start;
+  gap: 0.75rem;
+}

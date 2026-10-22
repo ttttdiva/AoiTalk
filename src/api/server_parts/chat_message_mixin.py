@@ -13,6 +13,7 @@ from ...assistant.chat_attachment_utils import (
     add_project_attachment_context_marker,
     verified_project_attachment_items,
 )
+from ...memory.conversation_repository import ConversationRepository
 from ...services.turn_context import reset_turn_context, set_turn_context
 from ...services.mention_resolver import normalize_mentions, resolve_mentions
 from ...services.privacy_masking_projection import is_privacy_masking_source
@@ -1577,6 +1578,12 @@ class ChatMessageMixin:
         agent_run_id = data.get("agent_run_id")
         if not isinstance(agent_run_id, str) or not agent_run_id:
             agent_run_id = None
+        expected_agent_provided = bool(data.get("expected_agent_provided"))
+        expected_agent_id = data.get("expected_agent_id")
+        if expected_agent_id == "__omitted__":
+            expected_agent_id = None
+        elif expected_agent_id is not None:
+            expected_agent_id = str(expected_agent_id).strip() or None
         project_id = data.get("project_id")  # Extract project_id from message data
         app_id = data.get("app_id")
         app_target_id = data.get("app_target_id")
@@ -1592,7 +1599,10 @@ class ChatMessageMixin:
         auth_enabled = getattr(self, "auth_enabled", None)
         if auth_enabled is not True and auth_enabled is not False:
             raise PermissionError("Authentication state is unavailable")
-        from .conversation_mixin import TRUSTED_LEGACY_MARKER
+        from .conversation_mixin import (
+            TRUSTED_LEGACY_MARKER,
+            TRUSTED_TYPED_RESUME_MARKER,
+        )
 
         trusted_legacy = data.get("_trusted_legacy") is TRUSTED_LEGACY_MARKER
         sender_identity_available = auth_enabled is True and sender_user_id != "default_user"
@@ -1626,6 +1636,39 @@ class ChatMessageMixin:
             sanitize_command_capabilities(data.get("command_capabilities")),
         )
         help_requested = "aoitalk_help" in command_capabilities
+        context_project_hint_id = data.get("context_project_hint_id")
+        if context_project_hint_id not in (None, ""):
+            from uuid import UUID
+
+            if not sender_identity_available:
+                raise PermissionError("Authenticated user identity is required")
+            try:
+                context_project_hint_id = str(UUID(str(context_project_hint_id)))
+            except (TypeError, ValueError):
+                raise ValueError("Invalid context project hint") from None
+            if project_id not in (None, ""):
+                raise ValueError(
+                    "context_project_hint_id requires a projectless root turn"
+                )
+            hint_checker = getattr(self, "_assert_project_read_access_for_turn", None)
+            if not callable(hint_checker):
+                raise RuntimeError("Project access checker is unavailable")
+            await hint_checker(
+                UUID(context_project_hint_id),
+                user_id=sender_user_id,
+                user_role=sender_user_role,
+            )
+            conversation = await ConversationRepository().get_session_by_id(
+                session_id,
+                with_messages=False,
+            )
+            if conversation is None:
+                raise ValueError("Session not found")
+            if conversation.project_id is not None:
+                raise ValueError("AoiDots root session must remain projectless")
+            # Keep the hint as a child-work reference only.  It never becomes
+            # TurnContext.project_id or a root ConversationSession attachment.
+            project_id = None
 
         if help_requested:
             # Help is a Guide-only controller turn. Audio/video recognition is
@@ -1638,7 +1681,7 @@ class ChatMessageMixin:
             # mutate conversation Project association and do not perform a
             # Project write-ACL check for this read-only turn.
             project_id = None
-        else:
+        elif context_project_hint_id is None:
             project_id = await self._attach_project_to_conversation_if_missing(
                 session_id,
                 project_id,
@@ -1665,6 +1708,20 @@ class ChatMessageMixin:
         persisted_user_message_id = data.get("persisted_user_message_id")
         if not isinstance(persisted_user_message_id, str) or not persisted_user_message_id:
             persisted_user_message_id = None
+        trusted_typed_resume = (
+            data.get("_trusted_typed_resume") is TRUSTED_TYPED_RESUME_MARKER
+        )
+        typed_resume_answer = (
+            trusted_typed_resume and data.get("typed_resume_answer") is True
+        )
+        typed_resume_answer_body = (
+            data.get("typed_resume_answer_body") if trusted_typed_resume else None
+        )
+        if typed_resume_answer and not isinstance(typed_resume_answer_body, str):
+            raise ValueError("typed resume answer body is missing")
+        typed_resume_answer_id = (
+            data.get("typed_resume_answer_id") if trusted_typed_resume else None
+        )
         attachments = sanitize_chat_attachments(data.get("attachments"))
         if video_data is None and not help_requested:
             for attachment in attachments:
@@ -1691,6 +1748,8 @@ class ChatMessageMixin:
             project_selected=bool(project_id),
         )
         if help_requested:
+            include_project_context = False
+        if context_project_hint_id is not None:
             include_project_context = False
         verified_attachment_items = _server_verified_project_attachment_items(
             self,
@@ -1821,6 +1880,7 @@ class ChatMessageMixin:
                     "session_id": session_id,
                     "user_id": sender_user_id,
                     "project_id": project_id,
+                    "context_project_hint_id": context_project_hint_id,
                     "trigger_message_id": persisted_user_message_id,
                     "objective": message,
                     "run_type": "chat_turn",
@@ -1836,8 +1896,11 @@ class ChatMessageMixin:
                         "tools_required": tools_required,
                         "edit_message_id": edit_message_id,
                         "response_model": response_model,
+                        "expected_agent_id": expected_agent_id,
+                        "expected_agent_provided": expected_agent_provided,
                         "attachment_count": len(attachments),
                         "dispatch_source": "server_fallback",
+                        "context_project_hint_id": context_project_hint_id,
                         "app_id": None if help_requested else (str(app_id) if app_id else None),
                         "app_target_id": None if help_requested else (str(app_target_id) if app_target_id else None),
                         "mention_count": len(mentions),
@@ -1845,7 +1908,9 @@ class ChatMessageMixin:
                     "app_id": None if help_requested else (str(app_id) if app_id else None),
                     "app_target_id": None if help_requested else (str(app_target_id) if app_target_id else None),
                 }
-                service = AgentRunService()
+                service = AgentRunService(
+                    config=getattr(self, "config", None),
+                )
                 if client_message_id:
                     agent_run, created = await service.create_or_get_dispatch_run(
                         client_message_id=client_message_id,
@@ -1857,14 +1922,34 @@ class ChatMessageMixin:
                         # generation for a duplicate WebSocket delivery.
                         return False
                 else:
-                    agent_run = await service.create_run(**run_kwargs)
+                    agent_run = await service.create_run(
+                        expected_agent_id=expected_agent_id,
+                        expected_agent_provided=expected_agent_provided,
+                        **run_kwargs,
+                    )
                 agent_run_id = str(agent_run["id"])
-            except Exception:
+            except Exception as exc:
                 # Every session-backed generation must have a durable run id.
                 # Continuing without one would make the turn un-fenceable if a
                 # stop/steer request races with this failure, and would also
                 # defeat client-message idempotency for WebSocket retries.
                 logger.exception("Failed to create fallback agent run")
+                code = str(getattr(exc, "code", "") or "").strip()
+                if code and any(
+                    marker in code.casefold()
+                    for marker in (
+                        "busy",
+                        "capacity",
+                        "conflict",
+                        "authorization",
+                        "forbidden",
+                        "permission",
+                        "not_found",
+                        "state",
+                        "admission",
+                    )
+                ):
+                    raise RuntimeError(f"agent_admission_{code}") from exc
                 raise
             return True
 
@@ -2405,6 +2490,7 @@ class ChatMessageMixin:
         turn_context_kwargs = {
             "user_id": sender_user_id if sender_identity_available else None,
             "project_id": str(project_id) if project_id else None,
+            "context_project_hint_id": context_project_hint_id,
             "include_project_context": include_project_context,
             "session_id": str(session_id) if session_id else None,
             "message_id": persisted_user_message_id,
@@ -2612,6 +2698,7 @@ class ChatMessageMixin:
                     task_id=task_id,
                     explicit_references=explicit_references,
                     cloud_advisor_origin=cloud_advisor_origin,
+                    context_project_hint_id=context_project_hint_id,
                     verified_project_attachment=verified_project_attachment,
                     skip_user_persistence=skip_user_persistence,
                     persisted_user_message_id=persisted_user_message_id,
@@ -2698,6 +2785,8 @@ class ChatMessageMixin:
                         edit_message_id=edit_message_id,
                         response_model=response_model,
                         client_message_id=client_message_id,
+                        expected_agent_id=expected_agent_id,
+                        expected_agent_provided=expected_agent_provided,
                         attachments=attachments,
                         attachment_context=None if help_requested else attachment_context,
                         # Recognition labels are only a bounded routing hint
@@ -2716,14 +2805,23 @@ class ChatMessageMixin:
                         skip_user_persistence=skip_user_persistence,
                         persisted_user_message_id=persisted_user_message_id,
                         agent_run_id=agent_run_id,
+                        assistant_sender_type=data.get("assistant_sender_type"),
+                        assistant_sender_id=data.get("assistant_sender_id"),
+                        assistant_sender_display_name=data.get(
+                            "assistant_sender_display_name"
+                        ),
                         sender_user_id=sender_user_id,
                         sender_display_name=sender_display_name,
                         response_started_at_monotonic=response_started_at_monotonic,
                         command_capabilities=list(command_capabilities),
                         tools_required=tools_required,
                         cloud_advisor_origin=cloud_advisor_origin,
+                        context_project_hint_id=context_project_hint_id,
                         dispatch_lifecycle=dispatch_lifecycle,
                         suppress_automatic_context=help_requested,
+                        typed_resume_answer=typed_resume_answer,
+                        typed_resume_answer_body=typed_resume_answer_body,
+                        typed_resume_answer_id=typed_resume_answer_id,
                     )
                 finally:
                     # ``create_task``/``run_coroutine_threadsafe`` copy the
@@ -2761,6 +2859,7 @@ class ChatMessageMixin:
         task_id: Optional[str] = None,
         explicit_references: Optional[Iterable[Any]] = None,
         cloud_advisor_origin: Any | None = None,
+        context_project_hint_id: Optional[str] = None,
         verified_project_attachment: bool = False,
         skip_user_persistence: bool = False,
         persisted_user_message_id: Optional[str] = None,
@@ -2861,9 +2960,23 @@ class ChatMessageMixin:
                 persisted_sender_id = str(
                     getattr(persisted, "sender_id", "") or ""
                 ).strip()
+                dialogue_marker = data.get("agent_dialogue")
+                internal_dialogue_message = bool(
+                    data.get("_dialogue_transport") is True
+                    and isinstance(dialogue_marker, Mapping)
+                )
+                expected_sender_type = (
+                    "agent" if internal_dialogue_message else "user"
+                )
+                expected_sender_id = (
+                    str(dialogue_marker.get("source_agent_id") or "").strip()
+                    if internal_dialogue_message
+                    else str(sender_user_id).strip()
+                )
                 if (
-                    persisted_sender_type != "user"
-                    or persisted_sender_id != str(sender_user_id).strip()
+                    persisted_sender_type != expected_sender_type
+                    or not expected_sender_id
+                    or persisted_sender_id != expected_sender_id
                 ):
                     raise PermissionError("persisted user message sender mismatch")
                 expected_content = (
@@ -2895,7 +3008,9 @@ class ChatMessageMixin:
                 # attaching an assistant response to an unrelated message.
                 from ...services.agent_run_service import AgentRunService
 
-                run = await AgentRunService().get_run(agent_run_id)
+                run = await AgentRunService(
+                    config=getattr(self, "config", None),
+                ).get_run(agent_run_id)
                 if not isinstance(run, dict):
                     raise ValueError("agent run for persisted user message not found")
                 if (
@@ -2990,7 +3105,9 @@ class ChatMessageMixin:
                         # legacy terminal lease callback runs.
                         from ...services.agent_run_service import AgentRunService
 
-                        terminal_run = await AgentRunService().complete_run(
+                        terminal_run = await AgentRunService(
+                            config=getattr(self, "config", None),
+                        ).complete_run(
                             agent_run_id,
                             message=no_responder_reason,
                             result={"group_no_auto_responder": True},
@@ -3004,7 +3121,9 @@ class ChatMessageMixin:
                 elif agent_run_id:
                     from ...services.agent_run_service import AgentRunService
 
-                    terminal_run = await AgentRunService().complete_run(
+                    terminal_run = await AgentRunService(
+                        config=getattr(self, "config", None),
+                    ).complete_run(
                         agent_run_id,
                         message=no_responder_reason,
                         result={"group_no_auto_responder": True},
@@ -3103,6 +3222,7 @@ class ChatMessageMixin:
                     task_id=task_id,
                     explicit_references=tuple(explicit_references or ()),
                     cloud_advisor_origin=cloud_advisor_origin,
+                    context_project_hint_id=context_project_hint_id,
                     verified_project_attachment=verified_project_attachment,
                     skip_user_persistence=True,
                     persisted_user_message_id=str(persisted.id),
@@ -3114,6 +3234,9 @@ class ChatMessageMixin:
                     sender_display_name=sender_display_name,
                     response_started_at_monotonic=time.monotonic(),
                     dispatch_lifecycle=dispatch_lifecycle,
+                    typed_resume_answer=typed_resume_answer,
+                    typed_resume_answer_body=typed_resume_answer_body,
+                    typed_resume_answer_id=typed_resume_answer_id,
                 )
 
             if character_slugs and not agent_handoff_available:
@@ -3133,7 +3256,9 @@ class ChatMessageMixin:
                     elif agent_run_id:
                         from ...services.agent_run_service import AgentRunService
 
-                        terminal_run = await AgentRunService().complete_run(
+                        terminal_run = await AgentRunService(
+                            config=getattr(self, "config", None),
+                        ).complete_run(
                             agent_run_id,
                             message=character_completion_reason,
                             result={"group_character_responses": True},
@@ -3144,7 +3269,9 @@ class ChatMessageMixin:
                 elif agent_run_id:
                     from ...services.agent_run_service import AgentRunService
 
-                    terminal_run = await AgentRunService().complete_run(
+                    terminal_run = await AgentRunService(
+                        config=getattr(self, "config", None),
+                    ).complete_run(
                         agent_run_id,
                         message=character_completion_reason,
                         result={"group_character_responses": True},

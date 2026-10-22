@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { users } from "@/db/schema";
 import { attachSessionCookie, createSessionToken } from "@/lib/auth";
+import { withBasePath, withoutBasePath } from "@/lib/base-path";
 import {
   authFailureReason,
   authenticatePasswordViaPython,
@@ -15,6 +16,10 @@ import {
 } from "@/lib/server/login-log";
 import { withLoginThrottle } from "@/lib/server/login-throttle";
 import type { LoginThrottleTransaction } from "@/lib/server/login-throttle";
+import {
+  authResponse,
+  denyGatewayAuthFallback,
+} from "@/lib/server/browser-handoff";
 
 const MAX_USERNAME_LENGTH = 255;
 const MAX_PASSWORD_LENGTH = 1024;
@@ -43,24 +48,25 @@ async function failedLoginAuditUnavailable({
 }
 
 function safeLoginDestination(rawNext: FormDataEntryValue | null, baseUrl: string) {
-  if (typeof rawNext !== "string" || !rawNext.trim()) return "/chat";
+  if (typeof rawNext !== "string" || !rawNext.trim()) return withBasePath("/chat");
   try {
     const url = new URL(rawNext, baseUrl);
     const base = new URL(baseUrl);
-    if (url.origin !== base.origin || url.pathname.startsWith("//")) return "/chat";
-    if (url.pathname === "/login" || url.pathname.startsWith("/api/auth/")) return "/chat";
-    return `${url.pathname}${url.search}${url.hash}`;
+    if (url.origin !== base.origin || url.pathname.startsWith("//")) return withBasePath("/chat");
+    const appPath = withoutBasePath(url.pathname);
+    if (appPath === "/login" || appPath.startsWith("/api/auth/")) return withBasePath("/chat");
+    return `${withBasePath(appPath)}${url.search}${url.hash}`;
   } catch {
-    return "/chat";
+    return withBasePath("/chat");
   }
 }
 
 // Preserve the browser's origin when a trusted proxy rewrites the Host header.
 function redirectWithinSite(url: URL): NextResponse {
-  return new NextResponse(null, {
+  return authResponse(new NextResponse(null, {
     status: 303,
     headers: { Location: `${url.pathname}${url.search}${url.hash}` },
-  });
+  }));
 }
 
 function redirectForAuthFailure(
@@ -80,11 +86,14 @@ function redirectForAuthFailure(
 }
 
 export async function POST(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+
   let formData: FormData;
   try {
     formData = await request.formData();
   } catch {
-    return NextResponse.json({ detail: "Invalid login input" }, { status: 400 });
+    return authResponse(NextResponse.json({ detail: "Invalid login input" }, { status: 400 }));
   }
   const usernameEntry = formData.get("username");
   const passwordEntry = formData.get("password");
@@ -101,7 +110,7 @@ export async function POST(request: NextRequest) {
       normalizeCredentialSource(credentialSourceEntry) === null) ||
     (typeof next === "string" && next.length > MAX_NEXT_LENGTH)
   ) {
-    return NextResponse.json({ detail: "Invalid login input" }, { status: 400 });
+    return authResponse(NextResponse.json({ detail: "Invalid login input" }, { status: 400 }));
   }
   const username = usernameEntry ?? "";
   const password = passwordEntry ?? "";
@@ -112,7 +121,7 @@ export async function POST(request: NextRequest) {
   const host = request.headers.get("host") || "localhost:3002";
   const protocol = request.headers.get("x-forwarded-proto") || "http";
   const baseUrl = `${protocol}://${host}`;
-  const loginUrl = new URL("/login", baseUrl);
+  const loginUrl = new URL(withBasePath("/login"), baseUrl);
   if (typeof next === "string" && next.trim()) loginUrl.searchParams.set("next", next);
 
   if (!username || !password) {
@@ -177,7 +186,7 @@ export async function POST(request: NextRequest) {
 
     // A user with an initial password must not enter the regular app layout yet.
     const destination = user.password_reset_required
-      ? "/change-password"
+      ? withBasePath("/change-password")
       : safeLoginDestination(next, baseUrl);
     const response = redirectWithinSite(new URL(destination, baseUrl));
     attachSessionCookie(response, token, protocol === "https");
@@ -191,16 +200,24 @@ export async function POST(request: NextRequest) {
     failureReason: "rate_limited",
   });
   if (auditUnavailable) {
-    return NextResponse.json(
+    return authResponse(NextResponse.json(
       { detail: "Authentication audit logging is unavailable" },
       { status: 503 },
-    );
+    ));
   }
-  return NextResponse.json(
+  return authResponse(NextResponse.json(
     { detail: "Too many login attempts. Try again shortly." },
     {
       status: 429,
       headers: { "Retry-After": String(guarded.retryAfter) },
     },
+  ));
+}
+
+export async function GET(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+  return authResponse(
+    new NextResponse(null, { status: 405, headers: { allow: "POST" } }),
   );
 }

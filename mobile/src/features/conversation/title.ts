@@ -92,15 +92,14 @@ function fallbackTitleFromFirstMessage(content: string): string {
   return compact.length > 40 ? `${compact.slice(0, 37)}...` : compact;
 }
 
-function isScenarioSession(session: ConversationSession): boolean {
-  const characterName = session.character_name || "";
-  return (
-    /^scenario_roleplay:[^:]+:[^:]+$/.test(characterName) ||
-    characterName.startsWith("scenario_") ||
-    characterName.startsWith("trpg_room_") ||
-    session.title?.startsWith("[シナリオ]") ||
-    session.title?.startsWith("[執筆]") ||
-    session.title?.startsWith("[TRPG]")
+export function hasManualConversationTitle(context: unknown): boolean {
+  if (!context || typeof context !== "object" || Array.isArray(context)) return false;
+  const generation = (context as Record<string, unknown>).title_generation;
+  return Boolean(
+    generation &&
+    typeof generation === "object" &&
+    !Array.isArray(generation) &&
+    (generation as Record<string, unknown>).source === "manual",
   );
 }
 
@@ -108,7 +107,7 @@ export function shouldGenerateConversationTitle(
   session: ConversationSession | null,
   messages: ConversationMessage[],
 ): boolean {
-  if (!session || isScenarioSession(session) || !hasTitleContext(messages)) {
+  if (!session || hasManualConversationTitle(session.context) || !hasTitleContext(messages)) {
     return false;
   }
   const title = compactText(session.title || "");

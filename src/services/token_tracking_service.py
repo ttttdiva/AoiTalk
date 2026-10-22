@@ -24,9 +24,12 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
-from ..memory.database import get_db_session
+from ..memory.database import get_database_manager, get_db_session
+from ..memory.models import AgentRun
 from ..models.ecc_models import TokenUsage
+from .agent_run_service import get_current_agent_run_id
 from .pricing import (
     AllocatableRecord,
     CostBreakdown,
@@ -49,6 +52,117 @@ ZERO = Decimal("0")
 #: 無料枠の割り当てが請求スコープ全体の履歴順序に依存するため、集計はSQLの
 #: SUMではなくPython側で行う。暴走を避けるための安全弁。
 MAX_AGGREGATION_ROWS = 500_000
+
+# ``None`` is a meaningful explicit value for usage attribution.  Keep a
+# private sentinel so callers that omit the argument inherit the trusted
+# task-local Run context while callers that pass ``None`` deliberately clear
+# any ambient attribution.
+_AGENT_RUN_ID_UNSET = object()
+
+
+def _coerce_agent_run_uuid(value: Any) -> uuid.UUID | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+async def _validated_agent_run_id(
+    session: Any,
+    value: Any,
+    *,
+    project_id: Any,
+    user_id: Any,
+) -> uuid.UUID | None:
+    """Return a Run id only when its attribution scope matches the usage.
+
+    Usage ownership fields remain caller supplied.  This check only decides
+    whether the optional foreign-key link is safe to persist; an invalid,
+    missing, or out-of-scope Run must never discard the usage row itself.
+    """
+
+    candidate = _coerce_agent_run_uuid(value)
+    if candidate is None:
+        return None
+    getter = getattr(session, "get", None)
+    if not callable(getter):
+        return None
+    try:
+        # A failed lookup (for example a transient missing-table/schema
+        # condition) must not leave the outer usage transaction aborted.
+        async with session.begin_nested():
+            run = await getter(
+                AgentRun,
+                candidate,
+                options=[load_only(AgentRun.project_id, AgentRun.user_id)],
+                with_for_update={"read": True, "key_share": True},
+            )
+    except Exception:
+        logger.debug("Failed to resolve AgentRun for usage link", exc_info=True)
+        return None
+    if run is None:
+        return None
+
+    run_project_id = getattr(run, "project_id", None)
+    if run_project_id is None or project_id is None:
+        if run_project_id is not None or project_id is not None:
+            return None
+    else:
+        run_project_uuid = _coerce_agent_run_uuid(run_project_id)
+        usage_project_uuid = _coerce_agent_run_uuid(project_id)
+        if (
+            run_project_uuid is None
+            or usage_project_uuid is None
+            or run_project_uuid != usage_project_uuid
+        ):
+            return None
+
+    # Personal runs have no Project grant boundary, so their user identity is
+    # the required ownership boundary.  Project runs intentionally use the
+    # existing shared Project boundary and retain the usage's user_id.
+    if run_project_id is None:
+        run_user = str(getattr(run, "user_id", None) or "").strip()
+        usage_user = str(user_id or "").strip()
+        if not run_user or not usage_user or run_user != usage_user:
+            return None
+    return candidate
+
+
+def _database_ready_for_usage() -> bool:
+    """Return whether startup has made the database safe for usage writes.
+
+    Usage capture is a side effect of a provider request.  It must never be
+    the first database caller in a process: ``DatabaseManager.get_session``
+    deliberately performs lazy Alembic initialization, which would move a
+    migration into the provider completion/cancellation path.  The normal
+    application bootstrap initializes the shared manager before any model
+    request, so usage persistence can require that readiness here and leave
+    startup/retry policy to the composition root.
+
+    The production ``DatabaseManager`` owns this readiness probe.  A manager
+    without it is an invalid production wiring and is treated as unavailable
+    rather than allowed to fall back to a lazy session path.
+    """
+
+    try:
+        manager = get_database_manager()
+        probe = getattr(manager, "is_initialized", None)
+        if not callable(probe):
+            logger.error(
+                "トークン使用量の保存をスキップしました: DatabaseManagerの準備状態プローブがありません"
+            )
+            return False
+        return bool(probe())
+    except Exception:
+        logger.warning(
+            "トークン使用量の保存をスキップしました: DatabaseManagerの準備状態を確認できません",
+            exc_info=True,
+        )
+        return False
 
 # ────────────────────────────────────────────
 # 日付ヘルパー
@@ -417,6 +531,7 @@ class TokenTrackingService:
         requested_model: Optional[str] = None,
         resolved_model: Optional[str] = None,
         billing_scope_id: Optional[str] = None,
+        quota_reservation_id: Optional[str] = None,
         provider_reported_cost: Any = None,
         provider_reported_cost_details: Optional[Mapping[str, Any]] = None,
         tool_invocations: Optional[Mapping[str, int]] = None,
@@ -437,6 +552,7 @@ class TokenTrackingService:
         session_id: Optional[uuid.UUID] = None,
         user_id: Optional[str] = None,
         project_id: Optional[uuid.UUID] = None,
+        agent_run_id: Any = _AGENT_RUN_ID_UNSET,
         agent_name: Optional[str] = None,
         request_type: str = "chat",
         latency_ms: int = 0,
@@ -450,7 +566,25 @@ class TokenTrackingService:
         Returns:
             記録した行の辞書表現。失敗時は None。
         """
+        # Capture before the first await.  ContextVars do not follow the
+        # executor/thread bridges used by several producers, and an explicit
+        # ``None`` must remain an intentional NULL rather than falling back to
+        # a later ambient context.
+        if agent_run_id is _AGENT_RUN_ID_UNSET:
+            agent_run_id = get_current_agent_run_id()
         try:
+            # Provider completion must not become an implicit migration trigger.
+            # ``DatabaseManager.get_session`` initializes lazily, so usage
+            # writes are allowed only after the application startup gate has
+            # completed.  A normal startup has already initialized the shared
+            # manager; an early/direct invocation is skipped safely and the
+            # provider result remains successful.
+            if not _database_ready_for_usage():
+                logger.warning(
+                    "トークン使用量の保存をスキップしました: DatabaseManagerが未初期化です"
+                )
+                return None
+
             cache_read_tokens = (
                 int(cached_tokens or 0)
                 if cache_read_tokens is None
@@ -494,11 +628,15 @@ class TokenTrackingService:
                 session_id=session_id,
                 user_id=user_id,
                 project_id=project_id,
+                # The optional Run link is validated inside the DB session
+                # below. Keep the usage's own attribution fields untouched.
+                agent_run_id=None,
                 provider=provider,
                 model=model,
                 requested_model=requested,
                 resolved_model=resolved_model,
                 billing_scope_id=scope,
+                quota_reservation_id=uuid.UUID(str(quota_reservation_id)) if quota_reservation_id else None,
                 agent_name=agent_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -542,6 +680,12 @@ class TokenTrackingService:
             )
 
             async with await get_db_session() as session:
+                row.agent_run_id = await _validated_agent_run_id(
+                    session,
+                    agent_run_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                )
                 session.add(row)
                 await session.commit()
 
@@ -566,6 +710,58 @@ class TokenTrackingService:
         return engine.calculate(usage)
 
     # ──────── 行の読み込みと無料枠割り当て ────────
+
+    async def get_record_detail(
+        self,
+        usage_id: uuid.UUID,
+        *,
+        user_id: str | None,
+        is_admin: bool = False,
+        agent_run_id: uuid.UUID | None = None,
+    ) -> Dict[str, Any] | None:
+        """Read one exact usage record within its owner/Project boundary."""
+        async with await get_db_session() as session:
+            row = await session.get(TokenUsage, usage_id)
+            if row is None or (
+                agent_run_id is not None and row.agent_run_id != agent_run_id
+            ):
+                return None
+            if not is_admin and row.user_id != user_id:
+                from ..memory.models import Project
+                from .project_context import has_project_read_access
+
+                project = await session.get(Project, row.project_id) if row.project_id else None
+                if project is None or project.deleted_at is not None or not await has_project_read_access(
+                    session, project, user_id=user_id,
+                ):
+                    return None
+
+            def money(value: Any) -> str | None:
+                return (
+                    format(value, "f")
+                    if isinstance(value, Decimal) and value.is_finite() and value >= 0
+                    else None
+                )
+
+            return {
+                "id": str(row.id), "user_id": row.user_id,
+                "project_id": str(row.project_id) if row.project_id else None,
+                "agent_run_id": str(row.agent_run_id) if row.agent_run_id else None,
+                "provider": row.provider,
+                "requested_model": row.requested_model or row.model,
+                "resolved_model": row.resolved_model,
+                "agent_name": row.agent_name,
+                "input_tokens": row.input_tokens or 0,
+                "output_tokens": row.output_tokens or 0,
+                "total_tokens": row.total_tokens or 0,
+                "cached_tokens": row.cached_tokens or 0,
+                "reasoning_tokens": row.reasoning_tokens or 0,
+                "pricing_status": row.pricing_status,
+                "list_total_cost": money(row.list_total_cost)
+                if row.pricing_status in {"priced", "free_incentive"} else None,
+                "provider_reported_cost": money(row.provider_reported_cost),
+                "created_at": row.created_at,
+            }
 
     async def _load_rows(
         self,
@@ -1423,6 +1619,10 @@ def track_tokens(
     def decorator(fn: F) -> F:
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Capture the trusted Run before awaiting the wrapped provider
+            # call. The provider response is untrusted and may contain a
+            # spoofed ``agent_run_id`` field.
+            agent_run_id = get_current_agent_run_id()
             start_time = time.monotonic()
             result = await fn(*args, **kwargs)
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
@@ -1487,6 +1687,7 @@ def track_tokens(
                     session_id=kwargs.get("session_id"),
                     user_id=kwargs.get("user_id"),
                     project_id=kwargs.get("project_id"),
+                    agent_run_id=agent_run_id,
                     agent_name=agent_name,
                     request_type=request_type,
                     latency_ms=elapsed_ms,

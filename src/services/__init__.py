@@ -4,19 +4,6 @@ Services package for AoiTalk.
 Contains service modules for various functionalities.
 """
 
-from .project_context import (
-    ProjectContextResolver,
-    build_project_context,
-    format_minimal_project_context_for_chat_prompt,
-    format_project_context_for_chat_prompt,
-    format_project_context_for_prompt,
-    get_runtime_project_context,
-    merge_project_metadata,
-    normalize_project_metadata,
-    reset_runtime_project_context,
-    sanitize_project_context_for_chat,
-    set_runtime_project_context,
-)
 from .mention_resolver import (
     CanonicalMention,
     MentionResolution,
@@ -63,10 +50,33 @@ __all__ = [
 ]
 
 
-def __getattr__(name):
-    """Lazily expose WS01 services without creating import cycles."""
+_PROJECT_CONTEXT_EXPORTS = {
+    "ProjectContextResolver",
+    "build_project_context",
+    "format_minimal_project_context_for_chat_prompt",
+    "format_project_context_for_chat_prompt",
+    "format_project_context_for_prompt",
+    "get_runtime_project_context",
+    "merge_project_metadata",
+    "normalize_project_metadata",
+    "reset_runtime_project_context",
+    "sanitize_project_context_for_chat",
+    "set_runtime_project_context",
+}
 
-    if name in {"ActorPrincipal", "ActorPrincipalError"}:
+
+def __getattr__(name):
+    """Lazily expose services without importing asyncio on model load.
+
+    Alembic's minimal CI install has no greenlet. Importing task models must
+    not pull ``sqlalchemy.ext.asyncio`` through this package.
+    """
+
+    if name in _PROJECT_CONTEXT_EXPORTS:
+        from . import project_context
+
+        value = getattr(project_context, name)
+    elif name in {"ActorPrincipal", "ActorPrincipalError"}:
         from .actor_principal import ActorPrincipal, ActorPrincipalError
 
         value = {

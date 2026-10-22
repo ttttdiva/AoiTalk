@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from .config import RagConfig, get_rag_config, QdrantConfig, get_project_collection_name
 from .qdrant_client import QdrantManager
-from .embedding import BgeM3Embedding
+from .embedding import EmbeddingGemma2Embedding, get_embedding
 from .reranker import BgeReranker
 from .indexer import DocumentIndexer
 from .retriever import Retriever, RetrievalResult
@@ -17,7 +17,7 @@ from .retriever import Retriever, RetrievalResult
 logger = logging.getLogger(__name__)
 
 # Shared models (heavy, should be loaded once)
-_shared_embedding: Optional[BgeM3Embedding] = None
+_shared_embedding: Optional[EmbeddingGemma2Embedding] = None
 _shared_reranker: Optional[BgeReranker] = None
 
 
@@ -39,7 +39,7 @@ class RagManager:
 
         # Components (initialized lazily)
         self._qdrant: Optional[QdrantManager] = None
-        self._embedding: Optional[BgeM3Embedding] = None
+        self._embedding: Optional[EmbeddingGemma2Embedding] = None
         self._reranker: Optional[BgeReranker] = None
         self._indexer: Optional[DocumentIndexer] = None
         self._retriever: Optional[Retriever] = None
@@ -77,17 +77,17 @@ class RagManager:
             # Use shared embedding model (heavy, load once)
             if _shared_embedding is None:
                 logger.info("Loading shared embedding model...")
-                _shared_embedding = BgeM3Embedding(self.config.embedding)
-                if not await _shared_embedding.initialize():
-                    logger.error("Failed to initialize embedding model")
-                    return False
+                _shared_embedding = get_embedding(self.config.embedding)
+            if not await _shared_embedding.initialize():
+                logger.error("Failed to initialize embedding model")
+                return False
             self._embedding = _shared_embedding
             
             # Create project-specific Qdrant config with appropriate collection name
             project_qdrant_config = QdrantConfig(
                 host=self.config.qdrant.host,
                 port=self.config.qdrant.port,
-                collection_name=collection_name,
+                collection_name=collection_name + "__files",
                 api_key=self.config.qdrant.api_key,
                 local_path=self.config.qdrant.local_path
             )

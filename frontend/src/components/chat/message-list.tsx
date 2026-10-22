@@ -20,7 +20,6 @@ import {
   ChevronLeft,
   ChevronRight,
   GitFork,
-  MessageSquareText,
   Bot,
 } from "lucide-react";
 import { MarkdownContent as SharedMarkdownContent } from "@/components/ui/markdown-content";
@@ -63,7 +62,10 @@ import {
   commandCapabilitiesFromMessageMetadata,
   type ChatCommandCapability,
 } from "@/lib/chat-commands";
+import { withBasePath } from "@/lib/base-path";
+import { appHref, canonicalAppHref } from "@/lib/apps-link";
 import { cn, formatBytes } from "@/lib/utils";
+import { mediaSearchLink } from "@/lib/media-search-api";
 import Link from "next/link";
 
 // 保存確定でサーバーIDが付いても、送信済みの行とスクロール位置を維持する。
@@ -76,6 +78,30 @@ function messageRenderKey(message: ConversationMessage): string {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const MAX_READ_ORIGINAL_LINKS = 8;
+const MAX_READ_ORIGINAL_URL_LENGTH = 2048;
+const SENSITIVE_ORIGINAL_QUERY_RE =
+  /(?:^|[_-])(?:access[_-]?token|api[_-]?key|apikey|auth(?:orization)?|bearer|credential|password|private[_-]?key|secret|signature|sig|token)(?:$|[_-])/i;
+
+type ChatToolResultWithName = ChatToolResultMetadata & { name?: unknown };
+
+function isMediaReadIdentifier(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim();
+  if (!/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$/u.test(normalized)) {
+    return false;
+  }
+  return normalized.split(".").at(-1)?.toLowerCase() === "media_read";
+}
+
+function isMediaReadToolResult(result: ChatToolResultMetadata): boolean {
+  const namedResult = result as ChatToolResultWithName;
+  if (typeof result.tool === "string" && result.tool.trim()) {
+    return isMediaReadIdentifier(result.tool);
+  }
+  return isMediaReadIdentifier(namedResult.name);
+}
 
 function generatedImageSrc(imageRef: string): string {
   if (!imageRef) return "";
@@ -155,10 +181,12 @@ function MentionText({ text }: { text: string }) {
           );
         }
         if (type === "app") {
+          const href = appHref(id);
+          if (!href) return <span key={i}>{part}</span>;
           return (
             <Link
               key={i}
-              href={`/apps/${id}`}
+              href={href}
               className="inline-flex items-center gap-0.5 rounded bg-mention-app/15 px-1 text-xs font-medium text-mention-app underline"
             >
               @{name}
@@ -209,7 +237,6 @@ type MessageListProps = {
   onTaskClick?: (taskId: string) => void;
   onEditMessage?: (messageId: string, newContent: string) => void;
   onForkMessage?: (message: ConversationMessage) => void | Promise<void>;
-  onForkStoryMessage?: (message: ConversationMessage) => void | Promise<void>;
   onSwitchBranch?: (
     message: ConversationMessage,
     targetBranchIndex: number,
@@ -218,6 +245,8 @@ type MessageListProps = {
     message: ConversationMessage,
     responseModel?: ChatResponseModelSelection,
   ) => void;
+  /** Retry an optimistic user turn with its original client id. */
+  onRetryMessage?: (message: ConversationMessage) => void | Promise<unknown>;
   /** Retry only the durable assistant-message write for a completed report. */
   onRetryMessagePersistence?: (
     clientMessageId: string,
@@ -273,6 +302,93 @@ function getMessageToolResults(
       typeof result === "object" &&
       (typeof (result as ChatToolResultMetadata).output === "string" ||
         Array.isArray((result as ChatToolResultMetadata).urls)),
+  );
+}
+
+/**
+ * The server projects only verified media_read originals into `urls`.
+ * Keep this renderer intentionally narrow: output JSON and assistant prose
+ * are display-only and must never become citation candidates here.
+ */
+function readOriginalLinks(
+  results?: ChatToolResultMetadata[],
+): string[] {
+  if (!Array.isArray(results) || typeof window === "undefined") return [];
+
+  const links: string[] = [];
+  for (const result of results) {
+    if (!isMediaReadToolResult(result)) continue;
+    if (!Array.isArray(result.urls)) continue;
+
+    for (const rawUrl of result.urls) {
+      if (
+        typeof rawUrl !== "string" ||
+        rawUrl.length === 0 ||
+        rawUrl.length > MAX_READ_ORIGINAL_URL_LENGTH
+      ) {
+        continue;
+      }
+      const sanitized = mediaSearchLink(rawUrl);
+      if (!sanitized) continue;
+
+      try {
+        const parsed = new URL(sanitized, window.location.origin);
+        if (parsed.origin !== window.location.origin) continue;
+        const hasUnsafeQuery = [...parsed.searchParams.entries()].some(
+          ([key, value]) =>
+            SENSITIVE_ORIGINAL_QUERY_RE.test(key) ||
+            /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(value.trim()),
+        );
+        if (hasUnsafeQuery) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      const href = withBasePath(sanitized);
+      if (!links.includes(href)) links.push(href);
+      if (links.length >= MAX_READ_ORIGINAL_LINKS) return links;
+    }
+  }
+  return links;
+}
+
+function ReadOriginalLinks({
+  results,
+}: {
+  results?: ChatToolResultMetadata[];
+}) {
+  const links = readOriginalLinks(results);
+  if (links.length === 0) return null;
+
+  return (
+    <div
+      data-testid="assistant-read-originals"
+      className="flex flex-wrap items-center gap-1.5 pt-1 text-xs"
+      aria-label="読んだ原本"
+    >
+      <span className="text-muted-foreground">読んだ原本</span>
+      {links.map((href, index) => {
+        const label =
+          links.length === 1 ? "読んだ原本" : `読んだ原本 ${index + 1}`;
+        return (
+          <a
+            key={href}
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={label}
+            className="inline-flex max-w-full items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2 py-0.5 text-primary hover:bg-primary/10 hover:underline"
+          >
+            <ExternalLink className="size-3 shrink-0" aria-hidden="true" />
+            <span className="truncate">
+              {links.length === 1 ? "原本" : `原本 ${index + 1}`}
+            </span>
+          </a>
+        );
+      })}
+    </div>
   );
 }
 
@@ -420,7 +536,11 @@ function ToolResultDetails({
     <div className="mt-2 space-y-2">
       {visibleResults.map((result, index) => {
         const toolLabel = result.tool ? getToolLabel(result.tool) : "検索";
-        const urls = Array.isArray(result.urls) ? result.urls : [];
+        const urls = isMediaReadToolResult(result)
+          ? readOriginalLinks([result])
+          : Array.isArray(result.urls)
+            ? result.urls
+            : [];
         return (
           <details
             key={`${result.tool ?? "tool"}-${index}`}
@@ -652,6 +772,17 @@ function MarkdownContent({ content }: { content: string }) {
               </Link>
             );
           }
+          const appLink = canonicalAppHref(href);
+          if (appLink) {
+            return (
+              <Link
+                href={appLink}
+                className="text-primary underline [overflow-wrap:anywhere] hover:text-primary/80"
+              >
+                {children}
+              </Link>
+            );
+          }
           return (
             <a
               href={href}
@@ -768,9 +899,9 @@ export function MessageList({
   onTaskClick,
   onEditMessage,
   onForkMessage,
-  onForkStoryMessage,
   onSwitchBranch,
   onRerunMessage,
+  onRetryMessage,
   onRetryMessagePersistence,
   responseModelOptions = [],
   responseModelOptionsLoading = false,
@@ -1005,7 +1136,7 @@ export function MessageList({
             <Pencil className="size-3.5" />
           </Button>
         )}
-        {isPersisted && onForkMessage && !onForkStoryMessage && (
+        {isPersisted && onForkMessage && (
           <Button
             variant="ghost"
             size="icon"
@@ -1015,32 +1146,6 @@ export function MessageList({
           >
             <GitFork className="size-3.5" />
           </Button>
-        )}
-        {isPersisted && onForkMessage && onForkStoryMessage && (
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className={actionButtonClass}
-                  title="フォーク"
-                />
-              }
-            >
-              <GitFork className="size-3.5" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start">
-              <DropdownMenuItem onClick={() => void onForkMessage(msg)}>
-                <MessageSquareText className="size-3.5" />
-                チャットだけをフォーク
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void onForkStoryMessage(msg)}>
-                <GitFork className="size-3.5" />
-                物語とチャットをフォーク
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
         )}
         {canRerun && (
           <Button
@@ -1113,7 +1218,6 @@ export function MessageList({
       savingDocsId,
       onEditMessage,
       onForkMessage,
-      onForkStoryMessage,
       onRerunMessage,
       openFeedback,
       responseModelOptions,
@@ -1336,12 +1440,29 @@ export function MessageList({
                   : "即時割り込み";
             const commandCapabilities =
               commandCapabilitiesFromMessageMetadata(msg.metadata);
+            const deliveryState = msg.metadata?.delivery_state;
+            const deliveryError =
+              typeof msg.metadata?.delivery_error === "string"
+                ? msg.metadata.delivery_error
+                : null;
+            const clientMessageId =
+              typeof msg.metadata?.client_message_id === "string"
+                ? msg.metadata.client_message_id
+                : msg.client_message_id ?? null;
+            const retryable =
+              (deliveryState === "failed" || deliveryState === "uncertain") &&
+              Boolean(onRetryMessage && clientMessageId);
+            const attachmentReselectRequired =
+              msg.metadata?.attachments_reselect_required === true;
             const messageTime = formatMessageTime(msg.created_at);
             return (
               <div
                 key={messageRenderKey(msg)}
                 id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
+                data-chat-message-delivery-state={
+                  typeof deliveryState === "string" ? deliveryState : undefined
+                }
                 className="group/msg flex min-w-0 flex-col items-end gap-1"
               >
                 {isEditing ? (
@@ -1403,6 +1524,54 @@ export function MessageList({
                       </div>
                     )}
                     <MessageAttachments attachments={attachments} align="end" />
+                    {deliveryState === "pending" && (
+                      <span
+                        data-testid="chat-message-pending"
+                        className="text-[11px] text-muted-foreground"
+                      >
+                        送信を確認中…
+                      </span>
+                    )}
+                    {deliveryState === "uncertain" && (
+                      <span
+                        data-testid="chat-message-uncertain"
+                        className="flex flex-wrap items-center justify-end gap-2 text-[11px] text-warning"
+                      >
+                        <span>{deliveryError || "送信結果を確認できませんでした"}</span>
+                        {retryable && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void onRetryMessage?.(msg)}
+                          >
+                            {attachmentReselectRequired
+                              ? "添付を再選択して再試行"
+                              : "同じ内容で再試行"}
+                          </Button>
+                        )}
+                      </span>
+                    )}
+                    {deliveryState === "failed" && (
+                      <span
+                        data-testid="chat-message-failed"
+                        className="flex flex-wrap items-center justify-end gap-2 text-[11px] text-destructive"
+                      >
+                        <span>{deliveryError || "送信できませんでした"}</span>
+                        {retryable && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void onRetryMessage?.(msg)}
+                          >
+                            {attachmentReselectRequired
+                              ? "添付を再選択して再試行"
+                              : "再試行"}
+                          </Button>
+                        )}
+                      </span>
+                    )}
                   </div>
                 )}
                 {!isEditing && renderActions(msg, "")}
@@ -1492,6 +1661,7 @@ export function MessageList({
                     <MessageContent content={msg.content} />
                   </div>
                 )}
+                <ReadOriginalLinks results={toolResults} />
                 {persistenceFailed && (
                   <div
                     data-testid="assistant-persistence-warning"

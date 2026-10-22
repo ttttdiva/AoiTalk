@@ -44,7 +44,7 @@ test.describe("一般ユーザー settings 境界", () => {
     await loginAsRegularLiveUser(page, liveUser!);
   });
 
-  test("settings は mobile/commands を呼ばず、ログイン履歴カードも出さない", async ({
+  test("settings は検索を表示し、一般ユーザーへ管理項目を露出しない", async ({
     page,
   }) => {
     const runtimeIssues = observabilityByPage.get(page);
@@ -62,9 +62,18 @@ test.describe("一般ユーザー settings 境界", () => {
     await expect(
       page.getByRole("heading", { name: "設定", exact: true }),
     ).toBeVisible();
-    await expect(page.getByText("Settings / Workspace")).toBeVisible({
-      timeout: 20_000,
-    });
+    const search = page.getByRole("combobox", { name: "設定を検索" });
+    await expect(search).toBeVisible({ timeout: 20_000 });
+    await expect(
+      page.getByText("Settings / Workspace", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("Settings / Admin", { exact: true }),
+    ).toHaveCount(0);
+    await search.fill("ユーザー管理");
+    await expect(
+      page.getByRole("option", { name: /ユーザー管理/ }),
+    ).toHaveCount(0);
     await page.waitForTimeout(1_500);
 
     await expect(
@@ -75,6 +84,11 @@ test.describe("一般ユーザー settings 境界", () => {
     ).toHaveCount(0);
     await expect(
       page.locator('[data-settings-target="mobile-commands"]'),
+    ).toHaveCount(0);
+    await expect(
+      page
+        .getByRole("navigation", { name: "設定カテゴリ" })
+        .locator('[data-settings-target="admin"]'),
     ).toHaveCount(0);
     await expect(page.getByText("ログイン履歴", { exact: true })).toHaveCount(
       0,

@@ -101,7 +101,7 @@ class MemoryConfig:
     max_context_tokens: int = 8000         # Maximum context size in tokens
     
     # Semantic search is owned by CrossSessionMemoryService and src.rag using
-    # BAAI/bge-m3 embeddings with Qdrant.  Keep search controls here, but do not
+    # EmbeddingGemma 2 embeddings with Qdrant.  Keep search controls here, but do not
     # expose the retired SentenceTransformer model/preload settings.
     enable_search: bool = True             # Enable memory search tools; heavy work stays lazy/background
     search_timeout: float = 3.0            # Search timeout in seconds (changed from 30.0)

@@ -99,20 +99,30 @@ export function useFilerOperations({
       paths: string[];
       destDir: string;
       operation: "move" | "copy";
-      onTransferred?: () => void;
+      onTransferred?: (transferredPaths: string[]) => void;
     }) => {
-      const { capabilities, refresh } = paramsRef.current;
-      return runFilerTransfer({ ...params, capabilities, refresh });
+      const { capabilities, refresh, confirm } = paramsRef.current;
+      return runFilerTransfer({ ...params, capabilities, refresh, confirm });
     },
     [],
   );
 
   const undo = useCallback(
-    () => undoFilerOperation(paramsRef.current.refresh),
+    () =>
+      undoFilerOperation(
+        paramsRef.current.refresh,
+        paramsRef.current.confirm,
+        paramsRef.current.capabilities,
+      ),
     [],
   );
   const redo = useCallback(
-    () => redoFilerOperation(paramsRef.current.refresh),
+    () =>
+      redoFilerOperation(
+        paramsRef.current.refresh,
+        paramsRef.current.confirm,
+        paramsRef.current.capabilities,
+      ),
     [],
   );
 

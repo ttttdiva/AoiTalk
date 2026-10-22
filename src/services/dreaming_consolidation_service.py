@@ -28,6 +28,11 @@ DEFAULT_DREAMING_BATCH_SIZE = 100
 MAX_DREAMING_BATCH_SIZE = 1000
 DEFAULT_DREAMING_IDLE_SECONDS = 5 * 60
 DEFAULT_DREAMING_RETRY_BASE_SECONDS = 30.0
+DEFAULT_DREAMING_SKIPPED_RUN_HEARTBEAT_SECONDS = 6 * 60 * 60
+DREAMING_SOURCE_POLICY_REVISION = "project-chat-user-memory-v2"
+DREAMING_SOURCE_POLICY_REPAIR_TRIGGER = "source_policy_repair"
+DEFAULT_DREAMING_SOURCE_POLICY_REPAIR_BATCH_SIZE = 10
+DEFAULT_DREAMING_SOURCE_POLICY_REPAIR_BATCH_CHARS = 8_000
 MAX_DREAMING_RETRY_SECONDS = 6 * 60 * 60
 
 
@@ -87,6 +92,60 @@ def _json_digest(value: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _evidence_ref_key(value: Any) -> str:
+    """Return a content-free stable identity for one persisted evidence ref."""
+
+    if not isinstance(value, Mapping):
+        return ""
+    session_id = _text(value.get("session_id"))
+    message_id = _text(value.get("message_id", value.get("user_message_id")))
+    if message_id:
+        return f"conversation:{session_id}:{message_id}"
+    evidence_id = _text(
+        value.get(
+            "evidence_id", value.get("evidence_identity", value.get("source_ref"))
+        )
+    )
+    if evidence_id:
+        return evidence_id
+    try:
+        return _json_digest(dict(value))
+    except (TypeError, ValueError):
+        return hashlib.sha256(repr(sorted(value.items())).encode("utf-8")).hexdigest()
+
+
+def _merge_evidence_refs(*groups: Any) -> list[dict[str, Any]]:
+    """Merge evidence without duplicating a conversation/message identity."""
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        values = [group] if isinstance(group, Mapping) else group
+        if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+            continue
+        for raw in values:
+            if not isinstance(raw, Mapping):
+                continue
+            ref = dict(raw)
+            key = _evidence_ref_key(ref)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+    return merged
+
+
+def _string_set(value: Any) -> set[str]:
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, Iterable) or isinstance(values, (bytes, Mapping)):
+        return set()
+    return {_text(item) for item in values if _text(item)}
+
+
+def _memory_content_key(value: Any) -> str:
+    return " ".join(_text(value).casefold().split())
+
+
 def _callable_accepts(function: Callable[..., Any], key: str) -> bool:
     try:
         parameters = inspect.signature(function).parameters
@@ -121,6 +180,9 @@ class DreamingConsolidationService:
         idle_seconds: float = DEFAULT_DREAMING_IDLE_SECONDS,
         retry_base_seconds: float = DEFAULT_DREAMING_RETRY_BASE_SECONDS,
         max_retry_seconds: float = MAX_DREAMING_RETRY_SECONDS,
+        skipped_run_heartbeat_seconds: float = (
+            DEFAULT_DREAMING_SKIPPED_RUN_HEARTBEAT_SECONDS
+        ),
         privacy_transform: Callable[..., Any] | None = None,
         config: Any | None = None,
     ) -> None:
@@ -135,6 +197,14 @@ class DreamingConsolidationService:
         self.idle_seconds = max(0.0, float(idle_seconds))
         self.retry_base_seconds = max(0.0, float(retry_base_seconds))
         self.max_retry_seconds = max(self.retry_base_seconds, float(max_retry_seconds))
+        self.skipped_run_heartbeat_seconds = max(
+            0.0, float(skipped_run_heartbeat_seconds)
+        )
+        # No-input sweeps happen frequently.  Keep one compact in-memory
+        # heartbeat per user/trigger/backfill tuple instead of appending a run
+        # row and updating the state table on every poll.  Process restart may
+        # emit one additional heartbeat, which is intentional and bounded.
+        self._last_skipped_run_at: dict[tuple[str, str, bool], datetime] = {}
         # Optional deployment-specific redaction/local-only gate.  It runs
         # before an LLM call and before any cursor/state mutation.
         self.privacy_transform = privacy_transform
@@ -179,7 +249,9 @@ class DreamingConsolidationService:
                 rows = list(all_method())
             except Exception:
                 rows = []
-        elif isinstance(result, Iterable) and not isinstance(result, (str, bytes, Mapping)):
+        elif isinstance(result, Iterable) and not isinstance(
+            result, (str, bytes, Mapping)
+        ):
             rows = list(result)
         else:
             rows = []
@@ -191,7 +263,85 @@ class DreamingConsolidationService:
                 normalized.append(row)
         return normalized
 
-    async def _load_state(self, user_id: str, *, create: bool = False, session: Any | None = None) -> Any | None:
+    @staticmethod
+    def _user_process_lock_key(user_id: str) -> int:
+        """Return a stable signed PostgreSQL advisory-lock key per user."""
+
+        digest = hashlib.sha256(
+            f"aoitalk:dreaming-memory:{str(user_id)}".encode("utf-8")
+        ).digest()
+        return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+    async def _acquire_user_process_lock(
+        self, user_id: str
+    ) -> tuple[Any | None, int | None] | None:
+        """Acquire one cross-process Dreaming lease for the user.
+
+        PostgreSQL gets a session-level advisory lock. Test/fallback database
+        dialects keep their existing behavior and return a no-op lease.
+        ``None`` means another process already owns the PostgreSQL lease.
+        """
+
+        session = await self._new_session()
+        try:
+            get_bind = getattr(session, "get_bind", None)
+            if not callable(get_bind):
+                await self._close_session(session)
+                return (None, None)
+            bind = get_bind()
+            dialect = _text(_attr(_attr(bind, "dialect"), "name")).lower()
+            if dialect != "postgresql":
+                await self._close_session(session)
+                return (None, None)
+
+            from sqlalchemy import text
+
+            key = self._user_process_lock_key(str(user_id))
+            result = await self._execute(
+                session,
+                text(f"SELECT pg_try_advisory_lock({key})"),
+            )
+            scalar = getattr(result, "scalar", None)
+            if callable(scalar):
+                acquired = bool(scalar())
+            else:
+                scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
+                acquired = bool(
+                    scalar_one_or_none() if callable(scalar_one_or_none) else False
+                )
+            if not acquired:
+                await self._close_session(session)
+                return None
+            return (session, key)
+        except Exception:
+            await self._close_session(session)
+            raise
+
+    async def _release_user_process_lock(
+        self, lease: tuple[Any | None, int | None]
+    ) -> None:
+        session, key = lease
+        if session is None or key is None:
+            return
+        try:
+            from sqlalchemy import text
+
+            await self._execute(
+                session,
+                text(f"SELECT pg_advisory_unlock({int(key)})"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive cleanup path
+            logger.warning(
+                "Dreaming advisory-lock release failed for key=%s: %s",
+                key,
+                type(exc).__name__,
+            )
+        finally:
+            await self._close_session(session)
+
+    async def _load_state(
+        self, user_id: str, *, create: bool = False, session: Any | None = None
+    ) -> Any | None:
         owns_session = session is None
         if owns_session:
             session = await self._new_session()
@@ -201,7 +351,9 @@ class DreamingConsolidationService:
 
             result = await self._execute(
                 session,
-                select(DreamingMemoryState).where(DreamingMemoryState.user_id == str(user_id)),
+                select(DreamingMemoryState).where(
+                    DreamingMemoryState.user_id == str(user_id)
+                ),
             )
             state = None
             scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
@@ -218,6 +370,81 @@ class DreamingConsolidationService:
                     add(state)
                 await _maybe_await(getattr(session, "flush", lambda: None)())
             return state
+        finally:
+            if owns_session:
+                await self._close_session(session)
+
+    async def _source_policy_repair_pending(self, user_id: str) -> bool:
+        """Return whether historical Project conversations need one safe repair."""
+
+        state = await self._load_state(str(user_id), create=False)
+        return (
+            str(getattr(state, "source_policy_revision", "") or "")
+            != DREAMING_SOURCE_POLICY_REVISION
+        )
+
+    async def _mark_source_policy_revision(self, user_id: str) -> None:
+        """Mark targeted repair complete without rewinding normal cursors."""
+
+        session = await self._new_session()
+        try:
+            from sqlalchemy import select
+            from ..memory.models import DreamingMemoryState
+
+            result = await self._execute(
+                session,
+                select(DreamingMemoryState)
+                .where(DreamingMemoryState.user_id == str(user_id))
+                .with_for_update(),
+            )
+            state = None
+            scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
+            if callable(scalar_one_or_none):
+                with suppress(Exception):
+                    state = scalar_one_or_none()
+            if state is None:
+                rows = self._scalars(result)
+                state = rows[0] if rows else None
+            if state is None:
+                state = DreamingMemoryState(user_id=str(user_id))
+                add = getattr(session, "add", None)
+                if callable(add):
+                    add(state)
+            state.source_policy_revision = DREAMING_SOURCE_POLICY_REVISION
+            state.updated_at = self.now_fn().replace(tzinfo=None)
+            await _maybe_await(getattr(session, "commit", lambda: None)())
+        finally:
+            await self._close_session(session)
+
+    async def _completed_source_policy_repair_message_ids(
+        self,
+        user_id: str,
+        *,
+        session: Any | None = None,
+    ) -> set[str]:
+        """Return source IDs already completed under the repaired policy."""
+
+        owns_session = session is None
+        if owns_session:
+            session = await self._new_session()
+        try:
+            from sqlalchemy import select
+            from ..memory.models import DreamingMemoryRun
+
+            result = await self._execute(
+                session,
+                select(DreamingMemoryRun).where(
+                    DreamingMemoryRun.user_id == str(user_id),
+                    DreamingMemoryRun.trigger == DREAMING_SOURCE_POLICY_REPAIR_TRIGGER,
+                    DreamingMemoryRun.status == "completed",
+                ),
+            )
+            completed: set[str] = set()
+            for run in self._scalars(result):
+                completed.update(
+                    _string_set(getattr(run, "source_message_ids", None))
+                )
+            return completed
         finally:
             if owns_session:
                 await self._close_session(session)
@@ -240,7 +467,9 @@ class DreamingConsolidationService:
         except TypeError:
             return await _maybe_await(factory())
 
-    async def load_idle_users(self, *, limit: int = 20, now: datetime | None = None) -> list[str]:
+    async def load_idle_users(
+        self, *, limit: int = 20, now: datetime | None = None
+    ) -> list[str]:
         """Return users with idle active conversations and no retry backoff."""
 
         now = (now or self.now_fn()).replace(tzinfo=None)
@@ -253,7 +482,9 @@ class DreamingConsolidationService:
             try:
                 result = await self._execute(
                     session,
-                    select(ConversationSession.user_id, ConversationSession.last_activity)
+                    select(
+                        ConversationSession.user_id, ConversationSession.last_activity
+                    )
                     .where(
                         ConversationSession.deleted_at.is_(None),
                     )
@@ -273,9 +504,15 @@ class DreamingConsolidationService:
                         owner = _id(row.get("user_id"))
                         activity = _datetime(row.get("last_activity"))
                     else:
-                        owner = _id(row[0] if isinstance(row, (tuple, list)) else _attr(row, "user_id"))
+                        owner = _id(
+                            row[0]
+                            if isinstance(row, (tuple, list))
+                            else _attr(row, "user_id")
+                        )
                         activity = _datetime(
-                            row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else _attr(row, "last_activity")
+                            row[1]
+                            if isinstance(row, (tuple, list)) and len(row) > 1
+                            else _attr(row, "last_activity")
                         )
                     if owner:
                         candidates.append((owner, activity))
@@ -313,7 +550,9 @@ class DreamingConsolidationService:
                             continue
                     state_result = await self._execute(
                         session,
-                        select(DreamingMemoryState).where(DreamingMemoryState.user_id == owner),
+                        select(DreamingMemoryState).where(
+                            DreamingMemoryState.user_id == owner
+                        ),
                     )
                     state_rows = self._scalars(state_result)
                     state = state_rows[0] if state_rows else None
@@ -330,6 +569,273 @@ class DreamingConsolidationService:
             logger.warning("Dreaming idle-user load failed: %s", exc)
             return []
 
+    async def load_source_policy_repair_batch(
+        self,
+        user_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[DreamingSourceTurn]:
+        """Load only ACL-readable Project history missed by the old policy.
+
+        Completed repair-run ledgers are the cursor. Normal incremental and
+        backfill cursors remain untouched, and failed batches stay eligible.
+        """
+
+        requested = max(
+            1,
+            min(
+                int(limit or self.batch_size),
+                MAX_DREAMING_BATCH_SIZE,
+                DEFAULT_DREAMING_SOURCE_POLICY_REPAIR_BATCH_SIZE,
+            ),
+        )
+        if self.source_turn_loader is not None:
+            loader = self.source_turn_loader
+            values = {
+                "user_id": str(user_id),
+                "limit": requested,
+                "backfill": False,
+                "source_policy_repair": True,
+            }
+            try:
+                parameters = inspect.signature(loader).parameters
+                if not any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                ):
+                    values = {
+                        key: value for key, value in values.items() if key in parameters
+                    }
+            except (TypeError, ValueError):
+                pass
+            try:
+                result = loader(**values)
+            except TypeError:
+                result = loader(str(user_id))
+            result = await _maybe_await(result)
+            completed_ids = await self._completed_source_policy_repair_message_ids(
+                str(user_id)
+            )
+            turns: list[DreamingSourceTurn] = []
+            for item in result or []:
+                if isinstance(item, DreamingSourceTurn):
+                    turn = item
+                elif isinstance(item, Mapping):
+                    try:
+                        turn = DreamingSourceTurn(**dict(item))
+                    except TypeError:
+                        continue
+                else:
+                    continue
+                if (
+                    turn.project_id
+                    and turn.user_text
+                    and turn.user_message_id not in completed_ids
+                ):
+                    turns.append(turn)
+            return turns[:requested]
+
+        session = await self._new_session()
+        try:
+            from sqlalchemy import or_, select
+            from ..memory.models import (
+                ConversationMessage,
+                ConversationSession,
+                Project,
+            )
+            from ..memory.project_repository import ProjectRepository
+
+            session_result = await self._execute(
+                session,
+                select(ConversationSession).where(
+                    ConversationSession.user_id == str(user_id),
+                    ConversationSession.deleted_at.is_(None),
+                    ConversationSession.project_id.is_not(None),
+                ),
+            )
+            conversations = self._scalars(session_result)
+            try:
+                actor_uuid = uuid.UUID(str(user_id))
+            except (TypeError, ValueError):
+                # Opaque/external principals cannot be proven against Project ACL.
+                return []
+
+            readable_project_ids: set[str] = set()
+            for raw_project_id in sorted(
+                {
+                    _attr(conversation, "project_id")
+                    for conversation in conversations
+                    if _attr(conversation, "project_id") is not None
+                },
+                key=str,
+            ):
+                try:
+                    project_uuid = (
+                        raw_project_id
+                        if isinstance(raw_project_id, uuid.UUID)
+                        else uuid.UUID(str(raw_project_id))
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if await ProjectRepository.has_permission(
+                    session,
+                    project_uuid,
+                    actor_uuid,
+                    "read",
+                ):
+                    readable_project_ids.add(str(project_uuid))
+
+            conversations = [
+                conversation
+                for conversation in conversations
+                if _id(_attr(conversation, "project_id")) in readable_project_ids
+            ]
+            if not conversations:
+                return []
+
+            project_result = await self._execute(
+                session,
+                select(Project).where(
+                    Project.id.in_(
+                        [uuid.UUID(value) for value in sorted(readable_project_ids)]
+                    )
+                ),
+            )
+            project_by_id = {
+                _id(_attr(project, "id")): project
+                for project in self._scalars(project_result)
+            }
+            # Fail closed if the Project disappeared between ACL verification
+            # and the metadata re-read used for privacy policy selection.
+            conversations = [
+                conversation
+                for conversation in conversations
+                if _id(_attr(conversation, "project_id")) in project_by_id
+            ]
+            if not conversations:
+                return []
+            completed_ids = await self._completed_source_policy_repair_message_ids(
+                str(user_id),
+                session=session,
+            )
+
+            messages: list[tuple[Any, Any, str]] = []
+            for conversation in conversations:
+                message_result = await self._execute(
+                    session,
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.session_id == _attr(conversation, "id"),
+                        ConversationMessage.role == "user",
+                        ConversationMessage.deleted_at.is_(None),
+                        or_(
+                            ConversationMessage.is_active_branch.is_(True),
+                            ConversationMessage.is_active_branch.is_(None),
+                        ),
+                    )
+                    .order_by(
+                        ConversationMessage.created_at.desc(),
+                        ConversationMessage.id.desc(),
+                    ),
+                )
+                for message in self._scalars(message_result):
+                    message_id = _id(_attr(message, "id"))
+                    if not message_id or message_id in completed_ids:
+                        continue
+                    sender_id = _id(_attr(message, "sender_id"))
+                    sender_type = _text(_attr(message, "sender_type")).lower()
+                    if (
+                        sender_id
+                        and sender_type in {"user", "human", "member"}
+                        and sender_id != str(user_id)
+                    ):
+                        continue
+                    user_text = _text(_attr(message, "content"))
+                    if not user_text:
+                        continue
+                    messages.append((conversation, message, user_text))
+
+            messages.sort(
+                key=lambda item: (
+                    _datetime(_attr(item[1], "created_at")) or datetime.min,
+                    _id(_attr(item[1], "id")),
+                ),
+                reverse=True,
+            )
+            selected: list[tuple[Any, Any, str]] = []
+            selected_chars = 0
+            for item in messages:
+                cost = len(item[2])
+                if selected and (
+                    selected_chars + cost
+                    > DEFAULT_DREAMING_SOURCE_POLICY_REPAIR_BATCH_CHARS
+                ):
+                    break
+                selected.append(item)
+                selected_chars += cost
+                if len(selected) >= requested:
+                    break
+
+            turns: list[DreamingSourceTurn] = []
+            for conversation, message, user_text in selected:
+                session_context = _attr(conversation, "context")
+                if not isinstance(session_context, Mapping):
+                    session_context = {}
+                project = project_by_id.get(_id(_attr(conversation, "project_id")))
+                project_metadata = _attr(project, "project_metadata")
+                if not isinstance(project_metadata, Mapping):
+                    project_metadata = {}
+                privacy_mode = _strongest_privacy_mode(
+                    session_context,
+                    project_metadata,
+                )
+                assistant_result = await self._execute(
+                    session,
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.session_id == _attr(conversation, "id"),
+                        ConversationMessage.parent_message_id == _attr(message, "id"),
+                        ConversationMessage.role == "assistant",
+                        ConversationMessage.deleted_at.is_(None),
+                        or_(
+                            ConversationMessage.is_active_branch.is_(True),
+                            ConversationMessage.is_active_branch.is_(None),
+                        ),
+                    )
+                    .order_by(
+                        ConversationMessage.created_at.asc(),
+                        ConversationMessage.id.asc(),
+                    )
+                    .limit(1),
+                )
+                assistants = self._scalars(assistant_result)
+                assistant = assistants[0] if assistants else None
+                turns.append(
+                    DreamingSourceTurn(
+                        session_id=_id(_attr(conversation, "id")),
+                        user_message_id=_id(_attr(message, "id")),
+                        user_text=user_text,
+                        user_created_at=_datetime(_attr(message, "created_at")),
+                        user_updated_at=_datetime(_attr(message, "updated_at")),
+                        deleted_at=_datetime(_attr(message, "deleted_at")),
+                        is_active_branch=_attr(message, "is_active_branch", True),
+                        project_id=_id(_attr(conversation, "project_id")) or None,
+                        assistant_message_id=_id(_attr(assistant, "id")) or None,
+                        assistant_text=_text(_attr(assistant, "content")),
+                        assistant_created_at=_datetime(
+                            _attr(assistant, "created_at")
+                        ),
+                        privacy_mode=privacy_mode,
+                        privacy_context={
+                            **dict(session_context),
+                            "project_metadata": dict(project_metadata),
+                        },
+                    )
+                )
+            return turns
+        finally:
+            await self._close_session(session)
+
     async def load_dreaming_source_batch(
         self,
         user_id: str,
@@ -342,9 +848,17 @@ class DreamingConsolidationService:
         if self.source_turn_loader is not None:
             self._last_scan_started_at = self.now_fn().replace(tzinfo=None)
             loader = self.source_turn_loader
-            values = {"user_id": str(user_id), "limit": limit or self.batch_size, "backfill": backfill}
+            values = {
+                "user_id": str(user_id),
+                "limit": limit or self.batch_size,
+                "backfill": backfill,
+            }
             try:
-                result = loader(**values) if _callable_accepts(loader, "user_id") else loader(str(user_id))
+                result = (
+                    loader(**values)
+                    if _callable_accepts(loader, "user_id")
+                    else loader(str(user_id))
+                )
             except TypeError:
                 result = loader(str(user_id))
             result = await _maybe_await(result)
@@ -357,16 +871,26 @@ class DreamingConsolidationService:
                         turns.append(DreamingSourceTurn(**dict(item)))
                     except TypeError:
                         continue
-            return turns[: max(1, min(int(limit or self.batch_size), MAX_DREAMING_BATCH_SIZE))]
+            return turns[
+                : max(1, min(int(limit or self.batch_size), MAX_DREAMING_BATCH_SIZE))
+            ]
 
         requested = max(1, min(int(limit or self.batch_size), MAX_DREAMING_BATCH_SIZE))
         session = await self._new_session()
         try:
             from sqlalchemy import or_, select
-            from ..memory.models import ConversationMessage, ConversationSession, Project
+            from ..memory.models import (
+                ConversationMessage,
+                ConversationSession,
+                Project,
+            )
 
             state = await self._load_state(str(user_id), create=False, session=session)
-            use_backfill = bool(backfill) if backfill is not None else not bool(_attr(state, "backfill_complete", False))
+            use_backfill = (
+                bool(backfill)
+                if backfill is not None
+                else not bool(_attr(state, "backfill_complete", False))
+            )
             # Capture a scan boundary before selecting rows.  Writes arriving
             # during the scan are intentionally left for the next run.
             scan_start = self.now_fn().replace(tzinfo=None)
@@ -378,34 +902,63 @@ class DreamingConsolidationService:
                 select(ConversationSession).where(
                     ConversationSession.user_id == str(user_id),
                     ConversationSession.deleted_at.is_(None),
-                    # The current background consolidator writes only
-                    # user-scope memories.  Project sessions require a
-                    # separate live ACL/read-policy check and must not be
-                    # sent to an LLM or downgraded into personal memory.
-                    ConversationSession.project_id.is_(None),
                 ),
             )
             sessions = self._scalars(session_result)
             project_by_id: dict[str, Any] = {}
-            project_ids = [
+            raw_project_ids = {
                 _attr(conversation, "project_id")
                 for conversation in sessions
                 if _attr(conversation, "project_id") is not None
-            ]
-            if project_ids:
+            }
+            readable_project_ids: set[str] = set()
+            if raw_project_ids:
                 try:
-                    project_result = await self._execute(
-                        session,
-                        select(Project).where(Project.id.in_(project_ids)),
-                    )
-                    project_by_id = {
-                        _id(_attr(project, "id")): project
-                        for project in self._scalars(project_result)
-                    }
-                except Exception:
-                    # Some isolated unit fixtures do not create projects;
-                    # session policy still remains authoritative there.
-                    project_by_id = {}
+                    actor_uuid = uuid.UUID(str(user_id))
+                    from ..memory.project_repository import ProjectRepository
+
+                    for project_id in sorted(raw_project_ids, key=str):
+                        project_uuid = (
+                            project_id
+                            if isinstance(project_id, uuid.UUID)
+                            else uuid.UUID(str(project_id))
+                        )
+                        if await ProjectRepository.has_permission(
+                            session,
+                            project_uuid,
+                            actor_uuid,
+                            "read",
+                        ):
+                            readable_project_ids.add(str(project_uuid))
+                except (TypeError, ValueError, AttributeError):
+                    # External/opaque principals cannot be bound to a Project
+                    # ACL. Their project-less history remains eligible.
+                    readable_project_ids = set()
+
+            sessions = [
+                conversation
+                for conversation in sessions
+                if _attr(conversation, "project_id") is None
+                or _id(_attr(conversation, "project_id")) in readable_project_ids
+            ]
+            project_ids = [uuid.UUID(value) for value in sorted(readable_project_ids)]
+            if project_ids:
+                project_result = await self._execute(
+                    session,
+                    select(Project).where(Project.id.in_(project_ids)),
+                )
+                project_by_id = {
+                    _id(_attr(project, "id")): project
+                    for project in self._scalars(project_result)
+                }
+                # A deleted/revoked Project must not fall back to empty/direct
+                # privacy metadata after its ACL check.
+                sessions = [
+                    conversation
+                    for conversation in sessions
+                    if _attr(conversation, "project_id") is None
+                    or _id(_attr(conversation, "project_id")) in project_by_id
+                ]
             messages: list[tuple[Any, Any]] = []
             for conversation in sessions:
                 sid = _id(_attr(conversation, "id"))
@@ -423,12 +976,19 @@ class DreamingConsolidationService:
                             ConversationMessage.is_active_branch.is_(None),
                         ),
                     )
-                    .order_by(ConversationMessage.created_at.asc(), ConversationMessage.id.asc()),
+                    .order_by(
+                        ConversationMessage.created_at.asc(),
+                        ConversationMessage.id.asc(),
+                    ),
                 )
                 for message in self._scalars(message_result):
                     sender_id = _id(_attr(message, "sender_id"))
                     sender_type = _text(_attr(message, "sender_type")).lower()
-                    if sender_id and sender_type in {"user", "human", "member"} and sender_id != str(user_id):
+                    if (
+                        sender_id
+                        and sender_type in {"user", "human", "member"}
+                        and sender_id != str(user_id)
+                    ):
                         continue
                     messages.append((conversation, message))
 
@@ -437,12 +997,17 @@ class DreamingConsolidationService:
             # message inserted with the same timestamp from being lost.
             cursor = _datetime(_attr(state, "last_incremental_at"))
             if use_backfill:
-                cutoff = _datetime(_attr(state, "backfill_before_at")) or self.now_fn().replace(tzinfo=None)
+                cutoff = _datetime(
+                    _attr(state, "backfill_before_at")
+                ) or self.now_fn().replace(tzinfo=None)
                 messages = [
                     (conversation, message)
                     for conversation, message in messages
-                    if (_datetime(_attr(message, "created_at")) is not None
-                    and (_datetime(_attr(message, "created_at")) or datetime.min) <= cutoff)
+                    if (
+                        _datetime(_attr(message, "created_at")) is not None
+                        and (_datetime(_attr(message, "created_at")) or datetime.min)
+                        <= cutoff
+                    )
                 ]
                 messages.sort(
                     key=lambda pair: (
@@ -454,7 +1019,11 @@ class DreamingConsolidationService:
                 cursor_id = _id(_attr(state, "backfill_before_message_id"))
                 if cursor_id:
                     try:
-                        start = next(index for index, (_, msg) in enumerate(messages) if _id(_attr(msg, "id")) == cursor_id)
+                        start = next(
+                            index
+                            for index, (_, msg) in enumerate(messages)
+                            if _id(_attr(msg, "id")) == cursor_id
+                        )
                         messages = messages[start + 1 :]
                     except StopIteration:
                         pass
@@ -465,21 +1034,37 @@ class DreamingConsolidationService:
                     if (
                         (
                             _datetime(_attr(message, "created_at")) is not None
-                            and (_datetime(_attr(message, "created_at")) or datetime.min) > cursor
+                            and (
+                                _datetime(_attr(message, "created_at")) or datetime.min
+                            )
+                            > cursor
                         )
                         or (
                             _datetime(_attr(message, "updated_at")) is not None
-                            and (_datetime(_attr(message, "updated_at")) or datetime.min) > cursor
+                            and (
+                                _datetime(_attr(message, "updated_at")) or datetime.min
+                            )
+                            > cursor
                         )
                     )
                     and (
-                        (_datetime(_attr(message, "created_at")) is None or (_datetime(_attr(message, "created_at")) or datetime.min) <= scan_start)
-                        and (_datetime(_attr(message, "updated_at")) is None or (_datetime(_attr(message, "updated_at")) or datetime.min) <= scan_start)
+                        (
+                            _datetime(_attr(message, "created_at")) is None
+                            or (_datetime(_attr(message, "created_at")) or datetime.min)
+                            <= scan_start
+                        )
+                        and (
+                            _datetime(_attr(message, "updated_at")) is None
+                            or (_datetime(_attr(message, "updated_at")) or datetime.min)
+                            <= scan_start
+                        )
                     )
                 ]
                 messages.sort(
                     key=lambda pair: (
-                        _datetime(_attr(pair[1], "updated_at")) or _datetime(_attr(pair[1], "created_at")) or datetime.min,
+                        _datetime(_attr(pair[1], "updated_at"))
+                        or _datetime(_attr(pair[1], "created_at"))
+                        or datetime.min,
                         _id(_attr(pair[1], "id")),
                     )
                 )
@@ -489,16 +1074,20 @@ class DreamingConsolidationService:
                     for conversation, message in messages
                     if (
                         _datetime(_attr(message, "created_at")) is None
-                        or (_datetime(_attr(message, "created_at")) or datetime.min) <= scan_start
+                        or (_datetime(_attr(message, "created_at")) or datetime.min)
+                        <= scan_start
                     )
                     and (
                         _datetime(_attr(message, "updated_at")) is None
-                        or (_datetime(_attr(message, "updated_at")) or datetime.min) <= scan_start
+                        or (_datetime(_attr(message, "updated_at")) or datetime.min)
+                        <= scan_start
                     )
                 ]
                 messages.sort(
                     key=lambda pair: (
-                        _datetime(_attr(pair[1], "updated_at")) or _datetime(_attr(pair[1], "created_at")) or datetime.min,
+                        _datetime(_attr(pair[1], "updated_at"))
+                        or _datetime(_attr(pair[1], "created_at"))
+                        or datetime.min,
                         _id(_attr(pair[1], "id")),
                     )
                 )
@@ -513,7 +1102,9 @@ class DreamingConsolidationService:
                 project_metadata = _attr(project, "project_metadata")
                 if not isinstance(project_metadata, Mapping):
                     project_metadata = {}
-                privacy_mode = _strongest_privacy_mode(session_context, project_metadata)
+                privacy_mode = _strongest_privacy_mode(
+                    session_context, project_metadata
+                )
                 assistant_result = await self._execute(
                     session,
                     select(ConversationMessage)
@@ -527,7 +1118,10 @@ class DreamingConsolidationService:
                             ConversationMessage.is_active_branch.is_(None),
                         ),
                     )
-                    .order_by(ConversationMessage.created_at.asc(), ConversationMessage.id.asc())
+                    .order_by(
+                        ConversationMessage.created_at.asc(),
+                        ConversationMessage.id.asc(),
+                    )
                     .limit(1),
                 )
                 assistants = self._scalars(assistant_result)
@@ -561,11 +1155,18 @@ class DreamingConsolidationService:
         method = getattr(service, "list_memories", None)
         if not callable(method):
             return []
-        kwargs = {"actor_id": str(user_id), "scope_type": "user", "status": "active"}
+        # Include review candidates so later independent sessions can merge
+        # their trusted evidence and promote the same durable memory.
+        kwargs = {"actor_id": str(user_id), "scope_type": "user"}
         try:
             parameters = inspect.signature(method).parameters
-            if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-                kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+            if not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                kwargs = {
+                    key: value for key, value in kwargs.items() if key in parameters
+                }
         except (TypeError, ValueError):
             pass
         try:
@@ -587,7 +1188,9 @@ class DreamingConsolidationService:
                     "deleted_at": _iso(turn.deleted_at),
                     "is_active_branch": turn.is_active_branch is not False,
                     "privacy_mode": str(turn.privacy_mode or "direct").lower(),
-                    "user_text_sha256": hashlib.sha256(turn.user_text.encode("utf-8")).hexdigest(),
+                    "user_text_sha256": hashlib.sha256(
+                        turn.user_text.encode("utf-8")
+                    ).hexdigest(),
                 }
                 for turn in turns
             ]
@@ -619,7 +1222,9 @@ class DreamingConsolidationService:
                     getter = getattr(session, "get", None)
                     if callable(getter):
                         with suppress(Exception):
-                            run = await _maybe_await(getter(DreamingMemoryRun, uuid.UUID(str(run_id))))
+                            run = await _maybe_await(
+                                getter(DreamingMemoryRun, uuid.UUID(str(run_id)))
+                            )
                 if run is None:
                     run = DreamingMemoryRun(
                         id=uuid.UUID(str(run_id)) if run_id else uuid.uuid4(),
@@ -705,6 +1310,7 @@ class DreamingConsolidationService:
         complete_backfill: bool = False,
         error: str | None = None,
         failed: bool = False,
+        advance_cursor: bool = True,
     ) -> None:
         session = await self._new_session()
         try:
@@ -717,36 +1323,43 @@ class DreamingConsolidationService:
                     self.retry_base_seconds * (2 ** max(0, failures - 1)),
                 )
                 state.consecutive_failures = failures
-                state.last_error = _text(error)[:2000] or "dreaming_consolidation_failed"
+                state.last_error = (
+                    _text(error)[:2000] or "dreaming_consolidation_failed"
+                )
                 state.next_retry_at = now + timedelta(seconds=delay)
             else:
                 state.consecutive_failures = 0
                 state.last_error = None
                 state.next_retry_at = None
                 state.last_dreamed_at = now
-                state.last_history_digest = source_digest
-                if backfill:
-                    if complete_backfill:
-                        state.backfill_complete = True
-                        state.last_full_reconcile_at = now
-                    if turns:
-                        oldest = min(
-                            turns,
-                            key=lambda turn: (
-                                turn.user_created_at or turn.user_updated_at or datetime.min,
-                                turn.user_message_id,
-                            ),
-                        )
-                        # The backfill cursor is ordered by created_at/id;
-                        # edits must not move it forward or backward.
-                        state.backfill_before_at = oldest.user_created_at
-                        with suppress(Exception):
-                            state.backfill_before_message_id = uuid.UUID(str(oldest.user_message_id))
-                elif turns:
-                    # Capture the scan boundary, not completion time or the
-                    # newest row, so messages arriving during processing are
-                    # picked up by the next run.
-                    state.last_incremental_at = self._last_scan_started_at or now
+                if advance_cursor:
+                    state.last_history_digest = source_digest
+                    if backfill:
+                        if complete_backfill:
+                            state.backfill_complete = True
+                            state.last_full_reconcile_at = now
+                        if turns:
+                            oldest = min(
+                                turns,
+                                key=lambda turn: (
+                                    turn.user_created_at
+                                    or turn.user_updated_at
+                                    or datetime.min,
+                                    turn.user_message_id,
+                                ),
+                            )
+                            # The backfill cursor is ordered by created_at/id;
+                            # edits must not move it forward or backward.
+                            state.backfill_before_at = oldest.user_created_at
+                            with suppress(Exception):
+                                state.backfill_before_message_id = uuid.UUID(
+                                    str(oldest.user_message_id)
+                                )
+                    elif turns:
+                        # Capture the scan boundary, not completion time or the
+                        # newest row, so messages arriving during processing are
+                        # picked up by the next run.
+                        state.last_incremental_at = self._last_scan_started_at or now
             state.updated_at = now
             await _maybe_await(getattr(session, "commit", lambda: None)())
         finally:
@@ -761,72 +1374,75 @@ class DreamingConsolidationService:
         source_digest: str | None = None,
         run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Apply validated operations through ScopedMemoryService only."""
+        """Apply validated operations and merge evidence across bounded runs."""
 
         service = await self._resolve_memory_service()
         existing = await self._existing_memories(str(user_id))
         existing_by_key: dict[str, Mapping[str, Any]] = {}
+        existing_by_id: dict[str, Mapping[str, Any]] = {}
         for memory in existing:
             key = _text(memory.get("dedupe_key"))
+            memory_id = _text(memory.get("id"))
             if key:
                 existing_by_key[key] = memory
+            if memory_id:
+                existing_by_id[memory_id] = memory
 
         def op_time(item: Mapping[str, Any]) -> datetime:
-            return _datetime(item.get("source_updated_at", item.get("source_at"))) or datetime.min
+            return (
+                _datetime(item.get("source_updated_at", item.get("source_at")))
+                or datetime.min
+            )
 
-        ordered = sorted((item for item in operations if isinstance(item, Mapping)), key=op_time)
+        ordered = sorted(
+            (item for item in operations if isinstance(item, Mapping)),
+            key=op_time,
+        )
         changed: list[dict[str, Any]] = []
         for item in ordered:
-            if _text(item.get("operation", item.get("action", "upsert"))).lower() not in {"upsert", "update", "replace"}:
+            operation = _text(
+                item.get("operation", item.get("action", "upsert"))
+            ).lower()
+            if operation not in {"upsert", "update", "replace"}:
                 continue
-            if _text(item.get("scope", item.get("scope_intent", "user"))).lower() not in {"user", "global", "user_memory"}:
+            scope = _text(item.get("scope", item.get("scope_intent", "user"))).lower()
+            if scope not in {"user", "global", "user_memory"}:
                 continue
-            corroborated = bool(item.get("corroborated", item.get("verified", False)))
-            try:
-                active_threshold = (
-                    corroborated
-                    and float(item.get("confidence", 0.0)) >= 0.90
-                    and int(item.get("importance", 0)) >= 7
-                )
-            except (TypeError, ValueError):
-                active_threshold = False
-            status_hint = _text(item.get("status")).lower()
-            if status_hint == "active" and not active_threshold:
-                # Never let a provider flag promote a one-session candidate.
-                status_hint = "candidate"
-            if status_hint not in {"active", "candidate"}:
-                status_hint = "active" if active_threshold else "candidate"
-            # A candidate is still persisted for review; only a verified
-            # multi-session operation may be written as active.
-                continue
+
             content = _text(item.get("content"))
             if not content:
                 continue
-            dedupe_key = _text(item.get("dedupe_key")) or _json_digest({"type": item.get("memory_type", "fact"), "content": content.casefold()})[:128]
-            if not corroborated:
-                # Keep a one-session review candidate beside (rather than
-                # superseding) an already-active corroborated memory.
-                dedupe_key = f"{dedupe_key}:candidate"[:128]
-            previous = existing_by_key.get(dedupe_key)
+            memory_type = _text(item.get("memory_type")) or "fact"
+            try:
+                confidence = float(item.get("confidence", 0.8))
+                importance = int(item.get("importance", 6))
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            base_dedupe_key = (
+                _text(item.get("dedupe_key"))
+                or _json_digest({"type": memory_type, "content": content.casefold()})[
+                    :128
+                ]
+            )
+            candidate_dedupe_key = f"{base_dedupe_key}:candidate"[:128]
             requested_memory_id = _text(item.get("memory_id"))
-            if previous is None and requested_memory_id:
-                previous = next(
-                    (memory for memory in existing if _text(memory.get("id")) == requested_memory_id),
-                    None,
-                )
-            if previous is not None and requested_memory_id:
-                dedupe_key = _text(previous.get("dedupe_key")) or dedupe_key
-            if previous is not None:
-                previous_time = self._memory_source_time(previous)
-                if previous_time is not None and op_time(item) < previous_time:
-                    # Temporal precedence: a late retry must not replace a
-                    # newer observation with stale content.
-                    continue
+            previous = (
+                existing_by_id.get(requested_memory_id) if requested_memory_id else None
+            )
+            if previous is None:
+                previous = existing_by_key.get(base_dedupe_key)
+            if previous is None:
+                previous = existing_by_key.get(candidate_dedupe_key)
 
             refs = item.get("evidence_refs")
-            if not isinstance(refs, list):
-                refs = []
+            refs = (
+                [dict(ref) for ref in refs if isinstance(ref, Mapping)]
+                if isinstance(refs, list)
+                else []
+            )
             if not refs and source_turns:
+                source_message_ids = _string_set(item.get("source_message_ids"))
                 refs = [
                     {
                         "type": "conversation",
@@ -835,15 +1451,105 @@ class DreamingConsolidationService:
                         "source_at": _iso(turn.user_updated_at or turn.user_created_at),
                     }
                     for turn in source_turns
-                    if turn.user_message_id in set(item.get("source_message_ids") or [])
+                    if turn.user_message_id in source_message_ids
                 ]
-            structured = dict(item.get("structured_data") or {}) if isinstance(item.get("structured_data"), Mapping) else {}
-            source_time = _datetime(item.get("source_updated_at", item.get("source_at")))
-            if source_time is None and refs:
-                source_time = max(
-                    (_datetime(ref.get("created_at", ref.get("source_at"))) for ref in refs if isinstance(ref, Mapping)),
-                    default=None,
+
+            previous_structured = (
+                dict(previous.get("structured_data") or {})
+                if isinstance(previous, Mapping)
+                and isinstance(previous.get("structured_data"), Mapping)
+                else {}
+            )
+            previous_source = (
+                _text(previous.get("source_type")).casefold()
+                if isinstance(previous, Mapping)
+                else ""
+            )
+            previous_mergeable = bool(
+                isinstance(previous, Mapping)
+                and previous_source.startswith(("dreaming", "history_consolidation"))
+                and _memory_content_key(previous.get("content"))
+                == _memory_content_key(content)
+                and _text(previous.get("memory_type")).casefold()
+                == memory_type.casefold()
+            )
+            if previous_mergeable:
+                refs = _merge_evidence_refs(previous.get("evidence_refs"), refs)
+                try:
+                    confidence = max(
+                        confidence, float(previous.get("confidence") or 0.0)
+                    )
+                    importance = max(importance, int(previous.get("importance") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            else:
+                refs = _merge_evidence_refs(refs)
+
+            source_message_ids = _string_set(item.get("source_message_ids"))
+            source_session_ids = _string_set(item.get("source_session_ids"))
+            if previous_mergeable:
+                source_message_ids.update(
+                    _string_set(previous_structured.get("source_message_ids"))
                 )
+                source_session_ids.update(
+                    _string_set(previous_structured.get("source_session_ids"))
+                )
+            for ref in refs:
+                message_id = _text(ref.get("message_id", ref.get("user_message_id")))
+                session_id = _text(ref.get("session_id"))
+                if message_id:
+                    source_message_ids.add(message_id)
+                if session_id:
+                    source_session_ids.add(session_id)
+
+            # Provider booleans never grant promotion authority. Only persisted,
+            # exact conversation citations from distinct sessions do. A weaker
+            # later batch must never demote an already-active exact memory.
+            corroborated = len(source_session_ids) >= 2
+            previous_was_active = bool(
+                previous_mergeable
+                and _text(previous.get("status")).casefold() == "active"
+            )
+            active_threshold = previous_was_active or (
+                corroborated and confidence >= 0.90 and importance >= 7
+            )
+            status_hint = "active" if active_threshold else "candidate"
+
+            if previous is not None and not previous_mergeable:
+                previous_time = self._memory_source_time(previous)
+                if previous_time is not None and op_time(item) < previous_time:
+                    # An unrelated/stale replacement must not overwrite a newer
+                    # generation. Evidence extensions are handled below.
+                    continue
+
+            if previous_mergeable:
+                dedupe_key = _text(previous.get("dedupe_key")) or (
+                    base_dedupe_key if corroborated else candidate_dedupe_key
+                )
+            else:
+                dedupe_key = base_dedupe_key if corroborated else candidate_dedupe_key
+                if previous is not None and requested_memory_id:
+                    dedupe_key = _text(previous.get("dedupe_key")) or dedupe_key
+
+            source_time = _datetime(
+                item.get("source_updated_at", item.get("source_at"))
+            )
+            ref_times = [
+                _datetime(ref.get("created_at", ref.get("source_at")))
+                for ref in refs
+                if isinstance(ref, Mapping)
+            ]
+            ref_times = [value for value in ref_times if value is not None]
+            if ref_times:
+                newest_ref = max(ref_times)
+                source_time = (
+                    max(source_time, newest_ref) if source_time else newest_ref
+                )
+
+            structured = previous_structured if previous_mergeable else {}
+            current_structured = item.get("structured_data")
+            if isinstance(current_structured, Mapping):
+                structured = {**structured, **dict(current_structured)}
             dreaming = dict(structured.get("dreaming") or {})
             dreaming.update(
                 {
@@ -858,8 +1564,8 @@ class DreamingConsolidationService:
                 {
                     "dreaming": dreaming,
                     "source_digest": source_digest,
-                    "source_message_ids": list(item.get("source_message_ids") or []),
-                    "source_session_ids": list(item.get("source_session_ids") or []),
+                    "source_message_ids": sorted(source_message_ids),
+                    "source_session_ids": sorted(source_session_ids),
                     "source_updated_at": _iso(source_time),
                 }
             )
@@ -867,26 +1573,34 @@ class DreamingConsolidationService:
                 refs = [
                     {
                         **dict(ref),
-                        "created_at": ref.get("created_at") or ref.get("source_at") or _iso(source_time),
+                        "created_at": ref.get("created_at")
+                        or ref.get("source_at")
+                        or _iso(source_time),
                     }
                     for ref in refs
-                    if isinstance(ref, Mapping)
                 ]
+
             kwargs: dict[str, Any] = {
                 "actor_id": str(user_id),
                 "content": content,
                 "scope_type": "user",
                 "scope_id": str(user_id),
-                "memory_type": _text(item.get("memory_type")) or "fact",
+                "memory_type": memory_type,
                 "title": _text(item.get("title")) or None,
                 "structured_data": structured,
-                "source_type": "dreaming_auto" if corroborated else "dreaming_candidate",
+                "source_type": (
+                    _text(previous.get("source_type"))
+                    if previous_was_active
+                    else "dreaming_auto" if corroborated else "dreaming_candidate"
+                ),
                 "source_ref": f"dreaming:{source_digest or _json_digest(item)}",
-                "confidence": float(item.get("confidence", 0.8)),
-                "importance": int(item.get("importance", 6)),
+                "confidence": confidence,
+                "importance": importance,
                 "trust_level": "verified",
                 "evidence_refs": refs,
-                "evidence_span": {"text": _text(item.get("quote", item.get("evidence_span")))},
+                "evidence_span": {
+                    "text": _text(item.get("quote", item.get("evidence_span")))
+                },
                 "dedupe_key": dedupe_key,
                 "status": status_hint,
                 "evidence_max_created_at": source_time,
@@ -897,26 +1611,27 @@ class DreamingConsolidationService:
             replace_method = getattr(service, "replace_memory_from_dreaming", None)
             if not callable(method) and not callable(replace_method):
                 continue
+
+            target_id = (
+                _text(previous.get("id"))
+                if previous is not None and active_threshold
+                else None
+            )
             try:
-                target_id = (
-                    _text(previous.get("id"))
-                    if previous is not None and active_threshold and status_hint == "active"
-                    else None
-                )
                 if callable(replace_method):
                     replace_kwargs = {
                         "actor_id": str(user_id),
                         "content": content,
                         "existing_memory_id": target_id,
-                        "memory_type": kwargs["memory_type"],
+                        "memory_type": memory_type,
                         "title": kwargs["title"],
                         "structured_data": structured,
                         "evidence_refs": refs,
                         "evidence_span": kwargs["evidence_span"],
                         "evidence_max_created_at": source_time,
                         "evidence_count": len(refs),
-                        "confidence": kwargs["confidence"],
-                        "importance": kwargs["importance"],
+                        "confidence": confidence,
+                        "importance": importance,
                         "source_type": kwargs["source_type"],
                         "source_ref": kwargs["source_ref"],
                         "run_id": run_id,
@@ -926,26 +1641,58 @@ class DreamingConsolidationService:
                     }
                     try:
                         parameters = inspect.signature(replace_method).parameters
-                        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-                            replace_kwargs = {key: value for key, value in replace_kwargs.items() if key in parameters}
+                        if not any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        ):
+                            replace_kwargs = {
+                                key: value
+                                for key, value in replace_kwargs.items()
+                                if key in parameters
+                            }
                     except (TypeError, ValueError):
                         pass
                     result = await _maybe_await(replace_method(**replace_kwargs))
                 else:
                     try:
                         parameters = inspect.signature(method).parameters
-                        if not any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-                            kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+                        if not any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters.values()
+                        ):
+                            kwargs = {
+                                key: value
+                                for key, value in kwargs.items()
+                                if key in parameters
+                            }
                     except (TypeError, ValueError):
                         pass
                     result = await _maybe_await(method(**kwargs))
             except Exception:
-                # A failed mutation is fatal for this batch.  The caller must
+                # A failed mutation is fatal for this batch. The caller must
                 # not advance its cursor and the worker will retry with backoff.
                 raise
+
             payload = result.get("memory") if isinstance(result, Mapping) else result
-            changed.append(dict(payload) if isinstance(payload, Mapping) else {"result": payload})
-            existing_by_key[dedupe_key] = payload if isinstance(payload, Mapping) else item
+            stored = (
+                dict(payload) if isinstance(payload, Mapping) else {"result": payload}
+            )
+            changed.append(stored)
+            if previous is not None:
+                old_key = _text(previous.get("dedupe_key"))
+                old_id = _text(previous.get("id"))
+                if old_key:
+                    existing_by_key.pop(old_key, None)
+                if old_id:
+                    existing_by_id.pop(old_id, None)
+            if isinstance(payload, Mapping):
+                new_key = _text(payload.get("dedupe_key")) or dedupe_key
+                new_id = _text(payload.get("id", payload.get("memory_id")))
+                existing_by_key[new_key] = payload
+                if new_id:
+                    existing_by_id[new_id] = payload
+            else:
+                existing_by_key[dedupe_key] = item
         return changed
 
     @staticmethod
@@ -958,15 +1705,51 @@ class DreamingConsolidationService:
                 return parsed
             source = metadata.get("source_metadata")
             if isinstance(source, Mapping):
-                parsed = _datetime(source.get("source_updated_at", source.get("source_at")))
+                parsed = _datetime(
+                    source.get("source_updated_at", source.get("source_at"))
+                )
                 if parsed is not None:
                     return parsed
         refs = memory.get("evidence_refs")
         if isinstance(refs, list):
-            values = [_datetime(item.get("created_at", item.get("source_at"))) for item in refs if isinstance(item, Mapping)]
+            values = [
+                _datetime(item.get("created_at", item.get("source_at")))
+                for item in refs
+                if isinstance(item, Mapping)
+            ]
             values = [value for value in values if value is not None]
             return max(values) if values else None
         return None
+
+    def _skipped_run_heartbeat_due(
+        self,
+        *,
+        user_id: str,
+        trigger: str,
+        backfill: bool,
+        now: datetime,
+    ) -> bool:
+        interval = self.skipped_run_heartbeat_seconds
+        if interval <= 0:
+            return True
+        key = (str(user_id), str(trigger or "idle"), bool(backfill))
+        previous = self._last_skipped_run_at.get(key)
+        if previous is None:
+            return True
+        return (
+            now.replace(tzinfo=None) - previous.replace(tzinfo=None)
+        ).total_seconds() >= interval
+
+    def _mark_skipped_run_heartbeat(
+        self,
+        *,
+        user_id: str,
+        trigger: str,
+        backfill: bool,
+        now: datetime,
+    ) -> None:
+        key = (str(user_id), str(trigger or "idle"), bool(backfill))
+        self._last_skipped_run_at[key] = now.replace(tzinfo=None)
 
     async def process_dreaming_user(
         self,
@@ -978,38 +1761,148 @@ class DreamingConsolidationService:
         backfill: bool | None = None,
         privacy_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run one idempotent user consolidation and update its cursor."""
+        """Run one user at a time across every backend process."""
+
+        normalized_user_id = str(user_id)
+        lease = await self._acquire_user_process_lock(normalized_user_id)
+        if lease is None:
+            return {
+                "user_id": normalized_user_id,
+                "status": "skipped",
+                "reason": "already_running",
+                "backfill": bool(backfill),
+                "source_count": 0,
+                "source_message_ids": [],
+                "mutation_count": 0,
+                "source_policy_repair": False,
+                "source_policy_repair_complete": False,
+            }
+        try:
+            return await self._process_dreaming_user_unlocked(
+                normalized_user_id,
+                trigger=trigger,
+                source_turns=source_turns,
+                llm_client=llm_client,
+                backfill=backfill,
+                privacy_context=privacy_context,
+            )
+        finally:
+            await self._release_user_process_lock(lease)
+
+    async def _process_dreaming_user_unlocked(
+        self,
+        user_id: str,
+        *,
+        trigger: str = "idle",
+        source_turns: Sequence[DreamingSourceTurn] | None = None,
+        llm_client: Any | None = None,
+        backfill: bool | None = None,
+        privacy_context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run one idempotent consolidation while holding the user lease."""
 
         user_id = str(user_id)
         started = self.now_fn().replace(tzinfo=None)
-        turns = list(source_turns) if source_turns is not None else await self.load_dreaming_source_batch(user_id, backfill=backfill)
-        use_backfill = bool(backfill) if backfill is not None else not bool(
-            _attr(await self._load_state(user_id, create=False), "backfill_complete", False)
-        )
+        effective_trigger = str(trigger or "idle")
+        source_policy_repair = False
+        source_policy_repair_complete = False
+        previous_state = await self._load_state(user_id, create=False)
+        if source_turns is not None:
+            turns = list(source_turns)
+            use_backfill = (
+                bool(backfill)
+                if backfill is not None
+                else not bool(_attr(previous_state, "backfill_complete", False))
+            )
+        else:
+            source_policy_repair = await self._source_policy_repair_pending(user_id)
+            if source_policy_repair:
+                effective_trigger = DREAMING_SOURCE_POLICY_REPAIR_TRIGGER
+                turns = await self.load_source_policy_repair_batch(user_id)
+                use_backfill = False
+                if not turns:
+                    await self._mark_source_policy_revision(user_id)
+                    source_policy_repair = False
+                    source_policy_repair_complete = True
+                    effective_trigger = str(trigger or "idle")
+                    previous_state = await self._load_state(user_id, create=False)
+                    turns = await self.load_dreaming_source_batch(
+                        user_id,
+                        backfill=backfill,
+                    )
+                    use_backfill = (
+                        bool(backfill)
+                        if backfill is not None
+                        else not bool(
+                            _attr(previous_state, "backfill_complete", False)
+                        )
+                    )
+            else:
+                turns = await self.load_dreaming_source_batch(
+                    user_id,
+                    backfill=backfill,
+                )
+                use_backfill = (
+                    bool(backfill)
+                    if backfill is not None
+                    else not bool(_attr(previous_state, "backfill_complete", False))
+                )
         source_ids = [turn.user_message_id for turn in turns]
         digest = self._source_digest(turns) if turns else None
         if not turns:
-            await self._update_state(
-                user_id,
-                turns=[],
-                source_digest=digest,
-                backfill=use_backfill,
-                complete_backfill=use_backfill,
-            )
-            await self._record_run(
+            completed_at = self.now_fn().replace(tzinfo=None)
+            heartbeat_due = self._skipped_run_heartbeat_due(
                 user_id=user_id,
-                trigger=trigger,
-                status="skipped",
-                source_ids=[],
-                source_digest=None,
+                trigger=effective_trigger,
                 backfill=use_backfill,
-                started_at=started,
-                completed_at=self.now_fn(),
+                now=completed_at,
             )
-            return {"user_id": user_id, "status": "skipped", "backfill": use_backfill, "source_count": 0, "mutation_count": 0}
+            # The first empty backfill must still close the historical cursor.
+            # After that, update health state only with the bounded heartbeat.
+            state_update_due = use_backfill or previous_state is None or heartbeat_due
+            if state_update_due:
+                await self._update_state(
+                    user_id,
+                    turns=[],
+                    source_digest=digest,
+                    backfill=use_backfill,
+                    complete_backfill=use_backfill,
+                    advance_cursor=not source_policy_repair,
+                )
+            if heartbeat_due:
+                await self._record_run(
+                    user_id=user_id,
+                    trigger=effective_trigger,
+                    status="skipped",
+                    source_ids=[],
+                    source_digest=None,
+                    backfill=use_backfill,
+                    started_at=started,
+                    completed_at=completed_at,
+                )
+                self._mark_skipped_run_heartbeat(
+                    user_id=user_id,
+                    trigger=effective_trigger,
+                    backfill=use_backfill,
+                    now=completed_at,
+                )
+            return {
+                "user_id": user_id,
+                "status": "skipped",
+                "backfill": use_backfill,
+                "source_count": 0,
+                "mutation_count": 0,
+                "ledger_recorded": heartbeat_due,
+                "state_updated": state_update_due,
+                "source_policy_repair": source_policy_repair,
+                "source_policy_repair_complete": source_policy_repair_complete,
+            }
 
-        previous_state = await self._load_state(user_id, create=False)
-        if digest and digest == _text(_attr(previous_state, "last_history_digest")):
+        if (
+            not source_policy_repair
+            and digest
+            and digest == _text(_attr(previous_state, "last_history_digest"))
+        ):
             return {
                 "user_id": user_id,
                 "status": "idempotent",
@@ -1018,11 +1911,13 @@ class DreamingConsolidationService:
                 "source_message_ids": source_ids,
                 "source_digest": digest,
                 "mutation_count": 0,
+                "source_policy_repair": source_policy_repair,
+                "source_policy_repair_complete": source_policy_repair_complete,
             }
 
         run_id = await self._record_run(
             user_id=user_id,
-            trigger=trigger,
+            trigger=effective_trigger,
             status="running",
             source_ids=source_ids,
             source_digest=digest,
@@ -1031,7 +1926,11 @@ class DreamingConsolidationService:
         )
         try:
             existing = await self._existing_memories(user_id)
-            client = llm_client if llm_client is not None else await self._resolve_llm_client(user_id)
+            client = (
+                llm_client
+                if llm_client is not None
+                else await self._resolve_llm_client(user_id)
+            )
             if client is None:
                 raise RuntimeError("dreaming consolidation LLM is unavailable")
             # Partition by the effective source policy before any outbound
@@ -1062,7 +1961,9 @@ class DreamingConsolidationService:
                         transformed = transform(payload, privacy_context)
                     transformed = await _maybe_await(transformed)
                     if isinstance(transformed, Mapping):
-                        partition_turns = list(transformed.get("source_turns") or partition_turns)
+                        partition_turns = list(
+                            transformed.get("source_turns") or partition_turns
+                        )
                         partition_existing = list(
                             transformed.get("existing_memories") or partition_existing
                         )
@@ -1110,10 +2011,11 @@ class DreamingConsolidationService:
                 source_digest=digest,
                 backfill=use_backfill,
                 complete_backfill=complete_backfill,
+                advance_cursor=not source_policy_repair,
             )
             await self._record_run(
                 user_id=user_id,
-                trigger=trigger,
+                trigger=effective_trigger,
                 status="completed",
                 source_ids=source_ids,
                 source_digest=digest,
@@ -1124,6 +2026,22 @@ class DreamingConsolidationService:
                 completed_at=self.now_fn(),
                 run_id=run_id,
             )
+            if source_policy_repair:
+                try:
+                    remaining = await self.load_source_policy_repair_batch(
+                        user_id,
+                        limit=1,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Dreaming source-policy repair completion probe failed for user=%s: %s",
+                        user_id,
+                        type(exc).__name__,
+                    )
+                    remaining = [object()]
+                if not remaining:
+                    await self._mark_source_policy_revision(user_id)
+                    source_policy_repair_complete = True
             return {
                 "user_id": user_id,
                 "status": "completed",
@@ -1134,6 +2052,8 @@ class DreamingConsolidationService:
                 "candidate_count": len(operations or []),
                 "mutation_count": len(mutations),
                 "mutations": mutations,
+                "source_policy_repair": source_policy_repair,
+                "source_policy_repair_complete": source_policy_repair_complete,
             }
         except Exception as exc:
             # Provider exceptions can echo request payloads.  Persist/log only
@@ -1147,10 +2067,11 @@ class DreamingConsolidationService:
                 backfill=use_backfill,
                 error=error,
                 failed=True,
+                advance_cursor=not source_policy_repair,
             )
             await self._record_run(
                 user_id=user_id,
-                trigger=trigger,
+                trigger=effective_trigger,
                 status="failed",
                 source_ids=source_ids,
                 source_digest=digest,
@@ -1160,7 +2081,11 @@ class DreamingConsolidationService:
                 error=error,
                 run_id=run_id,
             )
-            logger.warning("Dreaming consolidation failed for user=%s: %s", user_id, type(exc).__name__)
+            logger.warning(
+                "Dreaming consolidation failed for user=%s: %s",
+                user_id,
+                type(exc).__name__,
+            )
             return {
                 "user_id": user_id,
                 "status": "failed",
@@ -1170,9 +2095,13 @@ class DreamingConsolidationService:
                 "source_digest": digest,
                 "error": error,
                 "mutation_count": 0,
+                "source_policy_repair": source_policy_repair,
+                "source_policy_repair_complete": source_policy_repair_complete,
             }
 
-    async def get_dreaming_overview(self, user_id: str | None = None, *, limit: int = 50) -> dict[str, Any]:
+    async def get_dreaming_overview(
+        self, user_id: str | None = None, *, limit: int = 50
+    ) -> dict[str, Any]:
         """Return compact cursor/run health data without conversation content."""
 
         limit = max(1, min(int(limit), 200))
@@ -1181,16 +2110,38 @@ class DreamingConsolidationService:
             from sqlalchemy import select
             from ..memory.models import DreamingMemoryRun, DreamingMemoryState
 
-            state_stmt = select(DreamingMemoryState).order_by(DreamingMemoryState.updated_at.desc()).limit(limit)
-            run_stmt = select(DreamingMemoryRun).order_by(DreamingMemoryRun.created_at.desc()).limit(limit)
+            state_stmt = (
+                select(DreamingMemoryState)
+                .order_by(DreamingMemoryState.updated_at.desc())
+                .limit(limit)
+            )
+            run_stmt = (
+                select(DreamingMemoryRun)
+                .order_by(DreamingMemoryRun.created_at.desc())
+                .limit(limit)
+            )
             if user_id:
-                state_stmt = state_stmt.where(DreamingMemoryState.user_id == str(user_id))
+                state_stmt = state_stmt.where(
+                    DreamingMemoryState.user_id == str(user_id)
+                )
                 run_stmt = run_stmt.where(DreamingMemoryRun.user_id == str(user_id))
             states = self._scalars(await self._execute(session, state_stmt))
             runs = self._scalars(await self._execute(session, run_stmt))
-            state_payload = [item.to_dict() if callable(getattr(item, "to_dict", None)) else dict(item) for item in states]
-            run_payload = [item.to_dict() if callable(getattr(item, "to_dict", None)) else dict(item) for item in runs]
-            completed = sum(1 for run in run_payload if run.get("status") == "completed")
+            state_payload = [
+                item.to_dict()
+                if callable(getattr(item, "to_dict", None))
+                else dict(item)
+                for item in states
+            ]
+            run_payload = [
+                item.to_dict()
+                if callable(getattr(item, "to_dict", None))
+                else dict(item)
+                for item in runs
+            ]
+            completed = sum(
+                1 for run in run_payload if run.get("status") == "completed"
+            )
             failed = sum(1 for run in run_payload if run.get("status") == "failed")
             return {
                 "user_id": str(user_id) if user_id else None,
@@ -1213,6 +2164,10 @@ DreamingMemoryConsolidationService = DreamingConsolidationService
 __all__ = [
     "DEFAULT_DREAMING_BATCH_SIZE",
     "DEFAULT_DREAMING_IDLE_SECONDS",
+    "DEFAULT_DREAMING_SKIPPED_RUN_HEARTBEAT_SECONDS",
+    "DREAMING_SOURCE_POLICY_REVISION",
+    "DREAMING_SOURCE_POLICY_REPAIR_TRIGGER",
+    "DEFAULT_DREAMING_SOURCE_POLICY_REPAIR_BATCH_SIZE",
     "DreamingConsolidationService",
     "DreamingMemoryConsolidationService",
 ]

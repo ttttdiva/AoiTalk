@@ -316,11 +316,7 @@ def _director_graph_records(
                 or project.get("development_status")
                 or project.get("status")
             ),
-            story_mode=session.get("story_mode"),
             context_tags=context_tags,
-            trpg_context=session.get("trpg_context")
-            if isinstance(session.get("trpg_context"), bool)
-            else None,
         )
         active_team_ids = {
             str(item).strip()
@@ -380,10 +376,10 @@ def _format_director_graph(records: Sequence[dict[str, Any]]) -> str:
 
     if not records:
         return (
-            "## 利用可能なAgent Team\n"
+            "## 利用可能なExecution Team\n"
             "現在利用可能なTeam/Subagent情報はありません。必要なら通常の機能を直接使ってください。"
         )
-    lines = ["## 利用可能なAgent Team"]
+    lines = ["## 利用可能なExecution Team"]
     for team in records:
         name = str(team.get("name") or "Team").strip()
         description = str(team.get("description") or "").strip()

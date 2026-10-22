@@ -9,6 +9,7 @@ import {
 } from "@/db/schema";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { serializeDbTimestamp } from "@/lib/server/db-time";
+import { normalizeTaskStatus } from "@/lib/task-status";
 
 type DashboardScope =
   | { type: "project"; id: string }
@@ -22,9 +23,9 @@ type MemberTimeStat = {
 };
 
 function scopeCondition(scope: DashboardScope, projectIds: string[]) {
-  if (scope.type === "project") return eq(tasks.projectId, scope.id);
+  if (scope.type === "project") return and(eq(tasks.projectId, scope.id), isNull(tasks.deletedAt));
   if (projectIds.length === 0) return sql`false`;
-  return inArray(tasks.projectId, projectIds);
+  return and(inArray(tasks.projectId, projectIds), isNull(tasks.deletedAt));
 }
 
 export async function getDashboardData(scope: DashboardScope) {
@@ -91,7 +92,7 @@ export async function getDashboardData(scope: DashboardScope) {
     .innerJoin(tasks, eq(tasks.id, taskTags.taskId))
     .innerJoin(tags, eq(tags.id, taskTags.tagId))
     .leftJoin(timeEntries, eq(timeEntries.taskId, tasks.id))
-    .where(and(condition, isNotNull(timeEntries.endedAt)))
+    .where(and(condition, isNull(timeEntries.deletedAt), isNotNull(timeEntries.endedAt)))
     .groupBy(tags.id);
 
   const tagTaskCounts = await db
@@ -148,7 +149,7 @@ export async function getDashboardData(scope: DashboardScope) {
       .select({ count: sql<number>`count(*)::int` })
       .from(timeEntries)
       .where(
-        and(inArray(timeEntries.taskId, ids), isNull(timeEntries.endedAt)),
+        and(inArray(timeEntries.taskId, ids), isNull(timeEntries.deletedAt), isNull(timeEntries.endedAt)),
       );
     activeTimerCount = activeResult?.count || 0;
 
@@ -158,7 +159,7 @@ export async function getDashboardData(scope: DashboardScope) {
       })
       .from(timeEntries)
       .where(
-        and(inArray(timeEntries.taskId, ids), isNotNull(timeEntries.endedAt)),
+        and(inArray(timeEntries.taskId, ids), isNull(timeEntries.deletedAt), isNotNull(timeEntries.endedAt)),
       );
     totalTimeSeconds = timeResult?.total || 0;
 
@@ -172,7 +173,7 @@ export async function getDashboardData(scope: DashboardScope) {
       .from(timeEntries)
       .innerJoin(users, eq(users.id, timeEntries.userId))
       .where(
-        and(inArray(timeEntries.taskId, ids), isNotNull(timeEntries.endedAt)),
+        and(inArray(timeEntries.taskId, ids), isNull(timeEntries.deletedAt), isNotNull(timeEntries.endedAt)),
       )
       .groupBy(timeEntries.userId, users.username, users.displayName);
 
@@ -206,11 +207,14 @@ export async function getDashboardData(scope: DashboardScope) {
       ),
     );
 
+  const normalizedStatusCounts = new Map<string, number>();
+  for (const row of statusCounts) {
+    const status = normalizeTaskStatus(row.status);
+    normalizedStatusCounts.set(status, (normalizedStatusCounts.get(status) || 0) + row.count);
+  }
+
   return {
-    status_counts: statusCounts.map((row) => ({
-      status: row.status,
-      count: row.count,
-    })),
+    status_counts: Array.from(normalizedStatusCounts, ([status, count]) => ({ status, count })),
     priority_counts: priorityCounts.map((row) => ({
       priority: row.priority,
       count: row.count,

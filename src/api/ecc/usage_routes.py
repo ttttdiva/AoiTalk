@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from ...services import token_tracking_service
 from ..ecc_helpers import parse_date as _parse_date
+from .usage_schemas import TokenUsageDetail
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,22 @@ def build_usage_router(app_instance: Any, require_auth: Callable[..., Any]) -> A
         _, is_admin = await _usage_scope(request)
         if not is_admin:
             raise HTTPException(status_code=403, detail="Admin access required")
+
+    @usage_router.get("/records/{usage_id}", response_model=TokenUsageDetail)
+    async def get_usage_record(
+        usage_id: UUID,
+        request: Request,
+        run_id: UUID | None = Query(None),
+        _=Depends(require_auth),
+    ):
+        user_id, is_admin = await _usage_scope(request)
+        detail = await token_tracking_service.get_token_tracking_service().get_record_detail(
+            usage_id, user_id=user_id, is_admin=is_admin, agent_run_id=run_id,
+        )
+        if detail is None:
+            # Do not reveal whether an inaccessible ID exists.
+            raise HTTPException(status_code=404, detail="Usage record not found")
+        return detail
 
     @usage_router.get("/dashboard")
     async def get_usage_dashboard(

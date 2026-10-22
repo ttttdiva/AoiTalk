@@ -13,10 +13,71 @@ export type SettingsScrollBehavior = "auto" | "smooth";
 
 const SETTINGS_SCROLL_MARGIN = 20;
 
+export type SettingsOuterScrollSnapshot = {
+  shell: HTMLElement | null;
+  shellTop: number;
+  documentTop: number;
+  bodyTop: number;
+  windowY: number;
+};
+
+/** Capture scroll owners outside Settings so native history restoration cannot move them. */
+export function captureSettingsOuterScroll(
+  root?: ParentNode,
+): SettingsOuterScrollSnapshot {
+  if (typeof document === "undefined") {
+    return { shell: null, shellTop: 0, documentTop: 0, bodyTop: 0, windowY: 0 };
+  }
+  const searchRoot = root ?? document;
+  const shell = searchRoot.querySelector<HTMLElement>(
+    '[data-shell="contextual-workspace"]',
+  );
+  return {
+    shell,
+    shellTop: shell?.scrollTop ?? 0,
+    documentTop: document.documentElement.scrollTop,
+    bodyTop: document.body.scrollTop,
+    windowY: typeof window !== "undefined" ? window.scrollY : 0,
+  };
+}
+
+/** Restore only the outer scroll owners; Settings content remains owned by `.ao-main-scroll`. */
+export function restoreSettingsOuterScroll(
+  snapshot: SettingsOuterScrollSnapshot,
+): void {
+  if (typeof document === "undefined") return;
+  if (snapshot.shell?.isConnected !== false) {
+    if (snapshot.shell) snapshot.shell.scrollTop = snapshot.shellTop;
+  }
+  document.documentElement.scrollTop = snapshot.documentTop;
+  document.body.scrollTop = snapshot.bodyTop;
+  if (
+    typeof window !== "undefined" &&
+    snapshot.windowY !== 0 &&
+    window.scrollY !== snapshot.windowY &&
+    typeof window.scrollTo === "function"
+  ) {
+    window.scrollTo(0, snapshot.windowY);
+  }
+}
+
 /** Update a category hash without triggering the browser's native scroll. */
 export function pushSettingsCategoryHash(category: string): boolean {
   if (typeof window === "undefined") return false;
   const nextHash = `#${category}`;
+  if (window.location.hash === nextHash) return false;
+  window.history.pushState(
+    null,
+    "",
+    `${window.location.pathname}${window.location.search}${nextHash}`,
+  );
+  return true;
+}
+
+/** Update a direct target hash without creating a duplicate history entry. */
+export function pushSettingsTargetHash(targetId: string): boolean {
+  if (typeof window === "undefined") return false;
+  const nextHash = `#${targetId}`;
   if (window.location.hash === nextHash) return false;
   window.history.pushState(
     null,

@@ -1,7 +1,7 @@
 "use client";
 
-// Agent Team schema v3 settings UI.  This file intentionally keeps the
-// background automation and Character/TRPG boundaries separate from the Team
+// Execution Team schema v3 settings UI.  This file intentionally keeps the
+// background automation and Character boundaries separate from the Team
 // topology.
 
 import { AppSelect } from "@/components/ui/app-select";
@@ -13,10 +13,12 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { AgentTeamTopologyPreview } from "./agent-team-topology-preview";
-import { ExecutionRouteEditor } from "./llm-agent-team-execution-route";
+import { ExecutionProfileEffectiveRoutePreview, ExecutionRouteEditor, ExecutionRouteSummary } from "./llm-agent-team-execution-route";
 import {
   canonicalAgentTeamConfig,
+  canonicalAgentTeamConfigWithPresets,
   canonicalTeamExecutionProfile,
   emptyAgentTeamConfig,
   emptyExecutionRoute,
@@ -96,8 +98,6 @@ const workspaceLabels: Record<AgentTeamSubagent["max_workspace_access"], string>
 // draft, but expose only the user-facing descriptions in the settings UI.
 const contextOptions: Array<{ value: string; label: string }> = [
   { value: "app_development", label: "App開発時" },
-  { value: "story", label: "Story利用時" },
-  { value: "trpg", label: "TRPG利用時" },
 ];
 
 function newId(prefix: string, existing: Record<string, unknown>): string {
@@ -142,11 +142,11 @@ function explicitRouteValidationError(
   // Free Team is a routing profile rather than an effort-capable model.
   if (provider === "routing-profile" && model === "free-team") return "";
   const effortPolicy = route.effort_policy;
-  // Gemini's catalog exposes fast/thinking, but the Agent Team native
+  // Gemini's catalog exposes fast/thinking, but the Execution Team native
   // transport cannot pass those modes without silently dropping or mapping
   // them.  Model-default remains valid because it sends no explicit effort.
   if (provider === "gemini" && effortPolicy === "explicit") {
-    return `${label} の Gemini explicit effort は Agent Team runtime では利用できません。`;
+    return `${label} の Gemini explicit effort は Execution Team runtime では利用できません。`;
   }
   if (effortPolicy === "default") {
     if (String(route.effort || "").trim()) return `${label} はモデル既定では effort を空にしてください。`;
@@ -244,7 +244,7 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
     else if (!selectedExecutionProfileId || !profiles[selectedExecutionProfileId]) setSelectedExecutionProfileId(ids[0]);
   }, [draft.teams, selectedExecutionProfileId, selectedTeamId]);
 
-  // The canonical endpoint is the only Agent Team source of truth.  GET-only
+  // The canonical endpoint is the only Execution Team source of truth.  GET-only
   // catalog/effective route fields are kept outside the draft and never sent
   // back by canonicalAgentTeamConfig().
   useEffect(() => {
@@ -252,14 +252,14 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
     void pyFetch<{ agent_team?: AgentTeamConfigEnvelope }>("/agent-team/config")
       .then((response) => {
         if (!active || !response.agent_team) return;
-        const next = canonicalAgentTeamConfig(response.agent_team);
+        const next = canonicalAgentTeamConfigWithPresets(response.agent_team);
         draftRef.current = next;
         setDraft(next);
         setAgentTeamConfig?.(next);
         setCapabilityCatalog(response.agent_team.capability_catalog ?? {});
       })
       .catch((error) => {
-        if (active) setTeamError(error instanceof Error ? error.message : "Agent Team設定を取得できませんでした");
+        if (active) setTeamError(error instanceof Error ? error.message : "Execution Team設定を取得できませんでした");
       });
     return () => { active = false; };
   }, [setAgentTeamConfig]);
@@ -285,7 +285,7 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
       const routeError = firstExplicitRouteError(payload, catalog);
       if (routeError) {
         setTeamError(routeError);
-        setTeamMessage("Agent Team設定を保存できませんでした。");
+        setTeamMessage("Execution Team設定を保存できませんでした。");
         return;
       }
       const response = await pyFetch<{ agent_team?: AgentTeamConfigEnvelope }>("/agent-team/config", {
@@ -294,14 +294,14 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
       });
       const saved = canonicalAgentTeamConfig(response.agent_team ?? payload);
       commitDraft(saved);
-      setTeamMessage("Agent Team設定を保存しました。");
+      setTeamMessage("Execution Team設定を保存しました。");
       // Director connection options remain owned by their dedicated settings
       // paths; save them together without adding them to the Team document.
       await Promise.resolve(saveRoutingSettings());
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Agent Team設定の保存に失敗しました";
+      const message = error instanceof Error ? error.message : "Execution Team設定の保存に失敗しました";
       setTeamError(message);
-      setTeamMessage("Agent Team設定を保存できませんでした。");
+      setTeamMessage("Execution Team設定を保存できませんでした。");
     } finally {
       setTeamSaving(false);
     }
@@ -452,8 +452,12 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
     <div className="space-y-4" data-settings-surface="agent-team">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-sm font-medium">Agent Team</div>
-          <p className="text-[11px] text-muted-foreground">Team、Subagent、Execution Profileを一つの構成として管理します。</p>
+          <div className="inline-flex items-center gap-1 text-sm font-medium">
+            Execution Team
+            <HelpPopover label="Execution Team">
+              SubagentとExecution Profileをまとめた実行構成です。Agent同士の所属・指揮関係は「Agent組織」で管理します。
+            </HelpPopover>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <Badge variant={delegationEnabled ? "secondary" : "outline"}>{delegationEnabled ? "有効" : "無効"}</Badge>
@@ -463,21 +467,26 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
         </div>
       </div>
 
-      <label className="flex items-start gap-2 rounded-md border bg-muted/35 p-3 text-xs">
-        <Checkbox checked={delegationEnabled} onCheckedChange={(checked) => setDelegationEnabled(checked === true)} disabled={teamSaving || savingRouting} className="mt-0.5" />
-        <span><span className="font-medium">Agent Team topologyを有効にする</span><span className="mt-0.5 block text-[10px] text-muted-foreground">個別Team/Subagentの有効状態とは別に、委譲機能全体を切り替えます。</span></span>
-      </label>
+      <div className="flex items-start gap-2 rounded-md border bg-muted/35 p-3 text-xs">
+        <label className="flex min-w-0 flex-1 items-start gap-2">
+          <Checkbox checked={delegationEnabled} onCheckedChange={(checked) => setDelegationEnabled(checked === true)} disabled={teamSaving || savingRouting} className="mt-0.5" />
+          <span className="font-medium">Execution Team topologyを有効にする</span>
+        </label>
+        <HelpPopover label="Execution Team topologyを有効にする">
+          個別Team/Subagentの有効状態とは別に、委譲機能全体を切り替えます。
+        </HelpPopover>
+      </div>
       {(teamMessage || teamError) && <p role={teamError ? "alert" : "status"} aria-live="polite" className={`rounded border p-2 text-[10px] ${teamError ? "border-destructive/40 text-destructive" : "text-muted-foreground"}`}>{teamError || teamMessage}</p>}
 
       <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as typeof activeTab)} className="space-y-3">
-      <TabsList variant="line" aria-label="Agent Team設定" className="flex w-full flex-wrap justify-start gap-1 border-b">
+      <TabsList variant="line" aria-label="Execution Team設定" className="flex w-full flex-wrap justify-start gap-1 border-b">
         <TabsTrigger value="teams">Teams</TabsTrigger>
         <TabsTrigger value="subagents">Subagents</TabsTrigger>
         <TabsTrigger value="director">Director</TabsTrigger>
       </TabsList>
 
       <TabsContent value="teams"><section className="space-y-3 rounded-md border border-border bg-muted/35 p-3" aria-label="Teams">
-        <div className="flex items-center justify-between gap-2"><div><h3 className="text-xs font-medium">Teams</h3><p className="text-[10px] text-muted-foreground">一覧から選択して詳細を編集します。</p></div><Button type="button" size="sm" variant="outline" onClick={addTeam} disabled={teamSaving}><Plus className="mr-1 size-3" />Teamを追加</Button></div>
+        <div className="flex items-center justify-between gap-2"><div className="inline-flex items-center gap-1"><h3 className="text-xs font-medium">Teams</h3><HelpPopover label="Teams">一覧から選択して詳細を編集します。</HelpPopover></div><Button type="button" size="sm" variant="outline" onClick={addTeam} disabled={teamSaving}><Plus className="mr-1 size-3" />Teamを追加</Button></div>
         <div className="grid gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
           <aside className="space-y-1 border-b pb-3 md:border-b-0 md:border-r md:pb-0 md:pr-3" aria-label="Team一覧">
             <Input aria-label="Teamを検索" value={teamSearch} onChange={(event) => setTeamSearch(event.target.value)} placeholder="Teamを検索" className="h-8 text-xs" />
@@ -510,8 +519,12 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
             <div className="space-y-2 rounded border border-border bg-background/40 p-2" role="group" aria-label="Execution Profiles">
               <div className="flex items-center justify-between gap-2">
                 <div>
-                  <div className="text-[10px] font-medium">Execution Profiles</div>
-                  <p className="text-[10px] text-muted-foreground">このTeamの各Subagentを今回どのLLMで実行するかを定義します。</p>
+                  <div className="inline-flex items-center gap-1 text-[10px] font-medium">
+                    Execution Profiles
+                    <HelpPopover label="Execution Profiles">
+                      このTeamの各Subagentを今回どのLLMで実行するかを定義します。
+                    </HelpPopover>
+                  </div>
                 </div>
                 <Button type="button" size="sm" variant="outline" onClick={() => addExecutionProfile(selectedTeamId)} disabled={teamSaving}><Plus className="mr-1 size-3" />Profileを追加</Button>
               </div>
@@ -528,6 +541,7 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
                       >
                         <span className="block truncate font-medium">{profile.name || "名称未設定"}</span>
                         <span className="block truncate text-muted-foreground">{profile.enabled ? "有効" : "無効"}</span>
+                        <ExecutionRouteSummary route={profile.default_route} mainProvider={provider} mainModel={selectedModelId} ariaLabel={`${profile.name || id} default route`} />
                       </button>
                     ))}
                   </aside>
@@ -565,9 +579,17 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
                           mainModel={selectedModelId}
                         />
                       </div>
+                      <ExecutionProfileEffectiveRoutePreview
+                        profile={selectedExecutionProfile}
+                        subagents={Object.fromEntries(selectedTeam.subagent_ids.map((subagentId) => [subagentId, draft.subagents[subagentId] ?? {}]))}
+                        mainProvider={provider}
+                        mainModel={selectedModelId}
+                      />
                       <div className="space-y-2 rounded border border-border bg-background/50 p-2" role="group" aria-label="Execution Profile overrides">
-                        <div className="text-[10px] font-medium">Overrides</div>
-                        <p className="text-[10px] text-muted-foreground">未設定のメンバーは Default Subagent Route を使います。</p>
+                        <div className="inline-flex items-center gap-1 text-[10px] font-medium">
+                          Overrides
+                          <HelpPopover label="Overrides">未設定のメンバーは Default Subagent Route を使います。</HelpPopover>
+                        </div>
                         {selectedTeam.subagent_ids.map((subagentId) => {
                           const subagent = draft.subagents[subagentId];
                           const override = selectedExecutionProfile.overrides[subagentId];
@@ -622,7 +644,7 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
       </section></TabsContent>
 
       <TabsContent value="subagents"><section className="space-y-3 rounded-md border border-border bg-muted/35 p-3" aria-label="Subagents">
-        <div className="flex items-center justify-between gap-2"><div><h3 className="text-xs font-medium">Subagents</h3><p className="text-[10px] text-muted-foreground">役割と指示だけを編集します。実行するLLMは Execution Profile で決めます。</p></div><Button type="button" size="sm" variant="outline" onClick={addSubagent} disabled={teamSaving}><Plus className="mr-1 size-3" />Subagentを追加</Button></div>
+        <div className="flex items-center justify-between gap-2"><div className="inline-flex items-center gap-1"><h3 className="text-xs font-medium">Subagents</h3><HelpPopover label="Subagents">役割と指示だけを編集します。実行するLLMは Execution Profile で決めます。</HelpPopover></div><Button type="button" size="sm" variant="outline" onClick={addSubagent} disabled={teamSaving}><Plus className="mr-1 size-3" />Subagentを追加</Button></div>
         <div className="grid gap-3 md:grid-cols-[220px_minmax(0,1fr)]">
           <aside className="space-y-1 border-b pb-3 md:border-b-0 md:border-r md:pb-0 md:pr-3" aria-label="Subagent一覧">
             <Input aria-label="Subagentを検索" value={subagentSearch} onChange={(event) => setSubagentSearch(event.target.value)} placeholder="Subagentを検索" className="h-8 text-xs" />
@@ -647,7 +669,15 @@ export function LlmAgentTeamRouting(props: AgentTeamRoutingProps) {
 
       <TabsContent value="director"><section className="space-y-3 rounded-md border border-border bg-muted/35 p-3" aria-labelledby="agent-team-orchestration">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <label className="flex items-start gap-2 text-xs"><Checkbox checked={directorEnabled} onCheckedChange={(checked) => setOrchestrationMode(checked === true ? "director" : "standard")} disabled={!delegationEnabled || savingRouting} className="mt-0.5" /><span><span className="font-medium">Web版ChatGPTをDirectorとして使用する</span><span className="mt-0.5 block text-[10px] text-muted-foreground">OFFの場合はAoiTalkが通常どおりAgent Teamを実行します。</span></span></label>
+          <div className="flex min-w-0 items-start gap-2 text-xs">
+            <label className="flex min-w-0 items-start gap-2">
+              <Checkbox checked={directorEnabled} onCheckedChange={(checked) => setOrchestrationMode(checked === true ? "director" : "standard")} disabled={!delegationEnabled || savingRouting} className="mt-0.5" />
+              <span className="font-medium">Web版ChatGPTをDirectorとして使用する</span>
+            </label>
+            <HelpPopover label="Web版ChatGPTをDirectorとして使用する">
+              OFFの場合はAoiTalkが通常どおりExecution Teamを実行します。
+            </HelpPopover>
+          </div>
           {delegationEnabled && directorEnabled && <Badge role="status" variant={connectionPresentation.tone === "error" ? "destructive" : connectionPresentation.tone === "warning" ? "outline" : "secondary"}>{connectionPresentation.label}</Badge>}
         </div>
           {delegationEnabled && directorEnabled && <div className="space-y-3 rounded-md border border-border dark:border-[#333335] bg-muted/65 dark:bg-[#242426]/65 p-3">

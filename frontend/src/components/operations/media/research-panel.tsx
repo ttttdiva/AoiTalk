@@ -30,10 +30,10 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -126,6 +126,14 @@ function decisionItems(
   );
 }
 
+function parsePublicationLimit(value: string): number | null {
+  if (value === "") return null;
+  if (!/^\d+$/u.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) > 10000) {
+    throw new Error("投稿上限は0〜10000の整数、または未設定の空欄にしてください");
+  }
+  return Number(value);
+}
+
 export function MediaResearchPanel() {
   const [routines, setRoutines] =
     useState<ResearchRoutine[]>([]);
@@ -178,6 +186,16 @@ export function MediaResearchPanel() {
   const [personaId, setPersonaId] = useState("");
   const [programName, setProgramName] = useState("");
   const [programObjective, setProgramObjective] = useState("");
+  const [programMaxPublications, setProgramMaxPublications] = useState("");
+  const [publicationLimit, setPublicationLimit] = useState("");
+  const selectedProgram = useMemo(
+    () => programs.find((item) => item.id === selectedProgramId) ?? null,
+    [programs, selectedProgramId],
+  );
+  useEffect(() => {
+    setPublicationLimit(selectedProgram?.current_revision.max_publications == null
+      ? "" : String(selectedProgram.current_revision.max_publications));
+  }, [selectedProgram]);
 
   const [contentTitle, setContentTitle] = useState("");
   const [contentBrief, setContentBrief] = useState("");
@@ -186,7 +204,7 @@ export function MediaResearchPanel() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] =
     useState<
-      "routine" | "run" | "finding" | "program" | "content" | null
+      "routine" | "run" | "finding" | "program" | "publication-limit" | "content" | null
     >(null);
   const [error, setError] = useState<unknown>(null);
 
@@ -804,6 +822,7 @@ export function MediaResearchPanel() {
               programName.trim(),
             objective:
               programObjective.trim(),
+            max_publications: parsePublicationLimit(programMaxPublications),
             content_type: "article",
             cadence: "manual",
             draft_generation_policy:
@@ -816,6 +835,7 @@ export function MediaResearchPanel() {
 
       setProgramName("");
       setProgramObjective("");
+      setProgramMaxPublications("");
 
       const nextPrograms =
         await mediaResearchApi.listPrograms();
@@ -823,6 +843,38 @@ export function MediaResearchPanel() {
       setSelectedProgramId(
         created.id,
       );
+    } catch (nextError) {
+      setError(nextError);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const savePublicationLimit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProgram) return;
+    const programId = selectedProgram.id;
+    const revision = selectedProgram.current_revision;
+    setBusy("publication-limit");
+    setError(null);
+    try {
+      await mediaResearchApi.reviseProgram(programId, {
+        expected_version: revision.version,
+        name: revision.name,
+        objective: revision.objective,
+        content_type: revision.content_type,
+        cadence: revision.cadence,
+        target_platforms: revision.target_platforms,
+        target_account_refs: revision.target_account_refs,
+        content_pillar: revision.content_pillar,
+        required_resources: revision.required_resources,
+        default_creative_recipe_ref: revision.default_creative_recipe_ref,
+        default_qa_policy_ref: revision.default_qa_policy_ref,
+        experiment_ref: revision.experiment_ref,
+        draft_generation_policy: revision.draft_generation_policy,
+        max_publications: parsePublicationLimit(publicationLimit),
+      }, newIdempotencyKey());
+      setPrograms(await mediaResearchApi.listPrograms());
     } catch (nextError) {
       setError(nextError);
     } finally {
@@ -889,14 +941,12 @@ export function MediaResearchPanel() {
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">
+          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
             Research
+            <HelpPopover label="Research">
+              ResearchRoutineの定義、Run snapshot、Evidence付きFinding、Findingを参照するContentItemまでを記録します。検索・生成・投稿は実行しません。
+            </HelpPopover>
           </h2>
-          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            ResearchRoutineの定義、Run snapshot、Evidence付きFinding、
-            Findingを参照するContentItemまでを記録します。
-            検索・生成・投稿は実行しません。
-          </p>
         </div>
 
         <Button
@@ -931,12 +981,10 @@ export function MediaResearchPanel() {
       <div className="grid gap-4 xl:grid-cols-2">
         <Card size="sm">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="text-sm">
+            <CardTitle className="inline-flex items-center gap-1 text-sm">
               ResearchRoutine
+              <HelpPopover label="ResearchRoutine">繰り返し使うResearch questionをversioned definitionとして保存します。</HelpPopover>
             </CardTitle>
-            <CardDescription>
-              繰り返し使うResearch questionをversioned definitionとして保存します。
-            </CardDescription>
           </CardHeader>
 
           <CardContent className="space-y-4 pt-4">
@@ -1054,13 +1102,10 @@ export function MediaResearchPanel() {
 
         <Card size="sm">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="text-sm">
+            <CardTitle className="inline-flex items-center gap-1 text-sm">
               ResearchRun / Findings
+              <HelpPopover label="ResearchRun / Findings">RunはRoutine revisionのhash snapshotを保持し、Findingは1件以上のtyped Evidenceを必須とします。</HelpPopover>
             </CardTitle>
-            <CardDescription>
-              RunはRoutine revisionのhash snapshotを保持し、
-              Findingは1件以上のtyped Evidenceを必須とします。
-            </CardDescription>
           </CardHeader>
 
           <CardContent className="space-y-4 pt-4">
@@ -1200,10 +1245,10 @@ export function MediaResearchPanel() {
 
       <Card size="sm" data-testid="research-candidates">
         <CardHeader className="border-b border-border/70">
-          <CardTitle className="text-sm">Research candidates</CardTitle>
-          <CardDescription>
-            Source-backed候補は未信頼のまま保留し、Decision ledgerを確認してから人間が採用・却下します。
-          </CardDescription>
+          <CardTitle className="inline-flex items-center gap-1 text-sm">
+            Research candidates
+            <HelpPopover label="Research candidates">Source-backed候補は未信頼のまま保留し、Decision ledgerを確認してから人間が採用・却下します。</HelpPopover>
+          </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4 pt-4">
           {!selectedRoutineId ? (
@@ -1359,14 +1404,12 @@ export function MediaResearchPanel() {
 
       <Card size="sm">
         <CardHeader className="border-b border-border/70">
-          <CardTitle className="text-sm">
+          <CardTitle className="inline-flex items-center gap-1 text-sm">
             Editorial trace boundary
+            <HelpPopover label="Editorial trace boundary">
+              PersonaにEditorialProgramを結び、ContentItemからimmutable Findingへtraceします。本文生成・予約・投稿は行いません。
+            </HelpPopover>
           </CardTitle>
-          <CardDescription>
-            PersonaにEditorialProgramを結び、
-            ContentItemからimmutable Findingへtraceします。
-            本文生成・予約・投稿は行いません。
-          </CardDescription>
         </CardHeader>
 
         <CardContent className="grid gap-4 pt-4 xl:grid-cols-2">
@@ -1406,6 +1449,11 @@ export function MediaResearchPanel() {
               rows={3}
               placeholder="Editorial objective"
             />
+            <label className="block text-xs">
+              累積投稿上限（空欄は未設定）
+              <Input aria-label="新規Program累積投稿上限" type="number" min={0} max={10000} step={1}
+                value={programMaxPublications} onChange={(event) => setProgramMaxPublications(event.target.value)} />
+            </label>
             <Button
               type="submit"
               size="sm"
@@ -1503,6 +1551,27 @@ export function MediaResearchPanel() {
               )}
               ContentItemを作成
             </Button>
+          </form>
+          <form className="space-y-2 xl:col-span-2" aria-label="累積投稿上限設定" onSubmit={savePublicationLimit}>
+            <p className="text-sm font-medium">選択中のProgram: {selectedProgram?.current_revision.name ?? "未選択"}</p>
+            <p className="text-xs text-muted-foreground" role="status">
+              現在の累積投稿上限: {selectedProgram?.current_revision.max_publications == null
+                ? "未設定（上限なし）" : `${selectedProgram.current_revision.max_publications}件`}
+            </p>
+            <div className="space-y-1.5">
+              <span className="inline-flex items-center gap-1 text-xs">
+                <label htmlFor="program-publication-limit">累積投稿上限（0〜10000、空欄は未設定）</label>
+                <HelpPopover label="累積投稿上限">Programの全期間・全子jobに適用します。成功済みと結果未確定の投稿を含み、Xスレッドは投稿数分、Carousel・単体投稿・出品は1件を予約します。</HelpPopover>
+              </span>
+              <Input id="program-publication-limit" aria-label="Program累積投稿上限" type="number" min={0} max={10000} step={1}
+                disabled={!selectedProgram || busy !== null} value={publicationLimit}
+                onChange={(event) => setPublicationLimit(event.target.value)} />
+            </div>
+            <p className="text-xs text-amber-700 dark:text-amber-300">0で新規送信を停止し、未送信確認が取れた予約だけ解放します。</p>
+            <Button type="submit" size="sm" disabled={!selectedProgram || busy !== null}>投稿上限を保存</Button>
+            <Button type="button" size="sm" variant="outline" disabled={!selectedProgram || busy !== null}
+              onClick={() => setPublicationLimit(selectedProgram?.current_revision.max_publications == null
+                ? "" : String(selectedProgram.current_revision.max_publications))}>変更を取り消す</Button>
           </form>
         </CardContent>
       </Card>

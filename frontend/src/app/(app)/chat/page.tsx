@@ -19,9 +19,13 @@ import { PendingLlmHandoffError } from "@/lib/chat-session-route-handoff";
 import {
   safeLocalStorageGetItem,
   safeLocalStorageSetItem,
+  safeSessionStorage,
 } from "@/lib/safe-storage";
-import { storyApi } from "@/lib/story/api";
-import { normalizeEpisode, objectOf } from "@/lib/story/view-model";
+import { useContextRailVisibility } from "@/hooks/use-context-rail-visibility";
+import {
+  hasPersistedChatComposerDraft,
+  NEW_CHAT_COMPOSER_DRAFT_KEY,
+} from "@/lib/chat-composer-draft-store";
 import type {
   ChatToolResultMetadata,
   ConversationMessage,
@@ -30,18 +34,20 @@ import type {
 import { useWebSocket } from "@/hooks/use-websocket";
 import { useAudioPlayer } from "@/contexts/audio-player-context";
 import { MessageList } from "@/components/chat/message-list";
+import { MemoryVisualization } from "@/components/chat/memory-visualization/memory-visualization";
+import { useMemorySelection } from "@/hooks/use-memory-selection";
 import {
   ChatComposer,
   type SubmittedSteeringInstruction,
 } from "@/components/chat/chat-composer";
 import type { ChatAppContextSelection } from "@/components/chat/app-context-picker";
 import { ConversationSearchDialog } from "@/components/chat/conversation-search-dialog";
+import { ChatAgentSelector } from "@/components/chat/chat-agent-selector";
 import { useProject } from "@/contexts/project-context";
 import {
   useChatSessions,
 } from "@/contexts/chat-session-context";
 import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
-import { StoryChatAuthoringWorkspace } from "@/components/story/chat/story-chat-authoring-workspace";
 import { GroupChatDialog } from "@/components/chat/group-chat-dialog";
 import { SteeringPanel } from "@/components/chat/steering-panel";
 import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
@@ -85,6 +91,9 @@ import { useConversationSearch } from "@/hooks/use-conversation-search";
 import { useRelatedTasksPanel } from "@/hooks/use-related-tasks-panel";
 import { ChatSidebar } from "@/components/layout/sidebar/chat-sidebar";
 import { ChatContextRail } from "@/components/chat/chat-context-rail";
+import { ChatWaveBackground } from "@/components/chat/chat-wave-background";
+import { useChatBackgroundPreference } from "@/lib/chat-background-preference";
+import { useTheme } from "@/contexts/theme-context";
 import {
   useWorkspaceShellRegistration,
 } from "@/components/layout/shell-context";
@@ -93,10 +102,11 @@ import {
   CheckSquare,
   FolderOpen,
   MoreHorizontal,
+  PanelRightClose,
+  PanelRightOpen,
   RefreshCcw,
   Users,
   Sliders,
-  BookOpen,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { appsApi } from "@/lib/apps-api";
@@ -121,68 +131,64 @@ import {
 
 const PROJECT_CONTEXT_KEY = "aoitalk-chat-project-context";
 const DEEP_RESEARCH_KEY = "aoitalk-chat-deep-research";
+const PENDING_AGENT_KEY = "aoitalk-chat-pending-agent";
 const TEMPORARY_FILE_DRAFT_SESSION_KEY = "__new_chat__";
-
-function isStoryWorkflowSession(session: ConversationSession) {
-  const characterName = session.character_name || "";
-  return (
-    characterName.startsWith("story_") ||
-    session.title?.startsWith("[執筆]")
-  );
-}
-
-/**
- * 構造操作は `{results:[{op, episode_id}], ...graph}`、エピソード作成は `{episode:{...}}` を返す。
- * 生の snake_case を各所で読まないよう、ここで view-model の正規化を通して ID だけを取り出す。
- */
-function extractStoryEpisodeId(value: unknown): string | null {
-  const record = objectOf(value);
-  const firstResult = Array.isArray(record.results) ? objectOf(record.results[0]) : {};
-  const candidates = [
-    firstResult.episode_id,
-    normalizeEpisode(record.created ?? value).id,
-    record.episode_id,
-    record.created_episode_id,
-  ];
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate) return candidate;
-  }
-  return null;
-}
-
-type StoryWritingSessionView = {
-  id: string;
-  workId: string;
-  episodeId: string | null;
-};
-
-/** story API の執筆セッション応答を camelCase へ寄せる。生の snake_case は画面側へ持ち出さない。 */
-function normalizeWritingSession(value: unknown): StoryWritingSessionView | null {
-  const record = objectOf(value);
-  const id = typeof record.id === "string" ? record.id : "";
-  const workId = typeof record.work_id === "string" ? record.work_id : "";
-  if (!id || !workId) return null;
-  return {
-    id,
-    workId,
-    episodeId: typeof record.episode_id === "string" ? record.episode_id : null,
-  };
-}
 
 function ChatPageInner() {
   const { isMobile } = useSidebar();
+  const { resolvedTheme } = useTheme();
+  const chatBackgroundPreference = useChatBackgroundPreference();
+  const chatViewportRef = useRef<HTMLDivElement>(null);
   const searchParams = useSearchParams();
   const router = useRouter();
   const currentUserId = useCurrentUserId();
+  const {
+    visible: contextRailVisible,
+    hydrated: contextRailVisibilityHydrated,
+    toggle: toggleContextRailVisibility,
+  } = useContextRailVisibility(currentUserId);
+  const hasPersistedNewChatDraft = hasPersistedChatComposerDraft(
+    NEW_CHAT_COMPOSER_DRAFT_KEY,
+    currentUserId,
+  );
+  const [memoryMode, setMemoryMode] = useState(searchParams.get("view") === "memory");
+  const [memoryRailOpen, setMemoryRailOpen] = useState(false);
+  useEffect(() => { if (!memoryMode) setMemoryRailOpen(false); }, [memoryMode]);
+  const contextRailToggleOpen = contextRailVisible;
+  const handleContextRailToggle = useCallback(() => {
+    toggleContextRailVisibility();
+  }, [toggleContextRailVisibility]);
+  const memoryRailPresentation = useMemo(() => memoryMode && !isMobile
+    ? { open: memoryRailOpen, onOpenChange: setMemoryRailOpen } : undefined,
+  [memoryMode, memoryRailOpen, isMobile]);
+  const memoryView = searchParams.get("memory_view") === "process" ? "process" : "graph";
+  const memoryPreferenceKey = currentUserId ? `aoitalk.chat.display.${currentUserId}` : null;
+  useEffect(() => {
+    if (!memoryPreferenceKey) return;
+    const routeView = searchParams.get("view");
+    const selected = routeView === "memory" || (routeView !== "normal" && safeLocalStorageGetItem(memoryPreferenceKey) === "memory");
+    setMemoryMode(selected);
+    if (routeView === "memory" || routeView === "normal") safeLocalStorageSetItem(memoryPreferenceKey, routeView);
+  }, [memoryPreferenceKey, searchParams]);
+  const changeChatDisplay = (mode: "normal" | "memory", view?: "graph" | "process") => {
+    setMemoryMode(mode === "memory");
+    if (memoryPreferenceKey) safeLocalStorageSetItem(memoryPreferenceKey, mode);
+    const query = new URLSearchParams(searchParams.toString());
+    query.set("view", mode);
+    if (view) query.set("memory_view", view);
+    router.push(`/chat?${query}`);
+  };
   const runtime = useOptionalRuntimeContext();
   const refreshCharacters = runtime?.refreshCharacters;
   const searchParamSessionId = searchParams.get("s") || null;
+  const agentQueryId = searchParams.get("agent_id")?.trim() || null;
   const appQueryId = searchParams.get("app_id") || null;
   const appQueryTargetId = searchParams.get("app_target_id") || null;
   const appQueryProjectId = searchParams.get("project_id") || null;
-  const { selectedProjectId, allProjects, initialLoadComplete } = useProject();
+  const { selectedProjectId, selectedSpaceId, allProjects, initialLoadComplete } = useProject();
   const {
     addSession,
+    markSessionRead,
     upsertSession,
     updateSession,
     updateSessionTitle: updateSidebarTitle,
@@ -197,7 +203,11 @@ function ChatPageInner() {
       searchParamSessionId,
       requestedSessionId,
       onRequestedSessionConsumed: clearRequestedSession,
-      suppressLastSessionRestore: Boolean(appQueryId),
+      // An Agent deeplink is an explicit new-Chat intent.  A canonical `s`
+      // route still wins because activeSessionId is initialized from it and
+      // the restore hook exits before consulting last-session storage.
+      suppressLastSessionRestore: Boolean(appQueryId || agentQueryId),
+      hasUnsavedNewChatDraft: hasPersistedNewChatDraft,
       router,
       allProjects,
       sessions,
@@ -205,22 +215,16 @@ function ChatPageInner() {
 
   // Character metadata is session-scoped on the backend. Refresh it whenever
   // the active conversation changes so the picker follows the restored
-  // session without mutating global character state in the page itself.
+  // session. A blank route must also refresh the global character after Back;
+  // otherwise a worker session's character remains visible in the new Chat.
   useEffect(() => {
-    if (!activeSessionId) return;
     void refreshCharacters?.(activeSessionId);
   }, [activeSessionId, refreshCharacters]);
 
   useEffect(() => {
     if (!activeSessionId) return;
-    updateSession(activeSessionId, (session) => ({
-      ...session,
-      is_unread: false,
-    }));
-    void chatApi.markSessionRead(activeSessionId).catch(() => {
-      // 読み込みは継続し、次回の履歴取得で状態を再同期する。
-    });
-  }, [activeSessionId, updateSession]);
+    void markSessionRead(activeSessionId);
+  }, [activeSessionId, markSessionRead]);
   const [includeProjectContext, setIncludeProjectContext] = useState(() => {
     if (typeof window === "undefined") return false;
     return safeLocalStorageGetItem(PROJECT_CONTEXT_KEY) === "true";
@@ -229,6 +233,9 @@ function ChatPageInner() {
     if (typeof window === "undefined") return false;
     return safeLocalStorageGetItem(DEEP_RESEARCH_KEY) === "true";
   });
+  // Keep the server and first client render identical.  The per-tab pending
+  // intent is hydrated after mount; an explicit URL Agent always wins.
+  const [pendingAgentId, setPendingAgentId] = useState<string | null>(agentQueryId);
   const {
     llmMode,
     llmModeOptions,
@@ -240,6 +247,21 @@ function ChatPageInner() {
     setLlmModeLabels,
     handleLlmModeChange,
   } = useChatLlmMode();
+
+  useEffect(() => {
+    if (activeSessionId) {
+      // Existing-session navigation (including an AoiDots worker detail)
+      // must not discard the Agent selected on the originating blank Chat.
+      // Creation is the only authoritative consumer and clears it through
+      // onSessionAgentConsumed after the server binding is confirmed.
+      return;
+    }
+    const nextAgentId =
+      agentQueryId || safeSessionStorage.getItem(PENDING_AGENT_KEY)?.trim() || null;
+    setPendingAgentId((current) =>
+      current === nextAgentId ? current : nextAgentId,
+    );
+  }, [activeSessionId, agentQueryId]);
 
   useEffect(() => {
     safeLocalStorageSetItem(
@@ -254,6 +276,17 @@ function ChatPageInner() {
       deepResearchEnabled ? "true" : "false",
     );
   }, [deepResearchEnabled]);
+
+  // A selector on the blank Chat route is session-scoped input for the next
+  // server-created session. Keep it across a reload in this tab only, but
+  // clear it as soon as that exact binding is persisted by canonical create.
+  useEffect(() => {
+    if (pendingAgentId) {
+      safeSessionStorage.setItem(PENDING_AGENT_KEY, pendingAgentId);
+    } else {
+      safeSessionStorage.removeItem(PENDING_AGENT_KEY);
+    }
+  }, [pendingAgentId]);
 
   // ─── 状態 ───
   const [chatTimeline, dispatchChatTimeline] = useReducer(
@@ -280,17 +313,6 @@ function ChatPageInner() {
       // keep the historical fetch behaviour.
       shared: runtime != null,
     });
-  const [writingSession, setWritingSession] =
-    useState<
-      Awaited<ReturnType<typeof storyApi.getWritingSessionByConversation>>
-    >(null);
-  // 画面からは正規化済みビューだけを参照する（生の snake_case を持ち回らない）。
-  const writingView = useMemo(
-    () => normalizeWritingSession(writingSession),
-    [writingSession],
-  );
-  const [mobileAuthoringOpen, setMobileAuthoringOpen] = useState(false);
-
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
@@ -314,13 +336,106 @@ function ChatPageInner() {
 
   // グループチャット
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
+  const [activeSessionSnapshot, setActiveSessionSnapshot] = useState<{
+    ownerKey: string | null | undefined;
+    session: ConversationSession;
+  } | null>(null);
+  const activeSessionHydrationRef = useRef({
+    sessionId: null as string | null,
+    requestId: 0,
+  });
   const currentSession = useMemo(
-    () =>
-      activeSessionId
-        ? sessions.find((session) => session.id === activeSessionId) ?? null
-        : null,
-    [activeSessionId, sessions],
+    () => {
+      if (!activeSessionId) return null;
+      const snapshot = activeSessionSnapshot;
+      return (
+        (currentUserId
+          ? sessions.find(
+              (session) =>
+                session.id === activeSessionId &&
+                session.user_id === currentUserId,
+            )
+          : null) ??
+        (currentUserId &&
+        snapshot &&
+        snapshot.ownerKey === currentUserId &&
+        snapshot.session.id === activeSessionId
+          ? snapshot.session
+          : null)
+      );
+    },
+    [activeSessionId, activeSessionSnapshot, currentUserId, sessions],
   );
+  useEffect(() => {
+    if (!currentUserId || !activeSessionId) {
+      activeSessionHydrationRef.current = {
+        sessionId: null,
+        requestId: activeSessionHydrationRef.current.requestId + 1,
+      };
+      setActiveSessionSnapshot(null);
+      return;
+    }
+
+    const listed = currentUserId
+      ? sessions.find(
+          (session) =>
+            session.id === activeSessionId &&
+            session.user_id === currentUserId,
+        )
+      : null;
+    if (listed) {
+      activeSessionHydrationRef.current.sessionId = activeSessionId;
+      setActiveSessionSnapshot((previous) => {
+        if (
+          previous?.ownerKey === currentUserId &&
+          previous.session.id === listed.id &&
+          previous.session === listed
+        ) {
+          return previous;
+        }
+        return { ownerKey: currentUserId, session: listed };
+      });
+      return;
+    }
+    if (
+      activeSessionSnapshot?.ownerKey === currentUserId &&
+      activeSessionSnapshot.session.id === activeSessionId
+    ) return;
+    if (activeSessionHydrationRef.current.sessionId === activeSessionId) return;
+
+    const requestId = activeSessionHydrationRef.current.requestId + 1;
+    activeSessionHydrationRef.current = { sessionId: activeSessionId, requestId };
+    const requestedSessionId = activeSessionId;
+    const requestedOwnerKey = currentUserId;
+    let cancelled = false;
+    void chatApi
+      .resumeSession(requestedSessionId, false)
+      .then(({ session }) => {
+        if (
+          cancelled ||
+          activeSessionIdRef.current !== requestedSessionId ||
+          currentUserId !== requestedOwnerKey ||
+          activeSessionHydrationRef.current.requestId !== requestId
+        ) {
+          return;
+        }
+        setActiveSessionSnapshot({ ownerKey: requestedOwnerKey, session });
+        upsertSession(session);
+      })
+      .catch(() => {
+        if (
+          !cancelled &&
+          activeSessionIdRef.current === requestedSessionId &&
+          currentUserId === requestedOwnerKey &&
+          activeSessionHydrationRef.current.requestId === requestId
+        ) {
+          setActiveSessionSnapshot(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, activeSessionIdRef, activeSessionSnapshot, currentUserId, sessions, upsertSession]);
   const [appContext, setAppContext] = useState<ChatAppContextSelection | null>(
     null,
   );
@@ -509,9 +624,6 @@ function ChatPageInner() {
     (currentCharacterType
       ? currentCharacterType !== "assistant"
       : currentSession.character_name !== "aoi");
-  const isStoryChatSession =
-    (currentSession ? isStoryWorkflowSession(currentSession) : false) ||
-    Boolean(writingView);
   const isSending =
     generationState.lifecycle.phase === "dispatching" &&
     generationState.lifecycle.sessionId === activeSessionId;
@@ -519,7 +631,7 @@ function ChatPageInner() {
     generationState,
     activeSessionId,
   );
-  const effectiveProjectId = isStoryChatSession ? undefined : appProjectId;
+  const effectiveProjectId = appProjectId;
   const displayedProjectId = currentSession
     ? currentSession.project_id ?? null
     : appQueryId
@@ -529,6 +641,18 @@ function ChatPageInner() {
     ? allProjects.find((project) => project.id === displayedProjectId)
     : undefined;
   const displayedProjectName = displayedProject?.name;
+  // Existing sessions own their canonical project scope, including explicit
+  // null. Only a blank/new Chat may inherit the global project selection for
+  // Agent catalog discovery.
+  const agentCatalogProjectId = activeSessionId
+    ? currentSession?.id === activeSessionId
+      ? currentSession.project_id ?? null
+      : null
+    : effectiveProjectId ?? null;
+  const composerAgentId = activeSessionId
+    ? currentSession?.agent_id ?? null
+    : pendingAgentId;
+  const pendingNewSessionAgentId = activeSessionId ? null : pendingAgentId;
   const projectAssociationLabel = currentSession
     ? currentSession.project_id
       ? (displayedProjectName ?? "不明なプロジェクト")
@@ -565,15 +689,38 @@ function ChatPageInner() {
             targetId: effectiveAppContext.targetId,
           }
         : null;
-      const created = await chatApi.createSession(
-        characterName,
-        effectiveProjectId,
-        undefined,
-        appContext,
-        generationReadyMain,
-      );
+      const created = pendingNewSessionAgentId
+        ? await chatApi.createSession(
+            characterName,
+            effectiveProjectId,
+            undefined,
+            appContext,
+            generationReadyMain,
+            pendingNewSessionAgentId,
+          )
+        : await chatApi.createSession(
+            characterName,
+            effectiveProjectId,
+            undefined,
+            appContext,
+            generationReadyMain,
+          );
+      if (
+        pendingNewSessionAgentId &&
+        created.session.agent_id !== pendingNewSessionAgentId
+      ) {
+        throw new Error(
+          "サーバーでAgent bindingを確認できなかったため、音声セッションを開始しませんでした。",
+        );
+      }
       const sessionId = created.session.id;
       addSession(created.session);
+      if (
+        pendingNewSessionAgentId &&
+        created.session.agent_id === pendingNewSessionAgentId
+      ) {
+        setPendingAgentId(null);
+      }
       const applied = await applyPendingNewChatLlmSettingsToSession(
         sessionId,
         currentUserId,
@@ -607,6 +754,7 @@ function ChatPageInner() {
     effectiveProjectId,
     router,
     activeSessionIdRef,
+    pendingNewSessionAgentId,
   ]);
 
   // WebSocket
@@ -625,7 +773,11 @@ function ChatPageInner() {
     sendHumanInteractionResponse,
     stopGeneration,
     sendSteering,
-  } = useWebSocket(activeSessionId, activeAgentRunIdForSocket);
+  } = useWebSocket(
+    activeSessionId,
+    activeAgentRunIdForSocket,
+    currentSession?.agent_id ?? null,
+  );
   const isStreaming = selectGenerationIsStreaming(generationState, activeSessionId);
   const activeTool = selectGenerationActiveTool(generationState, activeSessionId);
   const activityMessage = selectGenerationActivityMessage(
@@ -659,6 +811,14 @@ function ChatPageInner() {
     }
     return null;
   }, [messages]);
+  const latestVoiceAssistantMessage = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "assistant" || !message.content.trim()) continue;
+      return { id: message.id, text: message.content };
+    }
+    return null;
+  })();
   const relatedAgentRunId = displayAgentRunId ?? latestAssistantAgentRunId;
   const chatBusy = selectGenerationIsBusy(generationState, activeSessionId);
   const generationInputBlocked =
@@ -705,6 +865,7 @@ function ChatPageInner() {
   const {
     attachedFiles,
     setAttachedFiles,
+    promoteAttachedFiles,
     handleChatFileDragOver,
     handleChatFileDrop,
   } = useChatAttachedFiles({ temporaryFileSessionKey, chatBusy });
@@ -824,6 +985,7 @@ function ChatPageInner() {
     bumpSessionForAssistant,
     handleCreateGroupChat,
     handleSendMessage,
+    handleRetryMessage,
     retryDeepResearchAssistantPersistence,
     handleEditMessage,
     handleRerunMessage,
@@ -835,7 +997,6 @@ function ChatPageInner() {
     activateSession,
     allProjects,
     effectiveProjectId,
-    isStoryChatSession,
     isGroupChat,
     includeProjectContext,
     deepResearchEnabled,
@@ -860,7 +1021,8 @@ function ChatPageInner() {
     setSteeringInstructions,
     setIsLoadingMessages,
     setSessionLoadError,
-    setWritingSession,
+    newSessionAgentId: pendingNewSessionAgentId,
+    onSessionAgentConsumed: () => setPendingAgentId(null),
   });
 
   const handleSendMessageFromComposer = useCallback(
@@ -911,8 +1073,14 @@ function ChatPageInner() {
     setExternalModelPromptDraft,
   });
 
+  const memorySelection = useMemorySelection({
+    sessionId: activeSessionId, lifecycle: generationState.lifecycle, messages,
+    enabled: memoryMode, busy: chatBusy, toolRevision: liveToolResults.length,
+  });
+
   useChatWebSocketEvents({
     lastMessage,
+    onMemorySelectionEvent: memorySelection.onEvent,
     activeSessionId,
     connectionGeneration,
     streamBuffer,
@@ -1069,43 +1237,6 @@ function ChatPageInner() {
     },
     [activeSessionId, activateSession, addSession, router],
   );
-  const handleForkStoryMessage = useCallback(
-    async (message: ConversationMessage) => {
-      const sourceEpisodeId = writingView?.episodeId;
-      if (!activeSessionId || !writingView?.workId || !sourceEpisodeId) {
-        toast.error("分岐元のStory本文が選択されていません");
-        return;
-      }
-      try {
-        const branchResult = await storyApi.updateStructure(
-          writingView.workId,
-          { ops: [{ op: "duplicate_as_branch", episode_id: sourceEpisodeId, choice_label: "チャットからの分岐", new_title: "チャットからの分岐" }] },
-        );
-        const branchEpisodeId = extractStoryEpisodeId(branchResult);
-        if (!branchEpisodeId) throw new Error("Story Studio の分岐先を取得できませんでした");
-        const forked = await chatApi.forkSession(activeSessionId, message.id);
-        const clonedWriting = normalizeWritingSession(
-          await storyApi.getWritingSessionByConversation(forked.session.id),
-        );
-        if (clonedWriting) {
-          await storyApi.updateWritingSession(clonedWriting.id, { episode_id: branchEpisodeId });
-        } else {
-          await storyApi.startWriting(writingView.workId, {
-            episode_id: branchEpisodeId,
-            conversation_session_id: forked.session.id,
-          });
-        }
-        addSession(forked.session);
-        activateSession(forked.session.id);
-        router.push(`/chat?s=${encodeURIComponent(forked.session.id)}`);
-        toast.success("物語とチャットを独立してフォークしました");
-      } catch (error) {
-        console.error("物語フォークエラー:", error);
-        toast.error("物語とチャットをフォークできませんでした");
-      }
-    },
-    [activeSessionId, activateSession, addSession, router, writingView],
-  );
   const {
     selectedRelatedTaskId,
     setSelectedRelatedTaskId,
@@ -1181,112 +1312,12 @@ function ChatPageInner() {
     id: "chat-workspace",
     routeKey: "/chat",
     contextRailPersistent: true,
+    contextRailPersistentVisible: contextRailVisible,
+    contextRailPresentation: memoryRailPresentation,
   });
 
-  return (
-    <div
-      className="chat-viewport-root relative flex h-full min-h-0 overflow-hidden bg-background text-on-surface"
-      onDragOver={handleChatFileDragOver}
-      onDrop={handleChatFileDrop}
-    >
-      {!isMobile && writingView && (
-        <div className="min-w-0 flex-1 border-r border-border-subtle bg-background">
-          <StoryChatAuthoringWorkspace
-            workId={writingView.workId}
-            episodeId={writingView.episodeId}
-            writingSessionId={writingView.id}
-            onAskAgent={(instruction) => {
-              void handleSendMessageFromComposer(instruction);
-            }}
-          />
-        </div>
-      )}
-      <div
-        className={
-          !isMobile && writingView
-            ? "flex w-[36%] min-w-0 shrink flex-col overflow-hidden bg-background"
-            : "flex min-w-0 flex-1 flex-col overflow-hidden bg-background"
-        }
-      >
-        {/* ヘッダーバー：チャット操作・ステアリングトグル */}
-        <div
-          className="flex min-h-12 shrink-0 items-center gap-2 border-b border-border-subtle bg-background px-4 py-2"
-          data-chat-toolbar="true"
-        >
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              className="inline-flex size-7 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-slate hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-              title="チャットメニュー"
-              aria-label="チャットメニュー"
-            >
-              <MoreHorizontal className="size-4" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start">
-              <DropdownMenuItem onClick={() => setGroupDialogOpen(true)}>
-                <Users className="size-4" />
-                グループチャットを作成
-              </DropdownMenuItem>
-              {isMobile && writingView && (
-                <DropdownMenuItem onClick={() => setMobileAuthoringOpen(true)}>
-                  <BookOpen className="size-4" />
-                  本文とアウトラインを表示
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-          {isMobile && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="text-text-secondary hover:bg-surface-slate hover:text-primary"
-              title="関連情報を開く"
-              aria-label="関連情報を開く"
-              onClick={() => setMobileRailOpen(true)}
-            >
-              <CheckSquare className="size-4" />
-            </Button>
-          )}
-          {projectAssociationLabel && (
-            <span className="inline-flex min-w-0 max-w-[52%] items-center gap-1 rounded border border-border-subtle bg-surface-charcoal px-2 py-1 text-[11px] text-text-secondary">
-              <FolderOpen className="size-3.5 shrink-0" />
-              <span className="truncate">
-                プロジェクト: {projectAssociationLabel}
-              </span>
-            </span>
-          )}
-          {(chatBusy || isStreaming) && (
-            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-primary" role="status">
-              <span className="size-2 animate-pulse rounded-full bg-primary" />
-              生成中…
-            </span>
-          )}
-          {isRpSession && activeSessionId && (
-            <Button
-              variant={steeringVisible ? "secondary" : "ghost"}
-              size="sm"
-              onClick={() => setSteeringVisible((v) => !v)}
-              title="ステアリングパネル"
-              className="h-7 rounded border border-transparent px-2 text-text-secondary hover:bg-surface-slate hover:text-primary data-[state=on]:border-primary/50"
-            >
-              <Sliders className="size-3.5" />
-            </Button>
-          )}
-          {isGroupChat && (
-            <span className="ml-auto truncate text-[11px] text-text-secondary">
-              グループチャット (
-              {currentSession?.participants
-                ?.map((p) => p.display_name || p.participant_id)
-                .join(", ") ||
-                currentSession?.group_character_names?.join(", ") ||
-                ""}
-              )
-            </span>
-          )}
-        </div>
-
-        {/* メッセージ */}
-        {isLoadingMessages ? (
+  const chatMessageContent = (
+    isLoadingMessages ? (
           <div className="flex flex-1 items-center justify-center bg-background">
             <div className="rounded-md border border-border-subtle bg-surface-container-low px-5 py-4 text-sm text-text-secondary">
               メッセージを読み込み中...
@@ -1332,16 +1363,158 @@ function ChatPageInner() {
             onTaskClick={setSelectedRelatedTaskId}
             onEditMessage={handleEditMessage}
             onForkMessage={handleForkMessage}
-            onForkStoryMessage={
-              writingView ? handleForkStoryMessage : undefined
-            }
             onRerunMessage={handleRerunMessage}
+            onRetryMessage={handleRetryMessage}
             onRetryMessagePersistence={retryDeepResearchAssistantPersistence}
             onSwitchBranch={handleSwitchBranch}
             responseModelOptions={responseModelOptions}
             responseModelOptionsLoading={responseModelOptionsLoading}
           />
-        )}
+        )
+  );
+
+  return (
+    <div
+      ref={chatViewportRef}
+      className="chat-viewport-root relative flex h-full min-h-0 overflow-hidden bg-background text-on-surface"
+      onDragOver={handleChatFileDragOver}
+      onDrop={handleChatFileDrop}
+    >
+      <div className="relative isolate flex min-w-0 flex-1 flex-col overflow-hidden">
+        <ChatWaveBackground
+          enabled={chatBackgroundPreference.enabled}
+          active={!memoryMode}
+          dark={resolvedTheme === "dark"}
+          viewportRef={chatViewportRef}
+        />
+        <div className={`relative z-10 flex min-w-0 flex-1 flex-col overflow-hidden ${chatBackgroundPreference.enabled === true && !memoryMode ? "bg-transparent" : "bg-background"} ${memoryMode ? "memory-chat-column" : ""}`} data-memory-chat={memoryMode || undefined}>
+        {/* ヘッダーバー：チャット操作・ステアリングトグル */}
+        <div
+          className="flex min-h-12 shrink-0 items-center gap-2 border-b border-border-subtle bg-background px-4 py-2 min-[768px]:flex-wrap min-[768px]:gap-1 min-[768px]:px-2 min-[900px]:gap-2 min-[900px]:px-4"
+          data-chat-toolbar="true"
+        >
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className="inline-flex size-7 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-slate hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+              title="チャットメニュー"
+              aria-label="チャットメニュー"
+            >
+              <MoreHorizontal className="size-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onClick={() => setGroupDialogOpen(true)}>
+                <Users className="size-4" />
+                グループチャットを作成
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <div
+            className="min-w-0 min-[768px]:min-w-[12rem] min-[768px]:max-w-full min-[768px]:shrink-0 min-[768px]:overflow-hidden"
+            data-testid="chat-agent-toolbar-slot"
+          >
+            <ChatAgentSelector
+              sessionId={activeSessionId}
+              sessionAgentId={currentSession?.agent_id ?? null}
+              pendingAgentId={pendingNewSessionAgentId}
+              projectId={agentCatalogProjectId}
+              disabled={appQueryContextPending}
+              busy={chatBusy || isStreaming}
+              isGroupChat={isGroupChat}
+              onPendingAgentChange={setPendingAgentId}
+              onSessionUpdated={upsertSession}
+            />
+          </div>
+          <div className="ml-auto flex gap-1" role="group" aria-label="チャットの表示">
+            <Button variant={memoryMode ? "ghost" : "secondary"} size="sm" aria-pressed={!memoryMode} onClick={() => changeChatDisplay("normal")}>通常</Button>
+            <Button variant={memoryMode ? "secondary" : "ghost"} size="sm" aria-pressed={memoryMode} onClick={() => changeChatDisplay("memory", "graph")}>記憶可視化</Button>
+          </div>
+          {isMobile ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-text-secondary hover:bg-surface-slate hover:text-primary"
+              title="関連情報を開く"
+              aria-label="関連情報を開く"
+              onClick={() => setMobileRailOpen(true)}
+            >
+              <CheckSquare className="size-4" />
+            </Button>
+          ) : !memoryMode ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              data-testid="chat-context-rail-toggle"
+              className="text-text-secondary hover:bg-surface-slate hover:text-primary"
+              title={contextRailToggleOpen ? "Context Railを閉じる" : "Context Railを開く"}
+              aria-label={contextRailToggleOpen ? "Context Railを閉じる" : "Context Railを開く"}
+              aria-expanded={contextRailToggleOpen}
+              disabled={!contextRailVisibilityHydrated}
+              onClick={handleContextRailToggle}
+            >
+              {contextRailToggleOpen ? (
+                <PanelRightClose className="size-4" aria-hidden="true" />
+              ) : (
+                <PanelRightOpen className="size-4" aria-hidden="true" />
+              )}
+            </Button>
+          ) : null}
+          {projectAssociationLabel && (
+            <span className="inline-flex min-w-0 max-w-[52%] items-center gap-1 rounded border border-border-subtle bg-surface-charcoal px-2 py-1 text-[11px] text-text-secondary">
+              <FolderOpen className="size-3.5 shrink-0" />
+              <span className="truncate">
+                プロジェクト: {projectAssociationLabel}
+              </span>
+            </span>
+          )}
+          {(chatBusy || isStreaming) && (
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-primary" role="status">
+              <span className="size-2 animate-pulse rounded-full bg-primary" />
+              生成中…
+            </span>
+          )}
+          {isRpSession && activeSessionId && (
+            <Button
+              variant={steeringVisible ? "secondary" : "ghost"}
+              size="sm"
+              onClick={() => setSteeringVisible((v) => !v)}
+              title="ステアリングパネル"
+              className="h-7 rounded border border-transparent px-2 text-text-secondary hover:bg-surface-slate hover:text-primary data-[state=on]:border-primary/50"
+            >
+              <Sliders className="size-3.5" />
+            </Button>
+          )}
+          {isGroupChat && (
+            <span className="ml-auto truncate text-[11px] text-text-secondary">
+              グループチャット (
+              {currentSession?.participants
+                ?.map((p) => p.display_name || p.participant_id)
+                .join(", ") ||
+                currentSession?.group_character_names?.join(", ") ||
+                ""}
+              )
+            </span>
+          )}
+        </div>
+
+        {memoryMode && !isLoadingMessages && !sessionLoadError ? (
+          <MemoryVisualization
+            key={activeGenerationKey ?? activeSessionId ?? "new"}
+            items={memorySelection.items} stages={memorySelection.stages}
+            history={memorySelection.history} liveObserved={memorySelection.liveObserved}
+            toolRecall={memorySelection.toolRecall} recheckToolReference={memorySelection.recheckToolReference}
+            liveToolObserved={(chatBusy || isStreaming) && liveToolResults.some(result => result.tool?.endsWith("search_past_chats") || result.tool?.endsWith("semantic_memory_search"))}
+            status={memorySelection.status} itemsPending={memorySelection.itemsPending} generationKey={activeGenerationKey}
+            agentRunId={displayAgentRunId} busy={chatBusy || isStreaming}
+            terminalPhase={generationState.lifecycle.sessionId === activeSessionId ? generationState.lifecycle.phase : "idle"}
+            view={memoryView} onViewChange={(view) => changeChatDisplay("memory", view)}
+            messages={messages} streamingContent={streamingContent} activityMessage={activityMessage}
+            pastSearchStatus={displayActiveTool?.includes("search_past_chats") ? "過去会話検索を実行中" : "過去会話検索は別の実検索として表示します"}
+            characterName={currentSession?.character_name || "アシスタント"}
+            composer={null} conversationHistory={chatMessageContent}
+          />
+        ) : chatMessageContent}
 
         {/* ステアリングパネル */}
         {isRpSession && activeSessionId && (
@@ -1370,6 +1543,7 @@ function ChatPageInner() {
             )}
           </div>
         )}
+        <div className={memoryMode ? "memory-host-composer" : undefined}>
         <ChatComposer
           onSend={handleSendMessageFromComposer}
           onSteer={handleSteerGeneration}
@@ -1379,6 +1553,7 @@ function ChatPageInner() {
           generationTerminalKey={generationTerminalKey}
           attachedFiles={attachedFiles}
           onAttachedFilesChange={setAttachedFiles}
+          onAttachmentsPromoted={promoteAttachedFiles}
           projectContextEnabled={includeProjectContext}
           onProjectContextToggle={setIncludeProjectContext}
           deepResearchEnabled={deepResearchEnabled}
@@ -1392,12 +1567,16 @@ function ChatPageInner() {
           projectId={effectiveProjectId}
           projectScopeReady={initialLoadComplete ?? true}
           sessionId={activeSessionId}
+          agentId={composerAgentId}
           contextSnapshot={contextSnapshot}
           contextSnapshotStatus={contextSnapshotStatus}
           appContext={effectiveAppContext}
           onAppContextChange={handleAppContextChange}
           ensureLiveVoiceConversationSession={ensureLiveVoiceConversationSession}
+          voiceAssistantMessage={latestVoiceAssistantMessage}
         />
+        </div>
+        </div>
       </div>
 
       {isMobile && (
@@ -1407,7 +1586,11 @@ function ChatPageInner() {
             setMobileRailOpen(open);
           }}
         >
-          <SheetContent side="right" className="w-[min(92vw,24rem)] p-0">
+          <SheetContent
+            side="right"
+            showCloseButton={false}
+            className="w-[min(92vw,24rem)] p-0"
+          >
             <SheetHeader className="sr-only">
               <SheetTitle>Context Rail</SheetTitle>
             </SheetHeader>
@@ -1433,25 +1616,6 @@ function ChatPageInner() {
                 />
               )}
             </div>
-          </SheetContent>
-        </Sheet>
-      )}
-
-      {isMobile && writingView && (
-        <Sheet open={mobileAuthoringOpen} onOpenChange={setMobileAuthoringOpen}>
-          <SheetContent side="left" className="w-screen max-w-none p-0">
-            <SheetHeader className="sr-only">
-              <SheetTitle>シナリオ執筆</SheetTitle>
-            </SheetHeader>
-            <StoryChatAuthoringWorkspace
-              workId={writingView.workId}
-              episodeId={writingView.episodeId}
-              writingSessionId={writingView.id}
-              onAskAgent={async (instruction) => {
-                await handleSendMessageFromComposer(instruction);
-                setMobileAuthoringOpen(false);
-              }}
-            />
           </SheetContent>
         </Sheet>
       )}
@@ -1524,6 +1688,10 @@ function ChatPageInner() {
         open={conversationSearchOpen}
         onOpenChange={setConversationSearchOpen}
         projectId={selectedProjectId}
+        spaceId={selectedSpaceId}
+        sessionId={activeSessionId}
+        messageId={[...messages].reverse().find((message) => message.role === "user" &&
+          message.metadata?.attachments?.length && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(message.id))?.id}
         onSelectResult={handleSelectSearchResult}
       />
     </div>

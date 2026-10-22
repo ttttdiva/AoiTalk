@@ -106,7 +106,11 @@ async def initialize_tts_engine(
                 engine_initialized = True
 
     elif normalized_engine == "voicevox":
-        voicevox_path = _config_get(config, "voicevox_path")
+        # Config.voicevox_path resolves configured paths, environment variables,
+        # and platform defaults; Config.get("voicevox_path") is not that property.
+        voicevox_path = getattr(config, "voicevox_path", None) or _config_get(
+            config, "voicevox_path"
+        ) or _config_get(config, "voicevox_engine_path")
         voicevox_engine = await tts_manager.create_voicevox_engine(voicevox_path)
         if voicevox_engine:
             tts_manager.register_engine("voicevox", voicevox_engine)
@@ -125,6 +129,15 @@ async def initialize_tts_engine(
         if miotts_engine:
             tts_manager.register_engine("miotts", miotts_engine)
             tts_manager.set_engine("miotts")
+            engine_initialized = True
+
+    elif normalized_engine == "gemini_tts":
+        gemini_engine = await tts_manager.create_gemini_tts_engine(
+            _config_get(config, "gemini_api_key")
+        )
+        if gemini_engine:
+            tts_manager.register_engine("gemini_tts", gemini_engine)
+            tts_manager.set_engine("gemini_tts")
             engine_initialized = True
 
     if not engine_initialized:

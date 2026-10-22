@@ -7,7 +7,9 @@ import { CHAT_TIMEOUT } from "../constants/config";
 import type {
   ChatResponseModelSelection,
   AgentRun,
+  ConversationAgent,
   ConversationSession,
+  ConversationHistoryStatus,
   ConversationMessage,
   LlmModelCatalogResponse,
 } from "../types/api";
@@ -16,6 +18,8 @@ import { requireCharacterSlug } from "./character-api";
 
 type CanonicalConversationSearchResponse =
   GeneratedApiComponents["schemas"]["ConversationSearchResponse"];
+type CanonicalConversationHistoryResponse =
+  GeneratedApiComponents["schemas"]["ConversationHistoryListResponse"];
 import type {
   ChatCommandCapability,
   SkillSlashCommand,
@@ -33,6 +37,10 @@ export type ChatAppContext = {
 };
 
 export type CreateSessionOptions = ChatAppContext & {
+  /** Stable local UUID; the dedicated PUT is safe after a lost response. */
+  clientSessionId?: string;
+  /** Agent主体を新規会話へ任意にbindingする。 */
+  agentId?: string | null;
   mainRoute?: {
     provider?: string;
     model?: string;
@@ -112,6 +120,11 @@ export type ConversationSearchResult = {
   created_at?: string | null;
   last_activity?: string | null;
   project_id?: string | null;
+  /** Same server-owned projection used by the history list. */
+  history_status?: ConversationHistoryStatus | null;
+  history_completed_at?: string | null;
+  is_pinned?: boolean;
+  pinned_at?: string | null;
 };
 
 export type GenerationSteerResponse = {
@@ -248,8 +261,15 @@ export const chatApi = {
     });
   },
 
-  async getLlmModelCatalog(): Promise<LlmModelCatalogResponse> {
-    return fetchApi<LlmModelCatalogResponse>("/api/llm/models");
+  async getLlmModelCatalog(options: {
+    refresh?: boolean;
+    provider?: string | null;
+  } = {}): Promise<LlmModelCatalogResponse> {
+    const query = new URLSearchParams();
+    if (options.refresh) query.set("refresh", "true");
+    if (options.provider?.trim()) query.set("provider", options.provider.trim());
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return fetchApi<LlmModelCatalogResponse>(`/api/llm/models${suffix}`);
   },
 
   async listSkillSlashCommands(projectId?: string | null): Promise<SkillSlashCommand[]> {
@@ -270,10 +290,71 @@ export const chatApi = {
     if (options?.appId) query.set("app_id", options.appId);
     if (options?.appTargetId) query.set("app_target_id", options.appTargetId);
     const params = query.toString() ? `?${query.toString()}` : "";
-    const data = await fetchApi<{ conversations: ConversationSession[] }>(
+    const data = await fetchApi<CanonicalConversationHistoryResponse>(
       `/api/conversations${params}`,
     );
-    return data.conversations;
+    return data.conversations as unknown as ConversationSession[];
+  },
+
+  /** 認証済みユーザーが利用できる安全なAgentカタログ。 */
+  async listConversationAgents(options: {
+    sessionId?: string | null;
+    projectId?: string | null;
+  } = {}): Promise<{ agents: ConversationAgent[] }> {
+    const query = new URLSearchParams();
+    if (options.sessionId?.trim()) query.set("session_id", options.sessionId.trim());
+    if (options.projectId?.trim()) query.set("project_id", options.projectId.trim());
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return fetchApi<{ agents: ConversationAgent[] }>(
+      `/api/conversation-agents${suffix}`,
+      {},
+      CHAT_TIMEOUT,
+    );
+  },
+
+  /** Agentに紐付く会話をACL適用済みのprojectionとして取得する。 */
+  async listAgentConversations(
+    agentId: string,
+  ): Promise<{ sessions: ConversationSession[] }> {
+    return fetchApi<{ sessions: ConversationSession[] }>(
+      `/api/agents/${encodeURIComponent(agentId)}/conversations`,
+      {},
+      CHAT_TIMEOUT,
+    );
+  },
+
+  /** Agent主体のrun履歴。サーバーが返す安全なprojectionだけを扱う。 */
+  async listAgentRuns(
+    agentId: string,
+  ): Promise<{ runs: AgentRun[] }> {
+    return fetchApi<{ runs: AgentRun[] }>(
+      `/api/agents/${encodeURIComponent(agentId)}/agent-runs`,
+      {},
+      CHAT_TIMEOUT,
+    );
+  },
+
+  /** 既存セッションのAgent bindingをCASで変更する。 */
+  async updateSessionAgent(
+    sessionId: string,
+    agentId: string | null,
+    expectedAgentId: string | null,
+  ): Promise<ConversationSession> {
+    const data = await fetchApi<{
+      success?: boolean;
+      session: ConversationSession;
+    }>(
+      `/api/conversations/${encodeURIComponent(sessionId)}/agent`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          agent_id: agentId,
+          expected_agent_id: expectedAgentId,
+        }),
+      },
+      CHAT_TIMEOUT,
+    );
+    return data.session;
   },
 
   /** Canonical FastAPI online conversation search endpoint. */
@@ -313,7 +394,7 @@ export const chatApi = {
     legacyMainRoute?: CreateSessionOptions["mainRoute"],
   ): Promise<ConversationSession> {
     const normalizedOptions: Partial<CreateSessionOptions> =
-      options && ("appId" in options || "appTargetId" in options || "mainRoute" in options)
+      options && ("appId" in options || "appTargetId" in options || "mainRoute" in options || "clientSessionId" in options || "agentId" in options)
         ? options
         : {
             ...(legacyAppContext?.appId ? { appId: legacyAppContext.appId } : {}),
@@ -322,21 +403,28 @@ export const chatApi = {
               : {}),
             ...(legacyMainRoute ? { mainRoute: legacyMainRoute } : {}),
           };
-    const body: Record<string, string> = {
+    const body: Record<string, unknown> = {
       character_name: requireCharacterSlug(characterName),
     };
     if (projectId) body.project_id = projectId;
     if (normalizedOptions.appId) body.app_id = normalizedOptions.appId;
     if (normalizedOptions.appTargetId) body.app_target_id = normalizedOptions.appTargetId;
+    if (normalizedOptions.agentId !== undefined) {
+      body.agent_id = normalizedOptions.agentId;
+    }
     const mainRoute = normalizedOptions.mainRoute;
 
     const data = await fetchApi<{
       session: ConversationSession;
       first_message?: string;
     }>(
-      "/api/conversations",
+      normalizedOptions.clientSessionId
+        ? `/api/conversations/client/${encodeURIComponent(normalizedOptions.clientSessionId)}`
+        : "/api/conversations",
       {
-        method: "POST",
+        // Never fall back to POST on a legacy server's 404/405. That request
+        // cannot safely be replayed when its response is lost.
+        method: normalizedOptions.clientSessionId ? "PUT" : "POST",
         body: JSON.stringify({
           ...body,
           ...(mainRoute?.provider && mainRoute?.model
@@ -461,6 +549,8 @@ export const chatApi = {
     data: {
       message: string;
       project_id?: string;
+      /** Optional project context hint for the projectless AoiDots root. */
+      context_project_hint_id?: string | null;
       app_id?: string | null;
       app_target_id?: string | null;
       agent_mode?: string;
@@ -470,6 +560,8 @@ export const chatApi = {
       response_model?: ChatResponseModelSelection;
       command_capabilities?: ChatCommandCapability[];
       tools_required?: boolean;
+      /** Exact session Agent binding observed when the input was queued. */
+      expected_agent_id?: string | null;
       mentions?: Array<{ type: string; id: string; name: string }>;
       attachments?: Array<ChatAttachmentMetadata | Record<string, unknown>>;
       client_message_id?: string;
@@ -483,6 +575,7 @@ export const chatApi = {
   }> {
     const body = {
       ...data,
+      expected_agent_id: data.expected_agent_id ?? null,
       ...(data.attachments
         ? { attachments: sanitizeChatAttachmentMetadata(data.attachments) }
         : {}),
@@ -648,10 +741,14 @@ export const chatApi = {
   },
 
   /** タイトル更新 */
-  async updateTitle(sessionId: string, title: string): Promise<void> {
+  async updateTitle(
+    sessionId: string,
+    title: string,
+    source?: "llm" | "fallback",
+  ): Promise<void> {
     await fetchApi(`/api/conversations/${sessionId}`, {
       method: "PUT",
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, ...(source ? { title_source: source } : {}) }),
     });
   },
 

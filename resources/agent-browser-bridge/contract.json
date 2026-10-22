@@ -1,0 +1,119 @@
+{
+  "bridge_protocol": 1,
+  "capabilities": [
+    "metadata-targets-v1",
+    "existing-target-v1",
+    "existing-target-discovery-v1",
+    "local-target-labels-v1",
+    "strict-refs-v1",
+    "redact-editable-values-v1",
+    "private-command-v1",
+    "local-verify-v1",
+    "persistent-session-v1",
+    "crowdworks-inspection-v1"
+  ],
+  "daemon_stamp": "0.38.2+bridge.4",
+  "config_required_each_command": {
+    "cdp": "<validated exact endpoint>",
+    "attachTarget": "<known target OR omit with discoverExisting:true; mutually exclusive>",
+    "strictRefs": true,
+    "noAutoDialog": true,
+    "noWebmcp": true,
+    "session": "<owned unique Bridge-lifetime session>",
+    "namespace": "aoitalk-pc-bridge"
+  },
+  "snapshot_command": [
+    "snapshot",
+    "--interactive",
+    "--redact-editable-values",
+    "--json"
+  ],
+  "ref_rule": "Fresh per-snapshot refs; exact node/frame/document/URL/meaning guard; no role/name/nth fallback; selector roots exclude descendants of every in-scope AX ancestor, including virtual/ignored nodes, so each ref is rendered once",
+  "input_rule": "Before strict fill/type, activate only the bound parent page via Page.bringToFront, recheck exact ref identity, then retain Document.hasFocus and native deep focus guards. A confirmed native focus rejection before clear/insert returns FOCUS_CHANGED with executed:false; transport failures and post-input drift stay outcome_unknown. No replay. Type rejects Tab/CR/LF; literal fill for multiline; no unconfirmed checkbox second click",
+  "rebind_rule": "Explicit same-connection target selection only; no fallback. Failed persistence blocks commands. Explicit reconnect is the only new-WS recovery and is never automatic.",
+  "retry_rule": "Strict CLI transport at most once; no daemon respawn/replay after transport failure; outcome_unknown stops automatic retry",
+  "private_command": {
+    "argv": [
+      "--config",
+      "<owned fixed config>",
+      "--json",
+      "bridge-command",
+      "--stdin"
+    ],
+    "stdin": "UTF-8 exact object {\"argv\":[\"command\", \"argument\", ...]}",
+    "maximum_bytes": 65536,
+    "one_command_only": true,
+    "batch_or_nested_commands": false,
+    "sensitive_operands_in_argv": false
+  },
+  "local_verify": {
+    "command": "verify --expected-url URL --expected-text TEXT [--ref @eN --expected-value VALUE] through private stdin",
+    "predicates": "At least one; all supplied predicates must match",
+    "value": "Exact native input/textarea/select value including empty; contenteditable value unsupported",
+    "response": {
+      "matched": "boolean only"
+    }
+  },
+  "cached_counters": [
+    "connect_attempts",
+    "explicit_reconnects",
+    "target_attach_attempts",
+    "target_set_auto_attach_attempts",
+    "auto_attached_events",
+    "daemon_starts"
+  ],
+  "bootstrap": {
+    "config": "discoverExisting:true,strictRefs:true,ownedfixedsession",
+    "initial": "One retainedWS,zero pageattach/domains/autoattach",
+    "selection": "Explicit fullcase-sensitive pagetargetID; firstselection binds cachedmetadata aftersingleattach/setup withoutfocus/getURL/getTitle",
+    "zero_targets": "unavailablewithsameconnectionretained; noimplicitblanktab",
+    "snapshot_and_actions_before_selection": "TARGET_SELECTION_REQUIRED; notexecuted",
+    "session_info": "cached,noCDPquery",
+    "regular_tab_list": "origin/id/type/active only,no title",
+    "local_GUI_titles": {
+      "transport": "native private stdin only: {argv:[tab,list,--local-labels]}",
+      "limits": "512 Unicode scalars; control/bidi sanitized; nofullURL/body/inputvalues",
+      "boundaries": "MCP andWSS rejectlocal-label requests; onlylocalGUI projectionreceives title"
+    }
+  },
+  "crowdworks_inspection": {
+    "stdin": {
+      "argv": [
+        "crowdworks-inspect"
+      ]
+    },
+    "scope": "Explicit selected strict target; HTTPS crowdworks.jp or www.crowdworks.jp /public/jobs subtree. No fallback target or generic eval.",
+    "output": "origin, candidates:{cw_N:{href,label,context}}, text, coverage; IDs never grant action authority",
+    "complete": "Full bounded main/light-DOM output only; unsupported or overflow returns no partial data. One pierced DOM capture may contain descendant metadata before projection.",
+    "guards": "Exact target and strict document identity before/after; queued iframe initialization/resume excluded; mixed-job card contexts rejected.",
+    "limits": {
+      "candidates": 200,
+      "label_utf8_bytes": 4096,
+      "context_utf8_bytes": 16000,
+      "text_utf8_bytes": 131072,
+      "text_and_candidate_strings_utf8_bytes": 524288,
+      "serialized_data_utf8_bytes": 786432
+    },
+    "unverified": "Real CrowdWorks layouts and Windows bridge.4 execution"
+  },
+  "connection_failure_diagnostics": {
+    "field": "data.connectionDiagnostic",
+    "scope": "Optional fixed stage on strict launch with code unavailable only; no replay or connection changes",
+    "codes": [
+      "websocket_timeout",
+      "websocket_connect_error",
+      "target_discovery_timeout",
+      "target_discovery_error",
+      "target_metadata_timeout",
+      "target_metadata_error"
+    ],
+    "compatibility": "code and data.executed retain their existing meaning; older pinned helpers omit the optional field",
+    "privacy": "Exact static internal messages only; no exception text, URL, headers, target IDs or browser response payloads",
+    "stages": {
+      "websocket": "Existing browser WebSocket handshake/connect",
+      "target_discovery": "Target.setDiscoverTargets",
+      "target_metadata": "Target.getTargets and typed response decoding"
+    },
+    "errors": "Each stage distinguishes timeout from error; error does not imply a permission refusal"
+  }
+}

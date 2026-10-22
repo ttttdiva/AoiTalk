@@ -120,6 +120,8 @@ export type KnowledgeCaptureCandidate = {
   status: KnowledgeCaptureCandidateStatus;
   version: number;
   publicationGuardAdoptionRequired: boolean;
+  canWrite?: boolean;
+  canPublish?: boolean;
   question: KnowledgeCaptureQuestion | null;
   questions: KnowledgeCaptureQuestion[];
   draft: KnowledgeCaptureDraft | null;
@@ -591,6 +593,8 @@ export function normalizeKnowledgeCaptureCandidate(
       root.publication_guard_adoption_required,
       booleanValue(root.publicationGuardAdoptionRequired, false),
     ),
+    canWrite: typeof root.can_write === "boolean" ? root.can_write : undefined,
+    canPublish: typeof root.can_publish === "boolean" ? root.can_publish : undefined,
     question,
     questions,
     draft: candidateDraft,

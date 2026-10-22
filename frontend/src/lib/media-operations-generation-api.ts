@@ -429,6 +429,11 @@ export const mediaGenerationApi = {
     );
   },
 
+  async retireWorkspace(id: string, expectedConfigHash: string): Promise<GenerationWorkspace> {
+    return request<GenerationWorkspace>(`/operations/media/generation-workspaces/${encodeId(id)}/retire`,
+      { method: "POST", ...jsonBody({ expected_config_hash: expectedConfigHash }) });
+  },
+
   async listRecipes(personaId?: string | null): Promise<CreativeRecipe[]> {
     return request<CreativeRecipe[]>(
       `/operations/media/creative-recipes${querySuffix({ persona_id: personaId })}`,

@@ -129,12 +129,6 @@ agents:
     enabled: true
   spotify:
     enabled: false
-  scenario:
-    enabled: false
-  writing:
-    enabled: false
-  import:
-    enabled: false
 
 # Ordinary employee Agents may use this capability only from a native Windows
 # AoiTalk process, and only for the mediated filesystem/RepoMap APIs.  The

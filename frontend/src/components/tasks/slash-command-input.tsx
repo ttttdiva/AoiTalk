@@ -200,8 +200,6 @@ export function SlashCommandInput({
   // --- コマンド補完メニュー ---
   const [showMenu, setShowMenu] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(0);
-  const [commandSelectionExplicit, setCommandSelectionExplicit] =
-    useState(false);
   const [filtered, setFiltered] = useState<SlashCommandDef[]>([]);
   const [slashPos, setSlashPos] = useState(-1);
 
@@ -329,7 +327,6 @@ export function SlashCommandInput({
       if (matches.length > 0) {
         setFiltered(matches);
         setSelectedIdx(0);
-        setCommandSelectionExplicit(false);
         setSlashPos(lastSlash);
         setShowMenu(true);
       } else {
@@ -495,12 +492,10 @@ export function SlashCommandInput({
         switch (e.key) {
           case "ArrowDown":
             e.preventDefault();
-            setCommandSelectionExplicit(true);
             setSelectedIdx((prev) => (prev + 1) % filtered.length);
             break;
           case "ArrowUp":
             e.preventDefault();
-            setCommandSelectionExplicit(true);
             setSelectedIdx(
               (prev) => (prev - 1 + filtered.length) % filtered.length,
             );
@@ -509,7 +504,6 @@ export function SlashCommandInput({
           case "Tab":
             e.preventDefault();
             e.stopPropagation();
-            if (filtered.length > 1 && !commandSelectionExplicit) break;
             applyCommand(filtered[selectedIdx]);
             break;
           case "Escape":
@@ -568,7 +562,6 @@ export function SlashCommandInput({
       showMenu,
       filtered,
       selectedIdx,
-      commandSelectionExplicit,
       applyCommand,
       showCandidates,
       candidateList,
@@ -640,7 +633,6 @@ export function SlashCommandInput({
               )}
               onMouseEnter={() => {
                 setSelectedIdx(idx);
-                setCommandSelectionExplicit(true);
               }}
               onMouseDown={(e) => {
                 e.preventDefault(); // blur 防止

@@ -7,7 +7,6 @@ import {
   Button,
   Chip,
   Dialog,
-  IconButton,
   Portal,
   Surface,
   Text,
@@ -16,6 +15,7 @@ import {
 import { format } from "date-fns";
 import { useAuth } from "../../../contexts/AuthContext";
 import { memoryApi } from "../../../lib/memory-api";
+import { ScreenHeader } from "../../../components/screen-header";
 import type { ScopedMemory } from "../../../types/api";
 
 type EditingState = {
@@ -185,26 +185,13 @@ export default function SettingsMemoryScreen() {
   }, []);
 
   return (
-    <>
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-        <Surface style={styles.header} elevation={1}>
-          <View style={styles.headerRow}>
-            <IconButton
-              icon="arrow-left"
-              iconColor="#cdd6f4"
-              onPress={() => goBackOrReplace(router, '/(tabs)/settings')}
-            />
-            <View style={{ flex: 1 }}>
-              <Text variant="titleLarge" style={styles.headerTitle}>
-                User Memory
-              </Text>
-              <Text style={styles.headerSubtext}>
-                会話から保存されたユーザー情報を確認・編集します。
-              </Text>
-            </View>
-          </View>
-        </Surface>
-
+    <View style={styles.container}>
+      <ScreenHeader
+        title="User Memory"
+        subtitle="会話から保存されたユーザー情報を確認・編集します。"
+        onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+      />
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
         <Surface style={styles.card} elevation={0}>
           <View style={styles.sectionHeader}>
             <View>
@@ -351,22 +338,14 @@ export default function SettingsMemoryScreen() {
           </Dialog.Actions>
         </Dialog>
       </Portal>
-    </>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
+  scroll: { flex: 1 },
   content: { paddingBottom: 32 },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
-  },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 4 },
   card: {
     backgroundColor: "#1e1e2e",
     borderRadius: 16,

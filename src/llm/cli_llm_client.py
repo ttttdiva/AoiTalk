@@ -7,6 +7,7 @@ AgentLLMClientと互換のインターフェースを提供する。
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import tempfile
@@ -29,6 +30,14 @@ from ..services.project_context import (
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
+from ..services.agent_run_service import get_current_agent_run_id
+from ..services.agent_dialogue_workspace import (
+    AgentDialogueWorkspace,
+    AgentDialogueWorkspaceDenied,
+    bind_agent_dialogue_workspace,
+    reset_agent_dialogue_workspace,
+    get_current_agent_dialogue_workspace,
+)
 from .manager_parts.context_building import strip_project_context_bundle
 from ..services.turn_context import (
     AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
@@ -48,11 +57,6 @@ from .context_snapshot import (
     sanitized_snapshot_series,
     snapshot,
 )
-from ..services.story_chat_context import (
-    build_story_chat_context,
-    run_story_chat_context_sync,
-    is_story_workflow_tool_allowed,
-)
 from .cli_backends.base import CLIBackendBase, CLISessionCapabilities
 from .cli_sessions import (
     CLINativeSessionScope,
@@ -69,13 +73,24 @@ from .agent_runtime import (
     build_tool_hint_context_sync,
     combined_final_response_check,
     compose_tool_hint_user_message,
+    dialogue_provider_max_output_tokens,
+    dialogue_provider_tool_round_limit,
     guard_tool_execution_claims,
     project_context_required_read_tool_names,
+)
+from .cli_native_capabilities import (
+    CLI_NATIVE_EDIT_TOOL_NAMES,
+    cli_native_duplicate_tool_names,
+    mcp_servers_for_cli_backend,
+    registry_without_names,
 )
 from .cli_tool_context import build_cli_tool_context
 from .context_budget import clip_text
 from .unified_turn_runtime import (
     CLI_TOOL_LOOP_FAILURE_MESSAGE,
+    ToolNoProgressGuard,
+    activate_tool_no_progress_guard,
+    current_tool_no_progress_guard,
     run_cli_tool_call_loop,
 )
 
@@ -88,7 +103,7 @@ from ..memory.history import HistoryManager
 from ..reasoning import ReasoningManager
 
 # Unified tool registry and adapters
-from ..tools.adapters import CLIAdapter
+from ..tools.adapters import CLIAdapter, OpenAIAPIAdapter
 from ..tools.registry import ToolRegistry
 from .generation_policy import (
     DEFAULT_GENERATION_POLICY,
@@ -101,15 +116,21 @@ from .generation_cancellation import (
     GenerationCancelled,
     GenerationInterrupted,
     get_current_generation_cancellation,
+    register_generation_cancellation,
     raise_if_generation_interrupted,
+    release_generation_cancellation,
+    reset_current_generation_cancellation,
+    set_current_generation_cancellation,
+    cli_backend_call_scope,
+    run_owned_cli_worker,
 )
+from .generation_budget import current_generation_budget
 from .runtime_tool_registry import (
     build_runtime_tool_registry,
     build_runtime_tool_registry_for_client,
 )
 from .tool_packs import ensure_load_tool_pack_tool
 from .tool_exposure import (
-    apply_story_pack_auto_load,
     effective_tool_pack_session,
     filter_tools_for_client,
     filtered_registry_for_client,
@@ -133,6 +154,7 @@ MAX_CLI_TOOL_RESULT_MAX_CHARS = 16000
 DEFAULT_CLI_TOOL_ROUND_LIMIT = 5
 DEFAULT_CLI_WORK_TOOL_ROUND_LIMIT = 12
 MAX_CLI_TOOL_ROUND_LIMIT = 12
+CLI_PLAIN_TEXT_LOCK_POLL_SECONDS = 0.05
 CLI_TOOL_LOOP_EXHAUSTED_MESSAGE = (
     "ツール実行回数の上限に達したため、処理を完了できませんでした。"
     "未完了の操作は実行していないため、内容を確認してから再実行してください。"
@@ -319,7 +341,18 @@ class CLILLMClient:
             and not Features.is_enterprise()
             and config.get('mcp_enabled', False)
         ):
-            self._mcp_servers = config.get('mcp', {}).get('servers', {})
+            # Bundled filesystem/shell MCP servers duplicate the CLI's own
+            # native tools; AoiTalk-specific and user-added servers are kept.
+            self._mcp_servers, skipped_mcp = mcp_servers_for_cli_backend(
+                config.get('mcp', {}).get('servers', {}),
+                self.cli_backend,
+            )
+            if skipped_mcp:
+                logger.info(
+                    "[CLILLMClient] MCP: skipped %s (duplicates %s native tools)",
+                    ", ".join(sorted(skipped_mcp)),
+                    self.cli_backend.get_provider_name(),
+                )
             if self._mcp_servers:
                 mcp_args = self.cli_backend.get_mcp_args(self._mcp_servers)
                 if mcp_args:
@@ -514,6 +547,31 @@ class CLILLMClient:
         return capabilities if isinstance(capabilities, CLISessionCapabilities) else CLISessionCapabilities()
 
     def _native_chat_session_allowed(self) -> bool:
+        # Provider-managed continuations can retain native shell/apply-patch/
+        # MCP state outside AoiTalk's registry.  A Chat Agent may use such a
+        # session only when an already-issued finite repository scope is
+        # bound; otherwise stay stateless and let the invocation gate choose
+        # an attested tool-free lane (or deny before the provider starts).
+        try:
+            agent_turn = bool(
+                getattr(get_turn_context(), "agent_execution_binding", None) is not None
+                or getattr(self, "_agent_native_scope_required", False)
+            )
+        except Exception:
+            agent_turn = bool(getattr(self, "_agent_native_scope_required", False))
+        if agent_turn:
+            try:
+                from ..security.agent_run_scope import get_current_run_scope
+
+                current_scope = get_current_run_scope()
+                proof = getattr(self, "_agent_native_scope_proof", None)
+                if current_scope is None or proof is None:
+                    return False
+                proof.assert_lease()
+                if current_scope is not proof.scope:
+                    return False
+            except Exception:
+                return False
         # Reserved controller turns such as AoiTalk Help must always receive
         # the full stateless bootstrap.  Resuming a provider-managed native
         # lease would replace that bootstrap with a continuation context and
@@ -540,6 +598,100 @@ class CLILLMClient:
             return False
         return True
 
+    def _bind_fresh_native_provider_entry(self):
+        """Freshly revalidate the durable Agent proof before provider auth."""
+
+        if not self._agent_prompt_active():
+            return None
+        workspace = self._bound_agent_dialogue_workspace()
+        proof = getattr(self, "_agent_native_scope_proof", None)
+        if workspace is None or proof is None:
+            raise AgentDialogueWorkspaceDenied(
+                "native provider launch requires the issued Agent scope proof"
+            )
+        try:
+            from ..security.agent_run_scope import (
+                bind_run_scope,
+                get_current_run_scope,
+                reset_run_scope,
+            )
+            from ..security.harness_execution_scope import (
+                bind_harness_execution_scope,
+                reset_harness_execution_scope,
+            )
+            from ..services.agent_run_scope_service import (
+                revalidate_interactive_agent_run_scope,
+            )
+
+            current_scope = get_current_run_scope()
+            if current_scope is not proof.scope:
+                raise AgentDialogueWorkspaceDenied(
+                    "native provider launch scope is not the retained issued proof"
+                )
+            fresh = self._run_async_in_new_loop(
+                revalidate_interactive_agent_run_scope(
+                    proof,
+                    provider_id=str(workspace.provider_id),
+                    model_id=str(workspace.model_id),
+                    workspace_path=workspace.workspace_path,
+                    project_id=workspace.project_id,
+                    config=getattr(self, "config", None),
+                )
+            )
+            refreshed_workspace = replace(workspace, native_scope=fresh.scope)
+            previous_proof = proof
+            previous_workspace = workspace
+            run_token = None
+            harness_token = None
+            workspace_token = None
+            try:
+                run_token = bind_run_scope(fresh.scope)
+                harness_token = bind_harness_execution_scope(fresh.execution_scope)
+                workspace_token = bind_agent_dialogue_workspace(refreshed_workspace)
+            except Exception:
+                if workspace_token is not None:
+                    reset_agent_dialogue_workspace(workspace_token)
+                if harness_token is not None:
+                    reset_harness_execution_scope(harness_token)
+                if run_token is not None:
+                    reset_run_scope(run_token)
+                raise
+            # The fresh proof is active only for this launch. Cleanup restores
+            # the retained proof so the next launch repeats the DB re-read.
+            self._agent_native_scope_proof = fresh
+            self._agent_dialogue_workspace = refreshed_workspace
+            return (
+                reset_run_scope,
+                run_token,
+                reset_harness_execution_scope,
+                harness_token,
+                reset_agent_dialogue_workspace,
+                workspace_token,
+                previous_proof,
+                previous_workspace,
+            )
+        except Exception:
+            raise
+
+    def _reset_fresh_native_provider_entry(self, binding: Any) -> None:
+        if not binding:
+            return
+        (
+            reset_run,
+            run_token,
+            reset_harness,
+            harness_token,
+            reset_workspace,
+            workspace_token,
+            previous_proof,
+            previous_workspace,
+        ) = binding
+        reset_workspace(workspace_token)
+        reset_harness(harness_token)
+        reset_run(run_token)
+        self._agent_native_scope_proof = previous_proof
+        self._agent_dialogue_workspace = previous_workspace
+
     def _build_cli_session_scope(self, cwd: Path) -> CLINativeSessionScope:
         provider = self.cli_backend.get_provider_name().lower().replace(" ", "-")
         model = str(
@@ -558,6 +710,31 @@ class CLILLMClient:
             except Exception:
                 user_custom_instructions = None
         policy = get_client_generation_policy(self)
+        proof = getattr(self, "_agent_native_scope_proof", None)
+        binding = getattr(self, "_agent_execution_binding", None)
+        current_mcp_servers = self._current_mcp_servers()
+        # The formal MCP context contains a rotated lease token. Keep the
+        # server/policy shape in continuation fingerprints while excluding
+        # per-run bearer material so same-conversation fresh runs can resume
+        # only when the actual policy remains stable.
+        fingerprint_mcp_servers = {
+            str(name): {
+                key: value
+                for key, value in settings.items()
+                if key != "_aoitalk_formal_agent_context"
+            }
+            if isinstance(settings, dict)
+            else settings
+            for name, settings in current_mcp_servers.items()
+        }
+        policy_fingerprint = fingerprint_settings(
+            {
+                "profile": str(policy.profile),
+                "permission_policy": str(policy.permission_policy),
+                "mcp_servers": fingerprint_mcp_servers,
+                "native_tools": getattr(self, "_native_tools_enabled", None),
+            }
+        )
         fingerprint = fingerprint_settings(
             {
                 "provider": provider,
@@ -578,8 +755,19 @@ class CLILLMClient:
                         "CLAUDE_ALLOWED_TOOLS",
                     )
                 },
-                "mcp_servers": sorted(str(key) for key in self._mcp_servers),
+                "mcp_servers": fingerprint_mcp_servers,
+                "tool_surface": OpenAIAPIAdapter.convert_all(self._cli_tool_registry().get_all()),
                 "include_project_context": self.current_include_project_context,
+                "agent_revision_id": (
+                    getattr(proof, "agent_revision_id", None)
+                    or getattr(binding, "agent_revision_id", None)
+                ),
+                "binding_snapshot_hash": getattr(proof, "binding_snapshot_hash", None),
+                "capability_manifest_digest": getattr(
+                    proof, "capability_manifest_digest", None
+                ),
+                "authority_digest": getattr(proof, "authority_digest", None),
+                "policy_fingerprint": policy_fingerprint,
             }
         )
         project_key = str(self.current_project_id or "none")
@@ -591,6 +779,18 @@ class CLILLMClient:
             project_key=project_key,
             working_directory=str(cwd.resolve()),
             fingerprint=fingerprint,
+            agent_run_id=getattr(proof, "run_id", None),
+            agent_revision_id=(
+                getattr(proof, "agent_revision_id", None)
+                or getattr(binding, "agent_revision_id", None)
+            ),
+            binding_snapshot_hash=getattr(proof, "binding_snapshot_hash", None),
+            capability_manifest_digest=getattr(
+                proof, "capability_manifest_digest", None
+            ),
+            authority_digest=getattr(proof, "authority_digest", None),
+            policy_fingerprint=policy_fingerprint if proof is not None else None,
+            provider_cache_root=getattr(proof, "provider_cache_root", None),
         )
 
     def _build_cli_continuation_context(
@@ -623,19 +823,7 @@ class CLILLMClient:
         tool_results_text: str,
     ) -> str:
         """Return only new tool results for a provider-managed conversation."""
-        suppress_automatic_context = bool(
-            getattr(get_turn_context(), "suppress_automatic_context", False)
-        )
-        story_chat_context = (
-            None
-            if suppress_automatic_context
-            else self._get_story_chat_context_sync()
-        )
-        task_instruction = (
-            "シナリオ進行の応答を続けてください。"
-            if story_chat_context
-            else "ツール結果に基づいて、ユーザーへ自然な最終回答を返してください。"
-        )
+        task_instruction = "ツール結果に基づいて、ユーザーへ自然な最終回答を返してください。"
         return "\n".join(
             [
                 "# AoiTalk tool result",
@@ -686,6 +874,98 @@ class CLILLMClient:
         with self._get_cli_execution_lock():
             return self._execute_prompt_tracked_locked(*args, **kwargs)
 
+    def _ensure_agent_strict_mcp_controls(self, controls: dict | None) -> dict | None:
+        """Fence every Agent CLI invocation against ambient MCP discovery."""
+
+        if controls is None:
+            return None
+        try:
+            agent_invocation = bool(
+                getattr(get_turn_context(), "agent_execution_binding", None) is not None
+                or getattr(self, "_agent_native_scope_required", False)
+            )
+        except Exception:
+            agent_invocation = bool(getattr(self, "_agent_native_scope_required", False))
+        if not agent_invocation:
+            return controls
+        supports_strict = getattr(
+            self.cli_backend,
+            "formal_mcp_configuration_supported",
+            None,
+        )
+        if not callable(supports_strict) or not bool(supports_strict()):
+            return None
+        extra = [str(item) for item in (controls.get("extra_args") or [])]
+        extra = self._clear_formal_mcp_provider_env(extra)
+        if "--strict-mcp-config" in extra:
+            return {**controls, "extra_args": extra}
+        # Remove any caller/config supplied MCP JSON before adding the
+        # explicit empty configuration. This applies only to Agent turns;
+        # ordinary users retain their configured external MCP behavior.
+        filtered: list[str] = []
+        index = 0
+        while index < len(extra):
+            item = extra[index]
+            if item == "--mcp-config":
+                index += 1
+                while index < len(extra) and not extra[index].startswith("--"):
+                    index += 1
+                continue
+            filtered.append(item)
+            index += 1
+        filtered.extend(("--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"))
+        return {
+            **controls,
+            "extra_args": self._clear_formal_mcp_provider_env(filtered),
+        }
+
+    @staticmethod
+    def _clear_formal_mcp_provider_env(extra_args: list[str]) -> list[str]:
+        """Make formal MCP children start with empty provider auth env names."""
+
+        cleared_names = (
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GITHUB_TOKEN",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+        )
+        result = list(extra_args)
+        for index, item in enumerate(result[:-1]):
+            if item != "--mcp-config":
+                continue
+            try:
+                payload = json.loads(result[index + 1])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+            if not isinstance(servers, dict):
+                continue
+            changed = False
+            for name, server in servers.items():
+                if not isinstance(server, dict):
+                    continue
+                args = server.get("args")
+                if args != ["-m", "src.mcp_server_entry", str(name)]:
+                    continue
+                env = dict(server.get("env") or {})
+                for env_name in cleared_names:
+                    env[env_name] = ""
+                server["env"] = env
+                changed = True
+            if changed:
+                result[index + 1] = json.dumps(payload, ensure_ascii=False)
+        return result
+
     def _execute_prompt_tracked_locked(self, *args: Any, **kwargs: Any):
         """CLI実行と、その構造化usageの永続化を一体で行う。"""
         suppress_automatic_context = bool(
@@ -722,6 +1002,9 @@ class CLILLMClient:
         started = time.monotonic()
         if not hasattr(self, "_last_context_snapshots"):
             self._last_context_snapshots = []
+        budget_timeout_supplier = kwargs.pop("_budget_timeout_supplier", None)
+        if budget_timeout_supplier is not None and not callable(budget_timeout_supplier):
+            raise TypeError("CLI budget timeout supplier must be callable")
         snapshot_components = list(kwargs.pop("_snapshot_components", []) or [])
         native_mode = str(kwargs.pop("_native_session_mode", "stateless") or "stateless")
         native_recreated = bool(kwargs.pop("_native_session_recreated", False))
@@ -729,6 +1012,36 @@ class CLILLMClient:
         snapshot_model = kwargs.pop("_snapshot_model", None)
         prompt = kwargs.get("prompt", args[0] if args else "")
         system_context = kwargs.get("system_context", "")
+        from .cli_native_capabilities import native_cli_capability_gate_error, native_cli_invocation_controls
+
+        reset_scoped_provider_env = getattr(
+            self.cli_backend,
+            "reset_scoped_provider_env",
+            None,
+        )
+        if callable(reset_scoped_provider_env):
+            reset_scoped_provider_env()
+
+        controls = native_cli_invocation_controls(
+            self.cli_backend, getattr(self, "config", None),
+            self._native_feature_gate_args(self._disabled_native_features()),
+            kwargs.get("extra_args"),
+            client=self,
+        )
+        if controls is None:
+            return False, native_cli_capability_gate_error(
+                self.cli_backend,
+                getattr(self, "config", None),
+                client=self,
+            )
+        controls = self._ensure_agent_strict_mcp_controls(controls)
+        if controls is None:
+            return False, native_cli_capability_gate_error(
+                self.cli_backend,
+                getattr(self, "config", None),
+                client=self,
+            )
+        kwargs.update(controls)
         mcp_args = kwargs.get("extra_args") or []
         parts = []
         # Mirror prompt construction's OFF projection in the trace as well;
@@ -842,6 +1155,8 @@ class CLILLMClient:
                     call_kwargs["prompt"] = final_prompt
                 call_kwargs["system_context"] = final_system_context
                 call_kwargs["extra_args"] = final_extra_args
+                if budget_timeout_supplier is not None:
+                    call_kwargs["timeout"] = budget_timeout_supplier()
                 # Tell provider-specific wrappers (Claude legacy format,
                 # transient retry loops, etc.) that this is already inside a
                 # single privacy transaction.  They must not emit a hidden
@@ -851,9 +1166,36 @@ class CLILLMClient:
                     self.cli_backend, "_aoitalk_egress_transaction", False
                 )
                 setattr(self.cli_backend, "_aoitalk_egress_transaction", True)
+                fresh_entry = None
                 try:
-                    return self.cli_backend.execute_prompt(*call_args, **call_kwargs)
+                    fresh_entry = self._bind_fresh_native_provider_entry()
+                    if fresh_entry:
+                        reset_scoped_provider_env = getattr(
+                            self.cli_backend,
+                            "reset_scoped_provider_env",
+                            None,
+                        )
+                        if callable(reset_scoped_provider_env):
+                            reset_scoped_provider_env()
+                        refreshed_controls = native_cli_invocation_controls(
+                            self.cli_backend,
+                            getattr(self, "config", None),
+                            self._native_feature_gate_args(self._disabled_native_features()),
+                            call_kwargs.get("extra_args"),
+                            client=self,
+                        )
+                        refreshed_controls = self._ensure_agent_strict_mcp_controls(
+                            refreshed_controls
+                        )
+                        if refreshed_controls is None:
+                            raise AgentDialogueWorkspaceDenied(
+                                "native provider capabilities changed before launch"
+                            )
+                        call_kwargs.update(refreshed_controls)
+                    with cli_backend_call_scope():
+                        return self.cli_backend.execute_prompt(*call_args, **call_kwargs)
                 finally:
+                    self._reset_fresh_native_provider_entry(fresh_entry)
                     if had_marker:
                         setattr(
                             self.cli_backend,
@@ -866,6 +1208,8 @@ class CLILLMClient:
                         except AttributeError:
                             pass
 
+            if budget_timeout_supplier is not None:
+                budget_timeout_supplier()
             success, output = gateway.execute_sync(
                 request_payload,
                 provider=provider_name,
@@ -945,6 +1289,9 @@ class CLILLMClient:
                         if snapshot_model is not None
                         else getattr(self.cli_backend, "_model", None) or self.model_name
                     )
+                    # Capture trusted task-local provenance before handing the
+                    # coroutine to the dedicated event loop.
+                    agent_run_id = get_current_agent_run_id()
 
                     async def _record() -> None:
                         await get_token_tracking_service().record_usage(
@@ -964,6 +1311,7 @@ class CLILLMClient:
                             session_id=_uuid_or_none(self.current_session_id),
                             user_id=self._get_session_user_id(),
                             project_id=_uuid_or_none(self.current_project_id),
+                            agent_run_id=agent_run_id,
                             agent_name=self.character_name,
                             request_type="cli",
                             latency_ms=int((time.monotonic() - started) * 1000),
@@ -1020,6 +1368,7 @@ class CLILLMClient:
     ) -> Union[str, Generator[str, None, None]]:
         logger.info(f"[CLILLMClient] Generating response for: {user_input[:50]}...")
         stream_callback = kwargs.get("stream_callback")
+        max_tokens = dialogue_provider_max_output_tokens(self, max_tokens)
 
         try:
             response = self._generate_sync(
@@ -1193,6 +1542,10 @@ class CLILLMClient:
         native_active_session_id: Optional[str] = None
         native_usable = False
         native_recreated = False
+        no_progress_guard_scope = activate_tool_no_progress_guard(
+            current_tool_no_progress_guard() or ToolNoProgressGuard()
+        )
+        no_progress_guard_scope.__enter__()
 
         try:
             project_context = self._resolve_project_context_sync()
@@ -1237,7 +1590,7 @@ class CLILLMClient:
                         f"[CLILLMClient] {self.cli_backend.get_provider_name()} は画像入力未対応"
                     )
 
-            cli_cwd = self._cli_execution_cwd(user_input)
+            cli_cwd = self._agent_cli_execution_cwd(user_input)
             if cli_cwd is None:
                 cli_cwd = Path.cwd()
 
@@ -1315,10 +1668,7 @@ class CLILLMClient:
                 if suppress_automatic_context
                 else build_tool_hint_context_sync(
                     user_input=user_input,
-                    registry=filtered_registry_for_client(
-                        self,
-                        self._tool_registry,
-                    ),
+                    registry=self._cli_tool_registry(),
                     policy=get_client_generation_policy(self),
                     log_prefix="CLILLMClient",
                 )
@@ -1363,10 +1713,11 @@ class CLILLMClient:
                 snapshot_components.append(component("attachments", "添付ファイル・画像由来の入力", source="CLI image attachment", measurement="unavailable", preview="画像入力（バイナリ・パスは保存しません）"))
 
             # MCP args (CLI-native delegation)
+            current_mcp_servers = self._current_mcp_servers()
             mcp_args = (
-                self.cli_backend.get_mcp_args(self._mcp_servers)
+                self.cli_backend.get_mcp_args(current_mcp_servers)
                 if (
-                    self._mcp_servers
+                    current_mcp_servers
                     and not suppress_automatic_context
                     and not is_review_generation(self)
                 )
@@ -1596,7 +1947,7 @@ class CLILLMClient:
             turn_result = run_cli_tool_call_loop(
                 original_input=user_input,
                 initial_output=cli_output,
-                registry=filtered_registry_for_client(self, self._tool_registry),
+                registry=self._cli_tool_registry(),
                 parse_tool_calls=self.cli_backend.parse_tool_calls,
                 execute_follow_up=lambda follow_up: _execute_cli_invocation(
                     follow_up,
@@ -1651,6 +2002,15 @@ class CLILLMClient:
                     tool=tool_result.call.tool,
                     arguments=dict(tool_result.call.arguments),
                     result=tool_result.model_output,
+                    # The model-facing result text is not the status
+                    # authority.  Carry the router's explicit outcome so a
+                    # blocked call with an empty legacy error cannot become a
+                    # successful AgentRun record downstream.
+                    success=bool(tool_result.success),
+                    blocked_reason=(
+                        str(getattr(tool_result, "blocked_reason", "") or "").strip()
+                        or None
+                    ),
                 )
                 for tool_result in audit_results
             ]
@@ -1727,6 +2087,7 @@ class CLILLMClient:
             logger.info(f"[CLILLMClient] Response generated: {len(response)} chars")
             return response
         finally:
+            no_progress_guard_scope.__exit__(None, None, None)
             if native_store is not None and native_lease is not None:
                 try:
                     self._run_async_in_new_loop(native_store.release(native_lease))
@@ -1770,7 +2131,7 @@ class CLILLMClient:
             return ""
         success, cli_output = self._execute_prompt_tracked(
             prompt=prompt,
-            cwd=self._cli_execution_cwd(user_input),
+            cwd=self._agent_cli_execution_cwd(user_input),
             timeout=self._cli_execution_timeout(user_input),
             system_context=system_context,
             event_callback=event_callback,
@@ -1782,11 +2143,11 @@ class CLILLMClient:
         turn_result = run_cli_tool_call_loop(
             original_input=user_input,
             initial_output=cli_output,
-            registry=filtered_registry_for_client(self, self._tool_registry),
+            registry=self._cli_tool_registry(),
             parse_tool_calls=self.cli_backend.parse_tool_calls,
             execute_follow_up=lambda follow_up: self._execute_prompt_tracked(
                 follow_up,
-                cwd=self._cli_execution_cwd(user_input),
+                cwd=self._agent_cli_execution_cwd(user_input),
                 timeout=self._cli_execution_timeout(user_input),
                 system_context=system_context,
                 event_callback=event_callback,
@@ -1827,6 +2188,11 @@ class CLILLMClient:
                 tool=tool_result.call.tool,
                 arguments=dict(tool_result.call.arguments),
                 result=tool_result.model_output,
+                success=bool(tool_result.success),
+                blocked_reason=(
+                    str(getattr(tool_result, "blocked_reason", "") or "").strip()
+                    or None
+                ),
             )
             for tool_result in audit_results
         ]
@@ -1864,6 +2230,50 @@ class CLILLMClient:
         except (TypeError, ValueError):
             value = DEFAULT_CLI_TOOL_RESULT_MAX_CHARS
         return max(1000, min(value, MAX_CLI_TOOL_RESULT_MAX_CHARS))
+
+    def _bound_agent_dialogue_workspace(self) -> AgentDialogueWorkspace | None:
+        """Return the request-scoped workspace, never a raw path payload."""
+
+        selected = getattr(self, "_agent_dialogue_workspace", None)
+        if selected is None:
+            selected = get_current_agent_dialogue_workspace()
+        if selected is not None and not isinstance(selected, AgentDialogueWorkspace):
+            raise AgentDialogueWorkspaceDenied(
+                "invalid Agent Dialogue workspace binding"
+            )
+        if selected is not None:
+            selected.assert_provider_entry()
+        return selected
+
+    def _agent_cli_execution_cwd(self, user_input: str | None) -> Path:
+        """Resolve the CLI cwd while preserving ordinary Chat behaviour.
+
+        An Agent client is always request-scoped.  If its workspace lease was
+        not bound, stop before launching a provider instead of falling back to
+        the process cwd or a shared temp directory.  Legacy Character clients
+        continue through the existing static helper below.
+        """
+
+        if self._agent_prompt_active():
+            workspace = self._bound_agent_dialogue_workspace()
+            if workspace is None:
+                raise AgentDialogueWorkspaceDenied(
+                    "Agent Dialogue provider execution requires a session workspace"
+                )
+            return Path(workspace.working_directory)
+        return self._cli_execution_cwd(user_input)
+
+    def _agent_cli_plain_text_cwd(self) -> Path:
+        """Resolve the isolated cwd for a tool-free Agent generation."""
+
+        if self._agent_prompt_active():
+            workspace = self._bound_agent_dialogue_workspace()
+            if workspace is None:
+                raise AgentDialogueWorkspaceDenied(
+                    "Agent Dialogue plain-text execution requires a session workspace"
+                )
+            return Path(workspace.runtime_cache_directory)
+        return self._cli_plain_text_cwd()
 
     @staticmethod
     def _cli_execution_cwd(user_input: str | None) -> Path:
@@ -1905,17 +2315,28 @@ class CLILLMClient:
         neutral.mkdir(parents=True, exist_ok=True)
         return neutral
 
-    def _cli_plain_text_timeout(self) -> int:
-        """Bound provider calls so a hung CLI cannot hold ingest forever."""
+    def _configured_cli_plain_text_timeout(self) -> int | None:
+        """Return the optional provider timeout configured for plain text."""
+
         configured = None
         config = getattr(self, "config", None)
         if hasattr(config, "get"):
             configured = config.get("llm_cli.plain_text_timeout_seconds", None)
         try:
-            value = int(configured) if configured is not None else 120
-        except (TypeError, ValueError):
-            value = 120
+            value = int(configured) if configured is not None else None
+        except (TypeError, ValueError, OverflowError):
+            # Preserve the historical fallback as an explicit ceiling when a
+            # deployment supplies a malformed value.
+            return 120
+        if value is None:
+            return None
         return max(15, min(value, 600))
+
+    def _cli_plain_text_timeout(self) -> int:
+        """Bound provider calls so a hung CLI cannot hold ingest forever."""
+
+        configured = self._configured_cli_plain_text_timeout()
+        return configured if configured is not None else 120
 
     def _cli_execution_timeout(self, user_input: str | None) -> int | None:
         if not looks_like_managed_workspace_request(user_input or ""):
@@ -1987,7 +2408,11 @@ class CLILLMClient:
             value = int(configured) if configured is not None else default
         except (TypeError, ValueError):
             value = default
-        return max(1, min(value, MAX_CLI_TOOL_ROUND_LIMIT))
+        value = max(1, min(value, MAX_CLI_TOOL_ROUND_LIMIT))
+        projected = dialogue_provider_tool_round_limit(self)
+        if projected is not None:
+            value = min(value, projected)
+        return max(1, value)
 
     def _should_include_cli_project_context(self, user_input: str | None) -> bool:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
@@ -2327,6 +2752,8 @@ class CLILLMClient:
     ) -> str:
         from ..services.session_llm_generation import run_session_aware_generation
 
+        max_tokens = dialogue_provider_max_output_tokens(self, max_tokens)
+
         return await run_session_aware_generation(
             self,
             # Lightweight/internal clients (and cancellation tests) may be
@@ -2348,37 +2775,8 @@ class CLILLMClient:
         max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str:
-        cancellation_handle = get_current_generation_cancellation()
-        if cancellation_handle is not None:
-            cancellation_handle.mark_worker_started()
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                self.generate_response,
-                user_input,
-                temperature,
-                max_tokens,
-                stream=False,
-                **kwargs,
-            )
-        )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            if cancellation_handle is not None:
-                cancellation_handle.cancel_requested.set()
-            try:
-                await worker
-            except GenerationCancelled:
-                pass
-            except Exception:
-                logger.debug(
-                    "[CLILLMClient] Worker failed while cancellation was draining",
-                    exc_info=True,
-                )
-            raise
-        finally:
-            if cancellation_handle is not None:
-                cancellation_handle.mark_worker_completed()
+        return await run_owned_cli_worker(lambda: self.generate_response(
+            user_input, temperature, max_tokens, stream=False, **kwargs))
 
     async def generate_plain_text_async(
         self,
@@ -2410,21 +2808,104 @@ class CLILLMClient:
         # Check before creating a worker so a protected/local-only call cannot
         # even enter the CLI execution queue.  The tracked seam repeats this
         # guard for direct/internal callers.
+        budget = current_generation_budget.get()
+
+        def checkpoint_budget() -> float | None:
+            if budget is not None:
+                return budget.checkpoint()
+            cancellation_handle = get_current_generation_cancellation()
+            if (
+                cancellation_handle is not None
+                and cancellation_handle.cancel_requested.is_set()
+            ):
+                raise GenerationCancelled("CLI generation cancelled")
+            return None
+
+        checkpoint_budget()
         self._ensure_cli_privacy_direct()
+        checkpoint_budget()
         prompt_text = str(prompt or "")
         provider_name = str(self.cli_backend.get_provider_name() or "").lower()
         is_codex = "codex" in provider_name
+        finite_budget = budget is not None and budget.timeout_seconds is not None
 
-        def invoke(model_override: object = _PLAIN_TEXT_MODEL_OVERRIDE_UNSET):
+        def remaining_timeout(
+            deadline: float,
+            provider_timeout: int,
+            *,
+            for_lock: bool = False,
+        ) -> float:
+            budget_remaining = checkpoint_budget()
+            remaining_deadline = deadline - time.monotonic()
+            if not finite_budget:
+                if for_lock:
+                    return max(0.0, remaining_deadline)
+                # Keep the legacy provider timeout unchanged when no finite
+                # request budget is active.  The deadline above still bounds
+                # lock acquisition, as it did before budget propagation.
+                return float(provider_timeout)
+
+            if budget_remaining is None:
+                effective = remaining_deadline
+            else:
+                effective = min(remaining_deadline, budget_remaining)
+            if effective <= 0:
+                # ``checkpoint_budget`` above raises the request's canonical
+                # timeout error when the caller budget itself expired.  This
+                # branch covers a configured provider ceiling expiring while
+                # the request budget still has time left.
+                raise RuntimeError(
+                    "CLI plain-text generation timed out waiting for another request"
+                    if for_lock
+                    else "CLI plain-text generation timed out before provider invocation"
+                )
+            return effective
+
+        def acquire_plain_lock(
+            lock: Any,
+            deadline: float,
+            provider_timeout: int,
+        ) -> bool:
+            """Wait cooperatively so cancelled budget workers can drain."""
+
+            poll_mode = (
+                budget is not None
+                or get_current_generation_cancellation() is not None
+            )
+            while True:
+                wait_timeout = remaining_timeout(
+                    deadline,
+                    provider_timeout,
+                    for_lock=True,
+                )
+                if wait_timeout <= 0:
+                    return False
+                if poll_mode:
+                    wait_timeout = min(
+                        wait_timeout,
+                        CLI_PLAIN_TEXT_LOCK_POLL_SECONDS,
+                    )
+                if lock.acquire(timeout=wait_timeout):
+                    return True
+                if not poll_mode:
+                    return False
+
+        def invoke(
+            model_override: object = _PLAIN_TEXT_MODEL_OVERRIDE_UNSET,
+            *,
+            timeout_supplier: Any,
+        ):
             user_input_token = set_current_user_input(prompt_text)
             generation_policy_token = set_current_generation_policy(
                 get_client_generation_policy(self)
             )
             try:
+                cwd = self._agent_cli_plain_text_cwd()
                 kwargs: dict[str, Any] = {
                     "prompt": prompt_text,
-                    "cwd": self._cli_plain_text_cwd(),
-                    "timeout": self._cli_plain_text_timeout(),
+                    "cwd": cwd,
+                    "timeout": timeout_supplier(),
+                    "_budget_timeout_supplier": timeout_supplier,
                     # Plain generation must not inherit configured MCP servers.
                     "extra_args": [],
                     "system_context": system,
@@ -2447,17 +2928,29 @@ class CLILLMClient:
                 reset_current_generation_policy(generation_policy_token)
                 reset_current_user_input(user_input_token)
 
-        def _run_locked() -> str:
+        def _run_locked(deadline: float, provider_timeout: int) -> str:
             self._last_context_snapshots = []
             self._last_cli_usage = {}
             self._agent_run_usage = {}
-            success, output = invoke()
-            if not success and is_codex and _is_codex_model_unavailable(output):
+            timeout_supplier = lambda: remaining_timeout(deadline, provider_timeout)
+            success, output = invoke(
+                timeout_supplier=timeout_supplier
+            )
+            checkpoint_budget()
+            config = getattr(self, "config", None)
+            # An explicit Team/Agent target must retain its exact model. An
+            # account-default retry would make the pinned route audit false.
+            explicit_target = bool(config is not None and config.get("runtime.target_model", ""))
+            if not success and is_codex and not explicit_target and _is_codex_model_unavailable(output):
                 logger.warning(
                     "[CLILLMClient] Codex model is unavailable for the current "
                     "account; retrying plain generation with the CLI default"
                 )
-                success, output = invoke(None)
+                success, output = invoke(
+                    None,
+                    timeout_supplier=timeout_supplier,
+                )
+                checkpoint_budget()
             if not success:
                 raise RuntimeError(str(output or "CLI plain-text generation failed"))
             result = str(output or "").strip()
@@ -2466,46 +2959,73 @@ class CLILLMClient:
             return result
 
         def run() -> str:
-            deadline = time.monotonic() + self._cli_plain_text_timeout()
-            if not self._plain_text_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-                raise RuntimeError(
-                    "CLI plain-text generation timed out waiting for another request"
-                )
-            execution_lock = self._get_cli_execution_lock()
+            if budget is not None:
+                budget.worker_pending.set()
             try:
-                if not execution_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                provider_timeout = self._cli_plain_text_timeout()
+                budget_remaining = checkpoint_budget()
+                configured_timeout = self._configured_cli_plain_text_timeout()
+                if finite_budget and budget_remaining is not None:
+                    if configured_timeout is None:
+                        initial_timeout = float(budget_remaining)
+                    else:
+                        initial_timeout = min(
+                            float(configured_timeout),
+                            float(budget_remaining),
+                        )
+                else:
+                    initial_timeout = float(provider_timeout)
+                deadline = time.monotonic() + initial_timeout
+
+                if not acquire_plain_lock(
+                    self._plain_text_lock,
+                    deadline,
+                    provider_timeout,
+                ):
+                    checkpoint_budget()
                     raise RuntimeError(
                         "CLI plain-text generation timed out waiting for another request"
                     )
+                execution_lock = self._get_cli_execution_lock()
                 try:
-                    return _run_locked()
+                    if not acquire_plain_lock(
+                        execution_lock,
+                        deadline,
+                        provider_timeout,
+                    ):
+                        checkpoint_budget()
+                        raise RuntimeError(
+                            "CLI plain-text generation timed out waiting for another request"
+                        )
+                    try:
+                        return _run_locked(deadline, provider_timeout)
+                    finally:
+                        execution_lock.release()
                 finally:
-                    execution_lock.release()
+                    self._plain_text_lock.release()
             finally:
-                self._plain_text_lock.release()
+                if budget is not None:
+                    budget.worker_pending.clear()
 
         cancellation_handle = get_current_generation_cancellation()
-        if cancellation_handle is not None:
-            cancellation_handle.mark_worker_started()
-        worker = asyncio.create_task(asyncio.to_thread(run))
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            if cancellation_handle is not None:
-                cancellation_handle.cancel_requested.set()
-            try:
-                await worker
-            except GenerationCancelled:
-                pass
-            except Exception:
-                logger.debug(
-                    "[CLILLMClient] Plain-text worker failed while cancellation was draining",
-                    exc_info=True,
+        owned_cancellation_handle = None
+        owned_cancellation_token = None
+        if cancellation_handle is None and budget is not None:
+            owned_cancellation_handle = register_generation_cancellation(
+                f"cli-plain-{uuid.uuid4()}"
+            )
+            if owned_cancellation_handle is not None:
+                owned_cancellation_token = set_current_generation_cancellation(
+                    owned_cancellation_handle
                 )
-            raise
+                cancellation_handle = owned_cancellation_handle
+        try:
+            return await run_owned_cli_worker(run, on_cancel=budget.cancelled.set if budget is not None else None)
         finally:
-            if cancellation_handle is not None:
-                cancellation_handle.mark_worker_completed()
+            if owned_cancellation_token is not None:
+                reset_current_generation_cancellation(owned_cancellation_token)
+            if owned_cancellation_handle is not None:
+                release_generation_cancellation(owned_cancellation_handle)
 
     def generate(self, prompt: str) -> str:
         """Generate a synchronous response for reasoning workflows."""
@@ -2528,8 +3048,29 @@ class CLILLMClient:
         """
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             return False
-        return bool(self._mcp_servers) and (
-            bool(self.cli_backend.get_mcp_args(self._mcp_servers))
+        servers = self._current_mcp_servers()
+        return bool(servers) and (
+            bool(self.cli_backend.get_mcp_args(servers))
+        )
+
+    def _current_mcp_servers(self) -> dict:
+        """Revalidate forwarded MCP servers before each CLI invocation."""
+        from .cli_native_capabilities import current_cli_mcp_servers
+
+        # MCP is a provider-owned surface and can include host/native-session
+        # servers outside AoiTalk's configured list.  Chat Agent turns may
+        # only use MCP through an explicit provider-side finite gate; the
+        # native invocation policy supplies that gate where supported.
+        try:
+            agent_turn = bool(
+                getattr(get_turn_context(), "agent_execution_binding", None) is not None
+                or getattr(self, "_agent_native_scope_required", False)
+            )
+        except Exception:
+            agent_turn = bool(getattr(self, "_agent_native_scope_required", False))
+        return current_cli_mcp_servers(
+            getattr(self, "config", None), self.cli_backend, getattr(self, "_mcp_servers", {}),
+            client=self,
         )
 
     # ------------------------------------------------------------------
@@ -2548,6 +3089,24 @@ class CLILLMClient:
     # Prompt building
     # ------------------------------------------------------------------
 
+    def _agent_prompt_active(self) -> bool:
+        """Return whether this request is an exact Agent turn.
+
+        The client marker is copied onto isolated Agent clients at the
+        adapter boundary.  It remains authoritative when a provider worker
+        loses its task-local TurnContext; a missing marker keeps legacy
+        Character behaviour unchanged.
+        """
+
+        marker = bool(getattr(self, "_agent_native_scope_required", False))
+        try:
+            return marker or (
+                getattr(get_turn_context(), "agent_execution_binding", None)
+                is not None
+            )
+        except Exception:
+            return marker
+
     def _build_system_context(self, user_input: str | None = None) -> str:
         """Build system context for stdin (instructions + history + tools)
 
@@ -2558,17 +3117,11 @@ class CLILLMClient:
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
-        story_chat_context = (
-            None
-            if suppress_automatic_context
-            else self._get_story_chat_context_sync()
-        )
+        agent_turn = self._agent_prompt_active()
 
         # System instructions (セクションヘッダなし — Geminiが誤解しないように)
         if suppress_automatic_context:
             parts.append(AOITALK_HELP_ISOLATED_SYSTEM_PROMPT)
-        elif story_chat_context:
-            parts.append(story_chat_context.prompt)
         elif self.custom_system_prompt and not suppress_automatic_context:
             parts.append(self.custom_system_prompt)
         else:
@@ -2577,6 +3130,7 @@ class CLILLMClient:
                 config=self.config,
                 include_mcp_info=False,
                 include_static_tool_reference=False,
+                available_tool_names=self._cli_tool_registry().get_names(),
                 # Help is grounded only by the server-verified Guide. Do not
                 # read or inject mutable per-user custom instructions here.
                 custom_instructions=(
@@ -2590,9 +3144,7 @@ class CLILLMClient:
         context_bundle = self._context_bundle_for_turn()
         context_builder_block = (
             context_bundle.render_for_prompt()
-            if not suppress_automatic_context
-            and not story_chat_context
-            and context_bundle
+            if not suppress_automatic_context and context_bundle
             else ""
         )
         if context_builder_block:
@@ -2605,7 +3157,7 @@ class CLILLMClient:
         )
         project_context = (
             None
-            if suppress_automatic_context or story_chat_context or not include_project_context
+            if suppress_automatic_context or not include_project_context
             else get_runtime_project_context()
         )
         if project_context and not context_builder_block:
@@ -2622,30 +3174,6 @@ class CLILLMClient:
         if context_text:
             parts.append(f"\n会話履歴:\n{context_text}")
 
-        if story_chat_context:
-            # シナリオ許可ツールは全て deferred pack 所属なので、
-            # 絞り込み前に pack を自動ロードしないとツール0件になる。
-            apply_story_pack_auto_load(self, story_chat_context)
-            story_tools = [
-                tool
-                for tool in filter_tools_for_client(
-                    self,
-                    self._tool_registry.get_all(),
-                )
-                if is_story_workflow_tool_allowed(
-                    tool.name,
-                    story_chat_context,
-                )
-            ]
-            if story_tools:
-                tool_prompt = CLIAdapter.to_prompt_text(story_tools)
-                parts.append(f"\nAvailable scenario tools:\n{tool_prompt}")
-            parts.append(
-                "\n---\n"
-                "Respond according to the dedicated scenario workflow instructions above."
-            )
-            return "\n".join(parts)
-
         # Tool information.  A reserved controller turn gets no tool-context
         # selection at all; an empty registry is not enough because selection
         # can still inspect the utterance and loaded-pack state.
@@ -2654,10 +3182,7 @@ class CLILLMClient:
             if suppress_automatic_context
             else build_cli_tool_context(
                 user_input=user_input,
-                registry=filtered_registry_for_client(
-                    self,
-                    self._tool_registry,
-                ),
+                registry=self._cli_tool_registry(),
                 force_project_tools=include_project_context,
                 loaded_pack_ids=effective_tool_pack_session(self).loaded,
             )
@@ -2668,17 +3193,71 @@ class CLILLMClient:
         # Final response instruction for the current user utterance.
         parts.append(
             "\n---\n"
-            "以下のユーザー発話に、キャラクターとして直接答えてください。"
+            + (
+                "以下のユーザー発話に、このAgentRevisionの職務と運用指示に従って直接答えてください。"
+                if agent_turn
+                else "以下のユーザー発話に、キャラクターとして直接答えてください。"
+            )
         )
 
         if not suppress_automatic_context:
             parts.append(self._build_tool_execution_contract_prompt())
         return "\n".join(parts)
 
+    def _cli_tool_registry(self):
+        """Exposure/execution registry without CLI-native duplicates.
+
+        Generic repository primitives are hidden only while the CLI provably
+        owns the same capability on the same root (trusted repository scope);
+        AoiTalk high-level bridges are never removed here.
+        """
+        return registry_without_names(
+            filtered_registry_for_client(self, self._tool_registry),
+            self._current_native_duplicate_tool_names(),
+        )
+
+    def _disabled_native_features(self) -> frozenset[str]:
+        from .cli_native_capabilities import disabled_cli_native_features
+
+        return disabled_cli_native_features(getattr(self, "config", None))
+
+    def _native_feature_gate_args(self, disabled_features):
+        from .cli_native_capabilities import native_cli_feature_gate_args
+
+        return native_cli_feature_gate_args(
+            self.cli_backend, getattr(self, "config", None), disabled_features,
+            getattr(self, "_mcp_servers", {}),
+        )
+
+    def _current_native_duplicate_tool_names(self):
+        disabled = self._disabled_native_features()
+        if "filesystem" in disabled or self._native_feature_gate_args(disabled) is None:
+            # A tool-free fallback cannot own native primitives. Keep enabled
+            # AoiTalk bridges available instead of advertising lost native tools.
+            return frozenset()
+        return cli_native_duplicate_tool_names(self.cli_backend)
+
     def _build_tool_execution_contract_prompt(self) -> str:
+        from .tool_policy import _runtime_capability_for_tool
+
+        if _runtime_capability_for_tool("calculate", config=getattr(self, "config", None)) is not None:
+            return ""
+        native = self._current_native_duplicate_tool_names()
+        native_note: list[str] = []
+        if native:
+            native_scope = (
+                "ファイル検索・読み取り・編集"
+                if native & CLI_NATIVE_EDIT_TOOL_NAMES
+                else "ファイル検索・読み取り"
+            )
+            native_note.append(
+                f"- リポジトリ内の{native_scope}は、あなた自身（CLI）の標準ツールで行ってください。"
+                "AoiTalkツールは一覧にある操作に使います。"
+            )
         return "\n".join(
             [
                 "\nツール実行形式:",
+                *native_note,
                 "- ツールが必要な場合は通常回答ではなく `[TOOL_CALL: tool_name(key=value)]` 形式で出力してください。",
                 "- 引数が不要な場合は `[TOOL_CALL: tool_name()]` 形式で出力してください。",
                 "- 外部状態を確認・変更した事実は、ツール結果だけを根拠にしてください。",
@@ -2697,24 +3276,10 @@ class CLILLMClient:
         parts = [
             "# ツール実行結果",
         ]
-        suppress_automatic_context = bool(
-            getattr(get_turn_context(), "suppress_automatic_context", False)
-        )
-        story_chat_context = (
-            None
-            if suppress_automatic_context
-            else self._get_story_chat_context_sync()
-        )
-        if story_chat_context:
-            parts.extend([story_chat_context.prompt, ""])
-        task_instruction = (
-            "上記のツール結果に基づいて、シナリオ進行の応答を続けてください。"
-            if story_chat_context
-            else "上記のツール結果に基づいて、ユーザーに自然に回答してください。"
-        )
+        task_instruction = "上記のツール結果に基づいて、ユーザーに自然に回答してください。"
         final_reminder = (
-            "専用シナリオ進行指示に従ってください。"
-            if story_chat_context
+            "AgentRevisionの職務・運用指示と現在の権限範囲を維持してください。"
+            if self._agent_prompt_active()
             else f"キャラクターとしての応答を維持してください: {self.character_name}"
         )
         parts.extend([
@@ -2744,8 +3309,6 @@ class CLILLMClient:
         self, user_input: str, project_context: Optional[dict[str, Any]]
     ) -> Optional[ContextBundle]:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return None
-        if self._get_story_chat_context_sync():
             return None
         include_project_context = self._should_include_cli_project_context(user_input)
         try:
@@ -2779,9 +3342,6 @@ class CLILLMClient:
         if not self.current_project_id and not self.current_session_id:
             return None
 
-        if self._get_story_chat_context_sync():
-            return None
-
         resolver = ProjectContextResolver()
         try:
             return self._run_async_in_new_loop(
@@ -2795,37 +3355,10 @@ class CLILLMClient:
             logger.warning(f"[CLILLMClient] Failed to resolve project context: {e}")
             return None
 
-    def _get_story_chat_context_sync(self):
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return None
-        if not self.current_session_id:
-            return None
-        return run_story_chat_context_sync(
-            self._run_async_in_new_loop,
-            self.current_session_id,
-        )
-
     def _get_available_tools(self) -> List[str]:
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
         if suppress_automatic_context:
             return []
-        story_chat_context = (
-            self._get_story_chat_context_sync()
-        )
-        if not story_chat_context:
-            return filter_tools_for_client(
-                self,
-                self._tool_registry.get_names(),
-                **({"story_context": None} if suppress_automatic_context else {}),
-            )
-        apply_story_pack_auto_load(self, story_chat_context)
-        return [
-            name
-            for name in filter_tools_for_client(
-                self,
-                self._tool_registry.get_names(),
-            )
-            if is_story_workflow_tool_allowed(name, story_chat_context)
-        ]
+        return filter_tools_for_client(self, self._tool_registry.get_names())

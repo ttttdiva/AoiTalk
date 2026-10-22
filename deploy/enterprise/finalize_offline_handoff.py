@@ -11,6 +11,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+from functools import partial
 import hashlib
 import json
 import os
@@ -22,10 +23,10 @@ import tempfile
 import zipfile
 
 from enterprise_release_common import (
-    BLOCK, ContractError, atomic_json, hash_file, no_links, publish_directory,
+    BLOCK, ContractError, atomic_json, hash_file, no_links, preflight_publication, publish_directory,
     read_json, relative_path, verify_checksums, write_checksums, write_zip,
 )
-from produce_offline_inputs import collect, inspect_source, verify_proof
+from produce_offline_inputs import collect, inspect_source, verify_completed_inputs, verify_proof
 
 
 MAX_SOURCE_BYTES = 8 * 1024**3
@@ -92,19 +93,32 @@ def extract_source(archive: Path, destination: Path) -> None:
     verify_checksums(destination)
 
 
-def finalize(archive: Path, expected_sha256: str, destination: Path, *, collector=None, verifier=None, hydrator=None) -> dict:
+def finalize(archive: Path, expected_sha256: str, destination: Path, *, collector=None, verifier=None, hydrator=None,
+             blob_cache: Path | None = None, resume_inputs: Path | None = None) -> dict:
     destination = no_links(destination)
+    if resume_inputs is not None and blob_cache is not None:
+        raise ContractError('offline input root and OCI blob cache are mutually exclusive')
+    if resume_inputs is not None:
+        resume_inputs = no_links(resume_inputs)
+        if resume_inputs == destination or resume_inputs in destination.parents or destination in resume_inputs.parents:
+            raise ContractError('offline input root must not overlap release output')
     if destination.exists():
         raise ContractError('release output must be a new directory')
     destination.parent.mkdir(parents=True, exist_ok=True)
+    preflight_publication(destination.parent)
     # Test doubles are injectable in the Python API only; the public CLI has
-    # no skip-proof, skip-validator, or manual cache override.
-    collector = collector or collect
+    # no skip-proof or skip-validator option. A completed checkpoint must pass
+    # the same source/proof/consumer validation again; the OCI byte cache still
+    # cannot change any pin, source binding, dependency resolution or proof.
+    # Keep failed acquisition cache outside this finalizer's disposable staging.
+    collector = collector or partial(collect, failure_cache_parent=destination.parent)
     if verifier is None or hydrator is None:
         from offline_inputs import hydrate_archive, verify_companion
         verifier = verifier or verify_companion
         hydrator = hydrator or hydrate_archive
     staging = Path(tempfile.mkdtemp(prefix='.enterprise-release-', dir=destination.parent))
+    checkpoint = None
+    published = False
     try:
         snapshot = staging / 'authenticated-source.zip'
         authenticated_copy(archive, snapshot, expected_sha256.lower())
@@ -119,8 +133,19 @@ def finalize(archive: Path, expected_sha256: str, destination: Path, *, collecto
         original_offline = manifest.get('offline_build', {})
         if original_offline.get('mode') != 'none' or original_offline.get('enabled') is not False:
             raise ContractError('already-bound releases must reuse their original companion, not be regenerated')
-        inputs = staging / 'inputs'
-        collector(manifest_path, inputs)
+        if resume_inputs is not None:
+            inputs = resume_inputs
+            verify_completed_inputs(inputs, manifest_path)
+        else:
+            # This private owned container is outside disposable packaging
+            # staging. Even a failed input publication leaves its completed
+            # producer stage recoverable without another multi-GiB copy.
+            checkpoint = Path(tempfile.mkdtemp(prefix='.enterprise-input-checkpoint-', dir=destination.parent))
+            inputs = checkpoint / 'inputs'
+            if blob_cache is None:
+                collector(manifest_path, inputs)
+            else:
+                collector(manifest_path, inputs, blob_cache=blob_cache)
         # A collector return value is not sufficient: the proof and the full
         # canonical consumer must validate the actual emitted bytes.
         verify_proof(inputs, manifest, source)
@@ -149,20 +174,41 @@ def finalize(archive: Path, expected_sha256: str, destination: Path, *, collecto
         # that the manifest checksum and source binding survive ZIP packaging.
         roundtrip = staging / 'roundtrip'
         extract_source(target, roundtrip)
-        # Reuse the private input path rather than keeping a second expanded
-        # multi-GiB payload. Validate the bytes actually carried by the ZIP.
-        shutil.rmtree(inputs)
-        hydrator(companion, inputs)
-        verifier(inputs, roundtrip / 'bundle-manifest.json', archive=companion)
+        # Never consume the recovery checkpoint or a caller-owned input root.
+        # The separate private extraction validates the actual transport bytes.
+        roundtrip_inputs = staging / 'roundtrip-inputs'
+        hydrator(companion, roundtrip_inputs)
+        verifier(roundtrip_inputs, roundtrip / 'bundle-manifest.json', archive=companion)
         receipt = {'format': 'enterprise-offline-release-capsule', 'version': 1,
                    'status': 'complete', 'source_commit': commit,
                    'handoff': {'file': handoff_name, 'sha256': hash_file(target)},
                    'companion': {'file': companion_name, 'sha256': hash_file(companion)}}
         atomic_json(output / 'release-capsule.json', receipt)
         publish_directory(output, destination)
+        published = True
         return receipt
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        if checkpoint is not None:
+            if published:
+                shutil.rmtree(checkpoint, ignore_errors=True)
+            elif checkpoint.exists():
+                # Early acquisition failures leave only an empty owned wrapper
+                # after the producer retains its untrusted OCI byte cache.
+                try:
+                    checkpoint.rmdir()
+                except OSError:
+                    print(f"[Enterprise producer] Input checkpoint container retained: {checkpoint}",
+                          file=sys.stderr, flush=True)
+                    try:
+                        for candidate in sorted(checkpoint.iterdir()):
+                            if candidate.is_dir() and (candidate / 'offline-build-manifest.json').is_file():
+                                print(f"[Enterprise producer] Resume candidate (revalidation required): {candidate}",
+                                      file=sys.stderr, flush=True)
+                    except OSError:
+                        # The known container path is sufficient to recover;
+                        # diagnostics must not replace the original failure.
+                        pass
 
 
 def main() -> int:
@@ -170,9 +216,15 @@ def main() -> int:
     parser.add_argument('--handoff-zip', type=Path, required=True)
     parser.add_argument('--expected-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    reuse = parser.add_mutually_exclusive_group()
+    reuse.add_argument('--oci-blob-cache', type=Path,
+                       help='optional read-only previous producer directory; all reused OCI bytes are re-verified and the full offline build remains mandatory')
+    reuse.add_argument('--offline-input-root', type=Path,
+                       help='read-only completed input checkpoint; its exact source binding, full payload and existing offline proof are revalidated before packaging')
     args = parser.parse_args()
     try:
-        receipt = finalize(args.handoff_zip, args.expected_sha256, args.output)
+        receipt = finalize(args.handoff_zip, args.expected_sha256, args.output, blob_cache=args.oci_blob_cache,
+                           resume_inputs=args.offline_input_root)
     except (ContractError, OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
         parser.exit(1, f'Enterprise standalone producer failed: {type(exc).__name__}: {exc}\n')
     print(json.dumps(receipt, sort_keys=True))

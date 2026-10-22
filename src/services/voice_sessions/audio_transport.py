@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from ...aoirig.visemes import validate_visemes
 
 
 MAX_AUDIO_FRAME_BYTES = 8 * 1024 * 1024
@@ -19,6 +20,7 @@ class PendingAudioSegment:
     segment_id: str
     mime_type: str
     audio: bytes
+    visemes: list[dict[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -169,6 +171,7 @@ class VoiceAudioTransportManager:
         segment_id: str,
         mime_type: str,
         audio: bytes,
+        visemes: list[dict[str, float]] | None = None,
     ) -> int | None:
         state = self._state
         if state is None or state.closed or generation_id != state.generation_id:
@@ -186,6 +189,7 @@ class VoiceAudioTransportManager:
                 segment_id=segment_id,
                 mime_type=mime_type,
                 audio=audio,
+                visemes=validate_visemes(visemes),
             )
         )
         return sequence
@@ -305,6 +309,7 @@ class VoiceAudioTransportManager:
                         "segment_id": item.segment_id,
                         "mime_type": item.mime_type,
                         "byte_length": len(item.audio),
+                        **({"visemes": item.visemes} if item.visemes else {}),
                     }
                 )
                 await send_binary(item.audio)

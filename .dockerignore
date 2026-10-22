@@ -127,3 +127,9 @@ docker-compose*.yml
 Thumbs.db
 *.bak
 *.orig
+
+# Retain canonical runtime provenance and redistribution notices.
+!resources/seethrough-rig/runtime/**/*.md
+!resources/seethrough-rig/runtime/*.md
+!resources/seethrough-rig/runtime/LICENSE*
+!resources/seethrough-rig/runtime/NOTICE*

@@ -30,6 +30,32 @@ describe("mediaResearchApi", () => {
     vi.unstubAllGlobals();
   });
 
+  it("requests bounded ContentItem pages without changing legacy program filtering", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response([]));
+    vi.stubGlobal("fetch", fetchMock);
+    await mediaResearchApi.listContentItems("program-id", { limit: 100, offset: 100 });
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/python-proxy/operations/media/content-items?editorial_program_id=program-id&limit=100&offset=100");
+    await mediaResearchApi.listContentItems("program-id");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/python-proxy/operations/media/content-items?editorial_program_id=program-id");
+  });
+
+  it("sends an original brief without synthesizing research and retains the raw text", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ id: "original-item" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const brief = "  人の原文\r\n確認は未実施。\n  ";
+    await mediaResearchApi.createContentItem({
+      editorial_program_id: "program-id", input_kind: "user_authored",
+      title: "Original lesson", brief, persona_revision_id: "revision-id",
+    }, "original-key");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/python-proxy/operations/media/content-items");
+    expect(new Headers(init.headers).get("idempotency-key")).toBe("original-key");
+    expect(JSON.parse(String(init.body))).toEqual({
+      editorial_program_id: "program-id", input_kind: "user_authored",
+      title: "Original lesson", brief, persona_revision_id: "revision-id",
+    });
+  });
+
   it("starts a pinned ResearchRun with idempotency", async () => {
     const fetchMock = vi
       .fn()

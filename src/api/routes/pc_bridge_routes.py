@@ -13,6 +13,7 @@ from ...services.pc_bridge_store import PcBridgeError
 class BridgeRegistration(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: str = Field(min_length=1, max_length=80)
+    machine_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class BridgeSelection(BaseModel):
@@ -23,6 +24,9 @@ class BridgeSelection(BaseModel):
 
 class BridgeCommand(BaseModel):
     model_config = ConfigDict(extra='forbid')
+    # Saved App Actions are dispatched only by AppActionRunService after the
+    # release/input/idempotency checks.  The generic PC command endpoint must
+    # never become a raw apps.start bypass.
     channel: Literal['browser', 'computer']
     action: str = Field(min_length=1, max_length=40)
     params: dict[str, Any] = Field(default_factory=dict)
@@ -35,6 +39,14 @@ class BridgeReply(BaseModel):
 
 def register_pc_bridge_routes(app: FastAPI, server) -> None:
     hub = get_pc_bridge_hub()
+    def dedicated_enabled():
+        from ...services.browser_agent_models import BrowserAgentSettings
+        try:
+            settings = BrowserAgentSettings.from_config(server.config)
+            return settings.enabled and settings.dedicated_enabled
+        except (ValueError, TypeError, AttributeError):
+            return False
+    hub.dedicated_enabled = dedicated_enabled
 
     async def owner(request):
         user = await server._get_user_info_from_request(request)
@@ -48,7 +60,12 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
 
     @app.post('/api/pc-bridge/devices', response_model=BridgeReply, operation_id='pc_bridge_register_device')
     async def register(body: BridgeRegistration, request: Request):
-        return BridgeReply(result=await hub.store.register(await owner(request), body.name.strip()))
+        try:
+            result = await hub.store.register(await owner(request), body.name.strip(),
+                                              body.machine_id.strip() if body.machine_id else None)
+        except PcBridgeError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return BridgeReply(result=result)
 
     @app.put('/api/pc-bridge/selection', response_model=BridgeReply, operation_id='pc_bridge_select_device')
     async def select(body: BridgeSelection, request: Request):
@@ -72,6 +89,8 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
     @app.post('/api/pc-bridge/devices/{device_id}/command', response_model=BridgeReply, operation_id='pc_bridge_command')
     async def command(device_id: str, body: BridgeCommand, request: Request):
         user_id = await owner(request)
+        if body.channel == 'browser' and body.action.startswith('media_prepare_'):
+            raise HTTPException(403, 'media preparation requires an approved MediaAction')
         try:
             await hub.store.resolve(user_id, device_id)
             result = await hub.call(user_id, device_id, body.channel, body.action, body.params)
@@ -114,11 +133,24 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
             hello = await asyncio.wait_for(socket.receive_json(), 10)
             if (not isinstance(hello, dict) or hello.get('type') != 'hello' or hello.get('protocol') != 1
                     or not isinstance(hello.get('capabilities'), list)
-                    or any(item not in {'computer', 'browser'} for item in hello.get('capabilities', []))):
+                    or any(item not in {'computer', 'browser', 'media_asset', 'media_prepare', 'dedicated_browser', 'apps'} for item in hello.get('capabilities', []))):
                 await socket.close(code=4400)
                 return
+            if 'apps' in hello.get('capabilities', []):
+                expected_machine = device.get('machine_id')
+                if (not isinstance(expected_machine, str) or not expected_machine
+                        or hello.get('machine_id') != expected_machine
+                        or not isinstance(hello.get('boot_id'), str) or not hello.get('boot_id')):
+                    await socket.close(code=4403)
+                    return
             connection = hub.attach(user_id, device['id'], socket, hello)
-            await socket.send_json({'type': 'ready', 'device_id': device['id'], 'name': device['name']})
+            ready = {'type': 'ready', 'device_id': device['id'], 'name': device['name'],
+                     'connection_epoch': connection.epoch}
+            if 'apps' in connection.capabilities or 'dedicated_browser' in connection.capabilities:
+                ready.update(owner_user_id=user_id, dedicated_browser_enabled=dedicated_enabled())
+            if connection.media_preparation_backend == 'managed_profile':
+                ready.update(owner_user_id=user_id, browser_profiles=await hub.store.browser_profiles(user_id))
+            await socket.send_json(ready)
             while True:
                 message = await asyncio.wait_for(socket.receive_json(), 45)
                 if not isinstance(message, dict):

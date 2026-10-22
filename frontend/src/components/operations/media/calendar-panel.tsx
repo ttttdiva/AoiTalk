@@ -15,6 +15,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { cn } from "@/lib/utils";
 
 function readableError(error: unknown): string {
@@ -116,8 +117,10 @@ export function MediaCalendarPanel() {
     <div className="space-y-4" data-testid="media-calendar-panel">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">カレンダー</h2>
-          <p className="mt-1 text-sm text-muted-foreground">調査・編集・生成・公開・人手レビューの次の予定をまとめて確認します。</p>
+          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
+            カレンダー
+            <HelpPopover label="カレンダー">調査・編集・生成・公開・人手レビューの次の予定をまとめて確認します。</HelpPopover>
+          </h2>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} /> 更新
@@ -125,8 +128,14 @@ export function MediaCalendarPanel() {
       </div>
       <Card size="sm">
         <CardHeader className="border-b border-border/70">
-          <CardTitle className="flex items-center gap-1.5 text-sm"><CalendarDays className="size-4 text-primary" /> MediaOpsの予定</CardTitle>
-          <CardDescription>{total}件 · 日付はMediaOpsの保存済み予定と監査時刻から生成されます。</CardDescription>
+          <CardTitle className="flex items-center gap-1.5 text-sm">
+            <CalendarDays className="size-4 text-primary" />
+            <span className="inline-flex items-center gap-1">
+              MediaOpsの予定
+              <HelpPopover label="MediaOpsの予定">日付はMediaOpsの保存済み予定と監査時刻から生成されます。</HelpPopover>
+            </span>
+          </CardTitle>
+          <CardDescription>{total}件</CardDescription>
         </CardHeader>
         <CardContent className="pt-3">
           {error ? <div role="alert" className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{readableError(error)}</div> : null}

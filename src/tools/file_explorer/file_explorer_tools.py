@@ -331,7 +331,12 @@ def create_workspace_directory(path: str, name: str) -> Dict[str, Any]:
 
 
 @tool
-def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict[str, Any]:
+def upload_workspace_file(
+    path: str,
+    filename: str,
+    content_base64: str,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
     """ワークスペースにファイルをアップロードする
     
     Base64エンコードされたファイル内容をアップロードします。
@@ -340,14 +345,24 @@ def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict
         path: アップロード先ディレクトリのパス（空文字でルート）
         filename: ファイル名
         content_base64: Base64エンコードされたファイル内容
+        overwrite: 同名ファイルが存在する場合に上書きするか（既定値: False）
         
     Returns:
         Dict[str, Any]: アップロード結果
     """
-    print(f"[Tool] upload_workspace_file が呼び出されました: path={path}, filename={filename}")
+    print(
+        f"[Tool] upload_workspace_file が呼び出されました: "
+        f"path={path}, filename={filename}, overwrite={overwrite}"
+    )
+    if type(overwrite) is not bool:
+        return {
+            "success": False,
+            "error": "overwrite は boolean で指定してください。",
+            "error_code": "invalid_argument",
+        }
     if not _check_permission_sync(
         "upload_workspace_file",
-        {"path": path, "filename": filename},
+        {"path": path, "filename": filename, "overwrite": overwrite},
     ):
         return {"success": False, "error": "ユーザーによってファイル保存がキャンセルされました。"}
     try:
@@ -377,7 +392,13 @@ def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict
     )
     if project_write_error:
         return project_write_error
-    return upload_file(resolved, filename, content, is_admin=True)
+    return upload_file(
+        resolved,
+        filename,
+        content,
+        is_admin=True,
+        allow_overwrite=overwrite,
+    )
 
 
 @tool

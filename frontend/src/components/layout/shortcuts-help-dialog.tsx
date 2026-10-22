@@ -44,6 +44,7 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   {
     title: "Docs",
     items: [
+      { keys: ["Ctrl", "Alt", "D"], description: "今日のメモを開いて追記" },
       { keys: ["Ctrl", "Alt", "I"], description: "クリップ取り込みを開く" },
     ],
   },
@@ -108,7 +109,7 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
       {
         keys: ["Ctrl", "←/→"],
         description:
-          "Filesタブ（Project Files / User Files / HF / Hydrus）を切り替え",
+          "Filesタブ（Project Files / User Files）を切り替え",
       },
       { keys: [":"], description: "サムネイル表示" },
       { keys: [";"], description: "リスト表示" },
@@ -155,8 +156,8 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
     title: "その他",
     items: [
       { keys: ["Ctrl", "K"], description: "コマンドパレットを開く" },
-      { keys: ["Ctrl", "Alt", "S"], description: "スペース選択を開く" },
-      { keys: ["Ctrl", "Alt", "P"], description: "プロジェクト選択を開く" },
+      { keys: ["Alt", "Shift", "S"], description: "スペース選択を開く" },
+      { keys: ["Alt", "Shift", "P"], description: "プロジェクト選択を開く" },
       { keys: ["?"], description: "ショートカット一覧を表示" },
       {
         keys: ["Alt", "Shift", "R"],

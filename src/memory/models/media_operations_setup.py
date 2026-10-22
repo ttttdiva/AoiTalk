@@ -65,6 +65,8 @@ _PLATFORM_COLUMNS: tuple[tuple[str, str], ...] = (
     ("patreon", "platform_patreon"),
     ("youtube", "platform_youtube"),
     ("instagram", "platform_instagram"),
+    ("fanza", "platform_fanza"),
+    ("tiktok", "platform_tiktok"),
 )
 
 
@@ -354,6 +356,14 @@ class PersonaBulkDraftSlot(Base):
         Boolean,
         nullable=True,
     )
+    platform_fanza = Column(
+        Boolean,
+        nullable=True,
+    )
+    platform_tiktok = Column(
+        Boolean,
+        nullable=True,
+    )
     platforms_evidence = Column(
         Text,
         nullable=True,
@@ -464,6 +474,8 @@ class PersonaBulkDraftSlot(Base):
             "AND platform_patreon IS NULL "
             "AND platform_youtube IS NULL "
             "AND platform_instagram IS NULL "
+            "AND platform_fanza IS NULL "
+            "AND platform_tiktok IS NULL "
             "AND platforms_evidence IS NULL"
             ") OR ("
             "platforms_state = 'explicit' "
@@ -472,7 +484,9 @@ class PersonaBulkDraftSlot(Base):
             "AND platform_dlsite IS NOT NULL "
             "AND platform_patreon IS NOT NULL "
             "AND platform_youtube IS NOT NULL "
-            "AND platform_instagram IS NOT NULL"
+            "AND platform_instagram IS NOT NULL "
+            "AND platform_fanza IS NOT NULL "
+            "AND platform_tiktok IS NOT NULL"
             ") OR ("
             "platforms_state = 'inferred' "
             "AND platform_x IS NOT NULL "
@@ -481,6 +495,8 @@ class PersonaBulkDraftSlot(Base):
             "AND platform_patreon IS NOT NULL "
             "AND platform_youtube IS NOT NULL "
             "AND platform_instagram IS NOT NULL "
+            "AND platform_fanza IS NOT NULL "
+            "AND platform_tiktok IS NOT NULL "
             "AND platforms_evidence IS NOT NULL"
             ")",
             name="ck_media_persona_bulk_draft_platforms_fact",
@@ -631,7 +647,7 @@ class PlatformAccount(Base):
     __table_args__ = (
         CheckConstraint(
             "platform IN "
-            "('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')",
+            "('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')",
             name="ck_media_platform_accounts_platform",
         ),
         CheckConstraint(

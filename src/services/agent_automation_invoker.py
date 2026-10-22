@@ -100,8 +100,16 @@ def _require_text_model(provider: Any, model: Any) -> None:
 
 
 def resolve_route(config: Any, team_id: str, profile_id: str) -> dict[str, Any]:
-    """Resolve supported pins without creating clients, loading Config or I/O.
+    """Resolve the *classifier default route* of a pinned Team Profile.
 
+    Classifier-only: a tool-free semantic match/extraction runs on the
+    Profile's Default Subagent Route (or Main for ``manual``) because no
+    Subagent acts.  Actual Operations work (deliverables, drafts, reviews)
+    must use ``agent_model_routing.resolve_agent_role_route`` /
+    ``resolve_agent_subagent_route`` so per-Subagent overrides apply; never
+    reuse this function for worker output.
+
+    Resolves supported pins without creating clients, loading Config or I/O.
     This checks structural transport support, not credentials/server health.
     An ambient conversation's Main override must not affect employee routing.
     """
@@ -131,7 +139,11 @@ def resolve_route(config: Any, team_id: str, profile_id: str) -> dict[str, Any]:
             selected = profile["default_route"]
             if selected.get("inherit_model") is False:
                 _require_text_model(selected.get("provider"), selected.get("model"))
-            route = _apply_execution_route(profile["default_route"], resolve_execution_main_route(config))
+            route = _apply_execution_route(
+                profile["default_route"],
+                resolve_execution_main_route(config),
+                config=config,
+            )
         else:
             raise AutomationInvocationError("semantic_route_invalid")
         if route.get("provider") not in _SUPPORTED_PROVIDERS or not route.get("model"):
@@ -346,10 +358,18 @@ def _usage(response: Any) -> dict[str, Any]:
     return result
 
 
+# Explicit name for callers: the automation classifier uses the Profile's
+# default route, which is distinct from a worker Subagent route.
+resolve_classifier_default_route = resolve_route
+
+
 class AgentAutomationInvoker:
     """Use the pinned Team Profile's default route for a single classifier call.
 
-No subagent is selected: per-subagent overrides are irrelevant to this call.
+No subagent is selected: per-subagent overrides are irrelevant to this
+    classifier call only.  Work that produces output for the Agent (drafts,
+    deliverables, reviews) resolves a Subagent route through
+    ``agent_model_routing`` instead and must not reuse this default route.
     Built-in Teams remain available in older configurations; explicit disabled
     overrides win. System manual uses configured Main. Other missing/disabled
     pins fail closed, without falling back to an active profile.
@@ -679,4 +699,11 @@ signature. Production always defaults to that manager factory.
         return response, gateway.restore(text)
 
 
-__all__ = ["AgentAutomationInvoker", "AutomationDecision", "AutomationInvocationError", "resolve_route", "readiness"]
+__all__ = [
+    "AgentAutomationInvoker",
+    "AutomationDecision",
+    "AutomationInvocationError",
+    "readiness",
+    "resolve_classifier_default_route",
+    "resolve_route",
+]

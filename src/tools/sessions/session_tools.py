@@ -90,6 +90,7 @@ def build_explicit_read_chat_session_tool():
         side_effect="none",
         risk="low",
         supports_parallel=False,
+        availability={"explicit_chat_reference": True},
     )
 
 

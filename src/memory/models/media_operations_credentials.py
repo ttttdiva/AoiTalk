@@ -33,6 +33,29 @@ from sqlalchemy.dialects.postgresql import UUID
 from .base import Base
 
 
+class MediaPlatformOAuthRequest(Base):
+    """One-use OAuth consent bound to an existing brand account."""
+    __tablename__ = "media_platform_oauth_requests"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    platform_account_id = Column(UUID(as_uuid=True), ForeignKey("media_platform_accounts.id", ondelete="CASCADE"), nullable=False)
+    account_revision_id = Column(UUID(as_uuid=True), nullable=False)
+    credential_revision = Column(Integer, nullable=False)
+    platform = Column(String(16), nullable=False)
+    state_digest = Column(String(64), nullable=False, unique=True)
+    encrypted_request = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default="pending")
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        CheckConstraint("platform IN ('x','youtube')", name="ck_media_oauth_platform"),
+        CheckConstraint("status IN ('pending','exchanging','completed','failed')", name="ck_media_oauth_status"),
+        CheckConstraint("credential_revision >= 0", name="ck_media_oauth_credential_revision"),
+    )
+
+
 class MediaCredentialConnectionType(str, Enum):
     COOKIE_EXPORT = "cookie_export"
     API_TOKEN = "api_token"

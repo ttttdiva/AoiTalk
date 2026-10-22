@@ -28,7 +28,7 @@ def register_crawler_routes(app: FastAPI, server: "WebChatServer") -> None:
 
     @app.get("/api/crawler/status")
     async def get_crawler_status(_: None = Depends(require_auth)):
-        """Get status of external crawlers (DiscordCrawler, EventMonitor, VideoCrawler, HydrusClient)"""
+        """Get status of external crawlers (DiscordCrawler, EventMonitor, VideoCrawler)"""
         if CrawlerStatusChecker is None:
             raise HTTPException(
                 status_code=503, detail="Crawler status checking is not available"
@@ -42,20 +42,12 @@ def register_crawler_routes(app: FastAPI, server: "WebChatServer") -> None:
             for crawler_name in [
                 "DiscordCrawler",
                 "EventMonitor",
-                "HydrusClient",
                 "VideoCrawler",
             ]:
-                # VideoCrawler and HydrusClient are special: need detailed Pull status
-                # VideoCrawler: external service, need HTTP call anyway
-                # HydrusClient: doesn't send Push updates
+                # VideoCrawler is special: external service, need HTTP call anyway
                 if crawler_name == "VideoCrawler":
                     detailed_status = (
                         await checker.get_video_crawler_detailed_status()
-                    )
-                    status_data[crawler_name] = detailed_status
-                elif crawler_name == "HydrusClient":
-                    detailed_status = (
-                        await checker.get_hydrus_client_detailed_status()
                     )
                     status_data[crawler_name] = detailed_status
                 else:
@@ -167,8 +159,6 @@ def register_crawler_routes(app: FastAPI, server: "WebChatServer") -> None:
                 result = await checker.restart_discord_crawler()
             elif crawler_name.lower() == "eventmonitor":
                 result = await checker.restart_event_monitor()
-            elif crawler_name.lower() == "hydrusclient":
-                result = await checker.launch_hydrus_client()
             else:
                 raise HTTPException(
                     status_code=400,
@@ -198,8 +188,6 @@ def register_crawler_routes(app: FastAPI, server: "WebChatServer") -> None:
                 result = await checker.stop_discord_crawler()
             elif crawler_name.lower() == "eventmonitor":
                 result = await checker.stop_event_monitor()
-            elif crawler_name.lower() == "hydrusclient":
-                result = await checker.stop_hydrus_client()
             else:
                 raise HTTPException(
                     status_code=400, detail=f"Stop not supported for {crawler_name}"

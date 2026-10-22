@@ -1,7 +1,11 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { Directory, Paths } from "expo-file-system";
-import { fetchApi, getBaseUrl } from "./api-client";
-import { getToken, getTokenAuthScope } from "./auth";
+import { FILES_DELETE_TIMEOUT_MS } from "../constants/config";
+import { fetchApi, getBaseUrl, getCredentialIdentityRevision } from "./api-client";
+import { getTokenAuthScope, getTokenSnapshot } from "./auth";
+import { sendWithTransportAuth } from "./transport-auth";
+import { cacheProtectedMediaResource } from "./media-cache";
+import { nativeMultipartUpload } from "./native-multipart";
 import { projectApi } from "./project-api";
 import {
   downloadFileToDevice,
@@ -180,6 +184,33 @@ export type ProjectFilesPath = {
   relativePath: string;
   rootPath: string;
 };
+
+/**
+ * The only upload response that the Files UI may resolve as an overwrite
+ * candidate.  Authentication, transport, and unknown 409 responses remain
+ * ordinary upload failures.
+ */
+export class FilesUploadCollisionError extends Error {
+  readonly code = "already_exists" as const;
+  readonly status = 409 as const;
+
+  constructor(message = "同じ名前のファイルが既に存在します") {
+    super(message);
+    this.name = "FilesUploadCollisionError";
+  }
+}
+
+export function isFilesUploadCollisionError(
+  error: unknown,
+): error is FilesUploadCollisionError {
+  return (
+    error instanceof FilesUploadCollisionError ||
+    (error instanceof Error &&
+      (error as Error & { code?: unknown; status?: unknown }).code ===
+        "already_exists" &&
+      (error as Error & { status?: unknown }).status === 409)
+  );
+}
 
 /** Parse the canonical server project namespace (`_projects/project_<uuid>`).
  *
@@ -559,6 +590,7 @@ async function saveServerProjectTextFile(
       projectPath.projectId,
       { uri: tempUri, name: filename, mimeType: "text/plain" },
       directory,
+      true,
     );
   } finally {
     await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
@@ -684,59 +716,86 @@ async function uploadLocalFile(
   return targetPath;
 }
 
+function parseUploadCollision(
+  status: number,
+  body: string,
+): FilesUploadCollisionError | null {
+  if (status !== 409) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  const detail = (payload as { detail?: unknown }).detail;
+  if (!detail || typeof detail !== "object") return null;
+  const code = (detail as { code?: unknown }).code;
+  if (code !== "already_exists") return null;
+  const message = (detail as { message?: unknown }).message;
+  return new FilesUploadCollisionError(
+    typeof message === "string" && message.trim()
+      ? message
+      : undefined,
+  );
+}
+
+function uploadResponseError(status: number, body: string): Error {
+  return (
+    parseUploadCollision(status, body) ??
+    new Error(`Upload failed: ${status} ${body.slice(0, 300)}`)
+  );
+}
+
 async function uploadServerProjectFile(
   projectId: string,
   parentPath: string,
   file: FilesUploadInput,
+  overwrite = false,
 ): Promise<void> {
   const baseUrl = await getBaseUrl();
-  const token = await getToken();
-  const formData = new FormData();
-  formData.append("file", {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType || inferMimeType(file.name) || "application/octet-stream",
-  } as unknown as Blob);
   const directory = projectRelativeDirectory(parentPath, projectId);
 
-  const response = await fetch(
-    `${baseUrl}/api/projects/${encodeURIComponent(projectId)}/files/upload?path=${encodeURIComponent(directory)}`,
-    {
-      method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      body: formData,
-    },
+  const url =
+    `${baseUrl}/api/projects/${encodeURIComponent(projectId)}/files/upload?path=${encodeURIComponent(directory)}${overwrite ? "&overwrite=true" : ""}`;
+  const response = await sendWithTransportAuth(url, { targetBaseUrl: baseUrl }, (headers) =>
+    nativeMultipartUpload({
+      url,
+      headers,
+      file: {
+        uri: file.uri,
+        name: file.name,
+        mimeType: file.mimeType || inferMimeType(file.name) || "application/octet-stream",
+      },
+    }),
   );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(`Upload failed: ${response.status} ${text.slice(0, 300)}`);
+    throw uploadResponseError(response.status, text);
   }
 }
 
 async function uploadServerExplorerFile(
   parentPath: string,
   file: FilesUploadInput,
+  overwrite = false,
 ): Promise<void> {
   const baseUrl = await getBaseUrl();
-  const token = await getToken();
-  const formData = new FormData();
-  formData.append("file", {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType || inferMimeType(file.name) || "application/octet-stream",
-  } as unknown as Blob);
-
-  const response = await fetch(
-    `${baseUrl}/api/explorer/upload?path=${encodeURIComponent(parentPath)}`,
-    {
-      method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      body: formData,
-    },
+  const url = `${baseUrl}/api/explorer/upload?path=${encodeURIComponent(parentPath)}${overwrite ? "&overwrite=true" : ""}`;
+  const response = await sendWithTransportAuth(url, { targetBaseUrl: baseUrl }, (headers) =>
+    nativeMultipartUpload({
+      url,
+      headers,
+      file: {
+        uri: file.uri,
+        name: file.name,
+        mimeType: file.mimeType || inferMimeType(file.name) || "application/octet-stream",
+      },
+    }),
   );
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(`Upload failed: ${response.status} ${text.slice(0, 300)}`);
+    throw uploadResponseError(response.status, text);
   }
 }
 
@@ -1086,9 +1145,11 @@ async function deleteServerEntry(path: string): Promise<void> {
     await projectApi.deleteFile(projectPath.projectId, projectPath.relativePath);
     return;
   }
-  await fetchApi(`/api/explorer/delete?path=${encodeURIComponent(path)}`, {
-    method: "DELETE",
-  });
+  await fetchApi(
+    `/api/explorer/delete?path=${encodeURIComponent(path)}`,
+    { method: "DELETE" },
+    FILES_DELETE_TIMEOUT_MS,
+  );
 }
 
 async function getServerMediaUrl(path: string): Promise<string> {
@@ -1104,9 +1165,25 @@ async function getServerThumbnailUrl(path: string, kind: FilesMediaKind, size = 
   return `${baseUrl}/api/explorer/image-thumbnail?path=${encodeURIComponent(path)}&size=${encodeURIComponent(String(size))}`;
 }
 
-async function getAuthHeaders(): Promise<Record<string, string> | undefined> {
-  const token = await getToken();
-  return token ? { Authorization: `Bearer ${token}` } : undefined;
+/**
+ * Native Image/Video/Audio loaders can follow redirects without exposing the
+ * redirect policy to this module. Fetch protected media with Expo's manual
+ * redirect transport, then hand the loader an app-private local URI.
+ */
+async function cacheProtectedMedia(
+  url: string,
+  targetUri: string,
+  targetBaseUrl: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  return cacheProtectedMediaResource(url, targetUri, {}, signal, {
+    revisionReader: getCredentialIdentityRevision,
+    request: async (send, requestSignal) => await sendWithTransportAuth(
+      url,
+      { targetBaseUrl, signal: requestSignal ?? signal },
+      async (headers) => await send(headers),
+    ),
+  });
 }
 
 function hashPath(value: string): string {
@@ -1115,6 +1192,12 @@ function hashPath(value: string): string {
     hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
   }
   return hash.toString(16);
+}
+
+async function getCredentialCacheScope(): Promise<string> {
+  const serverIdentity = await getCredentialIdentityRevision();
+  const snapshot = await getTokenSnapshot();
+  return `${serverIdentity}:${getTokenAuthScope(snapshot.token)}:r${snapshot.revision}`;
 }
 
 function cacheNameFor(entry: FilesEntry, authScope: string): string {
@@ -1128,23 +1211,17 @@ async function downloadServerMediaToCache(
 ): Promise<string> {
   const cacheRoot = FileSystem.cacheDirectory;
   if (!cacheRoot) throw new Error("メディアキャッシュを利用できません");
-  const token = await getToken();
-  const targetUri = `${cacheRoot}${cacheNameFor(entry, getTokenAuthScope(token))}`;
+  const cacheScope = await getCredentialCacheScope();
+  const targetUri = `${cacheRoot}${cacheNameFor(entry, cacheScope)}`;
   const info = await FileSystem.getInfoAsync(targetUri);
   if (info.exists) return targetUri;
 
   const url = await getServerMediaUrl(entry.path);
-  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+  const parsedBaseUrl = url.slice(0, url.indexOf("/api/"));
   try {
-    const result = await FileSystem.downloadAsync(
-      url,
-      targetUri,
-      headers ? { headers } : undefined,
-    );
-    if (result.status < 200 || result.status >= 300) {
-      throw new Error(`サーバーがエラーを返しました (${result.status})`);
-    }
-    return result.uri;
+    const cached = await cacheProtectedMedia(url, targetUri, parsedBaseUrl);
+    if (cached) return cached;
+    throw new Error("メディアキャッシュを利用できません");
   } catch (error) {
     await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
     throw error;
@@ -1154,26 +1231,19 @@ async function downloadServerMediaToCache(
 async function downloadServerFileForExport(entry: FilesEntry): Promise<string> {
   const cacheRoot = FileSystem.cacheDirectory;
   if (!cacheRoot) throw new Error("ファイル保存用キャッシュを利用できません");
-  const token = await getToken();
-  const baseName = cacheNameFor(entry, getTokenAuthScope(token));
+  const cacheScope = await getCredentialCacheScope();
+  const baseName = cacheNameFor(entry, cacheScope);
   const extension = getExtension(baseName);
   const stem = extension ? baseName.slice(0, -extension.length) : baseName;
   const targetUri = `${cacheRoot}${stem}-download-${Date.now()}-${Math.random()
     .toString(16)
     .slice(2)}${extension}`;
   const url = await getServerMediaUrl(entry.path);
-  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
-
+  const parsedBaseUrl = url.slice(0, url.indexOf("/api/"));
   try {
-    const result = await FileSystem.downloadAsync(
-      url,
-      targetUri,
-      headers ? { headers } : undefined,
-    );
-    if (result.status < 200 || result.status >= 300) {
-      throw new Error(`サーバーがエラーを返しました (${result.status})`);
-    }
-    return result.uri;
+    const cached = await cacheProtectedMedia(url, targetUri, parsedBaseUrl);
+    if (cached) return cached;
+    throw new Error("ファイルキャッシュを利用できません");
   } catch (error) {
     await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
     throw error;
@@ -1265,7 +1335,7 @@ export const filesApi = {
     source: FilesSource,
     parentPath: string,
     file: FilesUploadInput,
-    _options?: { projectId?: string | null },
+    options: { projectId?: string | null; overwrite?: boolean } = {},
   ) {
     if (source === "local") {
       return uploadLocalFile(parentPath, file);
@@ -1277,11 +1347,16 @@ export const filesApi = {
       allowRoot: true,
     });
     if (projectPath) {
-      await uploadServerProjectFile(projectPath.projectId, parentPath, file);
+      await uploadServerProjectFile(
+        projectPath.projectId,
+        parentPath,
+        file,
+        options.overwrite === true,
+      );
       return null;
     }
 
-    await uploadServerExplorerFile(parentPath, file);
+    await uploadServerExplorerFile(parentPath, file, options.overwrite === true);
     return null;
   },
 
@@ -1368,9 +1443,18 @@ export const filesApi = {
     if (!options?.thumbnail) {
       return (async () => {
         if (entry.source === "local") return { uri: entry.path };
-        const headers = await getAuthHeaders();
         const uri = await getServerMediaUrl(entry.path);
-        return headers ? { uri, headers } : { uri };
+        const cacheScope = await getCredentialCacheScope();
+        const cacheRoot = FileSystem.cacheDirectory;
+        if (!cacheRoot) throw new Error("メディアキャッシュを利用できません");
+        const parsedBaseUrl = uri.slice(0, uri.indexOf("/api/"));
+        const cached = await cacheProtectedMedia(
+          uri,
+          `${cacheRoot}${cacheNameFor(entry, cacheScope)}`,
+          parsedBaseUrl,
+        );
+        if (!cached) throw new Error("メディアキャッシュを利用できません");
+        return { uri: cached };
       })();
     }
 
@@ -1380,15 +1464,29 @@ export const filesApi = {
       return Promise.reject(new Error("ローカル一覧では元画像をサムネイルに使用しません"));
     }
     return (async () => {
-      const token = await getToken();
-      // token本体もkeyに含め、同一userのrefresh後に古いAuthorizationを再利用しない。
-      const key = filesThumbnailCacheKey(entry, options.size ?? 320, token);
+      const cacheScope = await getCredentialCacheScope();
+      // Include the credential generation so a refreshed account never reuses
+      // a source object constructed with an older auth header.
+      const key = filesThumbnailCacheKey(entry, options.size ?? 320, cacheScope);
       const cached = thumbnailCache.get(key);
       if (cached) return cached;
       const flight = (async () => {
-        const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
         const uri = await getServerThumbnailUrl(entry.path, kind, options.size);
-        return headers ? { uri, headers } : { uri };
+        const parsedBaseUrl = uri.slice(0, uri.indexOf("/api/"));
+        const cacheRoot = FileSystem.cacheDirectory;
+          if (cacheRoot) {
+          const thumbnailEntry = {
+            ...entry,
+            name: `${entry.name}-${options.size ?? 320}`,
+          };
+          const cached = await cacheProtectedMedia(
+            uri,
+            `${cacheRoot}${cacheNameFor(thumbnailEntry, cacheScope)}`,
+            parsedBaseUrl,
+          );
+          if (cached) return { uri: cached };
+        }
+        throw new Error("メディアキャッシュを利用できません");
       })().catch((error) => {
         if (thumbnailCache.get(key) === flight) thumbnailCache.delete(key);
         throw error;

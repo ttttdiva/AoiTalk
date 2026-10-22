@@ -41,6 +41,14 @@ export function getTaskDisplayStatus(task: Task): string {
   return task.effective_occurrence_status ?? task.status;
 }
 
+export function usesOccurrenceDisplayStatus(task: Task): boolean {
+  return Boolean(
+    task.effective_occurrence_id ||
+      task.effective_occurrence_status ||
+      (task.has_recurrence && task.effective_occurrence_start_at),
+  );
+}
+
 /**
  * タイマー開始成功後に一覧へ反映するローカル状態を作る。
  * startTimer API は時間エントリだけを返すため、サーバー側で同時に進行中へ
@@ -54,7 +62,7 @@ export function applyTaskTimerStart(
     ...task,
     active_time_entry: activeTimeEntry,
     status: "in_progress",
-    ...(task.effective_occurrence_id
+    ...(usesOccurrenceDisplayStatus(task)
       ? { effective_occurrence_status: "in_progress" }
       : {}),
   };

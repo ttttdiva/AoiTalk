@@ -18,6 +18,7 @@ AoiTalk 可以把配置好的语音合成角色作为 AI 助手的“声音与�
 
 - **VOICEROID2** — 可将 VOICEROID2 角色作为 AoiTalk 的语音使用
 - **Irodori-TTS** — 已集成本地 TTS。除默认的 v4.1 Small 外，还可按角色选择 v4.1 Anime、v3 VoiceDesign 等模型
+- **Gemini TTS** — 可按角色设置音色与朗读风格，使用 Gemini 3.8 Flash TTS / Flash-Lite TTS（[Gemini TTS 指南](docs/gemini_tts.md)）
 - **其他 TTS** — VOICEVOX、AivisSpeech、A.I.VOICE、CeVIO、Nijivoice、Azure TTS、gTTS、MioTTS 等
 - **语音识别** — Whisper、Parakeet、Google Speech、Gemini 系 ASR 等
 
@@ -48,7 +49,7 @@ AoiTalk 可以把配置好的语音合成角色作为 AI 助手的“声音与�
 
 AoiTalk 并不是只有一个聊天界面的应用。它可以组合 Agent 和外部服务来推进实际工作。
 
-- Agent Team / specialist 执行
+- Execution Team / specialist 执行
 - Heartbeat / scheduled execution
 - MCP
 - Web 搜索
@@ -88,6 +89,23 @@ AoiTalk 支持多种 LLM 使用方式，包括云端 API 与本地推理环境�
 - **Audio / Bot**: `src/audio/`、`src/tts/`、`src/bot/`。
 
 文档索引以及“当前规格 / 设计记录”的区分请参阅 [docs/README.md](docs/README.md)。
+
+## 本仓库（41_AoiTalk）的责任范围
+
+本仓库内部拥有语音对话、任务/日程管理、Docs/Files/知识检索、Agent、PC Bridge，以及 Web/Native
+Mobile 客户端本身。以下功能不属于本仓库，各自由独立应用作为正本，AoiTalk 的 Apps 界面仅提供指向
+这些应用的外部链接。
+
+| 功能 | 正本应用 |
+| --- | --- |
+| Hugging Face 浏览/同步 | `60_huggingface-sync` |
+| Hydrus 浏览 | `57_Hydrus_App` |
+| Story/Novel Studio、TRPG | `86_Novel-Graph-Studio` |
+| 公共 Gateway / Caddy / Cloudflare / 搜索入口 | [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway) |
+
+本地 LLM 的 Hugging Face Hub 获取/缓存，以及通过 URL ingest 抓取模型页面的能力仍保留在本仓库。
+本仓库 PostgreSQL 中的 `story_*` / `trpg_*` 表予以保留（不删除），仅作为 `86_Novel-Graph-Studio`
+的导入来源，本仓库运行时不再使用它们。
 
 ## 安装
 
@@ -130,9 +148,9 @@ Python 包本身考虑了 macOS，但 `setup.sh` 中部分步骤以 Debian / Ubu
 | --- | --- |
 | FastAPI | `3000` |
 | Next.js | `3002` |
-| Caddy | `6002` |
+| 共享 Gateway（独立仓库） | `6002` |
 
-Windows `run.bat` 与 Linux `run.sh` 的默认网络暴露边界不同。Linux / WSL 默认仅监听 loopback，并禁用 Caddy。需要对外提供服务时，应显式设置 TLS 边界，例如 `run.sh --public --with-caddy`。
+个人环境中的共享 Caddy、Cloudflare Worker、技术站点和搜索入口由 [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway) 管理。Windows `run.bat` 只启动 AoiTalk 的 FastAPI/Next.js，并默认使用 `/at` 公共前缀。Enterprise/Docker 分发继续使用本仓库中的 `caddy/Caddyfile.enterprise`。详情请参阅 [公共 Gateway 边界](docs/public_gateway.md)。
 
 ## 配置与数据库
 
@@ -147,17 +165,17 @@ Windows `run.bat` 与 Linux `run.sh` 的默认网络暴露边界不同。Linux /
 
 ## 开发与验证
 
-仓库内的工作规则以 `AGENTS.md` 为准。通常应根据变更范围执行针对性验证，并在推送 `main` 后确认 GitHub Actions。涉及 WebUI 用户行为的变更，还需要按照 [AI WebUI QA](docs/ai_webui_qa.md) 进行独立的真实浏览器验证。
+通常应根据变更范围执行本地针对性验证，并在推送 `main` 后确认远程提交 SHA。不等待 GitHub Actions / CI 完成，也不将其成功作为完成条件。涉及 WebUI 用户行为的变更，还需要按照 [AI WebUI QA](docs/ai_webui_qa.md) 进行独立的真实浏览器验证。
 
 ## 发布
 
 私有开发仓库与公开发布仓库是有意分离的。`scripts/publish_public.ps1` 会为 `ttttdiva/AoiTalk` 生成公开发布用 tree。
 
-- 公开发布: [docs/public_publish.md](docs/public_publish.md)
 - Mobile APK / 自动更新标准: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
 - Release checklist: [docs/release-checklist.md](docs/release-checklist.md)
-- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-MIT
+根目录的 [LICENSE](LICENSE)（MIT）适用于本仓库中未另行标注的内容。`resources/seethrough-rig/runtime` 是独立的包，其 upstream license 未指定（package.json 为 `UNLICENSED`），不适用 MIT，也不授予任何形式的许可。详见该目录下的 `FIRST_PARTY_NOTICE.md`。
+
+- [功能名称与职责](docs/feature_terminology.md)

@@ -21,6 +21,25 @@ The harness `WorkItem` has additive source/Agent/Project/Task/causal fields,
 but those values are routing metadata.  They do not grant filesystem,
 Project, model, or provider authority.
 
+## Runner model settings
+
+The runner selector is stored at `agent_harness.codex.runner`.  Each CLI runner
+keeps its own model settings, and the settings UI/API edits only the selected
+runner's branch, so switching runners never overwrites the other one:
+
+| Runner | Model / effort | Other |
+| --- | --- | --- |
+| Codex CLI (`codex_exec`) | `agent_harness.codex.model` / `reasoning_effort` | `approval_policy`, `exec_sandbox` |
+| Claude Code (`claude_code`) | `agent_harness.claude.model` / `reasoning_effort` | `permission_mode` (default `acceptEdits`; `bypassPermissions` is rejected), deployment-owned `allowed_tools` |
+
+`claude -p` starts in Claude Code's `default` permission mode, where every edit
+is denied because print mode cannot prompt; the Claude runner therefore passes
+an explicit `--permission-mode`.  The legacy flat `model`/`effort` aliases are
+routed to the selected runner's branch.  When Claude Code is selected, the
+settings response also reports the detected CLI version and model
+compatibility (for example, `opus` / `claude-opus-5-5` need Claude Code
+v2.1.280 or later to reach Opus 5.5).
+
 ## Current behavior
 
 When constructed without a coordinator, the legacy orchestrator still keeps

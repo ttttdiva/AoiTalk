@@ -25,9 +25,19 @@ import { getSession } from "@/lib/auth";
 import {
   cleanOptionalString,
   ensureDocsWorkspace,
-  getDocsNodeAccess,
+  getDocsNodeAccessMap,
+  effectiveDocsSearchBodyText,
   getDocsLibraryIdsForReadableProjects,
 } from "@/lib/server/knowledge-docs-utils";
+import {
+  collectDocsSearchPage,
+  docsSearchIndexJoin,
+  docsSearchSnippet,
+  docsSearchTagCondition,
+  docsSearchTextConditions,
+  loadDocsSearchBreadcrumbs,
+  parseDocsSearchQuery,
+} from "@/lib/server/docs-search";
 import { normalizeDocsNodeType } from "@/lib/docs-model";
 import { getAccessibleProject } from "@/lib/server/project-access";
 import {
@@ -44,16 +54,21 @@ export async function GET(request: NextRequest) {
   }
 
   const searchParams = request.nextUrl.searchParams;
-  const query = cleanOptionalString(searchParams.get("q"), 200);
+  const parsedQuery = parseDocsSearchQuery(cleanOptionalString(searchParams.get("q"), 200) ?? "");
+  const query = parsedQuery.text;
+  const explicitTag = cleanOptionalString(searchParams.get("tag"), 200);
+  const tagFilters = [...parsedQuery.tags, ...(explicitTag ? [explicitTag] : [])];
   const nodeType = cleanOptionalString(searchParams.get("node_type"), 40);
   const includeArchived = searchParams.get("include_archived") === "1";
   const archivedOnly = searchParams.get("archived_only") === "1";
   const rootsOnly = searchParams.get("roots_only") === "1";
   const projectRef = cleanOptionalString(searchParams.get("project"), 200);
-  const limit = Math.min(
-    Math.max(Number(searchParams.get("limit")) || 40, 1),
-    500,
-  );
+  const rawLimit = Number(searchParams.get("limit"));
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(Math.max(Math.floor(rawLimit) || 40, 1), 500)
+    : 40;
+  const rawCursor = Number(searchParams.get("cursor") ?? 0);
+  const cursor = Number.isSafeInteger(rawCursor) && rawCursor >= 0 ? rawCursor : 0;
   // Apply lifecycle visibility while building the search candidate set, not
   // only after fetching rows. This prevents archived nodes from consuming the
   // bounded candidate window and keeps search/live reads consistent.
@@ -112,7 +127,7 @@ export async function GET(request: NextRequest) {
         )
         .limit(2);
       if (projectRows.length !== 1) {
-        return NextResponse.json({ results: [] });
+        return NextResponse.json({ results: [], next_cursor: null });
       }
       projectId = projectRows[0].id;
     }
@@ -120,11 +135,10 @@ export async function GET(request: NextRequest) {
     // Keep project membership/permission semantics in the same ACL path as
     // the rest of Docs. A project reference never broadens Personal access.
     if (!(await getAccessibleProject(projectId, user.id))) {
-      return NextResponse.json({ results: [] });
+      return NextResponse.json({ results: [], next_cursor: null });
     }
   }
 
-  let searchNodeIds: string[] | null = null;
   let directNodeId: string | null = null;
   let nodeIdPrefix: string | null = null;
   const notLegacyEmailBlank = sql<boolean>`NOT (
@@ -149,39 +163,17 @@ export async function GET(request: NextRequest) {
       SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
     )
   )`;
-  if (query) {
-    if (isFullUuid(query)) {
-      // @Docs でIDを貼り付けた場合も、タイトル検索へ戻さず対象を
-      // 直接候補化する。認可・workspace/project境界は下のnode queryで再検証する。
-      // UUID列に対する単一ID検索は `inArray` の配列バインドに任せず、
-      // typed な `eq` 条件として組み立てる。これにより、単一候補の
-      // @Docs ID検索でドライバごとの配列キャスト差異を避けられる。
-      directNodeId = canonicalEntityId(query);
-    } else {
-      if (isUuidPrefixQuery(query)) nodeIdPrefix = compactEntityId(query);
-      const matched = await db
-        .select({ nodeId: knowledgeSearchIndex.nodeId })
-        .from(knowledgeSearchIndex)
-        .innerJoin(knowledgeNodes, eq(knowledgeSearchIndex.nodeId, knowledgeNodes.id))
-        .where(
-          and(
-            inArray(knowledgeSearchIndex.docsLibraryId, workspaceIds),
-            projectId ? eq(knowledgeSearchIndex.projectId, projectId) : undefined,
-            archiveCondition,
-            sql<boolean>`regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''`,
-            notLegacyEmailBlank,
-            or(
-              ilike(knowledgeSearchIndex.titleText, `%${query}%`),
-              ilike(knowledgeSearchIndex.bodyTextPlain, `%${query}%`),
-            ),
-          ),
-        )
-        .limit(limit);
-      searchNodeIds = matched.map((row) => row.nodeId);
-    }
-    if (searchNodeIds && searchNodeIds.length === 0 && !nodeIdPrefix)
-      return NextResponse.json({ results: [] });
+  if (isFullUuid(query)) {
+    // A pasted ID remains directly addressable; the ACL resolver below is
+    // authoritative even when its library is outside the broad candidate set.
+    directNodeId = canonicalEntityId(query);
+  } else if (isUuidPrefixQuery(query)) {
+    nodeIdPrefix = compactEntityId(query);
   }
+  const textConditions = query && !directNodeId ? docsSearchTextConditions(query) : null;
+  const prefixCondition = nodeIdPrefix
+    ? sql<boolean>`replace(${knowledgeNodes.id}::text, '-', '') like ${`${nodeIdPrefix}%`}`
+    : undefined;
 
   const conditions = [
     directNodeId ? undefined : inArray(knowledgeNodes.docsLibraryId, workspaceIds),
@@ -193,97 +185,98 @@ export async function GET(request: NextRequest) {
       ? eq(knowledgeNodes.nodeType, normalizeDocsNodeType(nodeType))
       : undefined,
     rootsOnly ? isNull(knowledgeNodes.parentId) : undefined,
+    ...tagFilters.map((tag) => docsSearchTagCondition(tag)),
     directNodeId
       ? eq(knowledgeNodes.id, directNodeId)
-      : nodeIdPrefix
-        ? or(
-            sql<boolean>`replace(${knowledgeNodes.id}::text, '-', '') like ${`${nodeIdPrefix}%`}`,
-            searchNodeIds && searchNodeIds.length > 0
-              ? inArray(knowledgeNodes.id, searchNodeIds)
-              : undefined,
-          )
-        : searchNodeIds
-          ? inArray(knowledgeNodes.id, searchNodeIds)
-          : undefined,
-  ].filter(Boolean);
+      : textConditions
+        ? or(prefixCondition, textConditions.match)
+        : undefined,
+  ];
 
-  const nodes = await db
-    .select()
-    .from(knowledgeNodes)
-    .where(and(...conditions))
-    .orderBy(
-      ...(nodeIdPrefix
-        ? [
-            sql`case when replace(${knowledgeNodes.id}::text, '-', '') like ${`${nodeIdPrefix}%`} then 0 else 1 end`,
-            asc(knowledgeNodes.sortOrder),
-            asc(knowledgeNodes.createdAt),
-            asc(knowledgeNodes.id),
-            desc(knowledgeNodes.updatedAt),
-          ]
-        : [
-            asc(knowledgeNodes.sortOrder),
-            asc(knowledgeNodes.createdAt),
-            asc(knowledgeNodes.id),
-            desc(knowledgeNodes.updatedAt),
-          ]),
-    )
-    .limit(limit * 4);
-
-  const visibleNodes = (
-    await Promise.all(nodes.map((node) => getDocsNodeAccess(node.id, user)))
-  )
-    .map((access) => access?.node)
-    .filter((node): node is NonNullable<typeof node> => Boolean(node))
-    .slice(0, limit);
+  // Ranking and all text/tag/lifecycle predicates are applied before the
+  // candidate scan. ACL filtering happens before the visible page limit,
+  // rather than letting private matches consume an arbitrary overfetch cap.
+  const order = [
+    ...(prefixCondition ? [sql`case when ${prefixCondition} then -1 else 0 end`] : []),
+    ...(textConditions ? [asc(textConditions.rank)] : []),
+    desc(knowledgeNodes.updatedAt),
+    asc(knowledgeNodes.sortOrder),
+    asc(knowledgeNodes.createdAt),
+    asc(knowledgeNodes.id),
+  ];
+  const page = await collectDocsSearchPage({
+    cursor,
+    limit,
+    fetchCandidates: async (offset, size) => db
+      .select({ id: knowledgeNodes.id })
+      .from(knowledgeNodes)
+      .leftJoin(knowledgeSearchIndex, docsSearchIndexJoin)
+      .where(and(...conditions))
+      .orderBy(...order)
+      .limit(size)
+      .offset(offset),
+    resolveVisible: async (candidates) => {
+      const access = await getDocsNodeAccessMap(candidates.map((node) => node.id), user, {
+        includeArchived: includeArchived || archivedOnly,
+      });
+      return candidates.map((candidate) => {
+        const node = access.get(candidate.id)?.node;
+        // Re-check lifecycle on the authorized row in case it changed while
+        // the candidate query was running.
+        if (!node || (archivedOnly ? !node.archivedAt : !includeArchived && node.archivedAt)) return null;
+        return node;
+      });
+    },
+  });
+  const visibleNodes = page.nodes;
 
   const tagRows = visibleNodes.length
     ? await db
-        .select({ nodeId: knowledgeNodeSupertags.nodeId, name: knowledgeSupertags.name })
+        .select({
+          nodeId: knowledgeNodeSupertags.nodeId,
+          name: knowledgeSupertags.name,
+          docsLibraryId: knowledgeSupertags.docsLibraryId,
+        })
         .from(knowledgeNodeSupertags)
         .innerJoin(knowledgeSupertags, eq(knowledgeNodeSupertags.supertagId, knowledgeSupertags.id))
         .where(inArray(knowledgeNodeSupertags.nodeId, visibleNodes.map((node) => node.id)))
     : [];
+  const nodeLibraryById = new Map(visibleNodes.map((node) => [node.id, node.docsLibraryId]));
   const tagsByNode = new Map<string, string[]>();
   for (const row of tagRows) {
+    if (row.docsLibraryId !== nodeLibraryById.get(row.nodeId)) continue;
     const tags = tagsByNode.get(row.nodeId) ?? [];
-    tags.push(row.name);
+    if (!tags.includes(row.name)) tags.push(row.name);
     tagsByNode.set(row.nodeId, tags);
   }
 
-  const parentIds = Array.from(
-    new Set(
-      visibleNodes
-        .map((node) => node.parentId)
-        .filter((id): id is string => Boolean(id)),
-    ),
-  );
-  const parentRows = parentIds.length
-    ? await db
-        .select()
-        .from(knowledgeNodes)
-        .where(inArray(knowledgeNodes.id, parentIds))
-    : [];
-  const parentAccessRows = await Promise.all(
-    parentRows.map((parent) => getDocsNodeAccess(parent.id, user)),
-  );
-  const parentTitlesById = new Map(
-    parentAccessRows
-      .map((access) => access?.node)
-      .filter((node): node is NonNullable<typeof node> => Boolean(node))
-      .map((node) => [node.id, node.title] as const),
-  );
+  const breadcrumbs = await loadDocsSearchBreadcrumbs(visibleNodes, async (ids) => {
+    const access = await getDocsNodeAccessMap(ids, user, { includeArchived: false });
+    return new Map([...access].map(([id, entry]) => [id, entry.node]));
+  });
 
-  // Keep the response aligned with the Python Docs API contract.  Body and
-  // internal node metadata are intentionally omitted from search candidates.
+  // Existing result fields stay compatible with mention pickers and callers;
+  // context fields are derived only from authorized, live rows.
   return NextResponse.json({
-    results: visibleNodes.map((node) => ({
-      id: node.id,
-      title: node.title,
-      tags: tagsByNode.get(node.id) ?? [],
-      project_id: node.projectId,
-      parent_title: node.parentId
-        ? parentTitlesById.get(node.parentId) ?? null
-        : null,
-    })),
+    results: visibleNodes.map((node) => {
+      const breadcrumb = breadcrumbs.get(node.id) ?? [];
+      let snippet = "";
+      try {
+        snippet = docsSearchSnippet(effectiveDocsSearchBodyText(node), query);
+      } catch {
+        // An unreadable encrypted body must never fall back to ciphertext or
+        // potentially stale plaintext from the search index.
+      }
+      return {
+        id: node.id,
+        title: node.title,
+        tags: (tagsByNode.get(node.id) ?? []).sort((a, b) => a.localeCompare(b)),
+        project_id: node.projectId,
+        parent_title: breadcrumb.at(-1) ?? null,
+        breadcrumb,
+        snippet,
+      };
+    }),
+    next_cursor: page.nextCursor,
   });
 }

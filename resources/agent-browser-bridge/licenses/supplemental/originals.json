@@ -1,0 +1,59 @@
+{
+  "files": [
+    {
+      "package": "rand@0.8.5",
+      "path": "COPYRIGHT",
+      "bytes": 569,
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+      "packaged_path": "licenses/supplemental/rand-0.8.5-COPYRIGHT.txt",
+      "encoding": "utf-8",
+      "source": "https://static.crates.io/crates/rand/rand-0.8.5.crate"
+    },
+    {
+      "package": "rand_chacha@0.3.1",
+      "path": "COPYRIGHT",
+      "bytes": 569,
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+      "packaged_path": "licenses/supplemental/rand_chacha-0.3.1-COPYRIGHT.txt",
+      "encoding": "utf-8",
+      "source": "https://static.crates.io/crates/rand_chacha/rand_chacha-0.3.1.crate"
+    },
+    {
+      "package": "rand_core@0.6.4",
+      "path": "COPYRIGHT",
+      "bytes": 569,
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+      "packaged_path": "licenses/supplemental/rand_core-0.6.4-COPYRIGHT.txt",
+      "encoding": "utf-8",
+      "source": "https://static.crates.io/crates/rand_core/rand_core-0.6.4.crate"
+    },
+    {
+      "package": "rav1e@0.8.1",
+      "path": "PATENTS",
+      "bytes": 5702,
+      "sha256": "7b14a70c194b19dbd0625e7eac839a63200f67484521ce5e8d8244b127e8907a",
+      "packaged_path": "licenses/supplemental/rav1e-0.8.1-PATENTS.txt",
+      "encoding": "cp1252",
+      "source": "https://static.crates.io/crates/rav1e/rav1e-0.8.1.crate"
+    },
+    {
+      "package": "tiff@0.10.3",
+      "path": "tests/COPYRIGHT",
+      "bytes": 334,
+      "sha256": "c341a79df284be8a0321dabda4aa1aeea053b55b4e0db827940c221fcaf29b7b",
+      "packaged_path": "licenses/supplemental/tiff-0.10.3-tests-COPYRIGHT.txt",
+      "encoding": "utf-8",
+      "source": "https://static.crates.io/crates/tiff/tiff-0.10.3.crate"
+    },
+    {
+      "package": "utf8_iter@1.0.4",
+      "path": "COPYRIGHT",
+      "bytes": 1742,
+      "sha256": "c30152c94a6d75e021adbc52b3a52470366a46edb917e17deae3259251af244c",
+      "packaged_path": "licenses/supplemental/utf8_iter-1.0.4-COPYRIGHT.txt",
+      "encoding": "utf-8",
+      "source": "https://static.crates.io/crates/utf8_iter/utf8_iter-1.0.4.crate"
+    }
+  ],
+  "scope": "Exact pinned crate originals; tiff tests attribution retained conservatively, not claimed linked into binary"
+}

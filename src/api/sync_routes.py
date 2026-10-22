@@ -1,7 +1,7 @@
 """Mobile sync API routes.
 
-Current write support covers `tasks` and `time_entries`. Remaining tables are
-pull-only local caches on mobile.
+Current write support covers Projects, Tasks, time entries, conversation pin/delete
+state, and Docs mutations. Remaining tables are pull-only local caches on mobile.
 """
 
 from __future__ import annotations
@@ -12,21 +12,29 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, literal, or_, select
+from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..memory.models import (
     ConversationMessage,
+    ConversationParticipant,
     ConversationSession,
+    AgentDialogue,
+    AgentDialogueInput,
+    AgentRun,
     ContentDeletionEvent,
     KnowledgeNodeShare,
     Project,
@@ -41,6 +49,7 @@ from ..memory.models import (
     TimeEntry,
     KnowledgeNode,
     DocsLibrary,
+    _session_iso,
     public_session_context,
 )
 from ..memory.project_repository import ProjectRepository
@@ -53,6 +62,17 @@ from ..services.docs_acl import (
     library_can_write,
 )
 from ..services.task_management_service import TaskManagementError, TaskManagementService
+from ..services.session_llm_runtime import release_session_agent_team_registry
+from ..services.conversation_status import (
+    ConversationStatusProjection,
+    project_conversation_statuses,
+)
+from ..services.agent_root_lifecycle import (
+    AgentRootLifecycleError,
+    attach_private_root_metadata,
+    guard_private_root_operation,
+    project_private_root_metadata,
+)
 from ..services.docs_library_compat import read_docs_library_id
 from ..services.docs_library_compat import with_legacy_docs_library_aliases
 from ..services.docs_workspace import get_project_docs_library
@@ -68,10 +88,57 @@ from .docs_sync import (
     pull_cursor_envelope,
     pull_docs_table,
 )
+from .routes.tasks._shared import _parse_timer_datetime
+from .general_sync_digest import (
+    GENERAL_DIGEST_VERSION,
+    pull_general_digest_page,
+    valid_general_digest,
+)
 from .uuid_http import parse_uuid_or_400
-from .story_legacy_compat import LEGACY_STORY_PULL_LIMITS, LEGACY_STORY_TABLES, pull_story_table
 
 logger = logging.getLogger(__name__)
+
+_SAFE_SYNC_EXCEPTION_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
+_SAFE_SYNC_SQLSTATE_RE = re.compile(r"^[0-9A-Z]{5}$")
+_SYNC_REASON_CODE_ALLOWLIST = frozenset(
+    {
+        "task_cas_stale",
+        "task_business_conflict",
+        "docs_cas_stale",
+        "docs_base_missing",
+        "docs_business_conflict",
+    }
+)
+_SYNC_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+def _safe_sync_exception_diagnostics(error: BaseException) -> dict[str, str]:
+    """Return bounded diagnostics without exception text, ids, or SQL data."""
+
+    exception_type = type(error).__name__
+    if not _SAFE_SYNC_EXCEPTION_TYPE_RE.fullmatch(exception_type):
+        exception_type = "Exception"
+    sqlstate = ""
+    for candidate in (error, getattr(error, "orig", None)):
+        value = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if isinstance(value, str) and _SAFE_SYNC_SQLSTATE_RE.fullmatch(value.upper()):
+            sqlstate = value.upper()
+            break
+    source_frame = ""
+    for frame in reversed(traceback.extract_tb(error.__traceback__)):
+        try:
+            relative = os.path.relpath(frame.filename, _SYNC_REPO_ROOT)
+        except (TypeError, ValueError):
+            continue
+        if relative.startswith("src" + os.sep) or relative.startswith("src/"):
+            source_frame = f"{os.path.basename(frame.filename)}:{int(frame.lineno)}"
+            break
+    return {
+        "exception_type": exception_type,
+        "sqlstate": sqlstate or "unknown",
+        "source_frame": source_frame or "unknown",
+    }
+
 
 SYNC_TABLES = {
     "projects",
@@ -83,7 +150,6 @@ SYNC_TABLES = {
     "record_tables",
     "record_fields",
     "record_rows",
-    *LEGACY_STORY_TABLES,
     *DOCS_SYNC_TABLES,
 }
 
@@ -104,7 +170,6 @@ SYNC_PULL_LIMITS = {
     "record_tables": 1000,
     "record_fields": 5000,
     "record_rows": 5000,
-    **LEGACY_STORY_PULL_LIMITS,
     **DOCS_PULL_LIMITS,
 }
 
@@ -114,6 +179,7 @@ SYNC_PULL_LIMITS = {
 # parser.  The additive protocol below keeps legacy clients unchanged while
 # allowing newer clients to consume a bounded keyset page at a time.
 GENERAL_SYNC_PAGINATION_VERSION = 1
+DOCS_SYNC_PROTOCOL_VERSION = 2
 GENERAL_SYNC_PAGE_LIMITS = {
     "projects": 100,
     "tasks": 100,
@@ -168,6 +234,33 @@ class SyncPullPayload(BaseModel):
     # cursor envelope so each protocol can evolve independently.
     general_cursors: dict[str, str] = Field(default_factory=dict)
     general_snapshot_token: Optional[str] = None
+    general_digests: dict[str, str] = Field(default_factory=dict)
+
+
+class SyncDocsDiagnosticResponse(BaseModel):
+    """Bounded metadata returned by the read-only Docs sync probe."""
+
+    protocol_version: Literal[1] = 1
+    docs_sync_protocol_version: Literal[2] = DOCS_SYNC_PROTOCOL_VERSION
+    read_only: Literal[True] = True
+    server_phase: Literal["metadata_read"] = "metadata_read"
+    status: Literal["ok", "error"]
+    personal_library_exists: bool | None = None
+    needs_normalization: bool | None = Field(
+        default=None,
+        description=(
+            "True when the current user owns a Docs Library row whose type is "
+            "not personal; this diagnostic never normalizes it."
+        ),
+    )
+    accessible_project_count: int | None = Field(default=None, ge=0)
+    accessible_scope_count: int | None = Field(default=None, ge=0)
+    error_code: Literal["diagnostic_query_failed"] | None = None
+    exception_type: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$",
+    )
 
 
 async def _read_pull_docs_digests(request: Request) -> dict[str, str]:
@@ -327,6 +420,27 @@ async def _read_pull_general_snapshot_token(request: Request) -> Optional[str]:
         return None
 
 
+async def _read_pull_general_digests(request: Request) -> dict[str, str]:
+    """Read completed content acknowledgements; they never become ``since``."""
+    from_query = request.query_params.get("general_digests")
+    try:
+        if from_query is not None:
+            digests = SyncPullPayload.model_validate(
+                {"general_digests": json.loads(from_query)}
+            ).general_digests
+        else:
+            raw = await request.body()
+            digests = SyncPullPayload.model_validate_json(raw).general_digests if raw else {}
+    except Exception as exc:  # noqa: BLE001
+        if from_query is None:
+            return {}
+        raise HTTPException(status_code=400, detail="Invalid general sync digests") from exc
+    if any(table not in GENERAL_SYNC_PAGE_LIMITS or not valid_general_digest(value)
+           for table, value in digests.items()):
+        raise HTTPException(status_code=400, detail="Invalid general sync digests")
+    return digests
+
+
 def _validate_docs_opaque_token(value: Optional[str], field_name: str) -> Optional[str]:
     """Validate token shape without interpreting its opaque contents."""
 
@@ -382,13 +496,21 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
 
 
 def _ensure_not_stale(
-    current_updated_at: Optional[datetime], base_updated_at: Optional[str]
+    current_updated_at: Optional[datetime],
+    base_updated_at: Optional[str],
+    *,
+    reason_code: str | None = None,
 ) -> None:
     if current_updated_at is None or base_updated_at in (None, ""):
         return
     base_dt = _parse_datetime(base_updated_at, "base_updated_at")
     if base_dt is not None and current_updated_at > base_dt:
-        raise TaskManagementError("Entity was updated on the server", status_code=409)
+        detail = {"code": reason_code} if reason_code else None
+        raise TaskManagementError(
+            "Entity was updated on the server",
+            status_code=409,
+            detail=detail,
+        )
 
 
 async def _accessible_project_ids(session: AsyncSession, user_id: UUID) -> list[UUID]:
@@ -417,11 +539,11 @@ async def _docs_sync_scopes(
     # ``personal_workspace`` is accepted only as an in-process compatibility
     # alias; the canonical service/API name is ``personal_library``.
     personal_library = personal_library or personal_workspace
-    if personal_library is None:
-        raise ValueError("personal_library is required")
-    libraries: dict[UUID, DocsLibrary] = {
-        personal_library.id: personal_library,
-    }
+    libraries: dict[UUID, DocsLibrary] = (
+        {personal_library.id: personal_library}
+        if personal_library is not None
+        else {}
+    )
     project_scopes: list[tuple[UUID, DocsLibrary, str]] = []
     if project_ids:
         # Project Docs now live in the owner's Personal Library.  A Project
@@ -451,17 +573,19 @@ async def _docs_sync_scopes(
                 (project_id, library, "write" if can_write else "read")
             )
 
-    shared_rows = await session.execute(
+    shared_query = (
         select(DocsLibrary, KnowledgeNodeShare.permission)
         .join(KnowledgeNode, KnowledgeNode.docs_library_id == DocsLibrary.id)
         .join(KnowledgeNodeShare, KnowledgeNodeShare.node_id == KnowledgeNode.id)
         .where(
             KnowledgeNodeShare.user_id == user_id,
             DocsLibrary.library_type == "personal",
-            DocsLibrary.id != personal_library.id,
             KnowledgeNode.archived_at.is_(None),
         )
     )
+    if personal_library is not None:
+        shared_query = shared_query.where(DocsLibrary.id != personal_library.id)
+    shared_rows = await session.execute(shared_query)
     shared_permissions: dict[UUID, str] = {}
     for library, permission in shared_rows.all():
         libraries[library.id] = library
@@ -470,17 +594,18 @@ async def _docs_sync_scopes(
             shared_permissions[library.id] = "write" if value == "write" else "read"
 
     scopes: list[dict[str, Any]] = []
-    scopes.append(
-        with_legacy_docs_library_aliases(
-            {
-                "docs_library_id": str(personal_library.id),
-                "source": "personal",
-                "access": "owner",
-                "read_only": False,
-            },
-            personal_library.id,
+    if personal_library is not None:
+        scopes.append(
+            with_legacy_docs_library_aliases(
+                {
+                    "docs_library_id": str(personal_library.id),
+                    "source": "personal",
+                    "access": "owner",
+                    "read_only": False,
+                },
+                personal_library.id,
+            )
         )
-    )
     # Keep one explicit scope per readable Project.  Multiple projects may
     # share the same owner's Personal Library; the project_id discriminator
     # prevents clients from treating the whole Personal Library as shared.
@@ -500,7 +625,10 @@ async def _docs_sync_scopes(
 
     project_library_ids = {library.id for _, library, _ in project_scopes}
     for library in sorted(libraries.values(), key=lambda item: str(item.id)):
-        if library.id == personal_library.id or library.id in project_library_ids:
+        if (
+            (personal_library is not None and library.id == personal_library.id)
+            or library.id in project_library_ids
+        ):
             continue
         # Personal subtree shares are advertised only as a shared scope.  The
         # pull endpoint still applies node-level ACL filtering, so metadata
@@ -806,6 +934,29 @@ def _row_general_event_at(row: Any) -> Optional[datetime]:
     return max(values) if values else datetime.min
 
 
+def _conversation_row_event_at(row: Any) -> Optional[datetime]:
+    """Read the SQL dependency clock retained on conversation ORM rows."""
+
+    event_at = _normalize_sync_datetime(
+        getattr(row, _CONVERSATION_EVENT_ATTR, None)
+    )
+    if event_at is not None:
+        return event_at
+    values = [
+        _normalize_sync_datetime(getattr(row, field, None))
+        for field in (
+            "last_activity",
+            "last_read_at",
+            "pin_updated_at",
+            "agent_binding_updated_at",
+            "session_start",
+            "deleted_at",
+        )
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
 def _general_page_payload(
     rows: list[Any],
     *,
@@ -825,23 +976,92 @@ def _general_page_payload(
     return payload
 
 
-def _conversation_session_payload(row: ConversationSession) -> dict[str, Any]:
-    payload = row.to_dict()
-    payload["is_unread"] = bool(
-        row.app_id is not None
-        and row.development_status == "waiting_for_user"
-        and row.last_activity is not None
-        and (row.last_read_at is None or row.last_activity > row.last_read_at)
+_CONVERSATION_EVENT_ATTR = "_conversation_sync_event_at"
+
+
+def _history_completion_iso(value: Any) -> Optional[str]:
+    """Serialize status fences as explicit UTC for the sync wire contract."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        normalized = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+        return normalized.isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _normalize_sync_datetime(value: Any) -> datetime | None:
+    """Normalize ORM/SQLite timestamp values before comparing them."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return (
+            value.astimezone(timezone.utc).replace(tzinfo=None)
+            if value.tzinfo is not None
+            else value
+        )
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (
+        parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        if parsed.tzinfo is not None
+        else parsed
     )
-    timestamps = [
-        value
-        for value in (row.last_activity, row.last_read_at, row.session_start)
-        if value is not None
-    ]
-    payload["updated_at"] = _iso(max(timestamps) if timestamps else None)
-    payload["created_at"] = _iso(row.session_start)
-    payload["session_metadata"] = public_session_context(row.context) or {}
+
+
+def _apply_conversation_status_projection(
+    payload: dict[str, Any],
+    projection: ConversationStatusProjection | None,
+) -> dict[str, Any]:
+    """Apply the shared status fields to an already serialized session."""
+
+    if projection is None:
+        return payload
+    status = str(projection.status)
+    payload["history_status"] = status
+    payload["history_completed_at"] = _history_completion_iso(
+        projection.history_completed_at
+    )
+    payload["is_unread"] = status == "ready"
     return payload
+
+
+def _conversation_session_payload(
+    row: ConversationSession,
+    *,
+    status_projection: ConversationStatusProjection | None = None,
+) -> dict[str, Any]:
+    payload = project_private_root_metadata(
+        row.to_dict(),
+        getattr(row, "_private_agent_root_metadata", None),
+    )
+    payload["history_status"] = "idle"
+    payload["history_completed_at"] = None
+    payload["is_unread"] = False
+    timestamps = [
+        normalized
+        for value in (
+            row.last_activity,
+            row.last_read_at,
+            row.pin_updated_at,
+            row.agent_binding_updated_at,
+            row.session_start,
+            getattr(row, _CONVERSATION_EVENT_ATTR, None),
+        )
+        for normalized in (_normalize_sync_datetime(value),)
+        if normalized is not None
+    ]
+    payload["updated_at"] = _session_iso(max(timestamps) if timestamps else None)
+    payload["created_at"] = _session_iso(row.session_start)
+    payload["session_metadata"] = public_session_context(row.context) or {}
+    return _apply_conversation_status_projection(payload, status_projection)
 
 
 def _record_table_payload(row: RecordTable) -> dict[str, Any]:
@@ -914,18 +1134,31 @@ def _split_record_changes(rows: list[Any], serializer) -> dict[str, Any]:
     return {"changes": changes, "tombstones": tombstones, "cursor": None}
 
 
-def _conversation_user_ids(user_id: UUID) -> list[str]:
-    """Return conversation owner ids visible to mobile sync.
+def _conversation_visibility_filter(
+    user_id: UUID, project_ids: list[UUID]
+) -> Any:
+    """Match the conversation API's owner/participant and Project read ACLs.
 
-    Existing conversation routes still store normal Web/mobile chat sessions
-    under `default_user`. Mobile sync must include those legacy sessions until
-    the conversation stack is fully user-scoped.
+    Legacy ``default_user`` rows are not public. They require an explicit
+    joined participant just like any other user's conversation; never use
+    the legacy owner name as an authenticated user's identity alias.
     """
-
-    ids = [str(user_id)]
-    if "default_user" not in ids:
-        ids.append("default_user")
-    return ids
+    actor_id = str(user_id)
+    participant_session_ids = select(ConversationParticipant.session_id).where(
+        ConversationParticipant.participant_type == "user",
+        ConversationParticipant.participant_id == actor_id,
+        ConversationParticipant.status == "joined",
+    )
+    return and_(
+        or_(
+            ConversationSession.user_id == actor_id,
+            ConversationSession.id.in_(participant_session_ids),
+        ),
+        or_(
+            ConversationSession.project_id.is_(None),
+            ConversationSession.project_id.in_(project_ids),
+        ),
+    )
 
 
 async def _pull_projects(
@@ -1296,71 +1529,264 @@ async def _pull_time_entries(
     return _split_changes(rows)
 
 
+def _max_datetime_expression(values: list[Any]) -> Any:
+    """Return a NULL-free maximum without expanding a nested CASE tree.
+
+    PostgreSQL's ``GREATEST`` and the SQLite test adapter both ignore NULL
+    arguments, while the explicit ``coalesce`` keeps the behavior consistent
+    for any dialect that does not.  A nested CASE implementation grows
+    exponentially once the status dependency clocks are added and can exceed
+    SQLite's bound-variable limit.
+    """
+
+    normalized = [func.coalesce(value, literal(datetime.min)) for value in values]
+    return func.greatest(*normalized)
+
+
+def _conversation_dependency_event_values() -> list[Any]:
+    """Return status-source clocks correlated to the outer session row.
+
+    Status transitions are intentionally not written back to
+    ``conversation_sessions``.  These scalar aggregates keep the existing
+    session pull contract while making a Run/dialogue-only mutation visible to
+    both the legacy ``since`` poll and bounded general pagination.
+    """
+
+    run_scope = AgentRun.session_id == ConversationSession.id
+    dialogue_scope = or_(
+        AgentDialogue.root_session_id == ConversationSession.id,
+        AgentDialogue.worker_session_id == ConversationSession.id,
+    )
+    input_scope = or_(
+        AgentDialogue.root_session_id == ConversationSession.id,
+        and_(
+            AgentDialogue.worker_session_id == ConversationSession.id,
+            AgentRun.session_id == AgentDialogue.worker_session_id,
+        ),
+    )
+
+    def aggregate(columns: tuple[Any, ...], *, source: Any, where: Any, joins=()) -> Any:
+        statement = select(func.max(_max_datetime_expression(list(columns)))).select_from(source)
+        for join in joins:
+            target, on_clause, isouter = join
+            statement = statement.join(target, on_clause, isouter=isouter)
+        return statement.where(where).correlate(ConversationSession).scalar_subquery()
+
+    return [
+        aggregate(
+            (
+                AgentRun.created_at,
+                AgentRun.updated_at,
+                AgentRun.last_event_at,
+                AgentRun.ended_at,
+            ),
+            source=AgentRun,
+            where=run_scope,
+        ),
+        aggregate(
+            (AgentDialogue.created_at, AgentDialogue.updated_at),
+            source=AgentDialogue,
+            where=dialogue_scope,
+        ),
+        aggregate(
+            (AgentDialogueInput.created_at, AgentDialogueInput.updated_at),
+            source=AgentDialogueInput,
+            where=input_scope,
+            joins=(
+                (
+                    AgentDialogue,
+                    AgentDialogue.id == AgentDialogueInput.dialogue_id,
+                    False,
+                ),
+                (
+                    AgentRun,
+                    AgentRun.id == AgentDialogueInput.source_run_id,
+                    True,
+                ),
+            ),
+        ),
+        aggregate(
+            (
+                ConversationMessage.created_at,
+                ConversationMessage.updated_at,
+                ConversationMessage.deleted_at,
+            ),
+            source=ConversationMessage,
+            where=ConversationMessage.session_id == ConversationSession.id,
+        ),
+    ]
+
+
+def _conversation_session_event_expression() -> Any:
+    """Return one effective mutation clock for session sync.
+
+    The dependency clocks are additive.  Existing session timestamps remain in
+    the expression so old rows and read/pin mutations preserve their ordering.
+    """
+
+    values = [
+        ConversationSession.last_activity,
+        ConversationSession.last_read_at,
+        ConversationSession.pin_updated_at,
+        ConversationSession.agent_binding_updated_at,
+        ConversationSession.session_start,
+        ConversationSession.deleted_at,
+    ]
+    values.extend(_conversation_dependency_event_values())
+    return _max_datetime_expression(values)
+
+
+def _conversation_rows_with_event(result: Any) -> list[ConversationSession]:
+    """Unpack ORM rows and retain the SQL event key for cursor serialization."""
+
+    rows: list[ConversationSession] = []
+    for item in result.all():
+        try:
+            row = item[0]
+            event_at = item[1]
+        except (IndexError, KeyError, TypeError):
+            row = item
+            event_at = None
+        setattr(row, _CONVERSATION_EVENT_ATTR, event_at)
+        rows.append(row)
+    return rows
+
+
+async def _project_sync_conversation_statuses(
+    session: AsyncSession,
+    session_ids: list[str],
+    last_read_at_by_session: dict[str, Any],
+) -> dict[str, ConversationStatusProjection]:
+    """Project one visible batch using the canonical history status service."""
+
+    if not session_ids:
+        return {}
+    return await project_conversation_statuses(
+        session_ids,
+        last_read_at_by_session=last_read_at_by_session,
+        db_session=session,
+    )
+
+
+async def _apply_sync_conversation_statuses(
+    session: AsyncSession,
+    payloads: list[dict[str, Any]],
+) -> None:
+    """Decorate pull/push session payloads with one shared status batch."""
+
+    if not payloads:
+        return
+    conversation_ids = list(
+        dict.fromkeys(
+            str(payload.get("id"))
+            for payload in payloads
+            if payload.get("id")
+        )
+    )
+    read_at_by_session = {
+        str(payload.get("id")): payload.get("last_read_at")
+        for payload in payloads
+        if payload.get("id")
+    }
+    projections = await _project_sync_conversation_statuses(
+        session,
+        conversation_ids,
+        read_at_by_session,
+    )
+    for payload in payloads:
+        _apply_conversation_status_projection(
+            payload,
+            projections.get(str(payload.get("id"))),
+        )
+
+
 async def _pull_conversation_sessions(
     session: AsyncSession,
     user_id: UUID,
     since: Optional[datetime],
     *,
+    project_ids: Optional[list[UUID]] = None,
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    visible_user_ids = _conversation_user_ids(user_id)
-    stmt = select(ConversationSession).where(
-        ConversationSession.user_id.in_(visible_user_ids)
-    )
-    if general_pagination:
-        if general_snapshot_at is None:
-            raise ValueError("General sync snapshot is missing")
-        # ``GREATEST`` is NULL-tolerant on PostgreSQL and keeps the SQL cursor
-        # timestamp identical to the Python event getter below, including
-        # session-start rows whose last-activity/read timestamps are absent.
-        session_event = func.greatest(
-            ConversationSession.last_activity,
-            ConversationSession.last_read_at,
-            ConversationSession.session_start,
-            ConversationSession.deleted_at,
-        )
-        stmt = _general_page_statement(
-            stmt,
-            ConversationSession,
-            table="conversation_sessions",
-            since=since,
-            snapshot_at=general_snapshot_at,
-            cursor=general_cursor,
-            limit=GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"],
-            event_expression=session_event,
-        )
-    else:
-        if since:
-            stmt = stmt.where(
-                or_(
-                    ConversationSession.last_activity > since,
-                    ConversationSession.last_read_at > since,
-                    ConversationSession.deleted_at > since,
-                )
+    visibility = _conversation_visibility_filter(user_id, project_ids or [])
+
+    def build_statement() -> Any:
+        stmt = select(ConversationSession).where(visibility)
+        session_event = _conversation_session_event_expression()
+        if general_pagination:
+            if general_snapshot_at is None:
+                raise ValueError("General sync snapshot is missing")
+            stmt = _general_page_statement(
+                stmt,
+                ConversationSession,
+                table="conversation_sessions",
+                since=since,
+                snapshot_at=general_snapshot_at,
+                cursor=general_cursor,
+                limit=GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"],
+                event_expression=session_event,
             )
-        stmt = stmt.order_by(ConversationSession.last_activity.desc()).limit(
-            SYNC_PULL_LIMITS["conversation_sessions"]
+        else:
+            if since:
+                stmt = stmt.where(session_event > since)
+            stmt = stmt.order_by(
+                session_event.desc(), ConversationSession.id.desc()
+            ).limit(SYNC_PULL_LIMITS["conversation_sessions"])
+        # Retain the exact SQL event key so a status-only mutation gets a
+        # matching cursor and wire ``updated_at`` value.
+        return stmt.add_columns(session_event.label(_CONVERSATION_EVENT_ATTR))
+
+    result = await session.execute(build_statement())
+    rows = _conversation_rows_with_event(result)
+    await attach_private_root_metadata(session, rows)
+
+    status_ids: list[str] = []
+    last_read_at_by_session: dict[str, Any] = {}
+    for row in rows:
+        session_id = str(row.id)
+        if row.deleted_at is None:
+            status_ids.append(session_id)
+            last_read_at_by_session[session_id] = row.last_read_at
+    status_projections = await _project_sync_conversation_statuses(
+        session,
+        status_ids,
+        last_read_at_by_session,
+    )
+
+    def payload_for(row: Any) -> dict[str, Any]:
+        session_id = str(row.id)
+        return _conversation_session_payload(
+            row,
+            status_projection=status_projections.get(session_id),
         )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
+
+    def split_page(page: list[ConversationSession]) -> dict[str, Any]:
+        return {
+            "changes": [
+                payload_for(row)
+                for row in page
+                if row.deleted_at is None
+            ],
+            "tombstones": [
+                {"id": str(row.id), "deleted_at": _iso(row.deleted_at)}
+                for row in page
+                if row.deleted_at is not None
+            ],
+            "cursor": None,
+        }
+
     page_rows = (
         rows[: GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"]]
         if general_pagination
         else rows
     )
-    changes = []
-    tombstones = []
-    for row in page_rows:
-        if row.deleted_at is None:
-            changes.append(_conversation_session_payload(row))
-        else:
-            tombstones.append({"id": str(row.id), "deleted_at": _iso(row.deleted_at)})
+    page_payload = split_page(page_rows)
 
     payload: dict[str, Any] = {
-        "changes": changes,
-        "tombstones": tombstones,
+        "changes": page_payload["changes"],
+        "tombstones": page_payload["tombstones"],
         "cursor": None,
     }
     if general_pagination:
@@ -1368,29 +1794,15 @@ async def _pull_conversation_sessions(
             rows,
             table="conversation_sessions",
             limit=GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"],
-            splitter=lambda page: {
-                "changes": [
-                    _conversation_session_payload(row)
-                    for row in page
-                    if row.deleted_at is None
-                ],
-                "tombstones": [
-                    {"id": str(row.id), "deleted_at": _iso(row.deleted_at)}
-                    for row in page
-                    if row.deleted_at is not None
-                ],
-                "cursor": None,
-            },
-            event_getter=lambda row: _row_event_at(
-                row, "last_activity", "last_read_at", "session_start", "deleted_at"
-            ),
+            splitter=split_page,
+            event_getter=_conversation_row_event_at,
         )
         # Authoritative reconciliation is safe only on the terminal page;
         # reconciling against a partial page would delete valid local rows.
         if payload.get("cursor") is None:
             active_ids_result = await session.execute(
                 select(ConversationSession.id).where(
-                    ConversationSession.user_id.in_(visible_user_ids),
+                    visibility,
                     ConversationSession.deleted_at.is_(None),
                 )
             )
@@ -1401,7 +1813,7 @@ async def _pull_conversation_sessions(
 
     active_ids_result = await session.execute(
         select(ConversationSession.id).where(
-            ConversationSession.user_id.in_(visible_user_ids),
+            visibility,
             ConversationSession.deleted_at.is_(None),
         )
     )
@@ -1414,6 +1826,7 @@ async def _pull_conversation_messages(
     user_id: UUID,
     since: Optional[datetime],
     *,
+    project_ids: Optional[list[UUID]] = None,
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
@@ -1424,7 +1837,7 @@ async def _pull_conversation_messages(
             ConversationSession,
             ConversationMessage.session_id == ConversationSession.id,
         )
-        .where(ConversationSession.user_id.in_(_conversation_user_ids(user_id)))
+        .where(_conversation_visibility_filter(user_id, project_ids or []))
     )
     if general_pagination:
         if general_snapshot_at is None:
@@ -1693,6 +2106,7 @@ async def _pull_table(
             session,
             user_id,
             since,
+            project_ids=project_ids,
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
@@ -1702,6 +2116,7 @@ async def _pull_table(
             session,
             user_id,
             since,
+            project_ids=project_ids,
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
@@ -1732,14 +2147,6 @@ async def _pull_table(
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
-        )
-    if table in LEGACY_STORY_TABLES:
-        return await pull_story_table(
-            table,
-            session,
-            user_id=user_id,
-            since=since,
-            limit=SYNC_PULL_LIMITS[table],
         )
     return {"changes": [], "tombstones": [], "cursor": None}
 
@@ -1813,10 +2220,10 @@ def _time_entry_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "occurrence_id": parse_uuid_or_400(payload.get("occurrence_id"), "occurrence_id")
         if "occurrence_id" in payload
         else None,
-        "started_at": _parse_datetime(payload.get("started_at"), "started_at")
+        "started_at": _parse_timer_datetime(payload.get("started_at"), "started_at")
         if "started_at" in payload
         else None,
-        "ended_at": _parse_datetime(payload.get("ended_at"), "ended_at")
+        "ended_at": _parse_timer_datetime(payload.get("ended_at"), "ended_at")
         if "ended_at" in payload
         else None,
         "source": str(payload.get("source") or "mobile"),
@@ -1846,26 +2253,29 @@ def _project_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _load_current_task_payload(
-    service: TaskManagementService, session: AsyncSession, task_id: UUID
+    service: TaskManagementService,
+    session: AsyncSession,
+    task_id: UUID,
+    *,
+    user_id: UUID,
 ) -> Optional[dict[str, Any]]:
+    # Conflict projections are reads too. Re-check the stored object's ACL
+    # after rollback rather than trusting the write check or client payload.
+    result = await session.execute(select(Task).where(Task.id == task_id))
+    task = result.scalar_one_or_none()
+    if task is None:
+        return None
     try:
-        task = await service._load_task(session, task_id)
-        return task.to_dict()
-    except TaskManagementError:
-        result = await session.execute(select(Task).where(Task.id == task_id))
-        task = result.scalar_one_or_none()
-        if task is None:
+        await service.require_project_permission(
+            session, project_id=task.project_id, user_id=user_id, permission="read"
+        )
+    except TaskManagementError as exc:
+        if exc.status_code in (403, 404):
             return None
-        return {
-            "id": str(task.id),
-            "updated_at": _iso(task.updated_at),
-            "deleted_at": _iso(task.deleted_at),
-            "deletion_batch_id": (
-                str(task.deletion_batch_id)
-                if getattr(task, "deletion_batch_id", None)
-                else None
-            ),
-        }
+        raise
+    if task.deleted_at is not None:
+        return _task_tombstone_payload(task)
+    return (await service._load_task(session, task_id)).to_dict()
 
 
 def _task_tombstone_payload(task: Task) -> dict[str, Any]:
@@ -1885,15 +2295,44 @@ def _task_tombstone_payload(task: Task) -> dict[str, Any]:
     }
 
 
-async def _load_current_time_entry_payload(
-    service: TaskManagementService, session: AsyncSession, entry_id: UUID
-) -> Optional[dict[str, Any]]:
-    result = await session.execute(
-        select(TimeEntry).where(TimeEntry.id == entry_id)
+async def _require_time_entry_permission(
+    service: TaskManagementService,
+    session: AsyncSession,
+    entry: TimeEntry,
+    *,
+    user_id: UUID,
+    permission: str,
+) -> None:
+    # Include task tombstones for idempotent deletes, and never use the
+    # request's task_id to authorize an already-persisted entry.
+    result = await session.execute(select(Task).where(Task.id == entry.task_id))
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise TaskManagementError("Task not found", status_code=404)
+    await service.require_project_permission(
+        session, project_id=task.project_id, user_id=user_id, permission=permission
     )
+
+
+async def _load_current_time_entry_payload(
+    service: TaskManagementService,
+    session: AsyncSession,
+    entry_id: UUID,
+    *,
+    user_id: UUID,
+) -> Optional[dict[str, Any]]:
+    result = await session.execute(select(TimeEntry).where(TimeEntry.id == entry_id))
     entry = result.scalar_one_or_none()
     if entry is None:
         return None
+    try:
+        await _require_time_entry_permission(
+            service, session, entry, user_id=user_id, permission="read"
+        )
+    except TaskManagementError as exc:
+        if exc.status_code in (403, 404):
+            return None
+        raise
     if entry.deleted_at is not None:
         return {
             "id": str(entry.id),
@@ -1921,6 +2360,12 @@ async def _apply_task_operation(
 
     existing_result = await session.execute(select(Task).where(Task.id == task_id))
     existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        # Authorize before stale checks, tombstones, or create replays can
+        # reveal server state. The stored project is authoritative.
+        await service.require_project_permission(
+            session, project_id=existing.project_id, user_id=user_id, permission="write"
+        )
 
     if operation.action == "delete":
         if existing is None:
@@ -1940,7 +2385,11 @@ async def _apply_task_operation(
             # Do not re-run stale checking for a tombstone.  A repeated offline
             # delete must converge on the server's original batch/timestamp.
             return _task_tombstone_payload(existing)
-        _ensure_not_stale(existing.updated_at, operation.base_updated_at)
+        _ensure_not_stale(
+            existing.updated_at,
+            operation.base_updated_at,
+            reason_code="task_cas_stale",
+        )
         return await service.delete_task(
             session, user_id=user_id, task_id=task_id
         )
@@ -1992,7 +2441,11 @@ async def _apply_task_operation(
                     detail={"code": "task_purged_tombstone"},
                 )
         if existing is not None and existing.deleted_at is None:
-            _ensure_not_stale(existing.updated_at, operation.base_updated_at)
+            _ensure_not_stale(
+                existing.updated_at,
+                operation.base_updated_at,
+                reason_code="task_cas_stale",
+            )
             return await service.update_task(
                 session,
                 user_id=user_id,
@@ -2035,7 +2488,11 @@ async def _apply_task_operation(
 
     if operation.action == "update":
         current = await service._load_task(session, task_id)
-        _ensure_not_stale(current.updated_at, operation.base_updated_at)
+        _ensure_not_stale(
+            current.updated_at,
+            operation.base_updated_at,
+            reason_code="task_cas_stale",
+        )
         return await service.update_task(
             session,
             user_id=user_id,
@@ -2044,6 +2501,124 @@ async def _apply_task_operation(
         )
 
     raise TaskManagementError("Unsupported task sync action", status_code=400)
+
+
+async def _apply_conversation_session_operation(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    user_info: dict[str, Any],
+    operation: SyncOperation,
+) -> dict[str, Any]:
+    """Apply native conversation pin updates and durable offline deletes."""
+
+    conversation_id = parse_uuid_or_400(operation.entity_id, "entity_id")
+    if conversation_id is None:
+        raise TaskManagementError("entity_id is required", status_code=400)
+
+    if operation.action not in {"update", "delete"}:
+        raise TaskManagementError(
+            "Conversation sync supports update/delete only", status_code=400
+        )
+    if operation.action == "update":
+        if set(operation.payload) != {"is_pinned"}:
+            raise TaskManagementError(
+                "Conversation sync accepts is_pinned only for update",
+                status_code=400,
+            )
+        is_pinned = operation.payload.get("is_pinned")
+        if not isinstance(is_pinned, bool):
+            raise TaskManagementError("is_pinned must be boolean", status_code=400)
+    else:
+        if operation.payload:
+            raise TaskManagementError(
+                "Conversation delete payload must be empty", status_code=400
+            )
+        is_pinned = None
+
+    existing = (
+        await session.execute(
+            select(ConversationSession)
+            .options(selectinload(ConversationSession.participants))
+            .where(ConversationSession.id == conversation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        if operation.action == "delete":
+            return {
+                "id": str(conversation_id),
+                "deleted_at": None,
+                "idempotent": True,
+                "purged": True,
+            }
+        raise TaskManagementError("Conversation not found", status_code=404)
+
+    await attach_private_root_metadata(session, [existing])
+
+    if operation.action == "update" and existing.deleted_at is not None:
+        raise TaskManagementError("Conversation not found", status_code=404)
+
+    actor_id = str(user_id)
+    can_manage = (
+        str(user_info.get("role") or "") == "admin"
+        or str(existing.user_id) == actor_id
+        or any(
+            participant.participant_type == "user"
+            and str(participant.participant_id) == actor_id
+            and participant.status == "joined"
+            and participant.role in {"owner", "admin"}
+            for participant in (existing.participants or [])
+        )
+    )
+    if not can_manage:
+        raise TaskManagementError("Conversation management denied", status_code=403)
+    if existing.project_id is not None:
+        allowed = await ProjectRepository.has_permission(
+            session,
+            existing.project_id,
+            user_id,
+            "write",
+        )
+        if not allowed:
+            raise TaskManagementError("Project permission denied", status_code=403)
+
+    if operation.action == "delete":
+        try:
+            await guard_private_root_operation(
+                session,
+                existing,
+                operation="delete",
+                actor_user_id=user_id,
+            )
+        except AgentRootLifecycleError as exc:
+            raise TaskManagementError(
+                str(exc),
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+
+    if operation.action == "delete":
+        if existing.deleted_at is None:
+            existing.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await session.commit()
+            await session.refresh(existing)
+            release_session_agent_team_registry(
+                str(existing.user_id) if existing.user_id is not None else None,
+                str(existing.id),
+            )
+        payload = _conversation_session_payload(existing)
+        payload["idempotent"] = True
+        return payload
+
+    _ensure_not_stale(existing.pin_updated_at, operation.base_updated_at)
+    changed_at = datetime.utcnow()
+    existing.is_pinned = is_pinned
+    existing.pinned_at = changed_at if is_pinned else None
+    existing.pin_updated_at = changed_at
+    await session.commit()
+    await session.refresh(existing)
+    return _conversation_session_payload(existing)
 
 
 async def _apply_time_entry_operation(
@@ -2060,6 +2635,10 @@ async def _apply_time_entry_operation(
     values = _time_entry_values_from_payload(operation.payload)
     existing_result = await session.execute(select(TimeEntry).where(TimeEntry.id == entry_id))
     existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        await _require_time_entry_permission(
+            service, session, existing, user_id=user_id, permission="write"
+        )
 
     if operation.action == "delete":
         if existing is None:
@@ -2113,21 +2692,36 @@ async def _apply_time_entry_operation(
             session, project_id=task.project_id, user_id=user_id, permission="write"
         )
 
-        if existing is not None and existing.deleted_at is None:
+        if existing is not None:
+            if existing.deleted_at is not None:
+                raise TaskManagementError("Time entry is deleted", status_code=409)
             _ensure_not_stale(existing.updated_at, operation.base_updated_at)
             return await service._serialize_time_entry(session, existing.id)
 
-        active_result = await session.execute(
-            select(TimeEntry).where(
-                TimeEntry.user_id == user_id,
-                TimeEntry.ended_at.is_(None),
-                TimeEntry.deleted_at.is_(None),
-                TimeEntry.id != entry_id,
+        ended_at = values["ended_at"]
+        if ended_at is not None and ended_at <= started_at:
+            raise TaskManagementError("ended_at must be after started_at", status_code=400)
+        if ended_at is None:
+            active_result = await session.execute(
+                select(TimeEntry).where(
+                    TimeEntry.user_id == user_id,
+                    TimeEntry.ended_at.is_(None),
+                    TimeEntry.deleted_at.is_(None),
+                    TimeEntry.id != entry_id,
+                ).with_for_update()
             )
-        )
-        for active_entry in active_result.scalars().all():
-            active_entry.ended_at = started_at
-            active_entry.updated_at = started_at
+            active_entries = list(active_result.scalars().all())
+            # An older offline start cannot stop a newer server timer. Keep
+            # both the server timer and outbox operation intact for resolution.
+            if any(entry.started_at >= started_at for entry in active_entries):
+                raise TaskManagementError(
+                    "A newer timer is already active on the server", status_code=409
+                )
+            for active_entry in active_entries:
+                active_entry.ended_at = started_at
+                active_entry.updated_at = datetime.utcnow()
+            # Release the unique active-user slot before inserting its successor.
+            await session.flush()
 
         entry = TimeEntry(
             id=entry_id,
@@ -2487,6 +3081,80 @@ def create_sync_router(
             raise HTTPException(status_code=401, detail="Not authenticated")
         return UUID(user_info["id"]), user_info
 
+    @router.get(
+        "/docs-diagnostic",
+        response_model=SyncDocsDiagnosticResponse,
+        response_model_exclude_none=True,
+        responses={
+            503: {
+                "model": SyncDocsDiagnosticResponse,
+                "description": "The diagnostic query could not be completed.",
+            }
+        },
+    )
+    async def docs_diagnostic(
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id, _ = await _get_current_user(request)
+        session: AsyncSession | None = None
+        try:
+            session = await get_db_manager().get_session()
+            project_ids = await _accessible_project_ids(session, user_id)
+            personal_result = await session.execute(
+                select(DocsLibrary)
+                .where(
+                    DocsLibrary.owner_user_id == user_id,
+                    DocsLibrary.library_type == "personal",
+                )
+                .limit(1)
+            )
+            personal_library = personal_result.scalars().first()
+            normalization_result = await session.execute(
+                select(DocsLibrary.id)
+                .where(
+                    DocsLibrary.owner_user_id == user_id,
+                    DocsLibrary.library_type != "personal",
+                )
+                .limit(1)
+            )
+            needs_normalization = (
+                normalization_result.scalar_one_or_none() is not None
+            )
+            scopes = await _docs_sync_scopes(
+                session,
+                user_id=user_id,
+                project_ids=project_ids,
+                personal_library=personal_library,
+            )
+            return SyncDocsDiagnosticResponse(
+                status="ok",
+                personal_library_exists=personal_library is not None,
+                needs_normalization=needs_normalization,
+                accessible_project_count=len(project_ids),
+                accessible_scope_count=len(scopes),
+            )
+        except Exception as exc:  # noqa: BLE001
+            exception_type = type(exc).__name__
+            if not _SAFE_SYNC_EXCEPTION_TYPE_RE.fullmatch(exception_type):
+                exception_type = "Exception"
+            error_payload = SyncDocsDiagnosticResponse(
+                status="error",
+                error_code="diagnostic_query_failed",
+                exception_type=exception_type,
+            )
+            return JSONResponse(
+                status_code=503,
+                content=jsonable_encoder(error_payload, exclude_none=True),
+            )
+        finally:
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:  # noqa: BLE001
+                    # A cleanup failure must not expose driver exception text.
+                    pass
+
     @router.get("/pull")
     async def pull(
         request: Request,
@@ -2512,6 +3180,12 @@ def create_sync_router(
         body_project_id = await _read_pull_project_id(request)
         body_docs_scope_id = await _read_pull_docs_scope_id(request)
         parsed_general_cursors = await _read_pull_general_cursors(request)
+        parsed_general_digests = await _read_pull_general_digests(request)
+        # Like docs_digests, this additive optional protocol is read directly
+        # from Request so the existing generated endpoint signature stays intact.
+        general_digest_version = request.query_params.get("general_digest_version", "0")
+        if general_digest_version not in ("0", str(GENERAL_DIGEST_VERSION)):
+            raise HTTPException(status_code=400, detail="Unsupported general sync digest version")
         requested_general_snapshot_token = (
             general_snapshot_token
             or await _read_pull_general_snapshot_token(request)
@@ -2558,6 +3232,11 @@ def create_sync_router(
         server_time = datetime.utcnow()
         try:
             since_dt = _parse_datetime(since, "since")
+            general_digest_enabled = (
+                general_requested
+                and general_digest_version == str(GENERAL_DIGEST_VERSION)
+                and since_dt is None
+            )
             general_snapshot_at: Optional[datetime] = None
             general_snapshot_scope: Optional[str] = None
             # Application timestamps are assigned before the first database
@@ -2942,32 +3621,50 @@ def create_sync_router(
             for table in requested:
                 table_is_general = general_requested and table in GENERAL_SYNC_PAGE_LIMITS
                 try:
-                    pulled[table] = await _pull_table(
-                        table,
-                        session,
-                        user_id=user_id,
-                        project_ids=project_ids,
-                        since=since_dt,
-                        docs_docs_library_id=docs_docs_library_id,
-                        docs_digests=docs_digests,
-                        docs_cursors=docs_cursors,
-                        docs_pagination=docs_pagination,
-                        force_docs_full=force_docs_full,
-                        docs_reconcile=docs_reconcile,
-                        docs_snapshot_token=cursor_snapshot_token,
-                        docs_scope_revision=current_docs_scope_revision,
-                        docs_project_id=docs_project_id,
-                        docs_accessible_project_ids=docs_scope_project_ids,
-                        general_pagination=table_is_general,
-                        general_cursor=(
-                            parsed_general_cursors.get(table)
-                            if table_is_general
-                            else None
-                        ),
-                        general_snapshot_at=(
-                            general_snapshot_at if table_is_general else None
-                        ),
-                    )
+                    if table_is_general and general_digest_enabled:
+                        async def pull_general_page(cursor: Optional[str], table_name: str = table):
+                            payload = await _pull_table(
+                                table_name, session, user_id=user_id, project_ids=project_ids,
+                                since=None, general_pagination=True,
+                                general_cursor=cursor, general_snapshot_at=general_snapshot_at,
+                            )
+                            # Hash exactly FastAPI's wire representation, even
+                            # if a serializer leaves a UUID/datetime/Decimal.
+                            return jsonable_encoder(payload)
+
+                        pulled[table] = await pull_general_digest_page(
+                            table=table, scope=current_general_scope,
+                            cursor=parsed_general_cursors.get(table),
+                            client_digest=parsed_general_digests.get(table),
+                            pull_page=pull_general_page,
+                        )
+                    else:
+                        pulled[table] = await _pull_table(
+                            table,
+                            session,
+                            user_id=user_id,
+                            project_ids=project_ids,
+                            since=since_dt,
+                            docs_docs_library_id=docs_docs_library_id,
+                            docs_digests=docs_digests,
+                            docs_cursors=docs_cursors,
+                            docs_pagination=docs_pagination,
+                            force_docs_full=force_docs_full,
+                            docs_reconcile=docs_reconcile,
+                            docs_snapshot_token=cursor_snapshot_token,
+                            docs_scope_revision=current_docs_scope_revision,
+                            docs_project_id=docs_project_id,
+                            docs_accessible_project_ids=docs_scope_project_ids,
+                            general_pagination=table_is_general,
+                            general_cursor=(
+                                parsed_general_cursors.get(table)
+                                if table_is_general
+                                else None
+                            ),
+                            general_snapshot_at=(
+                                general_snapshot_at if table_is_general else None
+                            ),
+                        )
                 except (ValueError, TypeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 if table not in DOCS_SYNC_TABLES and not table_is_general:
@@ -2986,13 +3683,15 @@ def create_sync_router(
                 "has_more": bool(docs_has_more or general_has_more),
             }
             if docs_pagination:
-                response["docs_pagination_version"] = 2
+                response["docs_pagination_version"] = DOCS_SYNC_PROTOCOL_VERSION
                 response["docs_scope_digest"] = current_docs_scope_digest
                 response["docs_snapshot_token"] = docs_snapshot_token
                 response["docs_scope_revision"] = current_docs_scope_revision
             if general_requested:
                 response["general_pagination_version"] = GENERAL_SYNC_PAGINATION_VERSION
                 response["general_snapshot_token"] = general_snapshot_token
+                if general_digest_enabled:
+                    response["general_digest_version"] = GENERAL_DIGEST_VERSION
                 # ``server_time`` remains the immutable page boundary.  The
                 # replay watermark is separate: an unstable run (one that
                 # observed an in-flight transaction before page 1) returns
@@ -3015,6 +3714,7 @@ def create_sync_router(
         user_id, user_info = await _get_current_user(request)
         session = await get_db_manager().get_session()
         results = []
+        conversation_result_refs: list[tuple[dict[str, Any], dict[str, Any]]] = []
         try:
             for operation in payload.operations:
                 try:
@@ -3035,6 +3735,13 @@ def create_sync_router(
                         entity = await _apply_time_entry_operation(
                             service, session, user_id=user_id, operation=operation
                         )
+                    elif operation.table == "conversation_sessions":
+                        entity = await _apply_conversation_session_operation(
+                            session,
+                            user_id=user_id,
+                            user_info=user_info,
+                            operation=operation,
+                        )
                     elif operation.table in DOCS_PUSH_TABLES:
                         entity = await _apply_docs_push_operation(
                             session,
@@ -3047,20 +3754,22 @@ def create_sync_router(
                             f"Unsupported push table: {operation.table}",
                             status_code=400,
                         )
-                    results.append(
-                        {
-                            "op_id": operation.op_id,
-                            "status": "ok",
-                            "entity": entity,
-                            "server_updated_at": entity.get("updated_at")
-                            if isinstance(entity, dict)
-                            else None,
-                        }
-                    )
+                    result_payload = {
+                        "op_id": operation.op_id,
+                        "status": "ok",
+                        "entity": entity,
+                        "server_updated_at": entity.get("updated_at")
+                        if isinstance(entity, dict)
+                        else None,
+                    }
+                    results.append(result_payload)
+                    if operation.table == "conversation_sessions" and isinstance(entity, dict):
+                        conversation_result_refs.append((result_payload, entity))
                 except (TaskManagementError, DocsOperationError) as exc:
                     await session.rollback()
                     status = "conflict" if exc.status_code == 409 else "error"
                     conflict_entity: Optional[dict[str, Any]] = None
+                    conflict_projection_failed = False
                     # Docs テーブルの entity_id は複合キー（"<node>:<field>" 等）が
                     # あり得るため、UUID として解釈できない場合は None として扱う
                     # （push 全体を 400 で落とさない）。
@@ -3068,68 +3777,145 @@ def create_sync_router(
                         entity_id = parse_uuid_or_400(operation.entity_id, "entity_id")
                     except HTTPException:
                         entity_id = None
-                    if status == "conflict" and operation.table in DOCS_PUSH_TABLES:
-                        docs_service = DocsGraphService(session)
-                        conflict_project = operation.payload.get("project_id")
-                        if conflict_project:
-                            try:
-                                docs_workspace = await docs_service.ensure_project_information_library(
-                                    UUID(str(conflict_project)), user_id
+                    try:
+                        if status == "conflict" and operation.table in DOCS_PUSH_TABLES:
+                            docs_service = DocsGraphService(session)
+                            conflict_project = operation.payload.get("project_id")
+                            if conflict_project:
+                                try:
+                                    docs_workspace = await docs_service.ensure_project_information_library(
+                                        UUID(str(conflict_project)), user_id
+                                    )
+                                except Exception:
+                                    docs_workspace = await docs_service.ensure_library(user_id)
+                            else:
+                                conflict_ref = operation.payload.get("node_id") or str(
+                                    operation.entity_id
+                                ).split(":", 1)[0]
+                                try:
+                                    conflict_node = await session.get(KnowledgeNode, UUID(str(conflict_ref)))
+                                except (TypeError, ValueError):
+                                    conflict_node = None
+                                docs_workspace = (
+                                    await session.get(DocsLibrary, conflict_node.docs_library_id)
+                                    if conflict_node is not None
+                                    else await docs_service.ensure_library(user_id)
                                 )
-                            except Exception:
-                                docs_workspace = await docs_service.ensure_library(user_id)
-                        else:
-                            conflict_ref = operation.payload.get("node_id") or str(
-                                operation.entity_id
-                            ).split(":", 1)[0]
-                            try:
-                                conflict_node = await session.get(KnowledgeNode, UUID(str(conflict_ref)))
-                            except (TypeError, ValueError):
-                                conflict_node = None
-                            docs_workspace = (
-                                await session.get(DocsLibrary, conflict_node.docs_library_id)
-                                if conflict_node is not None
-                                else await docs_service.ensure_library(user_id)
+                            conflict_entity = await load_current_docs_entity(
+                                session,
+                                docs_library_id=docs_workspace.id,
+                                table=operation.table,
+                                entity_id=operation.entity_id,
+                                user_id=user_id,
                             )
-                        conflict_entity = await load_current_docs_entity(
-                            session,
-                            docs_library_id=docs_workspace.id,
-                            table=operation.table,
-                            entity_id=operation.entity_id,
-                            user_id=user_id,
+                        elif status == "conflict" and entity_id is not None:
+                            if operation.table == "tasks":
+                                conflict_entity = await _load_current_task_payload(
+                                    service, session, entity_id, user_id=user_id
+                                )
+                            elif operation.table == "time_entries":
+                                conflict_entity = await _load_current_time_entry_payload(
+                                    service, session, entity_id, user_id=user_id
+                                )
+                            elif operation.table == "conversation_sessions":
+                                conflict_row = (
+                                    await session.execute(
+                                        select(ConversationSession).where(
+                                            ConversationSession.id == entity_id
+                                        )
+                                    )
+                                ).scalar_one_or_none()
+                                if conflict_row is not None:
+                                    await attach_private_root_metadata(session, [conflict_row])
+                                    conflict_entity = _conversation_session_payload(conflict_row)
+                    except Exception as projection_error:
+                        # A secondary snapshot loader can fail after the
+                        # typed operation rollback.  Clear SQLAlchemy's
+                        # failed transaction state before the next operation.
+                        await session.rollback()
+                        conflict_projection_failed = True
+                        safe_table = operation.table if operation.table in SYNC_TABLES else "unknown"
+                        safe_action = operation.action if operation.action in {"create", "update", "delete", "archive", "restore"} else "unknown"
+                        diagnostics = _safe_sync_exception_diagnostics(projection_error)
+                        logger.warning(
+                            "Sync conflict projection failed table=%s action=%s exception_type=%s sqlstate=%s source=%s",
+                            safe_table,
+                            safe_action,
+                            diagnostics["exception_type"],
+                            diagnostics["sqlstate"],
+                            diagnostics["source_frame"],
                         )
-                    elif status == "conflict" and entity_id is not None:
-                        if operation.table == "tasks":
-                            conflict_entity = await _load_current_task_payload(
-                                service, session, entity_id
-                            )
-                        elif operation.table == "time_entries":
-                            conflict_entity = await _load_current_time_entry_payload(
-                                service, session, entity_id
-                            )
-                    results.append(
-                        {
+                        conflict_entity = None
+                    if conflict_projection_failed:
+                        result_payload = {
                             "op_id": operation.op_id,
-                            "status": status,
-                            "reason": exc.message,
-                            "entity": conflict_entity,
-                            "server_updated_at": conflict_entity.get("updated_at")
-                            if isinstance(conflict_entity, dict)
-                            else None,
+                            "status": "error",
+                            "reason": "Conflict projection failed",
+                            "reason_code": "sync_conflict_projection_failed",
+                            "entity": None,
+                            "server_updated_at": None,
                         }
-                    )
+                        results.append(result_payload)
+                        continue
+                    result_payload = {
+                        "op_id": operation.op_id,
+                        "status": status,
+                        "reason": exc.message,
+                        "entity": conflict_entity,
+                        "server_updated_at": conflict_entity.get("updated_at")
+                        if isinstance(conflict_entity, dict)
+                        else None,
+                    }
+                    reason_code = getattr(exc, "reason_code", None)
+                    if (
+                        isinstance(reason_code, str)
+                        and reason_code in _SYNC_REASON_CODE_ALLOWLIST
+                    ):
+                        result_payload["reason_code"] = reason_code
+                    else:
+                        # Preserve the existing domain detail.code contract.
+                        # New exception attributes are accepted only from the
+                        # finite wire-code set above.
+                        error_detail = getattr(exc, "detail", None)
+                        if isinstance(error_detail, dict) and error_detail.get("code"):
+                            result_payload["reason_code"] = error_detail["code"]
+                    results.append(result_payload)
+                    if operation.table == "conversation_sessions" and isinstance(conflict_entity, dict):
+                        conversation_result_refs.append((result_payload, conflict_entity))
                 except Exception as exc:  # noqa: BLE001
                     await session.rollback()
-                    logger.exception("Sync push operation failed: %s", operation.op_id)
+                    safe_table = operation.table if operation.table in SYNC_TABLES else "unknown"
+                    safe_action = operation.action if operation.action in {"create", "update", "delete", "archive", "restore"} else "unknown"
+                    diagnostics = _safe_sync_exception_diagnostics(exc)
+                    logger.error(
+                        "Sync push operation failed table=%s action=%s exception_type=%s sqlstate=%s source=%s",
+                        safe_table,
+                        safe_action,
+                        diagnostics["exception_type"],
+                        diagnostics["sqlstate"],
+                        diagnostics["source_frame"],
+                    )
                     results.append(
                         {
                             "op_id": operation.op_id,
                             "status": "error",
-                            "reason": str(exc),
+                            "reason": "Sync operation failed",
+                            "reason_code": "sync_operation_failed",
                         }
                     )
+            if conversation_result_refs:
+                conversation_entities = [
+                    entity for _result, entity in conversation_result_refs
+                ]
+                await _apply_sync_conversation_statuses(
+                    session,
+                    conversation_entities,
+                )
+                for result_payload, entity in conversation_result_refs:
+                    result_payload["server_updated_at"] = entity.get("updated_at")
             return {"results": results}
         finally:
             await session.close()
 
     return router
+

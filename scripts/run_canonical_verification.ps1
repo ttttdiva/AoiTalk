@@ -262,6 +262,8 @@ function Test-WorkflowsChanged {
 }
 
 function Start-CanonicalPostgres {
+    $container = $null
+    $containerStarted = $false
     if (Test-CommandAvailable "docker") {
         try {
             & docker info 2>$null | Out-Null
@@ -283,6 +285,7 @@ function Start-CanonicalPostgres {
                 if ($LASTEXITCODE -ne 0) {
                     throw "docker run postgres:16 failed"
                 }
+                $containerStarted = $true
 
                 Wait-PostgresReady -HostName "127.0.0.1" -Port $port -User "aoitalk" -Database $database -Password "ci"
                 return [pscustomobject]@{
@@ -308,8 +311,14 @@ function Start-CanonicalPostgres {
             # local ephemeral database.  Otherwise a failed canonical run can
             # leave a postgres process (and port) behind despite the outer
             # teardown never receiving a context object.
-            if ($container) {
-                & docker rm -f $container 2>$null | Out-Null
+            $startupError = $_.Exception.Message
+            if ($container -and $containerStarted) {
+                try {
+                    Remove-CanonicalDockerContainer -ContainerName $container
+                }
+                catch {
+                    throw "Docker postgres startup failed ($startupError); cleanup failed: $($_.Exception.Message)"
+                }
             }
             Write-Host "Docker postgres failed — trying local ephemeral database." -ForegroundColor Yellow
         }
@@ -353,6 +362,16 @@ function Start-CanonicalPostgres {
     }
 }
 
+function Remove-CanonicalDockerContainer {
+    param([Parameter(Mandatory = $true)][string]$ContainerName)
+
+    & docker rm -f $ContainerName 2>$null | Out-Null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "Docker cleanup failed for canonical verification container '$ContainerName' (exit $exitCode)."
+    }
+}
+
 function Stop-CanonicalPostgres {
     param([object]$Context)
 
@@ -371,7 +390,7 @@ function Stop-CanonicalPostgres {
     }
 
     if ($Context.Mode -eq "docker" -and $Context.ContainerName) {
-        & docker rm -f $Context.ContainerName 2>$null | Out-Null
+        Remove-CanonicalDockerContainer -ContainerName $Context.ContainerName
         return
     }
 
@@ -382,9 +401,46 @@ function Stop-CanonicalPostgres {
                 -Database "postgres" -Sql "DROP DATABASE IF EXISTS `"$($Context.TempDatabase)`" WITH (FORCE);"
         }
         catch {
-            Write-Host "Warning: failed to drop temp database $($Context.TempDatabase): $_" -ForegroundColor Yellow
+            throw "PostgreSQL cleanup failed for temporary database '$($Context.TempDatabase)': $($_.Exception.Message)"
         }
     }
+}
+
+function Invoke-CanonicalPostgresCleanup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [object]$Context
+    )
+
+    if (-not $Context -or -not $Context.StartedByScript) {
+        return $true
+    }
+
+    try {
+        Stop-CanonicalPostgres -Context $Context
+        return $true
+    }
+    catch {
+        # Keep cleanup failures in the same gate summary as verification
+        # failures.  This makes a teardown-only failure fail the process while
+        # preserving any earlier failed gate and its reason.
+        Write-GateLine -Name "$Name cleanup" -Status "FAIL" -Reason $_.Exception.Message
+        return $false
+    }
+}
+
+function Invoke-CanonicalPostgresCleanupForResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [object]$Context,
+        [Parameter(Mandatory = $true)][ref]$AllPassed
+    )
+
+    $cleanupOk = Invoke-CanonicalPostgresCleanup -Name $Name -Context $Context
+    if (-not $cleanupOk) {
+        $AllPassed.Value = $false
+    }
+    return $cleanupOk
 }
 
 function Set-PostgresEnv {
@@ -502,9 +558,11 @@ function Install-CanonicalPythonDeps {
 }
 
 function Write-Summary {
-    $failed = @($Script:GateResults | Where-Object { $_.Status -eq "FAIL" })
-    $skipped = @($Script:GateResults | Where-Object { $_.Status -eq "SKIP" })
-    $passed = @($Script:GateResults | Where-Object { $_.Status -eq "PASS" })
+    param([Parameter(Mandatory = $true)][object]$Result)
+
+    $failed = @($Result.FailedGates)
+    $skipped = @($Result.SkippedGates)
+    $passed = @($Result.PassedGates)
 
     Write-Host ""
     Write-Host "=== Canonical verification summary ==="
@@ -522,6 +580,23 @@ function Write-Summary {
         foreach ($gate in $skipped) {
             Write-Host ("  - {0}: {1}" -f $gate.Name, $gate.Reason) -ForegroundColor Yellow
         }
+    }
+}
+
+function Get-CanonicalVerificationResult {
+    param([Parameter(Mandatory = $true)][bool]$AllPassed)
+
+    $failed = @($Script:GateResults | Where-Object { $_.Status -eq "FAIL" })
+    $skipped = @($Script:GateResults | Where-Object { $_.Status -eq "SKIP" })
+    $passed = @($Script:GateResults | Where-Object { $_.Status -eq "PASS" })
+    $exitCode = if ($AllPassed -and $skipped.Count -eq 0) { $EXIT_PASS } else { $EXIT_FAIL }
+
+    return [pscustomobject]@{
+        AllPassed   = $AllPassed
+        ExitCode    = $exitCode
+        FailedGates = $failed
+        SkippedGates = $skipped
+        PassedGates = $passed
     }
 }
 
@@ -881,7 +956,7 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
         $allPassed = $false
     }
     finally {
-        Stop-CanonicalPostgres -Context $Script:SchemaPostgresContext
+        $cleanupOk = Invoke-CanonicalPostgresCleanupForResult -Name "schema drift PostgreSQL" -Context $Script:SchemaPostgresContext -AllPassed ([ref]$allPassed)
         $Script:SchemaPostgresContext = $null
     }
     }
@@ -964,30 +1039,31 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
             $allPassed = $false
         }
         finally {
-            Stop-CanonicalPostgres -Context $Script:E2ePostgresContext
+            $cleanupOk = Invoke-CanonicalPostgresCleanupForResult -Name "frontend E2E PostgreSQL" -Context $Script:E2ePostgresContext -AllPassed ([ref]$allPassed)
             $Script:E2ePostgresContext = $null
         }
     }
 }
 finally {
-    Stop-CanonicalPostgres -Context $Script:SchemaPostgresContext
-    Stop-CanonicalPostgres -Context $Script:E2ePostgresContext
+    $cleanupOk = Invoke-CanonicalPostgresCleanupForResult -Name "schema drift PostgreSQL" -Context $Script:SchemaPostgresContext -AllPassed ([ref]$allPassed)
+    $cleanupOk = Invoke-CanonicalPostgresCleanupForResult -Name "frontend E2E PostgreSQL" -Context $Script:E2ePostgresContext -AllPassed ([ref]$allPassed)
 }
 
-Write-Summary
+$verificationResult = Get-CanonicalVerificationResult -AllPassed $allPassed
+Write-Summary -Result $verificationResult
 
-if ($allPassed) {
-    $skipped = @($Script:GateResults | Where-Object { $_.Status -eq "SKIP" })
-    if ($skipped.Count -gt 0) {
-        Write-Host ""
-        Write-Host "All executed gates passed, but some gates were skipped — not full CI parity." -ForegroundColor Yellow
-        exit $EXIT_FAIL
-    }
+if ($verificationResult.ExitCode -eq $EXIT_PASS) {
     Write-Host ""
     Write-Host "Canonical verification PASS — all gates passed." -ForegroundColor Green
-    exit $EXIT_PASS
+    exit $verificationResult.ExitCode
+}
+
+if ($verificationResult.AllPassed -and $verificationResult.SkippedGates.Count -gt 0) {
+    Write-Host ""
+    Write-Host "All executed gates passed, but some gates were skipped — not full CI parity." -ForegroundColor Yellow
+    exit $verificationResult.ExitCode
 }
 
 Write-Host ""
 Write-Host "Canonical verification FAIL — fix failed gates (remaining gates skipped after first FAIL)." -ForegroundColor Red
-exit $EXIT_FAIL
+exit $verificationResult.ExitCode

@@ -11,8 +11,7 @@ import {
   type SectionListRenderItemInfo,
 } from "react-native";
 import {
-  Button,
-  Chip,
+  Icon,
   IconButton,
   Text,
   TextInput,
@@ -179,6 +178,12 @@ type ScopeSwitcherProps = {
   projectNameOnly?: boolean;
 };
 
+function ScopeIcon({ source }: { source: string }) {
+  return typeof Icon === "function"
+    ? <Icon source={source} size={18} color="#cdd6f4" />
+    : null;
+}
+
 export function projectScopeLabel(project: Project, spaces: readonly Space[], projects: readonly Project[] = []): string {
   const space = spaces.find((item) => item.id === project.space_id);
   const parent = space
@@ -225,8 +230,12 @@ export function ScopeSwitcher({
   const selectionInFlight = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
+  const compactScopeLabel =
+    selectedProject?.name ??
+    ((!onSelectProject || allowSpaceSelection) ? selectedSpace?.name : undefined) ??
+    (selectedProjectId ? "プロジェクト" : allLabel);
   const currentScopeLabel = projectNameOnly
-    ? (selectedProject?.name || (selectedProjectId ? "プロジェクト" : allLabel))
+    ? compactScopeLabel
     : selectedProject
     ? projectScopeLabel(selectedProject, spaces, projects)
     : selectedProjectId ? `取得できないプロジェクト [${selectedProjectId}]`
@@ -272,6 +281,8 @@ export function ScopeSwitcher({
     [projects, search, spaces, allowAll],
   );
 
+  const anchorLabel = label ? `${label}: ${currentScopeLabel}` : currentScopeLabel;
+
   const anchor =
     variant === "inline" ? (
       <Pressable
@@ -281,43 +292,41 @@ export function ScopeSwitcher({
         accessibilityState={{ disabled }}
         disabled={disabled}
         onPress={open}
-        style={({ pressed }) => [styles.inline, pressed && styles.rowPressed]}
+        style={({ pressed }) => [styles.inline, disabled && styles.disabledAnchor, pressed && styles.rowPressed]}
       >
-        <Text testID="scope-switcher-inline-label" numberOfLines={1} ellipsizeMode="tail" style={[styles.inlineText, projectNameOnly && styles.projectName]}>
+        <Text testID="scope-switcher-inline-label" style={[styles.inlineText, projectNameOnly && styles.projectName]}>
           {currentScopeLabel.replace(/^スペース: /, "")}
         </Text>
         <Text style={styles.inlineChevron} importantForAccessibility="no">⌄</Text>
       </Pressable>
     ) : variant === "chip" ? (
-      <Chip
-        compact
-        icon="tune-variant"
+      <Pressable
+        accessibilityRole="button"
         accessibilityLabel={
           accessibilityLabel ?? `範囲: ${currentScopeLabel}`
         }
-        onPress={open}
+        accessibilityState={{ disabled }}
         disabled={disabled}
-        style={styles.chip}
-        textStyle={styles.chipText}
+        onPress={open}
+        style={({ pressed }) => [styles.chip, disabled && styles.disabledAnchor, pressed && styles.rowPressed]}
       >
-        {label ? `${label}: ${currentScopeLabel}` : currentScopeLabel}
-      </Chip>
+        <ScopeIcon source="tune-variant" />
+        <Text style={styles.anchorText}>{anchorLabel}</Text>
+      </Pressable>
     ) : (
-      <Button
-        compact
-        mode="outlined"
-        icon="target"
+      <Pressable
+        accessibilityRole="button"
         accessibilityLabel={
           accessibilityLabel ?? `範囲: ${currentScopeLabel}`
         }
-        textColor="#cdd6f4"
-        style={styles.button}
-        contentStyle={styles.buttonContent}
-        onPress={open}
+        accessibilityState={{ disabled }}
         disabled={disabled}
+        onPress={open}
+        style={({ pressed }) => [styles.button, disabled && styles.disabledAnchor, pressed && styles.rowPressed]}
       >
-        {label ? `${label}: ${currentScopeLabel}` : currentScopeLabel}
-      </Button>
+        <ScopeIcon source="target" />
+        <Text style={styles.anchorText}>{anchorLabel}</Text>
+      </Pressable>
     );
 
   const renderItem = ({ item }: SectionListRenderItemInfo<ScopeRow>) => {
@@ -451,14 +460,14 @@ export function ScopeSwitcher({
 }
 
 const styles = StyleSheet.create({
-  inline: { flex: 1, minWidth: 0, minHeight: 44, flexDirection: "row", alignItems: "center", paddingLeft: 6, paddingRight: 2 },
-  inlineText: { flex: 1, minWidth: 0, color: "#cdd6f4", fontSize: 12 },
+  inline: { width: "100%", flex: 1, minWidth: 0, minHeight: 44, flexDirection: "row", alignItems: "center", paddingLeft: 6, paddingRight: 2 },
+  inlineText: { flex: 1, minWidth: 0, flexShrink: 1, color: "#cdd6f4", fontSize: 12, paddingVertical: 6 },
   projectName: { fontSize: 13, fontWeight: "600" },
-  inlineChevron: { color: "#a6adc8", fontSize: 16, marginLeft: 2 },
-  chip: { backgroundColor: "#313244", maxWidth: 190 },
-  chipText: { color: "#cdd6f4" },
-  button: { borderColor: "#45475a" },
-  buttonContent: { minHeight: 34 },
+  inlineChevron: { color: "#a6adc8", fontSize: 16, marginLeft: 2, flexShrink: 0 },
+  disabledAnchor: { opacity: 0.5 },
+  chip: { backgroundColor: "#313244", maxWidth: "100%", minWidth: 0, minHeight: 44, flexShrink: 1, flexDirection: "row", alignItems: "flex-start", borderRadius: 16, paddingHorizontal: 12, paddingVertical: 8 },
+  button: { borderColor: "#45475a", borderWidth: 1, borderRadius: 4, maxWidth: "100%", minWidth: 0, minHeight: 44, flexShrink: 1, flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 12, paddingVertical: 8 },
+  anchorText: { flex: 1, minWidth: 0, flexShrink: 1, color: "#cdd6f4", fontSize: 14, paddingVertical: 2 },
   modal: { flex: 1, backgroundColor: "#11111b" },
   modalHeader: {
     minHeight: 56,

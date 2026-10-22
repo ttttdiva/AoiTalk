@@ -13,7 +13,7 @@ from .x_cookie_service import parse_x_cookie_bytes
 
 
 MAX_CREDENTIAL_PACKAGE_BYTES = 2 * 1024 * 1024
-SUPPORTED_PLATFORMS = frozenset({"x", "pixiv", "patreon", "youtube", "instagram", "dlsite"})
+SUPPORTED_PLATFORMS = frozenset({"x", "pixiv", "patreon", "youtube", "instagram", "dlsite", "fanza", "tiktok"})
 CONNECTION_TYPES = frozenset({"cookie_export", "api_token", "oauth"})
 
 _PLATFORM_DOMAINS: dict[str, tuple[str, ...]] = {
@@ -21,6 +21,8 @@ _PLATFORM_DOMAINS: dict[str, tuple[str, ...]] = {
     "youtube": ("youtube.com", "google.com"),
     "patreon": ("patreon.com",),
     "instagram": ("instagram.com",),
+    "fanza": ("dmm.co.jp", "dmm.com"),
+    "tiktok": ("tiktok.com",),
     "pixiv": ("pixiv.net",),
     "dlsite": ("dlsite.com",),
 }

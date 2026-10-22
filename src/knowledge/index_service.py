@@ -7,7 +7,6 @@ This module maintains the rebuildable Qdrant index used for hybrid retrieval.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import hashlib
 import json
 import logging
@@ -27,8 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import KnowledgeChunk, KnowledgeDocument, KnowledgeSource
 from ..rag.config import RagConfig, get_rag_config
-from ..rag.embedding import BgeM3Embedding
-from ..rag.qdrant_client import SharedQdrantClient
+from ..rag.embedding import EmbeddingGemma2Embedding, get_embedding
+from ..rag.qdrant_client import SharedQdrantClient, _LOCAL_INDEX_IO_LOCK
+from ..rag.index_io import run_index_io
 
 try:
     from qdrant_client import QdrantClient
@@ -41,13 +41,14 @@ except ImportError:  # pragma: no cover - optional dependency
     models = None  # type: ignore[assignment]
 
 
+from ..rag.embedding_identity import EMBEDDING_FINGERPRINT, EMBEDDING_IDENTITY, embedding_collection_name
+
 logger = logging.getLogger(__name__)
 
 # Like the native runner lock, these locks work across sync-bridge event loops.
 # This service is the sole Knowledge index writer within the runtime process.
 _SYNC_LOCKS: dict[tuple[str, ...], tuple[Any, int]] = {}
 _SYNC_LOCKS_GUARD = threading.Lock()
-_LOCAL_INDEX_IO_LOCK = threading.RLock()
 
 
 @asynccontextmanager
@@ -93,6 +94,10 @@ _CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
 class KnowledgeIndexHit:
     chunk_id: uuid.UUID
     score: float
+    content_hash: str | None = None
+    # Prepared semantic searches expose a request-local cosine separately
+    # from the legacy point score.  Legacy callers leave this unset.
+    dense_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,7 @@ class KnowledgeIndexSyncResult:
 class HashingSparseEncoder:
     """Small deterministic sparse encoder for exact/lexical retrieval.
 
-    BGE-M3 dense embeddings cover semantic similarity. This sparse side keeps
+    EmbeddingGemma 2 dense embeddings cover semantic similarity. This sparse side keeps
     filenames, IDs, model numbers, IP addresses, and Japanese character n-grams
     searchable without requiring a separate sparse model runtime.
     """
@@ -162,9 +167,9 @@ class KnowledgeIndexService:
 
     def __init__(self, config: Optional[RagConfig] = None) -> None:
         self.config = config or get_rag_config()
-        self.collection_name = self.config.qdrant.collection_name
+        self.collection_name = embedding_collection_name(self.config.qdrant.collection_name)
         self.client: Optional[QdrantClient] = None
-        self.embedding = BgeM3Embedding(self.config.embedding)
+        self.embedding = get_embedding(self.config.embedding)
         self.sparse_encoder = HashingSparseEncoder()
         self._initialized = False
         self._is_local_mode = False
@@ -184,45 +189,12 @@ class KnowledgeIndexService:
         return (endpoint, self.collection_name)
 
     async def _index_io(self, operation, *args, **kwargs):
-        finished = threading.Event()
-
-        def invoke():
-            try:
-                if self._is_local_mode:
-                    # Embedded Qdrant must not query while another index operation
-                    # mutates its arrays, even for a different source or event loop.
-                    with _LOCAL_INDEX_IO_LOCK:
-                        return operation(*args, **kwargs)
-                return operation(*args, **kwargs)
-            finally:
-                finished.set()
-
-        # The loop owns this bounded executor and shuts it down on teardown.
-        # Use a Future, not a Task that asyncio.run's all-task cancellation can
-        # mark done before its thread finishes. Preserve to_thread's context.
-        worker = asyncio.get_running_loop().run_in_executor(
-            None, contextvars.copy_context().run, invoke
+        # Embedded Qdrant shares this lock across sources and event loops.
+        return await run_index_io(
+            operation, *args,
+            lock=_LOCAL_INDEX_IO_LOCK if self._is_local_mode else None,
+            **kwargs,
         )
-
-        def consume_exception(future):
-            if not future.cancelled():
-                future.exception()
-
-        # Cancellation can win over an eventual I/O failure. Retrieve that
-        # exception even if its delivery to the loop follows finished.set().
-        worker.add_done_callback(consume_exception)
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            # A thread cannot be cancelled: retain the source lock until any
-            # in-flight write finishes, including during loop teardown and
-            # repeated cancellation. Only the executing thread signals this.
-            while not finished.is_set():
-                try:
-                    await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    continue
-            raise
 
     async def _initialize(self) -> bool:
         if self._initialized:
@@ -363,65 +335,63 @@ class KnowledgeIndexService:
             return KnowledgeIndexSyncResult(status="synced", indexed_chunks=0)
 
         existing = await self._index_io(self._source_points, source_id)
-        payloads = [self._payload(*row) for row in chunk_rows]
-        dense_vectors = []
-        changed = []
-        for index, ((chunk, _, _), payload) in enumerate(zip(chunk_rows, payloads)):
-            previous = existing.get(str(chunk.id))
-            old_payload = (previous.payload or {}) if previous is not None else {}
-            vectors = previous.vector if previous is not None else None
-            dense = vectors.get(self.dense_vector_name) if isinstance(vectors, dict) else None
-            if (
-                old_payload.get("content_hash") != payload["content_hash"]
-                or old_payload.get("embedding_fingerprint") != payload["embedding_fingerprint"]
-                or not self._valid_dense_vector(dense)
-            ):
-                dense = None
-                changed.append(index)
-            dense_vectors.append(dense)
+        batch_size = max(1, min(int(self.config.indexing.batch_size), int(self.config.embedding.batch_size), 32))
+        indexed = 0
+        # Persist each validated batch before another model request. A failed
+        # or cancelled source sync then reuses this exact completed prefix on
+        # retry, rather than discarding every newly generated source vector.
+        for offset in range(0, len(chunk_rows), batch_size):
+            batch_rows = chunk_rows[offset:offset + batch_size]
+            payloads = [self._payload(*row) for row in batch_rows]
+            dense_vectors, changed = [], []
+            for index, ((chunk, _, _), payload) in enumerate(zip(batch_rows, payloads)):
+                previous = existing.get(str(chunk.id))
+                old_payload = (previous.payload or {}) if previous is not None else {}
+                vectors = previous.vector if previous is not None else None
+                dense = vectors.get(self.dense_vector_name) if isinstance(vectors, dict) else None
+                if (
+                    old_payload.get("content_hash") != payload["content_hash"]
+                    or old_payload.get("embedding_fingerprint") != payload["embedding_fingerprint"]
+                    or not self._valid_dense_vector(dense)
+                ):
+                    dense = None
+                    changed.append(index)
+                dense_vectors.append(dense)
 
-        generated = []
-        if changed:
-            generated = await self.embedding.embed(
-                [self._dense_text(*chunk_rows[index]) for index in changed]
-            )
-        if len(generated) != len(changed) or any(
-            not self._valid_dense_vector(vector) for vector in generated
-        ):
-            return KnowledgeIndexSyncResult(
-                status="error",
-                error="invalid Knowledge embeddings (count, dimension or finite values)",
-            )
-        for index, dense in zip(changed, generated):
-            dense_vectors[index] = dense
-
-        points = []
-        for dense, (chunk, document, source), payload in zip(dense_vectors, chunk_rows, payloads):
-            vector_id = str(chunk.id)
-            points.append(
-                models.PointStruct(
-                    id=vector_id,
-                    vector={
-                        self.dense_vector_name: dense,
-                        self.sparse_vector_name: self.sparse_encoder.encode(
-                            self._sparse_text(chunk, document, source)
-                        ),
-                    },
-                    payload=payload,
+            generated = []
+            if changed:
+                generated = await self.embedding.embed(
+                    [self._dense_text(*batch_rows[index]) for index in changed],
+                    titles=[batch_rows[index][1].title for index in changed],
                 )
-            )
+            if len(generated) != len(changed) or any(
+                not self._valid_dense_vector(vector) for vector in generated
+            ):
+                return KnowledgeIndexSyncResult(
+                    status="error", indexed_chunks=indexed,
+                    error="invalid Knowledge embeddings (count, dimension, finite values or norm)",
+                )
+            for index, dense in zip(changed, generated):
+                dense_vectors[index] = dense
 
-        batch_size = max(1, self.config.indexing.batch_size)
-        for index in range(0, len(points), batch_size):
-            batch = points[index : index + batch_size]
+            points = [models.PointStruct(
+                id=str(chunk.id),
+                vector={
+                    self.dense_vector_name: dense,
+                    self.sparse_vector_name: self.sparse_encoder.encode(self._sparse_text(chunk, document, source)),
+                },
+                payload=payload,
+            ) for dense, (chunk, document, source), payload in zip(dense_vectors, batch_rows, payloads)]
             # Upsert replaces the entire payload, clearing legacy plaintext
             # text even when we reuse the dense vector. Sparse is refreshed too.
             await self._index_io(
                 self.client.upsert,
                 collection_name=self.collection_name,
-                points=batch,
+                points=points,
                 wait=True,
             )
+            indexed += len(points)
+        # Retain every stale old point until ALL batches have succeeded.
         retained = {str(chunk.id) for chunk, _, _ in chunk_rows}
         stale = sorted(set(existing) - retained)
         for index in range(0, len(stale), batch_size):
@@ -430,7 +400,14 @@ class KnowledgeIndexService:
             )
         for chunk, _, _ in chunk_rows:
             chunk.vector_id = str(chunk.id)
-        return KnowledgeIndexSyncResult(status="synced", indexed_chunks=len(points))
+        # Originals are already canonical; enqueue media derivatives only once
+        # this source sync transaction has committed.
+        if hasattr(session, "sync_session"):
+            from ..services.media_index_worker import queue_media_after_commit
+            documents = {str(document.id): (document, source) for _, document, source in chunk_rows}
+            for document, source in documents.values():
+                queue_media_after_commit(session, source.owner_user_id, "knowledge_document", document.id)
+        return KnowledgeIndexSyncResult(status="synced", indexed_chunks=indexed)
 
     def _valid_dense_vector(self, vector: Any) -> bool:
         return (
@@ -440,7 +417,7 @@ class KnowledgeIndexService:
                 isinstance(value, (int, float)) and math.isfinite(value)
                 for value in vector
             )
-            and any(value != 0 for value in vector)
+            and abs(sum(value * value for value in vector) - 1.0) <= 0.01
         )
 
     def _source_points(self, source_id: uuid.UUID) -> dict[str, Any]:
@@ -465,15 +442,26 @@ class KnowledgeIndexService:
         query: str,
         filters: Any,
         limit: int,
+        _prepared=None,
     ) -> list[KnowledgeIndexHit]:
         query = query.strip()
-        if not query or not await self.initialize():
+        if (not query and _prepared is None) or not await self.initialize():
+            if _prepared is not None:
+                raise RuntimeError("knowledge_index_unavailable")
             return []
         if self.client is None or models is None:
+            if _prepared is not None:
+                raise RuntimeError("knowledge_index_unavailable")
             return []
 
-        dense = await self.embedding.embed_query(query)
-        sparse = self.sparse_encoder.encode(query)
+        prepared = _prepared is not None
+        if prepared:
+            from ..rag.media_query import require_prepared
+            dense = require_prepared(_prepared)
+            sparse = None
+        else:
+            dense = await self.embedding.embed_query(query)
+            sparse = self.sparse_encoder.encode(query)
         query_filter = self._build_filter(filters)
         search_limit = max(limit, 1)
         prefetch = []
@@ -486,7 +474,7 @@ class KnowledgeIndexService:
                     limit=max(search_limit * 2, search_limit),
                 )
             )
-        if sparse.indices:
+        if sparse is not None and sparse.indices:
             prefetch.append(
                 models.Prefetch(
                     query=sparse,
@@ -507,7 +495,8 @@ class KnowledgeIndexService:
                     using=prefetch[0].using,
                     query_filter=query_filter,
                     limit=search_limit,
-                    with_payload=["chunk_id"],
+                    with_payload=["chunk_id", "content_hash"],
+                    **({"with_vectors": [self.dense_vector_name]} if prepared else {}),
                 )
             else:
                 response = await self._index_io(
@@ -517,9 +506,11 @@ class KnowledgeIndexService:
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
                     query_filter=query_filter,
                     limit=search_limit,
-                    with_payload=["chunk_id"],
+                    with_payload=["chunk_id", "content_hash"],
                 )
         except Exception:
+            if _prepared is not None:
+                raise
             logger.exception("Knowledge index search failed")
             return []
 
@@ -530,10 +521,33 @@ class KnowledgeIndexService:
             if not chunk_id:
                 continue
             try:
-                hits.append(KnowledgeIndexHit(chunk_id=uuid.UUID(str(chunk_id)), score=float(point.score)))
+                dense_score = None
+                if prepared:
+                    from ..rag.media_query import prepared_dense_cosine
+                    vector = getattr(point, "vector", None)
+                    dense_score = prepared_dense_cosine(
+                        dense,
+                        vector.get(self.dense_vector_name) if isinstance(vector, dict) else None,
+                        self.embedding.dimension,
+                    )
+                    if dense_score is None:
+                        # A malformed saved vector cannot become a semantic
+                        # hit through the legacy point/RRF score.
+                        continue
+                hits.append(KnowledgeIndexHit(
+                    chunk_id=uuid.UUID(str(chunk_id)),
+                    score=float(dense_score if dense_score is not None else point.score),
+                    content_hash=payload.get("content_hash"),
+                    dense_score=dense_score,
+                ))
             except ValueError:
                 continue
         return hits
+
+    async def search_prepared(self, unit, *, filters, limit):
+        from ..rag.media_query import require_prepared
+        require_prepared(unit)
+        return await self.search(query=unit.lexical_text, filters=filters, limit=limit, _prepared=unit)
 
     def _source_filter(self, source_id: uuid.UUID):
         return models.Filter(must=[
@@ -560,12 +574,15 @@ class KnowledgeIndexService:
         if models is None:
             return None
         must = [
+            models.FieldCondition(key="embedding_fingerprint", match=models.MatchValue(value=self._embedding_fingerprint())),
             models.FieldCondition(
                 key="document_status",
                 match=models.MatchValue(value="active"),
             )
         ]
         readable_sources = getattr(filters, "readable_source_ids", None)
+        if readable_sources is None:
+            raise PermissionError("Knowledge candidates require current readable_source_ids")
         if readable_sources is not None:
             must.append(models.FieldCondition(
                 key="source_id", match=models.MatchAny(any=[str(value) for value in readable_sources]),
@@ -584,6 +601,8 @@ class KnowledgeIndexService:
                     match=models.MatchValue(value=str(filters.project_id)),
                 )
             )
+        if getattr(filters, "non_project", False):
+            must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key="project_refs")))
         if getattr(filters, "extension", None):
             extension = str(filters.extension)
             if not extension.startswith("."):
@@ -731,6 +750,7 @@ class KnowledgeIndexService:
 
     def _embedding_fingerprint(self) -> str:
         identity = {
+            "encoder": EMBEDDING_IDENTITY,
             "model": self.embedding.config.model,
             "dimension": self.embedding.dimension,
             "input_version": self.dense_input_version,

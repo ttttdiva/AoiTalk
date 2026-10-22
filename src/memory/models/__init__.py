@@ -7,6 +7,14 @@
 from sqlalchemy.orm import configure_mappers
 
 from .base import Base
+from .personal_draft import PersonalDraftEvent
+from .auth_handoff import (
+    AuthHandoffClientTransaction,
+    AuthHandoffRateLimit,
+    AuthHandoffTransaction,
+)
+from .agent_delegation import AgentDelegation, AgentDelegationArtifact, AgentDelegationBudgetReservation
+from .daily_capture import DocsDailyCapture
 from .agent_automation import (
     AgentAutomationRule, AgentAutomationRuleRevision, AgentAutomationRuleAction,
     AgentAutomationEvent, AgentActionPolicy, AgentActionPolicyRevision,
@@ -25,22 +33,16 @@ from .telephony import (
 )
 from .conversations import (
     ConversationSession,
+    AgentExecutionBinding,
     ConversationParticipant,
     ConversationMessage,
     ConversationArchive,
     ConversationHistory,
     public_session_context,
+    _session_iso,
 )
 from .generated_media import GeneratedMedia
 from .audit import ContentDeletionEvent
-from .trpg_play import (
-    TrpgPlayEvent,
-    TrpgPlayParticipant,
-    TrpgPlayPrivateState,
-    TrpgPlaySession,
-    TrpgPlayWhisper,
-    TrpgPlayWhisperRecipient,
-)
 from .agent_runs import (
     AgentRun,
     AgentRunEdge,
@@ -80,13 +82,12 @@ from .skill_learning import (
     SkillProposalHistory,
     SkillUsageReceipt,
 )
+from .skill_execution import SkillExecution
 from .users import (
     User,
     ExternalIdentityBinding,
     ScopedMemoryPrincipal,
     LongLivedApiToken,
-    UserHfCredential,
-    UserHydrusCredential,
     UserXCookieCredential,
     WebUILoginLog,
     AppConfigSetting,
@@ -146,6 +147,32 @@ from .knowledge_capture import (
     validate_question_transition,
 )
 from .meeting_processing import MeetingProcessingJob
+from .agent_dialogue import (
+    AGENT_PRIVATE_ROOT_PURPOSES,
+    AGENT_PRIVATE_ROOT_STATES,
+    AGENT_DIALOGUE_STATES,
+    AGENT_DIALOGUE_DELIVERY_KINDS,
+    AGENT_DIALOGUE_DELIVERY_STATES,
+    AGENT_DIALOGUE_INPUT_KINDS,
+    AGENT_DIALOGUE_INPUT_STATES,
+    AgentPrivateRoot,
+    AgentDialogue,
+    AgentDialogueBudgetRoot,
+    AgentDialogueReservation,
+    AgentDialogueUsage,
+    AgentDialogueDelivery,
+    AgentDialogueInput,
+)
+from .workspace_files import (
+    WorkspaceFileEntry, WorkspaceFileRootObservation, WORKSPACE_FILE_SCOPES, WORKSPACE_FILE_STATUSES,
+)
+from .personal_ledger import (
+    PERSONAL_LEDGER_ACTOR_KINDS,
+    PERSONAL_LEDGER_ENTRY_TYPES,
+    PERSONAL_LEDGER_KINDS,
+    PERSONAL_LEDGER_USER_ONLY_ENTRY_TYPES,
+    PersonalLedgerEntry,
+)
 from .records import (
     RecordTable,
     RecordField,
@@ -235,6 +262,15 @@ from .apps import (
     ProjectApp,
     TaskAppLink,
 )
+from .app_actions import (
+    APP_ACTION_DISPATCH_STATES,
+    APP_ACTION_MODES,
+    APP_ACTION_PROCESS_STATES,
+    APP_ACTION_READINESS_STATES,
+    APP_ACTION_RUN_STATUSES,
+    AppActionRun,
+    AppRuntimeActivation,
+)
 from .managed_tools import (
     MANAGED_TOOL_RUNTIMES,
     MANAGED_TOOL_STATUSES,
@@ -249,21 +285,6 @@ from .managed_tools import (
     ManagedTool,
 )
 from .project_storage_operations import ProjectStorageOperation
-from .story import (
-    StoryWork,
-    StoryEpisode,
-    StoryLink,
-    StoryCharacter,
-    StoryWorkCharacter,
-    StoryRulebook,
-    StoryWorkRulebook,
-    StoryNote,
-    StoryEpisodeRevision,
-    StorySearchIndex,
-    StoryGenerationJob,
-    StoryIllustration,
-    StoryWritingSession,
-)
 from .operations import (
     ExternalConnection,
     ArtifactVersion,
@@ -311,6 +332,7 @@ from .media_operations_credentials import (
     MediaCredentialStatus,
     MediaPlatformCredential,
     MediaPlatformCredentialAuditEvent,
+    MediaPlatformOAuthRequest,
     media_credential_state_hash,
 )
 from .media_provider_capability import (
@@ -360,6 +382,8 @@ from .media_operations_generation import (
     GenerationOutput,
     GenerationOutputSelection,
 )
+from .media_assets import MediaAssetRevision
+from .media_browser_preparation import MediaBrowserPreparation
 from .media_operations_content import (
     CONTENT_VARIANT_PLATFORM_VALUES,
     ContentVariantPlatform,
@@ -401,7 +425,9 @@ from .media_operations_metrics import (
     ExperimentMetricInput,
     MetricSnapshotInput,
     RevenueEvent,
+    RevenueCostRecord,
 )
+from .media_operations_costs import MediaCostEntry, MediaCostAllocation
 from .media_operations_learning import (
     LearningProposalStatus,
     LEARNING_PROPOSAL_STATUS_VALUES,
@@ -444,6 +470,9 @@ def __getattr__(name):
     raise AttributeError(name)
 
 __all__ = [
+    "AgentDelegation",
+    "AgentDelegationArtifact",
+    "AgentDelegationBudgetReservation",
     "DocsAuthorityState", "DocsLibraryRevision", "DocsIndexQueue", "DocsReadLease",
     "DocsEditReadSession",
     "DocsMutationReceipt", "DocsCoverageRun",
@@ -487,8 +516,12 @@ __all__ = [
     "SkillProposal",
     "SkillProposalHistory",
     "SkillUsageReceipt",
+    "SkillExecution",
     "AppConfigSetting",
     "Base",
+    "AuthHandoffClientTransaction",
+    "AuthHandoffRateLimit",
+    "AuthHandoffTransaction",
     "ContextMemory",
     "ContextMemoryAudit",
     "DreamingMemoryState",
@@ -500,6 +533,7 @@ __all__ = [
     "ContentDeletionEvent",
     "ConversationParticipant",
     "ConversationSession",
+    "AgentExecutionBinding",
     "public_session_context",
     "Feedback",
     "EnterpriseBootstrapState",
@@ -524,6 +558,7 @@ __all__ = [
     "KnowledgeAnnotation",
     "ClipIngestReceipt",
     "DocsClipIngestJob",
+    "DocsDailyCapture",
     "DocsCandidate",
     "KnowledgeAiSuggestion",
     "KnowledgeAttachment",
@@ -573,9 +608,32 @@ __all__ = [
     "validate_candidate_transition",
     "validate_question_transition",
     "MeetingProcessingJob",
+    "AGENT_PRIVATE_ROOT_PURPOSES",
+    "AGENT_PRIVATE_ROOT_STATES",
+    "AGENT_DIALOGUE_STATES",
+    "AGENT_DIALOGUE_DELIVERY_KINDS",
+    "AGENT_DIALOGUE_DELIVERY_STATES",
+    "AGENT_DIALOGUE_INPUT_KINDS",
+    "AGENT_DIALOGUE_INPUT_STATES",
+    "AgentPrivateRoot",
+    "AgentDialogue",
+    "AgentDialogueBudgetRoot",
+    "AgentDialogueReservation",
+    "AgentDialogueUsage",
+    "AgentDialogueDelivery",
+    "AgentDialogueInput",
+    "WorkspaceFileEntry",
+    "WorkspaceFileRootObservation",
+    "WORKSPACE_FILE_SCOPES",
+    "WORKSPACE_FILE_STATUSES",
     "ProjectMember",
     "ProjectNotificationSetting",
     "ProjectQaEntry",
+    "PERSONAL_LEDGER_ACTOR_KINDS",
+    "PERSONAL_LEDGER_ENTRY_TYPES",
+    "PERSONAL_LEDGER_KINDS",
+    "PERSONAL_LEDGER_USER_ONLY_ENTRY_TYPES",
+    "PersonalLedgerEntry",
     "RecordAttachment",
     "RecordEvent",
     "RecordField",
@@ -608,8 +666,6 @@ __all__ = [
     "User",
     "ExternalIdentityBinding",
     "ScopedMemoryPrincipal",
-    "UserHfCredential",
-    "UserHydrusCredential",
     "UserXCookieCredential",
     "WebexConnection",
     "WebexSpaceSelection",
@@ -623,6 +679,13 @@ __all__ = [
     "AppJob",
     "AppRelease",
     "AppTarget",
+    "APP_ACTION_DISPATCH_STATES",
+    "APP_ACTION_MODES",
+    "APP_ACTION_PROCESS_STATES",
+    "APP_ACTION_READINESS_STATES",
+    "APP_ACTION_RUN_STATUSES",
+    "AppActionRun",
+    "AppRuntimeActivation",
     "ProjectApp",
     "TaskAppLink",
     "MANAGED_TOOL_RUNTIMES",
@@ -637,25 +700,6 @@ __all__ = [
     "ManagedScriptPromotionAudit",
     "ManagedTool",
     "ProjectStorageOperation",
-    "StoryWork",
-    "StoryEpisode",
-    "StoryLink",
-    "StoryCharacter",
-    "StoryWorkCharacter",
-    "StoryRulebook",
-    "StoryWorkRulebook",
-    "StoryNote",
-    "StoryEpisodeRevision",
-    "StorySearchIndex",
-    "StoryGenerationJob",
-    "StoryIllustration",
-    "StoryWritingSession",
-    "TrpgPlaySession",
-    "TrpgPlayParticipant",
-    "TrpgPlayEvent",
-    "TrpgPlayPrivateState",
-    "TrpgPlayWhisper",
-    "TrpgPlayWhisperRecipient",
     "ExternalConnection",
     "ArtifactVersion",
     "EngagementOpportunity",
@@ -696,6 +740,7 @@ __all__ = [
     "MediaCredentialStatus",
     "MediaPlatformCredential",
     "MediaPlatformCredentialAuditEvent",
+    "MediaPlatformOAuthRequest",
     "media_credential_state_hash",
     "MEDIA_PROVIDER_CAPABILITY_ACCOUNT_ELIGIBILITY",
     "MEDIA_PROVIDER_CAPABILITY_OPERATIONS",
@@ -740,6 +785,7 @@ __all__ = [
     "GenerationRun",
     "GenerationRunObservation",
     "GenerationOutput",
+    "MediaAssetRevision",
     "GenerationOutputSelection",
     "CONTENT_VARIANT_PLATFORM_VALUES",
     "ContentVariantPlatform",
@@ -776,6 +822,9 @@ __all__ = [
     "ExperimentMetricInput",
     "MetricSnapshotInput",
     "RevenueEvent",
+    "RevenueCostRecord",
+    "MediaCostEntry",
+    "MediaCostAllocation",
     "LearningProposalStatus",
     "LEARNING_PROPOSAL_STATUS_VALUES",
     "LearningProposal",

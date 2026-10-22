@@ -8,6 +8,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..conversation_context import (
+    canonical_model_transcript_for_history,
     compact_model_transcript_for_history,
     merge_model_transcript_snapshot,
 )
@@ -131,6 +132,7 @@ class MemoryIntegrationMixin:
             else:
                 model_messages.append({"role": msg.role, "content": msg.content})
 
+        model_messages = canonical_model_transcript_for_history(model_messages)
         compacted_model_messages = compact_model_transcript_for_history(
             model_messages,
             getattr(self, "config", None),

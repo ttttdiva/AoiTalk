@@ -12,7 +12,10 @@ from ..memory.models.agent_automation import (
     AgentActionPolicy, AgentActionPolicyRevision, AgentAutomationEvent,
     AgentAutomationRule, AgentAutomationRuleAction, AgentAutomationRuleRevision,
 )
-from ..memory.models.operations import ExternalAction, ExternalActionApproval, ExternalActionAttempt, ExternalConnection, OperationEvent
+from ..memory.models.operations import (
+    ApplicationDraft, EngagementOpportunity, ExternalAction, ExternalActionApproval,
+    ExternalActionAttempt, ExternalConnection, OperationEvent, sanitize_source_url,
+)
 from .agent_authority import AgentAuthorityResolver
 from .agent_identity_service import sha256_json
 from .integration_action_registry import ActionPolicyError, IntegrationActionRegistry
@@ -264,6 +267,28 @@ class AgentActionPolicyService:
         if connection is None or connection.provider_key not in definition.connection_provider_keys:
             raise ActionPolicyError("integration_provider_mismatch", 409)
         await self._human_owner(session, connection.owner_user_id)
+        if getattr(definition, "credential_mode", "vault") == "browser_session":
+            from .pc_bridge_service import get_pc_bridge_hub
+            hub = get_pc_bridge_hub()
+            try:
+                device_id = await hub.store.resolve(str(connection.owner_user_id), None, None)
+                bridge_connection = hub.connection(str(connection.owner_user_id), device_id)
+                if not bridge_connection.edge_connected or "browser" not in bridge_connection.capabilities:
+                    raise RuntimeError("edge unavailable")
+            except Exception as exc:
+                raise ActionPolicyError("crowdworks_browser_session_unavailable", 409) from exc
+            ready = {
+                "ready": True,
+                "revision": int(connection.version or 1),
+                "state_hash": sha256_json({
+                    "connection_id": str(connection.id),
+                    "connection_version": int(connection.version or 1),
+                    "device_id": device_id,
+                    "provider_key": connection.provider_key,
+                }),
+                "device_id": device_id,
+            }
+            return connection, ready
         capability = "telephony.control" if revision.action_type == "telephony.transfer_call" else revision.action_type
         ready = await self._vault().readiness_for_connection(session, connection.id, owner_user_id=connection.owner_user_id,
             project_id=connection.project_id, required_capabilities=(capability,))
@@ -318,6 +343,13 @@ class AgentActionPolicyService:
                     session, rule, rr, event=event)
             except AutomationError as exc:
                 raise ActionPolicyError("action_source_unavailable", 403) from exc
+        elif revision.action_type == "engagement.submit_application" and work is not None:
+            if (
+                work.source_type != "marketplace_crowdworks"
+                or work.intent_key != "marketplace.crowdworks.scan"
+                or event_id is not None
+            ):
+                raise ActionPolicyError("action_rule_origin_required", 403)
         elif revision.action_type != "telephony.transfer_call" or work_id or event_id:
             raise ActionPolicyError("action_rule_origin_required", 403)
         for capability in self.registry.require(revision.action_type).required_capabilities:
@@ -367,6 +399,29 @@ class AgentActionPolicyService:
         count = await session.scalar(select(func.count()).select_from(ExternalAction).where(*conditions))
         if count >= revision.rate_limit_json["max_actions"]:
             raise ActionPolicyError("action_rate_limited", 409)
+        return revision.rate_limit_json["max_actions"] - count
+
+    async def proposal_capacity(self, session, *, policy_revision_id):
+        """Read advisory capacity without reserving a slot or changing authority.
+
+        Actual proposal creation still serializes and rechecks _rate. A full
+        queue is expected scheduling pressure, while other policy errors keep
+        their normal failure semantics.
+        """
+        revision = await session.get(AgentActionPolicyRevision, uid(policy_revision_id))
+        if revision is None:
+            raise ActionPolicyError("action_policy_not_found", 404)
+        policy = await self._policy(session, revision.policy_id)
+        current = await self.current(session, policy.id)
+        if policy.state != "active" or current is None or current.id != revision.id:
+            raise ActionPolicyError("action_policy_stale", 409)
+        await self._revision_integrity(session, revision, bounded=revision.authorization_mode == "bounded_auto")
+        try:
+            return await self._rate(session, revision)
+        except ActionPolicyError as exc:
+            if exc.code != "action_rate_limited":
+                raise
+            return 0
 
     async def propose_action(self, session, *, policy_revision_id, automation_rule_revision_id,
                               origin_agent_id, origin_agent_run_id, origin_work_item_id,
@@ -391,6 +446,33 @@ class AgentActionPolicyService:
         connection, readiness = await self._ready(session, revision)
         if connection.project_id != project_id:
             raise ActionPolicyError("connection_scope_mismatch", 403)
+
+        engagement_opportunity = None
+        engagement_draft = None
+        if revision.action_type == "engagement.submit_application":
+            engagement_opportunity = await session.get(
+                EngagementOpportunity, uid(normalized.get("opportunity_id"))
+            )
+            engagement_draft = await session.get(
+                ApplicationDraft, uid(normalized.get("application_draft_id"))
+            )
+            if (
+                engagement_opportunity is None
+                or engagement_draft is None
+                or engagement_draft.opportunity_id != engagement_opportunity.id
+                or engagement_opportunity.connection_id != connection.id
+                or engagement_opportunity.project_id != connection.project_id
+                or engagement_draft.project_id != connection.project_id
+                or engagement_opportunity.owner_user_id != connection.owner_user_id
+                or engagement_draft.owner_user_id != connection.owner_user_id
+                or sanitize_source_url(engagement_opportunity.source_url) != normalized.get("source_url")
+                or engagement_draft.message != normalized.get("message")
+                or engagement_draft.offered_price != normalized.get("offered_price")
+                or engagement_draft.currency != normalized.get("currency")
+                or engagement_draft.delivery_estimate != normalized.get("delivery_estimate")
+            ):
+                raise ActionPolicyError("engagement_draft_binding_changed", 409)
+
         key = (f"automation:{uid(automation_rule_revision_id)}:{uid(source_event_id)}:{action_position}" if automation_rule_revision_id
                else "realtime:" + sha256_json({"run": str(run.id), "policy": str(revision.id), "payload": normalized}))
         replay = await session.scalar(select(ExternalAction).where(ExternalAction.idempotency_key == key,
@@ -407,6 +489,10 @@ class AgentActionPolicyService:
         await self._rate(session, revision)
         action = ExternalAction(id=uuid4(), owner_user_id=connection.owner_user_id, project_id=project_id,
             connection_id=connection.id, action_type=revision.action_type, idempotency_key=key,
+            opportunity_id=(engagement_opportunity.id if engagement_opportunity is not None else None),
+            application_draft_id=(engagement_draft.id if engagement_draft is not None else None),
+            application_draft_version=(int(engagement_draft.version) if engagement_draft is not None else 1),
+            source_url=(sanitize_source_url(engagement_opportunity.source_url) if engagement_opportunity is not None else None),
             payload_json=normalized, payload_hash=payload_hash(normalized), artifact_hashes=[], status="proposed",
             created_by=None, origin_agent_id=policy.agent_id, origin_agent_run_id=run.id,
             origin_work_item_id=work.id if work else None, authorization_mode="bounded_policy" if revision.authorization_mode == "bounded_auto" else "human_approval",

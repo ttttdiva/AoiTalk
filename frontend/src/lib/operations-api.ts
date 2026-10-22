@@ -12,6 +12,7 @@
 import type { components } from "@/lib/api-types.gen";
 
 export type OperationsJson = Record<string, unknown>;
+export type MediaActionPackagePreview = components["schemas"]["MediaActionPackagePreview"];
 
 export type OperationsConnection = {
   id: string;
@@ -37,8 +38,96 @@ export type EngagementOpportunity = {
   source_snapshot_hash?: string | null;
   source_untrusted?: boolean;
   status?: string | null;
+  workflow_stage?: string | null;
+  compensation_yen?: number | null;
+  compensation_type?: string | null;
+  expected_profit?: number | null;
+  expected_profit_per_hour?: number | null;
+  estimated_effort_hours?: number | null;
+  expected_human_minutes?: number | null;
+  fit?: string | null;
+  confidence?: number | null;
+  worker_kind?: string | null;
+  assigned_agent_id?: string | null;
+  assigned_agent_name?: string | null;
+  specialist_assessment?: SpecialistAssessment | null;
+  development?: DevelopmentResult | null;
+  development_blocking_requirements?: string[];
+  review_artifact_version_ids?: string[];
+  card_summary_lines?: string[];
+  screening_status?: string | null;
+  screening_reason?: string | null;
+  development_requirements_resolved?: boolean;
+  development_requirements_revision?: number | null;
+  development_requirements_note?: string | null;
+  external_action_id?: string | null;
+  external_action_status?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  [key: string]: unknown;
+};
+
+export type SpecialistAssessment = {
+  worker_kind?: string | null;
+  recommended_agent?: { id?: string | null; display_name?: string | null; available?: boolean } | null;
+  deliverable_summary?: string | null;
+  estimated_effort_hours?: number | null;
+  tech_stack?: string[];
+  development_blockers?: string[];
+  client_inputs_required?: string[];
+  unresolved_requirements?: string[];
+  environment_ready?: "ready" | "partial" | "unavailable" | string | null;
+  environment_notes?: string[];
+  feasibility?: "feasible" | "conditional" | "infeasible" | string | null;
+  feasibility_reason?: string | null;
+  risks?: string[];
+  human_tasks?: string[];
+  expected_human_minutes?: number | null;
+  estimated_cost?: number | null;
+  expected_revenue?: number | null;
+  expected_profit?: number | null;
+  expected_profit_per_hour?: number | null;
+  confidence?: number | null;
+  [key: string]: unknown;
+};
+
+export type DevelopmentCheck = {
+  id: string;
+  label: string;
+  status: "passed" | "failed" | "timeout" | "not_available" | "skipped" | "error" | string;
+  required?: boolean;
+  command?: string | null;
+  detail?: string | null;
+  duration_seconds?: number | null;
+};
+
+export type DevelopmentArtifactRef = {
+  id: string;
+  filename?: string | null;
+  size_bytes?: number | null;
+  mime_type?: string | null;
+  viewport?: string | null;
+};
+
+export type DevelopmentResult = {
+  status?: "running" | "ready_for_review" | "blocked" | "verification_failed" | "uncertain" | string | null;
+  worker_kind?: string | null;
+  agent?: { id?: string | null; display_name?: string | null; execution_profile_id?: string | null } | null;
+  runner?: { runner?: string | null; provider?: string | null; model?: string | null; source?: string | null } | null;
+  workspace?: { name?: string | null; isolated_git?: boolean } | null;
+  project_id?: string | null;
+  project_type?: string | null;
+  agent_report?: { summary?: string | null; implemented?: string[] } | null;
+  checks?: DevelopmentCheck[];
+  artifacts?: Record<string, DevelopmentArtifactRef | DevelopmentArtifactRef[] | undefined>;
+  deliverables?: string[];
+  unverified?: string[];
+  known_issues?: string[];
+  requirements?: { status?: string | null; items?: string[] } | null;
+  blocking_reason?: string | null;
+  uncertain_reason?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
   [key: string]: unknown;
 };
 
@@ -415,6 +504,7 @@ function normalizeOpportunity(value: unknown): EngagementOpportunity {
     source_snapshot_hash: asString(record.source_snapshot_hash ?? record.source_hash) ?? null,
     source_untrusted: record.source_untrusted === true,
     status: asString(record.status) ?? null,
+    expected_human_minutes: asNumber(record.expected_human_minutes) ?? null,
   };
 }
 
@@ -544,6 +634,14 @@ export const operationsApi = {
     return normalizeOpportunityDetail(payload);
   },
 
+  async resolveDevelopmentRequirements(id: string, input: { resolved: boolean; note?: string | null }): Promise<EngagementOpportunity> {
+    const payload = await request<unknown>(`/operations/opportunities/${encodeId(id)}/development-requirements`, {
+      method: "POST",
+      ...jsonBody(input),
+    });
+    return normalizeOpportunity(firstRecord(payload, ["opportunity", "data"]));
+  },
+
   async createEvaluation(opportunityId: string, input: CreateEvaluationInput, idempotencyKey?: string): Promise<OpportunityEvaluation> {
     const payload = await request<unknown>(`/operations/opportunities/${encodeId(opportunityId)}/evaluations`, { method: "POST", ...jsonBody(input) }, idempotencyKey);
     return normalizeEvaluation(firstRecord(payload, ["evaluation", "data"]));
@@ -580,6 +678,27 @@ export const operationsApi = {
   async getAction(id: string): Promise<OperationsAction> {
     const payload = await request<unknown>(`/operations/actions/${encodeId(id)}`);
     return actionRecord(payload);
+  },
+
+  async getActionPackage(id: string, actionVersion: number, payloadHash: string, signal?: AbortSignal): Promise<MediaActionPackagePreview> {
+    const query = new URLSearchParams({ expected_action_version: String(actionVersion), expected_payload_hash: payloadHash });
+    return request<MediaActionPackagePreview>(`/operations/actions/${encodeId(id)}/package?${query}`, { signal });
+  },
+
+  async downloadActionPackage(id: string, actionVersion: number, payloadHash: string, manifestHash: string, signal?: AbortSignal): Promise<Blob> {
+    const query = new URLSearchParams({ expected_action_version: String(actionVersion), expected_payload_hash: payloadHash, expected_manifest_sha256: manifestHash });
+    const response = await fetch(`/api/python-proxy/operations/actions/${encodeId(id)}/package/content?${query}`, {
+      cache: "no-store", credentials: "include", signal,
+    });
+    if (!response.ok) {
+      const body = await parseResponse(response);
+      const detail = isRecord(body) ? body.detail : undefined;
+      throw new OperationsApiError(typeof detail === "string" ? detail : `Package download failed (${response.status})`, { status: response.status, detail, body });
+    }
+    if (response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/zip" || response.headers.get("X-MediaOps-Manifest-SHA256") !== manifestHash) {
+      throw new OperationsApiError("Package response does not match the preview; reload it", { status: 409 });
+    }
+    return response.blob();
   },
 
   async reviseAction(id: string, input: ReviseActionInput, idempotencyKey?: string): Promise<OperationsAction> {

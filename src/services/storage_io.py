@@ -59,7 +59,15 @@ class StorageIO:
     async def run(
         self, key: str, function: Callable[[], T], *, timeout: float = 15.0,
         mutation: bool = False,
+        on_abandoned: Callable[[], None] | None = None,
     ) -> T:
+        """Run bounded I/O; optionally clean up after an abandoned worker exits.
+
+        The cleanup runs in that worker after ``function`` has unwound its file
+        handles and its cancellation context is reset, with admission retained.
+        It must only remove resources owned by this operation, never commit the
+        interrupted mutation. Ordinary callers retain their existing behavior.
+        """
         with self._lock:
             if self._active.get(key, 0) >= self.per_key or sum(self._active.values()) >= self.maximum:
                 raise StorageError("storage_busy", "このストレージの処理待ちです", 503)
@@ -70,19 +78,33 @@ class StorageIO:
 
         def work() -> None:
             token = _CANCELLED.set(cancelled)
+            value: T | None = None
+            failure: BaseException | None = None
             try:
                 check_io_cancelled()
-                result.set_result(function())
+                value = function()
             except BaseException as exc:
-                result.set_exception(exc)
+                failure = exc
             finally:
                 _CANCELLED.reset(token)
-                with self._lock:
-                    remaining = self._active[key] - 1
-                    if remaining:
-                        self._active[key] = remaining
-                    else:
-                        self._active.pop(key, None)
+                try:
+                    if cancelled.is_set() and on_abandoned is not None:
+                        on_abandoned()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                finally:
+                    with self._lock:
+                        remaining = self._active[key] - 1
+                        if remaining:
+                            self._active[key] = remaining
+                        else:
+                            self._active.pop(key, None)
+            # Resume callers only after the completed syscall's admission is released.
+            if failure is not None:
+                result.set_exception(failure)
+            else:
+                result.set_result(value)
 
         try:
             threading.Thread(target=lambda: context.run(work), daemon=True,

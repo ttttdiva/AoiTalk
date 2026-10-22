@@ -119,8 +119,6 @@ test.describe("Files storage toolbar integration", () => {
     await expect(
       toolbar.getByRole("button", { name: "User Files" }),
     ).toBeVisible();
-    await expect(toolbar.getByRole("button", { name: "HF" })).toBeVisible();
-    await expect(toolbar.getByRole("button", { name: "Hydrus" })).toBeVisible();
     await expect(selector).toHaveValue("default");
     expect(
       await storageControls.evaluate(

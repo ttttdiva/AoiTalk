@@ -1,3 +1,5 @@
+import { withBasePath } from "@/lib/base-path";
+
 /** Additional mounted Files roots; no host path is used as a client file id. */
 export interface StorageRootInfo {
   id: string; name: string; configuration_revision: string; root_path?: string; read_only: boolean; enabled: boolean;
@@ -70,6 +72,6 @@ export const storageRootsApi = {
   chunk: (id: string, uid: string, offset: number, data: Blob) => request<UploadSession>(storageEndpoint(id, `uploads/${encodeURIComponent(uid)}?offset=${offset}`), {method: "PUT", headers: {"Content-Type": "application/octet-stream"}, body: data}),
   finishUpload: (id: string, uid: string) => request(storageEndpoint(id, `uploads/${encodeURIComponent(uid)}/complete`), {method: "POST"}),
   cancelUpload: (id: string, uid: string) => request(storageEndpoint(id, `uploads/${encodeURIComponent(uid)}`), {method: "DELETE"}),
-  downloadUrl: (id: string, path: string) => `/api/python-proxy${storageEndpoint(id, `download?path=${encodeURIComponent(path)}`)}`,
+  downloadUrl: (id: string, path: string) => withBasePath(`/api/python-proxy${storageEndpoint(id, `download?path=${encodeURIComponent(path)}`)}`),
 };
 export const storageStatusLabel = (root: StorageRootInfo) => !root.enabled ? "無効" : root.status === "online" ? "接続中" : root.status === "checking" ? "確認中" : "オフライン";

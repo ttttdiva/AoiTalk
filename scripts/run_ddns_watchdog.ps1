@@ -40,9 +40,6 @@ if ($Uninstall) {
 $updateScript = Join-Path $ProjectRoot 'scripts\update_ddns.py'
 $pythonPath = Join-Path $ProjectRoot 'venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-    $pythonPath = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-}
-if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "プロジェクト venv の Python が見つかりません"
 }
 if (-not (Test-Path -LiteralPath $updateScript -PathType Leaf)) {

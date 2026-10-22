@@ -19,6 +19,7 @@ from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -42,6 +43,7 @@ from ..memory.models import (
     TaskAppLink,
 )
 from ..services.app_git_service import AppGitError, AppGitService
+from ..services.app_commit_archive import build_latest_commit_archive
 from ..services.app_bridge_service import (
     AppBridgeTokenError,
     DEFAULT_TTL_SECONDS,
@@ -109,7 +111,13 @@ from ..services.app_storage import (
     sha256_file,
     verify_file_integrity,
 )
-from .routes.apps import AppGrantPayload, AppRouterContext, register_app_grant_routes
+from .routes.apps import (
+    AppGrantPayload,
+    AppRouterContext,
+    register_app_action_file_routes,
+    register_app_action_routes,
+    register_app_grant_routes,
+)
 
 logger = logging.getLogger(__name__)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,119}$")
@@ -140,6 +148,21 @@ MAX_APP_JSON_DEPTH = 16
 #: AppJob.input_json は AOITALK_APP_INPUT_JSON へ json.dumps されるため、
 #: 実行時に環境変数構築で落ちる前に 422 で弾く。
 MAX_APP_INPUT_JSON_ENV_CHARS = 32_767
+
+
+def _attachment_content_disposition(filename: str) -> str:
+    """Return an attachment name with an ASCII fallback and UTF-8 value."""
+    ascii_filename = "".join(
+        "_" if ord(char) < 32 or ord(char) >= 127 or char in {"/", "\\", ":", "*", "?", "<", ">", "|"}
+        else "'" if char == '"'
+        else char
+        for char in filename
+    ).rstrip(" .") or "download"
+    encoded_filename = quote(filename, safe="")
+    return (
+        f'attachment; filename="{ascii_filename}"; '
+        f"filename*=UTF-8''{encoded_filename}"
+    )
 
 
 def _effective_capabilities_for_target(
@@ -715,6 +738,63 @@ def _archive_path_is_release_supplement(relative: str) -> bool:
     )
 
 
+def _archive_has_selected_content(
+    *,
+    workspace: Path,
+    source_bundle: Path | None,
+    exclude_git: bool,
+    exclude_dependencies: bool,
+    exclude_runtime: bool,
+    exclude_credentials: bool,
+    include_paths: tuple[str, ...] | None,
+) -> bool:
+    """Check whether an archive would contain a file without building the ZIP."""
+    if source_bundle is None:
+        return next(
+            _iter_workspace_archive_files(
+                workspace,
+                exclude_git=exclude_git,
+                exclude_dependencies=exclude_dependencies,
+                exclude_runtime=exclude_runtime,
+                exclude_credentials=exclude_credentials,
+                include_paths=include_paths,
+            ),
+            None,
+        ) is not None
+
+    try:
+        with zipfile.ZipFile(source_bundle) as bundle:
+            for info in bundle.infolist():
+                if info.is_dir() or stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF):
+                    continue
+                normalized = _normalize_archive_relative_path(info.filename)
+                if normalized is None:
+                    continue
+                if _archive_path_is_excluded(
+                    normalized,
+                    exclude_git=exclude_git,
+                    exclude_dependencies=exclude_dependencies,
+                    exclude_runtime=exclude_runtime,
+                    exclude_credentials=exclude_credentials,
+                ) or not _archive_path_is_included(normalized, include_paths):
+                    continue
+                return True
+    except (OSError, KeyError, zipfile.BadZipFile) as exc:
+        raise _error(409, "固定ReleaseのSource Bundleを読み込めません") from exc
+
+    for _path, relative in _iter_workspace_archive_files(
+        workspace,
+        exclude_git=exclude_git,
+        exclude_dependencies=exclude_dependencies,
+        exclude_runtime=exclude_runtime,
+        exclude_credentials=exclude_credentials,
+        include_paths=include_paths,
+    ):
+        if _archive_path_is_release_supplement(relative):
+            return True
+    return False
+
+
 def _remove_temp_file(path: Path) -> None:
     """Delete a streamed temp archive.  Failure must not break the response."""
     try:
@@ -858,6 +938,7 @@ def create_apps_router(
     workspace_root: str | Path | None = None,
     get_llm_client: Callable[[], Any] | None = None,
     get_app_config: Callable[[], dict[str, Any]] | None = None,
+    execution_service: Any | None = None,
 ) -> APIRouter:
     router = APIRouter(tags=["apps"])
     service = AppService(workspace_root=workspace_root)
@@ -1272,6 +1353,7 @@ def create_apps_router(
     async def list_apps(
         request: Request,
         project_id: str | None = Query(None),
+        include_archived: bool = Query(False),
         _: None = Depends(require_auth_dependency),
     ):
         user = await current_user(request)
@@ -1286,6 +1368,7 @@ def create_apps_router(
                 user_id=_user_id(user),
                 user_role=user.get("role"),
                 project_id=project_uuid,
+                include_archived=include_archived,
             )
             app_ids = [app.id for app, _permission in apps]
             # App 1件ごとの targets / bindings / project_access クエリを
@@ -1729,7 +1812,45 @@ def create_apps_router(
         session = await get_db_manager().get_session()
         try:
             project_uuid = _uuid(project_id, "project_id") if project_id else None
-            app, permission = await require_app(session, app_id, user, project_id=project_uuid)
+            app, permission = await require_app(
+                session,
+                app_id,
+                user,
+                project_id=project_uuid,
+                require_enabled_binding=False,
+            )
+            if project_uuid is not None:
+                project_binding = await session.scalar(
+                    select(ProjectApp)
+                    .where(
+                        ProjectApp.project_id == project_uuid,
+                        ProjectApp.app_id == app.id,
+                    )
+                    .limit(1)
+                )
+                if project_binding is None or not project_binding.enabled:
+                    enabled_bindings = list(
+                        (
+                            await session.scalars(
+                                select(ProjectApp).where(
+                                    ProjectApp.app_id == app.id,
+                                    ProjectApp.enabled.is_(True),
+                                )
+                            )
+                        ).all()
+                    )
+                    payload = app_payload(app, permission)
+                    payload["related_project_ids"] = [
+                        str(binding.project_id)
+                        for binding in enabled_bindings
+                        if await service.project_access(
+                            session,
+                            project_id=binding.project_id,
+                            user_id=_user_id(user),
+                            user_role=user.get("role"),
+                        )
+                    ]
+                    return {"app": payload}
             targets = list((await session.scalars(select(AppTarget).where(AppTarget.app_id == app.id).order_by(AppTarget.target_key))).all())
             releases = list((await session.scalars(
                 select(AppRelease)
@@ -1813,6 +1934,19 @@ def create_apps_router(
             await session.close()
 
     register_app_grant_routes(router, route_context)
+    action_service = register_app_action_routes(
+        router,
+        route_context,
+        workspace_root=workspace_root,
+        execution_service=execution_service,
+        execution_config=_app_config(),
+    )
+    register_app_action_file_routes(
+        router,
+        route_context,
+        workspace_root=workspace_root,
+        action_service=action_service,
+    )
 
     @router.get("/api/apps/{app_id}/targets")
     async def list_targets(app_id: str, request: Request, project_id: str | None = Query(None), _: None = Depends(require_auth_dependency)):
@@ -2254,7 +2388,7 @@ def create_apps_router(
                     content=content,
                     media_type=mimetypes.guess_type(Path(normalized).name)[0] or "application/octet-stream",
                     headers={
-                        "Content-Disposition": f'attachment; filename="{Path(normalized).name}"',
+                        "Content-Disposition": _attachment_content_disposition(Path(normalized).name),
                         "Cache-Control": "no-store",
                         "X-Content-Type-Options": "nosniff",
                     },
@@ -2275,8 +2409,11 @@ def create_apps_router(
             return FileResponse(
                 path=file_path,
                 media_type=media_type,
-                filename=file_path.name,
-                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+                headers={
+                    "Content-Disposition": _attachment_content_disposition(file_path.name),
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
             )
         finally:
             await session.close()
@@ -2287,6 +2424,7 @@ def create_apps_router(
         request: Request,
         project_id: str | None = Query(None),
         include_paths: str | None = Query(None),
+        latest_commit_only: bool = Query(False),
         exclude_git: bool = Query(False),
         exclude_dependencies: bool = Query(False),
         exclude_runtime: bool = Query(False),
@@ -2300,7 +2438,8 @@ def create_apps_router(
         除外する。内容の公開可否をサーバー側で推測せず、
         既存どおりrunner以上の利用者が選択する。Projectが保存版を固定している場合、通常ソースはその
         Releaseを使い、Release作成時に除外済みのローカルカテゴリだけworkspaceから
-        補完する。
+        補完する。latest_commit_only=trueでは対象commitとfirst parentとの差分を返す。
+        初回commitは全追跡ファイル、削除はmanifestに記録する。作業差分や秘密ファイルは含めない。
         """
         user = await current_user(request)
         session = await get_db_manager().get_session()
@@ -2316,7 +2455,62 @@ def create_apps_router(
             )
             selected_bundle = await installed_source_bundle(session, app, project_uuid)
             root_name = _archive_root_name(app)
-            if selected_bundle:
+            if request.headers.get("x-aoitalk-download-preflight") == "1":
+                if latest_commit_only:
+                    revision = selected_bundle[1].git_revision if selected_bundle else None
+                    if selected_bundle and not revision:
+                        raise _error(409, "保存版のGitコミットを特定できません。全体ダウンロードを使ってください")
+                    # The browser validates authorization and response metadata
+                    # before starting its native streaming download. Do not
+                    # build a potentially large ZIP for that metadata-only GET;
+                    # the actual response below supplies the authoritative name.
+                    filename = f"{root_name}_latest-commit.zip"
+                else:
+                    workspace = get_app_workspace_path(app.id, workspace_root=workspace_root)
+                    if not _archive_has_selected_content(
+                        workspace=workspace,
+                        source_bundle=selected_bundle[2] if selected_bundle else None,
+                        exclude_git=exclude_git,
+                        exclude_dependencies=exclude_dependencies,
+                        exclude_runtime=exclude_runtime,
+                        exclude_credentials=exclude_credentials,
+                        include_paths=selected_paths,
+                    ):
+                        raise _error(404, "ダウンロードできるファイルがありません")
+                    if selected_bundle:
+                        version = _safe_archive_component(selected_bundle[1].version, limit=40)
+                        filename = f"{root_name}_{version}.zip" if version else f"{root_name}.zip"
+                    else:
+                        filename = f"{root_name}.zip"
+                return Response(
+                    content=b"",
+                    media_type="application/zip",
+                    headers={
+                        "Content-Disposition": _attachment_content_disposition(filename),
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            if latest_commit_only:
+                revision = selected_bundle[1].git_revision if selected_bundle else None
+                if selected_bundle and not revision:
+                    raise _error(409, "保存版のGitコミットを特定できません。全体ダウンロードを使ってください")
+                def include_commit_path(relative: str) -> bool:
+                    return _archive_path_is_included(relative, selected_paths) and not _archive_path_is_excluded(
+                        relative, exclude_git=True,
+                        exclude_dependencies=exclude_dependencies,
+                        exclude_runtime=exclude_runtime, exclude_credentials=True,
+                    )
+                try:
+                    archive_path, commit = await asyncio.to_thread(
+                        build_latest_commit_archive, app.id, root_name, workspace_root,
+                        revision=revision, include_path=include_commit_path,
+                    )
+                except AppGitError as exc:
+                    raise _error(409, str(exc)) from exc
+                written = 1  # Empty/deletion-only commits still carry a manifest.
+                filename = f"{root_name}_commit-{commit[:12]}.zip"
+            elif selected_bundle:
                 version = _safe_archive_component(selected_bundle[1].version, limit=40)
                 workspace = get_app_workspace_path(app.id, workspace_root=workspace_root)
                 archive_path, written = await asyncio.to_thread(
@@ -2352,8 +2546,11 @@ def create_apps_router(
             return FileResponse(
                 path=archive_path,
                 media_type="application/zip",
-                filename=filename,
-                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+                headers={
+                    "Content-Disposition": _attachment_content_disposition(filename),
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
                 background=BackgroundTask(_remove_temp_file, archive_path),
             )
         finally:

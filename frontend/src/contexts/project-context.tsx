@@ -870,3 +870,8 @@ export function useProject() {
   }
   return ctx;
 }
+
+/** Optional read-only accessor for globally mounted overlays and isolated shell tests. */
+export function useOptionalProject() {
+  return useContext(ProjectContext);
+}

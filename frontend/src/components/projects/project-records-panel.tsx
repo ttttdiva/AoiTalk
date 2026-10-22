@@ -16,6 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -345,15 +346,13 @@ export function ProjectRecordsPanel({ projectId }: { projectId: string }) {
       <section className="flex min-w-0 flex-1 flex-col">
         <div className="flex shrink-0 items-center justify-between border-b px-4 py-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="inline-flex items-center gap-2">
               <Table2 className="size-4 text-muted-foreground" />
               <h3 className="truncate text-sm font-semibold">
                 {selectedTable?.name ?? "表を選択"}
               </h3>
+              <HelpPopover label="台帳">表・列・行をプロジェクト単位で管理します。</HelpPopover>
             </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              表・列・行をプロジェクト単位で管理します。
-            </p>
           </div>
           <Button size="sm" onClick={addRow} disabled={!selectedTableId || saving}>
             <Plus className="mr-1 size-3" />

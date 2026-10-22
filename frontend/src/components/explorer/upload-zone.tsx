@@ -1,13 +1,13 @@
 "use client";
 
+import { useConfirm } from "@/hooks/use-confirm";
+
 import { useState, useCallback, useRef } from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import { ExplorerUploadError, explorerUpload } from "@/lib/explorer-api";
 import { getDroppedExplorerFiles } from "@/lib/file-drop";
 import { Upload } from "lucide-react";
 import { toast } from "sonner";
-import { HfUploadError, hfUploadFiles } from "@/lib/hf-api";
-import { parseHfPath } from "@/lib/hf/virtual-path";
 import { uploadFailureToastOptions } from "@/lib/upload-failure";
 
 interface UploadZoneProps {
@@ -17,18 +17,12 @@ interface UploadZoneProps {
 }
 
 export function UploadZone({ children, onContextMenu, disabled = false }: UploadZoneProps) {
-  const { currentPath, refresh, isHfMode, isHydrusMode, capabilities } =
-    useExplorer();
+  const { currentPath, refresh, capabilities } = useExplorer();
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const confirmOverwrite = useConfirm();
   const dragCounterRef = useRef(0);
-  const hfPath = isHfMode ? parseHfPath(currentPath) : null;
-  const uploadEnabled =
-    !disabled &&
-    !isHydrusMode &&
-    (isHfMode
-      ? Boolean(hfPath?.kind === "repo" && hfPath.accountId)
-      : capabilities.canCreate);
+  const uploadEnabled = !disabled && capabilities.canCreate;
 
   const handleDragEnter = useCallback(
     (e: React.DragEvent) => {
@@ -74,39 +68,24 @@ export function UploadZone({ children, onContextMenu, disabled = false }: Upload
       const files = await getDroppedExplorerFiles(e.dataTransfer);
       if (!files || files.length === 0) return;
       if (!uploadEnabled) {
-        toast.info(
-          isHydrusMode
-            ? "Hydrusへのアップロードは対応していません"
-            : "書き込み用アカウントに紐づくHFリポジトリで利用できます",
-        );
+        toast.info("この場所へのアップロードは対応していません");
         return;
       }
 
       setUploading(true);
       try {
-        const result = isHfMode
-          ? await hfUploadFiles(currentPath, files)
-          : await explorerUpload(currentPath, files);
+        const result = await explorerUpload(currentPath, files, { confirmOverwrite });
         if (result.failureCount > 0) {
           toast.warning(
             `${result.successCount}件成功、${result.failureCount}件失敗しました`,
             uploadFailureToastOptions(result.failures),
           );
-        } else {
+        } else if (result.successCount > 0) {
           toast.success(`${result.successCount}件アップロードしました`);
         }
         await refresh();
       } catch (error) {
         if (error instanceof ExplorerUploadError) {
-          const { successCount, failureCount } = error.batchResult;
-          if (successCount > 0) await refresh();
-          toast.error(
-            successCount > 0
-              ? `${successCount}件アップロード、${failureCount}件失敗しました`
-              : error.message,
-            uploadFailureToastOptions(error.batchResult.failures),
-          );
-        } else if (error instanceof HfUploadError) {
           const { successCount, failureCount } = error.batchResult;
           if (successCount > 0) await refresh();
           toast.error(
@@ -126,7 +105,7 @@ export function UploadZone({ children, onContextMenu, disabled = false }: Upload
         setUploading(false);
       }
     },
-    [currentPath, disabled, isHfMode, isHydrusMode, refresh, uploadEnabled],
+    [currentPath, disabled, refresh, uploadEnabled, confirmOverwrite],
   );
 
   return (

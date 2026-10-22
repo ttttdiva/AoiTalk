@@ -1,10 +1,11 @@
-"""Audit and optionally remove unreferenced persistent workspace data.
+"""Audit and quarantine unreferenced persistent workspace data.
 
-The default is a read-only audit. Use ``--apply`` only after reviewing the JSON
-report. This command intentionally handles only namespaces whose ownership is
-unambiguous from the database: Docs attachments, Project roots, and User roots.
-Project ``attachments`` and App source workspaces have separate lifecycles and are
-not treated as interchangeable data.
+The default is a read-only audit. ``--apply`` moves candidates to a restorable
+Recycle Bin batch. Restore a batch with ``--restore-batch`` after stopping
+workspace writers. This command handles only Docs attachments, Project roots,
+and User roots. Its reference reader also classifies Chat, App/run, generated
+media, Files-root, and selected QA-manifest references so other lifecycles do
+not make a workspace candidate look unowned.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,7 +33,9 @@ from src.services.workspace_gc import (
     apply_workspace_gc,
     audit_workspace,
     resolve_workspaces_root,
+    restore_workspace_gc,
 )
+from src.services.workspace_gc_references import load_workspace_reference_inventory
 
 
 # Shared with other maintenance jobs only as a namespace for this process. The
@@ -44,15 +48,26 @@ async def run(
     apply: bool,
     workspace_root: str | None = None,
     service_stopped: bool = False,
+    restore_batch: str | None = None,
 ) -> int:
-    if apply and not service_stopped:
+    if (apply or restore_batch) and not service_stopped:
         print(
-            "--apply は通常のworkspace writerを停止した状態でのみ実行できます。"
+            "--apply / --restore-batch は通常のworkspace writerを停止した状態でのみ実行できます。"
             "確認済みなら --service-stopped を付けて再実行してください。",
             file=sys.stderr,
         )
         return 2
     root = resolve_workspaces_root(workspace_root)
+    if restore_batch:
+        restored = restore_workspace_gc(restore_batch, workspace_root=root)
+        print(
+            json.dumps(
+                {"mode": "restore", "result": restored},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     # Do not call DatabaseManager.get_session(): that path initializes Alembic
     # migrations as a side effect. This maintenance command only needs a direct
     # read-only transaction against an already-running schema.
@@ -71,7 +86,7 @@ async def run(
         if apply:
             # The advisory lock serializes maintenance jobs, but normal API
             # writers do not take it. Re-read DB ownership immediately before
-            # deleting so a just-committed upload/project/user is not removed
+            # moving so a just-committed upload/project/user is not moved
             # from a stale first snapshot. Operators should still run --apply
             # while the service is stopped (see docs/workspace_storage_cleanup.md).
             fresh_report = await _load_report(session, root)
@@ -87,7 +102,7 @@ async def run(
                 return 2
             report = fresh_report
             payload["report"] = report.to_dict()
-            payload["removed"] = apply_workspace_gc(report)
+            payload["quarantined"] = apply_workspace_gc(report)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     finally:
@@ -104,11 +119,20 @@ async def _load_report(session, root: Path) -> WorkspaceGcReport:
     )
     project_ids = list((await session.execute(select(Project.id))).scalars().all())
     user_ids = list((await session.execute(select(User.id))).scalars().all())
+    references = await load_workspace_reference_inventory(
+        session,
+        workspace_root=root,
+        repository_root=ROOT_DIR,
+        qa_manifest_path=os.environ.get("AOITALK_EMPLOYEE_QA_MANIFEST") or None,
+    )
     return audit_workspace(
         workspace_root=root,
-        attachment_references=attachment_references,
-        project_ids=project_ids,
-        user_ids=user_ids,
+        attachment_references=(
+            *attachment_references,
+            *references.workspace_references,
+        ),
+        project_ids=(*project_ids, *references.project_ids),
+        user_ids=(*user_ids, *references.user_ids),
     )
 
 
@@ -128,10 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="ワークスペースの未参照ファイル・孤児ディレクトリを監査します（既定はdry-run）。"
     )
-    parser.add_argument(
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument(
         "--apply",
         action="store_true",
-        help="監査結果のDocs添付・Project root・User root・Docs内の空ディレクトリを削除する",
+        help="監査したDocs添付・orphan Project/User rootをRecycle Binへ移動する",
+    )
+    operation.add_argument(
+        "--restore-batch",
+        help="UUIDで指定したRecycle Bin batchを元のpathへ復元する（上書きしない）",
     )
     parser.add_argument(
         "--workspace-root",
@@ -152,6 +181,7 @@ def main() -> int:
             apply=args.apply,
             workspace_root=args.workspace_root,
             service_stopped=args.service_stopped,
+            restore_batch=args.restore_batch,
         )
     )
 

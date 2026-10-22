@@ -1,3 +1,5 @@
+import type { RevenueCostProjection } from "@/lib/media-operations-api";
+
 export type MediaCalendarReference = {
   type: string;
   id: string;
@@ -65,11 +67,15 @@ export type MediaResultsResponse = {
   };
   revenue: {
     event_count: number;
-    by_currency: Array<{
-      currency: string;
+    by_currency: Array<RevenueCostProjection & {
+      currency: string | null;
       event_count: number;
-      gross: number;
-      net: number;
+      gross: number | null;
+      net: number | null;
+      event_type?: string;
+      source?: string;
+      settlement_status?: string;
+      revenue_authority?: string;
     }>;
   };
   experiments: {

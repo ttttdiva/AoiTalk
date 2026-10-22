@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -10,8 +11,15 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from scripts.verification.ai_employee_qa import (
-    check_identity, child_environment, load_manifest, write_json,
+    QA_SESSION_COOKIE_NAME, REPO, check_identity, child_environment, load_manifest,
+    qa_artifact_path, qa_run_path, write_json,
 )
+
+
+def _temporary_directory():
+    parent = REPO / ".local" / "qa-script-tests"
+    parent.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=parent)
 
 
 class LauncherBoundaryTests(unittest.TestCase):
@@ -24,6 +32,19 @@ class LauncherBoundaryTests(unittest.TestCase):
         for value in ("aoitalk_memory", "public", "aoitalk_test_employee_", self.name + ";DROP", self.name.upper(), "../" + self.name):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 check_identity(value)
+
+    def test_run_output_path_is_confined_to_repository_scratch(self):
+        with _temporary_directory() as temp:
+            repository = Path(temp) / "checkout"
+            repository.mkdir()
+            path = qa_run_path(self.name, repository=repository)
+
+            self.assertEqual(
+                path,
+                repository.resolve() / ".local" / "qa-runs" / self.name,
+            )
+            with self.assertRaises(ValueError):
+                qa_run_path("../" + self.name, repository=repository)
 
     def test_child_environment_cannot_inherit_live_db_or_provider_secrets(self):
         manifest = {"output_dir": "task-output", "database": self.name, "pg_host": "127.0.0.1", "pg_port": 55432,
@@ -39,11 +60,12 @@ class LauncherBoundaryTests(unittest.TestCase):
             self.assertNotIn(key, env)
         self.assertEqual(env["PYTHON_API_URL"], "http://127.0.0.1:3100")
         self.assertEqual(env["NEXT_PUBLIC_AOITALK_WS_PORT"], "3100")
+        self.assertEqual(env["AOITALK_SESSION_COOKIE_NAME"], QA_SESSION_COOKIE_NAME)
         self.assertNotIn("live-provider", json.dumps(env))
 
     def test_manifest_rejects_unowned_paths_and_existing_app_ports(self):
         from scripts.verification.ai_employee_qa import REPO
-        with tempfile.TemporaryDirectory() as temp:
+        with _temporary_directory() as temp:
             root = Path(temp) / self.name
             root.mkdir()
             manifest = {"harness": "ai_employee_qa", "database": self.name, "run_id": str(self.run_id), "schema": "public",
@@ -81,7 +103,7 @@ for address in [('203.0.113.1',443),('127.0.0.1',3000),('127.0.0.1',3002),('127.
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_artifact_replace_leaves_valid_json_without_temporary_files(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with _temporary_directory() as temp:
             path = Path(temp) / "manifest.json"
             write_json(path, {"stage": "prepared"})
             write_json(path, {"stage": "ready"})
@@ -102,7 +124,7 @@ for address in [('203.0.113.1',443),('127.0.0.1',3000),('127.0.0.1',3002),('127.
 
     def test_private_cleanup_requires_stopped_cluster_and_keeps_evidence(self):
         from scripts.verification.ai_employee_qa import REPO, cleanup
-        with tempfile.TemporaryDirectory() as temp:
+        with _temporary_directory() as temp:
             root = Path(temp) / self.name
             (root / "postgres").mkdir(parents=True)
             manifest = {"harness": "ai_employee_qa", "database": self.name, "run_id": str(self.run_id), "schema": "public",
@@ -122,6 +144,131 @@ for address in [('203.0.113.1',443),('127.0.0.1',3000),('127.0.0.1',3002),('127.
             self.assertTrue((root / "provider-evidence.json").exists())
             self.assertTrue((Path(temp) / ".env.qa-login").exists())
             self.assertEqual(load_manifest(root / "manifest.json")["cleanup"]["private_files_removed"], [".runtime-private.json"])
+
+    def test_cleanup_archives_evidence_and_removes_new_qa_scratch(self):
+        from scripts.verification.ai_employee_qa import cleanup
+
+        root = qa_run_path(self.name)
+        artifact_root = qa_artifact_path(self.name)
+        root.mkdir(parents=True)
+        (root / "screenshots").mkdir()
+        (root / "screenshots" / "review.png").write_bytes(b"fixture")
+        manifest = {
+            "harness": "ai_employee_qa",
+            "database": self.name,
+            "run_id": str(self.run_id),
+            "schema": "public",
+            "repo": str(REPO),
+            "output_dir": str(root),
+            "pg_host": "127.0.0.1",
+            "pg_port": 55432,
+            "backend_port": 3100,
+            "frontend_port": 3102,
+            "processes": {},
+            "dedicated_cluster": False,
+            "status": "database_dropped",
+        }
+        write_json(root / "manifest.json", manifest)
+        write_json(root / "provider-evidence.json", {"submission_count": 1})
+        write_json(root / ".runtime-private.json", {"fixture": "private"})
+        (root / "browser.log").write_text("safe test log\n", encoding="utf-8")
+
+        try:
+            archived_manifest = cleanup(manifest)
+
+            self.assertEqual(archived_manifest, artifact_root / "manifest.json")
+            self.assertFalse(root.exists())
+            archived = load_manifest(archived_manifest)
+            self.assertEqual(archived["output_dir"], str(artifact_root))
+            self.assertTrue((artifact_root / "provider-evidence.json").is_file())
+            self.assertTrue((artifact_root / "browser.log").is_file())
+            self.assertTrue((artifact_root / "screenshots" / "review.png").is_file())
+            self.assertFalse((artifact_root / ".runtime-private.json").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(artifact_root, ignore_errors=True)
+
+    def test_cleanup_resumes_from_partial_owned_archive(self):
+        from scripts.verification.ai_employee_qa import cleanup
+
+        root = qa_run_path(self.name)
+        artifact_root = qa_artifact_path(self.name)
+        root.mkdir(parents=True)
+        write_json(root / "manifest.json", {
+            "harness": "ai_employee_qa",
+            "database": self.name,
+            "run_id": str(self.run_id),
+            "schema": "public",
+            "repo": str(REPO),
+            "output_dir": str(root),
+            "pg_host": "127.0.0.1",
+            "pg_port": 55432,
+            "backend_port": 3100,
+            "frontend_port": 3102,
+            "processes": {},
+            "dedicated_cluster": False,
+            "status": "database_dropped",
+        })
+        (root / "provider-evidence.json").write_text(
+            '{"submission_count":1}\n', encoding="utf-8"
+        )
+        artifact_root.mkdir(parents=True)
+        write_json(artifact_root / ".archive-owner.json", {
+            "run_id": str(self.run_id),
+            "database": self.name,
+        })
+        (artifact_root / "partial-copy.bin").write_bytes(b"partial")
+        manifest = load_manifest(root / "manifest.json")
+
+        try:
+            archived_manifest = cleanup(manifest)
+
+            self.assertEqual(archived_manifest, artifact_root / "manifest.json")
+            self.assertFalse(root.exists())
+            self.assertTrue((artifact_root / "provider-evidence.json").is_file())
+            self.assertFalse((artifact_root / "partial-copy.bin").exists())
+            self.assertFalse((artifact_root / ".archive-owner.json").exists())
+            self.assertEqual(load_manifest(archived_manifest)["run_id"], str(self.run_id))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(artifact_root, ignore_errors=True)
+
+    def test_cleanup_does_not_overwrite_another_runs_archive(self):
+        from scripts.verification.ai_employee_qa import cleanup
+
+        root = qa_run_path(self.name)
+        artifact_root = qa_artifact_path(self.name)
+        root.mkdir(parents=True)
+        artifact_root.mkdir(parents=True)
+        (artifact_root / "foreign.txt").write_text("keep\n", encoding="utf-8")
+        manifest = {
+            "harness": "ai_employee_qa",
+            "database": self.name,
+            "run_id": str(self.run_id),
+            "schema": "public",
+            "repo": str(REPO),
+            "output_dir": str(root),
+            "pg_host": "127.0.0.1",
+            "pg_port": 55432,
+            "backend_port": 3100,
+            "frontend_port": 3102,
+            "processes": {},
+            "dedicated_cluster": False,
+            "status": "database_dropped",
+        }
+        write_json(root / "manifest.json", manifest)
+
+        try:
+            with self.assertRaises(RuntimeError):
+                cleanup(manifest)
+            self.assertTrue(root.exists())
+            self.assertEqual(
+                (artifact_root / "foreign.txt").read_text(encoding="utf-8"),
+                "keep\n",
+            )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(artifact_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

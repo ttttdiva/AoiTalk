@@ -2,15 +2,12 @@
  * ファイラーのタブ / パス種別ごとの操作可否フラグ（純粋ロジック）。
  *
  * これまで削除・リネーム・移動の可否判定が page.tsx / file-context-menu.tsx に
- * それぞれ書かれており、HF / Hydrus では実際には失敗する
- * メニューが表示されていた。判定はここに一元化する。
+ * それぞれ書かれていた。判定はここに一元化する。
  */
 
 export type FilerTargetKind =
   | "workspace"
   | "user"
-  | "hf"
-  | "hydrus"
   | "remote"
   | "absolute";
 
@@ -34,8 +31,6 @@ export interface FilerCapabilities {
 export interface FilerCapabilityOptions {
   /** 管理者かどうか。 */
   isAdmin?: boolean;
-  /** 現在のHFリポジトリが認証済みユーザー自身のアカウントか。 */
-  hfOwnAccount?: boolean;
 }
 
 export function isRemoteFilerPath(path: string): boolean {
@@ -59,26 +54,6 @@ const CAPABILITIES: Record<FilerTargetKind, FilerCapabilities> = {
     canMove: true,
     canCopy: true,
     canCreate: true,
-    deleteNeedsConfirm: false,
-    deleteUndoable: true,
-  },
-  // HF: 削除のみ可。HF 側にゴミ箱が無いため確認必須・Undo 不可。
-  hf: {
-    canDelete: true,
-    canRename: false,
-    canMove: false,
-    canCopy: false,
-    canCreate: false,
-    deleteNeedsConfirm: true,
-    deleteUndoable: false,
-  },
-  // Hydrus: 削除のみ可。Hydrus 側の trash に入るため Undo 可・確認不要。
-  hydrus: {
-    canDelete: true,
-    canRename: false,
-    canMove: false,
-    canCopy: false,
-    canCreate: false,
     deleteNeedsConfirm: false,
     deleteUndoable: true,
   },
@@ -109,13 +84,9 @@ export function resolveFilerTargetKind(params: {
   filerTab?: string | null;
   isAbsoluteFilerPath?: boolean;
   isRemoteWorkspace?: boolean;
-  isHfMode?: boolean;
-  isHydrusMode?: boolean;
 }): FilerTargetKind {
   if (params.isRemoteWorkspace) return "remote";
   if (params.isAbsoluteFilerPath) return "absolute";
-  if (params.isHfMode || params.filerTab === "hf") return "hf";
-  if (params.isHydrusMode || params.filerTab === "hydrus") return "hydrus";
   if (params.filerTab === "user") return "user";
   return "workspace";
 }
@@ -125,10 +96,6 @@ export function filerCapabilities(
   options?: FilerCapabilityOptions,
 ): FilerCapabilities {
   const base = CAPABILITIES[kind];
-  // HFの書き込みAPIは管理者または現在のユーザー自身のアカウントだけ。
-  if (kind === "hf" && !options?.isAdmin && !options?.hfOwnAccount) {
-    return { ...base, canDelete: false };
-  }
   // 絶対パスは管理者だけがバックエンドの境界チェックを通過できる。
   if (kind === "absolute" && !options?.isAdmin) {
     return {
@@ -149,12 +116,9 @@ export function resolveFilerCapabilities(
     filerTab?: string | null;
     isAbsoluteFilerPath?: boolean;
     isRemoteWorkspace?: boolean;
-    isHfMode?: boolean;
-    isHydrusMode?: boolean;
   } & FilerCapabilityOptions,
 ): FilerCapabilities {
   return filerCapabilities(resolveFilerTargetKind(params), {
     isAdmin: params.isAdmin,
-    hfOwnAccount: params.hfOwnAccount,
   });
 }

@@ -23,12 +23,18 @@ interface NetworkStoreState {
   online: boolean;
   serverReachable: boolean;
   serverCheckedAt: number | null;
+  /** Gateway/runtime startup is separate from API auth and outbox status. */
+  safeLifecycle: SafeLifecycle;
+  safeLifecycleError: string | null;
   lastChange: number;
   _unsubscribe: (() => void) | null;
   start: () => void;
   stop: () => void;
   setServerReachable: (ok: boolean) => void;
+  setSafeLifecycle: (state: SafeLifecycle, errorCode?: string | null) => void;
 }
+
+export type SafeLifecycle = "idle" | "starting" | "ready" | "failed";
 
 /**
  * NetInfo's `isInternetReachable` is deliberately not used for AoiTalk
@@ -70,6 +76,8 @@ export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
   online: true,
   serverReachable: false,
   serverCheckedAt: null,
+  safeLifecycle: "idle",
+  safeLifecycleError: null,
   lastChange: Date.now(),
   _unsubscribe: null,
 
@@ -129,6 +137,15 @@ export const useNetworkStore = create<NetworkStoreState>((set, get) => ({
       if (ok && state.serverReachable) return state;
       const now = Date.now();
       return { serverReachable: ok, serverCheckedAt: now, lastChange: now };
+    }),
+
+  setSafeLifecycle: (safeLifecycle, safeLifecycleError = null) =>
+    set((state) => {
+      if (
+        state.safeLifecycle === safeLifecycle &&
+        state.safeLifecycleError === safeLifecycleError
+      ) return state;
+      return { safeLifecycle, safeLifecycleError, lastChange: Date.now() };
     }),
 }));
 

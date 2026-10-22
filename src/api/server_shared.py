@@ -351,11 +351,15 @@ except ImportError:
 
 # Import conversation routes
 try:
-    from .conversation_routes import create_conversation_router
+    from .conversation_routes import (
+        create_conversation_agent_router,
+        create_conversation_router,
+    )
 
     CONVERSATION_ROUTES_AVAILABLE = True
 except ImportError:
     CONVERSATION_ROUTES_AVAILABLE = False
+    create_conversation_agent_router = None
     create_conversation_router = None
 
 # Import group chat routes
@@ -498,27 +502,6 @@ except ImportError:
     APPS_ROUTES_AVAILABLE = False
     create_apps_router = None
 
-# Hydrus compatibility is a desktop/local integration and is deliberately not
-# part of the Enterprise HTTP surface.  Keep this boundary at import time so a
-# source-tree Enterprise build cannot register the legacy unauthenticated
-# compatibility routes before the publisher's file exclusion runs.
-if Features.is_enterprise():
-    HYDRUS_ROUTES_AVAILABLE = False
-    create_hydrus_compat_router = None
-    create_hydrus_router = None
-else:
-    try:
-        from ..tools.hydrus_browser import (
-            create_hydrus_compat_router,
-            create_hydrus_router,
-        )
-
-        HYDRUS_ROUTES_AVAILABLE = True
-    except ImportError:
-        HYDRUS_ROUTES_AVAILABLE = False
-        create_hydrus_compat_router = None
-        create_hydrus_router = None
-
 # Import ECC feature routes
 try:
     from .ecc_routes import create_ecc_router
@@ -527,72 +510,6 @@ try:
 except ImportError:
     ECC_ROUTES_AVAILABLE = False
     create_ecc_router = None
-
-# Import Scenario Studio canonical routes and its read-only legacy projection.
-# Enterprise keeps the shared sync/model modules, but does not import or
-# register the route modules at all.  This makes the product boundary
-# fail-closed even if an optional route dependency is broken at import time.
-if Features.is_enterprise():
-    STORY_ROUTES_AVAILABLE = False
-    create_story_router = None
-    STORY_ASSIST_ROUTES_AVAILABLE = False
-    create_story_assist_router = None
-    STORY_LEGACY_COMPAT_AVAILABLE = False
-    create_story_legacy_compat_router = None
-    TRPG_REFERENCE_ROUTES_AVAILABLE = False
-    create_trpg_reference_router = None
-    TRPG_PLAY_ROUTES_AVAILABLE = False
-    create_trpg_play_router = None
-    TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = False
-    register_trpg_play_websocket_routes = None
-else:
-    try:
-        from .story_routes import create_story_router
-
-        STORY_ROUTES_AVAILABLE = True
-    except ImportError:
-        STORY_ROUTES_AVAILABLE = False
-        create_story_router = None
-
-    try:
-        from .story_assist_routes import create_story_assist_router
-
-        STORY_ASSIST_ROUTES_AVAILABLE = True
-    except ImportError:
-        STORY_ASSIST_ROUTES_AVAILABLE = False
-        create_story_assist_router = None
-
-    try:
-        from .story_legacy_compat import create_story_legacy_compat_router
-
-        STORY_LEGACY_COMPAT_AVAILABLE = True
-    except ImportError:
-        STORY_LEGACY_COMPAT_AVAILABLE = False
-        create_story_legacy_compat_router = None
-
-    try:
-        from .trpg_reference_routes import create_trpg_reference_router
-
-        TRPG_REFERENCE_ROUTES_AVAILABLE = True
-    except ImportError:
-        TRPG_REFERENCE_ROUTES_AVAILABLE = False
-        create_trpg_reference_router = None
-
-    try:
-        from .trpg_play_routes import create_trpg_play_router
-
-        TRPG_PLAY_ROUTES_AVAILABLE = True
-    except ImportError:
-        TRPG_PLAY_ROUTES_AVAILABLE = False
-        create_trpg_play_router = None
-
-    try:
-        from .routes.trpg_play_websocket_routes import register_trpg_play_websocket_routes
-
-        TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = True
-    except ImportError:
-        TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE = False
-        register_trpg_play_websocket_routes = None
 
 # ComfyUI can target arbitrary local HTTP endpoints and is disabled by the
 # Enterprise product boundary.  Do not register its management API in a

@@ -8,15 +8,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import shutil
 import stat
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .app_storage import get_workspaces_root
 
@@ -24,6 +24,8 @@ from .app_storage import get_workspaces_root
 _NAMESPACE_ID = re.compile(r"^(?P<kind>project|user)_(?P<id>[0-9a-fA-F-]{36})$")
 _QUARANTINE_MARKER = ".deleting-"
 _QUARANTINE_GRACE_SECONDS = 60 * 60
+_RECYCLE_BIN = "_recycle_bin"
+_GC_BATCHES = "workspace_orphans"
 
 
 @dataclass(frozen=True)
@@ -71,11 +73,16 @@ def remove_user_workspace(
     *,
     workspace_root: str | os.PathLike[str] | None = None,
 ) -> bool:
-    """Remove one user's personal storage after the DB row was committed."""
+    """Move one user's personal storage to the recycle bin after the DB row was committed."""
     target = get_user_workspace_path(user_id, workspace_root=workspace_root)
     if not target.exists() and not target.is_symlink():
         return False
-    _remove_tree(target)
+    apply_workspace_gc(
+        WorkspaceGcReport(
+            workspace_root=get_workspaces_root(workspace_root),
+            user_orphans=(target,),
+        )
+    )
     return True
 
 
@@ -136,59 +143,253 @@ def audit_workspace(
     )
 
 
-def apply_workspace_gc(report: WorkspaceGcReport) -> dict[str, int]:
-    """Apply a previously generated report.
+def apply_workspace_gc(report: WorkspaceGcReport) -> dict[str, int | str]:
+    """Move reported orphan files/directories into a restorable recycle batch.
 
-    The report is validated again so a stale or hand-built report cannot delete a
-    namespace root or a path outside the configured workspace.
+    Empty directories are retained. The report is revalidated so a stale or
+    hand-built report cannot move namespace roots, links, or paths outside the
+    configured workspace.
     """
     root = report.workspace_root.resolve()
     docs_root = (root / "_docs" / "attachments").resolve()
     project_root = (root / "_projects").resolve()
     user_root = (root / "_users").resolve()
-
-    removed_files = 0
-    removed_dirs = 0
+    candidates: list[tuple[Path, str]] = []
     for path in report.docs_orphans:
-        target = _validate_under(path, docs_root, direct_child=False)
-        if target.exists() or target.is_symlink():
-            _remove_tree(target)
-            removed_files += 1
+        source = _validate_gc_source(path, docs_root, direct_child=False)
+        if not source.is_file():
+            raise ValueError("Docs orphan is no longer a regular file")
+        candidates.append((source, "file"))
     for path, namespace_root in (
         *((path, project_root) for path in report.project_orphans),
         *((path, user_root) for path in report.user_orphans),
     ):
-        target = _validate_under(path, namespace_root, direct_child=True)
-        if target.exists() or target.is_symlink():
-            _remove_tree(target)
-            removed_dirs += 1
+        source = _validate_gc_source(path, namespace_root, direct_child=True)
+        if not source.is_dir():
+            raise ValueError("orphan namespace is no longer a directory")
+        candidates.append((source, "directory"))
 
-    # Removing an orphan file can make its parent directory empty even when it
-    # was not empty at audit time. Re-scan repeatedly so multi-level empty trees
-    # disappear in the same apply.
-    pending_empty_dirs = set(report.empty_dirs)
+    if not candidates:
+        return {
+            "quarantined_files": 0,
+            "quarantined_dirs": 0,
+            "batch_id": "",
+            "quarantine_root": "",
+        }
+
+    batch_id = str(uuid4())
+    recycle_parent = root / _RECYCLE_BIN
+    batches_root = recycle_parent / _GC_BATCHES
+    for directory in (recycle_parent, batches_root):
+        if _is_link(directory):
+            raise ValueError("workspace recycle bin cannot contain links")
+        directory.mkdir(exist_ok=True)
+        if _is_link(directory):
+            raise ValueError("workspace recycle bin cannot contain links")
+    batch_root = batches_root / batch_id
+    batch_root.mkdir(exist_ok=False)
+    items = [
+        {
+            "source": source.relative_to(root).as_posix(),
+            "kind": kind,
+            "status": "pending",
+        }
+        for source, kind in candidates
+    ]
+    manifest = {
+        "schema": 1,
+        "batch_id": batch_id,
+        "status": "quarantining",
+        "items": items,
+    }
+    _write_gc_manifest(batch_root / "manifest.json", manifest)
+
+    moved_files = 0
+    moved_dirs = 0
+    for item in items:
+        relative = _validated_gc_relative(item["source"])
+        source = root.joinpath(*relative.parts)
+        namespace_root = (
+            root / "_docs" / "attachments"
+            if item["kind"] == "file"
+            else root / relative.parts[0]
+        )
+        source = _validate_gc_source(
+            source,
+            namespace_root,
+            direct_child=item["kind"] == "directory",
+        )
+        destination = batch_root / "payload" / Path(*relative.parts)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("recycle-bin destination already exists")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if _has_link_component(destination.parent, batch_root):
+            raise ValueError("recycle-bin destination contains a link")
+        item["status"] = "moving"
+        _write_gc_manifest(batch_root / "manifest.json", manifest)
+        source.replace(destination)
+        item["status"] = "moved"
+        _write_gc_manifest(batch_root / "manifest.json", manifest)
+        if item["kind"] == "file":
+            moved_files += 1
+        else:
+            moved_dirs += 1
+
+    manifest["status"] = "quarantined"
+    _write_gc_manifest(batch_root / "manifest.json", manifest)
+    return {
+        "quarantined_files": moved_files,
+        "quarantined_dirs": moved_dirs,
+        "batch_id": batch_id,
+        "quarantine_root": str(batch_root),
+    }
+
+
+def restore_workspace_gc(
+    batch_id: str,
+    *,
+    workspace_root: str | os.PathLike[str],
+) -> dict[str, int | str]:
+    """Restore a quarantine batch without overwriting newer workspace files."""
+    try:
+        parsed_batch_id = UUID(str(batch_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("batch_id must be a UUID") from exc
+    if str(parsed_batch_id) != str(batch_id):
+        raise ValueError("batch_id must be a canonical UUID")
+
+    root = Path(workspace_root).expanduser().resolve()
+    recycle_parent = root / _RECYCLE_BIN
+    batches_root = recycle_parent / _GC_BATCHES
+    batch_root = batches_root / str(parsed_batch_id)
+    if _has_link_component(batch_root, root):
+        raise ValueError("recycle batch path contains a link")
+    manifest_path = batch_root / "manifest.json"
+    if _is_link(manifest_path) or not manifest_path.is_file():
+        raise FileNotFoundError("recycle batch manifest was not found")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != 1
+        or manifest.get("batch_id") != str(parsed_batch_id)
+        or manifest.get("status") not in {"quarantining", "partial", "quarantined"}
+        or not isinstance(manifest.get("items"), list)
+    ):
+        raise ValueError("recycle batch manifest is invalid")
+
+    restore_items: list[tuple[dict[str, str], Path, Path]] = []
+    for item in manifest["items"]:
+        if not isinstance(item, dict) or item.get("status") not in {"moved", "moving"}:
+            continue
+        kind = item.get("kind")
+        relative = _validated_gc_relative(item.get("source"))
+        original = _workspace_gc_path(root, relative.as_posix(), kind)
+        archive = batch_root / "payload" / Path(*relative.parts)
+        if _has_link_component(archive, batch_root):
+            raise ValueError("quarantined source cannot be a link")
+        if not archive.exists():
+            if item.get("status") == "moving" and original.exists():
+                item["status"] = "pending"
+                _write_gc_manifest(manifest_path, manifest)
+                continue
+            raise FileNotFoundError("quarantined source is missing")
+        if _is_link(archive):
+            raise ValueError("quarantined source cannot be a link")
+        if original.exists() or original.is_symlink():
+            raise FileExistsError(f"restore target already exists: {relative.as_posix()}")
+        if _has_link_component(original.parent, root):
+            raise ValueError("restore target path contains a link")
+        restore_items.append((item, archive, original))
+
+    restored_files = 0
+    restored_dirs = 0
+    for item, archive, original in restore_items:
+        original.parent.mkdir(parents=True, exist_ok=True)
+        if _has_link_component(original.parent, root):
+            raise ValueError("restore target path contains a link")
+        archive.replace(original)
+        item["status"] = "restored"
+        _write_gc_manifest(manifest_path, manifest)
+        if item["kind"] == "file":
+            restored_files += 1
+        else:
+            restored_dirs += 1
+
+    manifest["status"] = "restored"
+    _write_gc_manifest(manifest_path, manifest)
+    return {
+        "batch_id": str(parsed_batch_id),
+        "restored_files": restored_files,
+        "restored_dirs": restored_dirs,
+    }
+
+
+def _validate_gc_source(path: Path, namespace_root: Path, *, direct_child: bool) -> Path:
+    lexical = Path(path)
+    target = _validate_under(lexical, namespace_root, direct_child=direct_child)
+    if _has_link_component(lexical, namespace_root):
+        raise ValueError("cleanup source path contains a link")
+    if target != lexical.resolve():
+        raise ValueError("cleanup source path changed during audit")
+    return lexical
+
+
+def _validated_gc_relative(value: object) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\\" in value or ":" in value:
+        raise ValueError("workspace recycle path is invalid")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("workspace recycle path is invalid")
+    return relative
+
+
+def _workspace_gc_path(root: Path, value: object, kind: object) -> Path:
+    relative = _validated_gc_relative(value)
+    parts = relative.parts
+    if kind == "file":
+        if len(parts) < 3 or parts[:2] != ("_docs", "attachments"):
+            raise ValueError("only Docs attachment files can be restored")
+        namespace_root = root / "_docs" / "attachments"
+    elif kind == "directory":
+        if len(parts) != 2 or parts[0] not in {"_projects", "_users"}:
+            raise ValueError("only direct Project/User roots can be restored")
+        expected_kind = "project" if parts[0] == "_projects" else "user"
+        if not _NAMESPACE_ID.fullmatch(parts[1]) or not parts[1].startswith(expected_kind + "_"):
+            raise ValueError("workspace owner namespace is invalid")
+        namespace_root = root / parts[0]
+    else:
+        raise ValueError("workspace recycle item kind is invalid")
+    target = root.joinpath(*parts)
+    _validate_under(target, namespace_root, direct_child=kind == "directory")
+    return target
+
+
+def _has_link_component(path: Path, root: Path) -> bool:
+    candidate = Path(path)
+    boundary = Path(root)
+    try:
+        candidate.relative_to(boundary)
+    except ValueError as exc:
+        raise ValueError("workspace path escaped its boundary") from exc
+    current = candidate
     while True:
-        pending_empty_dirs.update(_find_empty_dirs(docs_root))
-        if not pending_empty_dirs:
-            break
-        removed_any = False
-        for path in sorted(pending_empty_dirs, key=lambda item: len(item.parts), reverse=True):
-            target = _validate_empty_dir(path, (docs_root,))
-            if target.exists() and target.is_dir() and not _is_link(target):
-                try:
-                    target.rmdir()
-                    removed_dirs += 1
-                    removed_any = True
-                except OSError:
-                    # A file may have appeared after the audit. The next audit
-                    # will report it; cleanup must not turn that race into a
-                    # failed job.
-                    pass
-            pending_empty_dirs.discard(path)
-        if not removed_any:
-            break
+        if _is_link(current):
+            return True
+        if current == boundary:
+            return False
+        current = current.parent
 
-    return {"removed_files": removed_files, "removed_dirs": removed_dirs}
+
+def _write_gc_manifest(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _parse_uuid(value: str | UUID, label: str) -> UUID:
@@ -369,27 +570,3 @@ def _validate_under(path: Path, root: Path, *, direct_child: bool) -> Path:
     if not relative.parts or (direct_child and len(relative.parts) != 1):
         raise ValueError("cleanup target is not a removable child")
     return target
-
-
-def _validate_empty_dir(path: Path, roots: tuple[Path, ...]) -> Path:
-    target = _resolved(path)
-    for root in roots:
-        try:
-            relative = target.relative_to(root)
-        except ValueError:
-            continue
-        if relative.parts:
-            return target
-    raise ValueError("empty directory escaped cleanup namespaces")
-
-
-def _remove_tree(target: Path) -> None:
-    if target.is_symlink() or target.is_file():
-        target.unlink()
-        return
-    shutil.rmtree(target, onerror=_remove_readonly)
-
-
-def _remove_readonly(function, path, _exc_info) -> None:
-    os.chmod(path, stat.S_IWRITE)
-    function(path)

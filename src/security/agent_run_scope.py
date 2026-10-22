@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 PathLike = str | os.PathLike[str]
 AccessKind = Literal["read", "write", "delete", "mutation"]
+CommandBackendKind = Literal["wsl_bwrap", "native_windows"]
 
 
 class RunScopeError(ValueError):
@@ -235,6 +236,7 @@ class AgentRunScope:
     baseline_revision: str | None = None
     baseline_git_state: Mapping[str, Any] = field(default_factory=dict)
     workspace_access_level: Literal["none", "read", "write"] = "write"
+    backend_kind: CommandBackendKind = "wsl_bwrap"
     read_roots: Sequence[PathLike] | PathLike | None = None
     write_roots: Sequence[PathLike] | PathLike | None = None
     delete_roots: Sequence[PathLike] | PathLike | None = None
@@ -300,6 +302,10 @@ class AgentRunScope:
             raise RunScopeConfigurationError(
                 f"unsupported workspace_access_level: {self.workspace_access_level!r}"
             )
+        if self.backend_kind not in {"wsl_bwrap", "native_windows"}:
+            raise RunScopeConfigurationError(
+                f"unsupported command backend kind: {self.backend_kind!r}"
+            )
 
         object.__setattr__(self, "target_root", root)
         object.__setattr__(self, "repository_identity", self.repository_identity or _default_identity(root))
@@ -309,6 +315,7 @@ class AgentRunScope:
         object.__setattr__(self, "delete_roots", delete_roots)
         object.__setattr__(self, "command_roots", command_roots)
         object.__setattr__(self, "scratch_roots", scratch)
+        object.__setattr__(self, "backend_kind", str(self.backend_kind))
 
     @property
     def canonical_root(self) -> Path:
@@ -360,6 +367,14 @@ class AgentRunScope:
     def scratch_scope(self) -> tuple[Path, ...]:
         return self.scratch_roots
 
+    @property
+    def file_scoped(self) -> bool:
+        return self.backend_kind == "wsl_bwrap"
+
+    @property
+    def filesystem_isolation(self) -> bool:
+        return self.file_scoped
+
     @classmethod
     def for_repository(
         cls,
@@ -375,6 +390,7 @@ class AgentRunScope:
         delete_roots: Sequence[PathLike] | PathLike | None = None,
         command_roots: Sequence[PathLike] | PathLike | None = None,
         scratch_roots: Sequence[PathLike] | PathLike = (),
+        backend_kind: CommandBackendKind = "wsl_bwrap",
     ) -> "AgentRunScope":
         """Build the safe default scope for a selected repository."""
 
@@ -389,6 +405,7 @@ class AgentRunScope:
             "delete_roots": delete_roots,
             "command_roots": command_roots,
             "scratch_roots": scratch_roots,
+            "backend_kind": backend_kind,
         }
         if run_id is not None:
             kwargs["run_id"] = run_id
@@ -602,6 +619,8 @@ class AgentRunScope:
             "baseline_revision": self.baseline_revision,
             "baseline_git_state": dict(self.baseline_git_state),
             "workspace_access_level": self.workspace_access_level,
+            "backend_kind": self.backend_kind,
+            "filesystem_isolation": self.filesystem_isolation,
             "read_roots": [str(path) for path in self.read_roots],
             "write_roots": [str(path) for path in self.write_roots],
             "delete_roots": [str(path) for path in self.delete_roots],
@@ -668,6 +687,7 @@ RunScope = AgentRunScope
 
 __all__ = [
     "AccessKind",
+    "CommandBackendKind",
     "AgentRunScope",
     "bind_run_scope",
     "get_current_run_scope",

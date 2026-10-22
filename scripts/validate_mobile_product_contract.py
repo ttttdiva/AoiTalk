@@ -300,6 +300,16 @@ def _physical_mobile_routes(repo_root: Path) -> set[str] | None:
         rel_parts = source.relative_to(app_root).parts
         if "__tests__" in rel_parts or source.stem == "_layout":
             continue
+        # +native-intent is declared as a deep-link system entry in the
+        # Product Contract. Other Expo Router special files are not screens.
+        # Keep unknown '+' files visible so a typo cannot disappear silently.
+        if (
+            (len(rel_parts) == 1 and source.stem == "+html")
+            or source.stem == "+not-found"
+            or source.stem.endswith("+api")
+            or source.stem.endswith("+middleware")
+        ):
+            continue
         result.add(source.relative_to(app_root).with_suffix("").as_posix())
     return result
 

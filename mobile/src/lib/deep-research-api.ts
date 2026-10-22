@@ -1,5 +1,6 @@
 import { fetchApi } from "./api-client";
 import { CHAT_TIMEOUT } from "../constants/config";
+import type { components } from "../types/api-types.gen";
 
 export type DeepResearchStatus =
   | "queued"
@@ -66,17 +67,22 @@ export type DeepResearchJob = {
   metadata: Record<string, unknown>;
 };
 
-export type StartDeepResearchRequest = {
-  query: string;
-  mode: "quick" | "detailed" | "report";
-  max_iterations: number;
-  questions_per_iteration: number;
-  max_results_per_query: number;
-  engines: string[];
-  include_local_knowledge: boolean;
-  /** Conversation scope is validated by the server before execution. */
-  session_id?: string | null;
-  project_id?: string | null;
+type StartDeepResearchPayload = components["schemas"]["StartDeepResearchPayload"];
+type OptionalizeDefaults<T, K extends keyof T> = Omit<T, K> &
+  Partial<Pick<T, K>>;
+
+/** Keep the generated FastAPI payload authoritative while making server
+ * defaults optional for native callers, including legacy clients. */
+export type StartDeepResearchRequest = OptionalizeDefaults<
+  StartDeepResearchPayload,
+  | "strategy"
+  | "mode"
+  | "max_iterations"
+  | "questions_per_iteration"
+  | "max_results_per_query"
+  | "include_local_knowledge"
+> & {
+  client_request_id: string;
 };
 
 export const deepResearchApi = {

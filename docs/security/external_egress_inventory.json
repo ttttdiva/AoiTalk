@@ -255,6 +255,15 @@
       "redirect_policy": "disabled"
     },
     {
+      "path": "src/tts/engines/gemini_tts_engine.py",
+      "symbol": "GeminiTTSEngine._execute_external",
+      "classification": "external",
+      "provider": "gemini",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
       "path": "src/services/live_voice_service.py",
       "symbol": "OpenAIRealtimeProvider",
       "classification": "external",
@@ -270,15 +279,6 @@
       "provider": "mage-vl",
       "boundary": "OutboundPrivacyGateway.execute",
       "retry_policy": "separate_transaction",
-      "redirect_policy": "disabled"
-    },
-    {
-      "path": "src/tools/import_tools.py",
-      "symbol": "_llm_extract",
-      "classification": "external",
-      "provider": "openai",
-      "boundary": "OutboundPrivacyGateway.execute",
-      "retry_policy": "disabled",
       "redirect_policy": "disabled"
     },
     {
@@ -352,31 +352,6 @@
       "boundary": "unresolved",
       "retry_policy": "disabled",
       "redirect_policy": "error"
-    },
-    {
-      "path": "frontend/src/app/api/huggingface/file/route.ts",
-      "symbol": "GET",
-      "classification": "external",
-      "provider": "huggingface",
-      "boundary": "unresolved",
-      "retry_policy": "disabled",
-      "redirect_policy": "manual_allowlist",
-      "redirect_max_hops": 5,
-      "redirect_exact_hosts": [
-        "huggingface.co",
-        "cdn-lfs.huggingface.co",
-        "cdn-lfs.hf.co",
-        "hf.co",
-        "cdn-lfs-us-1.hf.co",
-        "cdn-lfs-eu-1.hf.co",
-        "transfer.xethub-eu.hf.co"
-      ],
-      "redirect_single_label_families": [
-        "xethub.hf.co",
-        "aws.cdn.hf.co",
-        "gcp.cdn.hf.co"
-      ],
-      "authorization_policy": "bearer_only_on_exact_canonical_huggingface_co_until_origin_boundary_crossed"
     },
     {
       "path": "mobile/src/lib/mobile-llm.ts",
@@ -606,24 +581,6 @@
       "redirect_policy": "fixed_control"
     },
     {
-      "path": "src/tools/hydrus_browser/client.py",
-      "pattern": "httpx\\.AsyncClient",
-      "reason": "configured local Hydrus endpoint",
-      "classification": "local_control",
-      "boundary": "none_fixed_control",
-      "retry_policy": "disabled",
-      "redirect_policy": "fixed_control"
-    },
-    {
-      "path": "src/tools/hydrus_browser/routes.py",
-      "pattern": "httpx\\.AsyncClient",
-      "reason": "inbound compatibility proxy to local Hydrus",
-      "classification": "local_control",
-      "boundary": "none_fixed_control",
-      "retry_policy": "disabled",
-      "redirect_policy": "fixed_control"
-    },
-    {
       "path": "src/tts/engine_startup.py",
       "pattern": "requests\\.get",
       "reason": "local TTS readiness probe",
@@ -751,7 +708,6 @@
     }
   ],
   "unresolved_sinks": [
-    "frontend/src/app/api/docs/link-preview/route.ts:POST inbound user-URL retrieval; redirect is fail-closed and no user payload is sent",
-    "frontend/src/app/api/huggingface/file/route.ts:GET inbound HuggingFace retrieval; provider-scoped bounded manual redirects to reviewed HF Hub/storage/CDN hosts; bearer auth is canonical-huggingface.co-only and permanently dropped after crossing that origin"
+    "frontend/src/app/api/docs/link-preview/route.ts:POST inbound user-URL retrieval; redirect is fail-closed and no user payload is sent"
   ]
 }

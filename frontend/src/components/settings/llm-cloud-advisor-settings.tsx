@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import type {
   CloudAdvisorProviderOption,
   CloudAdvisorSettings,
@@ -67,7 +68,7 @@ function reviewPolicyLabel(
 
 /**
  * Cloud Advisor is intentionally a first-class settings surface rather than
- * another Agent Team route.  This component only edits non-secret routing
+ * another Execution Team route.  This component only edits non-secret routing
  * fields and exposes privacy diagnostics; it never displays payloads or
  * credentials returned by the backend.
  */
@@ -96,17 +97,16 @@ export function LlmCloudAdvisorSettings({
   return (
     <Card size="sm" data-testid="cloud-advisor-settings">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
+        <CardTitle className="inline-flex items-center gap-2 text-sm">
           <Cloud className="size-4" />
           Cloud Advisor
           <Badge variant={mode === "disabled" ? "secondary" : "default"}>
             {mode === "disabled" ? "無効" : mode === "manual" ? "手動" : "自動"}
           </Badge>
+          <HelpPopover label="Cloud Advisor">
+            Main Agent専用の読み取り専用相談先です。Execution Team v3の構成や通常のモデル経路は変更しません。
+          </HelpPopover>
         </CardTitle>
-        <p className="text-[11px] text-muted-foreground">
-          Main Agent専用の読み取り専用相談先です。Agent Team
-          v3の構成や通常のモデル経路は変更しません。
-        </p>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-3 md:grid-cols-2">
@@ -129,9 +129,13 @@ export function LlmCloudAdvisorSettings({
               <option value="automatic">自動（親Agentの判定時のみ）</option>
             </AppSelect>
           </label>
-          <label className="space-y-1 text-xs">
-            <Label>Provider</Label>
+          <div className="space-y-1 text-xs">
+            <div className="inline-flex items-center gap-1">
+              <Label htmlFor="cloud-advisor-provider">Provider</Label>
+              <HelpPopover label="Cloud Advisor Provider">利用可能な候補はbackendの設定schemaに従います。</HelpPopover>
+            </div>
             <AppSelect
+              id="cloud-advisor-provider"
               aria-label="Cloud Advisor provider"
               value={provider}
               disabled={saving || providerOptions.length === 0}
@@ -148,10 +152,7 @@ export function LlmCloudAdvisorSettings({
                 <option value={provider}>{provider}</option>
               )}
             </AppSelect>
-            <p className="text-[10px] text-muted-foreground">
-              利用可能な候補はbackendの設定schemaに従います。
-            </p>
-          </label>
+          </div>
           <label className="space-y-1 text-xs">
             <Label>モデル（空欄で既定）</Label>
             <Input
@@ -191,7 +192,7 @@ export function LlmCloudAdvisorSettings({
             <div className="text-xs font-medium">Web ChatGPT接続設定</div>
             <p className="text-[11px] text-muted-foreground">
               Cloud Advisorではテキスト相談だけを、既存の親専用ブラウザプロファイルから送信します。
-              ログイン確認とプロファイル変更は Agent Team の Director設定と共有されます。
+              ログイン確認とプロファイル変更は Execution Team の Director設定と共有されます。
             </p>
             <dl className="grid gap-2 text-[11px] sm:grid-cols-3">
               <div className="rounded border border-border/70 bg-background/60 p-2">

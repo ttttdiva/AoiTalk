@@ -59,6 +59,18 @@ class DocsIndexWorker:
             report = await index.reconcile_library(session, library_id)
             if report.get("status") != "synced":
                 return False
+            # Next.js attachment writes share this durable database queue.
+            # Publish attachment jobs only after the corresponding reconcile commits.
+            from ..memory.models import DocsLibrary, KnowledgeAttachment, KnowledgeNode
+            from .media_index_worker import queue_media_after_commit
+            library = await session.get(DocsLibrary, library_id)
+            attachments = (await session.execute(select(KnowledgeAttachment).join(
+                KnowledgeNode, KnowledgeAttachment.node_id == KnowledgeNode.id,
+            ).where(KnowledgeNode.docs_library_id == library_id))).scalars().all()
+            for attachment in attachments:
+                actor = attachment.created_by or (library.owner_user_id if library else None)
+                if actor:
+                    queue_media_after_commit(session, actor, "docs_attachment", attachment.id)
             # A writer may have advanced requested_revision while embedding.
             # Acknowledge only the revision observed before this job started.
             await session.execute(update(DocsIndexQueue).where(

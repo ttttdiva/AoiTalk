@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -14,10 +15,23 @@ from ..services.outbound_privacy_service import (
     OutboundPrivacyGateway,
     get_privacy_policy_context,
 )
+from ..services import generated_media_storage
 
 logger = logging.getLogger(__name__)
 
 _RECORDED_USAGE_RESPONSES: list[Any] = []
+_GENERATED_MEDIA_ROOT = Path("data/generated_media")
+
+
+async def _save_generated_image(image_bytes: bytes, mime_type: str) -> Path:
+    """Persist a standalone tool output through the canonical media root."""
+    extension = ".png" if "png" in str(mime_type or "").casefold() else ".jpg"
+    logical_path = f"generated_media/{uuid.uuid4().hex}{extension}"
+    root = generated_media_storage.get_media_root(_GENERATED_MEDIA_ROOT)
+    await generated_media_storage.write_media(
+        logical_path, image_bytes, _GENERATED_MEDIA_ROOT
+    )
+    return root.resolve(generated_media_storage.media_relative_path(logical_path))
 
 
 def persist_usage_sync(*args: Any, **kwargs: Any) -> bool:
@@ -247,25 +261,12 @@ async def generate_image(prompt: str) -> str:
             latency_ms=int((time.monotonic() - started) * 1000),
         )
             
-        # Save image
-        # Create temp directory if it doesn't exist
-        output_dir = Path("temp/generated_images")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        timestamp = int(time.time())
-        filename = f"gen_{timestamp}.jpg" # Defaulting to jpg, though mime_type might vary
-        
-        # Check mime type to be sure
+        # Keep the Discord-compatible absolute-path tag, while using the same
+        # configured physical root as DB-backed generated media.
         mime_type = image_part.inline_data.mime_type
-        if "png" in mime_type:
-            filename = f"gen_{timestamp}.png"
-            
-        output_path = output_dir / filename
-        
-        with open(output_path, "wb") as f:
-            f.write(image_part.inline_data.data)
-            
-        abs_path = output_path.resolve()
+        abs_path = await _save_generated_image(
+            image_part.inline_data.data, mime_type
+        )
         print(f"[ImageGeneration] Image saved to {abs_path}")
         
         # Return special tag for Discord bot to pick up

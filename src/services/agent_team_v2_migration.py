@@ -13,6 +13,7 @@ from typing import Any
 
 from . import agent_team_service as _runtime_facade  # noqa: F401
 from .agent_team_v3 import (
+    AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
     AGENT_TEAM_DEFAULT_LLM_PROFILES,
     AGENT_TEAM_DEFAULT_TEAMS,
     AGENT_TEAM_SUBAGENT_CATALOG,
@@ -24,6 +25,7 @@ from .agent_team_v3 import (
     agent_team_v3_subagents,
     agent_team_v3_teams,
     resolve_agent_team_v3_route,
+    seed_agent_team_execution_profile_presets,
 )
 
 # Legacy reserved IDs are migration policy, not canonical runtime security.
@@ -68,10 +70,6 @@ def _legacy_team(team_id: str, raw: Any, valid_subagents: set[str] | None = None
     contexts: list[str] = []
     if activation_value.get("development_status"):
         contexts.append("app_development")
-    if activation_value.get("story_modes"):
-        contexts.append("story")
-    if activation_value.get("trpg") or activation_value.get("trpg_modes"):
-        contexts.append("trpg")
     if contexts:
         payload["activation"] = {"mode": "contextual", "contexts": contexts}
     elif "mode" in activation_value:
@@ -94,14 +92,101 @@ _LEGACY_TO_SUBAGENT = {
     "explorer": "code_explorer",
     "implementer": "code_implementer",
     "reviewer": "code_reviewer",
-    "writing": "story_writer",
-    "story_writer": "story_writer",
-    "story_consistency_reviewer": "story_consistency_reviewer",
-    "character_voice_reviewer": "character_voice_reviewer",
-    "import": "story_import",
-    "story_import": "story_import",
 }
-_DEFAULT_TEAM_BY_SUBAGENT = {**{key: "general" for key in ("general_worker", "general_researcher", "docs_operator", "project_operator", "workspace_operator")}, **{key: "app_development" for key in ("code_explorer", "architecture_planner", "code_implementer", "code_reviewer")}, **{key: "story" for key in ("story_writer", "story_consistency_reviewer", "character_voice_reviewer", "story_import")}}
+# Retired Story/TRPG Subagents.  Legacy v2 members/teams referencing these
+# are dropped during migration rather than resurrected as empty entries.
+_RETIRED_SUBAGENT_IDS = frozenset({
+    "story_writer",
+    "story_consistency_reviewer",
+    "character_voice_reviewer",
+    "story_import",
+    "writing",
+    "import",
+})
+_DEFAULT_TEAM_BY_SUBAGENT = {**{key: "general" for key in ("general_worker", "general_researcher", "docs_operator", "project_operator", "workspace_operator")}, **{key: "app_development" for key in ("code_explorer", "architecture_planner", "code_implementer", "code_reviewer")}}
+
+_LEGACY_APP_DEVELOPMENT_SUBAGENTS = [
+    "code_explorer",
+    "architecture_planner",
+    "code_implementer",
+    "code_reviewer",
+]
+_LEGACY_APP_DEVELOPMENT_DESCRIPTIONS = frozenset(
+    {
+        "アプリ開発の探索、設計、実装、レビュー。",
+        "アプリ開発の探索、設計、実装、レビューと承認済み外部操作。",
+    }
+)
+
+
+def _is_saved_builtin_app_development_team(raw: Any) -> bool:
+    """Recognize only the untouched shipped App Development seed."""
+
+    if not isinstance(raw, dict):
+        return False
+    if set(raw) - {
+        "team_id",
+        "name",
+        "description",
+        "enabled",
+        "sort_order",
+        "activation",
+        "subagent_ids",
+        "execution_profiles",
+    }:
+        return False
+    try:
+        sort_order = int(raw.get("sort_order") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(raw.get("team_id") or "").strip() == "app_development"
+        and str(raw.get("name") or "").strip() == "App Development"
+        and str(raw.get("description") or "").strip() in _LEGACY_APP_DEVELOPMENT_DESCRIPTIONS
+        and raw.get("enabled", True) is True
+        and sort_order == 20
+        and raw.get("activation") == {"mode": "contextual", "contexts": ["app_development"]}
+        and raw.get("subagent_ids") == _LEGACY_APP_DEVELOPMENT_SUBAGENTS
+    )
+
+
+def migrate_saved_builtin_app_development_team(value: Any) -> dict[str, Any]:
+    """Add ``employee_operator`` to the untouched saved built-in Team.
+
+    The migration is one-way and idempotent.  It only adds the code-owned
+    Subagent when the saved row is the exact old seed; custom Teams and
+    custom ``employee_operator`` definitions are left unchanged.
+    """
+
+    result = copy.deepcopy(value) if isinstance(value, dict) else {}
+    teams = result.get("teams") if isinstance(result.get("teams"), dict) else {}
+    subagents = result.get("subagents") if isinstance(result.get("subagents"), dict) else {}
+    raw_team = teams.get("app_development")
+    if not _is_saved_builtin_app_development_team(raw_team):
+        return result
+    existing_operator = subagents.get("employee_operator")
+    if existing_operator is not None:
+        normalized_existing = _subagent_normalized("employee_operator", existing_operator)
+        normalized_seed = _subagent_normalized(
+            "employee_operator", AGENT_TEAM_SUBAGENT_CATALOG["employee_operator"]
+        )
+        if normalized_existing != normalized_seed:
+            # A same-ID user definition is not silently adopted into the
+            # built-in Team.  Leave the whole custom topology untouched.
+            return result
+    else:
+        subagents["employee_operator"] = _subagent_normalized(
+            "employee_operator", AGENT_TEAM_SUBAGENT_CATALOG["employee_operator"]
+        )
+    migrated_team = copy.deepcopy(raw_team)
+    migrated_team["subagent_ids"] = [
+        *list(_LEGACY_APP_DEVELOPMENT_SUBAGENTS),
+        "employee_operator",
+    ]
+    teams["app_development"] = migrated_team
+    result["teams"] = teams
+    result["subagents"] = subagents
+    return result
 
 
 def _legacy_profile(profile_id: str, route: dict[str, Any], group: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -165,7 +250,7 @@ def _migrate_section(old: Any) -> dict[str, Any]:
         # removed every Team/Subagent.  Never fall back to legacy catalog
         # defaults for a malformed-but-versioned section.  Keep old
         # llm_profiles / llm_profile_id so normalize can migrate them.
-        return {
+        result = {
             "schema_version": 3,
             "delegation_enabled": bool(old.get("delegation_enabled", False)),
             "orchestration_mode": "director" if old.get("orchestration_mode") == "director" else "standard",
@@ -173,6 +258,11 @@ def _migrate_section(old: Any) -> dict[str, Any]:
             "subagents": copy.deepcopy(old.get("subagents")) if isinstance(old.get("subagents"), dict) else {},
             "llm_profiles": copy.deepcopy(old.get("llm_profiles")) if isinstance(old.get("llm_profiles"), dict) else {},
         }
+        if AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER in old:
+            result[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = copy.deepcopy(
+                old[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER]
+            )
+        return result
 
     # v2 built-ins and custom template metadata become Subagent fields.  The
     # migration consumes, but never returns, the template/member/model-group
@@ -198,6 +288,10 @@ def _migrate_section(old: Any) -> dict[str, Any]:
         if template_id in {"media_operator", "spotify", "media"} or key in {"media_operator", "spotify", "media"}:
             # Shared Tool / Integration routes are intentionally not migrated
             # into the Agent Team → Subagent topology.
+            continue
+        if template_id in _RETIRED_SUBAGENT_IDS or key in _RETIRED_SUBAGENT_IDS:
+            # Story/TRPG Subagents were retired; legacy members referencing
+            # them are dropped rather than resurrected as empty entries.
             continue
         seed = catalog.get(template_id, catalog.get(key, {}))
         sid = _id(raw.get("subagent_id") or raw.get("member_id") or raw.get("id") or template_id)
@@ -253,6 +347,8 @@ def _migrate_section(old: Any) -> dict[str, Any]:
             # Media/Spotify are Shared Integrations and must never become
             # Subagents during migration, even when the old Team listed them.
             if template_id in {"media_operator", "spotify"}:
+                continue
+            if template_id in _RETIRED_SUBAGENT_IDS:
                 continue
             if template_id in subagents:
                 ids.append(template_id)
@@ -354,10 +450,25 @@ def migrate_agent_team_config(value: Any) -> dict[str, Any]:
 
     result = copy.deepcopy(value) if isinstance(value, dict) else {}
     raw = result.get("agent_team") if isinstance(result.get("agent_team"), dict) else {}
-    result["agent_team"] = normalize_agent_team_v3(
-        _migrate_section(raw),
+    migrated_section = migrate_saved_builtin_app_development_team(_migrate_section(raw))
+    canonical = normalize_agent_team_v3(
+        migrated_section,
         global_execution_profiles=result.get("execution_profiles"),
     )
+    # Seed after the legacy conversion as well when the resulting Team
+    # fingerprints are still the shipped built-ins.  This gives existing v2
+    # installs the same additive catalog as fresh/v3 installs while custom
+    # topologies remain untouched by the seed helper.
+    try:
+        raw_schema = int(raw.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        raw_schema = 0
+    if raw_schema >= 3 or any(
+        str(team_id) in {"general", "app_development"}
+        for team_id in (canonical.get("teams") or {})
+    ):
+        canonical = seed_agent_team_execution_profile_presets(canonical)
+    result["agent_team"] = canonical
     return result
 
 

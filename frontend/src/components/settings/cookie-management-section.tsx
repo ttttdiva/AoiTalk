@@ -342,12 +342,10 @@ export function CookieManagementSection() {
       open={expanded}
       onOpenChange={setExpanded}
       summary={<Badge variant={status?.status === "available" ? "default" : "secondary"}>{statusCopy}</Badge>}
+      help="サービスごとのCookieを管理します。現在は対応するサービスだけを表示します。"
     >
       <div className="space-y-4" data-settings-surface="cookie-management">
         <div className="space-y-2" aria-label="Cookie管理サービス一覧">
-          <p className="text-xs text-muted-foreground">
-            サービスごとのCookieを管理します。現在は次のサービスに対応しています。
-          </p>
           {COOKIE_SERVICE_DEFINITIONS.map((service) => (
             <div key={service.id} data-cookie-service={service.id} className="flex items-center gap-2">
               <h3 id={`cookie-management-service-${service.id}`} className="text-sm font-semibold">{service.label}</h3>

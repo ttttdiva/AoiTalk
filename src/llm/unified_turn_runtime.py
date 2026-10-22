@@ -8,27 +8,39 @@ CLI-style, and specialist runners the same execution contract.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+import re
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from ..tools.core import ToolArgumentValidationError
+from ..tools.core import ToolArgumentValidationError, ToolPolicyDeniedError
 from ..tools.registry import ToolRegistry
 from ..services.agent_team_service import (
     ToolFailureCircuitBreaker,
+    is_internal_tool_failure_code,
     parse_structured_tool_failure,
     tool_failure_family,
+    tool_failure_scope,
 )
 from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
+from ..services.semantic_citation import safe_verified_media_read_url
 from .context_compression import model_tool_result_payload
 from .generation_cancellation import (
     GenerationInterrupted,
     PlanningInteractionTerminated,
+)
+from .generation_error import (
+    GenerationFailure,
+    tool_failure_circuit_open_failure,
+    tool_execution_blocked_failure,
 )
 from .turn_stream_events import (
     SyncStreamEmitter,
@@ -89,6 +101,395 @@ def tool_output_indicates_success(output: Any) -> tuple[bool, str]:
     if lowered.startswith(("error:", "tool execution error:", "tool not found")):
         return False, text
     return True, ""
+
+
+_COMMAND_TOOL_NAMES = frozenset(
+    {"execute_command", "read_command_output", "write_command_input", "stop_command"}
+)
+_COMMAND_RESULT_TEXT_LIMIT = 1_500
+_COMMAND_RESULT_TOTAL_LIMIT = 12_000
+_TOOL_END_OUTPUT_LIMIT = 4_096
+_MEDIA_READ_EVENT_OUTPUT_LIMIT = 4_096
+_MEDIA_READ_EVENT_CITATION_KEYS = frozenset(
+    {
+        "body_sha256",
+        "derived_text_start",
+        "derived_text_end",
+        "text_start",
+        "text_end",
+        "text_length",
+        "chunk_id",
+        "chunk_index",
+        "page_number",
+        "start_seconds",
+        "end_seconds",
+        "unit_id",
+    }
+)
+_MEDIA_READ_EVENT_LOCATOR_KEYS = frozenset(
+    {"kind", "id", "session_id", "docs_library_id"}
+)
+_MEDIA_READ_EVENT_FIELDS = (
+    "success",
+    "complete",
+    "target_kind",
+    "source_kind",
+    "source_id",
+    "unit_id",
+    "session_id",
+    "message_id",
+    "original_url",
+    "conversation_url",
+)
+
+
+def _is_command_tool_name(value: Any) -> bool:
+    return str(value or "").rsplit(".", 1)[-1].strip().lower() in _COMMAND_TOOL_NAMES
+
+
+def _tool_result_output(tool_name: str, result: Any) -> str:
+    """Keep command failures structured so exit evidence reaches the model."""
+
+    if _is_command_tool_name(tool_name) and isinstance(result, Mapping):
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            pass
+    return str(result)
+
+
+def _bounded_media_read_event_output(result: "UnifiedToolResult") -> str:
+    """Project a media read for stream/audit consumers without source text.
+
+    The model still receives the normal ``model_tool_result_payload`` below.
+    ``tool_end`` crosses a separate persistence/WebSocket boundary, so a
+    successful canonical read must carry only the fields needed to make a
+    source link and prove that the read was complete.  In particular, never
+    copy ``text`` (or an opaque provider output) into this event projection.
+    """
+
+    if str(result.call.tool or "").rsplit(".", 1)[-1].strip().casefold() != "media_read":
+        return result.model_output
+
+    try:
+        payload = json.loads(result.output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, Mapping):
+        return json.dumps(
+            {"success": False, "complete": False},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    projected: dict[str, Any] = {}
+    for key in _MEDIA_READ_EVENT_FIELDS:
+        if key in {"original_url", "conversation_url"}:
+            continue
+        value = payload.get(key)
+        if key in {"success", "complete"}:
+            if isinstance(value, bool):
+                projected[key] = value
+            continue
+        if isinstance(value, str) and value and len(value) <= 2_048:
+            if not any(ord(char) < 32 or ord(char) == 127 for char in value):
+                projected[key] = value
+
+    # Do not infer authority from a missing producer marker.  The persistence
+    # projection is fail-closed even when a legacy/native reader omits it.
+    if "success" not in projected:
+        projected["success"] = False
+    if "complete" not in projected:
+        projected["complete"] = False
+
+    arguments = result.call.arguments if isinstance(result.call.arguments, Mapping) else {}
+    target_kind = str(
+        projected.get("target_kind")
+        or arguments.get("target_kind")
+        or "media"
+    ).strip()
+    if target_kind and len(target_kind) <= 64:
+        projected["target_kind"] = target_kind
+
+    locator = arguments.get("locator")
+    if isinstance(locator, Mapping):
+        safe_locator: dict[str, str] = {}
+        for key in _MEDIA_READ_EVENT_LOCATOR_KEYS:
+            value = locator.get(key)
+            if isinstance(value, str) and value and len(value) <= 256:
+                if not any(ord(char) < 32 or ord(char) == 127 for char in value):
+                    safe_locator[key] = value
+        if safe_locator:
+            projected["locator"] = safe_locator
+            projected.setdefault("source_kind", safe_locator.get("kind"))
+            projected.setdefault("source_id", safe_locator.get("id"))
+
+    if "unit_id" not in projected:
+        unit_id = arguments.get("unit_id")
+        if isinstance(unit_id, str) and unit_id and len(unit_id) <= 256:
+            projected["unit_id"] = unit_id
+
+    citation = payload.get("citation")
+    if isinstance(citation, Mapping):
+        safe_citation: dict[str, Any] = {}
+        for key in _MEDIA_READ_EVENT_CITATION_KEYS:
+            value = citation.get(key)
+            if isinstance(value, (bool, int, float)) and not isinstance(value, bool):
+                safe_citation[key] = value
+            elif isinstance(value, str) and value and len(value) <= 256:
+                if not any(ord(char) < 32 or ord(char) == 127 for char in value):
+                    safe_citation[key] = value
+        if safe_citation:
+            projected["citation"] = safe_citation
+
+    # Only a strictly successful, complete read with the required canonical
+    # body digest may carry a link across the emitter boundary.  This keeps a
+    # malformed/no-source success envelope from becoming a transport citation.
+    citation_hash = citation.get("body_sha256") if isinstance(citation, Mapping) else None
+    requires_hash = target_kind.casefold() in {"docs", "knowledge", "conversation"}
+    warnings = payload.get("warnings")
+    canonical_empty_warnings = isinstance(warnings, list) and not warnings
+    can_emit_urls = (
+        projected.get("success") is True
+        and projected.get("complete") is True
+        and (not requires_hash or (isinstance(citation_hash, str) and re.fullmatch(r"[0-9a-fA-F]{64}", citation_hash)))
+        and (
+            canonical_empty_warnings
+            or (not requires_hash and "warnings" not in payload)
+        )
+    )
+    if can_emit_urls:
+        for key in ("original_url", "conversation_url"):
+            safe_url = safe_verified_media_read_url(
+                payload.get(key),
+                target_kind=target_kind,
+                locator=locator if isinstance(locator, Mapping) else None,
+                unit_id=projected.get("unit_id"),
+                source_id=projected.get("source_id"),
+            )
+            if safe_url:
+                projected[key] = safe_url
+
+    if "warnings" in payload:
+        if not isinstance(warnings, list):
+            projected["warnings"] = ["unverified"]
+        else:
+            invalid_warning = False
+            safe_warnings = []
+            for item in warnings[:8]:
+                if (
+                    not isinstance(item, str)
+                    or len(item) > 200
+                    or any(ord(char) < 32 or ord(char) == 127 for char in item)
+                ):
+                    invalid_warning = True
+                    continue
+                safe_warnings.append(item)
+            if invalid_warning:
+                projected["warnings"] = ["unverified"]
+            elif safe_warnings:
+                projected["warnings"] = safe_warnings
+
+    # Keep malformed/failed errors bounded for the existing UI, while never
+    # copying the full tool body into the durable event.
+    if not projected.get("success"):
+        error = payload.get("error")
+        if isinstance(error, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", error):
+            projected["error"] = error
+
+    rendered = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) <= _MEDIA_READ_EVENT_OUTPUT_LIMIT:
+        return rendered
+    # This should only be reachable for unexpectedly large identifiers or
+    # warning lists.  Preserve the proof/link fields and drop optional data.
+    compact: dict[str, Any] = {
+        key: projected[key]
+        for key in (
+            "success",
+            "complete",
+            "target_kind",
+            "source_kind",
+            "source_id",
+            "unit_id",
+            "locator",
+        )
+        if key in projected
+    }
+    # Keep the body digest and at most one server URL when the optional
+    # metadata made the first rendering unexpectedly large.
+    citation = projected.get("citation")
+    if isinstance(citation, Mapping):
+        body_sha256 = citation.get("body_sha256")
+        if isinstance(body_sha256, str) and len(body_sha256) <= 128:
+            compact["citation"] = {"body_sha256": body_sha256}
+    for key in ("original_url", "conversation_url"):
+        value = projected.get(key)
+        if not isinstance(value, str):
+            continue
+        candidate = dict(compact)
+        candidate[key] = value
+        rendered = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= _MEDIA_READ_EVENT_OUTPUT_LIMIT:
+            return rendered
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_tool_end_text(value: Any) -> str:
+    """Redact and bound generic tool text before it reaches tool_end."""
+
+    try:
+        from ..services.outbound_privacy_service import redact_secret_for_local_display
+
+        redacted = redact_secret_for_local_display(str(value or ""))
+    except Exception:
+        return "[tool output omitted: redaction unavailable]"
+    if not isinstance(redacted, str):
+        return "[tool output omitted: redaction unavailable]"
+    if len(redacted) <= _TOOL_END_OUTPUT_LIMIT:
+        return redacted
+    return redacted[: _TOOL_END_OUTPUT_LIMIT - 16].rstrip() + "\n... (truncated)"
+
+
+def _bounded_tool_end_output(result: "UnifiedToolResult") -> str:
+    if str(result.call.tool or "").rsplit(".", 1)[-1].strip().casefold() == "media_read":
+        return _bounded_media_read_event_output(result)
+    return _bounded_tool_end_text(result.model_output)
+
+
+def _redact_command_text(value: Any, *, limit: int = _COMMAND_RESULT_TEXT_LIMIT) -> str:
+    """Bound command streams before exposing them to a model-facing result."""
+
+    try:
+        from ..services.local_agent_tasks import SecretRedactor
+
+        return SecretRedactor().text(value, limit)
+    except Exception:
+        # A missing redactor must never turn a command result into a secret
+        # disclosure.  The structured exit code is retained separately.
+        return "[command output omitted: redaction unavailable]"
+
+
+def _command_result_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bounded, redacted command contract used by model output."""
+
+    result: dict[str, Any] = {}
+    for key in (
+        "success", "return_code", "stdout", "stderr", "output", "error",
+        "job_id", "status", "next_offset", "truncated", "timed_out",
+        "cancelled", "finalization_error", "finalization_published",
+    ):
+        if key not in value:
+            continue
+        item = value.get(key)
+        if key in {"stdout", "stderr", "output", "error", "finalization_error"}:
+            if item is not None:
+                result[key] = _redact_command_text(item)
+        elif key == "return_code":
+            if isinstance(item, int) and not isinstance(item, bool):
+                result[key] = max(-1_000_000, min(item, 1_000_000))
+        elif isinstance(item, (bool, int, float)) or item is None:
+            result[key] = item
+        elif key in {"job_id", "status"}:
+            result[key] = _redact_command_text(item, limit=200)
+    return result
+
+
+def _command_nonzero_failure(value: Any) -> bool:
+    """Recognize a ToolGuard command exit only with numeric/result agreement."""
+
+    if not isinstance(value, Mapping) or value.get("success") is not False:
+        return False
+    return_code = value.get("return_code")
+    if isinstance(return_code, bool) or not isinstance(return_code, int) or return_code == 0:
+        return False
+    if value.get("timed_out") is True or value.get("cancelled") is True:
+        return False
+    if "status" in value and str(value.get("status") or "").strip().lower() not in {"", "exited", "completed"}:
+        return False
+    if value.get("finalization_error"):
+        return False
+    if "finalization_published" in value and value.get("finalization_published") is False:
+        return False
+    if value.get("error_code"):
+        return False
+    error = str(value.get("error") or "").strip()
+    match = re.fullmatch(r"Command exited with code (-?\d+)", error)
+    if match:
+        return int(match.group(1)) == return_code
+    # The plain execute_command executor reports a nonzero shell exit with the
+    # process stderr as ``error`` (no "Command exited" sentence).  Accept that
+    # shape only when the error is exactly the captured stderr, so a wrapper or
+    # scope denial that merely carries some other text stays fail-closed.
+    stderr = value.get("stderr")
+    if error and isinstance(stderr, str) and error == stderr.strip():
+        return True
+    # A test runner such as pytest reports failures on stdout and leaves stderr
+    # empty, so execute_command falls back to this fixed sentence.  It only
+    # counts as an ordinary exit when it names the same numeric return code.
+    return error == f"コマンドが終了コード {return_code} で失敗しました"
+
+
+def _is_file_mutation_tool_name(value: Any) -> bool:
+    """A successful file-editing call.  Echo/read/other commands are not progress."""
+
+    from .tool_policy import FILESYSTEM_MUTATION_TOOL_NAMES
+
+    name = str(value or "").rsplit(".", 1)[-1].strip().lower()
+    if name in _COMMAND_TOOL_NAMES:
+        # Commands appear in the policy's mutation set, but a command run
+        # (echo, read, test) proves no file changed.
+        return False
+    return name in {
+        str(item).rsplit(".", 1)[-1].casefold() for item in FILESYSTEM_MUTATION_TOOL_NAMES
+    }
+
+
+_DURATION_UNIT = r"(?:ms|msec|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)"
+# Only known timing/timestamp decorations: whole ``Wall time:``/``Duration:``
+# lines, per-test duration lines, "in 10.9s"-style phrases, pytest's
+# ``(0:02:54)`` total, bracketed ``[0.12s]`` and clock/ISO timestamps.
+# Other numbers (ids, counts, values) are substantive and are kept.
+_TIMING_NOISE_RES = (
+    re.compile(r"^[ \t]*(?:wall[ _]time|duration|elapsed(?: time)?)\b.*$", re.I | re.M),
+    re.compile(rf"^[ \t]*\d+(?:\.\d+)?[ \t]*{_DURATION_UNIT}[ \t]+(?:call|setup|teardown)\b.*$", re.I | re.M),
+    re.compile(
+        rf"\b(?:in|took|after|elapsed)[ \t]+\d+(?:\.\d+)?[ \t]*{_DURATION_UNIT}\b"
+        r"(?:[ \t]*\(\d+:\d{2}:\d{2}\))?",
+        re.I,
+    ),
+    re.compile(rf"[\[(]\d+(?:\.\d+)?[ \t]*{_DURATION_UNIT}[\])]", re.I),
+    re.compile(
+        r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+    ),
+    re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b"),
+)
+_FAILED_TEST_LINE_RE = re.compile(r"^FAILED\s+(\S+)", re.M)
+
+
+def _stable_command_outcome(output: Any) -> str:
+    """Semantic outcome of a command exit: return code plus failing ids or text.
+
+    Known timing/timestamp decorations vary between identical failures and are
+    excluded so a changed ``Wall time`` cannot evade the guard.  Substantive
+    numbers (ids, counts, values) stay: a different value is a different outcome.
+    """
+
+    try:
+        payload = json.loads(output) if isinstance(output, str) else dict(output or {})
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, Mapping):
+        payload = {}
+    text = "\n".join(str(payload.get(key) or "") for key in ("stdout", "stderr"))
+    failed = sorted(set(_FAILED_TEST_LINE_RE.findall(text)))
+    if failed:
+        body = "\n".join(failed)
+    else:
+        body = text
+        for pattern in _TIMING_NOISE_RES:
+            body = pattern.sub("", body)
+        body = re.sub(r"\s+", " ", body).strip()
+    return f"{payload.get('return_code')}|{body}"
 
 
 def _observable_tool_arguments(
@@ -163,6 +564,16 @@ def _registry_contains(registry: ToolRegistry, tool_name: str) -> bool:
         return False
 
 
+_SAFE_EXCEPTION_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,63}")
+
+
+def _safe_exception_code(exc: BaseException) -> str:
+    """Return the fixed reason code an exception explicitly opts to expose."""
+
+    code = getattr(exc, "safe_code", None)
+    return code if isinstance(code, str) and _SAFE_EXCEPTION_CODE_RE.fullmatch(code) else ""
+
+
 @dataclass(frozen=True)
 class UnifiedToolCall:
     """Provider-neutral tool call."""
@@ -171,6 +582,250 @@ class UnifiedToolCall:
     arguments: dict[str, Any] = field(default_factory=dict)
     call_id: str = ""
     raw: Any = None
+
+
+@dataclass
+class ToolNoProgressGuard:
+    """Stop one unchanged validation/parse failure within a logical turn.
+
+    The guard intentionally covers only errors where the model can make one
+    concrete correction.  Framework/tool-domain failures continue through the
+    existing failure breaker and approval/policy blocks remain authoritative.
+    """
+
+    max_same_failure: int = 2
+    _counts: dict[str, int] = field(default_factory=dict, init=False)
+    _success_digests: dict[str, set[str]] = field(default_factory=dict, init=False)
+    _exit_counts: dict[str, int] = field(default_factory=dict, init=False)
+    _effect_epoch: int = field(default=0, init=False)
+
+    def note_effect(self) -> None:
+        """Record a successful file mutation; only that changes what a rerun sees."""
+
+        self._effect_epoch += 1
+
+    def observe_command_exit(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None,
+        output: Any,
+    ) -> GenerationFailure | None:
+        """Stop only an identical command that exits identically with no file edit between.
+
+        A nonzero exit is task evidence, not an infrastructure fault, so a
+        changed command, a changed outcome, or a successful file mutation in
+        between counts as progress and is never stopped here.
+        """
+
+        try:
+            rendered = json.dumps(
+                {
+                    "arguments": dict(arguments or {}),
+                    "outcome": _stable_command_outcome(output),
+                    "epoch": self._effect_epoch,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            rendered = "{}"
+        digest = hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()[:16]
+        key = f"{self._normalized_tool_name(tool_name)}:command_exit:{digest}"
+        count = self._exit_counts.get(key, 0) + 1
+        self._exit_counts[key] = count
+        if count < max(1, int(self.max_same_failure)):
+            return None
+        return tool_failure_circuit_open_failure(
+            family=tool_failure_family(tool_name),
+            signature=f"no_progress_command_exit_{digest}",
+        )
+
+    @staticmethod
+    def _normalized_tool_name(tool_name: str) -> str:
+        return re.sub(
+            r"[^a-z0-9_.:-]+",
+            "_",
+            str(tool_name or UNKNOWN_TOOL_NAME).strip().lower(),
+        )[:128] or UNKNOWN_TOOL_NAME
+
+    def _canonical_key(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None,
+        error_code: str,
+        failure_group: str | None = None,
+    ) -> tuple[str, str]:
+        try:
+            rendered = json.dumps(
+                dict(arguments or {}),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            rendered = "{}"
+        if str(failure_group or "").strip().lower().startswith("correctable_once"):
+            # Planning owns one correction opportunity for the whole
+            # preflight/revision scope; changing invalid args or error codes
+            # must not mint another budget slot.
+            digest = "correction"
+        else:
+            digest = hashlib.sha256(
+                rendered.encode("utf-8", "replace")
+            ).hexdigest()[:16]
+        normalized_tool = self._normalized_tool_name(tool_name)
+        normalized_code = re.sub(
+            r"[^a-z0-9_.:-]+",
+            "_",
+            str(failure_group or error_code or "tool_argument_invalid")
+            .strip()
+            .lower(),
+        ) or "tool_argument_invalid"
+        normalized_code = normalized_code[:64]
+        return f"{normalized_tool}:{normalized_code}:{digest}", normalized_code
+
+    def observe_failure(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None,
+        error_code: str,
+        failure_group: str | None = None,
+    ) -> GenerationFailure | None:
+        """Record a repairable failure and return a terminal failure on repeat.
+
+        ``failure_group`` lets a typed domain outcome declare that several
+        allowlisted codes share one concrete correction opportunity.
+        """
+
+        key, normalized_code = self._canonical_key(
+            tool_name,
+            arguments,
+            error_code,
+            failure_group,
+        )
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+        if count < max(1, int(self.max_same_failure)):
+            return None
+        family = tool_failure_family(tool_name)
+        return tool_failure_circuit_open_failure(
+            family=family,
+            signature=f"no_progress_{normalized_code}_{key.rsplit(':', 1)[-1]}",
+        )
+
+    def record_progress(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None,
+        output: Any,
+    ) -> bool:
+        """Reset this tool after a new, bounded success observation.
+
+        Only the digest is retained. Repeating an identical read result does
+        not provide new progress and therefore cannot reset an unchanged
+        failure indefinitely.
+        """
+
+        tool = self._normalized_tool_name(tool_name)
+        try:
+            rendered = json.dumps(
+                {
+                    "arguments": dict(arguments or {}),
+                    "result": str(output or ""),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            rendered = "{}"
+        digest = hashlib.sha256(
+            rendered.encode("utf-8", "replace")
+        ).hexdigest()[:16]
+        seen_digests = self._success_digests.setdefault(tool, set())
+        if digest in seen_digests:
+            return False
+        seen_digests.add(digest)
+        prefix = f"{tool}:"
+        self._counts = {
+            key: count
+            for key, count in self._counts.items()
+            if not key.startswith(prefix)
+        }
+        return True
+
+
+_NO_PROGRESS_VALIDATION_CODES = frozenset(
+    {
+        "not_found",
+        "ambiguous_target",
+        "user_validation",
+        "validation",
+        "docs_not_found",
+        "docs_ambiguous_target",
+        "docs_validation",
+        "invalid_search_request",
+        "invalid_read_request",
+        "invalid_locator",
+        "conversation_context_required",
+        "query_source_budget_exceeded",
+        "evidence_changed",
+        "evidence_version_required",
+        "tool_argument_unknown",
+        "tool_argument_conflict",
+        "tool_argument_missing",
+        "tool_argument_invalid",
+    }
+)
+
+
+# Failures that are neither an infrastructure fault nor something a changed call
+# can fix: a command's own nonzero exit is task evidence and cancellation /
+# circuit markers are framework outcomes.  They never feed the unchanged-call guard.
+_NO_PROGRESS_EXEMPT_CODES = frozenset(
+    {"command_failed", "command_nonzero_exit", "circuit_open", "not_executed", "cancelled"}
+)
+
+
+def _is_correctable_tool_failure(error_code: str) -> bool:
+    code = str(error_code or "").strip().lower()
+    return code not in _NO_PROGRESS_EXEMPT_CODES and not is_internal_tool_failure_code(code)
+
+
+_MODEL_SAFE_DETAIL_CODES = frozenset({"read_invalid_line_range"})
+
+
+_ACTIVE_NO_PROGRESS_GUARD: ContextVar[ToolNoProgressGuard | None] = ContextVar(
+    "aoitalk_tool_no_progress_guard",
+    default=None,
+)
+
+
+def current_tool_no_progress_guard() -> ToolNoProgressGuard | None:
+    """Return the request/logical-turn guard bound to this execution context."""
+
+    return _ACTIVE_NO_PROGRESS_GUARD.get()
+
+
+@contextmanager
+def activate_tool_no_progress_guard(
+    guard: ToolNoProgressGuard | None = None,
+) -> Iterator[ToolNoProgressGuard]:
+    """Bind one guard across provider/review continuations of one logical turn."""
+
+    active = guard or current_tool_no_progress_guard() or ToolNoProgressGuard()
+    token = _ACTIVE_NO_PROGRESS_GUARD.set(active)
+    try:
+        yield active
+    finally:
+        _ACTIVE_NO_PROGRESS_GUARD.reset(token)
 
 
 @dataclass(frozen=True)
@@ -182,10 +837,78 @@ class UnifiedToolResult:
     success: bool
     error: str = ""
     elapsed_ms: float = 0.0
+    # Policy blocks have a user-safe reason even when ``error`` is
+    # intentionally empty for legacy model-facing payloads.  Keep that
+    # structured reason available to stream/audit projections without making
+    # the result text itself the status authority.
+    blocked_reason: str = ""
+    # A framework-owned failure is terminal for the enclosing turn.  Keep it
+    # separate from provider/tool output so raw text cannot manufacture one.
+    generation_failure: GenerationFailure | None = None
+    # Framework-owned, user-safe status text for stream/UI projections.
+    status_message: str = ""
+    # Typed framework outcomes can stop the current turn without pretending
+    # to be a generation transport failure (for example approval is pending).
+    turn_terminal: bool = False
+    terminal_reason: str = ""
+    failure_group: str = ""
+    # Framework-owned execution provenance; raw tool output cannot set it.
+    executed: bool = True
+    synthetic: bool = False
+    # Digest (never the value) of the restored raw intent, so durable receipts
+    # recorded from the observable projection stay comparable by identity.
+    intent_digest: str = ""
 
     @property
     def model_output(self) -> str:
-        return self.output if self.success else f"Error: {self.error or self.output}"
+        if _is_command_tool_name(self.call.tool):
+            try:
+                payload = json.loads(self.output)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, Mapping):
+                bounded = _command_result_projection(payload)
+                prefix = ""
+                if not self.success:
+                    prefix = (
+                        "Error: "
+                        + _redact_command_text(
+                            self.error or payload.get("error") or "command failed",
+                            limit=1_000,
+                        )
+                        + "\n"
+                    )
+                rendered = prefix + json.dumps(bounded, ensure_ascii=False, default=str)
+                if len(rendered) > _COMMAND_RESULT_TOTAL_LIMIT:
+                    rendered = rendered[:_COMMAND_RESULT_TOTAL_LIMIT]
+                return rendered
+            fallback = _redact_command_text(self.error or self.output, limit=_COMMAND_RESULT_TOTAL_LIMIT)
+            return ("Error: " if not self.success else "") + fallback
+        if self.success:
+            return self.output
+        detail = self._safe_failure_detail()
+        return f"Error: {self.error or self.output}" + (f" ({detail})" if detail else "")
+
+    def _safe_failure_detail(self) -> str:
+        """Fixed-vocabulary detail the model needs to correct its own call.
+
+        Only codes whose ``message`` is built from the caller's integers and
+        fixed text are surfaced; arbitrary tool messages stay out of the
+        model-facing line (``_read_failure`` keeps ``error`` secret-free).
+        """
+
+        try:
+            payload = json.loads(self.output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, Mapping):
+            return ""
+        if str(payload.get("error_code") or "") not in _MODEL_SAFE_DETAIL_CODES:
+            return ""
+        message = payload.get("message")
+        if not isinstance(message, str):
+            return ""
+        return re.sub(r"\s+", " ", message).strip()[:200]
 
 
 @dataclass(frozen=True)
@@ -200,11 +923,77 @@ class UnifiedTurnResult:
     # ``tool_results`` is the model/display view and may contain synthetic
     # same-batch results.  Audit consumers must use this execution-only view.
     audit_tool_results: list[UnifiedToolResult] = field(default_factory=list)
+    generation_failure: GenerationFailure | None = None
 
     @property
     def tool_calls(self) -> list[UnifiedToolCall]:
         return [result.call for result in self.tool_results]
 
+
+def _tool_status_message(
+    result: UnifiedToolResult,
+    *,
+    success_message: str,
+) -> str:
+    """Return a safe UI status without promoting raw tool output to authority."""
+
+    if result.status_message:
+        return result.status_message
+    if not result.success:
+        return "ツール実行に失敗しました"
+    return success_message
+
+
+def _planning_tool_outcome_projection(value: Any) -> dict[str, Any] | None:
+    """Project only the typed planning outcome into a safe tool result."""
+
+    try:
+        from ..services.planning_tool_outcome import is_planning_tool_outcome
+
+        if not is_planning_tool_outcome(value):
+            return None
+    except Exception:
+        return None
+    code = str(getattr(value, "failure_code", "") or "").strip().lower()
+    failure_class = str(getattr(value, "failure_class", "") or "").strip().lower()
+    if failure_class not in {"terminal", "correctable_once", "human_wait"}:
+        return None
+    message = str(value.get("message") or "").strip()
+    if not code or not message:
+        return None
+    revision = getattr(value, "revision", None)
+    if revision is None and isinstance(value.get("planning_outcome"), Mapping):
+        revision = value["planning_outcome"].get("revision")
+    revision_text = str(revision or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", revision_text):
+        revision_text = ""
+    try:
+        rendered = json.dumps(dict(value), ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = json.dumps(
+            {
+                "success": False,
+                "error_code": code,
+                "message": message,
+            },
+            ensure_ascii=False,
+        )
+    return {
+        "output": rendered,
+        "success": False,
+        "error": code,
+        "status_message": message[:512],
+        "turn_terminal": failure_class in {"terminal", "human_wait"},
+        "terminal_reason": code,
+        "failure_group": (
+            (
+                "correctable_once"
+                + (f":{revision_text}" if revision_text else "")
+            )
+            if failure_class == "correctable_once"
+            else ""
+        ),
+    }
 
 @dataclass
 class UnifiedTurnLedger:
@@ -212,22 +1001,156 @@ class UnifiedTurnLedger:
 
     run_id: str | None = None
     results: list[UnifiedToolResult] = field(default_factory=list)
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: dict[str, Any] = field(default_factory=dict)
+    # One immutable receipt per provider invocation.  The key is generated at
+    # the provider boundary and makes retries/replayed callbacks idempotent
+    # without collapsing two distinct rounds that happen to report the same
+    # token counts.
+    usage_records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    usage_unknown: bool = False
+    reserved_tokens: int = 0
+    reserved_cost_micros: int = 0
     failure: str = ""
     on_result: Callable[[UnifiedToolResult], None] | None = None
+    _provider_sequence: int = field(default=0, init=False, repr=False)
+    _budget_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+    output_includes_reasoning: bool | None = None
+    total_tokens_source: str | None = None
 
     def record(self, result: UnifiedToolResult) -> None:
         self.results.append(result)
         if self.on_result is not None:
             self.on_result(result)
 
-    def record_usage(self, usage: Mapping[str, Any] | None) -> None:
+    def next_provider_usage_key(self, prefix: str = "provider") -> str:
+        """Return a unique request key local to this logical turn."""
+
+        with self._budget_lock:
+            self._provider_sequence += 1
+            return f"{prefix}:{self._provider_sequence}"
+
+    def mark_usage_unknown(self) -> None:
+        """Fence later budget admissions after a provider omits usage."""
+
+        with self._budget_lock:
+            self.usage_unknown = True
+
+    def reserve_provider_budget(
+        self,
+        tokens: int,
+        *,
+        total_tokens: int | None = None,
+        total_cost_micros: int | None = None,
+        cost_micros: int = 0,
+    ) -> str | None:
+        """Reserve output capacity before a concurrent provider starts.
+
+        The check and increment share one lock.  This is the admission fence
+        that prevents two parallel nested specialists from observing the same
+        stale remainder and both starting an over-budget request.
+        """
+
+        try:
+            amount = max(0, int(tokens))
+        except (TypeError, ValueError, OverflowError):
+            amount = 0
+        if amount <= 0:
+            return None
+        with self._budget_lock:
+            if total_tokens is not None:
+                consumed = int(self.usage.get("total_tokens", 0) or 0)
+                if consumed + int(self.reserved_tokens or 0) + amount > int(total_tokens):
+                    return None
+            if total_cost_micros is not None:
+                consumed_cost = int(self.usage.get("cost_micros", 0) or 0)
+                try:
+                    requested_cost = max(0, int(cost_micros))
+                except (TypeError, ValueError, OverflowError):
+                    requested_cost = 0
+                if (
+                    consumed_cost
+                    + int(self.reserved_cost_micros or 0)
+                    + requested_cost
+                    > int(total_cost_micros)
+                ):
+                    return None
+            key = self.next_provider_usage_key("reservation")
+            self.reserved_tokens += amount
+            if cost_micros:
+                self.reserved_cost_micros += max(0, int(cost_micros))
+            self._remember_provider_reservation(
+                key,
+                amount,
+                max(0, int(cost_micros or 0)),
+            )
+            return key
+
+    def settle_provider_budget(
+        self,
+        reservation_key: str | None,
+        usage: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Release one in-flight output reservation exactly once."""
+
+        if not reservation_key:
+            return
+        # Reservations are tracked by key on the ledger so a duplicate
+        # callback cannot release another invocation's capacity.
+        with self._budget_lock:
+            reservations = getattr(self, "_reservations", None)
+            if reservations is None:
+                reservations = {}
+                object.__setattr__(self, "_reservations", reservations)
+            reservation = reservations.pop(reservation_key, 0)
+            if isinstance(reservation, tuple):
+                amount, cost = reservation
+            else:
+                amount, cost = reservation, 0
+            self.reserved_tokens = max(0, self.reserved_tokens - int(amount or 0))
+            self.reserved_cost_micros = max(
+                0,
+                self.reserved_cost_micros - int(cost or 0),
+            )
+
+    def _remember_provider_reservation(
+        self,
+        key: str,
+        amount: int,
+        cost_micros: int = 0,
+    ) -> None:
+        with self._budget_lock:
+            reservations = getattr(self, "_reservations", None)
+            if reservations is None:
+                reservations = {}
+                object.__setattr__(self, "_reservations", reservations)
+            reservations[key] = (
+                max(0, int(amount)),
+                max(0, int(cost_micros or 0)),
+            )
+
+    def record_usage(
+        self,
+        usage: Mapping[str, Any] | None,
+        *,
+        usage_key: str | None = None,
+    ) -> None:
         """Accumulate confirmed usage from every completion in this turn."""
 
         if not isinstance(usage, Mapping):
             return
-        normalized: dict[str, int] = {}
-        for key in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+        normalized: dict[str, Any] = {}
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "cost_micros",
+        ):
             value = usage.get(key)
             if value is None:
                 continue
@@ -237,12 +1160,72 @@ class UnifiedTurnLedger:
                 continue
         if not normalized:
             return
-        normalized.setdefault(
-            "total_tokens",
-            normalized.get("input_tokens", 0) + normalized.get("output_tokens", 0),
-        )
-        for key, value in normalized.items():
-            self.usage[key] = self.usage.get(key, 0) + value
+        reported_total = usage.get("total_tokens")
+        if usage.get("total_tokens_source") == "derived":
+            # A normalized synthetic total is an accounting projection, not
+            # a provider receipt. Reconstruct it from the canonical flags so
+            # a stale input+output value cannot erase separate reasoning.
+            reported_total = None
+        output_includes_reasoning = usage.get("output_includes_reasoning")
+        if isinstance(output_includes_reasoning, bool):
+            normalized["output_includes_reasoning"] = output_includes_reasoning
+        if reported_total is None:
+            normalized["total_tokens"] = (
+                normalized.get("input_tokens", 0)
+                + normalized.get("output_tokens", 0)
+                + (
+                    normalized.get("reasoning_tokens", 0)
+                    if output_includes_reasoning is not True
+                    else 0
+                )
+            )
+            normalized["total_tokens_source"] = "derived"
+        else:
+            normalized["total_tokens_source"] = str(
+                usage.get("total_tokens_source") or "reported"
+            )
+        with self._budget_lock:
+            key = str(usage_key or "").strip() or self.next_provider_usage_key()
+            if key in self.usage_records:
+                return
+            self.usage_records[key] = dict(normalized)
+            for name, value in normalized.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                self.usage[name] = self.usage.get(name, 0) + value
+            if isinstance(output_includes_reasoning, bool):
+                if self.output_includes_reasoning is None:
+                    self.output_includes_reasoning = output_includes_reasoning
+                elif self.output_includes_reasoning != output_includes_reasoning:
+                    self.output_includes_reasoning = None
+            source = normalized.get("total_tokens_source")
+            if isinstance(source, str):
+                if self.total_tokens_source is None:
+                    self.total_tokens_source = source
+                elif self.total_tokens_source != source:
+                    self.total_tokens_source = "mixed"
+            if self.output_includes_reasoning is not None:
+                self.usage["output_includes_reasoning"] = self.output_includes_reasoning
+            if self.total_tokens_source is not None:
+                self.usage["total_tokens_source"] = self.total_tokens_source
+            self.usage_unknown = False
+
+    def enrich_latest_usage_cost(self, cost_micros: int) -> None:
+        """Attach a server-rate-derived cost to the latest receipt once."""
+
+        try:
+            amount = max(0, int(cost_micros))
+        except (TypeError, ValueError, OverflowError):
+            return
+        with self._budget_lock:
+            if not self.usage_records:
+                return
+            key = next(reversed(self.usage_records))
+            record = self.usage_records[key]
+            if record.get("cost_micros") is not None:
+                return
+            record["cost_micros"] = amount
+            self.usage["cost_micros"] = self.usage.get("cost_micros", 0) + amount
 
 
 _ACTIVE_TURN_LEDGER: ContextVar[UnifiedTurnLedger | None] = ContextVar(
@@ -277,6 +1260,7 @@ class RegistryToolRouter:
         user_input: str | None = None,
         enforce_tool_policy: bool = True,
         failure_breaker: ToolFailureCircuitBreaker | None = None,
+        no_progress_guard: ToolNoProgressGuard | None = None,
     ):
         self.registry = registry
         self.log_prefix = log_prefix
@@ -302,6 +1286,11 @@ class RegistryToolRouter:
             )
         else:
             self.failure_breaker = None
+        self.no_progress_guard = (
+            no_progress_guard
+            or current_tool_no_progress_guard()
+            or ToolNoProgressGuard()
+        )
 
     def _effective_config(self) -> Any | None:
         current = getattr(self.client, "config", None) if self.client is not None else None
@@ -342,6 +1331,60 @@ class RegistryToolRouter:
             success=result.success,
             error=result.error,
             elapsed_ms=result.elapsed_ms,
+            blocked_reason=result.blocked_reason,
+            generation_failure=result.generation_failure,
+            status_message=result.status_message,
+            turn_terminal=result.turn_terminal,
+            terminal_reason=result.terminal_reason,
+            failure_group=result.failure_group,
+            executed=result.executed,
+            synthetic=result.synthetic,
+        )
+
+    @staticmethod
+    def _framework_block_result(
+        result: UnifiedToolResult,
+        *,
+        source: str,
+    ) -> UnifiedToolResult:
+        """Make a source-owned pre-execution block terminal and user-safe."""
+
+        failure = tool_execution_blocked_failure(source=source)
+        return replace(
+            result,
+            success=False,
+            generation_failure=failure,
+            status_message=failure.user_message,
+            turn_terminal=True,
+            terminal_reason=failure.kind,
+            executed=False,
+        )
+
+    @staticmethod
+    def _circuit_generation_failure(
+        breaker: ToolFailureCircuitBreaker,
+        family: str,
+    ) -> GenerationFailure:
+        """Project only a normalized breaker key into a terminal failure."""
+
+        signature = ""
+        try:
+            opened = breaker.snapshot().get("opened", [])
+        except Exception:
+            opened = []
+        if isinstance(opened, (list, tuple, set)):
+            prefix = f"{family}:"
+            signature = next(
+                (
+                    str(candidate).split("@", 1)[0]
+                    for candidate in opened
+                    if str(candidate).startswith(prefix)
+                ),
+                "",
+            )
+        return tool_failure_circuit_open_failure(
+            family=family,
+            signature=signature,
         )
 
     def _runtime_capability_block_result(
@@ -380,11 +1423,128 @@ class RegistryToolRouter:
             observable_name,
             reason,
         )
-        return UnifiedToolResult(
-            call=call,
-            output=output,
-            success=False,
-            error=str(reason),
+        return self._framework_block_result(
+            UnifiedToolResult(
+                call=call,
+                output=output,
+                success=False,
+                error=str(reason),
+            ),
+            source="runtime_capability",
+        )
+
+    def _agent_authority_block_result(
+        self,
+        call: UnifiedToolCall,
+    ) -> UnifiedToolResult | None:
+        """Revalidate the current Agent identity for sync tool lanes."""
+
+        from ..services.turn_context import get_turn_context
+
+        agent_execution_active = (
+            getattr(get_turn_context(), "agent_execution_binding", None) is not None
+        )
+        try:
+            from ..services.agent_authority_guard import guard_agent_tool_call_sync
+
+            decision = guard_agent_tool_call_sync(
+                call.tool,
+                dict(call.arguments or {}),
+                tool_definition=self._tool_definition(call),
+                config=self._effective_config(),
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] Agent authority guard failed: exception_type=%s",
+                self.log_prefix,
+                type(exc).__name__,
+            )
+            decision = None
+        if decision is None:
+            if not agent_execution_active:
+                return None
+            observable_name = observable_tool_name(self.registry, call.tool)
+            return self._framework_block_result(
+                UnifiedToolResult(
+                    call=call,
+                    output=(
+                        f"Tool execution blocked `{observable_name}`: "
+                        "Agent authority could not be revalidated"
+                    ),
+                    success=False,
+                    error="agent_authority_unavailable",
+                ),
+                source="agent_authority",
+            )
+        if decision.allowed:
+            return None
+        observable_name = observable_tool_name(self.registry, call.tool)
+        return self._framework_block_result(
+            UnifiedToolResult(
+                call=call,
+                output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
+                success=False,
+                error="agent_authority_denied",
+            ),
+            source="agent_authority",
+        )
+
+    async def _agent_authority_block_result_async(
+        self,
+        call: UnifiedToolCall,
+    ) -> UnifiedToolResult | None:
+        """Revalidate the current Agent identity for async tool lanes."""
+
+        from ..services.turn_context import get_turn_context
+
+        agent_execution_active = (
+            getattr(get_turn_context(), "agent_execution_binding", None) is not None
+        )
+        try:
+            from ..services.agent_authority_guard import guard_agent_tool_call_async
+
+            decision = await guard_agent_tool_call_async(
+                call.tool,
+                dict(call.arguments or {}),
+                tool_definition=self._tool_definition(call),
+                config=self._effective_config(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "[%s] Agent authority guard failed: exception_type=%s",
+                self.log_prefix,
+                type(exc).__name__,
+            )
+            decision = None
+        if decision is None:
+            if not agent_execution_active:
+                return None
+            observable_name = observable_tool_name(self.registry, call.tool)
+            return self._framework_block_result(
+                UnifiedToolResult(
+                    call=call,
+                    output=(
+                        f"Tool execution blocked `{observable_name}`: "
+                        "Agent authority could not be revalidated"
+                    ),
+                    success=False,
+                    error="agent_authority_unavailable",
+                ),
+                source="agent_authority",
+            )
+        if decision.allowed:
+            return None
+        observable_name = observable_tool_name(self.registry, call.tool)
+        return self._framework_block_result(
+            UnifiedToolResult(
+                call=call,
+                output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
+                success=False,
+                error="agent_authority_denied",
+            ),
+            source="agent_authority",
         )
 
     def _breaker_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
@@ -395,7 +1555,7 @@ class RegistryToolRouter:
         # provider-controlled unknown such as ``docs_fake ...`` must not
         # inherit the Docs breaker and poison a real Docs failure budget.
         family = tool_failure_family(observable_tool_name(self.registry, call.tool))
-        if not breaker.is_open(family):
+        if not breaker.is_open(family, tool_failure_scope(call.tool, call.arguments)):
             return None
         payload = {
             "success": False,
@@ -409,11 +1569,40 @@ class RegistryToolRouter:
             observable_tool_name(self.registry, call.tool),
             family,
         )
+        generation_failure = self._circuit_generation_failure(breaker, family)
         return UnifiedToolResult(
             call=call,
             output=json.dumps(payload, ensure_ascii=False),
             success=False,
             error=payload["error"],
+            generation_failure=generation_failure,
+            status_message=generation_failure.user_message,
+            executed=False,
+        )
+
+    def _no_progress_validation_failure(
+        self,
+        call: UnifiedToolCall,
+        parsed: Mapping[str, Any] | None,
+        failure_group: str = "",
+    ) -> GenerationFailure | None:
+        if not isinstance(parsed, Mapping):
+            return None
+        error_code = str(parsed.get("error_code") or "").strip().lower()
+        if (
+            error_code not in _NO_PROGRESS_VALIDATION_CODES
+            and not failure_group.startswith("correctable_once")
+            and not _is_correctable_tool_failure(error_code)
+        ):
+            return None
+        if self.no_progress_guard is None:
+            self.no_progress_guard = ToolNoProgressGuard()
+        guard = self.no_progress_guard
+        return guard.observe_failure(
+            tool_name=call.tool,
+            arguments=call.arguments,
+            error_code=error_code,
+            failure_group=failure_group or None,
         )
 
     def _apply_failure_breaker(
@@ -421,11 +1610,18 @@ class RegistryToolRouter:
         call: UnifiedToolCall,
         result: UnifiedToolResult,
     ) -> UnifiedToolResult:
+        raw_tool_name = call.tool
         result = self._observable_result(result)
         call = result.call
         breaker = self.failure_breaker
-        if breaker is None or result.success:
+        if result.success:
             return result
+        if self.no_progress_guard is None and result.failure_group.startswith(
+            "correctable_once"
+        ):
+            # Typed planning correction budgets are request-local even when
+            # the legacy failure breaker is disabled for this router.
+            self.no_progress_guard = ToolNoProgressGuard()
         parsed = parse_structured_tool_failure(result.output)
         if parsed is None:
             lowered = str(result.output or result.error or "").strip().lower()
@@ -445,10 +1641,71 @@ class RegistryToolRouter:
                 "error": result.error or result.output,
             }
         else:
-            failure = parsed
+            # ``parse_structured_tool_failure`` returns the normalized
+            # diagnostic fields, while ``ToolFailureCircuitBreaker.check``
+            # intentionally accepts only an explicitly failed envelope. Keep
+            # that marker when handing the normalized view back to the
+            # breaker; otherwise the breaker discards the safe error code and
+            # falls back to ``tool_error``.
+            failure = {"success": False, **parsed}
+            if _is_command_tool_name(raw_tool_name) or _is_command_tool_name(call.tool):
+                try:
+                    command_payload = json.loads(result.output)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    command_payload = None
+                if _command_nonzero_failure(command_payload):
+                    failure = {
+                        "success": False,
+                        **parsed,
+                        "error_code": "command_failed",
+                        "diagnostic_code": "command_nonzero_exit",
+                        "root_cause": "command_nonzero_exit",
+                    }
+                    if self.no_progress_guard is None:
+                        self.no_progress_guard = ToolNoProgressGuard()
+                    repeated_exit = self.no_progress_guard.observe_command_exit(
+                        tool_name=call.tool,
+                        arguments=call.arguments,
+                        output=result.output,
+                    )
+                    if repeated_exit is not None:
+                        return replace(
+                            result,
+                            generation_failure=repeated_exit,
+                            status_message=repeated_exit.user_message,
+                        )
+                elif not is_internal_tool_failure_code(parsed.get("error_code")):
+                    # Scope denials, timeouts and malformed wrappers are not
+                    # model-correctable command exits; keep them fail-closed.
+                    failure = {
+                        "success": False,
+                        **parsed,
+                        "error_code": "command_unclassified_failure",
+                        "root_cause": "command_unclassified_failure",
+                    }
+        terminal_validation_failure = self._no_progress_validation_failure(
+            call,
+            failure,
+            result.failure_group,
+        )
+        if terminal_validation_failure is not None:
+            # The call did run: keep its real output/error/executed so the
+            # receipt shows the actual cause.  The stop decision travels in
+            # ``generation_failure``/``status_message`` (like Hermes'
+            # separate outcome vs. control), not by replacing the result.
+            return replace(
+                result,
+                generation_failure=terminal_validation_failure,
+                status_message=terminal_validation_failure.user_message,
+            )
+
+        if breaker is None:
+            return result
+
         decision = breaker.check(
             tool_failure_family(observable_tool_name(self.registry, call.tool)),
             failure,
+            scope=tool_failure_scope(call.tool, call.arguments),
         )
         if decision.allowed:
             return result
@@ -457,28 +1714,24 @@ class RegistryToolRouter:
             if decision.signature
             else tool_failure_family(observable_tool_name(self.registry, call.tool))
         )
-        payload = {
-            "success": False,
-            "error_code": "circuit_open",
-            "retryable": False,
-            "error": (
-                "内部障害の同一原因を繰り返したため、このturnの再試行を停止しました"
-                f" ({signature})"
-            ),
-            "retry_suppressed": True,
-        }
         logger.warning(
             "[%s] Tool failure circuit opened for %s: %s",
             self.log_prefix,
             observable_tool_name(self.registry, call.tool),
             signature,
         )
-        return UnifiedToolResult(
-            call=call,
-            output=json.dumps(payload, ensure_ascii=False),
-            success=False,
-            error=payload["error"],
-            elapsed_ms=result.elapsed_ms,
+        generation_failure = tool_failure_circuit_open_failure(
+            family=tool_failure_family(
+                observable_tool_name(self.registry, call.tool)
+            ),
+            signature=signature,
+        )
+        # Keep the executed result (output/error/executed/synthetic) intact;
+        # only the control decision is attached.
+        return replace(
+            result,
+            generation_failure=generation_failure,
+            status_message=generation_failure.user_message,
         )
 
     def _policy_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
@@ -515,6 +1768,8 @@ class RegistryToolRouter:
                 ),
                 success=False,
                 error="tool policy unavailable",
+                blocked_reason="tool policy unavailable",
+                executed=False,
             )
 
         if decision.allowed:
@@ -528,12 +1783,31 @@ class RegistryToolRouter:
             observable_name,
             decision.reason,
         )
-        return UnifiedToolResult(
+        blocked = UnifiedToolResult(
             call=call,
             output=output,
             success=False,
             error="",
+            blocked_reason=str(decision.reason or "tool policy blocked"),
+            # A policy refusal never ran the tool.
+            executed=False,
         )
+        from .tool_policy import (
+            current_structured_task_mode,
+            record_structured_task_policy_denial,
+            tool_definition_is_mutating,
+        )
+
+        if current_structured_task_mode() is not None and tool_definition_is_mutating(
+            call.tool,
+            tool_definition=self._tool_definition(call),
+        ):
+            # A structured Agent task must not route around a write denial
+            # with another write tool or a review-driven retry.  The denial
+            # is terminal for the turn and recorded for task settlement.
+            record_structured_task_policy_denial(blocked.blocked_reason)
+            return self._framework_block_result(blocked, source="tool_policy")
+        return blocked
 
     def _approval_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
         registry_get = getattr(self.registry, "get", None)
@@ -604,6 +1878,30 @@ class RegistryToolRouter:
             error="",
         )
 
+    def _policy_denied_result(
+        self,
+        call: UnifiedToolCall,
+        exc: ToolPolicyDeniedError,
+        *,
+        elapsed_ms: float = 0.0,
+    ) -> UnifiedToolResult:
+        """Record a tool-level policy refusal as not executed, keeping its reason."""
+
+        payload = {
+            "success": False,
+            "error_code": "tool_policy_denied",
+            "retryable": False,
+            "error": f"Blocked by task execution policy: {exc.reason}",
+        }
+        return UnifiedToolResult(
+            call=self._observable_call(call),
+            output=json.dumps(payload, ensure_ascii=False),
+            success=False,
+            error=payload["error"],
+            elapsed_ms=elapsed_ms,
+            executed=False,
+        )
+
     def _argument_validation_result(
         self,
         call: UnifiedToolCall,
@@ -636,10 +1934,36 @@ class RegistryToolRouter:
             success=False,
             error=payload["error"],
             elapsed_ms=elapsed_ms,
+            executed=False,
         )
-        # Contract validation failures are deterministic caller/protocol
-        # errors, not failures of the tool implementation.  Do not consume
-        # the tool failure circuit budget or open its breaker.
+        if self.no_progress_guard is not None:
+            terminal_failure = self.no_progress_guard.observe_failure(
+                tool_name=safe_call.tool,
+                # Keep raw values only inside the request-local hash builder;
+                # the returned/audited call remains the redacted safe_call.
+                arguments=call.arguments,
+                error_code=exc.code,
+            )
+            if terminal_failure is not None:
+                terminal_payload = {
+                    "success": False,
+                    "error_code": "circuit_open",
+                    "retryable": False,
+                    "error": terminal_failure.user_message,
+                    "retry_suppressed": True,
+                }
+                return UnifiedToolResult(
+                    call=safe_call,
+                    output=json.dumps(terminal_payload, ensure_ascii=False),
+                    success=False,
+                    error=terminal_failure.user_message,
+                    elapsed_ms=elapsed_ms,
+                    generation_failure=terminal_failure,
+                    status_message=terminal_failure.user_message,
+                    executed=False,
+                )
+        # Contract validation failures get one concrete correction opportunity;
+        # the request-local guard above only stops an unchanged repeat.
         return result
 
     def _normalize_call_arguments(
@@ -712,6 +2036,9 @@ class RegistryToolRouter:
         blocked = self._runtime_capability_block_result(call)
         if blocked is not None:
             return self._observable_result(blocked)
+        blocked = self._agent_authority_block_result(call)
+        if blocked is not None:
+            return self._observable_result(blocked)
         blocked = self._policy_block_result(call)
         if blocked is not None:
             return self._observable_result(blocked)
@@ -720,6 +2047,10 @@ class RegistryToolRouter:
             return self._observable_result(blocked)
 
         started = time.perf_counter()
+        status_message = ""
+        turn_terminal = False
+        terminal_reason = ""
+        failure_group = ""
         try:
             from ..services.turn_context import (
                 reset_turn_context,
@@ -731,8 +2062,18 @@ class RegistryToolRouter:
                 result = self.registry.execute(call.tool, **dict(call.arguments or {}))
             finally:
                 reset_turn_context(tool_context_token)
-            output = str(result)
-            success, error = tool_output_indicates_success(result)
+            planning_projection = _planning_tool_outcome_projection(result)
+            if planning_projection is not None:
+                output = str(planning_projection["output"])
+                success = False
+                error = str(planning_projection["error"])
+                status_message = str(planning_projection["status_message"])
+                turn_terminal = bool(planning_projection["turn_terminal"])
+                terminal_reason = str(planning_projection["terminal_reason"])
+                failure_group = str(planning_projection["failure_group"])
+            else:
+                output = _tool_result_output(call.tool, result)
+                success, error = tool_output_indicates_success(result)
         except (GenerationInterrupted, PlanningInteractionTerminated):
             # Generation control flow is not a tool failure.  Let the owning
             # response/terminal layer handle steering or terminal planning
@@ -744,22 +2085,32 @@ class RegistryToolRouter:
                 exc,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
             )
+        except ToolPolicyDeniedError as exc:
+            return self._policy_denied_result(
+                call,
+                exc,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+            )
         except Exception as exc:
             # Provider/tool exception text may contain credentials, URLs, or
             # document content.  Keep the result machine-readable and let the
             # failure breaker classify it without echoing raw text to logs.
+            safe_code = _safe_exception_code(exc)
             output = (
                 "Tool not found: unavailable"
                 if self._tool_definition(call) is None
                 else "Tool execution failed."
+                if not safe_code
+                else f"Tool execution failed. (reason: {safe_code})"
             )
             success = False
             error = output
             logger.error(
-                "[%s] Tool execution failed: tool=%s exception_type=%s",
+                "[%s] Tool execution failed: tool=%s exception_type=%s reason=%s",
                 self.log_prefix,
                 observable_tool_name(self.registry, call.tool),
                 type(exc).__name__,
+                safe_code or "-",
             )
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -776,7 +2127,21 @@ class RegistryToolRouter:
             success=success,
             error=error,
             elapsed_ms=elapsed_ms,
+            status_message=status_message,
+            turn_terminal=turn_terminal,
+            terminal_reason=terminal_reason,
+            failure_group=failure_group,
         )
+        if success and self.no_progress_guard is not None:
+            if _is_file_mutation_tool_name(call.tool):
+                self.no_progress_guard.note_effect()
+            self.no_progress_guard.record_progress(
+                tool_name=call.tool,
+                arguments=call.arguments,
+                output=result.output,
+            )
+        if result.turn_terminal:
+            return result
         return self._apply_failure_breaker(call, result)
 
     async def execute_async(self, call: UnifiedToolCall) -> UnifiedToolResult:
@@ -789,6 +2154,9 @@ class RegistryToolRouter:
         blocked = self._runtime_capability_block_result(call)
         if blocked is not None:
             return self._observable_result(blocked)
+        blocked = await self._agent_authority_block_result_async(call)
+        if blocked is not None:
+            return self._observable_result(blocked)
         blocked = self._policy_block_result(call)
         if blocked is not None:
             return self._observable_result(blocked)
@@ -797,6 +2165,10 @@ class RegistryToolRouter:
             return self._observable_result(blocked)
 
         started = time.perf_counter()
+        status_message = ""
+        turn_terminal = False
+        terminal_reason = ""
+        failure_group = ""
         try:
             from ..services.turn_context import (
                 reset_turn_context,
@@ -811,8 +2183,18 @@ class RegistryToolRouter:
                 )
             finally:
                 reset_turn_context(tool_context_token)
-            output = str(result)
-            success, error = tool_output_indicates_success(result)
+            planning_projection = _planning_tool_outcome_projection(result)
+            if planning_projection is not None:
+                output = str(planning_projection["output"])
+                success = False
+                error = str(planning_projection["error"])
+                status_message = str(planning_projection["status_message"])
+                turn_terminal = bool(planning_projection["turn_terminal"])
+                terminal_reason = str(planning_projection["terminal_reason"])
+                failure_group = str(planning_projection["failure_group"])
+            else:
+                output = _tool_result_output(call.tool, result)
+                success, error = tool_output_indicates_success(result)
         except (GenerationInterrupted, PlanningInteractionTerminated):
             # Keep generation control flow out of model-visible tool errors.
             raise
@@ -822,21 +2204,31 @@ class RegistryToolRouter:
                 exc,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
             )
+        except ToolPolicyDeniedError as exc:
+            return self._policy_denied_result(
+                call,
+                exc,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+            )
         except Exception as exc:
             # Do not write raw provider/tool exception text into logs or the
             # model-facing result object.
+            safe_code = _safe_exception_code(exc)
             output = (
                 "Tool not found: unavailable"
                 if self._tool_definition(call) is None
                 else "Tool execution failed."
+                if not safe_code
+                else f"Tool execution failed. (reason: {safe_code})"
             )
             success = False
             error = output
             logger.error(
-                "[%s] Tool execution failed: tool=%s exception_type=%s",
+                "[%s] Tool execution failed: tool=%s exception_type=%s reason=%s",
                 self.log_prefix,
                 observable_tool_name(self.registry, call.tool),
                 type(exc).__name__,
+                safe_code or "-",
             )
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -853,7 +2245,21 @@ class RegistryToolRouter:
             success=success,
             error=error,
             elapsed_ms=elapsed_ms,
+            status_message=status_message,
+            turn_terminal=turn_terminal,
+            terminal_reason=terminal_reason,
+            failure_group=failure_group,
         )
+        if success and self.no_progress_guard is not None:
+            if _is_file_mutation_tool_name(call.tool):
+                self.no_progress_guard.note_effect()
+            self.no_progress_guard.record_progress(
+                tool_name=call.tool,
+                arguments=call.arguments,
+                output=result.output,
+            )
+        if result.turn_terminal:
+            return result
         return self._apply_failure_breaker(call, result)
 
     def execute_many(self, calls: Sequence[UnifiedToolCall]) -> list[UnifiedToolResult]:
@@ -880,26 +2286,134 @@ def openai_message_content(
     return str(getattr(message, "content", None) or "")
 
 
+class ToolCallArgumentsError(ValueError):
+    """Provider tool arguments are unusable and must not be invoked.
+
+    The rendered message is safe to log or persist verbatim: it carries a short
+    reason code and the tool name only. Raw argument text is never embedded,
+    because provider arguments may contain credentials or other secrets.
+    """
+
+    def __init__(self, reason: str, *, tool_name: str = "") -> None:
+        self.reason = str(reason)
+        self.tool_name = str(tool_name or "")
+        super().__init__(
+            "invalid tool call arguments"
+            f" (tool={self.tool_name or '<unknown>'}, reason={self.reason})"
+        )
+
+
+def parse_tool_call_arguments(
+    raw_args: Any,
+    *,
+    tool_name: str = "",
+    present: bool = True,
+) -> dict[str, Any]:
+    """Parse one provider ``arguments`` payload strictly (fail closed).
+
+    Before Phase 2 every unparsable / non-object payload collapsed to ``{}``,
+    which turned a malformed call into an authorized default no-argument
+    invocation. Only an explicit JSON object — including the explicit ``{}``
+    form — may reach authorization and execution.
+
+    Missing-argument support is deliberately not invented here: a provider that
+    omits ``arguments`` has no contract evidence for a no-argument call, so it
+    is rejected like any other unusable payload.
+    """
+
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if not present:
+        raise ToolCallArgumentsError("missing_arguments", tool_name=tool_name)
+    if raw_args is None:
+        raise ToolCallArgumentsError("null_arguments", tool_name=tool_name)
+    if not isinstance(raw_args, str):
+        raise ToolCallArgumentsError(
+            f"non_text_arguments:{type(raw_args).__name__}",
+            tool_name=tool_name,
+        )
+    text = raw_args.strip()
+    if not text:
+        raise ToolCallArgumentsError("empty_arguments", tool_name=tool_name)
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:  # noqa: BLE001 - reason code only, never the payload
+        raise ToolCallArgumentsError(
+            f"unparsable_json:{type(exc).__name__}",
+            tool_name=tool_name,
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ToolCallArgumentsError(
+            f"non_object_json:{type(parsed).__name__}",
+            tool_name=tool_name,
+        )
+    return parsed
+
+
 def openai_tool_call_function(tool_call: Any) -> tuple[str, dict[str, Any]]:
     function = getattr(tool_call, "function", None)
     if function is None and isinstance(tool_call, dict):
         function = tool_call.get("function")
 
     if isinstance(function, dict):
-        name = str(function.get("name") or "")
-        raw_args = function.get("arguments", "{}")
+        raw_name = function.get("name")
+        name = str(raw_name or "")
+        present = "arguments" in function
+        raw_args = function.get("arguments")
     else:
-        name = str(getattr(function, "name", "") or "")
-        raw_args = getattr(function, "arguments", "{}")
+        raw_name = getattr(function, "name", None)
+        name = str(raw_name or "")
+        present = hasattr(function, "arguments")
+        raw_args = getattr(function, "arguments", None)
 
-    if isinstance(raw_args, dict):
-        return name, dict(raw_args)
+    # A provider call without a usable tool name is malformed output; reject it
+    # before any authority or registry handling (reason code only, no payload).
+    if function is None:
+        raise ToolCallArgumentsError("missing_function")
+    if not isinstance(raw_name, str):
+        raise ToolCallArgumentsError("non_text_tool_name")
+    if not raw_name.strip():
+        raise ToolCallArgumentsError("missing_tool_name")
+
+    return name, parse_tool_call_arguments(
+        raw_args,
+        tool_name=name,
+        present=present,
+    )
+
+
+def _openai_tool_call_function_or_error(
+    tool_call: Any,
+) -> tuple[str, dict[str, Any], str]:
+    """Return ``(name, arguments, error_reason)`` without raising.
+
+    A non-empty ``error_reason`` means the arguments were unusable; the
+    arguments are then ``{}`` for display only and the call must never reach
+    authorization or execution.
+    """
 
     try:
-        parsed = json.loads(raw_args or "{}")
-    except Exception:
-        parsed = {}
-    return name, parsed if isinstance(parsed, dict) else {}
+        name, arguments = openai_tool_call_function(tool_call)
+    except ToolCallArgumentsError as exc:
+        return exc.tool_name, {}, exc.reason
+    return name, arguments, ""
+
+
+def _raw_intent_digest(arguments: Any) -> str:
+    from ..services.agent_run_service import canonical_audit_digest
+
+    return canonical_audit_digest(arguments if isinstance(arguments, dict) else {})
+
+
+def _tool_call_intent_fingerprint(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Canonical, order-insensitive intent used only for in-memory comparison."""
+
+    return json.dumps(
+        [str(tool_name), arguments],
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 def openai_tool_call_id(tool_call: Any) -> str:
@@ -1224,11 +2738,86 @@ CLI_TOOL_COMPLETION_CONTROL_PROMPT = """Completion control after tool results:
 - Do not call another tool just to reconfirm a successful result.
 - Re-running the same tool is allowed only when a concrete new reason exists, such as verifying a mutation, checking a changed file, resolving an error, or completing a distinct remaining subtask."""
 
+SUPPRESSED_TOOL_FINAL_ANSWER_INSTRUCTION = (
+    "The confirmed tool result above is authoritative. Do not call any tool again. "
+    "Write the final answer now; if the evidence is insufficient, say so instead of guessing."
+)
+
+# A status query is a live observation. Reusing a successful suffix for an
+# identical request can hide a worker transition and turn the final answer into
+# a stale snapshot. The ordinary round budget still bounds repeated polling.
+_NON_CACHEABLE_SUCCESSFUL_RECALL_TOOLS = frozenset(
+    {"get_agent_work_status"}
+)
+
 
 def _cli_tool_call_signature(call: UnifiedToolCall) -> tuple[str, str]:
     return (
         call.tool,
         json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _terminal_skip_reason(reason: str) -> str:
+    """Project a bounded framework reason into a synthetic receipt message."""
+
+    normalized = str(reason or "").strip().lower()
+    if normalized == "approval_already_pending":
+        return "Not executed: approval is already pending."
+    if normalized == "planning_not_active":
+        return "Not executed: planning is not active."
+    if normalized == "tool_failure_circuit_open":
+        return "Not executed: tool failure circuit opened."
+    return "Not executed: the framework stopped this turn."
+
+
+def _terminal_skip_message(reason: str) -> str:
+    normalized = str(reason or "").strip().lower()
+    if normalized == "approval_already_pending":
+        return "承認待ちのため未実行です"
+    if normalized == "planning_not_active":
+        return "計画が有効でないため未実行です"
+    if normalized == "tool_failure_circuit_open":
+        return "同じツール失敗の反復停止により未実行です"
+    return "処理停止により未実行です"
+
+
+def _synthetic_not_executed_result(
+    router: RegistryToolRouter,
+    call: UnifiedToolCall,
+    *,
+    reason: str,
+) -> UnifiedToolResult:
+    """Keep a provider batch transcript aligned after a terminal stop.
+
+    The synthetic result is display/model context only.  Callers must keep it
+    out of the execution ledger and provider usage audit.
+    """
+
+    safe_call = UnifiedToolCall(
+        tool=observable_tool_name(router.registry, call.tool),
+        arguments=_observable_tool_arguments(
+            router.registry,
+            call.tool,
+            call.arguments,
+        ),
+        call_id=call.call_id,
+    )
+    payload = {
+        "success": False,
+        "error_code": "not_executed",
+        "retryable": False,
+        "error": reason,
+    }
+    rendered = json.dumps(payload, ensure_ascii=False)
+    return UnifiedToolResult(
+        call=safe_call,
+        output=rendered,
+        success=False,
+        error=reason,
+        status_message=_terminal_skip_message(reason),
+        executed=False,
+        synthetic=True,
     )
 
 
@@ -1247,6 +2836,91 @@ def _redundant_successful_recall_batch(
         if not previous.success or not previous.output.strip():
             return None
     return suffix
+
+
+def _openai_exact_successful_recall_results(
+    calls: Sequence[UnifiedToolCall],
+    all_results: Sequence[UnifiedToolResult],
+) -> list[UnifiedToolResult] | None:
+    if not calls or len(calls) > len(all_results):
+        return None
+    suffix = list(all_results[-len(calls) :])
+    for call, previous in zip(calls, suffix):
+        if _cli_tool_call_signature(previous.call) != _cli_tool_call_signature(call):
+            return None
+        if (
+            not previous.success
+            or previous.synthetic
+            or previous.executed is not True
+            or not previous.output.strip()
+        ):
+            return None
+    return suffix
+
+
+def _openai_successful_recall_results(
+    calls: Sequence[UnifiedToolCall],
+    all_results: Sequence[UnifiedToolResult],
+    registry: ToolRegistry,
+) -> list[UnifiedToolResult | None] | None:
+    """Return stable per-call successes while excluding live status reads.
+
+    OpenAI tool rounds may interleave a live status read between repeated
+    mutation proposals. Keep a separate signature ledger for this path so the
+    read cannot shift a mutation's suffix position. A failed result removes
+    that signature and therefore never becomes a retry-suppressing success.
+    The CLI helper above intentionally retains its historical exact-suffix
+    behavior.
+    """
+
+    if not calls:
+        return None
+    has_dynamic_status_history = any(
+        previous.call.tool in _NON_CACHEABLE_SUCCESSFUL_RECALL_TOOLS
+        for previous in all_results
+    )
+    has_dynamic_status_call = any(
+        call.tool in _NON_CACHEABLE_SUCCESSFUL_RECALL_TOOLS for call in calls
+    )
+    if not has_dynamic_status_history and not has_dynamic_status_call:
+        return _openai_exact_successful_recall_results(calls, all_results)
+
+    def cacheable(tool_name: str) -> bool:
+        if tool_name in _NON_CACHEABLE_SUCCESSFUL_RECALL_TOOLS:
+            return False
+        try:
+            definition = registry.get(tool_name)
+        except Exception:
+            return False
+        side_effect = str(
+            getattr(definition, "side_effect", "") or ""
+        ).strip().lower()
+        return definition is not None and side_effect not in {"", "none"}
+
+    successful: dict[tuple[str, str], UnifiedToolResult] = {}
+    for previous in all_results:
+        tool = str(previous.call.tool or "")
+        if not cacheable(tool):
+            continue
+        signature = _cli_tool_call_signature(previous.call)
+        if (
+            previous.success
+            and not previous.synthetic
+            and previous.executed is True
+            and previous.output.strip()
+        ):
+            successful[signature] = previous
+        else:
+            successful.pop(signature, None)
+    aligned = [
+        (
+            None
+            if not cacheable(call.tool)
+            else successful.get(_cli_tool_call_signature(call))
+        )
+        for call in calls
+    ]
+    return aligned if any(previous is not None for previous in aligned) else None
 
 
 def _is_redundant_successful_cli_recall(
@@ -1268,6 +2942,134 @@ def _redundant_cli_recall_final_output(
                 outputs.append(previous.output)
                 break
     return "\n".join(output for output in outputs if output).strip()
+
+
+def _tool_has_write_side_effect(registry: ToolRegistry, tool_name: str) -> bool:
+    """True unless the tool is a known read-only / live-status read.
+
+    Unknown or unclassifiable tools are treated as writes (fail closed).
+    """
+
+    if tool_name in _NON_CACHEABLE_SUCCESSFUL_RECALL_TOOLS:
+        return False
+    try:
+        definition = registry.get(tool_name)
+    except Exception:
+        definition = None
+    if definition is None:
+        return True
+    side_effect = str(getattr(definition, "side_effect", "") or "").strip().lower()
+    return side_effect not in {"none"}
+
+
+def _plan_call_identity_fence(
+    calls: Sequence[UnifiedToolCall],
+    arg_errors: Sequence[str],
+    dispatched_intents: dict[str, tuple[str, bool, str]],
+    identity_check: Callable[[str, str, dict[str, Any]], str | None] | None,
+    registry: ToolRegistry | None = None,
+    reconciled: dict[int, str] | None = None,
+) -> list[str]:
+    """Return a per-call rejection reason (``""`` = may dispatch).
+
+    Rejections never rename an id or replay an earlier operation:
+    * unusable arguments are rejected outright;
+    * one id carrying different intents in a batch rejects every such call;
+    * the same id with a different intent than an earlier dispatch is rejected;
+    * an identical re-delivery is left to the existing successful-recall
+      suppression (mutations are never auto replayed there);
+    * the optional durable check (service receipt identity) can reject too, and
+      its failure fails closed.
+    """
+
+    fingerprints = [
+        _tool_call_intent_fingerprint(call.tool, call.arguments)
+        if not arg_errors[index]
+        else f"invalid:{arg_errors[index]}"
+        for index, call in enumerate(calls)
+    ]
+    by_id: dict[str, set[str]] = {}
+    for call, fingerprint in zip(calls, fingerprints):
+        call_id = call.call_id.strip()
+        if call_id:
+            by_id.setdefault(call_id, set()).add(fingerprint)
+
+    def _is_write(tool_name: str) -> bool:
+        return registry is not None and _tool_has_write_side_effect(
+            registry, tool_name
+        )
+
+    reasons: list[str] = []
+    batch_writes: set[str] = set()
+    for index, call in enumerate(calls):
+        call_id = call.call_id.strip()
+        if arg_errors[index]:
+            reasons.append("invalid_tool_arguments")
+            continue
+        if not call_id:
+            # Without a provider id nothing can bind this call to a durable
+            # identity. With a durable check active, fail closed instead of
+            # inventing an id; otherwise keep the id-less call unchanged.
+            reasons.append("missing_call_id" if identity_check is not None else "")
+            continue
+        if len(by_id[call_id]) > 1:
+            reasons.append("call_id_conflict_in_batch")
+            continue
+        prior = dispatched_intents.get(call_id)
+        if prior is not None and prior[0] != fingerprints[index]:
+            reasons.append("call_id_conflict_with_prior_dispatch")
+            continue
+        if prior is not None and not prior[1] and _is_write(call.tool):
+            # An attempted write that failed may have partial effects: the
+            # same call is never replayed automatically.
+            reasons.append("duplicate_write_not_replayed")
+            continue
+        if (
+            prior is not None
+            and prior[1]
+            and reconciled is not None
+            and _is_write(call.tool)
+        ):
+            # The turn remembers every executed write outcome (not just the
+            # latest batch): an exact retry reuses the success, never replays.
+            reconciled[index] = prior[2]
+            reasons.append("reconciled_prior_success")
+            continue
+        if _is_write(call.tool):
+            # The same write delivered twice in one batch is one operation:
+            # never auto replay it under the same (or a new) id.
+            if call_id in batch_writes:
+                reasons.append("duplicate_write_in_batch_not_replayed")
+                continue
+            batch_writes.add(call_id)
+        reason = ""
+        if identity_check is not None:
+            try:
+                # Keep the verdict object: it may carry the stored result.
+                reason = (
+                    identity_check(call_id, call.tool, dict(call.arguments)) or ""
+                )
+            except Exception:  # noqa: BLE001 - never log/echo the cause
+                reason = "identity_check_failed"
+        if reason == "already_executed_same_intent":
+            # Proven same invocation that already succeeded durably. A
+            # read-only poll may refresh; a write is never replayed and is
+            # reconciled with the stored successful result.
+            if not _is_write(call.tool):
+                reason = ""
+            elif reconciled is not None and hasattr(reason, "result"):
+                reconciled[index] = str(reason.result or "")
+                reason = "reconciled_prior_success"
+            else:
+                reason = "duplicate_write_not_replayed"
+        elif reason in {
+            "executed_state_unproven",
+            "executed_failed_unreconciled",
+            "claim_pending_uncertain",
+        }:
+            reason = "duplicate_write_not_replayed" if _is_write(call.tool) else ""
+        reasons.append(reason)
+    return reasons
 
 
 def run_openai_compatible_turn_loop(
@@ -1292,6 +3094,10 @@ def run_openai_compatible_turn_loop(
     event_callback: SyncStreamEmitter | None = None,
     turn_ledger: UnifiedTurnLedger | None = None,
     restore_tool_arguments: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    before_provider_call: Callable[[dict[str, Any]], bool] | None = None,
+    after_provider_call: Callable[[Any | None], Any] | None = None,
+    tool_call_identity_check: Callable[[str, str, dict[str, Any]], str | None]
+    | None = None,
 ) -> UnifiedTurnResult:
     """Run a Codex-style OpenAI-compatible tool loop.
 
@@ -1300,6 +3106,11 @@ def run_openai_compatible_turn_loop(
     """
 
     effective_user_input = user_input or _last_user_message_content(initial_messages)
+    # Turn-local fence: provider call id -> intent fingerprint of calls that
+    # were actually dispatched. Never shared across turns, runs, or owners.
+    dispatched_intents: dict[str, tuple[str, bool, str]] = {}
+    claim_hook = getattr(tool_call_identity_check, "claim", None)
+    settle_hook = getattr(tool_call_identity_check, "settle", None)
     # ``id(message)`` はオブジェクト解放後にアドレスが再利用されるため、
     # 別メッセージを無言でスキップしうる。round index をキーにして誤爆を避ける。
     emitted_thinking_rounds: set[int] = set()
@@ -1327,12 +3138,63 @@ def run_openai_compatible_turn_loop(
         enforce_tool_policy=enforce_tool_policy,
     )
     current_messages = list(initial_messages)
+    # ``current_messages`` is the canonical turn transcript returned to the
+    # caller.  Follow-up requests send a copy whose older tool results are
+    # deterministically reduced once the turn grows past the configured
+    # within-turn budget (see ``turn_context_shaping``).
+    from .turn_context_shaping import WithinTurnContextShaper, tools_payload_chars
+
+    try:
+        context_shaper = WithinTurnContextShaper.from_config(
+            config,
+            label=log_prefix or "unified",
+        )
+    except Exception:  # noqa: BLE001 - shaping must never block a turn
+        logger.warning("within-turn context shaper unavailable", exc_info=True)
+        context_shaper = WithinTurnContextShaper(enabled=False)
+    reserved_tool_chars = tools_payload_chars(api_kwargs.get("tools"))
+
+    def _shape_outgoing(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return context_shaper.shape_chat_messages(
+            messages,
+            reserved_chars=reserved_tool_chars,
+        )
+
     current_message = assistant_message
     current_tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
     current_content = openai_message_content(assistant_message, message_content)
     ledger = turn_ledger or _ACTIVE_TURN_LEDGER.get() or UnifiedTurnLedger()
     all_results = ledger.results
     display_results = list(all_results)
+    terminal_failure: GenerationFailure | None = None
+    terminal_reason = ""
+    terminal_status_message = ""
+
+    def _budget_stop() -> UnifiedTurnResult:
+        return UnifiedTurnResult(
+            final_output=CLI_TOOL_LOOP_FAILURE_MESSAGE,
+            tool_results=display_results,
+            rounds=0,
+            stopped_reason="budget_exhausted",
+            audit_tool_results=list(all_results),
+        )
+
+    def _create_provider_completion(payload: dict[str, Any]) -> Any | None:
+        if before_provider_call is not None and not before_provider_call(payload):
+            return None
+        response: Any | None = None
+        try:
+            response = create_completion(payload)
+        except BaseException:
+            if after_provider_call is not None:
+                after_provider_call(None)
+            raise
+        # A transport exception is still a provider invocation boundary; the
+        # ``None`` callback above releases its reservation and marks the
+        # receipt unknown rather than treating the failure as zero spend.
+        if after_provider_call is not None:
+            after_provider_call(response)
+        return response
 
     def _restore_arguments_for_tool(
         callback: Callable[..., dict[str, Any]],
@@ -1378,12 +3240,14 @@ def run_openai_compatible_turn_loop(
                     {"role": "user", "content": continuation_prompt}
                 )
                 follow_up_kwargs = dict(api_kwargs)
-                follow_up_kwargs["messages"] = current_messages
+                follow_up_kwargs["messages"] = _shape_outgoing(current_messages)
                 if "tool_choice" in follow_up_kwargs:
                     follow_up_kwargs["tool_choice"] = _follow_up_tool_choice(
                         follow_up_kwargs["tool_choice"]
                     )
-                response = create_completion(follow_up_kwargs)
+                response = _create_provider_completion(follow_up_kwargs)
+                if response is None:
+                    return _budget_stop()
                 message = response.choices[0].message
                 current_message = message
                 current_tool_calls = list(getattr(message, "tool_calls", None) or [])
@@ -1405,7 +3269,29 @@ def run_openai_compatible_turn_loop(
             )
 
         # ツール呼び出しを伴うラウンドの通常テキストは途中経過として配信する。
-        emit_assistant_text(event_callback, current_content, round_index=emit_round)
+        tool_names: tuple[str, ...] = ()
+        get_names = getattr(registry, "get_names", None)
+        if callable(get_names):
+            try:
+                tool_names = tuple(str(name) for name in (get_names() or ()) if name)
+            except Exception:
+                # Legacy duck registries may expose only ``__contains__`` and
+                # ``execute``.  Fall back to the names in this authoritative
+                # tool-call batch instead of requiring the full registry API.
+                tool_names = ()
+        if not tool_names:
+            tool_names = tuple(
+                name
+                for raw_call in current_tool_calls
+                for name, _, _ in [_openai_tool_call_function_or_error(raw_call)]
+                if name and observable_tool_name(registry, name) == name
+            )
+        emit_assistant_text(
+            event_callback,
+            current_content,
+            round_index=emit_round,
+            tool_names=tool_names,
+        )
 
         current_messages.append(
             serialize_openai_assistant_message(
@@ -1414,35 +3300,125 @@ def run_openai_compatible_turn_loop(
             )
         )
 
-        calls = [
-            UnifiedToolCall(
-                # Keep the raw provider name for authoritative registry
-                # lookup; only events/results/messages use the safe projection.
-                tool=name,
-                arguments=(
-                    _restore_arguments_for_tool(
-                        restore_tool_arguments,
-                        observable_tool_name(registry, name),
-                        dict(arguments),
-                    )
-                    if restore_tool_arguments is not None
-                    else arguments
-                ),
-                call_id=openai_tool_call_id(raw_call),
-                raw=raw_call,
+        call_arg_errors: list[str] = []
+        calls = []
+        for raw_call in current_tool_calls:
+            name, arguments, arg_error = _openai_tool_call_function_or_error(raw_call)
+            call_arg_errors.append(arg_error)
+            calls.append(
+                UnifiedToolCall(
+                    # Keep the raw provider name for authoritative registry
+                    # lookup; only events/results/messages use the safe projection.
+                    tool=name,
+                    arguments=(
+                        _restore_arguments_for_tool(
+                            restore_tool_arguments,
+                            observable_tool_name(registry, name),
+                            dict(arguments),
+                        )
+                        if restore_tool_arguments is not None and not arg_error
+                        else arguments
+                    ),
+                    call_id=openai_tool_call_id(raw_call),
+                    raw=raw_call,
+                )
             )
-            for raw_call in current_tool_calls
-            for name, arguments in [openai_tool_call_function(raw_call)]
-        ]
+        reconciled_outputs: dict[int, str] = {}
+        batch_results: dict[str, UnifiedToolResult] = {}
+        blocked_reasons = _plan_call_identity_fence(
+            calls,
+            call_arg_errors,
+            dispatched_intents,
+            tool_call_identity_check,
+            registry,
+            reconciled_outputs,
+        )
         ledger_snapshot = tuple(all_results)
-        redundant_batch = _redundant_successful_recall_batch(
+        redundant_batch = _openai_successful_recall_results(
             calls,
             ledger_snapshot,
+            registry,
         )
         results: list[UnifiedToolResult] = []
         model_results: list[UnifiedToolResult] = []
         suppressed_results: list[UnifiedToolResult] = []
+        def _fence_call(
+            call: UnifiedToolCall,
+            call_index: int,
+            blocked_reason: str,
+            claim_result: str | None = None,
+        ) -> None:
+            # Fail closed before authorization/registry execution. The
+            # call is never renamed or replayed as another operation.
+            blocked = replace(
+                _synthetic_not_executed_result(
+                    router,
+                    call,
+                    reason=blocked_reason,
+                ),
+                failure_group="identity_fence",
+                intent_digest=_raw_intent_digest(call.arguments),
+            )
+            reconciled_output: str | None = claim_result
+            if claim_result is not None:
+                pass
+            elif blocked_reason == "reconciled_prior_success":
+                reconciled_output = reconciled_outputs.get(call_index, "")
+            elif blocked_reason == "duplicate_write_in_batch_not_replayed":
+                first = batch_results.get(call.call_id.strip())
+                if first is not None and first.success and first.executed:
+                    reconciled_output = first.output
+            if reconciled_output is not None:
+                # Same proven invocation already succeeded: report that
+                # success without a second side effect. Audit-only (not
+                # ledgered as a new execution).
+                blocked = replace(
+                    blocked,
+                    output=reconciled_output,
+                    success=True,
+                    error="",
+                    status_message="同一呼び出しの実行済み結果を再利用しました（再実行なし）",
+                )
+            model_results.append(blocked)
+            if blocked_reason == "reconciled_prior_success" and claim_result is None:
+                # Turn-memory reconcile behaves like the historical redundant
+                # recall: model-visible only, no extra display entry.
+                suppressed_results.append(blocked)
+            else:
+                display_results.append(blocked)
+            logger.warning(
+                "[%s] Tool call rejected before dispatch (reason=%s)",
+                log_prefix,
+                blocked_reason,
+            )
+            _emit_sync(
+                event_callback,
+                "tool_end",
+                {
+                    "tool": blocked.call.tool,
+                    "tool_args": blocked.call.arguments,
+                    "message": blocked.status_message,
+                    "operation_id": blocked.call.call_id,
+                    "tool_call_id": blocked.call.call_id,
+                    "tool_result": {
+                        "tool": blocked.call.tool,
+                        "arguments": blocked.call.arguments,
+                        "output": blocked.output,
+                        "error": blocked.error,
+                        "success": bool(blocked.success),
+                        "executed": False,
+                        "synthetic": True,
+                        "not_executed_reason": blocked.error,
+                        "tool_call_id": blocked.call.call_id,
+                    },
+                },
+            )
+
         for call_index, call in enumerate(calls):
+            blocked_reason = blocked_reasons[call_index]
+            if blocked_reason:
+                _fence_call(call, call_index, blocked_reason)
+                continue
             previous = (
                 redundant_batch[call_index]
                 if redundant_batch is not None
@@ -1473,6 +3449,41 @@ def run_openai_compatible_turn_loop(
                 )
                 continue
 
+            claim_held = False
+            call_key = call.call_id.strip()
+            if (
+                claim_hook is not None
+                and call_key
+                and _tool_has_write_side_effect(router.registry, call.tool)
+            ):
+                # Reserve the run/call id for this exact intent before any
+                # effect. Only the claim owner may dispatch; everything else
+                # (conflict, pending/uncertain, executed failure) fails closed.
+                try:
+                    verdict = claim_hook(call_key, call.tool, dict(call.arguments))
+                except Exception:  # noqa: BLE001 - never echo the cause
+                    verdict = "identity_check_failed"
+                if verdict:
+                    if str(verdict) == "already_executed_same_intent" and hasattr(
+                        verdict, "result"
+                    ):
+                        _fence_call(
+                            call,
+                            call_index,
+                            "reconciled_prior_success",
+                            claim_result=str(verdict.result or ""),
+                        )
+                    elif str(verdict) in {
+                        "claim_pending_uncertain",
+                        "executed_failed_unreconciled",
+                        "executed_state_unproven",
+                    }:
+                        _fence_call(call, call_index, "duplicate_write_not_replayed")
+                    else:
+                        _fence_call(call, call_index, str(verdict))
+                    continue
+                claim_held = True
+
             operation_id = call.call_id.strip() or str(uuid.uuid4())
             observable_arguments = _observable_tool_arguments(
                 router.registry,
@@ -1491,20 +3502,127 @@ def run_openai_compatible_turn_loop(
                 },
             )
             result = router.execute(call)
+            result = replace(
+                result,
+                intent_digest=_raw_intent_digest(call.arguments),
+            )
+            if claim_held and settle_hook is not None:
+                # Authoritative outcome is durable before the next call. A
+                # failed settlement leaves the claim pending (uncertain), so
+                # the same call is never replayed.
+                try:
+                    settle_hook(
+                        call_key,
+                        call.tool,
+                        dict(call.arguments),
+                        bool(result.executed),
+                        bool(result.success),
+                        result.output,
+                    )
+                except Exception:  # noqa: BLE001 - never echo the cause
+                    logger.warning(
+                        "[%s] Tool call settlement failed; claim left pending",
+                        log_prefix,
+                    )
+            if result.executed and call.call_id.strip():
+                # Only dispatched calls bind an id; a validation-failed
+                # (never executed) call leaves its id free for a repair.
+                dispatched_intents[call.call_id.strip()] = (
+                    _tool_call_intent_fingerprint(call.tool, call.arguments),
+                    bool(result.success),
+                    result.output,
+                )
+            if call.call_id.strip():
+                batch_results[call.call_id.strip()] = result
             results.append(result)
             model_results.append(result)
             ledger.record(result)
             display_results.append(result)
+            tool_result_payload: dict[str, Any] = {
+                "tool": observable_name,
+                "arguments": observable_arguments,
+                "output": _bounded_tool_end_output(result),
+                "error": (
+                    _bounded_tool_end_text(result.error)
+                    if not result.success
+                    else ""
+                ),
+                # Preserve the router's authoritative status.  The event
+                # consumer keeps a legacy error-based fallback for older
+                # producers, but an explicit false must never be inferred as
+                # success merely because its error field is empty.
+                "success": bool(result.success),
+                "executed": bool(result.executed),
+                "synthetic": result.synthetic,
+            }
+            if result.blocked_reason:
+                tool_result_payload["blocked_reason"] = _bounded_tool_end_text(
+                    result.blocked_reason
+                )
+            tool_result_payload["tool_call_id"] = operation_id
             _emit_sync(
                 event_callback,
                 "tool_end",
                 {
                     "tool": observable_name,
                     "tool_args": observable_arguments,
-                    "message": f"Completed {observable_name}",
+                    "message": _tool_status_message(
+                        result,
+                        success_message=f"Completed {observable_name}",
+                    ),
+                    "executed": bool(result.executed),
+                    "synthetic": result.synthetic,
                     "operation_id": operation_id,
+                    "tool_call_id": operation_id,
+                    "tool_result": tool_result_payload,
                 },
             )
+
+            if result.generation_failure is not None or result.turn_terminal:
+                # The framework-owned breaker is terminal for this turn. Keep
+                # remaining provider call IDs in the transcript, but never
+                # execute them or add them to the execution ledger.
+                terminal_failure = result.generation_failure
+                terminal_reason = (
+                    result.terminal_reason
+                    or (terminal_failure.kind if terminal_failure else "tool_terminal")
+                )
+                terminal_status_message = (
+                    result.status_message
+                    or (terminal_failure.user_message if terminal_failure else "ツール実行を停止しました")
+                )
+                for skipped_call in calls[call_index + 1 :]:
+                    skipped = _synthetic_not_executed_result(
+                        router,
+                        skipped_call,
+                        reason=_terminal_skip_reason(terminal_reason),
+                    )
+                    model_results.append(skipped)
+                    display_results.append(skipped)
+                    skipped_id = skipped.call.call_id
+                    _emit_sync(
+                        event_callback,
+                        "tool_end",
+                        {
+                            "tool": skipped.call.tool,
+                            "tool_args": skipped.call.arguments,
+                            "message": skipped.status_message,
+                            "operation_id": skipped_id,
+                            "tool_call_id": skipped_id,
+                            "tool_result": {
+                                "tool": skipped.call.tool,
+                                "arguments": skipped.call.arguments,
+                                "output": skipped.output,
+                                "error": skipped.error,
+                                "success": False,
+                                "executed": False,
+                                "synthetic": True,
+                                "not_executed_reason": skipped.error,
+                                "tool_call_id": skipped_id,
+                            },
+                        },
+                    )
+                break
 
         for result in model_results:
             model_payload = model_tool_result_payload(
@@ -1523,12 +3641,36 @@ def run_openai_compatible_turn_loop(
                 }
             )
 
+        if terminal_failure is not None or terminal_reason:
+            return UnifiedTurnResult(
+                final_output=(
+                    terminal_failure.user_message
+                    if terminal_failure is not None
+                    else terminal_status_message
+                ),
+                tool_results=display_results,
+                rounds=round_index,
+                stopped_reason=terminal_reason,
+                messages=list(current_messages),
+                audit_tool_results=list(all_results),
+                generation_failure=terminal_failure,
+            )
+
         if suppressed_results and not results:
             final_kwargs = dict(api_kwargs)
-            final_kwargs["messages"] = current_messages
+            final_messages = [
+                *current_messages,
+                {
+                    "role": "user",
+                    "content": SUPPRESSED_TOOL_FINAL_ANSWER_INSTRUCTION,
+                },
+            ]
+            final_kwargs["messages"] = final_messages
             final_kwargs.pop("tools", None)
             final_kwargs.pop("tool_choice", None)
-            response = create_completion(final_kwargs)
+            response = _create_provider_completion(final_kwargs)
+            if response is None:
+                return _budget_stop()
             message = response.choices[0].message
             final_content = openai_message_content(message, message_content)
             _emit_thinking_once(message, emit_round + 1)
@@ -1554,20 +3696,22 @@ def run_openai_compatible_turn_loop(
                     else "redundant_tool_call_suppressed"
                 ),
                 messages=[
-                    *current_messages,
+                    *final_messages,
                     final_message,
                 ],
                 audit_tool_results=list(all_results),
             )
 
         follow_up_kwargs = dict(api_kwargs)
-        follow_up_kwargs["messages"] = current_messages
+        follow_up_kwargs["messages"] = _shape_outgoing(current_messages)
         if "tool_choice" in follow_up_kwargs:
             follow_up_kwargs["tool_choice"] = _follow_up_tool_choice(
                 follow_up_kwargs["tool_choice"]
             )
 
-        response = create_completion(follow_up_kwargs)
+        response = _create_provider_completion(follow_up_kwargs)
+        if response is None:
+            return _budget_stop()
         message = response.choices[0].message
         current_message = message
         next_tool_calls = getattr(message, "tool_calls", None)
@@ -1592,12 +3736,14 @@ def run_openai_compatible_turn_loop(
             )
             current_messages.append({"role": "user", "content": continuation_prompt})
             follow_up_kwargs = dict(api_kwargs)
-            follow_up_kwargs["messages"] = current_messages
+            follow_up_kwargs["messages"] = _shape_outgoing(current_messages)
             if "tool_choice" in follow_up_kwargs:
                 follow_up_kwargs["tool_choice"] = _follow_up_tool_choice(
                     follow_up_kwargs["tool_choice"]
                 )
-            response = create_completion(follow_up_kwargs)
+            response = _create_provider_completion(follow_up_kwargs)
+            if response is None:
+                return _budget_stop()
             message = response.choices[0].message
             current_message = message
             current_tool_calls = list(getattr(message, "tool_calls", None) or [])
@@ -1677,6 +3823,9 @@ def run_cli_tool_call_loop(
     current_output = str(initial_output or "")
     all_results: list[UnifiedToolResult] = []
     display_results: list[UnifiedToolResult] = []
+    terminal_failure: GenerationFailure | None = None
+    terminal_reason = ""
+    terminal_status_message = ""
 
     # ``max_rounds`` limits *tool executions*, not the follow-up response
     # that is produced after the last tool result.  Keep one parse-only pass
@@ -1808,7 +3957,7 @@ def run_cli_tool_call_loop(
             len(calls),
         )
         results: list[UnifiedToolResult] = []
-        for call in calls:
+        for call_index, call in enumerate(calls):
             if should_cancel and should_cancel():
                 return UnifiedTurnResult(
                     final_output=current_output,
@@ -1849,16 +3998,80 @@ def run_cli_tool_call_loop(
                 {
                     "tool": observable_name,
                     "tool_args": observable_arguments,
-                    "message": f"Completed {observable_name}",
+                    "message": _tool_status_message(
+                        result,
+                        success_message=f"Completed {observable_name}",
+                    ),
                     "tool_result": {
                         "tool": observable_name,
                         "arguments": observable_arguments,
                         "output": result.model_output,
                         "error": result.error if not result.success else "",
+                        # Keep an explicit failure marker even when a policy
+                        # block has no legacy error string.
+                        "success": bool(result.success),
+                        "executed": bool(result.executed),
+                        "synthetic": result.synthetic,
+                        **(
+                            {"blocked_reason": result.blocked_reason}
+                            if result.blocked_reason
+                            else {}
+                        ),
                     },
                 },
             )
+            if result.generation_failure is not None or result.turn_terminal:
+                terminal_failure = result.generation_failure
+                terminal_reason = (
+                    result.terminal_reason
+                    or (terminal_failure.kind if terminal_failure else "tool_terminal")
+                )
+                terminal_status_message = (
+                    result.status_message
+                    or (terminal_failure.user_message if terminal_failure else "ツール実行を停止しました")
+                )
+                for skipped_call in calls[call_index + 1 :]:
+                    skipped = _synthetic_not_executed_result(
+                        router,
+                        skipped_call,
+                        reason=_terminal_skip_reason(terminal_reason),
+                    )
+                    display_results.append(skipped)
+                    _emit_sync(
+                        event_callback,
+                        "tool_end",
+                        {
+                            "tool": skipped.call.tool,
+                            "tool_args": skipped.call.arguments,
+                            "message": skipped.status_message,
+                            "tool_result": {
+                                "tool": skipped.call.tool,
+                                "arguments": skipped.call.arguments,
+                                "output": skipped.output,
+                                "error": skipped.error,
+                                "success": False,
+                                "executed": False,
+                                "synthetic": True,
+                                "not_executed_reason": skipped.error,
+                            },
+                        },
+                    )
+                break
         all_results.extend(results)
+
+        if terminal_failure is not None or terminal_reason:
+            return UnifiedTurnResult(
+                final_output=(
+                    terminal_failure.user_message
+                    if terminal_failure is not None
+                    else terminal_status_message
+                ),
+                tool_results=display_results,
+                rounds=round_index,
+                stopped_reason=terminal_reason,
+                audit_tool_results=list(all_results),
+                generation_failure=terminal_failure,
+            )
 
         follow_up = build_follow_up_prompt(
             original_input,

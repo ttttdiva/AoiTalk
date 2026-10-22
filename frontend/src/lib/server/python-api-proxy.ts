@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isClientRequestAbort } from "./proxy-cancellation";
+import { createDownstreamResponseLifetime } from "./downstream-response-lifetime";
 
 export const NO_STORE_HEADERS = {
   "cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -17,7 +19,11 @@ export type InternalPythonUser = {
 // runtime harness can attribute entities created by any API surface (not just
 // the admin cleanup endpoint).  Arbitrary client headers remain blocked.
 const FORWARDABLE_REQUEST_HEADERS = new Set([
+  "cookie",
   "idempotency-key",
+  "x-asset-sha256",
+  "x-aoitalk-download-preflight",
+  "if-match",
   "x-aoitalk-verification-run-id",
   "x-aoitalk-verification-harness",
   "x-aoitalk-verification-source",
@@ -36,10 +42,6 @@ const VERIFICATION_REQUEST_HEADERS = [
 const ENTERPRISE_DISABLED_API_ROOTS = [
   "/api/mobile",
   "/api/sync",
-  "/api/story",
-  "/api/scenarios",
-  "/api/trpg",
-  "/api/hydrus",
   "/api/comfyui",
   "/api/crawler",
   "/api/remote-servers",
@@ -106,6 +108,79 @@ function normalizeApiPath(pathParts: string[]): string {
   return `/api/${apiPath}`;
 }
 
+function safeProxyRequestId(request: NextRequest): string {
+  const raw =
+    request.headers.get("x-request-id") ??
+    request.headers.get("x-correlation-id") ??
+    "";
+  return raw.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 128) || "-";
+}
+
+const SAFE_PROXY_ERROR_CODES = new Set([
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EPIPE",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ERR_NETWORK",
+  "ABORT_ERR",
+]);
+const SAFE_PROXY_ERROR_CLASSES = new Set([
+  "Error",
+  "TypeError",
+  "AbortError",
+  "TimeoutError",
+  "DOMException",
+  "NetworkError",
+  "RangeError",
+  "URIError",
+]);
+
+function safeProxyErrorClass(error: unknown): string {
+  if (!(error instanceof Error)) return "unknown";
+  const rawName =
+    typeof error.name === "string"
+      ? error.name
+      : typeof error.constructor?.name === "string"
+        ? error.constructor.name
+        : "";
+  const name = rawName.replace(/[^A-Za-z0-9]/g, "").slice(0, 32);
+  return SAFE_PROXY_ERROR_CLASSES.has(name) ? name : "Error";
+}
+
+function safeProxyErrorCode(error: unknown): string {
+  const cause =
+    error instanceof Error
+      ? (error as Error & { cause?: unknown }).cause
+      : undefined;
+  const rawCode =
+    cause && typeof cause === "object" && "code" in cause
+      ? (cause as { code?: unknown }).code
+      : undefined;
+  if (typeof rawCode !== "string") return "unknown";
+  const code = rawCode.trim().replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 64);
+  return SAFE_PROXY_ERROR_CODES.has(code) ? code : "unknown";
+}
+
+function logProxyUpstreamFailure(
+  request: NextRequest,
+  apiPath: string,
+  startedAt: number,
+  error: unknown,
+): void {
+  console.warn("Python API proxy upstream failure", {
+    path: apiPath,
+    request_id: safeProxyRequestId(request),
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    error_class: safeProxyErrorClass(error),
+    error_code: safeProxyErrorCode(error),
+  });
+}
+
 function isEnterpriseDisabledApiPath(apiPath: string): boolean {
   return (
     isEnterpriseProfile() &&
@@ -170,6 +245,7 @@ function buildResponseSecurityHeaders(res: Response): Record<string, string> {
 const FORWARDED_RESPONSE_BODY_HEADERS = [
   "content-length",
   "content-disposition",
+  "x-mediaops-manifest-sha256",
   "accept-ranges",
   "content-range",
 ] as const;
@@ -177,6 +253,7 @@ const FORWARDED_RESPONSE_BODY_HEADERS = [
 function buildResponseHeaders(
   res: Response,
   isGet: boolean,
+  forwardMetadata: readonly string[] = [],
 ): Record<string, string> {
   const contentType = res.headers.get("content-type");
   const contentEncoding = res.headers.get("content-encoding");
@@ -201,6 +278,12 @@ function buildResponseHeaders(
     if (name === "content-length" && contentEncoding) continue;
     const value = res.headers.get(name);
     if (value) headers[name] = value;
+  }
+  for (const name of forwardMetadata) {
+    // These SHA headers are opt-in only for the product deliverable GET route.
+    // Keep arbitrary upstream metadata outside this allowlist.
+    if (!["x-media-asset-sources-partial", "x-media-asset-sources-warning", "x-artifact-sha256", "x-manifest-sha256"].includes(name)) continue;
+    const value = res.headers.get(name); if (value) headers[name] = value;
   }
   return headers;
 }
@@ -274,6 +357,8 @@ export async function proxyRequestToPythonApi(
      * headers must never cross the internal API boundary.
      */
     forwardHeaders?: readonly string[];
+    /** Exact routes may forward these allowlisted safe response metadata headers. */
+    forwardResponseHeaders?: readonly string[];
     /**
      * Buffer a bounded, application-owned response before returning it from
      * the Next route. Next 16 may abort an upstream stream tied to
@@ -285,8 +370,13 @@ export async function proxyRequestToPythonApi(
     bufferResponse?: boolean;
     /** Required byte ceiling whenever bufferResponse is enabled. */
     maxBufferedResponseBytes?: number;
+    /** Exact binary asset upload route only; keep streaming with a byte ceiling. */
+    maxRequestBytes?: number;
+    /** Exact immutable preview route: downstream cancellation owns the stream. */
+    downstreamResponseLifetime?: boolean;
   },
 ): Promise<NextResponse> {
+  const startedAt = Date.now();
   const apiPath = normalizeApiPath(options.path);
   if (isEnterpriseDisabledApiPath(apiPath)) {
     return NextResponse.json(
@@ -360,18 +450,6 @@ export async function proxyRequestToPythonApi(
     // deployment paths or other sensitive values.
     const message = error instanceof Error ? error.message.toLowerCase() : "";
     if (message.includes("internal_api_key") || message.includes("internal api key")) {
-      if (apiPath === "/api/hydrus" || apiPath.startsWith("/api/hydrus/")) {
-        return NextResponse.json(
-          {
-            detail: {
-              category: "python_proxy",
-              code: "python_proxy_unreachable",
-              message: "AoiTalkのHydrusプロキシに接続できません",
-            },
-          },
-          { status: 503, headers: NO_STORE_HEADERS },
-        );
-      }
       return NextResponse.json(
         {
           detail: "Internal Python API authentication is not configured",
@@ -392,6 +470,10 @@ export async function proxyRequestToPythonApi(
     cache: "no-store",
     signal: request.signal,
   };
+  let requestTooLarge = false;
+  const responseLifetime = options.downstreamResponseLifetime
+    ? createDownstreamResponseLifetime(request.signal) : null;
+  if (responseLifetime) init.signal = responseLifetime.signal;
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     if (options.body !== undefined) {
@@ -402,6 +484,20 @@ export async function proxyRequestToPythonApi(
       // request.text()/arrayBuffer() here would make a client-controlled body
       // an unbounded allocation in the Next.js process.
       init.body = request.body;
+    }
+    if (options.maxRequestBytes && init.body && isReadableStreamBody(init.body)) {
+      const maximum = options.maxRequestBytes;
+      const declared = request.headers.get("content-length");
+      if (declared && (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+        await init.body.cancel();
+        return NextResponse.json({ detail: "Asset upload exceeds proxy limit" }, { status: 413, headers: NO_STORE_HEADERS });
+      }
+      let bytes = 0;
+      init.body = init.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) {
+        bytes += chunk.byteLength;
+        if (bytes > maximum) { requestTooLarge = true; throw new Error("asset_upload_too_large"); }
+        controller.enqueue(chunk);
+      } }));
     }
     if (
       init.body !== undefined &&
@@ -416,6 +512,9 @@ export async function proxyRequestToPythonApi(
 
   try {
     const res = await fetch(url.toString(), init);
+    // Next's completed GET handler may abort request.signal before media drains.
+    // From these headers onward the browser response stream owns cancellation.
+    responseLifetime?.detach();
 
     // 304 Not Modified はボディを持たないため、キャッシュ用ヘッダーのみで返す。
     if (res.status === 304) {
@@ -430,7 +529,7 @@ export async function proxyRequestToPythonApi(
 
     const hasNoBody =
       request.method === "HEAD" || [204, 205].includes(res.status);
-    const responseBody = hasNoBody
+    let responseBody = hasNoBody
       ? null
       : options.bufferResponse
         ? await readBoundedResponse(
@@ -438,43 +537,34 @@ export async function proxyRequestToPythonApi(
             Math.max(1, options.maxBufferedResponseBytes ?? 8 * 1024 * 1024),
           )
         : res.body;
+    if (responseLifetime && responseBody instanceof ReadableStream) {
+      responseBody = responseLifetime.wrap(responseBody);
+    }
     return new NextResponse(responseBody, {
       status: res.status,
-      headers: buildResponseHeaders(res, isGet),
+      headers: buildResponseHeaders(res, isGet, options.forwardResponseHeaders),
     });
   } catch (error) {
+    responseLifetime?.detach();
+    if (requestTooLarge) return NextResponse.json({ detail: "Asset upload exceeds proxy limit" }, { status: 413, headers: NO_STORE_HEADERS });
     if (error instanceof BufferedResponseTooLargeError) {
       return NextResponse.json(
         { detail: "Python API response exceeds proxy limit" },
         { status: 502, headers: NO_STORE_HEADERS },
       );
     }
-    // A disconnected browser request must stay cancelled all the way through
-    // the proxy.  Do not manufacture a 502 response after the client has gone
-    // away; Next/Fetch will terminate the downstream stream and the upstream
-    // request already carries the same AbortSignal.
-    if (
-      request.signal.aborted ||
-      (error instanceof DOMException && error.name === "AbortError") ||
-      (error instanceof Error && error.name === "AbortError")
-    ) {
-      throw error;
+    if (isClientRequestAbort(error, request.signal)) {
+      // The upstream fetch is already cancelled by request.signal. Settle the
+      // route without rethrowing Next's ResponseAborted into its 500/error-log
+      // path. There is no client left to consume a body; 499 records a client
+      // disconnect, never a successful upstream response.
+      return new NextResponse(null, { status: 499, headers: NO_STORE_HEADERS });
     }
-    if (apiPath === "/api/hydrus" || apiPath.startsWith("/api/hydrus/")) {
-      return NextResponse.json(
-        {
-          detail: {
-            category: "python_proxy",
-            code: "python_proxy_unreachable",
-            message: "AoiTalkのHydrusプロキシに接続できません",
-          },
-        },
-        { status: 502, headers: NO_STORE_HEADERS },
-      );
-    }
+    logProxyUpstreamFailure(request, apiPath, startedAt, error);
     return NextResponse.json(
       { detail: "Python APIに接続できません" },
       { status: 502, headers: NO_STORE_HEADERS },
     );
   }
 }
+

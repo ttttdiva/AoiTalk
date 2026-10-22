@@ -324,7 +324,7 @@ export function ChatComposerInput({
     const element = inputRef.current;
     if (!element) return;
     element.style.height = "auto";
-    element.style.height = `${Math.min(Math.max(element.scrollHeight, 40), 120)}px`;
+    element.style.height = `${Math.min(Math.max(element.scrollHeight, 36), 120)}px`;
   });
 
   useEffect(
@@ -366,10 +366,10 @@ export function ChatComposerInput({
         rows={1}
         wrap="soft"
         className={cn(
-          "block w-full resize-none border-0 bg-transparent px-4 py-3 text-sm leading-5 text-foreground outline-none",
+          "block w-full resize-none border-0 bg-transparent px-4 py-2 text-sm leading-5 text-foreground outline-none",
           "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-0",
         )}
-        style={{ height: "40px", minHeight: "40px", maxHeight: "120px" }}
+        style={{ height: "36px", minHeight: "36px", maxHeight: "120px" }}
       />
     </div>
   );

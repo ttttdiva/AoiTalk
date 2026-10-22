@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { Boxes, Loader2, Plus, Search, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -222,8 +223,15 @@ export function ProjectAppsPanel({ projectId, canWrite = true }: { projectId: st
             <Card className="w-full max-w-2xl">
               <CardHeader className="flex-row items-start justify-between gap-4 space-y-0">
                 <div>
-                  <CardTitle className="flex items-center gap-2 text-base"><Boxes className="size-4 text-primary" /> 既存AppをProjectに追加</CardTitle>
-                  <p className="mt-1 text-xs text-muted-foreground">このProjectで利用するAppを選びます。App本体や他Projectとの関連は変更しません。</p>
+                  <CardTitle className="flex items-center gap-2 text-base">
+                    <Boxes className="size-4 text-primary" />
+                    <span className="inline-flex items-center gap-1">
+                      既存AppをProjectに追加
+                      <HelpPopover label="既存AppをProjectに追加">
+                        このProjectで利用するAppを選びます。App本体や他Projectとの関連は変更しません。
+                      </HelpPopover>
+                    </span>
+                  </CardTitle>
                 </div>
                 <Button type="button" variant="ghost" size="sm" onClick={() => setShowLink(false)}>閉じる</Button>
               </CardHeader>
@@ -237,15 +245,22 @@ export function ProjectAppsPanel({ projectId, canWrite = true }: { projectId: st
           <div className="flex h-full min-h-0 items-start justify-center overflow-auto p-5 md:p-8">
             <Card className="w-full max-w-2xl">
               <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-base"><Plus className="size-4 text-primary" /> 新しいApp</CardTitle>
-                <p className="text-xs text-muted-foreground">App workspaceを作成し、業務内容を分析したあと、App context付きのChatで開発を始めます。</p>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Plus className="size-4 text-primary" />
+                  <span className="inline-flex items-center gap-1">
+                    新しいApp
+                    <HelpPopover label="新しいApp">
+                      App workspaceを作成し、業務内容を分析したあと、App context付きのChatで開発を始めます。
+                    </HelpPopover>
+                  </span>
+                </CardTitle>
               </CardHeader>
               <CardContent>
                 <form className="grid gap-4 md:grid-cols-2" onSubmit={createApp}>
                   <div className="space-y-1.5 md:col-span-2"><Label htmlFor="project-app-name">App名</Label><Input id="project-app-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例：申請ファイル変換" required autoFocus /></div>
                   <div className="space-y-1.5"><Label htmlFor="project-app-slug">識別子（任意）</Label><Input id="project-app-slug" value={slug} onChange={(event) => setSlug(event.target.value)} placeholder="request-file-converter" /></div>
                   <div className="space-y-1.5 md:col-span-2"><Label htmlFor="project-app-description">用途</Label><Textarea id="project-app-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="何を自動化するAppか" rows={4} /></div>
-                  <div className="space-y-1.5 md:col-span-2"><Label>既存ソースを取り込む（任意）</Label><div className={`rounded-xl border-2 border-dashed p-5 text-center transition-colors ${sourceDragging ? "border-primary bg-primary/10" : "border-border bg-muted/15"}`} onDragEnter={(event) => { event.preventDefault(); setSourceDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { event.preventDefault(); setSourceDragging(false); }} onDrop={(event) => void handleSourceDrop(event)}><Upload className="mx-auto size-6 text-muted-foreground" /><p className="mt-2 text-sm font-medium">フォルダ、ファイル、ZIPをここへドロップ</p><p className="mt-1 text-xs text-muted-foreground">元の場所は保存せず、App workspaceへコピーします。XLSMなどのバイナリもそのまま取り込めます。</p><Input id="project-app-source-files" type="file" multiple className="mx-auto mt-3 max-w-sm" onChange={(event) => acceptSourceFiles(Array.from(event.target.files || []).map((file) => ({ file, relativePath: file.webkitRelativePath || file.name })))} /></div>{sourceFiles.length > 0 && <p className="text-xs text-primary">{sourceFiles.length}ファイルを取り込みます</p>}</div>
+                  <div className="space-y-1.5 md:col-span-2"><div className="inline-flex items-center gap-1"><Label>既存ソースを取り込む（任意）</Label><HelpPopover label="既存ソースを取り込む">元の場所は保存せず、App workspaceへコピーします。XLSMなどのバイナリもそのまま取り込めます。</HelpPopover></div><div className={`rounded-xl border-2 border-dashed p-5 text-center transition-colors ${sourceDragging ? "border-primary bg-primary/10" : "border-border bg-muted/15"}`} onDragEnter={(event) => { event.preventDefault(); setSourceDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => { event.preventDefault(); setSourceDragging(false); }} onDrop={(event) => void handleSourceDrop(event)}><Upload className="mx-auto size-6 text-muted-foreground" /><p className="mt-2 text-sm font-medium">フォルダ、ファイル、ZIPをここへドロップ</p><Input id="project-app-source-files" type="file" multiple className="mx-auto mt-3 max-w-sm" onChange={(event) => acceptSourceFiles(Array.from(event.target.files || []).map((file) => ({ file, relativePath: file.webkitRelativePath || file.name })))} /></div>{sourceFiles.length > 0 && <p className="text-xs text-primary">{sourceFiles.length}ファイルを取り込みます</p>}</div>
                   <div className="flex justify-end gap-2 md:col-span-2"><Button type="button" variant="ghost" onClick={() => setShowCreate(false)}>キャンセル</Button><Button type="submit" disabled={creating || !name.trim()}>{creating && <Loader2 className="size-3.5 animate-spin" />} 作成してChatで開発</Button></div>
                 </form>
               </CardContent>

@@ -33,6 +33,9 @@ from ...services.agent_team_service import (
     agent_team_v3_subagents,
     resolve_agent_team_v3_route,
 )
+from ...services.agent_team_v3 import (
+    AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
+)
 from ...services.execution_profile_service import (
     validate_execution_route,
     validate_team_execution_profile,
@@ -50,6 +53,7 @@ from ...services.character_scope import (
     resolve_request_character_name,
     update_user_preferred_character,
 )
+from ...services.agent_root_lifecycle import AgentRootLifecycleError
 
 # Import CharacterSwitchManager (server.py と同じフォールバック付き)
 try:
@@ -147,6 +151,25 @@ def _load_character_catalog(config: Any) -> tuple[list[str], list[dict[str, str]
     return characters, [{"slug": name, "name": name} for name in characters]
 
 
+def _validate_harness_workspace_root(value: Any) -> str | None:
+    """Return an existing absolute directory path, or None to clear."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("harness_execution.workspace_root must be a string path")
+    raw = value.strip()
+    if chr(0) in raw:
+        raise ValueError("harness_execution.workspace_root is invalid")
+    from pathlib import Path
+
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("harness_execution.workspace_root must be an absolute path")
+    if not path.is_dir():
+        raise ValueError("harness_execution.workspace_root must be an existing directory")
+    return str(path)
+
+
 def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     """config / voice_status / characters / settings / character 切替ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
@@ -230,7 +253,11 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 _load_character_catalog,
                 server.config,
             )
-            current_character = await resolve_request_character_name(server, request)
+            current_character = await resolve_request_character_name(
+                server,
+                request,
+                character_options=character_options,
+            )
             if any(
                 option.get("slug") == "project_manager"
                 for option in character_options
@@ -280,6 +307,15 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "values": ["standard", "director"],
         },
         "agent_team.delegation_enabled": {"type": "bool"},
+        "local_agent_tasks.default_agent_id": {"type": "str"},
+        # Persistent command-workspace exemptions. Default is an empty
+        # document, which keeps the harness-root confinement.
+        "local_agent_tasks.command_workspace_unconfined": {"type": "object"},
+        # Trusted harness root for scoped local-agent commands
+        # (local_agent_task_adapter.command_workspace_root).  Admin-only like
+        # every key here; value must be an existing absolute directory, and
+        # null/"" clears it.
+        "harness_execution.workspace_root": {"type": "str"},
         "integrations.spotify.enabled": {"type": "bool"},
         # Team/Subagent/Profile topology is edited atomically through
         # /api/agent-team/config.  The old members/templates/model_groups
@@ -364,6 +400,8 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "values": ["openai", "local"],
         },
         "search.openai_model": {"type": "str"},
+        "search.jev_rerank_enabled": {"type": "bool"},
+        "search.jev_rerank_searxng_public": {"type": "bool"},
         # Agent/Tool toggles
         "agents.filesystem.enabled": {"type": "bool"},
         "agents.project_management.enabled": {"type": "bool"},
@@ -522,7 +560,15 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     is_admin=is_admin,
                 )
 
+            from ...services.command_workspace_confinement import stored_unconfined_setting
+
+            local_agent_tasks = {
+                "default_agent_id": server.config.get("local_agent_tasks.default_agent_id") or None,
+            }
+            if is_admin:
+                local_agent_tasks["command_workspace_unconfined"] = stored_unconfined_setting(server.config)
             settings = {
+                "local_agent_tasks": local_agent_tasks,
                 "external_llm": {
                     "auto_approve": server.config.get(
                         "external_llm.auto_approve", True
@@ -627,6 +673,8 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 },
                 "search": {
                     "provider": server.config.get("search.provider", "openai"),
+                    "jev_rerank_enabled": server.config.get("search.jev_rerank_enabled", False),
+                    "jev_rerank_searxng_public": server.config.get("search.jev_rerank_searxng_public", False),
                     "openai_model": str(
                         server.config.get("search.openai_model") or ""
                     ).strip(),
@@ -732,6 +780,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             },
             "capability_catalog": AGENT_TEAM_CAPABILITY_CATALOG,
         }
+        if AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER in section:
+            envelope[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = section[
+                AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER
+            ]
         return JSONResponse(
             {
                 "success": True,
@@ -772,6 +824,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "orchestration_mode",
             "teams",
             "subagents",
+            AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
         }
         readonly_fields = {
             "main_effective_route",
@@ -794,6 +847,13 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             raise HTTPException(status_code=400, detail="Only Agent Team schema_version 3 is supported")
         if "delegation_enabled" in raw and not isinstance(raw.get("delegation_enabled"), bool):
             raise HTTPException(status_code=400, detail="delegation_enabled must be boolean")
+        seed_marker = raw.get(AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER)
+        if seed_marker is not None and (
+            isinstance(seed_marker, bool)
+            or not isinstance(seed_marker, int)
+            or seed_marker < 0
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Agent Team preset seed marker")
         orchestration_mode = str(raw.get("orchestration_mode", "standard") or "standard").strip().lower()
         if orchestration_mode not in {"standard", "director"}:
             raise HTTPException(status_code=400, detail="Invalid orchestration_mode")
@@ -853,7 +913,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 raise HTTPException(status_code=400, detail=f"activation.contexts must be string[]: {key}")
             normalized_contexts = {str(item).strip().lower() for item in contexts if str(item).strip()}
             unknown_contexts = normalized_contexts - set(AGENT_TEAM_CONTEXT_TAGS)
-            if unknown_contexts:
+            # The retired Story context may survive in persisted schema-v3
+            # graphs. Preserve its exact stored Team on read/modify/write;
+            # never allow a new assignment, edited Team or arbitrary old tag.
+            retained_story_team = unknown_contexts == {"story"} and any(
+                str(existing.get("team_id")) == str(key) and existing == team
+                for existing in agent_team_v3_teams(server.config)
+            )
+            if unknown_contexts and not retained_story_team:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Unknown activation context for {key}: {sorted(unknown_contexts)[0]}",
@@ -1040,14 +1107,28 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             detail=f"Unsupported provider for {team_id}/{profile_key}/{override_key}",
                         )
 
+        canonical_payload = {
+            "schema_version": AGENT_TEAM_SCHEMA_VERSION,
+            "delegation_enabled": bool(raw.get("delegation_enabled", False)),
+            "orchestration_mode": orchestration_mode,
+            "teams": teams_raw,
+            "subagents": subagents_raw,
+        }
+        if seed_marker is not None:
+            canonical_payload[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = seed_marker
+        else:
+            # Preserve the durable marker for older clients that send a
+            # read/modify/write payload without this newly writable field.
+            existing_section = server.config.get("agent_team", {}) or {}
+            existing_marker = (
+                existing_section.get(AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER)
+                if isinstance(existing_section, dict)
+                else None
+            )
+            if isinstance(existing_marker, int) and not isinstance(existing_marker, bool):
+                canonical_payload[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = existing_marker
         candidate = normalize_agent_team_v3(
-            {
-                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-                "delegation_enabled": bool(raw.get("delegation_enabled", False)),
-                "orchestration_mode": orchestration_mode,
-                "teams": teams_raw,
-                "subagents": subagents_raw,
-            },
+            canonical_payload,
             global_execution_profiles=server.config.get("execution_profiles"),
         )
         if hasattr(server.config, "save_to_file"):
@@ -1086,6 +1167,34 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 status_code=403, detail="Administrator privileges required"
             )
 
+        if key == "local_agent_tasks.command_workspace_unconfined":
+            # Auth-disabled mode still cannot publish this exemption.
+            if not await server._is_admin_user(request):
+                raise HTTPException(status_code=403, detail="Administrator privileges required")
+
+        if key == "local_agent_tasks.default_agent_id":
+            # This global selection remains admin-only in auth-disabled mode.
+            if not await server._is_admin_user(request):
+                raise HTTPException(status_code=403, detail="Administrator privileges required")
+            from ...services.local_agent_task_adapter import validate_default_agent_id
+            from ...services.local_agent_tasks import LocalAgentTaskError
+            from ...services.conversation_agent_service import ConversationAgentError
+            from ...services.agent_model_routing import AgentModelRouteError
+
+            user_info = await server._get_user_info_from_request(request)
+            try:
+                value = await validate_default_agent_id(
+                    server.config, value,
+                    actor_user_id=(user_info or {}).get("id"), actor_role="admin",
+                )
+            except (LocalAgentTaskError, ConversationAgentError, AgentModelRouteError) as exc:
+                raise HTTPException(
+                    status_code=getattr(
+                        exc, "http_status", getattr(exc, "status_code", 409)
+                    ),
+                    detail={"code": exc.code, "message": "The default local Agent selection is invalid"},
+                ) from None
+
         # Validate the key is allowed
         if key not in ALLOWED_SETTINGS:
             raise HTTPException(
@@ -1111,7 +1220,12 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         f"Value must be one of: {setting_schema['values']}"
                     )
             elif setting_schema["type"] == "str":
-                if key == "cloud_advisor.model":
+                if key == "local_agent_tasks.default_agent_id":
+                    # Already validated; preserve null as an explicit clear.
+                    pass
+                elif key == "harness_execution.workspace_root":
+                    value = _validate_harness_workspace_root(value)
+                elif key == "cloud_advisor.model":
                     # Empty means use canonical_model_for_provider() at
                     # consultation time; this is an intentional setting.
                     value = "" if value is None else str(value).strip()
@@ -1160,6 +1274,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             elif setting_schema["type"] == "object":
                 if key == "browser_agent":
                     value = validate_browser_settings_update(value)
+                if key == "local_agent_tasks.command_workspace_unconfined":
+                    from ...services.command_workspace_confinement import (
+                        ensure_unconfined_subjects,
+                        normalize_unconfined_setting,
+                    )
+
+                    value = normalize_unconfined_setting(value)
+                    await ensure_unconfined_subjects(value)
                 if not isinstance(value, dict):
                     raise ValueError("Value must be an object")
                 if key == "llm_provider_visibility":
@@ -1294,6 +1416,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # Only update in memory
                 server.config.set(key, value)
 
+            if key == "browser_agent":
+                from ...services.pc_bridge_service import get_pc_bridge_hub
+                await get_pc_bridge_hub().sync_dedicated_gate()
+
             logger.info(
                 "Setting updated: %s = %s (persist=%s)",
                 key,
@@ -1341,6 +1467,58 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 (user_info or {}).get("id")
                 or ("default_user" if not auth_enabled else "")
             ).strip()
+
+            # Resolve the actual target session before changing global or
+            # preferred-character state.  The durable Root row is the
+            # authority; a client-supplied session marker is only a lookup
+            # hint.  This prevents a Root Character mutation from partially
+            # applying the global setting before the 409 is returned.
+            if user_id:
+                from ...memory.conversation_repository import ConversationRepository
+                from ...memory.database import get_database_manager
+                from ...memory.models import ConversationSession
+                from ...services.agent_root_lifecycle import guard_private_root_update
+
+                target_lookup = ConversationRepository()
+                requested_session_id = request.query_params.get("session_id")
+                try:
+                    if requested_session_id:
+                        target_for_guard = await target_lookup.get_session_by_id(
+                            requested_session_id,
+                            with_messages=False,
+                        )
+                    else:
+                        active_for_guard = await target_lookup.get_user_sessions(
+                            user_id,
+                            limit=20,
+                            include_inactive=False,
+                        )
+                        target_for_guard = next(
+                            (
+                                candidate
+                                for candidate in active_for_guard
+                                if not bool(getattr(candidate, "is_group_chat", False))
+                            ),
+                            None,
+                        )
+                except (TypeError, ValueError):
+                    target_for_guard = None
+                if target_for_guard is not None and str(target_for_guard.user_id) == user_id:
+                    guard_session = await get_database_manager().get_session()
+                    try:
+                        locked_target = await guard_session.get(
+                            ConversationSession,
+                            target_for_guard.id,
+                        )
+                        if locked_target is not None:
+                            await guard_private_root_update(
+                                guard_session,
+                                locked_target,
+                                fields={"character_name"},
+                                actor_user_id=user_id,
+                            )
+                    finally:
+                        await guard_session.close()
 
             if auth_enabled is False or is_admin:
                 # Keep manager callbacks on the FastAPI event-loop thread.
@@ -1415,17 +1593,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     target_session = None
 
                     def is_isolated_session(session) -> bool:
-                        session_character = str(
-                            getattr(session, "character_name", "") or ""
-                        )
-                        session_title = str(getattr(session, "title", "") or "")
-                        return bool(
-                            getattr(session, "is_group_chat", False)
-                            or session_character.startswith(("story_", "trpg_"))
-                            or session_title.startswith(
-                                ("[シナリオ]", "[執筆]", "[TRPG]")
-                            )
-                        )
+                        return bool(getattr(session, "is_group_chat", False))
 
                     if requested_session_id:
                         target_session = await repo.get_session_by_id(
@@ -1461,10 +1629,13 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             str(target_session.id),
                             character_name=canonical_character_name,
                             touch_activity=False,
+                            actor_user_id=user_id,
                         )
                         if not updated:
                             raise RuntimeError("対象セッションを更新できませんでした")
                         session_synchronized = True
+                except AgentRootLifecycleError:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "Failed to synchronize active conversation character: %s",
@@ -1510,6 +1681,11 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 exc.request_id or _request_correlation_ids(request)[0] or "-",
             )
             raise _character_lookup_http_exception(exc, request=request) from None
+        except AgentRootLifecycleError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except Exception as exc:
             # Keep unrelated switch failures generic; in particular, do not
             # echo a raw SQLAlchemy/DBAPI message that may contain a DSN.

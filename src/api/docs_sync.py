@@ -281,6 +281,7 @@ def _encode_pull_cursor(
     snapshot_digest: str,
     snapshot_token: Optional[str] = None,
     scope_revision: Optional[str] = None,
+    node_page: Optional[dict[str, Any]] = None,
 ) -> str:
     """Encode a stable keyset position as an opaque, self-validating cursor.
 
@@ -302,6 +303,8 @@ def _encode_pull_cursor(
         cursor_payload["snapshot_token"] = snapshot_token
     if scope_revision:
         cursor_payload["scope_revision"] = scope_revision
+    if node_page is not None:
+        cursor_payload["node_page"] = node_page
     payload = json.dumps(
         cursor_payload,
         ensure_ascii=True,
@@ -318,6 +321,7 @@ def _decode_pull_cursor(
     snapshot_digest: str,
     snapshot_token: Optional[str] = None,
     scope_revision: Optional[str] = None,
+    node_page_shape: Optional[str] = None,
 ) -> Optional[list[str]]:
     if not cursor:
         return None
@@ -351,6 +355,14 @@ def _decode_pull_cursor(
         scope_revision,
     }:
         raise ValueError("Docs sync scope changed; restart pull")
+    if node_page_shape is not None:
+        node_page = payload.get("node_page")
+        if (
+            not isinstance(node_page, dict)
+            or node_page.get("order") != "rank-id"
+            or node_page.get("shape") != node_page_shape
+        ):
+            raise ValueError("Docs sync snapshot changed; restart pull")
     return payload["position"]
 
 
@@ -835,37 +847,8 @@ async def pull_docs_table(
     effective_scope_revision = scope_revision or scope_fingerprint
 
     if table == "knowledge_nodes":
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeNode.id,
-                    KnowledgeNode.updated_at,
-                    KnowledgeNode.is_explicit_blank,
-                ).where(
-                    KnowledgeNode.docs_library_id == docs_library_id,
-                    project_access,
-                )
-            )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{id_}:{_digest_dt(updated_at)}:{int(bool(is_explicit_blank))}"
-                for id_, updated_at, is_explicit_blank in digest_rows
-            ]
-        )
-        effective_force_full = _effective_force_full(
-            force_full,
-            client_digest,
-            digest,
-            user_id=user_id,
-        )
-        stmt = select(KnowledgeNode).where(
-            KnowledgeNode.docs_library_id == docs_library_id,
-            project_access,
-        )
-        # 大規模workspaceの再同期中でもページ一覧を先に復元できるよう、
-        # mobile一覧対象root→その他root→子孫の順に送る。cursorにも同じrankを
-        # 含めて全ページを重複・欠落なく走査する。
+        # Content timestamps must not move a row across a page boundary while
+        # a user edits it.  Structural/ACL changes still invalidate the run.
         mobile_node_type = or_(
             KnowledgeNode.node_type.is_(None),
             KnowledgeNode.node_type.notin_(("search", "day", "system")),
@@ -880,6 +863,94 @@ async def pull_docs_table(
             (KnowledgeNode.parent_id.is_(None), 1),
             else_=2,
         )
+        digest_rows = (
+            await session.execute(
+                select(
+                    KnowledgeNode.id,
+                    KnowledgeNode.updated_at,
+                    KnowledgeNode.is_explicit_blank,
+                    KnowledgeNode.parent_id,
+                    KnowledgeNode.root_page_id,
+                    KnowledgeNode.project_id,
+                    KnowledgeNode.created_by,
+                    KnowledgeNode.archived_at,
+                    root_rank.label("pull_rank"),
+                ).where(
+                    KnowledgeNode.docs_library_id == docs_library_id,
+                    project_access,
+                )
+            )
+        ).all()
+        digest = _docs_digest(
+            [
+                f"{id_}:{_digest_dt(updated_at)}:{int(bool(is_explicit_blank))}"
+                for id_, updated_at, is_explicit_blank, *_ in digest_rows
+            ]
+        )
+        shape_digest = _docs_digest(
+            [
+                f"{row.id}:{row.parent_id}:{row.root_page_id}:{row.project_id}:"
+                f"{row.created_by}:{int(row.archived_at is not None)}:{row.pull_rank}"
+                for row in digest_rows
+            ]
+        )
+        envelope = pull_cursor_envelope(cursor) if paginate else None
+        stable_order = paginate and (
+            not cursor or bool(envelope and "node_page" in envelope)
+        )
+        snapshot_digest = digest
+        digest_matched = not force_full and client_digest is not None and client_digest == digest
+        effective_force_full = _effective_force_full(
+            force_full,
+            client_digest,
+            digest,
+            user_id=user_id,
+        )
+        if stable_order and cursor:
+            # The initial digest match also controls deletion reconciliation.
+            # A resumed client resends the saved run digest, not necessarily
+            # the digest it supplied when the run began.
+            node_page = envelope.get("node_page")
+            snapshot_digest = envelope.get("snapshot_digest")
+            if (
+                not isinstance(node_page, dict)
+                or not isinstance(node_page.get("force_full"), bool)
+                or not isinstance(node_page.get("digest_matched"), bool)
+                or not isinstance(snapshot_digest, str)
+                or len(snapshot_digest) != 64
+                or any(char not in "0123456789abcdef" for char in snapshot_digest)
+                or node_page.get("since") is not None
+                and not isinstance(node_page.get("since"), str)
+            ):
+                raise ValueError("Invalid Docs sync cursor")
+            effective_force_full = node_page["force_full"]
+            digest_matched = node_page["digest_matched"]
+            try:
+                since = (
+                    datetime.fromisoformat(node_page["since"])
+                    if node_page.get("since")
+                    else None
+                )
+            except ValueError as exc:
+                raise ValueError("Invalid Docs sync cursor") from exc
+        node_page = (
+            {
+                "order": "rank-id",
+                "shape": shape_digest,
+                "force_full": effective_force_full,
+                "digest_matched": digest_matched,
+                "since": _iso(since),
+            }
+            if stable_order
+            else None
+        )
+        stmt = select(KnowledgeNode).where(
+            KnowledgeNode.docs_library_id == docs_library_id,
+            project_access,
+        )
+        # 大規模workspaceの再同期中でもページ一覧を先に復元できるよう、
+        # mobile一覧対象root→その他root→子孫の順に送る。cursorにも同じrankを
+        # 含めて全ページを重複・欠落なく走査する。
         if since and not effective_force_full:
             stmt = stmt.where(
                 or_(KnowledgeNode.updated_at > since, KnowledgeNode.archived_at > since)
@@ -887,50 +958,70 @@ async def pull_docs_table(
         if paginate:
             cursor_parts = _decode_pull_cursor(
                 cursor,
-                3,
+                2 if stable_order else 3,
                 scope_digest=scope_fingerprint,
-                snapshot_digest=digest,
+                snapshot_digest=snapshot_digest,
                 snapshot_token=snapshot_token,
                 scope_revision=effective_scope_revision,
+                node_page_shape=shape_digest if stable_order else None,
             )
             if cursor_parts:
                 cursor_root_rank = int(cursor_parts[0])
-                cursor_updated_at = datetime.fromisoformat(cursor_parts[1])
-                cursor_id = UUID(cursor_parts[2])
+                cursor_id = UUID(cursor_parts[-1])
+                position_after = KnowledgeNode.id > cursor_id
+                if not stable_order:
+                    cursor_updated_at = datetime.fromisoformat(cursor_parts[1])
+                    position_after = or_(
+                        KnowledgeNode.updated_at > cursor_updated_at,
+                        and_(
+                            KnowledgeNode.updated_at == cursor_updated_at,
+                            KnowledgeNode.id > cursor_id,
+                        ),
+                    )
                 stmt = stmt.where(
                     or_(
                         root_rank > cursor_root_rank,
                         and_(
                             root_rank == cursor_root_rank,
-                            or_(
-                                KnowledgeNode.updated_at > cursor_updated_at,
-                                and_(
-                                    KnowledgeNode.updated_at == cursor_updated_at,
-                                    KnowledgeNode.id > cursor_id,
-                                ),
-                            ),
+                            position_after,
                         ),
                     )
                 )
-            stmt = stmt.order_by(
-                root_rank.asc(), KnowledgeNode.updated_at.asc(), KnowledgeNode.id.asc()
-            ).limit(limit + 1)
+            order = (
+                [root_rank.asc(), KnowledgeNode.id.asc()]
+                if stable_order
+                else [
+                    root_rank.asc(),
+                    KnowledgeNode.updated_at.asc(),
+                    KnowledgeNode.id.asc(),
+                ]
+            )
+            stmt = stmt.order_by(*order).limit(limit + 1)
         else:
             stmt = stmt.order_by(KnowledgeNode.updated_at.desc()).limit(limit)
-        rows = list((await session.execute(stmt)).scalars().all())
+        # A matching digest certifies the client's visible set.  On the first
+        # page there is therefore no content to replay, and skipping the ORM
+        # row fetch avoids rebuilding up to ``limit`` encrypted rows.  A
+        # continuation cursor still has to walk its captured snapshot.
+        rows = [] if digest_matched and not cursor else list(
+            (await session.execute(stmt)).scalars().all()
+        )
         next_cursor = None
         if paginate:
             rows, next_cursor = _split_page(
                 rows,
                 limit,
                 lambda row: _encode_pull_cursor(
-                    _node_pull_rank(row),
-                    row.updated_at,
-                    row.id,
+                    *(
+                        [_node_pull_rank(row), row.id]
+                        if stable_order
+                        else [_node_pull_rank(row), row.updated_at, row.id]
+                    ),
                     scope_digest=scope_fingerprint,
-                    snapshot_digest=digest,
+                    snapshot_digest=snapshot_digest,
                     snapshot_token=snapshot_token,
                     scope_revision=effective_scope_revision,
+                    node_page=node_page,
                 ),
             )
         sync_workspace = workspace_row or await session.get(
@@ -961,28 +1052,26 @@ async def pull_docs_table(
             "cursor": next_cursor,
             "authoritative_count": len(digest_rows),
         }
-        if not effective_force_full and client_digest is not None and client_digest == digest:
-            # 権威状態一致。changes は since 差分のまま返すが、
-            # 権威 ID 集合の全量返却は省く（定常時の応答をほぼ空にする）。
+        if digest_matched:
+            # 権威状態一致。初回ページは changes も空にし、継続 cursor の
+            # snapshot walk だけは上の分岐で維持する。権威 ID 集合の全量も省く。
             if next_cursor is None:
-                result["authoritative_digest"] = digest
+                result["authoritative_digest"] = snapshot_digest
             return _annotate_docs_page(
                 result,
-                snapshot_revision=digest,
+                snapshot_revision=snapshot_digest,
                 snapshot_token=snapshot_token,
                 scope_revision=effective_scope_revision,
             )
         # 不一致・未指定: ハード削除を reconcile できるよう権威 ID 集合を全量返す。
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [
-                    str(id_) for id_, _, _ in digest_rows
-                ]
+                result["authoritative_ids"] = [str(row.id) for row in digest_rows]
             result["authoritative_scope_id"] = str(docs_library_id)
-            result["authoritative_digest"] = digest
+            result["authoritative_digest"] = snapshot_digest
         return _annotate_docs_page(
             result,
-            snapshot_revision=digest,
+            snapshot_revision=snapshot_digest,
             snapshot_token=snapshot_token,
             scope_revision=effective_scope_revision,
         )
@@ -1783,10 +1872,17 @@ async def pull_docs_table(
 class DocsOperationError(Exception):
     """Docs 書き込みの入力不正・not found を表す（status_code 付き）。"""
 
-    def __init__(self, message: str, status_code: int = 400):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        *,
+        reason_code: str | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.reason_code = reason_code
 
 
 _SOURCE_REF_MAX_ITEMS = 64
@@ -1965,6 +2061,7 @@ async def _ensure_docs_project_allowed(
         raise DocsOperationError(
             "InboxはDocsの案件保存先にできません。実案件を指定してください。",
             status_code=409,
+            reason_code="docs_business_conflict",
         )
 
 
@@ -2161,6 +2258,7 @@ async def ensure_docs_operation_is_fresh(
         raise DocsOperationError(
             "Docs base_updated_at is required for an existing entity",
             status_code=409,
+            reason_code="docs_base_missing",
         )
     current = _parse_base_updated_at(entity.get("updated_at"))
     if deleted and action == "delete":
@@ -2174,6 +2272,7 @@ async def ensure_docs_operation_is_fresh(
         raise DocsOperationError(
             "Docs entity was updated on the server",
             status_code=409,
+            reason_code="docs_cas_stale",
         )
 
 
@@ -2216,6 +2315,7 @@ async def _active_project_pointer(
         raise DocsOperationError(
             "複数のProjectが同じDocs nodeを参照しているため操作を中止しました",
             status_code=409,
+            reason_code="docs_business_conflict",
         )
     return pointer_rows[0] if pointer_rows else None
 
@@ -2259,6 +2359,7 @@ async def _load_canonical_project_node(
         raise DocsOperationError(
             "Project Docsのcanonical rootが未初期化または不正です",
             status_code=409,
+            reason_code="docs_business_conflict",
         )
     return node
 
@@ -2292,7 +2393,11 @@ async def _ensure_canonical_project_parent(
     except PermissionError as exc:
         raise DocsOperationError(str(exc), status_code=403) from exc
     except ValueError as exc:
-        raise DocsOperationError(str(exc), status_code=409) from exc
+        raise DocsOperationError(
+            str(exc),
+            status_code=409,
+            reason_code="docs_business_conflict",
+        ) from exc
     if node.docs_library_id != docs_library_id:
         raise DocsOperationError(
             "Project Docsは案件所有者のPersonal Docs Libraryに限られます",
@@ -2417,6 +2522,7 @@ async def _update_app_readme_from_docs(
             raise DocsOperationError(
                 "README.mdがDocsの編集開始後に変更されています。先に競合を解決してください",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         # README.md が正本、Docs Node は同期ビュー。
         # checkpoint / Node同期のどちらかが失敗したら、書き込み前の README を
@@ -2611,6 +2717,7 @@ async def _assert_docs_operation_acl(
                 raise DocsOperationError(
                     "InboxはDocsの案件保存先にできません。実案件を指定してください。",
                     status_code=409,
+                    reason_code="docs_business_conflict",
                 )
         elif not await library_can_write(session, library, user_id):
             raise DocsOperationError("Docs workspaceへの書き込み権限がありません", status_code=403)
@@ -2692,6 +2799,7 @@ async def _apply_node_operation(
                 raise DocsOperationError(
                     "完了済みProjectのDocsには新しいnodeを作成できません",
                     status_code=409,
+                    reason_code="docs_business_conflict",
                 )
         if (
             "project_id" in payload
@@ -2703,7 +2811,11 @@ async def _apply_node_operation(
         if parent_ref:
             parent = await _get_node(service, docs_library_id, parent_ref)
             if parent.archived_at is not None:
-                raise DocsOperationError("アーカイブ済みnodeの下には作成できません", status_code=409)
+                raise DocsOperationError(
+                    "アーカイブ済みnodeの下には作成できません",
+                    status_code=409,
+                    reason_code="docs_business_conflict",
+                )
             await assert_generic_allowed(parent, "docs_rest_create")
         if requested_project_id is not None:
             # Explicit Project creates always resolve the canonical Project
@@ -2794,6 +2906,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "案件情報の正本/stale nodeは通常のDocs操作でアーカイブ/削除できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         await assert_generic_allowed(node, "docs_rest_archive")
         # オフラインで update → archive が統合された場合も、更新内容を先に
@@ -2818,6 +2931,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "アクティブProjectのcanonical情報rootは通常のDocs操作で移動できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         await assert_generic_allowed(node, "docs_rest_move")
         new_parent_ref = payload.get("new_parent_id") or payload.get("parent_id")
@@ -2825,9 +2939,17 @@ async def _apply_node_operation(
             raise DocsOperationError("new_parent_id is required", status_code=400)
         new_parent = await _get_node(service, docs_library_id, new_parent_ref)
         if new_parent.archived_at is not None:
-            raise DocsOperationError("アーカイブ済みnodeの下には移動できません", status_code=409)
+            raise DocsOperationError(
+                "アーカイブ済みnodeの下には移動できません",
+                status_code=409,
+                reason_code="docs_business_conflict",
+            )
         if str(getattr(new_parent, "system_key", "") or "").strip() == "project_information_root":
-            raise DocsOperationError("案件情報hub直下への通常のDocs moveはできません", status_code=409)
+            raise DocsOperationError(
+                "案件情報hub直下への通常のDocs moveはできません",
+                status_code=409,
+                reason_code="docs_business_conflict",
+            )
         await assert_generic_allowed(new_parent, "docs_rest_move")
         identity_system_key = str(getattr(node, "system_key", "") or "").strip()
         if identity_system_key == "project_information_root" or identity_system_key.startswith(
@@ -2836,6 +2958,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "案件情報hubは通常のDocs moveでは移動できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         # Moving an ordinary ancestor rewrites root_page_id for its complete
         # subtree.  Fence that operation when any descendant is a persisted
@@ -2866,6 +2989,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "Projectが参照するDocs nodeを含むため通常のDocs moveでは移動できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         identity_result = await service.session.execute(
             text(
@@ -2896,6 +3020,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "Project canonical/stale identityを含むDocs subtreeは通常のmoveで変更できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         node_project_id = parse_uuid(node.project_id)
         parent_project_id = parse_uuid(new_parent.project_id)
@@ -2952,6 +3077,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "stale案件情報の正本nodeは専用クリーンアップ/修復経路でのみ変更できます",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         if active_project_pointer is not None and (
             active_project_pointer.deleted_at is not None
@@ -2960,6 +3086,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "完了/削除済みProjectのcanonical情報rootは通常のDocs操作では変更できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         requested_title = (
             str(payload.get("title") or "")
@@ -2990,6 +3117,7 @@ async def _apply_node_operation(
                 raise DocsOperationError(
                     "アクティブProjectのcanonical情報rootのProject identityは変更できません",
                     status_code=409,
+                    reason_code="docs_business_conflict",
                 )
             if current_project_id is None and requested_project_id is not None:
                 raise DocsOperationError(
@@ -3010,6 +3138,7 @@ async def _apply_node_operation(
             raise DocsOperationError(
                 "アクティブProjectのcanonical情報rootは通常のDocs操作で移動できません",
                 status_code=409,
+                reason_code="docs_business_conflict",
             )
         if (
             "parent_id" in payload
@@ -3033,7 +3162,11 @@ async def _apply_node_operation(
             final_parent = await _get_node(service, docs_library_id, str(node.parent_id))
         if final_parent is not None:
             if final_parent.archived_at is not None:
-                raise DocsOperationError("アーカイブ済みnodeの下には移動できません", status_code=409)
+                raise DocsOperationError(
+                    "アーカイブ済みnodeの下には移動できません",
+                    status_code=409,
+                    reason_code="docs_business_conflict",
+                )
             if (
                 str(getattr(final_parent, "system_key", "") or "").strip()
                 == "project_information_root"
@@ -3042,6 +3175,7 @@ async def _apply_node_operation(
                 raise DocsOperationError(
                     "案件情報hub直下にはProject経由でのみ作成/移動できます",
                     status_code=409,
+                    reason_code="docs_business_conflict",
                 )
             await assert_generic_allowed(final_parent, "docs_rest_update")
 
@@ -3179,6 +3313,7 @@ async def _apply_node_supertag_operation(
         raise DocsOperationError(
             "案件情報の正本nodeは通常のDocs supertag操作で変更できません",
             status_code=409,
+            reason_code="docs_business_conflict",
         )
     from ..services.managed_docs_policy import assert_managed_docs_tree_mutation_allowed
 
@@ -3268,6 +3403,7 @@ async def _apply_field_value_operation(
         raise DocsOperationError(
             "案件情報の正本nodeのProject/Page Role fieldは専用Project APIで管理されます",
             status_code=409,
+            reason_code="docs_business_conflict",
         )
     from ..services.managed_docs_policy import assert_managed_docs_tree_mutation_allowed
 

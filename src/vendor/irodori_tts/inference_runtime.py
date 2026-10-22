@@ -6,10 +6,9 @@ import json
 import math
 import secrets
 import threading
-from contextlib import contextmanager
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +26,7 @@ from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
 from .duration import build_duration_features
 from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
+from .meanflow import sample_euler_meanflow
 from .model import TextToLatentRFDiT
 from .quantization import (
     is_torchao_quantized_state_dict,
@@ -200,7 +200,7 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
-    # Explicit per-runtime Hugging Face cache root.  Kept last for positional
+    # Explicit per-runtime Hugging Face cache root. Kept last for positional
     # compatibility with the upstream RuntimeKey constructor.
     cache_dir: str | None = None
 
@@ -228,7 +228,7 @@ class SamplingRequest:
     max_ref_seconds: float | None = None
     max_text_len: int | None = None
     max_caption_len: int | None = None
-    num_steps: int = 40
+    num_steps: int | None = None
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
@@ -548,8 +548,7 @@ def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
         return raw, None
     if len(parts) != 3:
         raise ValueError(
-            "Hugging Face checkpoint subfolders must use owner/repo/subfolder format: "
-            f"{source!r}"
+            f"Hugging Face checkpoint subfolders must use owner/repo/subfolder format: {source!r}"
         )
     return "/".join(parts[:2]), "/".join(parts[2:])
 
@@ -701,9 +700,7 @@ class InferenceRuntime:
                 repo_id=caption_tokenizer_source,
                 add_bos=model_cfg.caption_add_bos_resolved,
                 local_files_only=caption_tokenizer_is_local,
-                revision=(
-                    None if caption_tokenizer_is_local else model_cfg.text_encoder_revision
-                ),
+                revision=(None if caption_tokenizer_is_local else model_cfg.text_encoder_revision),
                 cache_dir=key.cache_dir,
             )
             if (
@@ -858,9 +855,7 @@ class InferenceRuntime:
             if req.max_ref_seconds is None
             else float(req.max_ref_seconds)
         )
-        wav_paths = ([req.ref_wav] if req.ref_wav is not None else []) + list(
-            req.ref_wavs or []
-        )
+        wav_paths = ([req.ref_wav] if req.ref_wav is not None else []) + list(req.ref_wavs or [])
         latent_paths = ([req.ref_latent] if req.ref_latent is not None else []) + list(
             req.ref_latents or []
         )
@@ -897,9 +892,7 @@ class InferenceRuntime:
             return ref_latent_patched, ref_mask
 
         if not wav_paths and not latent_paths:
-            raise ValueError(
-                "Specify ref_wav/ref_wavs/ref_latent/ref_latents, or set no_ref=True."
-            )
+            raise ValueError("Specify ref_wav/ref_wavs/ref_latent/ref_latents, or set no_ref=True.")
 
         max_ref_latent_steps = None
         if max_ref_seconds > 0:
@@ -924,8 +917,7 @@ class InferenceRuntime:
                 latent_pieces.append(piece.to(dtype=runtime_dtype))
                 if (
                     max_ref_latent_steps is not None
-                    and sum(int(item.shape[1]) for item in latent_pieces)
-                    >= max_ref_latent_steps
+                    and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
                 ):
                     break
             ref_latent = torch.cat(latent_pieces, dim=1)
@@ -965,8 +957,7 @@ class InferenceRuntime:
                 latent_pieces.append(piece)
                 if (
                     max_ref_latent_steps is not None
-                    and sum(int(item.shape[1]) for item in latent_pieces)
-                    >= max_ref_latent_steps
+                    and sum(int(item.shape[1]) for item in latent_pieces) >= max_ref_latent_steps
                 ):
                     break
             ref_latent = torch.cat(latent_pieces, dim=1)
@@ -1056,6 +1047,10 @@ class InferenceRuntime:
                 log_fn(msg)
 
         messages: list[str] = []
+        is_meanflow = self.model_cfg.flow_parameterization == "meanflow"
+        num_steps = (4 if is_meanflow else 40) if req.num_steps is None else int(req.num_steps)
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be > 0, got {req.num_steps}")
         _log(
             (
                 "[runtime] start synthesize "
@@ -1069,7 +1064,7 @@ class InferenceRuntime:
                 self.watermarker.ready,
                 req.cfg_guidance_mode,
                 req.seconds,
-                req.num_steps,
+                num_steps,
                 "random" if req.seed is None else int(req.seed),
                 req.num_candidates,
                 req.decode_mode,
@@ -1161,22 +1156,37 @@ class InferenceRuntime:
                         f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
                     )
 
-        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-        if cfg_mode not in {"independent", "joint", "alternating"}:
-            raise ValueError(
-                f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
-                "Expected one of: independent, joint, alternating."
-            )
+        if is_meanflow:
+            cfg_mode = "independent"
+            cfg_scale_text = 0.0
+            cfg_scale_caption = 0.0
+            cfg_scale_speaker = 0.0
+            scale_messages = [
+                f"info: MeanFlow checkpoint uses fused training-time CFG with "
+                f"{num_steps} NFE; runtime CFG and RF sampler controls are ignored."
+            ]
+            speaker_kv_scale = None
+            speaker_kv_min_t = None
+            speaker_kv_max_layers = None
+        else:
+            cfg_mode = str(req.cfg_guidance_mode).strip().lower()
+            if cfg_mode not in {"independent", "joint", "alternating"}:
+                raise ValueError(
+                    f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
+                    "Expected one of: independent, joint, alternating."
+                )
 
-        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
-            cfg_guidance_mode=cfg_mode,
-            cfg_scale_text=req.cfg_scale_text,
-            cfg_scale_caption=req.cfg_scale_caption,
-            cfg_scale_speaker=req.cfg_scale_speaker,
-            cfg_scale=req.cfg_scale,
-            use_caption_condition=has_caption_text,
-            use_speaker_condition=use_speaker_for_request,
-        )
+            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = (
+                resolve_cfg_scales(
+                    cfg_guidance_mode=cfg_mode,
+                    cfg_scale_text=req.cfg_scale_text,
+                    cfg_scale_caption=req.cfg_scale_caption,
+                    cfg_scale_speaker=req.cfg_scale_speaker,
+                    cfg_scale=req.cfg_scale,
+                    use_caption_condition=has_caption_text,
+                    use_speaker_condition=use_speaker_for_request,
+                )
+            )
         messages.extend(scale_messages)
         for msg in scale_messages:
             _log(msg)
@@ -1356,39 +1366,61 @@ class InferenceRuntime:
                     _log(msg)
 
             t0 = _measure_start(self.model_device)
-            z_patched = sample_euler_rf_cfg(
-                model=self.model,
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                sequence_length=patched_steps,
-                caption_input_ids=caption_ids,
-                caption_mask=caption_mask,
-                speaker_state_override=speaker_state_override,
-                speaker_mask_override=speaker_mask_override,
-                speaker_uncond_mode=req.speaker_uncond_mode,
-                num_steps=int(req.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_guidance_mode=cfg_mode,
-                cfg_min_t=float(req.cfg_min_t),
-                cfg_max_t=float(req.cfg_max_t),
-                seed=used_seed,
-                truncation_factor=truncation_factor,
-                rescale_k=rescale_k,
-                rescale_sigma=rescale_sigma,
-                use_context_kv_cache=bool(req.context_kv_cache),
-                speaker_kv_scale=speaker_kv_scale,
-                speaker_kv_max_layers=speaker_kv_max_layers,
-                speaker_kv_min_t=speaker_kv_min_t,
-                t_schedule_mode=str(req.t_schedule_mode),
-                sway_coeff=float(req.sway_coeff),
-            )
+            if self.model_cfg.flow_parameterization == "meanflow":
+                z_patched = sample_euler_meanflow(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    sequence_length=patched_steps,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=req.speaker_uncond_mode,
+                    num_steps=num_steps,
+                    seed=used_seed,
+                )
+            else:
+                z_patched = sample_euler_rf_cfg(
+                    model=self.model,
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    sequence_length=patched_steps,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    speaker_state_override=speaker_state_override,
+                    speaker_mask_override=speaker_mask_override,
+                    speaker_uncond_mode=req.speaker_uncond_mode,
+                    num_steps=num_steps,
+                    cfg_scale_text=cfg_scale_text,
+                    cfg_scale_caption=cfg_scale_caption,
+                    cfg_scale_speaker=cfg_scale_speaker,
+                    cfg_guidance_mode=cfg_mode,
+                    cfg_min_t=float(req.cfg_min_t),
+                    cfg_max_t=float(req.cfg_max_t),
+                    seed=used_seed,
+                    truncation_factor=truncation_factor,
+                    rescale_k=rescale_k,
+                    rescale_sigma=rescale_sigma,
+                    use_context_kv_cache=bool(req.context_kv_cache),
+                    speaker_kv_scale=speaker_kv_scale,
+                    speaker_kv_max_layers=speaker_kv_max_layers,
+                    speaker_kv_min_t=speaker_kv_min_t,
+                    t_schedule_mode=str(req.t_schedule_mode),
+                    sway_coeff=float(req.sway_coeff),
+                )
             stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("sample_rf", stage_sec))
-            _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
+            sample_stage = (
+                "sample_meanflow"
+                if self.model_cfg.flow_parameterization == "meanflow"
+                else "sample_rf"
+            )
+            stage_timings.append((sample_stage, stage_sec))
+            _log(f"[runtime] {sample_stage}: {stage_sec * 1000.0:.1f} ms")
 
             t0 = _measure_start(self.model_device)
             z = unpatchify_latent(
@@ -1493,10 +1525,8 @@ class InferenceRuntime:
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
 # Keep model construction/unload and inference in one process-wide critical
-# section.  The runtime cache is intentionally a single-slot VRAM cache, but
-# live and preview managers can invoke it from different threads/event loops;
-# unloading the previous checkpoint while another request is decoding would
-# otherwise invalidate its model/codec tensors.
+# section. The cache is intentionally single-slot VRAM state, but AoiTalk can
+# invoke live/preview synthesis from different threads and event loops.
 _RUNTIME_EXECUTION_LOCK = threading.RLock()
 _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
@@ -1520,27 +1550,13 @@ def _get_cached_runtime_locked(key: RuntimeKey) -> tuple[InferenceRuntime, bool]
 
 
 def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
-    """Return the cached runtime, preserving the historical API.
-
-    Callers that immediately perform inference should prefer
-    :func:`acquire_cached_runtime`, which keeps this lock held until the
-    operation completes.  The compatibility function still serializes model
-    replacement and unload for callers that only need a runtime handle.
-    """
-
     with _RUNTIME_EXECUTION_LOCK:
         return _get_cached_runtime_locked(key)
 
 
 @contextmanager
 def acquire_cached_runtime(key: RuntimeKey):
-    """Lease a checkpoint runtime for the duration of one inference.
-
-    The lease spans cache lookup, any old-runtime unload, model inference and
-    result materialization by the caller.  This prevents a concurrent request
-    for another checkpoint from unloading tensors that are still in use.
-    """
-
+    """Lease a checkpoint runtime until the caller finishes inference."""
     with _RUNTIME_EXECUTION_LOCK:
         yield _get_cached_runtime_locked(key)
 

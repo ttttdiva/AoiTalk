@@ -9,9 +9,11 @@ from .repository import ConversationRepository
 from .summary_validation import validate_generated_summary
 from .models import ConversationMessage
 from .cross_session_memory import get_cross_session_memory
+from .search_window import ConversationSearchWindow, conversation_search_window
+from .search_errors import MemorySearchUnavailable
 
 # Conversation semantic search is exclusively owned by CrossSessionMemoryService
-# and the shared BGE-M3 + Qdrant RAG infrastructure.
+# and the shared EmbeddingGemma 2 + Qdrant RAG infrastructure.
 
 
 class SummarizationService:
@@ -282,6 +284,8 @@ class MemorySearchService:
         time_range: str = "all",
         max_results: Optional[int] = None,
         project_id: Optional[str] = None,
+        search_window: Optional[ConversationSearchWindow] = None,
+        raise_on_unavailable: bool = False,
     ) -> List[Dict[str, Any]]:
         """Search conversation memory
         
@@ -301,12 +305,14 @@ class MemorySearchService:
         
         # Check if search is enabled
         if not hasattr(self.config, 'enable_search') or not self.config.enable_search:
-            print("[MemorySearchService] Memory search is disabled")
+            if raise_on_unavailable:
+                raise MemorySearchUnavailable("disabled")
             return []
 
         max_results = max_results or self.config.max_search_results
 
         try:
+            window = search_window or conversation_search_window(time_range)
             cross_session_memory = get_cross_session_memory({
                 "min_relevance_score": self.config.similarity_threshold,
                 "max_results": max_results,
@@ -318,6 +324,8 @@ class MemorySearchService:
                     limit=max_results,
                     character_name=character_name,
                     project_id=project_id,
+                    **window.sql_bounds(),
+                    **({"raise_on_unavailable": True} if raise_on_unavailable else {}),
                 ),
                 timeout=self.config.search_timeout,
             )
@@ -334,8 +342,19 @@ class MemorySearchService:
                 for result in results
             ]
 
-        except Exception as e:
-            print(f"[MemorySearchService] Search failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            if raise_on_unavailable:
+                raise MemorySearchUnavailable("timeout") from exc
+            return []
+        except MemorySearchUnavailable:
+            if raise_on_unavailable:
+                raise
+            return []
+        except Exception as exc:
+            if raise_on_unavailable:
+                raise MemorySearchUnavailable("backend_failed") from exc
             return []
 
 

@@ -62,6 +62,12 @@ from ..tools.registry import ToolRegistry
 from .agent_runtime import (
     OpenAIToolCallLoopResult,
     OpenAIToolCallRecord,
+    dialogue_provider_invocation_budget,
+    dialogue_provider_latest_usage,
+    dialogue_provider_observed_tokens,
+    dialogue_provider_usage_with_rate_card,
+    dialogue_provider_wire_max_output_tokens,
+    get_current_dialogue_budget_scope,
     run_openai_tool_call_loop,
 )
 from .context_budget import (
@@ -90,7 +96,10 @@ from .openai_compatible_local_profiles import (
 from .openrouter_provider_routing import merge_provider_options_into_extra_body
 from .unified_turn_runtime import run_cli_tool_call_loop
 from .cli_backends.base import CLIBackendBase
-from .generation_cancellation import GenerationInterrupted
+from .generation_cancellation import (
+    GenerationInterrupted,
+    get_current_generation_cancellation,
+)
 from .worker_report import (
     WORKER_REPORT_SCHEMA_VERSION,
     normalize_worker_report,
@@ -103,6 +112,7 @@ from .tool_policy import (
     PROJECT_MANAGEMENT_READ_TOOL_NAMES,
     reset_current_agent_team_role,
     set_current_agent_team_role,
+    _runtime_capability_for_tool,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,7 +267,7 @@ _QA_BROWSER_TOOL_NAMES = frozenset(
     }
 )
 _WORKER_PUBLICATION_INSTRUCTIONS = (
-    "This is a leaf Agent Team worker. Do not spawn or delegate another worker. "
+    "This is a leaf Execution Team worker. Do not spawn or delegate another worker. "
     "Do not open ChatGPT/Director or any unassigned browser transport, and do not use MCP tools. "
     "Do not commit, push, reset, clean, or publish Git state; return a concise "
     "worker report to the parent coordinator instead. Include task, findings, "
@@ -478,7 +488,7 @@ the assignment asks for a derived summary, and verify the target parent and
 project immediately before creating or updating a node.
 """.strip(),
     "architecture_planner": """
-You are the Agent Team architecture-planning Subagent.
+You are the Execution Team architecture-planning Subagent.
 
 Analyze the existing context and produce a concrete implementation blueprint.
 Make decisions, assign ownership boundaries, identify affected files/modules,
@@ -486,7 +496,7 @@ and call out risks that implementers and reviewers must handle.
 Do not write marketing copy. Be specific and operational.
 """.strip(),
     "code_explorer": """
-You are an Agent Team code-exploration Subagent.
+You are an Execution Team code-exploration Subagent.
 
 Investigate the requested topic with the available read-only tools. Trace entry
 points, data flow, configuration, tests, and nearby conventions. Return concise
@@ -495,7 +505,7 @@ Avoid duplicating other explorers' work when the request gives you a narrower
 question.
 """.strip(),
     "code_implementer": """
-You are an Agent Team implementation Subagent.
+You are an Execution Team implementation Subagent.
 
 Turn the assigned implementation scope into concrete steps and code-level
 guidance. Respect file ownership from the coordinator, avoid unrelated
@@ -504,7 +514,7 @@ write-capable runner is attached, return an implementation patch plan with exact
 files and functions rather than pretending to edit files.
 """.strip(),
     "code_reviewer": """
-You are an Agent Team code-review Subagent.
+You are an Execution Team code-review Subagent.
 
 Review the assigned scope for correctness, regressions, missing tests, security
 or privacy risks, and maintainability. Report only issues that are actionable and
@@ -519,22 +529,6 @@ this run.
     "general_researcher": """
 You are a read-only research Subagent. Cross-check available sources and
 return concise evidence without mutating workspace or application data.
-""".strip(),
-    "story_writer": """
-You are a Story writing Subagent. Preserve Story context and character voice,
-and use only the Story high-level tools exposed for this run.
-""".strip(),
-    "story_consistency_reviewer": """
-You are a read-only Story consistency-review Subagent. Check world setting,
-timeline, character facts, scenes, and terminology without writing changes.
-""".strip(),
-    "character_voice_reviewer": """
-You are a read-only character-voice review Subagent. Check personality,
-speech style, and prior statements without writing changes.
-""".strip(),
-    "story_import": """
-You are a Story import Subagent. Analyze and normalize supplied Story material
-through the exposed high-level import tools, preserving unrelated data.
 """.strip(),
 }
 
@@ -887,6 +881,46 @@ class SpecialistDelegationRunner:
         # so aliases can never leak across users/sessions.
         self._privacy_gateway: OutboundPrivacyGateway | None = None
         self._privacy_gateway_key: tuple[str, str] | None = None
+        # AgentDialogue provider budget is inherited through a turn-local
+        # scope.  A child uses the parent's ledger/reservation boundary while
+        # keeping its own provider identity and cancellation/binding context.
+        inherited_budget_scope = get_current_dialogue_budget_scope()
+        self._agent_dialogue_budget_scope = inherited_budget_scope
+        self._agent_dialogue_parent_run_id = (
+            inherited_budget_scope.parent_run_id
+            if inherited_budget_scope is not None
+            else None
+        )
+        self._agent_dialogue_execution_binding = (
+            inherited_budget_scope.execution_binding
+            if inherited_budget_scope is not None
+            else None
+        )
+        self._agent_dialogue_cancellation = get_current_generation_cancellation()
+        self._agent_dialogue_turn_ledger = (
+            inherited_budget_scope.ledger if inherited_budget_scope is not None else None
+        )
+        inherited_budget_client = (
+            inherited_budget_scope.client if inherited_budget_scope is not None else None
+        )
+        inherited_budget = getattr(
+            inherited_budget_client,
+            "_agent_dialogue_budget",
+            None,
+        )
+        self._agent_dialogue_budget = (
+            dict(inherited_budget) if isinstance(inherited_budget, Mapping) else None
+        )
+        if (
+            isinstance(self._agent_dialogue_budget, Mapping)
+            and self._agent_dialogue_budget.get("max_cost_micros") is not None
+        ):
+            child_card = self._specialist_provider_rate_card()
+            child_budget = dict(self._agent_dialogue_budget)
+            child_budget["server_rate_card"] = (
+                dict(child_card) if isinstance(child_card, Mapping) else None
+            )
+            self._agent_dialogue_budget = child_budget
         # The provider request itself is the canonical review boundary.  The
         # legacy approval helpers remain available for embedders/tests that
         # call them directly, but normal Agent Team execution defers review to
@@ -978,6 +1012,7 @@ class SpecialistDelegationRunner:
         def send_request(outbound: dict[str, Any]) -> Any:
             return client.chat.completions.create(**outbound)
 
+        from ..services.free_team_service import openai_credential_identity
         return gateway.execute_sync(
             payload,
             provider=self.provider,
@@ -986,6 +1021,7 @@ class SpecialistDelegationRunner:
             base_url=str(base_url or ""),
             source_kind=source_kind,
             model=str(model or ""),
+            credential_identity=openai_credential_identity(client, self.config),
         )
 
     def _apply_deployment_contract(self) -> None:
@@ -1095,6 +1131,8 @@ class SpecialistDelegationRunner:
                 team_id=str(self._agent_team_team_id or ""),
                 excluded_candidate_ids=excluded,
                 fallback_count=fallback_count,
+                config=self.config,
+                meter_per_request=True,
             )
             excluded.add(lease.candidate_id)
             self.route_metadata = {
@@ -1106,6 +1144,7 @@ class SpecialistDelegationRunner:
             client: Any = None
             side_effect_started = False
             side_effect_observable = False
+            provider_request_started = False
 
             async def monitor(event_type: str, _data: dict[str, Any]) -> None:
                 nonlocal side_effect_started
@@ -1164,6 +1203,7 @@ class SpecialistDelegationRunner:
                 side_effect_observable = _target_supports_stream_callback(
                     client, "generate_response_async"
                 )
+                provider_request_started = True
                 result = await asyncio.wait_for(
                     _call_target_method(
                         client,
@@ -1207,7 +1247,7 @@ class SpecialistDelegationRunner:
                 await finalize_route_lease(
                     lease,
                     success=False,
-                    consume_reserved_on_failure=error_class == "timeout",
+                    consume_reserved_on_failure=provider_request_started,
                     error_class=error_class,
                     latency_ms=(time.perf_counter() - started) * 1000,
                 )
@@ -1975,6 +2015,111 @@ class SpecialistDelegationRunner:
             agent_name=self.display_name,
         )
 
+    def _reserve_dialogue_provider_call(
+        self,
+        user_input: str,
+        requested: int | None,
+    ) -> tuple[str, int] | None:
+        """Atomically reserve one child provider invocation from the parent."""
+
+        ledger = getattr(self, "_agent_dialogue_turn_ledger", None)
+        budget = getattr(self, "_agent_dialogue_budget", None)
+        if ledger is None or not isinstance(budget, Mapping):
+            return None
+        if bool(getattr(ledger, "usage_unknown", False)):
+            return None
+        invocation = dialogue_provider_invocation_budget(
+            self,
+            user_input=user_input,
+            requested=requested,
+        )
+        try:
+            cap = max(0, int(invocation.get("max_output_tokens") or 0))
+        except (TypeError, ValueError, OverflowError):
+            cap = 0
+        total_tokens = budget.get("provider_max_output_tokens")
+        try:
+            total_tokens = (
+                max(0, int(total_tokens)) if total_tokens is not None else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            total_tokens = None
+        observed = dialogue_provider_observed_tokens(self, ledger) or 0
+        if total_tokens is not None:
+            input_tokens = max(0, int(invocation.get("input_tokens") or 0))
+            cap = min(cap, max(0, total_tokens - observed - input_tokens))
+        if cap <= 0:
+            return None
+        reservation_cost = 0
+        if invocation.get("cap_source") == "cost":
+            try:
+                reservation_cost = max(
+                    0,
+                    int(invocation.get("output_cost_per_token_micros") or 0)
+                    * cap,
+                )
+            except (TypeError, ValueError, OverflowError):
+                reservation_cost = 0
+        total_cost = budget.get("provider_reserved_cost_micros") or budget.get(
+            "max_cost_micros"
+        )
+        try:
+            total_cost = max(0, int(total_cost)) if total_cost is not None else None
+        except (TypeError, ValueError, OverflowError):
+            total_cost = None
+        key = ledger.reserve_provider_budget(
+            cap,
+            total_tokens=total_tokens,
+            total_cost_micros=total_cost,
+            cost_micros=reservation_cost,
+        )
+        return (key, cap) if key is not None else None
+
+    def _specialist_provider_rate_card(self) -> Mapping[str, Any] | None:
+        """Resolve pricing for this child provider/model only."""
+
+        cached = getattr(self, "_agent_dialogue_provider_rate_card", None)
+        if cached is not None:
+            return cached if isinstance(cached, Mapping) else None
+        card: dict[str, Any] | None = None
+        try:
+            from ..services.pricing import get_pricing_engine
+            from ..services.pricing.catalog import PricingRuleSnapshot
+
+            engine = get_pricing_engine()
+            if not getattr(engine, "_loaded", False):
+                # Synchronous provider paths must use the canonical catalog
+                # without borrowing the parent's persisted rate card.
+                from ..services.pricing.engine import PricingEngine
+
+                engine = PricingEngine.from_catalog_file()
+            rule = engine.resolve(self.provider, self.model)
+            if isinstance(rule, PricingRuleSnapshot):
+                rates = dict(getattr(rule, "rates", {}) or {})
+                if not rates and getattr(rule, "tiers", None):
+                    first = next(iter(rule.tiers), {})
+                    rates = dict(first.get("rates") or {}) if isinstance(first, Mapping) else {}
+                input_rate = rates.get("input")
+                output_rate = rates.get("output")
+                if input_rate is not None and output_rate is not None:
+                    from decimal import Decimal
+
+                    card = {
+                        "provider": str(self.provider),
+                        "model": str(self.model),
+                        "input_per_1k": str(Decimal(str(input_rate)) / Decimal(1000)),
+                        "output_per_1k": str(Decimal(str(output_rate)) / Decimal(1000)),
+                        "currency": "USD",
+                    }
+                    if rates.get("cached_input") is not None:
+                        card["cached_per_1k"] = str(
+                            Decimal(str(rates["cached_input"])) / Decimal(1000)
+                        )
+        except Exception:
+            card = None
+        self._agent_dialogue_provider_rate_card = card
+        return card
+
     def _persist_specialist_usage(
         self,
         usage: Any,
@@ -1989,18 +2134,32 @@ class SpecialistDelegationRunner:
     ) -> bool:
         """Normalize and persist one provider-confirmed specialist request."""
 
+        ledger = getattr(self, "_agent_dialogue_turn_ledger", None)
         if usage is None:
+            if ledger is not None:
+                ledger.mark_usage_unknown()
             return False
         provider_name = str(provider or self.provider or "").strip().lower()
         model_name = str(model or self.model or "").strip()
         if not provider_name or not model_name:
             return False
         try:
+            rate_card = (
+                self._specialist_provider_rate_card()
+                if isinstance(getattr(self, "_agent_dialogue_budget", None), Mapping)
+                and getattr(self, "_agent_dialogue_budget", {}).get("max_cost_micros") is not None
+                else None
+            )
+            priced_usage = dialogue_provider_usage_with_rate_card(usage, rate_card)
             normalized = normalize_usage(
-                usage,
+                priced_usage or usage,
                 provider=provider_name,
                 resolved_model=resolved_model,
             )
+            if isinstance(priced_usage, Mapping) and priced_usage.get("cost_micros") is not None:
+                normalized["cost_micros"] = int(priced_usage["cost_micros"])
+                if priced_usage.get("cost_currency") not in (None, ""):
+                    normalized["cost_currency"] = str(priced_usage["cost_currency"])
             if not normalized:
                 return False
             # Do not turn a missing provider usage payload into a fabricated
@@ -2009,7 +2168,32 @@ class SpecialistDelegationRunner:
                 normalized.get("input_tokens") is None
                 and normalized.get("output_tokens") is None
             ):
+                if ledger is not None:
+                    ledger.mark_usage_unknown()
                 return False
+            if (
+                ledger is not None
+                and isinstance(getattr(self, "_agent_dialogue_budget", None), Mapping)
+                and getattr(self, "_agent_dialogue_budget", {}).get("max_cost_micros") is not None
+                and normalized.get("cost_micros") is None
+            ):
+                # A configured cost ceiling cannot safely continue with token
+                # usage whose child-specific provider/model price is unknown.
+                ledger.mark_usage_unknown()
+            self._last_usage = dict(normalized)
+            if ledger is not None:
+                try:
+                    from ..services.agent_run_service import get_current_agent_run_id
+
+                    run_marker = str(get_current_agent_run_id() or "").strip() or "child"
+                except Exception:
+                    run_marker = "child"
+                ledger.record_usage(
+                    normalized,
+                    usage_key=ledger.next_provider_usage_key(
+                        f"specialist:{run_marker}"
+                    ),
+                )
             return persist_usage_sync(
                 self._usage_client(project_context=project_context),
                 provider=provider_name,
@@ -2020,6 +2204,8 @@ class SpecialistDelegationRunner:
                 is_streaming=bool(is_streaming),
             )
         except Exception:
+            if ledger is not None:
+                ledger.mark_usage_unknown()
             logger.debug(
                 "[%sDelegationRunner] usage persistence failed",
                 self.display_name,
@@ -2126,15 +2312,28 @@ class SpecialistDelegationRunner:
                 if system_context is not None:
                     kwargs["system_context"] = system_context
                 native_context = nullcontext()
-                if self.provider == "codex-cli" and self._subagent_cli_native_allowed():
+                if (
+                    self.provider in {"codex-cli", "claude-cli"}
+                    and self._subagent_cli_native_allowed()
+                ):
+                    # ``allow_cli_native_tools`` + workspace ceiling decide the
+                    # provider-native sandbox (Codex ``--sandbox``) or
+                    # permission mode (Claude ``--permission-mode``).
                     try:
-                        from .cli_backends.codex import agent_team_cli_context
+                        if self.provider == "codex-cli":
+                            from .cli_backends.codex import agent_team_cli_context
+                        else:
+                            from .cli_backends.claude import agent_team_cli_context
 
                         native_context = agent_team_cli_context(
                             workspace_access=self._subagent_cli_workspace_access()
                         )
                     except Exception:
-                        logger.debug("Agent Team Codex native context unavailable", exc_info=True)
+                        logger.debug(
+                            "Agent Team %s native context unavailable",
+                            self.provider,
+                            exc_info=True,
+                        )
 
                 gateway = self._privacy_gateway_for_turn()
                 descriptor = EgressDescriptor(
@@ -2163,6 +2362,19 @@ class SpecialistDelegationRunner:
                         final_kwargs["system_context"] = outbound.get(
                             "system_context"
                         )
+                    from .cli_native_capabilities import (
+                        native_cli_capability_gate_error,
+                        native_cli_feature_gate_args,
+                        native_cli_invocation_controls,
+                    )
+
+                    controls = native_cli_invocation_controls(
+                        self.cli_backend, self.config,
+                        native_cli_feature_gate_args(self.cli_backend, self.config),
+                    )
+                    if controls is None:
+                        return False, native_cli_capability_gate_error(self.cli_backend, self.config)
+                    final_kwargs.update(controls)
                     return self.cli_backend.execute_prompt(**final_kwargs)
 
                 egress_payload = {
@@ -2309,13 +2521,29 @@ class SpecialistDelegationRunner:
         ]
 
         def _create(messages_payload: list[dict[str, Any]]) -> str:
+            projected_output_tokens = dialogue_provider_wire_max_output_tokens(
+                self,
+                user_input=request,
+                requested=1024,
+            )
+            if projected_output_tokens is not None and projected_output_tokens <= 0:
+                raise RuntimeError("AgentDialogue provider budget is exhausted")
             api_kwargs: dict[str, Any] = {
                 "model": model,
                 "messages": messages_payload,
                 "temperature": 0,
-                "max_tokens": 1024,
+                "max_tokens": projected_output_tokens or 1024,
                 "response_format": {"type": "json_object"},
             }
+            reservation = self._reserve_dialogue_provider_call(
+                request,
+                projected_output_tokens,
+            )
+            child_ledger = getattr(self, "_agent_dialogue_turn_ledger", None)
+            if child_ledger is not None and reservation is None:
+                raise RuntimeError("AgentDialogue provider budget is exhausted")
+            if reservation is not None:
+                api_kwargs["max_tokens"] = reservation[1]
             reasoning_effort = ollama_reasoning_effort_for_mode(
                 model,
                 self._mode_preset,
@@ -2323,20 +2551,27 @@ class SpecialistDelegationRunner:
             if reasoning_effort:
                 api_kwargs["reasoning_effort"] = reasoning_effort
             started_at = time.perf_counter()
-            response = self._execute_sync_model_request(
-                client,
-                api_kwargs,
-                base_url=base_url,
-                model=model,
-                source_kind="agent_team_model_request",
-            )
-            self._persist_specialist_response_usage(
-                response,
-                started_at=started_at,
-                model=model,
-                project_context=project_context,
-                request_type="chat",
-            )
+            try:
+                response = self._execute_sync_model_request(
+                    client,
+                    api_kwargs,
+                    base_url=base_url,
+                    model=model,
+                    source_kind="agent_team_model_request",
+                )
+                self._persist_specialist_response_usage(
+                    response,
+                    started_at=started_at,
+                    model=model,
+                    project_context=project_context,
+                    request_type="chat",
+                )
+            finally:
+                if reservation is not None:
+                    child_ledger.settle_provider_budget(
+                        reservation[0],
+                        _response_usage(response) if "response" in locals() else None,
+                    )
             return self._privacy_gateway_for_turn().restore(
                 response.choices[0].message.content or ""
             )
@@ -2429,6 +2664,33 @@ class SpecialistDelegationRunner:
             clean_base_url = f"{clean_base_url}/v1"
         return clean_base_url, str(api_key or "dummy")
 
+    def _acquire_local_runtime_consumer_lease(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ):
+        """Protect a managed local endpoint for one specialist request."""
+
+        effective_provider = str(provider or self.provider or "").strip().lower()
+        if effective_provider != "openai_compatible_local":
+            return None
+        try:
+            from ..service_manager import (
+                _acquire_managed_local_runtime_consumer_for_route,
+            )
+            return _acquire_managed_local_runtime_consumer_for_route(
+                self.config,
+                provider=effective_provider,
+                model=str(model or self.model or ""),
+                consumer="specialist",
+            )
+        except Exception:
+            # A conflicting alias must fail before raw HTTP transport is
+            # allowed to issue a request against a process another consumer
+            # is still using.
+            raise
+
     def _create_openai_compatible_completion(self, client: OpenAI, api_kwargs: dict[str, Any]) -> Any:
         base_url = str(getattr(client, "base_url", "") or "")
         try:
@@ -2483,6 +2745,22 @@ class SpecialistDelegationRunner:
         *,
         project_context: Optional[dict[str, Any]] = None,
     ) -> str:
+        lease = self._acquire_local_runtime_consumer_lease()
+        try:
+            return self._run_via_openai_compatible_tool_loop_unleased(
+                request,
+                project_context=project_context,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_via_openai_compatible_tool_loop_unleased(
+        self,
+        request: str,
+        *,
+        project_context: Optional[dict[str, Any]] = None,
+    ) -> str:
         registry = self._build_tool_registry()
         agent_definition = self._get_agent_definition()
         instructions = str(getattr(agent_definition, "instructions", "")).strip()
@@ -2517,12 +2795,24 @@ class SpecialistDelegationRunner:
             "model": self.model or "local-model",
             "messages": messages,
         }
+        projected_output_tokens = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=request,
+            requested=context_budget.response_tokens,
+        )
+        if projected_output_tokens is not None and projected_output_tokens <= 0:
+            return f"{self.display_name} delegation stopped: AgentDialogue budget exhausted"
+        effective_response_tokens = (
+            projected_output_tokens
+            if projected_output_tokens is not None
+            else context_budget.response_tokens
+        )
         deepseek_effort = ""
         if self.provider == "deepseek":
             deepseek_effort = self._deepseek_effort_for_request()
             if deepseek_effort and deepseek_effort != "none":
                 api_kwargs["reasoning_effort"] = deepseek_effort
-            api_kwargs["max_tokens"] = context_budget.response_tokens
+            api_kwargs["max_tokens"] = effective_response_tokens
         elif self.provider == "kimi" and self.model == "kimi-k3":
             kimi_effort = "max"
             if self._uses_agent_team_subagent_target():
@@ -2542,12 +2832,12 @@ class SpecialistDelegationRunner:
                     kimi_effort = route_effort if route_effort in options else ""
             if kimi_effort:
                 api_kwargs["reasoning_effort"] = kimi_effort
-            api_kwargs["max_completion_tokens"] = context_budget.response_tokens
+            api_kwargs["max_completion_tokens"] = effective_response_tokens
         elif self.provider == "deepinfra":
-            api_kwargs["max_tokens"] = context_budget.response_tokens
+            api_kwargs["max_tokens"] = effective_response_tokens
         else:
             api_kwargs["temperature"] = 0
-            api_kwargs["max_tokens"] = context_budget.response_tokens
+            api_kwargs["max_tokens"] = effective_response_tokens
         extra_body = self._mode_extra_body()
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -2576,7 +2866,28 @@ class SpecialistDelegationRunner:
             )
             return response
 
-        response = _create_and_record(api_kwargs)
+        initial_reservation = self._reserve_dialogue_provider_call(
+            request,
+            int(api_kwargs.get("max_tokens") or api_kwargs.get("max_completion_tokens") or 0),
+        )
+        child_ledger = getattr(self, "_agent_dialogue_turn_ledger", None)
+        if child_ledger is not None and initial_reservation is None:
+            return f"{self.display_name} delegation stopped: AgentDialogue budget exhausted"
+        if initial_reservation is not None:
+            token_key = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in api_kwargs
+                else "max_tokens"
+            )
+            api_kwargs[token_key] = initial_reservation[1]
+        try:
+            response = _create_and_record(api_kwargs)
+        finally:
+            if initial_reservation is not None:
+                child_ledger.settle_provider_budget(
+                    initial_reservation[0],
+                    _response_usage(response) if "response" in locals() else None,
+                )
         message = response.choices[0].message
         if getattr(message, "tool_calls", None):
             result = run_openai_tool_call_loop(
@@ -2591,7 +2902,10 @@ class SpecialistDelegationRunner:
                 max_tool_result_chars=context_budget.tool_result_chars,
                 config=self.config,
                 user_input=request,
-            restore_tool_arguments=self._privacy_gateway_for_turn().restore_tool_arguments,
+                budget_client=self,
+                turn_ledger=self._agent_dialogue_turn_ledger,
+                record_provider_usage=False,
+                restore_tool_arguments=self._privacy_gateway_for_turn().restore_tool_arguments,
             )
             if isinstance(result, OpenAIToolCallLoopResult):
                 validated = self._validate_openai_tool_loop_result(
@@ -2948,6 +3262,9 @@ class SpecialistDelegationRunner:
                 success = await plugin.initialize(mcp_config)
                 if not success:
                     return f"Failed to initialize {self.display_name} MCP"
+                configure_runtime = getattr(plugin, "configure_runtime", None)
+                if callable(configure_runtime):
+                    configure_runtime(lambda: self.config)
                 set_mcp_plugin(plugin)
 
             # Preserve the helper seam for compatibility, but defer the real
@@ -2982,6 +3299,9 @@ class SpecialistDelegationRunner:
                     )
 
             if self.provider in CLI_PROVIDER_NAMES:
+                if self._uses_agent_team_subagent_target():
+                    from ..services.free_team_service import require_cli_provider_enabled
+                    await require_cli_provider_enabled(self.provider)
                 if self._turn_tool_required is not None and not self._subagent_cli_native_allowed():
                     return (
                         f"{self.display_name} delegation error: Agent Team CLI "
@@ -3090,11 +3410,21 @@ class SpecialistDelegationRunner:
                 # Signature introspection is diagnostics/compatibility-only;
                 # the native call itself remains authoritative.
                 pass
-            result = await run_native_agent_once(
-                agent,
-                delegated_request,
-                **native_kwargs,
-            )
+            native_lease = None
+            if native_provider == "openai_compatible_local":
+                native_lease = self._acquire_local_runtime_consumer_lease(
+                    provider=native_provider,
+                    model=str(getattr(agent, "model", None) or self.model or ""),
+                )
+            try:
+                result = await run_native_agent_once(
+                    agent,
+                    delegated_request,
+                    **native_kwargs,
+                )
+            finally:
+                if native_lease is not None:
+                    native_lease.release()
             # Native runtime intentionally returns one normalized usage record
             # per actual provider request. Persist each record independently;
             # this branch has no long-lived target client that could otherwise
@@ -3329,7 +3659,7 @@ class _AgentTeamSubagentAgent:
         if self._agent is None:
             instructions = self.instructions or TEAM_SUBAGENT_INSTRUCTIONS.get(
                 self.subagent_id,
-                f"You are the Agent Team {self.label} Subagent.",
+                f"You are the Execution Team {self.label} Subagent.",
             )
             # API/native workers receive this instruction through their system
             # message (CLI workers get the equivalent in
@@ -3438,106 +3768,8 @@ def _app_development_team_active(config: Any, team_id: str) -> bool:
 
 def _apps_feature_enabled(config: Any) -> bool:
     """Read the canonical Apps feature flag without widening child ACLs."""
+    return _runtime_capability_for_tool("create_app", config=config) is None
 
-    if config is None:
-        return True
-    try:
-        apps_section = config.get("apps", {})
-    except (AttributeError, TypeError):
-        apps_section = {}
-    if isinstance(apps_section, Mapping):
-        return bool(apps_section.get("enabled", True))
-    try:
-        return bool(config.get("apps.enabled", True))
-    except (AttributeError, TypeError):
-        return True
-
-
-def _bind_story_tools_to_turn(
-    tools: Sequence[ToolDefinition],
-) -> list[ToolDefinition]:
-    """Bind Story child tools to the trusted TurnContext session ID."""
-
-    bound: list[ToolDefinition] = []
-    for item in tools:
-        if item.name not in {
-            "get_story_context",
-            "write_episode_body",
-            "revise_episode_body",
-            "add_story_note",
-            "get_character_voice",
-        }:
-            bound.append(item)
-            continue
-        if not any(param.name == "conversation_id" for param in item.parameters):
-            bound.append(item)
-            continue
-        original = item.function
-
-        def _trusted_id(kwargs: dict[str, Any]) -> str:
-            turn_session_id = str(getattr(get_turn_context(), "session_id", None) or "").strip()
-            if not turn_session_id:
-                raise PermissionError(
-                    "Story child tool requires a trusted TurnContext session_id"
-                )
-            supplied = str(kwargs.pop("conversation_id", "") or "").strip()
-            if supplied and supplied != turn_session_id:
-                raise PermissionError(
-                    "Story child tool conversation_id must match the trusted TurnContext"
-                )
-            return turn_session_id
-
-        if inspect.iscoroutinefunction(original):
-            def _make_async_bound(original_fn: Any, trusted_id_fn: Any):
-                async def _async_bound(*args: Any, **kwargs: Any) -> Any:
-                    trusted_id = trusted_id_fn(kwargs)
-                    return await original_fn(
-                        *args,
-                        conversation_id=trusted_id,
-                        **kwargs,
-                    )
-
-                return _async_bound
-
-            wrapper = _make_async_bound(original, _trusted_id)
-        else:
-            def _make_sync_bound(original_fn: Any, trusted_id_fn: Any):
-                def _sync_bound(*args: Any, **kwargs: Any) -> Any:
-                    trusted_id = trusted_id_fn(kwargs)
-                    return original_fn(
-                        *args,
-                        conversation_id=trusted_id,
-                        **kwargs,
-                    )
-
-                return _sync_bound
-
-            wrapper = _make_sync_bound(original, _trusted_id)
-        bound_item = replace(
-            item,
-            function=wrapper,
-            is_async=inspect.iscoroutinefunction(wrapper),
-            hidden_argument_names=tuple(
-                sorted(
-                    {
-                        *getattr(item, "hidden_argument_names", ()),
-                        "conversation_id",
-                    }
-                )
-            ),
-            parameters=[
-                param
-                for param in item.parameters
-                if param.name != "conversation_id"
-            ],
-        )
-        # Removing the sole hidden parameter can leave an empty schema. Keep
-        # that wrapper closed so dataclass signature inference cannot turn its
-        # implementation closure (e.g. ``_original``) into a provider-visible
-        # variadic argument surface.
-        bound_item._legacy_variadic_kwargs = False
-        bound.append(bound_item)
-    return bound
 
 
 def _agent_team_tools_for_capabilities(
@@ -3683,59 +3915,6 @@ def _agent_team_tools_for_capabilities(
                 )
         except Exception:
             logger.debug("Project high-level tools unavailable for Agent Team subagent", exc_info=True)
-    if "story_write" in requested:
-        try:
-            from ..tools.writing_tools import (
-                add_story_note,
-                get_character_voice,
-                get_story_context,
-                revise_episode_body,
-                write_episode_body,
-            )
-
-            tools.extend(
-                ensure_tool_definitions(
-                    [
-                        get_story_context,
-                        write_episode_body,
-                        revise_episode_body,
-                        add_story_note,
-                        get_character_voice,
-                    ]
-                )
-            )
-        except Exception:
-            logger.debug("Story writing tools unavailable for Agent Team subagent", exc_info=True)
-    if "story_read" in requested:
-        try:
-            from ..tools.writing_tools import get_character_voice, get_story_context
-
-            tools.extend(
-                ensure_tool_definitions([get_story_context, get_character_voice])
-            )
-        except Exception:
-            logger.debug("Story read tools unavailable for Agent Team Subagent", exc_info=True)
-    if "story_import" in requested:
-        try:
-            from ..tools.import_tools import (
-                analyze_import_files,
-                import_file_as_character,
-                import_file_as_lore,
-                import_file_as_scene,
-            )
-
-            tools.extend(
-                ensure_tool_definitions(
-                    [
-                        analyze_import_files,
-                        import_file_as_character,
-                        import_file_as_lore,
-                        import_file_as_scene,
-                    ]
-                )
-            )
-        except Exception:
-            logger.debug("Story import tools unavailable for Agent Team subagent", exc_info=True)
     if "media" in requested:
         try:
             from ..agents.media_agent import MediaAgent
@@ -3780,10 +3959,11 @@ def _agent_team_tools_for_capabilities(
         for item in ensure_tool_definitions(tools)
         if _child_tool_allowed(item, allow_qa_browser=allow_qa_browser)
     ]
-    tools = _bind_story_tools_to_turn(tools)
     unique: dict[str, ToolDefinition] = {}
     for item in ensure_tool_definitions(tools):
         if not _child_tool_allowed(item, allow_qa_browser=allow_qa_browser):
+            continue
+        if _runtime_capability_for_tool(item.name, config=config, tool_definition=item) is not None:
             continue
         unique.setdefault(item.name, item)
     return list(unique.values())

@@ -431,7 +431,7 @@ def _assert_no_reparse_components(path: Path, *, root: Path | None = None) -> No
             raise ProjectStoragePathError("path escaped Project storage root") from exc
 
 
-def _assert_safe_root(root: Path) -> Path:
+def _assert_safe_root(root: Path, *, create: bool = True) -> Path:
     # Inspect the lexical path *before* ``realpath``.  Resolving first would
     # hide that the configured root itself (or one of its ancestors) is a
     # symlink/junction and would turn an explicit link rejection into an
@@ -442,7 +442,10 @@ def _assert_safe_root(root: Path) -> Path:
     _assert_no_reparse_components(lexical)
     canonical = Path(os.path.realpath(os.fspath(lexical)))
     _assert_no_reparse_components(canonical)
-    canonical.mkdir(parents=True, exist_ok=True)
+    if create:
+        canonical.mkdir(parents=True, exist_ok=True)
+    elif canonical.exists() and not canonical.is_dir():
+        raise ProjectStoragePathError("workspace root is not a directory")
     _assert_no_reparse_components(canonical)
     return canonical
 
@@ -1009,7 +1012,7 @@ class ProjectStoragePublisher:
         # Constructor arguments are service-side configuration, not model
         # payload.  They are canonicalised once and never replaced per call.
         configured = workspace_root if workspace_root is not None else get_workspaces_root()
-        self.workspace_root = _assert_safe_root(Path(configured))
+        self.workspace_root = _assert_safe_root(Path(configured), create=False)
         self.staged_root = (
             _assert_safe_root(Path(staged_root)) if staged_root is not None else None
         )

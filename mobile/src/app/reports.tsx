@@ -23,6 +23,7 @@ import { useProject } from "../contexts/ProjectContext";
 import { taskApi } from "../lib/task-api";
 import { TaskQuickViewDialog } from "../components/task-quick-view-dialog";
 import { ScopeSwitcher } from "../components/scope-switcher";
+import { ScreenHeader } from "../components/screen-header";
 import type { TimeEntry, TimeReport, TimeReportBucket } from "../types/api";
 
 function formatDuration(seconds: number): string {
@@ -285,23 +286,11 @@ export default function ReportsScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, '/(tabs)/settings')}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              Reports
-            </Text>
-            <Text style={styles.headerSubtext}>
-              {selectedSpace?.name ||
-                selectedProject?.name ||
-                "All projects"}
-            </Text>
-          </View>
+      <ScreenHeader
+        title="Reports"
+        subtitle={selectedSpace?.name || selectedProject?.name || "All projects"}
+        onBack={() => goBackOrReplace(router, "/(tabs)/settings")}
+        right={
           <View style={styles.headerActions}>
             <ScopeSwitcher accessibilityLabel="レポートの範囲を変更" />
             <IconButton
@@ -309,69 +298,73 @@ export default function ReportsScreen() {
               iconColor="#cdd6f4"
               accessibilityLabel="手動時間を追加"
               onPress={() => setManualEntryVisible(true)}
+              style={styles.headerActionButton}
             />
           </View>
-        </View>
-        <View style={styles.rangeRow}>
-          {(["7d", "30d"] as const).map((value) => (
+        }
+      />
+
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+        <View style={styles.rangeControls}>
+          <View style={styles.rangeRow}>
+            {(["7d", "30d"] as const).map((value) => (
+              <Chip
+                key={value}
+                selected={range === value}
+                onPress={() => {
+                  setCustomRange(false);
+                  setRange(value);
+                }}
+                style={[
+                  styles.rangeChip,
+                  range === value && styles.rangeChipActive,
+                ]}
+                textStyle={styles.rangeChipText}
+              >
+                {value}
+              </Chip>
+            ))}
             <Chip
-              key={value}
-              selected={range === value}
-              onPress={() => {
-                setCustomRange(false);
-                setRange(value);
-              }}
-              style={[
-                styles.rangeChip,
-                range === value && styles.rangeChipActive,
-              ]}
+              selected={customRange}
+              onPress={() => setCustomRange((value) => !value)}
+              style={[styles.rangeChip, customRange && styles.rangeChipActive]}
               textStyle={styles.rangeChipText}
             >
-              {value}
+              Custom
             </Chip>
-          ))}
-          <Chip
-            selected={customRange}
-            onPress={() => setCustomRange((value) => !value)}
-            style={[styles.rangeChip, customRange && styles.rangeChipActive]}
-            textStyle={styles.rangeChipText}
-          >
-            Custom
-          </Chip>
-          <Button
-            compact
-            mode="text"
-            textColor="#89b4fa"
-            onPress={() => router.push("/report/timeline")}
-          >
-            Timeline
-          </Button>
-        </View>
-        {customRange ? (
-          <View style={styles.customRangeRow}>
-            <TextInput
-              label="開始日"
-              value={customFrom}
-              onChangeText={setCustomFrom}
-              mode="outlined"
-              dense
-              style={styles.customRangeInput}
-              placeholder="YYYY-MM-DD"
-            />
-            <TextInput
-              label="終了日"
-              value={customTo}
-              onChangeText={setCustomTo}
-              mode="outlined"
-              dense
-              style={styles.customRangeInput}
-              placeholder="YYYY-MM-DD"
-            />
+            <Button
+              compact
+              mode="text"
+              textColor="#89b4fa"
+              contentStyle={styles.rangeButtonContent}
+              onPress={() => router.push("/report/timeline")}
+            >
+              Timeline
+            </Button>
           </View>
-        ) : null}
-      </Surface>
-
-      <ScrollView contentContainerStyle={styles.content}>
+          {customRange ? (
+            <View style={styles.customRangeRow}>
+              <TextInput
+                label="開始日"
+                value={customFrom}
+                onChangeText={setCustomFrom}
+                mode="outlined"
+                dense
+                style={styles.customRangeInput}
+                placeholder="YYYY-MM-DD"
+              />
+              <TextInput
+                label="終了日"
+                value={customTo}
+                onChangeText={setCustomTo}
+                mode="outlined"
+                dense
+                style={styles.customRangeInput}
+                placeholder="YYYY-MM-DD"
+              />
+            </View>
+          ) : null}
+        </View>
         {liveReport ? (
           <>
             <View style={styles.summaryRow}>
@@ -596,32 +589,38 @@ export default function ReportsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  headerActions: { flexDirection: "row", alignItems: "center" },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
+  scroll: { flex: 1 },
+  headerActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 4,
+    minWidth: 0,
+    maxWidth: "100%",
   },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
+  headerActionButton: {
+    width: 44,
+    height: 44,
+    minWidth: 44,
+    minHeight: 44,
+    margin: 0,
+  },
+  rangeControls: { gap: 8 },
   rangeRow: {
     flexDirection: "row",
     gap: 8,
-    paddingHorizontal: 16,
-    marginTop: 8,
+    flexWrap: "wrap",
   },
-  rangeChip: { backgroundColor: "#313244" },
+  rangeChip: { backgroundColor: "#313244", minHeight: 44 },
   rangeChipActive: { backgroundColor: "#4c1d95" },
   rangeChipText: { color: "#cdd6f4" },
+  rangeButtonContent: { minHeight: 44 },
   customRangeRow: {
     flexDirection: "row",
     gap: 8,
-    paddingHorizontal: 16,
-    marginTop: 8,
+    flexWrap: "wrap",
   },
-  customRangeInput: { flex: 1, backgroundColor: "#1e1e2e" },
+  customRangeInput: { flex: 1, minWidth: 140, backgroundColor: "#1e1e2e" },
   content: { padding: 16, gap: 12, paddingBottom: 40 },
   summaryRow: { flexDirection: "row", gap: 8 },
   summaryCard: {

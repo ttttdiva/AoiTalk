@@ -19,6 +19,7 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from ....llm.context_budget import clip_text
+from ....llm.generation_error import ModelOutputIncompleteError
 from ....services.agent_run_service import AgentRunService
 from ...chat_attachment_utils import sanitize_chat_attachments
 from ..agent_run_events import _DOCS_SEARCH_HIT_RE, _extract_search_tool_urls
@@ -976,6 +977,10 @@ class TerminalCommandsMixin:
                 plan = self._parse_clip_plan(
                     await self._plain_llm_response_for_command(llm_client, plan_prompt)
                 )
+            except ModelOutputIncompleteError:
+                # A truncated/empty model body is a real failure, not an
+                # unparseable plan: never hide it behind the archive fallback.
+                raise
             except Exception:
                 classification_failed = True
                 plan = {
@@ -1121,6 +1126,10 @@ class TerminalCommandsMixin:
                         generated,
                         allowed_source_keys=[item.key for item in all_sources],
                     )
+                except ModelOutputIncompleteError:
+                    # Do not replace a truncated/empty generation with the
+                    # fixed fallback document; fail the intake explicitly.
+                    raise
                 except Exception:
                     if not fallback_on_error:
                         return None
@@ -1426,6 +1435,10 @@ class TerminalCommandsMixin:
                         llm_client, refinement_prompt
                     )
                 )
+            except ModelOutputIncompleteError:
+                # The reply draft lives in this response; a truncated body
+                # must not degrade silently to "返信案を作成できませんでした".
+                raise
             except Exception:
                 # Task hierarchy planning is fail-open: the Inbox item remains
                 # processable with its initial title and no children.

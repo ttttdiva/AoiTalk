@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .config import ChunkingConfig, SourceConfig, IndexingConfig
-from .embedding import BgeM3Embedding
+from .embedding import EmbeddingGemma2Embedding
 from .qdrant_client import QdrantManager
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class DocumentIndexer:
     def __init__(
         self,
         qdrant: QdrantManager,
-        embedding: BgeM3Embedding,
+        embedding: EmbeddingGemma2Embedding,
         chunking_config: ChunkingConfig,
         source_config: SourceConfig,
         indexing_config: Optional[IndexingConfig] = None
@@ -173,7 +173,7 @@ class DocumentIndexer:
             
             # Generate embeddings
             texts = [chunk.text for chunk in chunks]
-            embeddings = await self.embedding.embed(texts)
+            embeddings = await self.embedding.embed(texts, titles=[chunk.metadata.get("file_name") or chunk.source_file for chunk in chunks])
             
             if not embeddings:
                 logger.error("Failed to generate embeddings")
@@ -405,7 +405,7 @@ class DocumentIndexer:
             batch_chunks = all_chunks[batch_start:batch_start + batch_size]
             texts = [chunk.text for chunk in batch_chunks]
 
-            embeddings = await self.embedding.embed(texts)
+            embeddings = await self.embedding.embed(texts, titles=[chunk.metadata.get("file_name") or chunk.source_file for chunk in batch_chunks])
 
             if not embeddings:
                 logger.error(f"Failed to generate embeddings for batch starting at {batch_start}")
@@ -485,7 +485,7 @@ class DocumentIndexer:
             
             # Generate embeddings
             texts = [chunk.text for chunk in chunks]
-            embeddings = await self.embedding.embed(texts)
+            embeddings = await self.embedding.embed(texts, titles=[chunk.metadata.get("file_name") or chunk.source_file for chunk in chunks])
             
             if not embeddings:
                 return 0

@@ -5,9 +5,11 @@ Provides endpoints for project management, member management, and join requests.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from os import PathLike
 from pathlib import Path, PurePosixPath
@@ -36,6 +38,12 @@ from src.services.project_knowledge_service import (
 from ..tools.file_explorer.download_stream import PreparedDownload, remove_temp_download
 
 logger = logging.getLogger(__name__)
+
+
+_MOVE_OVERWRITE_UNDO_LIMITATION = (
+    "上書き移動では移動先の以前の内容を保持しないため、"
+    "通常のUndo/Redoでは元に戻せません"
+)
 
 
 class _TemporaryProjectFileResponse(FileResponse):
@@ -205,6 +213,7 @@ class ProjectFileMovePayload(BaseModel):
     """Payload for moving a project file or folder"""
     src: str
     dest: str
+    overwrite: bool = False
 
 
 class ProjectFileCopyPayload(BaseModel):
@@ -309,6 +318,83 @@ def _raise_project_knowledge_http_error(exc: Exception) -> None:
     raise exc
 
 
+def _upload_publication_is_current(
+    target: Path,
+    publication: Any,
+) -> bool:
+    """Verify that an upload still owns ``target`` before rollback.
+
+    Files writers outside the project route do not share its row lock.  The
+    rollback therefore restores/removes a target only when its regular-file
+    identity, mode, size, mtime, and content still match the publication
+    observed by the upload service.  The final unlink/replace remains subject
+    to the narrow TOCTOU window inherent in uncoordinated external writers.
+    """
+
+    if not isinstance(publication, dict):
+        return False
+
+    expected_keys = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "sha256",
+    )
+    if any(key not in publication for key in expected_keys):
+        return False
+
+    try:
+        before = target.lstat()
+    except (FileNotFoundError, OSError, RuntimeError):
+        return False
+    if not stat.S_ISREG(before.st_mode):
+        return False
+
+    try:
+        expected_identity = tuple(
+            int(publication[key]) for key in expected_keys[:-1]
+        )
+    except (TypeError, ValueError):
+        return False
+    actual_identity = (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_mode),
+        int(before.st_size),
+        int(before.st_mtime_ns),
+    )
+    if actual_identity != expected_identity:
+        return False
+
+    digest = hashlib.sha256()
+    try:
+        with target.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        after = target.lstat()
+    except (FileNotFoundError, OSError, RuntimeError):
+        return False
+
+    if not stat.S_ISREG(after.st_mode):
+        return False
+    after_identity = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_mode),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+    )
+    return (
+        after_identity == expected_identity
+        and digest.hexdigest() == str(publication["sha256"])
+    )
+
+
 # ── Router Factory ───────────────────────────────────────────────────────
 
 
@@ -363,6 +449,11 @@ def create_project_router(
         search_files as search_workspace_files,
         resolve_workspace_path as resolve_workspace_file_path,
         workspace_root_context,
+    )
+    from ..tools.file_explorer.file_explorer_service import (
+        finalize_move_item,
+        inspect_move_item_collision,
+        rollback_move_item,
     )
     from ..tools.file_explorer.download_stream import (
         prepare_download_items,
@@ -1798,6 +1889,7 @@ def create_project_router(
         request: Request,
         file: UploadFile = File(...),
         path: str = "",
+        overwrite: bool = False,
         _: None = Depends(require_auth_dependency),
     ):
         """Upload a file into project storage."""
@@ -1859,8 +1951,14 @@ def create_project_router(
                 async def persist_upload():
                     created_path = None
                     backup_path = None
+                    published_upload = None
+
+                    def remember_upload_publication(publication):
+                        nonlocal published_upload
+                        published_upload = publication
+
                     try:
-                        if upload_target.is_file():
+                        if overwrite and upload_target.is_file():
                             backup_root = effective_workspace_root / ".project-upload-backups"
                             backup_root.mkdir(parents=True, exist_ok=True)
                             fd, backup_name = tempfile.mkstemp(
@@ -1890,12 +1988,15 @@ def create_project_router(
                             upload_directory,
                             upload_filename,
                             file.file,
-                            allow_overwrite=True,
+                            allow_overwrite=overwrite,
+                            _publication_observer=remember_upload_publication,
                         )
                         if not result.get("success"):
                             raise HTTPException(
-                                status_code=400,
-                                detail=result.get("error", "Failed to upload file"),
+                                status_code=409 if result.get("code") == "already_exists" else 400,
+                                detail={"code": "already_exists", "message": result.get("error")}
+                                if result.get("code") == "already_exists"
+                                else result.get("error", "Failed to upload file"),
                             )
                         raw_created_path = result.get("path")
                         if raw_created_path:
@@ -1938,23 +2039,50 @@ def create_project_router(
                         except Exception:
                             logger.exception("Failed to roll back project upload metadata")
                         finally:
-                            if backup_path is not None and backup_path.exists():
+                            if backup_path is not None:
                                 try:
-                                    os.replace(backup_path, upload_target)
+                                    if is_safe_workspace_path(
+                                        storage_path,
+                                        upload_target,
+                                    ) and _upload_publication_is_current(
+                                        upload_target,
+                                        published_upload,
+                                    ):
+                                        os.replace(backup_path, upload_target)
+                                        backup_path = None
+                                    else:
+                                        # A failed pre-publication write, or a
+                                        # target changed by another writer,
+                                        # must not be repaired from our backup.
+                                        backup_path.unlink(missing_ok=True)
+                                        backup_path = None
                                 except OSError:
                                     logger.exception(
-                                        "Failed to restore overwritten project upload: %s",
+                                        "Failed to roll back project upload: %s",
                                         upload_target,
                                     )
-                            elif created_path:
-                                created_candidate = Path(str(created_path))
-                                if is_safe_workspace_path(storage_path, created_candidate):
                                     try:
-                                        created_candidate.unlink(missing_ok=True)
+                                        backup_path.unlink(missing_ok=True)
+                                    except OSError:
+                                        logger.warning(
+                                            "Failed to remove project upload backup: %s",
+                                            backup_path,
+                                        )
+                                    backup_path = None
+                            elif published_upload is not None:
+                                if is_safe_workspace_path(
+                                    storage_path,
+                                    upload_target,
+                                ) and _upload_publication_is_current(
+                                    upload_target,
+                                    published_upload,
+                                ):
+                                    try:
+                                        upload_target.unlink(missing_ok=True)
                                     except OSError:
                                         logger.warning(
                                             "Failed to remove orphaned project upload: %s",
-                                            created_candidate,
+                                            upload_target,
                                         )
                         raise
 
@@ -2050,33 +2178,202 @@ def create_project_router(
         try:
             session = await db_manager.get_session()
             try:
+                project_uuid = UUID(project_id)
                 has_perm = await ProjectRepository.has_permission(
                     session,
-                    project_id=UUID(project_id),
+                    project_id=project_uuid,
                     user_id=UUID(user_info["id"]),
                     permission="write",
                 )
                 if not has_perm:
                     raise HTTPException(status_code=403, detail="Permission denied")
 
-                storage_root = await ProjectRepository.get_storage_path(UUID(project_id))
-                ensure_project_storage_root(storage_root)
-                result = run_workspace_operation(
-                    move_workspace_item,
-                    normalize_project_member_path(
-                        storage_root, payload.src, allow_root=False
-                    ),
-                    normalize_project_member_path(storage_root, payload.dest),
+                project = await ProjectRepository.get_by_id_for_update(
+                    session,
+                    project_uuid,
                 )
-                if not result.get("success"):
+                if not project or project.deleted_at is not None:
+                    raise HTTPException(status_code=404, detail="Project not found")
+
+                has_perm = await ProjectRepository.has_permission(
+                    session,
+                    project_id=project_uuid,
+                    user_id=UUID(user_info["id"]),
+                    permission="write",
+                )
+                if not has_perm:
+                    raise HTTPException(status_code=403, detail="Permission denied")
+
+                storage_root = await ProjectRepository.get_storage_path(project_uuid)
+                storage_path = ensure_project_storage_root(storage_root)
+                source_member_path = normalize_project_member_path(
+                    storage_root,
+                    payload.src,
+                    allow_root=False,
+                )
+                destination_member_path = normalize_project_member_path(
+                    storage_root,
+                    payload.dest,
+                )
+                collision = run_workspace_operation(
+                    inspect_move_item_collision,
+                    source_member_path,
+                    destination_member_path,
+                    allow_overwrite=payload.overwrite,
+                )
+                if collision is not None and not collision.get("success"):
+                    error_code = collision.get("error_code") or "conflict"
                     raise HTTPException(
-                        status_code=400,
-                        detail=result.get("error", "Failed to move file"),
+                        status_code=409,
+                        detail={
+                            "code": str(error_code),
+                            "message": str(collision.get("error") or "Move conflict"),
+                        },
                     )
+                source_absolute, source_valid = run_workspace_operation(
+                    resolve_workspace_file_path,
+                    source_member_path,
+                )
+                destination_absolute, destination_valid = run_workspace_operation(
+                    resolve_workspace_file_path,
+                    destination_member_path,
+                )
+                if not source_valid or not destination_valid:
+                    raise HTTPException(status_code=400, detail="Invalid move path")
+                if not source_absolute.exists():
+                    raise HTTPException(status_code=400, detail="Move source not found")
+
+                before_usage = await asyncio.to_thread(
+                    calculate_storage_usage,
+                    storage_path,
+                    strict=True,
+                )
+                projected_bytes = int(before_usage["total_bytes"])
+                overwrite_mutation = bool(
+                    collision
+                    and collision.get("overwrite_size") is not None
+                    and not collision.get("same_file")
+                )
+                quota_bytes: int | None = None
+                if overwrite_mutation:
+                    quota_mb = (
+                        1000
+                        if getattr(project, "storage_quota_mb", None) is None
+                        else int(project.storage_quota_mb)
+                    )
+                    quota_bytes = max(0, quota_mb) * 1024 * 1024
+                    projected_bytes -= int(collision["overwrite_size"])
+                    if projected_bytes > quota_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Project storage quota exceeded",
+                        )
+
+                result = None
+                created_path = destination_absolute / source_absolute.name
+                operation_mutated = False
+                try:
+                    result = run_workspace_operation(
+                        move_workspace_item,
+                        source_member_path,
+                        destination_member_path,
+                        allow_overwrite=payload.overwrite,
+                        retain_overwrite_backup=True,
+                    )
+                    if not result.get("success"):
+                        error_code = result.get("error_code") or result.get("code")
+                        if error_code in {"already_exists", "unsupported_collision"}:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": str(error_code),
+                                    "message": str(result.get("error") or "Move conflict"),
+                                },
+                            )
+                        raise HTTPException(
+                            status_code=400,
+                            detail=result.get("error", "Failed to move file"),
+                        )
+
+                    operation_mutated = not bool(
+                        collision and collision.get("same_file")
+                    )
+                    final_usage = await asyncio.to_thread(
+                        calculate_storage_usage,
+                        storage_path,
+                        strict=True,
+                    )
+                    final_bytes = int(final_usage["total_bytes"])
+                    transaction = result.get("_move_overwrite_transaction")
+                    committed_overwrite = bool(
+                        overwrite_mutation
+                        or (
+                            isinstance(transaction, dict)
+                            and not (collision and collision.get("same_file"))
+                        )
+                    )
+                    if committed_overwrite and isinstance(transaction, dict):
+                        try:
+                            Path(str(transaction["backup"])).relative_to(storage_path)
+                        except (KeyError, ValueError):
+                            pass
+                        else:
+                            final_bytes = max(
+                                0,
+                                final_bytes - int(transaction.get("size", 0)),
+                            )
+                    if committed_overwrite:
+                        if quota_bytes is None:
+                            quota_mb = (
+                                1000
+                                if getattr(project, "storage_quota_mb", None) is None
+                                else int(project.storage_quota_mb)
+                            )
+                            quota_bytes = max(0, quota_mb) * 1024 * 1024
+                        if final_bytes > quota_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Project storage quota exceeded",
+                            )
+                    project.storage_used_mb = final_bytes / (1024 * 1024)
+                    await session.commit()
+                except Exception:
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        logger.exception("Failed to roll back project move metadata")
+                    if result is not None and result.get("success") and operation_mutated:
+                        restored = run_workspace_operation(
+                            rollback_move_item,
+                            result,
+                            source_absolute,
+                            created_path,
+                        )
+                        if not restored:
+                            logger.critical(
+                                "Failed to restore project move after transaction rollback: "
+                                "project=%s source=%s destination=%s",
+                                project_id,
+                                source_absolute,
+                                created_path,
+                            )
+                    raise
+
+                overwrote_existing = isinstance(
+                    result.get("_move_overwrite_transaction"), dict
+                )
+                result["overwrote_existing"] = overwrote_existing
+                result["undoable"] = not overwrote_existing
+                result["undo_limitation"] = (
+                    _MOVE_OVERWRITE_UNDO_LIMITATION
+                    if overwrote_existing
+                    else None
+                )
                 if result.get("new_path"):
                     result["new_path"] = strip_project_storage_prefix(
                         storage_root, result.get("new_path")
                     ) or ""
+                finalize_move_item(result)
                 return JSONResponse(result)
             finally:
                 await session.close()

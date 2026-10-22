@@ -10,8 +10,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import desc, select
 
 from ..features import Features
-from ..memory.models import AgentWorkEvent, AgentWorkItem
-from ..memory.models import Project, ProjectMember
+from ..memory.models import (
+    AgentWorkEvent,
+    AgentWorkItem,
+    ConversationParticipant,
+    ConversationSession,
+    Project,
+    ProjectMember,
+)
 from ..services.project_permissions import normalize_project_member_permissions
 from ..services.agent_work_runtime import AgentWorkCoordinator
 
@@ -54,10 +60,41 @@ def create_agent_work_router(
         user_id = getattr(user, "id", None) if user is not None else None
         if isinstance(user, dict):
             user_id = user.get("id") or user.get("user_id")
-        if user_id is None or row.project_id is None:
+        session_id = getattr(row, "conversation_session_id", None)
+        if session_id is None:
+            metadata = getattr(row, "metadata_json", None)
+            session_id = metadata.get("conversation_session_id") if isinstance(metadata, dict) else None
+        if user_id is None or (row.project_id is None and session_id is None):
             raise HTTPException(status_code=403, detail="WorkItem access denied")
         session = await _session()
         try:
+            session_id = getattr(row, "conversation_session_id", None)
+            if session_id is None:
+                metadata = getattr(row, "metadata_json", None)
+                session_id = metadata.get("conversation_session_id") if isinstance(metadata, dict) else None
+            if session_id is not None:
+                conversation = await session.get(ConversationSession, session_id)
+                if conversation is None or getattr(conversation, "deleted_at", None) is not None:
+                    raise HTTPException(status_code=403, detail="WorkItem access denied")
+                is_owner = str(getattr(conversation, "user_id", "")) == str(user_id)
+                if not is_owner:
+                    participant = (
+                        await session.execute(
+                            select(ConversationParticipant).where(
+                                ConversationParticipant.session_id == session_id,
+                                ConversationParticipant.participant_type == "user",
+                                ConversationParticipant.participant_id == str(user_id),
+                                ConversationParticipant.status == "joined",
+                            )
+                        )
+                    ).scalars().first()
+                    if participant is None:
+                        raise HTTPException(status_code=403, detail="WorkItem access denied")
+            if row.project_id is None:
+                return user
+            # A session participant is only one half of the intersection. A
+            # project-bound WorkItem also requires current human Project read
+            # access, even when the same user owns the session.
             project = await session.get(Project, row.project_id)
             if project is None or getattr(project, "deleted_at", None) is not None:
                 raise HTTPException(status_code=403, detail="WorkItem access denied")

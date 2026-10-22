@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -1055,7 +1056,7 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
 
   return (
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
-      <CardHeader className="cursor-pointer select-none" onClick={handleToggle}>
+      <CardHeader className="cursor-pointer select-none" role="button" tabIndex={0} aria-expanded={expanded} data-settings-target-activation="cost-dashboard" onClick={handleToggle} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); handleToggle(); } }}>
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
             <DollarSign className="size-4" />
@@ -1390,16 +1391,14 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
               {dailyTrendData.length > 0 && (
                 <div className="space-y-2" data-testid="cost-dashboard-trend">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
+                    <div className="inline-flex items-center gap-1">
                       <h3 className="text-xs font-semibold text-muted-foreground">
                         {trendMetric === "cost"
                           ? "30日間コスト推移"
                           : "30日間トークン推移"}
                       </h3>
                       {trendMetric === "tokens" && (
-                        <p className="text-[11px] text-muted-foreground">
-                          無料枠グループごとにモデル別表示
-                        </p>
+                        <HelpPopover label="30日間トークン推移">無料枠グループごとにモデル別で表示します。</HelpPopover>
                       )}
                     </div>
                     <Tabs
@@ -1509,11 +1508,9 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
                 data-testid="cost-dashboard-period-selector"
               >
                 <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
+                  <div className="inline-flex items-center gap-1">
                     <h3 className="text-xs font-semibold">詳細の集計期間</h3>
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      下の使用量と内訳を、見たい期間にすぐ切り替えられます。
-                    </p>
+                    <HelpPopover label="詳細の集計期間">下の使用量と内訳を、見たい期間にすぐ切り替えられます。</HelpPopover>
                   </div>
                   <Badge variant="secondary" className="text-[10px]">
                     {detailPeriodLabel}

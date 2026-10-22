@@ -31,6 +31,10 @@ from uuid import UUID, uuid4
 class ClipUploadError(RuntimeError):
     """A staging or promotion request is invalid or cannot be completed."""
 
+    def __init__(self, message: str, *, reason: str = "source_unavailable") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 _ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -77,6 +81,21 @@ def _safe_name(value: Any) -> str:
     return raw[:_MAX_FILENAME] or "upload"
 
 
+def _require_original_root_available(root: Path) -> None:
+    """A missing child is a gap only while its original root remains available."""
+    try:
+        info = root.lstat()
+        root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ClipUploadError("original storage rootを確認できません") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    ):
+        raise ClipUploadError("original storage rootを確認できません")
+
+
 def _assert_under(path: Path, root: Path, *, allow_missing: bool = True) -> Path:
     """Resolve ``path`` and ensure it remains below ``root``."""
 
@@ -89,8 +108,16 @@ def _assert_under(path: Path, root: Path, *, allow_missing: bool = True) -> Path
         _reject_link_components(root_resolved, lexical.relative_to(root_resolved))
         resolved = path.resolve(strict=not allow_missing)
         resolved.relative_to(root_resolved)
-    except (OSError, ValueError) as exc:
-        raise ClipUploadError("staging pathがworkspace rootの外へ出ます") from exc
+    except FileNotFoundError as exc:
+        _require_original_root_available(root)
+        raise ClipUploadError("staging fileが見つかりません", reason="original_missing") from exc
+    except ValueError as exc:
+        raise ClipUploadError(
+            "staging pathがworkspace rootの外へ出ます", reason="original_path_invalid"
+        ) from exc
+    except OSError as exc:
+        # An unreadable/broken storage backend is not evidence of absence.
+        raise ClipUploadError("staging pathを確認できません") from exc
     return resolved
 
 
@@ -125,13 +152,16 @@ def _reject_link_components(root: Path, relative: Path) -> None:
             raise ClipUploadError("シンボリックリンク経由のstagingアクセスは許可されません")
 
 
-def _trusted_workspace_root(value: str | os.PathLike[str] | None) -> Path:
-    """Create/resolve a workspace root only when no component is a link.
+def _trusted_workspace_root(
+    value: str | os.PathLike[str] | None, *, create_root: bool = True
+) -> Path:
+    """Validate and resolve a root, optionally creating it for writers.
 
     ``Path.resolve`` follows a configured root symlink, which would silently
     move ClipIngest's namespace outside the operator's intended workspace.
-    Validate the lexical path first, create missing directories, then retain a
-    canonical resolved anchor for all later under-root checks.
+    Validate the lexical path first, then retain a canonical resolved anchor
+    for all later under-root checks. Readers require an existing directory
+    and never create missing original storage.
     """
 
     raw = value or os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
@@ -144,11 +174,14 @@ def _trusted_workspace_root(value: str | os.PathLike[str] | None) -> Path:
         current = current / component
         if _is_storage_link_or_reparse(current):
             raise ClipUploadError("workspace rootのシンボリックリンクは許可されません")
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ClipUploadError("workspace rootを作成できません") from exc
-    # Recheck after mkdir to close a simple replacement race.
+    if create_root:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ClipUploadError("workspace rootを作成できません") from exc
+    elif not candidate.is_dir():
+        raise ClipUploadError("workspace rootが見つかりません")
+    # Recheck the anchor before resolving, including after writer mkdir.
     current = Path(candidate.anchor)
     for component in candidate.parts[1:]:
         current = current / component
@@ -239,8 +272,9 @@ class ClipIngestStorage:
         max_upload_bytes: int | None = None,
         max_files: int = _DEFAULT_MAX_FILES,
         defer_staging_cleanup: bool = False,
+        create_root: bool = True,
     ) -> None:
-        self.workspace_root = _trusted_workspace_root(workspace_root)
+        self.workspace_root = _trusted_workspace_root(workspace_root, create_root=create_root)
         configured = max_upload_bytes
         if configured is None:
             try:
@@ -815,7 +849,7 @@ class ClipIngestStorage:
 
         raw = str(file_path or "").strip()
         if not raw:
-            raise ClipUploadError("attachment pathが空です")
+            raise ClipUploadError("attachment pathが空です", reason="original_path_invalid")
         candidate = Path(raw)
         if candidate.is_absolute():
             target = candidate
@@ -824,15 +858,28 @@ class ClipIngestStorage:
             # drive prefixes and both separator variants before joining.
             normalized = raw.replace("\\", "/")
             if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
-                raise ClipUploadError("attachment pathが不正です")
+                raise ClipUploadError("attachment pathが不正です", reason="original_path_invalid")
             parts = tuple(part for part in normalized.split("/") if part not in {""})
             if any(part in {".", ".."} for part in parts):
-                raise ClipUploadError("attachment path traversalは許可されません")
+                raise ClipUploadError("attachment path traversalは許可されません", reason="original_path_invalid")
             target = self.workspace_root.joinpath(*parts)
         target = _assert_under(target, self.workspace_root, allow_missing=not require_file)
         if require_file:
-            if target.is_symlink() or not target.is_file():
-                raise ClipUploadError("attachment fileが見つかりません")
+            try:
+                info = target.lstat()
+            except FileNotFoundError as exc:
+                _require_original_root_available(self.workspace_root)
+                raise ClipUploadError(
+                    "attachment fileが見つかりません", reason="original_missing"
+                ) from exc
+            except OSError as exc:
+                raise ClipUploadError("attachment fileを確認できません") from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            ):
+                raise ClipUploadError("attachment fileが不正です", reason="original_path_invalid")
         return target
 
     async def cleanup_uploads(self, user_id: Any, upload_ids: Iterable[Any]) -> int:

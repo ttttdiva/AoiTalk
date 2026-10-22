@@ -1,0 +1,64 @@
+AoiTalk Portable Bridge candidate modifications, 2026-10-04.
+Based on vercel-labs/agent-browser v0.38.2, upstream commit 39a74c70d7759d5a6de7a22c04570bb626bbd081.
+Original upstream copyright and Apache-2.0 license retained.
+Kit2 adds private bounded single-command stdin, local matched-only verification,
+persistent strict CDP lifecycle, explicit-only reconnect, non-sensitive connection
+counters, and Windows daemon standard-handle isolation. It retains kit1 existing-target,
+strict-reference and editable-value projection changes. This is a custom source
+candidate, not an official upstream binary. Original and bundled third-party licenses
+are in licenses/. No upstream source tree, Cargo cache, model, or browser profile is committed.
+Kit3 adds metadata-only retained-connection bootstrap, explicit initial selection
+without focus or page-content reads, native-only bounded local tab labels, and
+cached diagnostics. The Windows application adds GUI setup and fixed bundle
+verification. Original third-party license texts remain unmodified.
+Kit4 adds an argument-free bounded CrowdWorks projection on the selected strict
+target, document identity and completeness guards, and canonical job/card context.
+Observation IDs are not action refs. Unsupported/overflow returns no partial data.
+The application adds read-only raw Windows policy observations and shared scan
+lifecycle. Dependency original texts are preserved in the aggregate notice.
+2026-10-10: Selector-scoped snapshots choose roots across all AX ancestors,
+including ignored/virtual nodes with no backend DOM ID, so native select options
+are rendered exactly once. Duplicate-ref rejection in the application is retained.
+
+2026-10-10: Every custom source file listed below carries an AoiTalk Portable
+Bridge modification notice in its comment or JSON $comment metadata. Original
+upstream notices are retained. Source and helper checksums change accordingly.
+Modified/custom file inventory:
+  modified: README.md
+  modified: agent-browser.schema.json
+  modified: cli/Cargo.toml
+  added: cli/src/bridge_private.rs
+  modified: cli/src/commands.rs
+  modified: cli/src/connection.rs
+  modified: cli/src/doctor/launch.rs
+  modified: cli/src/doctor/webgpu.rs
+  modified: cli/src/flags.rs
+  modified: cli/src/main.rs
+  modified: cli/src/mcp.rs
+  modified: cli/src/native/actions.rs
+  added: cli/src/native/bridge_contract_tests.rs
+  modified: cli/src/native/browser.rs
+  modified: cli/src/native/cdp/client.rs
+  modified: cli/src/native/cdp/mod.rs
+  added: cli/src/native/cdp/targets.rs
+  added: cli/src/native/crowdworks.rs
+  modified: cli/src/native/daemon.rs
+  modified: cli/src/native/element.rs
+  modified: cli/src/native/interaction.rs
+  modified: cli/src/native/mod.rs
+  modified: cli/src/native/parity_tests.rs
+  modified: cli/src/native/snapshot.rs
+  modified: cli/src/native/tab_binding.rs
+  added: cli/src/native/test_fixtures/editable-value-projection.json
+  modified: cli/src/output.rs
+  added: cli/tests/bridge_helper_cli.rs
+  modified: docs/public/schema.json
+  modified: docs/src/app/cdp-mode/page.mdx
+  modified: docs/src/app/commands/page.mdx
+  modified: docs/src/app/configuration/page.mdx
+  modified: docs/src/app/sessions/page.mdx
+  modified: skill-data/core/SKILL.md
+  added: skill-data/core/references/bridge-helper.md
+  modified: skill-data/core/references/commands.md
+  modified: skill-data/core/references/session-management.md
+  modified: skill-data/core/references/snapshot-refs.md

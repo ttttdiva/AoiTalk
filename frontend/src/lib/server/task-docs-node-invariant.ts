@@ -159,7 +159,9 @@ export async function assertTaskProjectAccessInTransaction(
     .from(users)
     .where(eq(users.id, user.id))
     .limit(1)
-    .for("update");
+    // Role reads serialize ACL decisions with account changes while still
+    // allowing knowledge_revisions.created_by's FK KEY SHARE check.
+    .for("no key update");
 
   const memberships = new Map<string, unknown>();
   for (const project of lockedProjects) {
@@ -347,7 +349,9 @@ async function assertTaskDocsWriteAccessInTransaction(
       .from(users)
       .where(eq(users.id, user.id))
       .limit(1)
-      .for("update");
+      // Role reads serialize ACL decisions with account changes while still
+      // allowing knowledge_revisions.created_by's FK KEY SHARE check.
+      .for("no key update");
     const [project] = await tx
       .select({
         id: projects.id,

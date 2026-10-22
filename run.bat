@@ -5,14 +5,14 @@ title AoiTalk
 cd /d "%~dp0"
 if not defined AOITALK_PROFILE set "AOITALK_PROFILE=personal"
 if not defined AIVTUBER_ENV set "AIVTUBER_ENV=personal"
-rem The Windows Personal launcher is the trusted owner of the local Hydrus loopback endpoint.
-if not defined AOITALK_NATIVE_LOCAL set "AOITALK_NATIVE_LOCAL=1"
 if not defined AOITALK_WEB_PORT set "AOITALK_WEB_PORT=3000"
 if not defined AOITALK_NEXT_PORT set "AOITALK_NEXT_PORT=3002"
 if not defined AOITALK_CADDY_PORT set "AOITALK_CADDY_PORT=6002"
 if not defined AOITALK_CADDY_FASTAPI_PORT set "AOITALK_CADDY_FASTAPI_PORT=%AOITALK_WEB_PORT%"
 if not defined AOITALK_CADDY_NEXT_PORT set "AOITALK_CADDY_NEXT_PORT=%AOITALK_NEXT_PORT%"
-if not defined AOITALK_SKIP_CADDY set "AOITALK_SKIP_CADDY=false"
+if not defined AOITALK_SKIP_CADDY set "AOITALK_SKIP_CADDY=true"
+if not defined AOITALK_PUBLIC_BASE_PATH set "AOITALK_PUBLIC_BASE_PATH=/at"
+if not defined NEXT_PUBLIC_BASE_PATH set "NEXT_PUBLIC_BASE_PATH=%AOITALK_PUBLIC_BASE_PATH%"
 set "AOITALK_PYTHON=%~dp0venv\Scripts\python.exe"
 if not exist "%AOITALK_PYTHON%" (
     echo Python virtual environment not found: %AOITALK_PYTHON%
@@ -33,9 +33,11 @@ if exist ".env" (
     echo [警告] .envが見つかりません。必要な設定を確認してください。
 )
 set AOITALK_WEB_AUTO_OPEN=false
-echo AoiTalkを起動しています。初回はサービス準備に時間がかかる場合があります。
+echo AoiTalkを起動しています。
 
 :start
+if not exist ".local" mkdir ".local" >nul 2>&1
+> ".local\launcher-generation.txt" echo %RANDOM%-%RANDOM%-%DATE%-%TIME%
 "%AOITALK_PYTHON%" main.py
 set "AOITALK_EXIT_CODE=%ERRORLEVEL%"
 if "%AOITALK_EXIT_CODE%"=="42" (

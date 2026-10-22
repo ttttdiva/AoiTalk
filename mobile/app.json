@@ -2,7 +2,7 @@
   "expo": {
     "name": "AoiTalk",
     "slug": "aoitalk",
-    "version": "0.1.187",
+    "version": "0.1.289",
     "orientation": "default",
     "scheme": "aoitalk",
     "icon": "./assets/icon.png",
@@ -15,7 +15,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.aoitalk.mobile"
+      "bundleIdentifier": "com.aoitalk.mobile",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "音声会話で話した内容をサーバーで認識するためにマイクを使用します。"
+      }
     },
     "android": {
       "softwareKeyboardLayoutMode": "resize",
@@ -27,10 +30,28 @@
         "android.permission.REQUEST_INSTALL_PACKAGES",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_WIFI_STATE",
-        "android.permission.POST_NOTIFICATIONS"
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO"
       ],
-      "versionCode": 187,
-      "package": "com.aoitalk.mobile"
+      "versionCode": 289,
+      "package": "com.aoitalk.mobile",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ],
+          "data": [
+            {
+              "scheme": "https",
+              "host": "az-vnetspace.com",
+              "pathPrefix": "/.gateway/mobile/callback/aoitalk"
+            }
+          ]
+        }
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -56,7 +77,8 @@
             "usesCleartextTraffic": true
           }
         }
-      ]
+      ],
+      "./plugins/with-safe-websocket.cjs"
     ],
     "extra": {
       "router": {

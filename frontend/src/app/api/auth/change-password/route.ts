@@ -5,6 +5,7 @@ import {
   getSession,
 } from "@/lib/auth";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
+import { isSameOriginMutation } from "@/lib/server/same-origin-mutation";
 
 const MAX_PASSWORD_LENGTH = 1024;
 
@@ -35,23 +36,6 @@ async function readChangePasswordInput(request: NextRequest): Promise<
     current_password?: string | null;
     new_password?: string | null;
   };
-}
-
-function isSameOriginMutation(request: NextRequest): boolean {
-  const host = request.headers.get("x-forwarded-host") || request.headers.get("host");
-  if (!host) return false;
-  const forwardedProto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
-  const protocol = forwardedProto || request.nextUrl.protocol.replace(":", "");
-  const expectedOrigin = `${protocol}://${host}`;
-  const origin = request.headers.get("origin")?.trim();
-  if (origin) return origin === expectedOrigin;
-  const referer = request.headers.get("referer")?.trim();
-  if (!referer) return false;
-  try {
-    return new URL(referer).origin === expectedOrigin;
-  } catch {
-    return false;
-  }
 }
 
 export async function POST(request: NextRequest) {

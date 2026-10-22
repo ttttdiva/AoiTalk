@@ -23,6 +23,11 @@ const RESPONSE_MODEL_OPTIONS_SWR_KEY = "chat/response-model-options";
 
 const EMPTY_OPTIONS: ChatResponseModelOption[] = [];
 
+export type SavedResponseModelTarget = {
+  provider?: string | null;
+  model?: string | null;
+};
+
 const API_KEY_REQUIRED_PROVIDERS = new Set(["openai", "gemini", "openrouter", "deepseek", "deepinfra", "kimi"]);
 const STRICT_RUNTIME_PROVIDERS = new Set(["openai_compatible_local", "ollama", "sglang"]);
 
@@ -41,12 +46,13 @@ function modelLabel(
 export function buildResponseModelOptions(
   catalog: LlmModelCatalogResponse,
   _settings?: UserSettings | null,
+  savedResponseTarget?: SavedResponseModelTarget | null,
 ): ChatResponseModelOption[] {
   // User-level hidden-provider settings intentionally do not affect rerun
   // options; backend deployment availability is the authoritative filter.
   void _settings;
-  const currentProvider = catalog.current.provider;
-  const currentModel = catalog.current.model;
+  const currentProvider = savedResponseTarget?.provider?.trim() || catalog.current.provider;
+  const currentModel = savedResponseTarget?.model?.trim() || catalog.current.model;
   const hiddenProviderIds = new Set(
     normalizeHiddenProviderIds(catalog.provider_visibility),
   );
@@ -100,6 +106,16 @@ export function buildResponseModelOptions(
       model: normalizedModel,
       providerLabel,
       modelLabel: displayModel,
+      ...(Array.isArray(model?.reasoning_effort_options)
+        ? {
+            reasoningEffortOptions: [...model.reasoning_effort_options],
+            reasoningEffortDefault: model.reasoning_effort_default,
+            reasoningEffortKind: model.reasoning_effort_kind,
+          }
+        : {}),
+      ...(typeof model?.supports_reasoning === "boolean"
+        ? { supportsReasoning: model.supports_reasoning }
+        : {}),
       label: isCurrent
         ? `${providerLabel} / ${displayModel} (現在)`
         : `${providerLabel} / ${displayModel}`,
@@ -122,8 +138,16 @@ export function buildResponseModelOptions(
     const currentCatalogModel = chatModelsForProvider(currentCatalogProvider).find(
       (model) => model.id === currentModel,
     );
-    if (currentCatalogModel) {
-      addOption(currentCatalogProvider, currentModel, currentCatalogModel);
+    const currentUnverifiedModel =
+      currentCatalogModel
+      ?? (currentCatalogProvider.availability?.state === "not_checked"
+        ? currentCatalogProvider.models?.find((model) => model.id === currentModel)
+        : undefined);
+    const preserveCloudTarget =
+      !currentCatalogModel &&
+      !STRICT_RUNTIME_PROVIDERS.has(currentCatalogProvider.id.trim().toLowerCase());
+    if (currentUnverifiedModel || preserveCloudTarget) {
+      addOption(currentCatalogProvider, currentModel, currentUnverifiedModel);
     }
   } else if (
     !catalog.deployment &&
@@ -175,6 +199,7 @@ export type UseResponseModelOptionsInput = {
   catalog?: LlmModelCatalogResponse | null;
   /** Skip the hook's standalone request and use the shared catalog. */
   shared?: boolean;
+  savedResponseTarget?: SavedResponseModelTarget | null;
 };
 
 /**
@@ -211,9 +236,9 @@ export function useResponseModelOptions(
   const responseModelOptions = useMemo(
     () =>
       resolvedCatalog
-        ? buildResponseModelOptions(resolvedCatalog)
+        ? buildResponseModelOptions(resolvedCatalog, null, input?.savedResponseTarget)
         : EMPTY_OPTIONS,
-    [resolvedCatalog],
+    [resolvedCatalog, input?.savedResponseTarget],
   );
 
   return {

@@ -1,0 +1,38 @@
+export {
+  CHAT_WAVE_ATLAS_COLUMNS,
+  CHAT_WAVE_ATLAS_HEIGHT,
+  CHAT_WAVE_ATLAS_ROWS,
+  CHAT_WAVE_ATLAS_WIDTH,
+  CHAT_WAVE_GLYPH_ATLAS,
+  CHAT_WAVE_GLYPH_HEIGHT,
+  CHAT_WAVE_GLYPH_WIDTH,
+  CHAT_WAVE_GLYPHS,
+  buildGlyphAtlas,
+  glyphIndexForCharacter,
+} from "./glyph-atlas";
+export {
+  CHAT_WAVE_CELL_SIZE,
+  CHAT_WAVE_FRAGMENT_SHADER,
+  CHAT_WAVE_VERTEX_SHADER,
+  createChatWaveRenderer,
+  type ChatWaveGL,
+  type ChatWaveRenderer,
+  type ChatWaveRendererOptions,
+} from "./renderer";
+export {
+  DEFAULT_WAVE_SEED,
+  MAX_RIPPLES,
+  RIPPLE_CONTOUR_MAX_RADIUS_SCALE,
+  RIPPLE_CONTOUR_MIN_RADIUS_SCALE,
+  RIPPLE_CONTOUR_SAMPLES,
+  RIPPLE_LIFETIME_SECONDS,
+  RipplePool,
+  decodeRippleContourSample,
+  generateRippleContour,
+  glyphIndexForCell,
+  rippleAge,
+  rippleDynamicsForSeed,
+  rippleSeed,
+  stableHash01,
+  type RippleDynamics,
+} from "./wave-core";

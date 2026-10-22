@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { addAuthCookie, mockAuthenticatedApis } from "./support/auth";
+import { addAuthCookie, E2E_USER_ID, mockAuthenticatedApis } from "./support/auth";
 import type { ConversationMessage } from "../src/lib/chat-api";
 
 async function openStableChatSession(page: Page) {
@@ -15,6 +15,21 @@ async function openStableChatSession(page: Page) {
   await page.route("**/api/python-proxy/conversations/session-e2e/generation/status", (route) => route.fulfill({
     json: { session_id: "session-e2e", running: false, status: "idle" },
   }));
+  await page.route("**/api/conversations/session-e2e/resume**", (route) => route.fulfill({
+    json: {
+      session: {
+        id: "session-e2e",
+        user_id: E2E_USER_ID,
+        title: "E2E conversation",
+        character_name: "aoi",
+        message_count: 0,
+        is_active: true,
+        is_group_chat: false,
+        group_character_names: [],
+      },
+      messages: [],
+    },
+  }));
   // Socket delivery is outside this fixture; exercise deterministic REST persistence.
   await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => socket.close());
   await page.goto("/chat?s=session-e2e");
@@ -25,6 +40,18 @@ test.describe("チャットページ", () => {
   test.beforeEach(async ({ page }) => {
     await addAuthCookie(page);
     await mockAuthenticatedApis(page);
+    await page.route("**/api/python-proxy/agent-team/config", (route) => route.fulfill({
+      json: { teams: {} },
+    }));
+    await page.route("**/api/python-proxy/llm/execution-profiles", (route) => route.fulfill({
+      json: { active_profile_id: "manual", profiles: [], effective_main: { provider: "mock", model: "mock-model" } },
+    }));
+    await page.route("**/api/python-proxy/llm/new-chat-defaults", (route) => route.fulfill({
+      json: {
+        last_used_main: { provider: "mock", model: "mock-model" },
+        effective_main: { provider: "mock", model: "mock-model" },
+      },
+    }));
     await page.goto("/chat");
   });
 
@@ -36,10 +63,109 @@ test.describe("チャットページ", () => {
     await expect(chatTab).toBeVisible();
   });
 
+  test("Context Railをヘッダーの同じアイコンで閉じて戻し、保存値と本文を保持する", async ({ page }) => {
+    await openStableChatSession(page);
+
+    const toggle = page.getByTestId("chat-context-rail-toggle");
+    const rail = page.locator('[data-shell-region="context-rail"]');
+    const composer = page.getByRole("textbox", { name: "メッセージ入力", exact: true });
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(rail).toBeVisible();
+    await composer.fill("rail-toggle-draft");
+    const originalRail = await rail.elementHandle();
+    const initialMainWidth = (await page.locator('[data-shell-region="main-canvas"]').boundingBox())!.width;
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(rail).toBeHidden();
+    expect((await page.locator('[data-shell-region="main-canvas"]').boundingBox())!.width).toBeGreaterThan(initialMainWidth + 200);
+    await expect(composer).toHaveValue("rail-toggle-draft");
+    expect(await originalRail!.evaluate((element) => element.isConnected)).toBe(true);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(rail).toBeVisible();
+    expect(await originalRail!.evaluate((element) => element.isConnected)).toBe(true);
+    expect(await page.evaluate((key) => localStorage.getItem(key), `aoitalk:context-rail-visible:${E2E_USER_ID}`)).toBe("true");
+
+    await toggle.click();
+    await expect(rail).toBeHidden();
+    await page.reload();
+    await expect(page.getByTestId("chat-context-rail-toggle")).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator('[data-shell-region="context-rail"]')).toBeHidden();
+    await expect(page.getByRole("textbox", { name: "メッセージ入力", exact: true })).toHaveValue("rail-toggle-draft");
+  });
+
   test("サイドバーに新規会話ボタンが表示される", async ({ page }) => {
     // アプリサイドバー内に新規会話ボタンがある
     const newChatBtn = page.getByRole("button", { name: "新規会話", exact: true });
     await expect(newChatBtn).toBeVisible();
+  });
+
+  test.describe("Context Rail 768px境界", () => {
+    test.use({ viewport: { width: 768, height: 995 } });
+
+    test("通常railのtoggleが狭幅Sheetの導線と重ならず本文をはみ出させない", async ({ page }) => {
+      await openStableChatSession(page);
+      const toggle = page.getByTestId("chat-context-rail-toggle");
+      const rail = page.locator('[data-shell-region="context-rail"]');
+      await expect(toggle).toBeVisible();
+      await expect(page.getByRole("button", { name: "関連情報を開く", exact: true })).toHaveCount(0);
+      await expect(rail).toBeVisible();
+      const agentSelector = page.getByTestId("chat-agent-selector");
+      const displayGroup = page.getByRole("group", { name: "チャットの表示", exact: true });
+      await expect(agentSelector).toBeVisible();
+      await expect(displayGroup).toBeVisible();
+      const agentBox = await agentSelector.boundingBox();
+      const displayBox = await displayGroup.boundingBox();
+      const toggleBox = await toggle.boundingBox();
+      if (!agentBox || !displayBox || !toggleBox) {
+        throw new Error("Context Rail toolbar controls were not measurable at 768px");
+      }
+      expect(agentBox.width).toBeGreaterThan(0);
+      expect(displayBox.width).toBeGreaterThan(0);
+      const viewportWidth = page.viewportSize()?.width ?? 768;
+      expect(toggleBox.x).toBeGreaterThanOrEqual(0);
+      expect(toggleBox.x + toggleBox.width).toBeLessThanOrEqual(viewportWidth + 1);
+      for (const [left, right] of [[agentBox, displayBox], [agentBox, toggleBox], [displayBox, toggleBox]] as const) {
+        const separateX = left.x + left.width <= right.x + 1 || right.x + right.width <= left.x + 1;
+        const separateY = left.y + left.height <= right.y + 1 || right.y + right.height <= left.y + 1;
+        expect(separateX || separateY).toBe(true);
+      }
+
+      await toggle.click();
+      await expect(rail).toBeHidden();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(768);
+
+      await toggle.click();
+      await expect(rail).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(768);
+    });
+
+    test("動的な390/767/768リサイズでもmobile Sheetのcloseを1つに保つ", async ({ page }) => {
+      await openStableChatSession(page);
+      const toggle = page.getByTestId("chat-context-rail-toggle");
+      const mobileTrigger = page.getByRole("button", { name: "関連情報を開く", exact: true });
+      const sheet = page.locator('[data-slot="sheet-content"]');
+      const sheetClose = page.getByRole("button", { name: "Context Railを閉じる", exact: true });
+
+      for (const width of [390, 767]) {
+        await page.setViewportSize({ width, height: 995 });
+        await expect(toggle).toHaveCount(0);
+        await expect(mobileTrigger).toHaveCount(1);
+        await mobileTrigger.click();
+        await expect(sheet).toBeVisible();
+        await expect(sheetClose).toHaveCount(1);
+        await expect(sheet.locator('[data-slot="sheet-close"]')).toHaveCount(0);
+        await sheetClose.click();
+        await expect(sheet).toBeHidden();
+        expect(await page.evaluate((viewportWidth) => document.documentElement.scrollWidth <= viewportWidth, width)).toBe(true);
+      }
+
+      await page.setViewportSize({ width: 768, height: 995 });
+      await expect(mobileTrigger).toHaveCount(0);
+      await expect(toggle).toBeVisible();
+    });
   });
 
   test("初期状態でローディングまたは案内が表示される", async ({ page }) => {
@@ -77,6 +203,11 @@ test.describe("チャットページ", () => {
       await route.fulfill({ json: { success: true, queued: false, session_id: "session-e2e" } });
     });
     await openStableChatSession(page);
+    const railToggle = page.getByTestId("chat-context-rail-toggle");
+    await railToggle.click();
+    await expect(page.locator('[data-shell-region="context-rail"]')).toBeHidden();
+    await railToggle.click();
+    await expect(page.locator('[data-shell-region="context-rail"]')).toBeVisible();
     const composer = page.getByRole("textbox", { name: "メッセージ入力", exact: true });
     await composer.fill("保存時の描画確認");
     await page.getByRole("button", { name: "送信", exact: true }).click();

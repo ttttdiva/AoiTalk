@@ -31,9 +31,32 @@ export function storageEndpoint(id: string, resource: string) {
 }
 
 import * as FileSystem from "expo-file-system/legacy";
-import { fetchApiAtServerFingerprint, getBaseUrl, getConfiguredApiServerFingerprint } from "./api-client";
+import { fetchApiAtServerFingerprint, getBaseUrl, getConfiguredApiServerFingerprint, getCredentialIdentityRevision } from "./api-client";
 import { getToken, getTokenAuthScope } from "./auth";
+import { sendWithTransportAuth } from "./transport-auth";
+import { cacheProtectedMediaResource } from "./media-cache";
 import { downloadFileToDevice } from "./files-download";
+
+async function writeProtectedResponseToFile(
+  url: string,
+  target: string,
+  targetBaseUrl: string,
+): Promise<string> {
+  return cacheProtectedMediaResource(
+    url,
+    target,
+    {},
+    undefined,
+    {
+      revisionReader: getCredentialIdentityRevision,
+      request: async (send, requestSignal) => await sendWithTransportAuth(
+        url,
+        { targetBaseUrl, signal: requestSignal },
+        async (headers) => await send(headers),
+      ),
+    },
+  );
+}
 
 /** Decode only one bounded transfer chunk; no whole-file base64 materialization. */
 export function decodeStorageChunk(base64: string): Uint8Array {
@@ -104,15 +127,14 @@ export async function createStorageRootsClient() {
         return await downloadFileToDevice({name:entry.name,path:entry.path,type:"file",source:"server",size:entry.size_bytes ?? undefined,mimeType:entry.mime_type}, async () => {
           await client.status(id); // Resolve/refresh authentication through the existing client.
           const base = await getBaseUrl();
-          const token = await getToken();
           await assertIdentity();
-          if (!token || !FileSystem.cacheDirectory) throw new Error("ファイル取得の準備ができません");
+          if (!FileSystem.cacheDirectory) throw new Error("ファイル取得の準備ができません");
           const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g,"_").slice(-100) || "download";
           cached = `${FileSystem.cacheDirectory}storage-${Date.now()}-${Math.random().toString(16).slice(2)}-${safeName}`;
-          const response = await FileSystem.downloadAsync(`${base}/api${storageEndpoint(id,`download?path=${encodeURIComponent(entry.path)}`)}`,cached,{headers:{Authorization:`Bearer ${token}`},sessionType:FileSystem.FileSystemSessionType.FOREGROUND});
+          const url = `${base}/api${storageEndpoint(id,`download?path=${encodeURIComponent(entry.path)}`)}`;
+          const responseUri = await writeProtectedResponseToFile(url, cached!, base);
           await assertIdentity();
-          if(response.status!==200) throw new Error(`ファイル取得に失敗しました (HTTP ${response.status})`);
-          return response.uri;
+          return responseUri;
         });
       } finally {
         if(cached) await FileSystem.deleteAsync(cached,{idempotent:true}).catch(()=>undefined);

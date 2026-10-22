@@ -25,6 +25,7 @@ import {
 import type { ProjectManagementFilesController } from "@/components/projects/hooks/use-project-management-files";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
@@ -131,14 +132,16 @@ function ManagementDocumentCard({
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <FileText className="size-4 text-muted-foreground" />
-            <h3 className="text-sm font-medium">{title}</h3>
+            <h3 className="inline-flex items-center gap-1 text-sm font-medium">
+              {title}
+              <HelpPopover label={title}>{description}</HelpPopover>
+            </h3>
             {registeredFiles.length > 0 && (
               <Badge variant="secondary" className="text-[11px]">
                 {multiple ? `${registeredFiles.length}件` : "登録済み"}
               </Badge>
             )}
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">{description}</p>
         </div>
       </div>
 
@@ -283,13 +286,13 @@ export function ProjectManagementPanel({
             <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
               Project configuration
             </p>
-            <div className="mt-1 flex items-center gap-2 text-base font-semibold">
+            <div className="mt-1 inline-flex items-center gap-2 text-base font-semibold">
               <Settings2 className="size-4" />
               Management documents
+              <HelpPopover label="Management documents">Configure WBS, issue, risk, and supporting material.</HelpPopover>
             </div>
             <p className="mt-1 text-sm text-muted-foreground">
-              Configure WBS, issue, risk, and supporting material for{" "}
-              {projectName}.
+              Project: {projectName}
             </p>
           </div>
           <div className="flex items-center gap-2">

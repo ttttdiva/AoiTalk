@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { AppSelect } from "@/components/ui/app-select";
 import { BlurFade } from "@/components/magicui/blur-fade";
 import { BorderBeam } from "@/components/magicui/border-beam";
+import { withBasePath } from "@/lib/base-path";
 
 type CredentialSource = "local" | "active_directory";
 
@@ -50,7 +51,7 @@ function LoginForm() {
     // 通常のフォームPOSTで送信（fetchではなくブラウザのナビゲーションでCookieを確実に保存）
     const form = document.createElement("form");
     form.method = "POST";
-    form.action = "/api/auth/login-form";
+    form.action = withBasePath("/api/auth/login-form");
 
     const u = document.createElement("input");
     u.type = "hidden";
@@ -154,7 +155,7 @@ export default function LoginPage() {
         <CardHeader className="items-center gap-3">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src="/images/ui/brand-orb.png"
+            src={withBasePath("/images/ui/brand-orb.png")}
             alt=""
             className="size-14 rounded-full object-cover ring-1 ring-border"
           />

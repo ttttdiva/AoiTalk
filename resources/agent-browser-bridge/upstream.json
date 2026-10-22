@@ -1,0 +1,15 @@
+{
+  "repository": "vercel-labs/agent-browser",
+  "commit": "39a74c70d7759d5a6de7a22c04570bb626bbd081",
+  "archive_url": "https://codeload.github.com/vercel-labs/agent-browser/tar.gz/39a74c70d7759d5a6de7a22c04570bb626bbd081",
+  "archive_sha256": "f95f730316f2849fd62f41b2153f06fc6b78c76636270f98495c7e773ef77274",
+  "archive_size": 2169981,
+  "version": "0.38.2",
+  "daemon_stamp": "0.38.2+bridge.4",
+  "bridge_protocol": 1,
+  "patch": {
+    "path": "bridge.patch",
+    "sha256": "7c08928cb2da7d39fe0ffe072a7eeb3f0374189d82a9410aded073f1df71f05a",
+    "bytes": 701192
+  }
+}

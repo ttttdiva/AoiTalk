@@ -49,6 +49,7 @@ import {
 import { renderDocsInlineHtml, docsRowBlockClass } from "@/lib/docs-block-render";
 import { createEditorImageInsertExtension } from "@/components/editor/image-insert-extension";
 import { selectNextOccurrenceKeymap } from "@/components/editor/code-mirror-shared";
+import { withBasePath } from "@/lib/base-path";
 import { cn } from "@/lib/utils";
 import {
   canMutateDocsNode,
@@ -105,6 +106,8 @@ export type BlockCreateInput = {
   // Optimistic creates report a later POST failure so editor-only rows can
   // restore their text without delaying focus on the next row.
   onPersistenceError?: (nodeId: string, error: unknown) => void;
+  /** Await the POST when a lifecycle barrier must preserve this draft before navigation. */
+  awaitPersistence?: boolean;
 };
 
 export type BlockMoveInput = {
@@ -242,6 +245,8 @@ export type DocsEditorContextValue = {
   onOpenTask?: (taskId: string) => void;
   onFocused: (nodeId: string | null) => void;
   onCommitPending?: (operation: Promise<boolean> | null) => void;
+  /** Register editor-only draft flushes that navigation must await before remounting the page. */
+  registerEditorFlush?: (flush: () => Promise<void> | void) => () => void;
   onCommitTitle: (node: DocsNode, title: string, patch?: Partial<Pick<DocsNode, "body_json" | "body_text" | "node_type" | "display_props" | "description">>) => Promise<void | DocsNode> | void;
   onDraftChange?: (node: DocsNode, title: string) => void;
   onCommitSuccess?: (nodeId: string, committedDraft: string) => void;
@@ -1010,7 +1015,7 @@ function DocumentAttachmentPreview({ attachments }: { attachments: DocsAttachmen
       {attachments.map((attachment) => (
         <a
           key={attachment.id}
-          href={`/api/docs/attachments/${attachment.id}`}
+          href={withBasePath(`/api/docs/attachments/${attachment.id}`)}
           target="_blank"
           rel="noreferrer"
           className="block w-fit max-w-full rounded outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
@@ -1019,7 +1024,7 @@ function DocumentAttachmentPreview({ attachments }: { attachments: DocsAttachmen
         >
           {attachment.mime_type?.startsWith("image/") ? (
             <Image
-              src={`/api/docs/attachments/${attachment.id}`}
+              src={withBasePath(`/api/docs/attachments/${attachment.id}`)}
               alt={attachment.file_name}
               width={640}
               height={480}
@@ -1068,6 +1073,7 @@ export function OutlineBlockEditor({
     onOpenTask,
     onFocused,
     onCommitPending,
+    registerEditorFlush,
     onCommitTitle,
     onDraftChange,
     onCommitSuccess,
@@ -1116,6 +1122,8 @@ export function OutlineBlockEditor({
   const editingNodeIdRef = useRef<string | null>(null);
   editingNodeIdRef.current = editingNodeId;
   const [emptyDraft, setEmptyDraft] = useState("");
+  const emptyDraftRef = useRef(emptyDraft);
+  emptyDraftRef.current = emptyDraft;
   // A pending row intentionally remains a lightweight input rather than a
   // persisted node. Keep a small local value history so Ctrl/Cmd-Z and redo
   // behave like the CodeMirror row editor without stealing the first undo
@@ -1174,6 +1182,7 @@ export function OutlineBlockEditor({
   const [pendingBlankCommit, setPendingBlankCommit] = useState(false);
   const pendingBlankCommitRef = useRef(false);
   pendingBlankCommitRef.current = pendingBlankCommit;
+  const pendingBlankFlushPromiseRef = useRef<Promise<void> | null>(null);
   const [pendingBlankAutoFocus, setPendingBlankAutoFocus] = useState(true);
   const pendingCreateIdRef = useRef<string | null>(null);
   const pendingCreateGenerationRef = useRef(0);
@@ -1218,6 +1227,7 @@ export function OutlineBlockEditor({
     // and commit the pre-Undo title captured by its effect closure.
     historyRevision: number;
     historyCanonicalTitle: string | null;
+    savedDraft: string;
   } | null>(null);
   const pendingTagFocusRef = useRef<{ nodeId: string; tagId: string } | null>(null);
   const editorThemeCompartmentRef = useRef<Compartment | null>(null);
@@ -1303,11 +1313,13 @@ export function OutlineBlockEditor({
     if (!historySync?.revision) return;
     const session = editorSessionRef.current;
     if (!session || !historySync.nodeIds.includes(session.nodeId)) return;
+    if (session.historyRevision === historySync.revision) return;
     const row = rows.find((item) => item.node.id === session.nodeId);
     const canonicalTitle = historySync.titles?.[session.nodeId] ?? row?.node.title;
     if (typeof canonicalTitle !== "string") return;
     session.historyRevision = historySync.revision;
     session.historyCanonicalTitle = canonicalTitle;
+    session.savedDraft = canonicalTitle;
     if (session.view.state.doc.toString() === canonicalTitle) return;
     session.view.dispatch({
       changes: { from: 0, to: session.view.state.doc.length, insert: canonicalTitle },
@@ -1674,6 +1686,9 @@ export function OutlineBlockEditor({
     const commitKey = `${row.node.id}\u0000${draftAtCommit}`;
     const existing = commitPromisesRef.current.get(commitKey);
     if (existing) return existing;
+    const sessionAtCommit = editorSessionRef.current;
+    let savedDraft = draftAtCommit;
+    let savedTitle = draftAtCommit;
     const operation = (async () => {
       try {
         const protectedCanonical = isDocsProjectCanonicalNode(row.node) && !isDocsStaleProjectNode(row.node);
@@ -1689,6 +1704,8 @@ export function OutlineBlockEditor({
               ? normalized as DocsNode
               : null;
             const title = normalizedNode?.title || canonicalTitle;
+            savedDraft = title;
+            savedTitle = title;
             if (title !== draftAtCommit) syncCommittedEditorDraft(row.node.id, title, {
               ...row,
               node: { ...row.node, title, body_text: normalizedNode?.body_text ?? (row.node.body_text || title) },
@@ -1754,7 +1771,9 @@ export function OutlineBlockEditor({
           ? committed as DocsNode
           : null;
         const normalizedTitle = normalizedNode?.title;
+        savedTitle = normalizedTitle ?? shortcut?.title ?? draftAtCommit;
         if (normalizedTitle && normalizedTitle !== (shortcut?.title ?? draftAtCommit)) {
+          savedDraft = normalizedTitle;
           syncCommittedEditorDraft(row.node.id, normalizedTitle, {
             ...row,
             node: { ...row.node, ...normalizedNode, title: normalizedTitle, body_text: normalizedNode.body_text ?? normalizedTitle },
@@ -1773,7 +1792,16 @@ export function OutlineBlockEditor({
         commitPromisesRef.current.delete(commitKey);
         onCommitPending?.(Array.from(commitPromisesRef.current.values()).at(-1) ?? null);
       }
-    })();
+    })().then((handled) => {
+      if (sessionAtCommit?.nodeId === nodeId) {
+        sessionAtCommit.savedDraft = savedDraft;
+        sessionAtCommit.row = {
+          ...sessionAtCommit.row,
+          node: { ...sessionAtCommit.row.node, title: savedTitle, body_text: savedTitle },
+        };
+      }
+      return handled;
+    });
     commitPromisesRef.current.set(commitKey, operation);
     onCommitPending?.(operation);
     return operation;
@@ -2044,7 +2072,7 @@ export function OutlineBlockEditor({
   }, [focusLastDetail, focusNode]);
 
   const copyAttachment = useCallback(async (attachment: DocsAttachment) => {
-    const url = `/api/docs/attachments/${attachment.id}`;
+    const url = withBasePath(`/api/docs/attachments/${attachment.id}`);
     if (!attachment.mime_type?.startsWith("image/") || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
       await navigator.clipboard.writeText(new URL(url, window.location.origin).href);
       return;
@@ -2220,7 +2248,7 @@ export function OutlineBlockEditor({
               run: linkSelection,
             },
             {
-              key: "Alt-ArrowUp",
+              key: "Ctrl-Alt-ArrowUp",
               run: () => {
                 if (composingRef.current) return true;
                 if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
@@ -2238,7 +2266,7 @@ export function OutlineBlockEditor({
               },
             },
             {
-              key: "Alt-ArrowDown",
+              key: "Ctrl-Alt-ArrowDown",
               run: () => {
                 if (composingRef.current) return true;
                 if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
@@ -2922,8 +2950,9 @@ export function OutlineBlockEditor({
       nodeId: editorNodeId,
       row: editingRow,
       view,
-      historyRevision: 0,
+      historyRevision: historySync?.revision ?? 0,
       historyCanonicalTitle: null as string | null,
+      savedDraft: editingRow.node.title,
     };
     editorSessionRef.current = editorSession;
     view.focus();
@@ -3155,6 +3184,143 @@ export function OutlineBlockEditor({
     : pendingFieldOwnerRow
       ? (fieldCandidatesForRow?.(pendingFieldOwnerRow) ?? pendingFieldOwnerRow.fields ?? [])
       : [];
+
+  // Sidebar navigation remounts this editor by page id. Preserve a meaningful
+  // editor-only blank-row draft before that remount, while leaving an empty
+  // placeholder entirely local and avoiding an unrelated empty node.
+  const flushPendingBlankDraft = useCallback(() => {
+    const existing = pendingBlankFlushPromiseRef.current;
+    if (existing) return existing;
+    const operation = (async () => {
+    const input = editorRootRef.current?.querySelector<HTMLInputElement>(
+      "[data-docs-blank-row-input]",
+    );
+    const title = input ? input.value : emptyDraftRef.current;
+    const pendingFieldOperation = pendingField
+      || pendingFieldCreateRef.current
+      || pendingFieldSuggestion;
+    if (pendingFieldOperation) {
+      if (hasMeaningfulBlockTitle(title)) {
+        throw new Error("Field入力はEnterで保存してからページを移動してください");
+      }
+      return;
+    }
+    // An Enter-created optimistic node may still be posting while the next
+    // blank row is already empty. The Workspace barrier awaits its shared
+    // node-create promise below; do not start another create here.
+    if (pendingBlankCommitRef.current) return;
+    if (!hasMeaningfulBlockTitle(title)) return;
+
+    const currentInsertion = pendingBlankRowRef.current ?? (
+      rowsRef.current.length === 0 && emptyParentId
+        ? {
+            parentId: emptyParentId,
+            afterNodeId: null,
+            kind: "paragraph" as const,
+            depth: 0,
+          }
+        : null
+    );
+    if (!currentInsertion) return;
+
+    const anchor = currentInsertion.afterNodeId
+      ? rowsRef.current.find((item) => item.node.id === currentInsertion.afterNodeId) ?? null
+      : null;
+    const insertion = anchor
+      ? {
+          parentId: anchor.node.parent_id,
+          afterNodeId: anchor.node.id,
+          kind: currentInsertion.kind,
+          depth: anchor.depth,
+        }
+      : currentInsertion;
+    const markdownShortcut = markdownShortcutPatchForTitle(title, insertion.kind);
+    const persistedTitle = markdownShortcut?.title ?? title;
+    const persistedKind = markdownShortcut?.kind ?? insertion.kind;
+    const createGeneration = pendingCreateGenerationRef.current + 1;
+    pendingCreateGenerationRef.current = createGeneration;
+    pendingBlankCommitRef.current = true;
+    pendingCreateFocusRef.current = false;
+    pendingCreateIdRef.current = null;
+    setPendingBlankCommit(true);
+
+    try {
+      const created = await onCreateNode({
+        parentId: insertion.parentId,
+        afterNodeId: insertion.afterNodeId,
+        title: persistedTitle,
+        kind: persistedKind,
+        checked: markdownShortcut?.checked,
+        focusOnCreate: false,
+        awaitPersistence: true,
+      });
+      if (pendingCreateGenerationRef.current !== createGeneration) return;
+      const nextRow: PendingBlankRow = {
+        parentId: created.parent_id,
+        afterNodeId: created.id,
+        kind: persistedKind,
+        depth: insertion.depth,
+      };
+      pendingCreateIdRef.current = created.id;
+      pendingAnchorMemoryRef.current = created.id;
+      pendingKindRef.current = persistedKind;
+      resetPendingDraft("");
+      setPendingBlankRow(nextRow);
+      setPendingBlankAutoFocus(false);
+    } catch (error) {
+      if (pendingCreateGenerationRef.current === createGeneration) {
+        pendingCreateIdRef.current = null;
+        pendingKindRef.current = insertion.kind;
+        setPendingBlankRow(insertion);
+        resetPendingDraft(title);
+        setPendingBlankAutoFocus(false);
+      }
+      throw error;
+    } finally {
+      if (pendingCreateGenerationRef.current === createGeneration) {
+        pendingBlankCommitRef.current = false;
+        setPendingBlankCommit(false);
+      }
+    }
+    })();
+    pendingBlankFlushPromiseRef.current = operation;
+    void operation.then(
+      () => {
+        if (pendingBlankFlushPromiseRef.current === operation) pendingBlankFlushPromiseRef.current = null;
+      },
+      () => {
+        if (pendingBlankFlushPromiseRef.current === operation) pendingBlankFlushPromiseRef.current = null;
+      },
+    );
+    return operation;
+  }, [emptyParentId, onCreateNode, pendingField, pendingFieldSuggestion, resetPendingDraft]);
+
+  useEffect(() => {
+    if (!registerEditorFlush) return;
+    // Keyboard page navigation does not blur the CodeMirror view. Commit its
+    // current draft through the same save path before the page can unmount;
+    // a rejected save leaves both the draft and its focus in this session.
+    return registerEditorFlush(async () => {
+      for (;;) {
+        const session = editorSessionRef.current;
+        if (!session) return;
+        if (composingRef.current || session.view.composing) {
+          throw new Error("文字入力を確定してからページを移動してください");
+        }
+        const text = session.view.state.doc.toString();
+        // rows contains optimistic titles even after a failed PATCH. Only a
+        // successful commit may advance this barrier's saved draft.
+        if (text === session.savedDraft) return;
+        await commitNodeDraft(session.nodeId, text, session.row);
+        // Keep focus while saving; include any text entered during the wait.
+      }
+    });
+  }, [commitNodeDraft, registerEditorFlush]);
+
+  useEffect(() => {
+    if (!registerEditorFlush) return;
+    return registerEditorFlush(flushPendingBlankDraft);
+  }, [flushPendingBlankDraft, registerEditorFlush]);
 
   useEffect(() => {
     const persistPendingDraftOnPageHide = (event: PageTransitionEvent) => {
@@ -4379,13 +4545,13 @@ export function OutlineBlockEditor({
                             }
                             if (event.key === "Enter") {
                               event.preventDefault();
-                              window.open(`/api/docs/attachments/${attachment.id}`, "_blank", "noopener,noreferrer");
+                              window.open(withBasePath(`/api/docs/attachments/${attachment.id}`), "_blank", "noopener,noreferrer");
                             }
                           }}
                         >
                           {attachment.mime_type?.startsWith("image/") ? (
                             <Image
-                              src={`/api/docs/attachments/${attachment.id}`}
+                              src={withBasePath(`/api/docs/attachments/${attachment.id}`)}
                               alt={attachment.file_name}
                               width={480}
                               height={320}

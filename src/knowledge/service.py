@@ -79,6 +79,7 @@ class KnowledgeSearchFilters:
     path_prefix: Optional[str] = None
     # Server-resolved only: never exposed as a model/API argument.
     readable_source_ids: Optional[tuple[uuid.UUID, ...]] = None
+    non_project: bool = False
 
 
 @dataclass(frozen=True)
@@ -1647,8 +1648,9 @@ class KnowledgeService:
         is_admin: bool,
         filters: KnowledgeSearchFilters,
         limit: int,
+        _prepared=None,
     ) -> list[dict[str, Any]]:
-        if not query:
+        if not query and _prepared is None:
             return []
         readable = await KnowledgeService._readable_source_ids(
             session, source_id=filters.source_id,
@@ -1660,16 +1662,22 @@ class KnowledgeService:
         try:
             from .index_service import get_knowledge_index_service
 
-            index_hits = await get_knowledge_index_service().search(
-                query=query,
-                filters=index_filters,
-                limit=limit,
-            )
+            index = get_knowledge_index_service()
+            index_hits = (await index.search_prepared(_prepared, filters=index_filters, limit=limit)
+                          if _prepared is not None else await index.search(query=query, filters=index_filters, limit=limit))
         except Exception:
+            if _prepared is not None:
+                raise
             logger.exception("Knowledge index lookup failed; falling back to lexical search")
             return []
         if not index_hits:
             return []
+
+        if _prepared is not None:
+            # A grant may disappear while Qdrant is running. Repeat the live
+            # grant projection rather than trusting a warm permissions list.
+            current_readable = set(await KnowledgeService._readable_source_ids(session,
+                source_id=filters.source_id, actor_user_id=actor_user_id, is_admin=is_admin))
 
         chunk_ids = [hit.chunk_id for hit in index_hits]
         result = await session.execute(
@@ -1680,14 +1688,20 @@ class KnowledgeService:
                 KnowledgeChunk.id.in_(chunk_ids),
                 KnowledgeDocument.status == "active",
             )
+            .execution_options(populate_existing=True)
         )
         rows = {chunk.id: (chunk, document, source) for chunk, document, source in result.all()}
         hits: list[dict[str, Any]] = []
+        originals = {}
         for index_hit in index_hits:
             row = rows.get(index_hit.chunk_id)
             if not row:
                 continue
             chunk, document, source = row
+            if _prepared is not None and source.id not in current_readable:
+                continue
+            if _prepared is not None and index_hit.content_hash != index._index_content_hash(chunk, document, source):
+                continue
             if not await KnowledgeService._passes_search_acl_and_filters(
                 session,
                 source=source,
@@ -1697,19 +1711,80 @@ class KnowledgeService:
                 filters=filters,
             ):
                 continue
+            if _prepared is not None and source.source_type != "growi":
+                if document.id not in originals:
+                    try:
+                        root = lexical_path(source.root_path)
+                        path = root.joinpath(*relative_parts(document.path))
+                        current_text, error, _stat = await read_source_file(root, path, KnowledgeService._read_file_text)
+                        originals[document.id] = not error and KnowledgeService._content_hash(current_text) == document.content_hash
+                    except (StorageError, OSError, ValueError):
+                        originals[document.id] = False
+                if not originals[document.id]:
+                    continue
             lexical_score = KnowledgeService._lexical_score(query, chunk.text, document)
+            raw_prepared_score = getattr(index_hit, "dense_score", None)
+            prepared_score = float(raw_prepared_score) if _prepared is not None and raw_prepared_score is not None else None
             hits.append(
                 KnowledgeService._search_payload(
-                    score=float(index_hit.score) + min(lexical_score, 20.0) * 0.05,
+                    score=(prepared_score if prepared_score is not None else float(index_hit.score))
+                    if _prepared is not None else float(index_hit.score) + min(lexical_score, 20.0) * 0.05,
                     source=source,
                     document=document,
                     chunk=chunk,
                     retrieval="hybrid",
                 )
             )
+            if _prepared is not None:
+                hits[-1]["_query_content_hash"] = index_hit.content_hash
+                if prepared_score is not None:
+                    # UnifiedSearch consumes this internal field for the
+                    # request-local dense ranking; it is stripped at the API
+                    # projection boundary.
+                    hits[-1]["_query_semantic_score"] = prepared_score
             if len(hits) >= limit:
                 break
         return hits
+
+    @staticmethod
+    async def search_prepared(session, unit, *, actor_user_id, filters=None, limit=20):
+        from ..rag.media_query import require_prepared
+        require_prepared(unit)
+        return await KnowledgeService._search_index(session, query=unit.lexical_text, actor_user_id=actor_user_id,
+            is_admin=False, filters=filters or KnowledgeSearchFilters(), limit=limit, _prepared=unit)
+
+    @staticmethod
+    async def authorize_prepared_hits(session, hits, *, actor_user_id, filters):
+        from .index_service import get_knowledge_index_service
+        index = get_knowledge_index_service()
+        readable = set(await KnowledgeService._readable_source_ids(session, source_id=filters.source_id,
+            actor_user_id=actor_user_id, is_admin=False))
+        identifiers = {uuid.UUID(hit["chunk"]["id"]) for hit in hits}
+        rows = (await session.execute(select(KnowledgeChunk, KnowledgeDocument, KnowledgeSource)
+            .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
+            .join(KnowledgeSource, KnowledgeDocument.source_id == KnowledgeSource.id)
+            .where(KnowledgeChunk.id.in_(identifiers), KnowledgeDocument.status == "active")
+            .execution_options(populate_existing=True))).all()
+        originals, hashes = {}, {}
+        for chunk, document, source in rows:
+            if source.id not in readable or not await KnowledgeService._passes_search_acl_and_filters(
+                session, source=source, document=document, actor_user_id=actor_user_id,
+                is_admin=False, filters=filters):
+                continue
+            if source.source_type != "growi":
+                if document.id not in originals:
+                    try:
+                        root = lexical_path(source.root_path)
+                        path = root.joinpath(*relative_parts(document.path))
+                        text, error, _stat = await read_source_file(root, path, KnowledgeService._read_file_text)
+                        originals[document.id] = not error and KnowledgeService._content_hash(text) == document.content_hash
+                    except (StorageError, OSError, ValueError):
+                        originals[document.id] = False
+                if not originals[document.id]:
+                    continue
+            hashes[str(chunk.id)] = index._index_content_hash(chunk, document, source)
+        return [hit for hit in hits if hit.get("_query_content_hash") and
+            hit["_query_content_hash"] == hashes.get(hit["chunk"]["id"])]
 
     @staticmethod
     async def _search_lexical(
@@ -1753,6 +1828,8 @@ class KnowledgeService:
             doc_tags = {str(tag).lower() for tag in document.tags or []}
             if not all(tag.lower() in doc_tags for tag in filters.tags):
                 return False
+        if filters.non_project and document.project_refs:
+            return False
         if filters.project_id:
             project_refs = {str(ref) for ref in document.project_refs or []}
             if str(filters.project_id) not in project_refs:

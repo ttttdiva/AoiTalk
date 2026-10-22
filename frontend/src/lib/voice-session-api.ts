@@ -12,6 +12,7 @@ import {
   MAX_LIVE_VOICE_EVENT_BYTES,
   MAX_LIVE_VOICE_SDP_BYTES,
 } from "@/lib/live-voice-api";
+import { withBasePath } from "@/lib/base-path";
 
 export { LIVE_VOICE_END_TIMEOUT_MS, LiveVoiceApiError as VoiceSessionApiError };
 
@@ -334,9 +335,65 @@ export async function endVoiceSession(
 
 /** WebSocket URL for character TTS audio transport. */
 export function voiceSessionAudioWebSocketUrl(sessionId: string): string {
-  if (typeof window === "undefined") {
-    return `/api/voice-sessions/${encodeURIComponent(sessionId)}/audio`;
-  }
+  const path = withBasePath(
+    `/api/voice-sessions/${encodeURIComponent(sessionId)}/audio`,
+  );
+  if (typeof window === "undefined") return path;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/api/voice-sessions/${encodeURIComponent(sessionId)}/audio`;
+  return `${protocol}//${window.location.host}${path}`;
+}
+
+export type VoicePipelineTranscription = {
+  text: string;
+};
+
+export type VoicePipelineSpeech = {
+  audioBase64: string;
+  mimeType: "audio/wav";
+};
+
+/** Submit one bounded browser recording to the local pipeline ASR. */
+export async function transcribeVoicePipeline(input: {
+  sessionId: string;
+  audioBase64: string;
+  mimeType: "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "audio/wav" | "audio/webm";
+}): Promise<VoicePipelineTranscription> {
+  const payload = await request<unknown>(
+    `/api/voice-sessions/${encodeURIComponent(input.sessionId)}/pipeline/transcriptions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        audio_base64: input.audioBase64,
+        mime_type: input.mimeType,
+      }),
+    },
+  );
+  const value = (payload && typeof payload === "object"
+    ? payload
+    : {}) as Record<string, unknown>;
+  return { text: typeof value.text === "string" ? value.text.trim() : "" };
+}
+
+/** Synthesize one bounded assistant segment with the session character voice. */
+export async function synthesizeVoicePipeline(input: {
+  sessionId: string;
+  text: string;
+}): Promise<VoicePipelineSpeech> {
+  const payload = await request<unknown>(
+    `/api/voice-sessions/${encodeURIComponent(input.sessionId)}/pipeline/speech`,
+    {
+      method: "POST",
+      body: JSON.stringify({ text: input.text }),
+    },
+  );
+  const value = (payload && typeof payload === "object"
+    ? payload
+    : {}) as Record<string, unknown>;
+  if (typeof value.audio_base64 !== "string" || !value.audio_base64) {
+    throw new Error("読み上げ音声が返されませんでした");
+  }
+  return {
+    audioBase64: value.audio_base64,
+    mimeType: "audio/wav",
+  };
 }

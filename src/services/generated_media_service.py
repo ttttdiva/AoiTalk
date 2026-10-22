@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import tempfile
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from .storage_io import StorageError
 logger = logging.getLogger(__name__)
 
 STORAGE_ROOT = Path("data/generated_media")
+COMFYUI_STAGING_ROOT = Path("cache/generated_media_staging")
 SUPPORTED_ENGINES = frozenset({"comfyui"})
 ComfyGenerateFunc = Callable[..., Any]
 
@@ -72,43 +74,25 @@ async def get_media_record(media_id: str) -> GeneratedMedia | None:
         return await session.get(GeneratedMedia, uid)
 
 
-async def user_can_access_media(user_id: str, media: GeneratedMedia) -> bool:
+async def user_can_access_media(user_id: str, media: GeneratedMedia, *, session=None) -> bool:
     if not user_id:
         return False
-    if media.context_type == "trpg_play":
-        from ..memory.models.trpg_play import TrpgPlayParticipant
-
-        async with await get_db_session() as session:
-            participant = (
-                await session.execute(
-                    select(TrpgPlayParticipant).where(
-                        TrpgPlayParticipant.session_id == _parse_uuid(media.context_id),
-                        TrpgPlayParticipant.user_id == _parse_uuid(user_id),
-                        TrpgPlayParticipant.left_at.is_(None),
-                    )
-                )
-            ).scalar_one_or_none()
-            return participant is not None
     if str(media.owner_user_id) == str(user_id):
         return True
     if media.context_type == "conversation":
         from ..memory.models.conversations import ConversationSession
 
-        async with await get_db_session() as session:
-            session_row = await session.get(
-                ConversationSession, _parse_uuid(media.context_id)
+        async def conversation_owner(database):
+            session_row = await database.get(
+                ConversationSession, _parse_uuid(media.context_id), populate_existing=True
             )
             if session_row is None:
                 return False
             return str(session_row.user_id) == str(user_id)
-    if media.context_type == "story":
-        from ..memory.models.story import StoryWork
-
-        async with await get_db_session() as session:
-            work = await session.get(StoryWork, _parse_uuid(media.context_id))
-            if work is None:
-                return False
-            return str(work.user_id) == str(user_id)
+        if session is not None:
+            return await conversation_owner(session)
+        async with await get_db_session() as database:
+            return await conversation_owner(database)
     return False
 
 
@@ -300,175 +284,11 @@ async def generate_roleplay_scene_media(
             persisted.updated_at = datetime.utcnow()
             await session.commit()
             await session.refresh(persisted)
+            from .media_index_worker import notify_media_source
+            notify_media_source(owner_user_id, "generated_media", persisted.id)
             return _event_payload(persisted, session_id=session_id, message_id=message_id)
     except Exception as exc:
         logger.warning("Roleplay 画像生成に失敗しました: %s", exc)
-        async with await get_db_session() as session:
-            persisted = await session.get(GeneratedMedia, media_id)
-            if persisted is not None:
-                persisted.status = "failed"
-                persisted.error_message = str(exc)
-                persisted.updated_at = datetime.utcnow()
-                await session.commit()
-        return None
-
-
-async def generate_play_context_media(
-    *,
-    owner_user_id: str,
-    session_id: str,
-    bind_type: str,
-    bind_id: str,
-    positive_prompt: str,
-    negative_prompt: str,
-    scene_description: str = "",
-    comfyui_overrides: dict[str, Any] | None = None,
-    engine: str = "comfyui",
-    config: Any | None = None,
-    comfy_generate: ComfyGenerateFunc | None = None,
-) -> str | None:
-    """TRPG Play 卓画像を生成し、media ID を返す。"""
-    if not owner_user_id or not session_id or not bind_id:
-        return None
-
-    media_id = uuid.uuid4()
-    storage_key = uuid.uuid4().hex
-    extension = ".png"
-    relative = _relative_path(storage_key, extension)
-    prompt_meta = {
-        "scene": scene_description,
-        "prompt": positive_prompt,
-        "negative": negative_prompt,
-        "engine": engine,
-        "workflow": (comfyui_overrides or {}).get("workflow_path"),
-    }
-
-    async with await get_db_session() as session:
-        record = GeneratedMedia(
-            id=media_id,
-            owner_user_id=str(owner_user_id),
-            context_type="trpg_play",
-            context_id=str(session_id),
-            bind_type=bind_type,
-            bind_id=str(bind_id),
-            storage_key=storage_key,
-            mime_type="image/png",
-            relative_path=relative,
-            status="pending",
-            prompt_meta=prompt_meta,
-        )
-        session.add(record)
-        await session.commit()
-
-    try:
-        image_bytes, mime_type, saved_extension = await _generate_with_comfyui(
-            positive_prompt=positive_prompt,
-            negative_prompt=negative_prompt,
-            overrides=comfyui_overrides or {},
-            config=config,
-            comfy_generate=comfy_generate,
-        )
-        if saved_extension and saved_extension != extension:
-            extension = saved_extension
-            relative = _relative_path(storage_key, extension)
-        await write_media(relative, image_bytes, STORAGE_ROOT)
-
-        async with await get_db_session() as session:
-            persisted = await session.get(GeneratedMedia, media_id)
-            if persisted is None:
-                return None
-            persisted.status = "succeeded"
-            persisted.mime_type = mime_type
-            persisted.byte_size = len(image_bytes)
-            persisted.relative_path = relative
-            persisted.updated_at = datetime.utcnow()
-            await session.commit()
-            return str(media_id)
-    except Exception as exc:
-        logger.warning("TRPG Play 画像生成に失敗しました: %s", exc)
-        async with await get_db_session() as session:
-            persisted = await session.get(GeneratedMedia, media_id)
-            if persisted is not None:
-                persisted.status = "failed"
-                persisted.error_message = str(exc)
-                persisted.updated_at = datetime.utcnow()
-                await session.commit()
-        return None
-
-
-async def generate_story_context_media(
-    *,
-    owner_user_id: str,
-    work_id: str,
-    bind_type: str,
-    bind_id: str,
-    positive_prompt: str,
-    negative_prompt: str,
-    scene_description: str = "",
-    comfyui_overrides: dict[str, Any] | None = None,
-    engine: str = "comfyui",
-    config: Any | None = None,
-    comfy_generate: ComfyGenerateFunc | None = None,
-) -> str | None:
-    """Story 文脈の画像を生成し、media ID を返す。"""
-    if not owner_user_id or not work_id or not bind_id:
-        return None
-
-    media_id = uuid.uuid4()
-    storage_key = uuid.uuid4().hex
-    extension = ".png"
-    relative = _relative_path(storage_key, extension)
-    prompt_meta = {
-        "scene": scene_description,
-        "prompt": positive_prompt,
-        "negative": negative_prompt,
-        "engine": engine,
-        "workflow": (comfyui_overrides or {}).get("workflow_path"),
-    }
-
-    async with await get_db_session() as session:
-        record = GeneratedMedia(
-            id=media_id,
-            owner_user_id=str(owner_user_id),
-            context_type="story",
-            context_id=str(work_id),
-            bind_type=bind_type,
-            bind_id=str(bind_id),
-            storage_key=storage_key,
-            mime_type="image/png",
-            relative_path=relative,
-            status="pending",
-            prompt_meta=prompt_meta,
-        )
-        session.add(record)
-        await session.commit()
-
-    try:
-        image_bytes, mime_type, saved_extension = await _generate_with_comfyui(
-            positive_prompt=positive_prompt,
-            negative_prompt=negative_prompt,
-            overrides=comfyui_overrides or {},
-            config=config,
-            comfy_generate=comfy_generate,
-        )
-        if saved_extension and saved_extension != extension:
-            extension = saved_extension
-            relative = _relative_path(storage_key, extension)
-        await write_media(relative, image_bytes, STORAGE_ROOT)
-
-        async with await get_db_session() as session:
-            persisted = await session.get(GeneratedMedia, media_id)
-            if persisted is None:
-                return None
-            persisted.status = "succeeded"
-            persisted.mime_type = mime_type
-            persisted.byte_size = len(image_bytes)
-            persisted.relative_path = relative
-            persisted.updated_at = datetime.utcnow()
-            await session.commit()
-            return str(media_id)
-    except Exception as exc:
-        logger.warning("Story 画像生成に失敗しました: %s", exc)
         async with await get_db_session() as session:
             persisted = await session.get(GeneratedMedia, media_id)
             if persisted is not None:
@@ -490,28 +310,50 @@ async def _generate_with_comfyui(
     if comfy_generate is None:
         from .comfyui_service import generate_image as comfy_generate
 
-    result = await comfy_generate(
-        prompt=positive_prompt,
-        negative_prompt=negative_prompt,
-        workflow_path=overrides.get("workflow_path"),
-        overrides=overrides,
-    )
-    if not isinstance(result, dict) or not result.get("success"):
-        raise RuntimeError("ComfyUI 画像生成に失敗しました")
+    COMFYUI_STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="roleplay-", dir=COMFYUI_STAGING_ROOT
+    ) as staging_dir:
+        staging_root = Path(staging_dir).resolve()
+        result = await comfy_generate(
+            prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            workflow_path=overrides.get("workflow_path"),
+            overrides=overrides,
+            output_dir=staging_dir,
+        )
+        if not isinstance(result, dict) or not result.get("success"):
+            raise RuntimeError("ComfyUI 画像生成に失敗しました")
 
-    source_path = Path(str(result.get("image_path") or ""))
-    if not source_path.exists():
-        raise RuntimeError("ComfyUI 出力ファイルが見つかりません")
+        source_path = Path(str(result.get("image_path") or "")).resolve()
+        if not source_path.is_relative_to(staging_root) or not source_path.is_file():
+            raise RuntimeError("ComfyUI 出力ファイルが一時保存領域にありません")
 
-    mime_type = mimetypes.guess_type(source_path.name)[0] or "image/png"
-    extension = source_path.suffix or ".png"
-    data = source_path.read_bytes()
-    return data, mime_type, extension
+        mime_type = mimetypes.guess_type(source_path.name)[0] or "image/png"
+        extension = source_path.suffix or ".png"
+        data = source_path.read_bytes()
+        return data, mime_type, extension
 
 
-def resolve_media_file(media: GeneratedMedia) -> Path | None:
+def resolve_media_file(media: GeneratedMedia, *, create_root=True) -> Path | None:
     if media.status != "succeeded":
         return None
+    if not create_root:
+        from dataclasses import replace
+        from .generated_media_storage import media_relative_path
+        root = replace(get_media_root(STORAGE_ROOT), legacy_default=False)
+        path = root.resolve(media_relative_path(media.relative_path))
+        # Preserve permission/I/O failures instead of treating is_file() false
+        # as an original gap. A missing child is distinct from an offline root.
+        import stat
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            root.require_online()
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise StorageError("invalid_media_path", "生成メディアの原本が通常ファイルではありません", 400)
+        return path
     path = _absolute_path(media.relative_path)
     if not path.exists():
         # Distinguish a missing child file from a disconnected configured root.

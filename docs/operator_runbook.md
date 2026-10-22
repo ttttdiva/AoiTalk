@@ -85,7 +85,7 @@ AgentRuns, evidence or Media ledgers.
   Media evidence.
 * **Persona/Media:** `/operations?tab=personas` (and the preserved research,
   generation, pipeline, calendar and results tabs) remains the manual Media
-  surface.  Persona is a public identity, not an AI employee.
+  surface.  Persona is a public identity, not an Agent.
 * **Approvals:** `/operations?tab=actions` is human-only.  Inspect payload
   version/hash and approval invalidation before executing.
 

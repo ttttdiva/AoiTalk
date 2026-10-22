@@ -39,6 +39,11 @@ export function transitionDoubleEscapeKey(
     // capture boundary intentionally does not use this value: a child editor
     // may prevent the first Escape after the boundary has armed it.
     defaultPrevented?: boolean;
+    // IME composition: Chromium reports key "Process" (keyCode 229) while
+    // Firefox/Safari report key "Escape" with isComposing=true.  Both are the
+    // IME cancelling its composition, never an editor-close Escape.
+    isComposing?: boolean;
+    keyCode?: number;
   },
   options: { blocked: boolean; now: number },
 ): {
@@ -46,7 +51,7 @@ export function transitionDoubleEscapeKey(
   shouldClose: boolean;
   shouldConsume: boolean;
 } {
-  if (event.key !== "Escape") {
+  if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) {
     return {
       state: resetDoubleEscapeState(),
       shouldClose: false,

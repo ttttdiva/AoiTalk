@@ -10,8 +10,11 @@ import {
   fetchApi,
   fetchApiAtServerFingerprint,
 } from "./api-client";
+import { getTokenAuthScope, getTokenSnapshot } from "./auth";
 import {
   applyRemoteDocsNodeSupertags,
+  runDocsAuthProjection,
+  getDocsPermissionReadEpoch,
   applyRemoteDocsNodes,
   applyRemoteDocsEdges,
   applyRemoteDocsFieldValues,
@@ -66,6 +69,200 @@ export interface DocsNodeResponse {
   field_values?: DocsFieldValue[];
   placements?: DocsNodePlacement[];
   edges?: DocsEdge[];
+  /** HTTP 200 node is still usable when the optional local mirror write fails. */
+  local_sync_warning?: string;
+}
+
+type DocsNodeReadOptions = {
+  /** Keep the default projection blocking; only the detail fallback opts in. */
+  projection?: "blocking" | "deferred";
+  /** QA-only correlation nonce; never contains a node id or auth value. */
+  traceId?: string;
+};
+
+type DocsLoadMetricDetails = {
+  result?: "success" | "error" | "stale" | "hit" | "miss";
+  errorClass?: string;
+  readOnly?: boolean;
+  aclKnown?: boolean;
+};
+
+let docsLoadMetricSequence = 0;
+
+const DOCS_LOAD_SAFE_ERROR_CLASSES = new Set([
+  "AbortError",
+  "ApiConnectionError",
+  "ApiHttpError",
+  "ApiTimeoutError",
+  "DocsCanonicalResponseMalformedError",
+  "DocsCanonicalResponseStaleError",
+  "Error",
+  "RangeError",
+  "TypeError",
+]);
+
+function nextDocsLoadTraceId(): string {
+  docsLoadMetricSequence = (docsLoadMetricSequence + 1) % 1_000_000;
+  return `api-${docsLoadMetricSequence.toString(36)}`;
+}
+
+function docsLoadDebugMetricsEnabled(): boolean {
+  return process.env.EXPO_PUBLIC_DOCS_LOAD_DEBUG_METRICS === "1";
+}
+
+function isSafeDocsLoadTraceId(value: unknown): value is string {
+  return typeof value === "string" && /^(?:api|screen)-[0-9a-z]{1,8}$/.test(value);
+}
+
+function docsLoadMetricNow(): number {
+  return typeof globalThis.performance?.now === "function"
+    ? globalThis.performance.now()
+    : Date.now();
+}
+
+function safeDocsLoadErrorClass(error: unknown): string {
+  const name = error instanceof Error ? error.name : "";
+  return DOCS_LOAD_SAFE_ERROR_CLASSES.has(name) ? name : "UnknownError";
+}
+
+function emitDocsLoadMetric(
+  traceId: string,
+  startedAt: number,
+  phase: string,
+  details: DocsLoadMetricDetails = {},
+): void {
+  if (!docsLoadDebugMetricsEnabled()) return;
+  console.info("[DocsLoadMetric]", {
+    trace: traceId,
+    phase,
+    elapsedMs: Math.max(0, Math.round(docsLoadMetricNow() - startedAt)),
+    ...(details.result ? { result: details.result } : {}),
+    ...(details.errorClass ? { errorClass: details.errorClass } : {}),
+    ...(details.readOnly !== undefined ? { readOnly: details.readOnly } : {}),
+    ...(details.aclKnown !== undefined ? { aclKnown: details.aclKnown } : {}),
+  });
+}
+
+export class DocsCanonicalResponseStaleError extends Error {
+  constructor() {
+    super("認証スコープが変わったため、古いDocs応答を破棄しました");
+    this.name = "DocsCanonicalResponseStaleError";
+  }
+}
+
+type CanonicalNodeRequestControl = {
+  assertCurrent: () => void;
+  retain: () => void;
+  release: () => void;
+};
+
+const canonicalNodeRequests = new Map<string, object>();
+async function withCanonicalNodeRequest<T>(
+  nodeId: string,
+  authScope: string,
+  operation: (permissionEpoch: number, request: CanonicalNodeRequestControl) => Promise<T>,
+): Promise<T> {
+  const key = `${authScope}:${nodeId}`;
+  const identity = {};
+  canonicalNodeRequests.set(key, identity);
+  let retained = false;
+  const cleanup = () => {
+    if (canonicalNodeRequests.get(key) === identity) canonicalNodeRequests.delete(key);
+  };
+  const request: CanonicalNodeRequestControl = {
+    assertCurrent: () => {
+      if (canonicalNodeRequests.get(key) !== identity) throw new DocsCanonicalResponseStaleError();
+    },
+    retain: () => { retained = true; },
+    release: () => {
+      retained = false;
+      cleanup();
+    },
+  };
+  try { return await operation(getDocsPermissionReadEpoch(), request); }
+  finally { if (!retained) cleanup(); }
+}
+
+export class DocsCanonicalResponseMalformedError extends Error {
+  constructor() {
+    super("Canonical Docs node response is malformed");
+    this.name = "DocsCanonicalResponseMalformedError";
+  }
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNullableRecord(value: unknown): value is Record<string, unknown> | null {
+  return value === null
+    || (typeof value === "object" && value !== null && !Array.isArray(value));
+}
+
+function isDocsNodePayload(value: unknown, expectedId: string): value is DocsNode {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const node = value as Record<string, unknown>;
+  return node.id === expectedId
+    && isNullableString(node.workspace_id)
+    && isNullableString(node.parent_id)
+    && isNullableString(node.root_page_id)
+    && isNullableString(node.project_id)
+    && isNullableString(node.system_key)
+    && typeof node.title === "string"
+    && Array.isArray(node.aliases)
+    && node.aliases.every((alias) => typeof alias === "string")
+    && isNullableString(node.description)
+    && isNullableRecord(node.body_json)
+    && isNullableString(node.body_text)
+    && (node.node_type === "node"
+      || node.node_type === "search"
+      || node.node_type === "day"
+      || node.node_type === "system")
+    && isNullableRecord(node.display_props)
+    && isNullableRecord(node.query_json)
+    && isNullableRecord(node.view_json)
+    && isNullableString(node.day_date)
+    && (node.sort_order === null
+      || (typeof node.sort_order === "number" && Number.isFinite(node.sort_order)))
+    && isNullableString(node.created_by)
+    && isNullableString(node.updated_by)
+    && isNullableString(node.created_at)
+    && isNullableString(node.updated_at)
+    && isNullableString(node.archived_at)
+    && (node.source === undefined || isNullableString(node.source))
+    && (node.access === undefined || isNullableString(node.access))
+    && (node.read_only === undefined || typeof node.read_only === "boolean");
+}
+
+function hasCanonicalNodeAcl(node: DocsNode): boolean {
+  const access = node.access;
+  return (access === "owner" || access === "write" || access === "read")
+    && typeof node.read_only === "boolean"
+    && node.read_only === (access === "read");
+}
+
+type DocsAuthSnapshot = Awaited<ReturnType<typeof getTokenSnapshot>>;
+
+function sameAuthSnapshot(
+  expected: DocsAuthSnapshot,
+  current: DocsAuthSnapshot,
+): boolean {
+  return expected.revision === current.revision && expected.token === current.token;
+}
+
+async function assertAuthSnapshot(expected: DocsAuthSnapshot): Promise<void> {
+  if (!sameAuthSnapshot(expected, await getTokenSnapshot())) {
+    throw new DocsCanonicalResponseStaleError();
+  }
+}
+
+function authScopeFromSnapshot(snapshot: { token: string | null }): string | null {
+  if (!snapshot.token) return null;
+  try {
+    return getTokenAuthScope(snapshot.token);
+  } catch {
+    return null;
+  }
 }
 
 function normalizeTaskBinding(value: unknown): DocsTaskBinding | null {
@@ -82,25 +279,43 @@ function normalizeTaskBinding(value: unknown): DocsTaskBinding | null {
   };
 }
 
-async function applyDocsSnapshot(response: DocsTreeResponse | DocsNodeResponse) {
+async function applyDocsSnapshot(
+  response: DocsTreeResponse | DocsNodeResponse,
+  options: {
+    skipNodeId?: string;
+    assertAuth?: () => Promise<void>;
+  } = {},
+) {
+  const guarded = async (operation: () => Promise<void>): Promise<void> => {
+    if (options.assertAuth) await options.assertAuth();
+    await operation();
+    if (options.assertAuth) await options.assertAuth();
+  };
   const singleNode = "node" in response ? response.node : undefined;
   const nodes = response.nodes?.length ? response.nodes : singleNode ? [singleNode] : [];
-  if (nodes.length) await applyRemoteDocsNodes(nodes);
-  if (response.supertags?.length) await applyRemoteDocsSupertags(response.supertags);
+  const nodesToApply = options.skipNodeId
+    ? nodes.filter((node) => node.id !== options.skipNodeId)
+    : nodes;
+  if (nodesToApply.length) await guarded(() => applyRemoteDocsNodes(nodesToApply));
+  if (response.supertags?.length) {
+    await guarded(() => applyRemoteDocsSupertags(response.supertags!));
+  }
   if (response.node_supertags?.length) {
-    await applyRemoteDocsNodeSupertags(response.node_supertags);
+    await guarded(() => applyRemoteDocsNodeSupertags(response.node_supertags!));
   }
   if (response.supertag_fields?.length) {
-    await applyRemoteDocsSupertagFields(response.supertag_fields);
+    await guarded(() => applyRemoteDocsSupertagFields(response.supertag_fields!));
   }
-  if (response.fields?.length) await applyRemoteDocsFields(response.fields);
+  if (response.fields?.length) {
+    await guarded(() => applyRemoteDocsFields(response.fields!));
+  }
   if (response.field_values?.length) {
-    await applyRemoteDocsFieldValues(response.field_values);
+    await guarded(() => applyRemoteDocsFieldValues(response.field_values!));
   }
   if (response.placements?.length) {
-    await applyRemoteDocsPlacements(response.placements);
+    await guarded(() => applyRemoteDocsPlacements(response.placements!));
   }
-  if (response.edges?.length) await applyRemoteDocsEdges(response.edges);
+  if (response.edges?.length) await guarded(() => applyRemoteDocsEdges(response.edges!));
 }
 
 /** `POST /api/docs/ingest` の実行結果。ローカル実行時も同じ形へ揃える。 */
@@ -362,12 +577,167 @@ export const docsApi = {
   },
 
   /** GET /api/docs/nodes/{node_id} — ACL checked canonical node detail. */
-  async getNode(nodeId: string): Promise<DocsNodeResponse> {
-    const response = await fetchApi<DocsNodeResponse>(
-      `/api/docs/nodes/${encodeURIComponent(nodeId)}`,
-    );
-    await applyDocsSnapshot(response);
-    return response;
+  async getNode(
+    nodeId: string,
+    options: DocsNodeReadOptions = {},
+  ): Promise<DocsNodeResponse> {
+    const traceId = isSafeDocsLoadTraceId(options.traceId)
+      ? options.traceId
+      : nextDocsLoadTraceId();
+    const metricStartedAt = docsLoadMetricNow();
+    emitDocsLoadMetric(traceId, metricStartedAt, "auth_snapshot_start");
+    let requestSnapshot: DocsAuthSnapshot;
+    try {
+      requestSnapshot = await getTokenSnapshot();
+      emitDocsLoadMetric(traceId, metricStartedAt, "auth_snapshot_end", { result: "success" });
+    } catch (error) {
+      emitDocsLoadMetric(traceId, metricStartedAt, "auth_snapshot_error", {
+        result: "error",
+        errorClass: safeDocsLoadErrorClass(error),
+      });
+      throw error;
+    }
+    const requestAuth = authScopeFromSnapshot(requestSnapshot);
+    if (!requestAuth) throw new DocsCanonicalResponseStaleError();
+    return withCanonicalNodeRequest(nodeId, requestAuth, async (permissionEpoch, request) => {
+      emitDocsLoadMetric(traceId, metricStartedAt, "canonical_http_start");
+      let response: DocsNodeResponse;
+      try {
+        response = await fetchApi<DocsNodeResponse>(
+          `/api/docs/nodes/${encodeURIComponent(nodeId)}`,
+        );
+        emitDocsLoadMetric(traceId, metricStartedAt, "canonical_http_end", { result: "success" });
+      } catch (error) {
+        emitDocsLoadMetric(traceId, metricStartedAt, "canonical_http_error", {
+          result: "error",
+          errorClass: safeDocsLoadErrorClass(error),
+        });
+        throw error;
+      }
+      await assertAuthSnapshot(requestSnapshot);
+      request.assertCurrent();
+      if (!isDocsNodePayload(response?.node, nodeId)) {
+        throw new DocsCanonicalResponseMalformedError();
+      }
+      const projectCanonicalNode = () => {
+        emitDocsLoadMetric(traceId, metricStartedAt, "projection_enqueue");
+        return runDocsAuthProjection(async (applyNode) => {
+          emitDocsLoadMetric(traceId, metricStartedAt, "projection_start");
+          try {
+            await assertAuthSnapshot(requestSnapshot);
+            request.assertCurrent();
+            const result = await applyNode(response.node, {
+              permissionEpoch,
+              assertCurrent: request.assertCurrent,
+            });
+            // A rejected node projection may belong to another composite scope.
+            // Its related rows share global keys too, so do not write those rows
+            // unless the exact node membership was established successfully.
+            if (result.membershipApplied) {
+              await applyDocsSnapshot(response, {
+                skipNodeId: response.node.id,
+                assertAuth: async () => {
+                  await assertAuthSnapshot(requestSnapshot);
+                  request.assertCurrent();
+                },
+              });
+            }
+            await assertAuthSnapshot(requestSnapshot);
+            request.assertCurrent();
+            return result;
+          } catch (error) {
+            emitDocsLoadMetric(traceId, metricStartedAt, "projection_error", {
+              result: error instanceof DocsCanonicalResponseStaleError ? "stale" : "error",
+              errorClass: safeDocsLoadErrorClass(error),
+            });
+            throw error;
+          } finally {
+            emitDocsLoadMetric(traceId, metricStartedAt, "projection_settle");
+          }
+        });
+      };
+
+      const assertFinalAuth = async (): Promise<void> => {
+        try {
+          await assertAuthSnapshot(requestSnapshot);
+          request.assertCurrent();
+          emitDocsLoadMetric(traceId, metricStartedAt, "final_auth_guard", { result: "success" });
+        } catch (error) {
+          emitDocsLoadMetric(traceId, metricStartedAt, "final_auth_guard", {
+            result: "stale",
+            errorClass: safeDocsLoadErrorClass(error),
+          });
+          throw error;
+        }
+      };
+
+      if (options.projection === "deferred") {
+        if (!hasCanonicalNodeAcl(response.node)) {
+          throw new DocsCanonicalResponseMalformedError();
+        }
+        request.retain();
+        try {
+          void projectCanonicalNode()
+            .catch(() => undefined)
+            .finally(request.release);
+        } catch (error) {
+          request.release();
+          throw error;
+        }
+        emitDocsLoadMetric(traceId, metricStartedAt, "final_auth_guard", { result: "success" });
+        return {
+          ...response,
+          local_sync_warning:
+            "最新の内容を表示しています。同期が完了するまで閲覧のみです。",
+        };
+      }
+      try {
+        const readThrough = await projectCanonicalNode();
+        // Releasing the queue can admit a waiting auth transition before this
+        // continuation resumes. Validate once more before exposing its result.
+        await assertFinalAuth();
+        const effectiveNode = {
+          ...response.node,
+          ...(readThrough.access ? { access: readThrough.access } : {}),
+          ...(readThrough.readOnly !== undefined ? { read_only: readThrough.readOnly } : {}),
+        };
+        const effectiveNodes = response.nodes?.map((node) =>
+          node.id === effectiveNode.id ? effectiveNode : node,
+        );
+        if (!readThrough.membershipApplied) {
+          return {
+            ...response,
+            node: effectiveNode,
+            ...(effectiveNodes ? { nodes: effectiveNodes } : {}),
+            local_sync_warning:
+              "サーバーのノードは取得済みですが、端末のDocsスコープ投影が未確定です。同期後に再確認してください。",
+          };
+        }
+        return {
+          ...response,
+          node: effectiveNode,
+          ...(effectiveNodes ? { nodes: effectiveNodes } : {}),
+        };
+      } catch (error) {
+        if (error instanceof DocsCanonicalResponseStaleError) throw error;
+        await assertAuthSnapshot(requestSnapshot);
+        request.assertCurrent();
+        if (getDocsPermissionReadEpoch() !== permissionEpoch) throw new DocsCanonicalResponseStaleError();
+        // The canonical HTTP response remains valid even when a best-effort
+        // local mirror write fails (for example while SQLite is foreground-busy
+        // or a legacy parent/membership projection is still catching up).  Do
+        // not turn an authorized 200 into a false "node not found" screen.
+        console.warn(
+          "[docs] canonical node local apply failed",
+          error instanceof Error ? error.name : "UnknownError",
+        );
+        return {
+          ...response,
+          local_sync_warning:
+            "サーバーのノードは取得済みですが、端末キャッシュへの反映に失敗しました。同期後に再確認してください。",
+        };
+      }
+    });
   },
 
   /** GET /api/docs/search — online 全文検索。offline は docsRepo.searchLocal を UI で使う。 */

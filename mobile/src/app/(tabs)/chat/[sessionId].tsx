@@ -1,5 +1,6 @@
 import React, {
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -25,11 +26,14 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
+import { AoiDotsContext } from "../../../features/aoidots/context";
 import { useConversationController } from "../../../features/conversation/useConversationController";
 import { buildDurableTimeline } from "../../../features/conversation/timeline";
 import type { TimelineItem } from "../../../features/conversation/models";
 import { ChatHeaderStatus } from "../../../features/conversation/components/ChatHeaderStatus";
 import { ChatTimeline } from "../../../features/conversation/components/ChatTimeline";
+import { ChatTimelineFrame } from "../../../features/conversation/components/ChatTimelineFrame";
+import { parseCanonicalAppLink } from "../../../features/conversation/components/app-links";
 import {
   ChatComposer,
   type ChatComposerSubmission,
@@ -60,6 +64,10 @@ import {
   type ModelPickerEntry,
 } from "../../../features/conversation/model-picker";
 import { ChatTextInput } from "../../../features/conversation/chat-input-theme";
+import { getPendingMessageRetryRoute } from "../../../features/conversation/message-actions";
+import { conversationsRepo } from "../../../repositories";
+import type { ConversationAgent } from "../../../types/api";
+import type { OperationsWorkReference } from "../../../lib/operations-api";
 
 type DirectModelOption = DirectMobileLlmSelection & { label: string };
 
@@ -86,14 +94,20 @@ export default function ChatScreen() {
     selectedProjectId,
     setSelectedProjectId,
   } = useProject();
+  const aoiDots = useContext(AoiDotsContext);
+  const chatSurfaceActive = aoiDots?.isOpen !== true;
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
   const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promotedSessionTargetRef = useRef<string | null>(null);
+  const voiceSessionAliasesRef = useRef(new Map<string, string>());
   const reduceMotion = useReducedMotion();
   const [editTarget, setEditTarget] = useState<ConversationMessage | null>(
     null,
   );
   const [editContent, setEditContent] = useState("");
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const editTargetIdRef = useRef<string | null>(null);
   const [modelTarget, setModelTarget] = useState<ConversationMessage | null>(
     null,
   );
@@ -110,9 +124,7 @@ export default function ChatScreen() {
   );
   const [pendingQueueVisible, setPendingQueueVisible] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
-  const [actionTarget, setActionTarget] = useState<ConversationMessage | null>(
-    null,
-  );
+  const [actionTargetId, setActionTargetId] = useState<string | null>(null);
   const [titleDialogVisible, setTitleDialogVisible] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [titleSaving, setTitleSaving] = useState(false);
@@ -125,6 +137,9 @@ export default function ChatScreen() {
   const handleSessionPromoted = useCallback(
     (remoteSessionId: string) => {
       promotedSessionTargetRef.current = remoteSessionId;
+      voiceSessionAliasesRef.current.set(
+        remoteSessionId, voiceSessionAliasesRef.current.get(sessionId) ?? sessionId,
+      );
       router.setParams({
           sessionId: remoteSessionId,
           ...(routeAppId ? { appId: routeAppId } : {}),
@@ -133,7 +148,7 @@ export default function ChatScreen() {
           ...(routeTaskId ? { taskId: routeTaskId } : {}),
       });
     },
-    [routeAppId, routeAppTargetId, routeProjectId, routeTaskId, router],
+    [routeAppId, routeAppTargetId, routeProjectId, routeTaskId, router, sessionId],
   );
 
   const controller = useConversationController({
@@ -177,6 +192,10 @@ export default function ChatScreen() {
     : routeProjectId ?? selectedProjectId;
   const includeProjectContext = Boolean(currentProjectId);
   const appContextSelected = Boolean(controller.session?.app_id || routeAppId);
+  const agentBoundToServer = Boolean(
+    controller.session?.agent_id || controller.session?.agent_binding_pending,
+  );
+  editTargetIdRef.current = editTarget?.id ?? null;
 
   const openContextSnapshot = useCallback(() => {
     setContextVisible(true);
@@ -218,7 +237,9 @@ export default function ChatScreen() {
         (message) =>
           message.role === "user" &&
           Boolean(message.metadata?.local_only) &&
-          (Boolean(message.metadata?.pending) || message.metadata?.message_state === "direct-failed"),
+          (Boolean(message.metadata?.pending) ||
+            Boolean(message.metadata?.persistence_error) ||
+            message.metadata?.message_state === "direct-failed"),
       ),
     [controller.messages],
   );
@@ -304,7 +325,7 @@ export default function ChatScreen() {
   }, []);
 
   const selectResponseModelEntry = useCallback((entry: ModelPickerEntry) => {
-    if (appContextSelected && entry.kind === "direct") return;
+    if ((appContextSelected || agentBoundToServer) && entry.kind === "direct") return;
     if (entry.kind === "direct") {
       const efforts = getDirectReasoningEffortOptions(
         entry.provider as DirectMobileLlmProvider,
@@ -332,13 +353,13 @@ export default function ChatScreen() {
     setResponseModelVisible(false);
     setModelPickerProvider(null);
     setModelPickerFilter("");
-  }, [appContextSelected, controller.changeResponseTarget, directResponse]);
+  }, [agentBoundToServer, appContextSelected, controller.changeResponseTarget, directResponse]);
 
   useEffect(() => {
-    if (appContextSelected && directResponse) {
+    if ((appContextSelected || agentBoundToServer) && directResponse) {
       controller.changeResponseTarget({ kind: "server" });
     }
-  }, [appContextSelected, controller.changeResponseTarget, directResponse]);
+  }, [agentBoundToServer, appContextSelected, controller.changeResponseTarget, directResponse]);
 
   useEffect(() => {
     let cancelled = false;
@@ -416,6 +437,33 @@ export default function ChatScreen() {
     [controller.changeProject, setSelectedProjectId],
   );
 
+  const openSameAgentChat = useCallback(async () => {
+    const current = controller.session;
+    if (!current?.agent_id) return;
+    const agent: ConversationAgent = controller.agentCatalog.find(
+      (candidate) => candidate.id === current.agent_id,
+    ) ?? {
+      id: current.agent_id,
+      display_name: current.agent_display_name ?? `Agent ${current.agent_id.slice(0, 8)}`,
+      state: current.agent_state,
+      latest_revision_id: current.latest_revision_id,
+      character_id: current.agent_character_id,
+    };
+    const created = await conversationsRepo.createLocalSession(
+      current.character_name,
+      current.project_id,
+      user?.user_id,
+      agent,
+    );
+    router.push({
+      pathname: "/(tabs)/chat/[sessionId]",
+      params: {
+        sessionId: created.id,
+        ...(current.project_id ? { projectId: current.project_id } : {}),
+      },
+    });
+  }, [controller.agentCatalog, controller.session, router, user?.user_id]);
+
   const scheduleScrollToEnd = useCallback((delay = 48) => {
     if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
     scrollTimerRef.current = setTimeout(() => {
@@ -431,7 +479,7 @@ export default function ChatScreen() {
   useEffect(() => {
     const showSubscription = Keyboard.addListener("keyboardDidShow", () => {
       setKeyboardVisible(true);
-      scheduleScrollToEnd(64);
+      if (!editTargetIdRef.current) scheduleScrollToEnd(64);
     });
     const hideSubscription = Keyboard.addListener("keyboardDidHide", () => {
       setKeyboardVisible(false);
@@ -470,23 +518,82 @@ export default function ChatScreen() {
   );
 
   const openEdit = useCallback((message: ConversationMessage) => {
+    setActionTargetId(null);
     setEditTarget(message);
     setEditContent(message.content);
+    setEditError(null);
   }, []);
 
-  const submitEdit = useCallback(() => {
-    if (!editTarget || !editContent.trim()) return;
-    void controller.editMessage(editTarget, editContent.trim()).then(() => {
+  const cancelEdit = useCallback(() => {
+    if (editSaving) return;
+    setEditTarget(null);
+    setEditContent("");
+    setEditError(null);
+    Keyboard.dismiss();
+  }, [editSaving]);
+
+  const submitEdit = useCallback(async () => {
+    if (!editTarget || !editContent.trim() || editSaving) return;
+    setEditSaving(true);
+    setEditError(null);
+    try {
+      await controller.editMessage(editTarget, editContent.trim());
       setEditTarget(null);
       setEditContent("");
-    }).catch((error: unknown) => {
-      Alert.alert("編集したメッセージの送信に失敗しました", error instanceof Error ? error.message : "入力と履歴を保持しました。再試行できます。");
-    });
-  }, [controller, editContent, editTarget]);
+      Keyboard.dismiss();
+    } catch (error) {
+      setEditError(
+        error instanceof Error
+          ? error.message
+          : "編集に失敗しました。入力内容は保持されています。",
+      );
+    } finally {
+      setEditSaving(false);
+    }
+  }, [controller.editMessage, editContent, editSaving, editTarget]);
 
   const copyMessage = useCallback(async (message: ConversationMessage) => {
     await Clipboard.setStringAsync(message.content);
   }, []);
+
+  const rerunMessage = useCallback(
+    (message: ConversationMessage) => {
+      void controller.rerunMessage(message);
+    },
+    [controller.rerunMessage],
+  );
+
+  const retryMessage = useCallback(
+    (message: ConversationMessage) => {
+      void controller.retryPendingMessage(
+        message,
+        getPendingMessageRetryRoute(message),
+      );
+    },
+    [controller.retryPendingMessage],
+  );
+
+  const forkMessage = useCallback(
+    (message: ConversationMessage) => {
+      void controller
+        .forkConversation(message.id)
+        .then((forkedId) =>
+          router.replace({
+            pathname: "/(tabs)/chat/[sessionId]",
+            params: { sessionId: forkedId },
+          }),
+        )
+        .catch((error) =>
+          Alert.alert(
+            "Chat",
+            error instanceof Error
+              ? error.message
+              : "会話のフォークに失敗しました。",
+          ),
+        );
+    },
+    [controller.forkConversation, router],
+  );
 
   const changeLlmMode = useCallback(
     (mode: string) => {
@@ -497,8 +604,12 @@ export default function ChatScreen() {
   );
 
   const openMessageActions = useCallback((message: ConversationMessage) => {
-    setActionTarget(message);
+    if (editTargetIdRef.current) return;
+    setActionTargetId((current) =>
+      current === message.id ? null : message.id,
+    );
   }, []);
+  const dismissMessageActions = useCallback(() => setActionTargetId(null), []);
   const switchMessageBranch = useCallback(
     (message: ConversationMessage, nextIndex: number) => {
       void controller.switchBranch(message, nextIndex);
@@ -512,46 +623,116 @@ export default function ChatScreen() {
     void controller.refreshResponseModelOptions();
   }, [controller.refreshResponseModelOptions]);
   const openLlmMode = useCallback(() => setLlmModeVisible(true), []);
+  const openWork = useCallback(
+    (reference: OperationsWorkReference) => {
+      if (reference.kind !== "work" || !reference.id) return;
+      router.push({
+        pathname: "/operations/work/[workId]",
+        params: { workId: reference.id },
+      });
+    },
+    [router],
+  );
+  const openAppLink = useCallback(
+    (href: string): boolean => {
+      const target = parseCanonicalAppLink(href);
+      if (!target) return true;
+      router.push({
+        pathname: "/(tabs)/apps/[appId]",
+        params: {
+          appId: target.appId,
+          ...(target.projectId ? { projectId: target.projectId } : {}),
+        },
+      });
+      return false;
+    },
+    [router],
+  );
 
   return (
     <ChatScreenShell
       loading={controller.loading && !hasConversationContent}
       error={controller.error}
       onReload={() => void controller.load()}
-      header={
-        <ChatHeaderStatus
-        diagnostics={controller.diagnostics}
-        session={controller.session}
-        projects={projects}
-        currentProjectId={currentProjectId ?? null}
-        pendingCount={pendingMessages.length}
-        onChangeProject={changeChatProject}
-        onChangeCharacter={controller.changeCharacter}
-        onOpenPendingQueue={openPendingQueue}
-        onBack={() => router.back()}
-        onRenameTitle={() => {
-          setTitleDraft(controller.session?.title || "");
-          setTitleError(null);
-          setTitleDialogVisible(true);
-        }}
-      />
-      }
     >
-      <ChatTimeline
-        listRef={flatListRef}
-        items={durableTimeline}
-        allMessages={controller.messages}
-        streamContent={controller.streamContent}
-        reduceMotion={reduceMotion}
-        agentRuns={controller.agentRuns}
-        agentRunErrors={controller.agentRunErrors}
-        onLongPressMessage={openMessageActions}
-        onSwitchBranch={switchMessageBranch}
-        onRetryAgentRun={controller.retryAgentRun}
-        onRespondPermission={controller.respondPermission}
-      />
+      <ChatTimelineFrame
+        topInset={insets.top}
+        active={chatSurfaceActive}
+        character={controller.session?.character_name ?? "assistant"}
+        state={controller.diagnostics.runState !== "idle" ? "thinking" : "idle"}
+        messages={controller.messages}
+        historyReady={!controller.loading}
+        sessionKey={sessionId}
+      >
+        <ChatTimeline
+          listRef={flatListRef}
+          header={
+            <ChatHeaderStatus
+              diagnostics={controller.diagnostics}
+              session={controller.session}
+              projects={projects}
+              currentProjectId={currentProjectId ?? null}
+              pendingCount={pendingMessages.length}
+              onChangeProject={changeChatProject}
+              onChangeCharacter={controller.changeCharacter}
+              agents={controller.agentCatalog}
+              agentCatalogLoading={controller.agentCatalogLoading}
+              onChangeAgent={controller.changeAgent}
+              onRefreshAgents={controller.refreshAgentCatalog}
+              onAdoptServerAgent={controller.adoptServerAgent}
+              onNewSameAgentChat={() => void openSameAgentChat()}
+              onOpenPendingQueue={openPendingQueue}
+              onBack={() => router.back()}
+              onRenameTitle={() => {
+                setTitleDraft(controller.session?.title || "");
+                setTitleError(null);
+                setTitleDialogVisible(true);
+              }}
+            />
+          }
+          items={durableTimeline}
+          allMessages={controller.messages}
+          streamContent={controller.streamContent}
+          reduceMotion={reduceMotion}
+          agentRuns={controller.agentRuns}
+          agentRunErrors={controller.agentRunErrors}
+          onLongPressMessage={openMessageActions}
+          onPressMessage={dismissMessageActions}
+          actionTargetId={actionTargetId}
+          editTargetId={editTarget?.id ?? null}
+          editContent={editContent}
+          editSaving={editSaving}
+          editError={editError}
+          isAuthenticated={isAuthenticated}
+          retryingMessageIds={controller.retryingMessageIds}
+          onDismissMessageActions={dismissMessageActions}
+          onBeginEdit={openEdit}
+          onEditContentChange={setEditContent}
+          onCancelEdit={cancelEdit}
+          onSubmitEdit={() => void submitEdit()}
+          onRetryMessage={retryMessage}
+          onRerunMessage={rerunMessage}
+          onCopyMessage={(message) => void copyMessage(message)}
+          onForkMessage={forkMessage}
+          onSwitchBranch={switchMessageBranch}
+          onRetryAgentRun={controller.retryAgentRun}
+          onOpenWork={openWork}
+          onOpenAppLink={openAppLink}
+          onRespondPermission={controller.respondPermission}
+        />
+      </ChatTimelineFrame>
 
       <ChatComposer
+        voiceContext={{
+          conversationKey: voiceSessionAliasesRef.current.get(sessionId) ?? sessionId,
+          sessionId: controller.session?.id ?? sessionId,
+          sessionIsLocalOnly: controller.session?.is_local_only === true,
+          projectId: currentProjectId ?? null,
+          characterName: controller.session?.character_name ?? "assistant",
+          userId: user?.user_id ?? null,
+          messages: controller.visibleMessages,
+          busy: controller.diagnostics.runState !== "idle",
+        }}
         bottomInset={insets.bottom}
         keyboardVisible={keyboardVisible}
         sendEnabled={Boolean(sendEnabled)}
@@ -678,34 +859,71 @@ export default function ChatScreen() {
                     </Text>
                   </View>
                   <View>
-                  {isAuthenticated && message.metadata?.delivery_route !== "direct" ? (
-                  <Button
-                    compact
-                    icon="refresh"
-                    textColor="#89b4fa"
-                    disabled={controller.retryingMessageIds.includes(message.id)}
-                    onPress={() => {
-                      setPendingQueueVisible(false);
-                      void controller.retryPendingMessage(message);
-                    }}
-                  >
-                    {controller.retryingMessageIds.includes(message.id)
-                      ? "再試行中…"
-                      : "サーバーへ再送"}
-                  </Button>
-                  ) : null}
-                  <Button
-                    compact
-                    icon="cloud-outline"
-                    textColor="#89b4fa"
-                    disabled={controller.retryingMessageIds.includes(message.id)}
-                    onPress={() => {
-                      setPendingQueueVisible(false);
-                      void controller.retryPendingMessage(message, "direct");
-                    }}
-                  >
-                    Directで再試行
-                  </Button>
+                    {isAuthenticated &&
+                    message.metadata?.delivery_route !== "direct" ? (
+                      <Button
+                        compact
+                        icon="refresh"
+                        textColor="#89b4fa"
+                        disabled={controller.retryingMessageIds.includes(
+                          message.id,
+                        )}
+                        onPress={() => {
+                          setPendingQueueVisible(false);
+                          void controller.retryPendingMessage(message, "server");
+                        }}
+                      >
+                        {controller.retryingMessageIds.includes(message.id)
+                          ? "再試行中…"
+                          : "サーバーへ再送"}
+                      </Button>
+                    ) : null}
+                    {!agentBoundToServer ? <Button
+                      compact
+                      icon="cloud-outline"
+                      textColor="#89b4fa"
+                      disabled={controller.retryingMessageIds.includes(message.id)}
+                      onPress={() => {
+                        setPendingQueueVisible(false);
+                        void controller.retryPendingMessage(message, "direct");
+                      }}
+                    >
+                      Directで再試行
+                    </Button> : null}
+                    {(message.metadata?.pending ||
+                      message.metadata?.persistence_error ||
+                      message.metadata?.message_state === "direct-failed") ? (
+                      <>
+                        <Button
+                          compact
+                          icon="undo"
+                          textColor="#f9e2af"
+                          disabled={controller.retryingMessageIds.includes(message.id)}
+                          onPress={() => {
+                            setPendingQueueVisible(false);
+                            void controller.cancelPendingMessage(message, "cancel").catch((error) =>
+                              Alert.alert("Chat", error instanceof Error ? error.message : "未送信入力を取り消せませんでした."),
+                            );
+                          }}
+                        >
+                          送信を取り消す
+                        </Button>
+                        <Button
+                          compact
+                          icon="content-save-outline"
+                          textColor="#a6adc8"
+                          disabled={controller.retryingMessageIds.includes(message.id)}
+                          onPress={() => {
+                            setPendingQueueVisible(false);
+                            void controller.cancelPendingMessage(message, "draft").catch((error) =>
+                              Alert.alert("Chat", error instanceof Error ? error.message : "下書きへ戻せませんでした."),
+                            );
+                          }}
+                        >
+                          下書きに戻す
+                        </Button>
+                      </>
+                    ) : null}
                   </View>
                 </Surface>
               ))}
@@ -771,7 +989,7 @@ export default function ChatScreen() {
                         buttonColor={selected ? "#7c3aed" : undefined}
                         textColor={selected ? "#f5e9ff" : "#89b4fa"}
                         style={styles.modeButton}
-                        disabled={appContextSelected && entry.kind === "direct"}
+                        disabled={(appContextSelected || agentBoundToServer) && entry.kind === "direct"}
                         onPress={() => selectResponseModelEntry(entry)}
                       >
                         {entry.routeLabel
@@ -916,175 +1134,6 @@ export default function ChatScreen() {
               onPress={() => setLlmModeVisible(false)}
             >
               Cancel
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-
-        <Dialog
-          visible={Boolean(actionTarget)}
-          onDismiss={() => setActionTarget(null)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>メッセージ操作</Dialog.Title>
-          <Dialog.Content>
-            {(() => {
-              if (!actionTarget) return null;
-              const pending = Boolean(actionTarget.metadata?.pending);
-              const canServerAction =
-                isAuthenticated &&
-                !String(actionTarget.id).startsWith("temp-") &&
-                !pending;
-              const canEdit = canServerAction && actionTarget.role === "user";
-              const canModelRerun =
-                canServerAction && actionTarget.role === "assistant";
-              return (
-                <>
-                  <Button
-                    icon="content-copy"
-                    textColor="#cdd6f4"
-                    onPress={() => {
-                      const target = actionTarget;
-                      setActionTarget(null);
-                      if (target) void copyMessage(target);
-                    }}
-                  >
-                    コピー
-                  </Button>
-                  {pending && isAuthenticated ? (
-                    <Button
-                      icon="refresh"
-                      textColor="#89b4fa"
-                      disabled={controller.retryingMessageIds.includes(
-                        actionTarget.id,
-                      )}
-                      onPress={() => {
-                        const target = actionTarget;
-                        setActionTarget(null);
-                        if (target) void controller.retryPendingMessage(target);
-                      }}
-                    >
-                      {controller.retryingMessageIds.includes(actionTarget.id)
-                        ? "リトライ中…"
-                        : "リトライ"}
-                    </Button>
-                  ) : null}
-                  {canEdit ? (
-                    <Button
-                      icon="pencil"
-                      textColor="#cdd6f4"
-                      onPress={() => {
-                        const target = actionTarget;
-                        setActionTarget(null);
-                        if (target) openEdit(target);
-                      }}
-                    >
-                      編集
-                    </Button>
-                  ) : null}
-                  {canServerAction ? (
-                    <>
-                      <Button
-                        icon="replay"
-                        textColor="#89b4fa"
-                      onPress={() => {
-                        const target = actionTarget;
-                        setActionTarget(null);
-                        if (target) void controller.rerunMessage(target);
-                      }}
-                    >
-                        {actionTarget.role === "assistant"
-                          ? "この回答を再生成"
-                          : "再実行"}
-                      </Button>
-                      {canModelRerun ? (
-                        <Button
-                          icon="tune"
-                          textColor="#89b4fa"
-                          onPress={() => {
-                            const target = actionTarget;
-                            setActionTarget(null);
-                            setModelTarget(target);
-                          }}
-                        >
-                          別モデルでこの回答を再生成
-                        </Button>
-                      ) : null}
-                      <Button
-                        icon="source-branch"
-                        textColor="#89b4fa"
-                        onPress={() => {
-                          const target = actionTarget;
-                          setActionTarget(null);
-                          if (target) void controller.loadBranches(target.id);
-                        }}
-                      >
-                        分岐を読み込み
-                      </Button>
-                      <Button
-                        icon="source-fork"
-                        textColor="#89b4fa"
-                        onPress={() => {
-                          const target = actionTarget;
-                          setActionTarget(null);
-                          if (!target) return;
-                          void controller
-                            .forkConversation(target.id)
-                            .then((forkedId) =>
-                              router.replace({
-                                pathname: "/(tabs)/chat/[sessionId]",
-                                params: { sessionId: forkedId },
-                              }),
-                            )
-                            .catch((error) =>
-                              Alert.alert(
-                                "Chat",
-                                error instanceof Error
-                                  ? error.message
-                                  : "会話のフォークに失敗しました。",
-                              ),
-                            );
-                        }}
-                      >
-                        ここからフォーク
-                      </Button>
-                    </>
-                  ) : null}
-                </>
-              );
-            })()}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button textColor="#a6adc8" onPress={() => setActionTarget(null)}>
-              閉じる
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-
-        <Dialog
-          visible={Boolean(editTarget)}
-          onDismiss={() => setEditTarget(null)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>Edit Message</Dialog.Title>
-          <Dialog.Content>
-            <ChatTextInput
-              value={editContent}
-              onChangeText={setEditContent}
-              mode="outlined"
-              multiline
-              style={styles.editInput}
-            />
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button textColor="#a6adc8" onPress={() => setEditTarget(null)}>
-              Cancel
-            </Button>
-            <Button
-              textColor="#7c3aed"
-              onPress={submitEdit}
-              disabled={!editContent.trim()}
-            >
-              Save
             </Button>
           </Dialog.Actions>
         </Dialog>
@@ -1440,7 +1489,6 @@ const styles = StyleSheet.create({
   modeButton: { marginTop: 8 },
   providerButtonContent: { flexDirection: "row-reverse", justifyContent: "space-between" },
   targetButton: { marginTop: 4, marginLeft: 16 },
-  editInput: { backgroundColor: "#313244", marginTop: 8 },
   dialogScrollArea: { maxHeight: 460, borderColor: "#313244" },
   dialogScrollContent: { paddingVertical: 4 },
   modelPickerSearch: { marginBottom: 8 },

@@ -11,7 +11,9 @@ export type ConversationRuntimeFocus = {
  * stay mounted in the router stack, so mount state alone must not own sockets
  * and pollers.
  */
-export function useConversationRuntimeFocus(): ConversationRuntimeFocus {
+export function useConversationRuntimeFocus(
+  explicitRuntimeFocus?: ConversationRuntimeFocus | null,
+): ConversationRuntimeFocus {
   const [focus, setFocus] = useState<ConversationRuntimeFocus>({
     isFocused: false,
     focusEpoch: 0,
@@ -31,24 +33,34 @@ export function useConversationRuntimeFocus(): ConversationRuntimeFocus {
     }, []),
   );
 
-  return focus;
+  // Root mounted overlays do not receive Expo Router focus events. They pass
+  // an explicit epoch so their socket/poll lifecycle remains independent from
+  // the route that happens to be underneath the modal. Ordinary route users
+  // retain the useFocusEffect-derived behavior above.
+  return explicitRuntimeFocus ?? focus;
 }
 
 type ConversationFocusRecoveryArgs = ConversationRuntimeFocus & {
   enabled: boolean;
-  onRecover: (focusEpoch: number) => void;
+  /** Identifies the conversation owner within one navigation focus epoch. */
+  recoveryKey?: string | null;
+  onRecover: (focusEpoch: number, reason: "focus" | "session") => void;
   onBlur: () => void;
 };
 
-/** Runs recovery once per focus epoch and always tears UI runtime down on blur. */
+/** Recover each focused owner once; disabled owners also lose their UI runtime. */
 export function useConversationFocusRecovery({
   enabled,
   focusEpoch,
   isFocused,
+  recoveryKey,
   onRecover,
   onBlur,
 }: ConversationFocusRecoveryArgs): void {
-  const recoveredEpochRef = useRef(0);
+  const recoveredOwnerRef = useRef<{
+    focusEpoch: number;
+    recoveryKey: string | null | undefined;
+  } | null>(null);
   const onRecoverRef = useRef(onRecover);
   const onBlurRef = useRef(onBlur);
   onRecoverRef.current = onRecover;
@@ -59,8 +71,21 @@ export function useConversationFocusRecovery({
       onBlurRef.current();
       return;
     }
-    if (!enabled || recoveredEpochRef.current === focusEpoch) return;
-    recoveredEpochRef.current = focusEpoch;
-    onRecoverRef.current(focusEpoch);
-  }, [enabled, focusEpoch, isFocused]);
+    if (!enabled) {
+      recoveredOwnerRef.current = null;
+      onBlurRef.current();
+      return;
+    }
+    const previous = recoveredOwnerRef.current;
+    const sessionChanged =
+      previous !== null && previous.recoveryKey !== recoveryKey;
+    if (
+      previous?.focusEpoch === focusEpoch &&
+      previous.recoveryKey === recoveryKey
+    ) {
+      return;
+    }
+    recoveredOwnerRef.current = { focusEpoch, recoveryKey };
+    onRecoverRef.current(focusEpoch, sessionChanged ? "session" : "focus");
+  }, [enabled, focusEpoch, isFocused, recoveryKey]);
 }

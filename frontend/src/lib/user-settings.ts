@@ -3,7 +3,6 @@ import {
   normalizeAudioPlayerSettings,
   type AudioPlayerSettings,
 } from "./audio-player-settings";
-import type { AppNavigationVisibility } from "./app-navigation";
 
 export type UserSettings = Record<string, unknown>;
 export type UserSettingsRequestOptions = {
@@ -89,9 +88,6 @@ export const DEFAULT_EDITOR_LINK_DISPLAY_MODE: EditorLinkDefaultDisplayMode =
   "embed";
 export const DEFAULT_TASK_NOTIFICATIONS_ENABLED = true;
 export const DEFAULT_REMOTE_SERVER_CONNECTION_ENABLED = false;
-export const DEFAULT_SCENARIO_TAB_VISIBLE = false; // public-publish-default: false
-export const DEFAULT_TRPG_TAB_VISIBLE = false; // public-publish-default: false
-export type { AppNavigationVisibility };
 
 export function normalizeEditorLinkDefaultDisplayMode(
   value: unknown,
@@ -128,34 +124,6 @@ export function getRemoteServerConnectionEnabled(
   return settings?.remote_server_connection_enabled === true
     ? true
     : DEFAULT_REMOTE_SERVER_CONNECTION_ENABLED;
-}
-
-export function getAppNavigationVisibility(
-  settings: UserSettings | null | undefined,
-): AppNavigationVisibility {
-  const navigationTabs = settings?.navigation_tabs;
-  if (
-    typeof navigationTabs !== "object" ||
-    navigationTabs === null ||
-    Array.isArray(navigationTabs)
-  ) {
-    return {
-      scenarios: DEFAULT_SCENARIO_TAB_VISIBLE,
-      trpg: DEFAULT_TRPG_TAB_VISIBLE,
-    };
-  }
-
-  const values = navigationTabs as Record<string, unknown>;
-  return {
-    scenarios:
-      typeof values.scenarios === "boolean"
-        ? values.scenarios
-        : DEFAULT_SCENARIO_TAB_VISIBLE,
-    trpg:
-      typeof values.trpg === "boolean"
-        ? values.trpg
-        : DEFAULT_TRPG_TAB_VISIBLE,
-  };
 }
 
 export function getAudioPlayerSettings(

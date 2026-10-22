@@ -10,25 +10,49 @@
 import { getDb, schema } from '../db/client';
 import type { OutboxEnqueue } from './types';
 import { getToken, getTokenAuthScope } from '../lib/auth';
-import { asc, eq, and, isNull, like } from 'drizzle-orm';
+import { asc, eq, and, isNull, like, sql } from 'drizzle-orm';
+import type { OutboxSyncState } from '../stores/sync-status';
 
 /**
- * A stable identity for one conflict row.  Resolution handlers must carry
- * the complete operation snapshot rather than only an entity id: enqueue can
- * merge a newer edit into the same op id while a screen is open, and resolving
- * that newer row would otherwise silently discard the edit.
+ * Immutable pending-operation snapshot used by every resolution write.
+ *
+ * A conflict screen can remain open while enqueue merges a newer edit into the
+ * same operation id.  The operation id and payload alone therefore do not
+ * identify the row that was read.  Keep every nullable lifecycle field in the
+ * expected snapshot and turn null into an explicit `IS NULL` predicate below.
  */
-export type OutboxConflictReference = {
+export type PendingOutboxSnapshot = {
   opId: string;
   tableName: string;
   action: string;
   entityId: string;
   payload: string;
   baseUpdatedAt: string | null;
-  authScope: string;
+  basePayload: unknown | null;
+  conflictPayload: unknown | null;
+  retryCount: number;
+  lastError: string | null;
+  blockedReason: string | null;
+  authScope: string | null;
   docsScopeKey: string | null;
-  conflictPayload?: unknown;
 };
+
+/** A conflict reference is always scoped to a known authenticated account. */
+export type OutboxConflictReference = Omit<PendingOutboxSnapshot, 'authScope'> & {
+  authScope: string;
+};
+
+/**
+ * Identity and receipt-state fields captured when an outbox operation is sent.
+ *
+ * A caller passes this snapshot to a receipt marker so a response for an
+ * older payload cannot classify a newer merge under the same operation id, or
+ * overwrite a receipt that already advanced the row's mutable state.  The
+ * lifecycle and scope fields are required; core-only receipt updates are not
+ * safe for conflict resolution.
+ */
+/** Full lifecycle snapshot excluding the separately supplied operation id. */
+export type OutboxMutationSnapshot = Omit<PendingOutboxSnapshot, 'opId'>;
 
 export type OutboxConflictResolutionResult = {
   ok: boolean;
@@ -181,29 +205,10 @@ function serverUpdatedAt(payload: Record<string, unknown>): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
-function snapshotReference(row: {
-  opId: string;
-  tableName: string;
-  action: string;
-  entityId: string;
-  payload: string;
-  baseUpdatedAt: string | null;
-  authScope: string | null;
-  docsScopeKey: string | null;
-  conflictPayload?: unknown;
-}): OutboxConflictReference | null {
-  if (!row.authScope) return null;
-  return {
-    opId: row.opId,
-    tableName: row.tableName,
-    action: row.action,
-    entityId: row.entityId,
-    payload: row.payload,
-    baseUpdatedAt: row.baseUpdatedAt,
-    authScope: row.authScope,
-    docsScopeKey: row.docsScopeKey,
-    conflictPayload: row.conflictPayload,
-  };
+function snapshotReference(row: OutboxSnapshotRow): OutboxConflictReference | null {
+  const snapshot = pendingSnapshot(row);
+  if (!snapshot.authScope) return null;
+  return snapshot as OutboxConflictReference;
 }
 
 function scopePredicate(
@@ -212,6 +217,40 @@ function scopePredicate(
   return authScope === null
     ? isNull(schema.outbox.authScope)
     : eq(schema.outbox.authScope, authScope);
+}
+
+type OutboxSnapshotRow = {
+  opId: string;
+  tableName: string;
+  action: string;
+  entityId: string;
+  payload: string;
+  baseUpdatedAt: string | null;
+  authScope: string | null;
+  docsScopeKey: string | null;
+  basePayload?: unknown;
+  conflictPayload?: unknown;
+  retryCount?: number;
+  lastError?: string | null;
+  blockedReason?: string | null;
+};
+
+function pendingSnapshot(row: OutboxSnapshotRow): PendingOutboxSnapshot {
+  return {
+    opId: row.opId,
+    tableName: row.tableName,
+    action: row.action,
+    entityId: row.entityId,
+    payload: row.payload,
+    baseUpdatedAt: row.baseUpdatedAt ?? null,
+    basePayload: row.basePayload ?? null,
+    conflictPayload: row.conflictPayload ?? null,
+    retryCount: Number(row.retryCount ?? 0),
+    lastError: row.lastError ?? null,
+    blockedReason: row.blockedReason ?? null,
+    authScope: row.authScope ?? null,
+    docsScopeKey: row.docsScopeKey ?? null,
+  };
 }
 
 function inferDocsScopeKey(op: OutboxEnqueue): string | null {
@@ -397,6 +436,27 @@ export async function enqueueOutbox(op: OutboxEnqueue): Promise<string> {
   return opId;
 }
 
+/**
+ * Capture wake routing from a successfully saved operation, never a fresh
+ * token read. Call inside the caller's foreground SQLite unit, then publish
+ * the returned scope only after that whole unit and required post-reads pass.
+ * This hint must not turn a completed local edit into a new failure.
+ */
+export async function getOutboxMutationWakeScope(opId: string): Promise<string | null> {
+  try {
+    const [row] = await getDb()
+      .select({ authScope: schema.outbox.authScope, blockedReason: schema.outbox.blockedReason })
+      .from(schema.outbox)
+      .where(eq(schema.outbox.opId, opId))
+      .limit(1);
+    return row?.authScope && row.blockedReason == null ? row.authScope : null;
+  } catch {
+    // Do not log the token, actor, operation id, payload, or database error.
+    console.warn('[outbox] Mutation wake metadata unavailable; normal sync will retry');
+    return null;
+  }
+}
+
 export async function listPendingOutbox(
   limit?: number,
   requestedAuthScope?: string | null,
@@ -416,9 +476,146 @@ export async function listPendingOutbox(
     (row) =>
       row.authScope === authScope &&
       row.blockedReason == null &&
+      // Older task conflicts have no captured entity: allow one reconciliation
+      // read, then retain unresolved updates without resending indefinitely.
+      !(row.tableName === 'tasks' && (row.lastError ?? '').startsWith('conflict:')
+        && (row.action !== 'update' || row.conflictPayload != null)) &&
       (row.retryCount < 5 ||
         (row.lastError ?? '').startsWith('conflict:')),
   );
+}
+
+/**
+ * Read the durable state for the currently authenticated scope, including
+ * blocked/terminal rows that are intentionally excluded from the send list.
+ * A completed flight is only a successful sync when this state is empty.
+ */
+export async function getOutboxState(
+  requestedAuthScope?: string | null,
+): Promise<OutboxSyncState> {
+  const db = getDb();
+  const authScope = await resolveCurrentAuthScope(requestedAuthScope);
+  if (authScope === null) return 'empty';
+  const rows = await db
+    .select()
+    .from(schema.outbox)
+    .where(scopePredicate(authScope));
+  const scopedRows = rows.filter((row) => row.authScope === authScope);
+  if (scopedRows.length === 0) return 'empty';
+  if (scopedRows.some((row) =>
+    row.blockedReason != null
+    || row.retryCount >= 5
+    || (row.lastError ?? '').startsWith('conflict:'),
+  )) {
+    return 'failed';
+  }
+  if (scopedRows.some((row) => row.retryCount > 0 || row.lastError != null)) {
+    return 'retrying';
+  }
+  return 'pending';
+}
+
+export type OutboxDiagnostic = {
+  opId: string;
+  tableName: string;
+  action: string;
+  entityId: string;
+  /** Composite Docs scope, when the operation carries one. */
+  docsScopeKey: string | null;
+  /** Base/server snapshot metadata only; payloads remain private. */
+  baseUpdatedAt: string | null;
+  hasBaseSnapshot: boolean;
+  hasConflictSnapshot: boolean;
+  retryCount: number;
+  blockedReason: string | null;
+  errorKind: 'conflict' | 'scope' | 'missing_base' | 'missing_entity' | 'server_error' | 'pending';
+};
+
+/**
+ * One exact outbox operation for the generic resolution facade.  This is an
+ * internal read boundary: payload and lifecycle error fields are retained for
+ * private CAS/journal capture, while the public diagnostics DTO below never
+ * exposes them.
+ */
+export type OutboxResolutionReadSnapshot = PendingOutboxSnapshot & {
+  createdAt: number;
+};
+
+/** Read one operation by id and authenticated scope, with no queue mutation. */
+export async function getOutboxResolutionReadSnapshot(
+  opId: string,
+  expectedAuthScope: string,
+): Promise<OutboxResolutionReadSnapshot | null> {
+  const normalizedOpId = typeof opId === 'string' ? opId.trim() : '';
+  const authScope = await resolveCurrentAuthScope(expectedAuthScope);
+  if (!normalizedOpId || !authScope) return null;
+  const rows = await getDb()
+    .select()
+    .from(schema.outbox)
+    .where(and(eq(schema.outbox.opId, normalizedOpId), scopePredicate(authScope)))
+    .limit(1);
+  if (await resolveCurrentAuthScope(authScope) !== authScope) return null;
+  const row = rows[0];
+  if (!row || row.opId !== normalizedOpId || row.authScope !== authScope) return null;
+  const createdAt = Number(row.createdAt);
+  if (!Number.isFinite(createdAt)) return null;
+  return {
+    opId: row.opId,
+    tableName: row.tableName,
+    action: row.action,
+    entityId: row.entityId,
+    payload: row.payload,
+    baseUpdatedAt: row.baseUpdatedAt ?? null,
+    basePayload: row.basePayload ?? null,
+    conflictPayload: row.conflictPayload ?? null,
+    retryCount: Number(row.retryCount ?? 0),
+    lastError: row.lastError ?? null,
+    blockedReason: row.blockedReason ?? null,
+    authScope,
+    docsScopeKey: row.docsScopeKey ?? null,
+    createdAt,
+  };
+}
+
+/** Read operation metadata only, without payloads, receipts or credentials. */
+export async function getOutboxDiagnostics(
+  expectedAuthScope: string,
+): Promise<OutboxDiagnostic[]> {
+  const authScope = await resolveCurrentAuthScope(expectedAuthScope);
+  if (authScope === null) return [];
+  const rows = await getDb().select({
+    opId: schema.outbox.opId,
+    authScope: schema.outbox.authScope,
+    tableName: schema.outbox.tableName,
+    action: schema.outbox.action,
+    entityId: schema.outbox.entityId,
+    docsScopeKey: schema.outbox.docsScopeKey,
+    baseUpdatedAt: schema.outbox.baseUpdatedAt,
+    hasBaseSnapshot: sql<number>`CASE WHEN ${schema.outbox.basePayload} IS NULL THEN 0 ELSE 1 END`,
+    hasConflictSnapshot: sql<number>`CASE WHEN ${schema.outbox.conflictPayload} IS NULL THEN 0 ELSE 1 END`,
+    retryCount: schema.outbox.retryCount,
+    blockedReason: schema.outbox.blockedReason,
+    lastError: schema.outbox.lastError,
+  }).from(schema.outbox).where(scopePredicate(authScope)).orderBy(asc(schema.outbox.createdAt));
+  // A token can change while SQLite is waiting behind a foreground write.
+  if (await resolveCurrentAuthScope(authScope) !== authScope) return [];
+  return rows.filter((row) => row.authScope === authScope).map((row) => {
+    const error = row.lastError ?? '';
+    const errorKind: OutboxDiagnostic['errorKind'] = row.blockedReason != null || error.includes('invalid_ack_scope')
+      ? 'scope'
+      : /base_updated_at|base version|(?:docs|task|sync)_base_missing|base_missing|基準.*版|基準.*更新/i.test(error)
+        ? 'missing_base'
+        : error.startsWith('conflict:') ? 'conflict'
+        : row.tableName === 'tasks' && error === 'Task not found' ? 'missing_entity'
+        : error ? 'server_error' : 'pending';
+    return { opId: row.opId, tableName: row.tableName, action: row.action,
+      entityId: row.entityId, retryCount: row.retryCount,
+      docsScopeKey: row.docsScopeKey ?? null,
+      baseUpdatedAt: row.baseUpdatedAt ?? null,
+      hasBaseSnapshot: Number(row.hasBaseSnapshot ?? 0) !== 0,
+      hasConflictSnapshot: Number(row.hasConflictSnapshot ?? 0) !== 0,
+      blockedReason: row.blockedReason, errorKind };
+  });
 }
 
 export async function hasPendingOutbox(
@@ -467,10 +664,12 @@ export async function recordOutboxServerSnapshot(
         : []),
     ))
     .orderBy(asc(schema.outbox.createdAt));
-  // If multiple sibling scopes share an entity UUID and the server payload
-  // did not carry a composite identity, do not attach the snapshot to an
-  // arbitrary row.  A later scoped pull can safely retry with its key.
-  const row = rows.length === 1 ? rows[0] : inferredScopeKey ? rows[0] : null;
+  // The helper has no opId.  Even a verified composite scope cannot identify
+  // one row when multiple operations for the same entity are pending; keep
+  // every candidate untouched rather than attaching the snapshot to the
+  // oldest operation by accident.  A caller with an exact operation snapshot
+  // must perform the scoped CAS itself.
+  const row = rows.length === 1 ? rows[0] : null;
   if (!row) return;
   if (table === 'knowledge_nodes') {
     const reference = snapshotReference({
@@ -489,28 +688,39 @@ export async function recordOutboxServerSnapshot(
       return;
     }
   }
+  const expected = pendingSnapshot(row);
   await db
     .update(schema.outbox)
     .set({ conflictPayload: payload as never })
-    .where(eq(schema.outbox.opId, row.opId));
+    .where(outboxMutationSnapshotCondition(row.opId, expected))
+    .run();
 }
 
 export async function rebaseOutboxOp(
   opId: string,
   baseUpdatedAt: string | null,
-  basePayload?: unknown,
-): Promise<void> {
+  basePayload: unknown,
+  expected: PendingOutboxSnapshot,
+): Promise<boolean> {
+  if (expected.opId !== opId) return false;
   const db = getDb();
-  await db
+  const result = await db
     .update(schema.outbox)
     .set({
       baseUpdatedAt,
-      ...(basePayload === undefined ? {} : { basePayload: basePayload as never }),
+      basePayload: basePayload as never,
       conflictPayload: null,
       lastError: null,
       retryCount: 0,
     })
-    .where(eq(schema.outbox.opId, opId));
+    .where(and(
+      outboxMutationSnapshotCondition(opId, expected),
+      // A blocked row requires its scope recovery workflow; rebase must not
+      // clear a terminal failure merely because the snapshot still matches.
+      isNull(schema.outbox.blockedReason),
+    ))
+    .run();
+  return Number(result?.changes ?? 0) > 0;
 }
 
 function sameConflictReference(
@@ -525,10 +735,15 @@ function sameConflictReference(
       && current.entityId === expected.entityId
       && current.payload === expected.payload
       && current.baseUpdatedAt === expected.baseUpdatedAt
+      && JSON.stringify(current.basePayload ?? null)
+        === JSON.stringify(expected.basePayload ?? null)
+      && JSON.stringify(current.conflictPayload ?? null)
+        === JSON.stringify(expected.conflictPayload ?? null)
+      && current.retryCount === expected.retryCount
+      && current.lastError === expected.lastError
+      && current.blockedReason === expected.blockedReason
       && current.authScope === expected.authScope
       && current.docsScopeKey === expected.docsScopeKey
-      && JSON.stringify(current.conflictPayload ?? null)
-        === JSON.stringify(expected.conflictPayload ?? null),
   );
 }
 
@@ -565,6 +780,11 @@ export async function getOutboxConflict(
     .select()
     .from(schema.outbox)
     .where(and(...conditions));
+  // This lookup has no opId.  If multiple conflicts share the same entity and
+  // scope, returning the first row would let a UI resolve the wrong pending
+  // operation.  Require a unique candidate and let the caller refresh with an
+  // exact operation reference instead.
+  if (rows.length !== 1) return null;
   for (const row of rows) {
     if (row.authScope !== authScope) continue;
     if (
@@ -726,19 +946,9 @@ export async function rebaseOutboxConflict(
       retryCount: 0,
     })
     .where(and(
-      eq(schema.outbox.opId, reference.opId),
-      eq(schema.outbox.authScope, reference.authScope),
-      eq(schema.outbox.tableName, reference.tableName),
-      eq(schema.outbox.action, reference.action),
-      eq(schema.outbox.entityId, reference.entityId),
-      eq(schema.outbox.payload, reference.payload),
-      reference.baseUpdatedAt === null
-        ? isNull(schema.outbox.baseUpdatedAt)
-        : eq(schema.outbox.baseUpdatedAt, reference.baseUpdatedAt),
-      reference.docsScopeKey === null
-        ? isNull(schema.outbox.docsScopeKey)
-        : eq(schema.outbox.docsScopeKey, reference.docsScopeKey),
+      outboxMutationSnapshotCondition(reference.opId, reference),
       like(schema.outbox.lastError, 'conflict:%'),
+      isNull(schema.outbox.blockedReason),
     ))
     .run();
   return Number(result.changes ?? 0) > 0
@@ -779,30 +989,16 @@ export async function removeOutboxOp(opId: string): Promise<void> {
 
 export async function removeOutboxOpIfSnapshot(
   opId: string,
-  snapshot: {
-    table: string;
-    action: string;
-    entityId: string;
-    payload: string;
-    baseUpdatedAt: string | null;
-  },
+  snapshot: PendingOutboxSnapshot,
   guard: {
     authScope?: string | null;
     docsScopeKey?: string | null;
     requireConflict?: boolean;
   } = {},
 ): Promise<boolean> {
+  if (snapshot.opId !== opId) return false;
   const db = getDb();
-  const conditions = [
-    eq(schema.outbox.opId, opId),
-    eq(schema.outbox.tableName, snapshot.table),
-    eq(schema.outbox.action, snapshot.action),
-    eq(schema.outbox.entityId, snapshot.entityId),
-    eq(schema.outbox.payload, snapshot.payload),
-    snapshot.baseUpdatedAt === null
-      ? isNull(schema.outbox.baseUpdatedAt)
-      : eq(schema.outbox.baseUpdatedAt, snapshot.baseUpdatedAt),
-  ];
+  const conditions = [outboxMutationSnapshotCondition(opId, snapshot)];
   if (guard.authScope !== undefined) {
     conditions.push(scopePredicate(guard.authScope));
   }
@@ -823,7 +1019,55 @@ export async function removeOutboxOpIfSnapshot(
   return Number(result.changes ?? 0) > 0;
 }
 
-export async function markOutboxError(opId: string, error: string): Promise<void> {
+/**
+ * Build the one full-lifecycle predicate used by every resolution write.
+ *
+ * Do not make any field optional here.  A caller that only has the historic
+ * core identity cannot prove that it is still changing the row it read.
+ */
+export function outboxMutationSnapshotCondition(
+  opId: string,
+  expected: OutboxMutationSnapshot,
+) {
+  const conditions = [
+    eq(schema.outbox.opId, opId),
+  ];
+  conditions.push(
+    eq(schema.outbox.tableName, expected.tableName),
+    eq(schema.outbox.action, expected.action),
+    eq(schema.outbox.entityId, expected.entityId),
+    eq(schema.outbox.payload, expected.payload),
+    expected.baseUpdatedAt == null
+      ? isNull(schema.outbox.baseUpdatedAt)
+      : eq(schema.outbox.baseUpdatedAt, expected.baseUpdatedAt),
+    expected.basePayload == null
+      ? isNull(schema.outbox.basePayload)
+      : eq(schema.outbox.basePayload, expected.basePayload as never),
+    expected.conflictPayload == null
+      ? isNull(schema.outbox.conflictPayload)
+      : eq(schema.outbox.conflictPayload, expected.conflictPayload as never),
+    eq(schema.outbox.retryCount, expected.retryCount),
+    expected.lastError == null
+      ? isNull(schema.outbox.lastError)
+      : eq(schema.outbox.lastError, expected.lastError),
+    expected.blockedReason == null
+      ? isNull(schema.outbox.blockedReason)
+      : eq(schema.outbox.blockedReason, expected.blockedReason),
+    expected.authScope == null
+      ? isNull(schema.outbox.authScope)
+      : eq(schema.outbox.authScope, expected.authScope),
+    expected.docsScopeKey == null
+      ? isNull(schema.outbox.docsScopeKey)
+      : eq(schema.outbox.docsScopeKey, expected.docsScopeKey),
+  );
+  return and(...conditions);
+}
+
+export async function markOutboxError(
+  opId: string,
+  error: string,
+  expected: OutboxMutationSnapshot,
+): Promise<void> {
   const db = getDb();
   const row = (
     await db.select().from(schema.outbox).where(eq(schema.outbox.opId, opId))
@@ -834,13 +1078,14 @@ export async function markOutboxError(opId: string, error: string): Promise<void
       retryCount: (row?.retryCount ?? 0) + 1,
       lastError: error,
     })
-    .where(eq(schema.outbox.opId, opId));
+    .where(outboxMutationSnapshotCondition(opId, expected));
 }
 
 export async function markOutboxConflict(
   opId: string,
   error: string,
-  serverPayload?: unknown,
+  serverPayload: unknown | undefined,
+  expected: OutboxMutationSnapshot,
 ): Promise<void> {
   const db = getDb();
   const row = (
@@ -864,5 +1109,5 @@ export async function markOutboxConflict(
       lastError: `conflict:${error}`,
       ...(safeServerPayload === undefined ? {} : { conflictPayload: safeServerPayload as never }),
     })
-    .where(eq(schema.outbox.opId, opId));
+    .where(outboxMutationSnapshotCondition(opId, expected));
 }

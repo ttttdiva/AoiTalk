@@ -22,6 +22,7 @@ AoiTalk は、設定した音声合成キャラクターを AI アシスタン�
 
 - **VOICEROID2** — VOICEROID2 のキャラクターを AoiTalk の音声として利用可能
 - **Irodori-TTS** — AoiTalk に統合されたローカル TTS。既定の v4.1 Small に加え、v4.1 Anime / v3 VoiceDesign などをキャラクターごとに選択可能
+- **Gemini TTS** — Gemini 3.8 Flash TTS / Flash-Lite TTS をキャラクターごとのボイス・読み上げスタイルで利用可能（[Gemini TTS ガイド](docs/gemini_tts.md)）
 - **その他の TTS** — VOICEVOX、AivisSpeech、A.I.VOICE、CeVIO、Nijivoice、Azure TTS、gTTS、MioTTS など
 - **音声認識** — Whisper、Parakeet、Google Speech、Gemini 系 ASR など
 
@@ -52,7 +53,7 @@ Irodori-TTS の詳細は [Irodori-TTS ガイド](docs/irodori_tts.md) を参照�
 
 AoiTalk は一つのチャット画面だけで完結する構成ではなく、Agent や外部サービスと組み合わせて作業を進められます。
 
-- Agent Team / specialist 実行
+- Execution Team / specialist 実行
 - Heartbeat / scheduled execution
 - MCP
 - Web 検索
@@ -92,6 +93,23 @@ Mobile の現行仕様は [Mobile Product Contract / Conformance](docs/mobile_pr
 - **音声 / Bot**: `src/audio/`、`src/tts/`、`src/bot/`。
 
 文書一覧と「現行仕様 / 設計記録」の区別は [docs/README.md](docs/README.md) を参照してください。
+
+## 41 の責任範囲
+
+このリポジトリ（41_AoiTalk）は音声対話、タスク・予定管理、Docs/Files/ナレッジ検索、Agent、PC Bridge、
+Web/Native Mobile クライアント本体を内部所有します。次の機能は41に存在せず、独立アプリが正本です。
+AoiTalk の Apps 画面からは各アプリへの外部リンクだけを提供します。
+
+| 機能 | 正本アプリ |
+| --- | --- |
+| Hugging Face ブラウザ/同期 | `60_huggingface-sync` |
+| Hydrus ブラウザ | `57_Hydrus_App` |
+| Story/Novel Studio・TRPG | `86_Novel-Graph-Studio` |
+| 公開Gateway/Caddy/Cloudflare/検索ゲート | [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway) |
+
+ローカルLLMのHugging Face Hub取得・cache・URL ingestによるモデルページ取り込みは41に残ります。41の
+PostgreSQLにある `story_*` / `trpg_*` テーブルは削除せず、`86_Novel-Graph-Studio` の取り込み元として
+保持するだけで、41 runtime からは使用しません。
 
 ## セットアップ
 
@@ -134,9 +152,9 @@ Python パッケージ自体は macOS を考慮していますが、`setup.sh` �
 | --- | --- |
 | FastAPI | `3000` |
 | Next.js | `3002` |
-| Caddy | `6002` |
+| 共通Gateway（別リポジトリ） | `6002` |
 
-Windows `run.bat` と Linux `run.sh` では公開境界の既定が異なります。Linux / WSL は loopback + Caddy 無効が既定で、外部公開時は `run.sh --public --with-caddy` のように TLS 境界を明示します。
+個人環境の共通Caddy、Cloudflare Worker、技術サイト、検索ゲートは [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway) が管理します。Windows `run.bat` はAoiTalkのFastAPI/Next.jsだけを起動し、既定の公開prefixは `/at` です。Enterprise/Dockerの独立配布だけは、このリポジトリの `caddy/Caddyfile.enterprise` を引き続き使用します。詳細は [公開Gateway境界](docs/public_gateway.md) を参照してください。
 
 ## 設定・DB
 
@@ -151,17 +169,17 @@ Windows `run.bat` と Linux `run.sh` では公開境界の既定が異なりま�
 
 ## 開発・検証
 
-リポジトリ内の作業規約は `AGENTS.md` が正本です。通常の変更は変更範囲に応じたターゲット検証を行い、`main` push 後の GitHub Actions を確認します。WebUI のユーザー挙動を変える場合は [AI WebUI QA](docs/ai_webui_qa.md) の独立実ブラウザ確認が追加で必要です。
+通常の変更は変更範囲に応じたローカルのターゲット検証を行い、`main` push 後にリモートSHAを確認します。GitHub Actions / CI の完了は待たず、成功を完了条件にしません。WebUI のユーザー挙動を変える場合は [AI WebUI QA](docs/ai_webui_qa.md) の独立実ブラウザ確認が追加で必要です。
 
 ## 配布
 
 この開発リポジトリと公開版リポジトリは分離されています。公開版の同期先は `ttttdiva/AoiTalk` で、`scripts/publish_public.ps1` が公開用 tree を生成します。
 
-- 公開版同期: [docs/public_publish.md](docs/public_publish.md)
 - Mobile 自動更新 / APK: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
 - Release 共通手順: [docs/release-checklist.md](docs/release-checklist.md)
-- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-MIT
+リポジトリ直下の [LICENSE](LICENSE)（MIT）は、別段の表示がないこのリポジトリの内容に適用されます。`resources/seethrough-rig/runtime` は別パッケージで、upstream の license は未指定（package.json は `UNLICENSED`）のため、MIT を含むいかなる利用許諾も付与しません。詳細は同ディレクトリの `FIRST_PARTY_NOTICE.md` を参照してください。
+
+- [機能名称と責務の正本](docs/feature_terminology.md)

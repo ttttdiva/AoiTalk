@@ -536,10 +536,12 @@ def _managed_section_body_json(
     """Copy managed-section metadata while projecting its reviewed body."""
 
     body_json = dict(child.body_json) if isinstance(child.body_json, dict) else {}
+    body_json.pop("knowledge_capture_text", None)
     if body:
-        body_json["knowledge_capture_text"] = body
-    else:
-        body_json.pop("knowledge_capture_text", None)
+        body_json.update(format="doc_block", block_type="markdown", content=body)
+    elif body_json.get("format") == "doc_block" and body_json.get("block_type") == "markdown":
+        for key in ("format", "block_type", "content"):
+            body_json.pop(key, None)
     return body_json
 
 
@@ -582,7 +584,7 @@ async def _write_subtree(session: AsyncSession, *, parent: KnowledgeNode, projec
             # the publication guard complete without including unmanaged
             # children in the guarded set.
             current_body_json = child.body_json if isinstance(child.body_json, dict) else {}
-            if "knowledge_capture_text" in current_body_json:
+            if body_json != current_body_json:
                 await docs.update_node(
                     node=child,
                     user_id=user_id,
@@ -591,9 +593,9 @@ async def _write_subtree(session: AsyncSession, *, parent: KnowledgeNode, projec
                     change_summary="Resolution Knowledge Captureセクションをクリア",
                 )
             continue
-        # Docs stores content as child nodes.  Keep the section title as the
-        # canonical node mirror and put a bounded representation in the
-        # revision provenance/body metadata rather than violating that invariant.
+        # Each section is an editable typed child of the publication root.
+        # Its title remains a label mirror; Docs renders the reviewed content
+        # from the standard encrypted markdown payload.
         await docs.update_node(node=child, user_id=user_id, body_json=body_json, source_refs=source_refs, change_summary="Resolution Knowledge Captureセクションを保存")
     revision = await _latest_revision(session, root.id)
     return root, revision

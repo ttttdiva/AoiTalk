@@ -83,6 +83,8 @@ async function mockFilerApis(
   let listRequestCount = 0;
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    // Support the same fixture at root and at a configured public mount.
+    url.pathname = url.pathname.replace(/^.*?(\/api\/)/, "$1");
 
     if (url.pathname === "/api/auth/status") {
       await route.fulfill({
@@ -123,15 +125,6 @@ async function mockFilerApis(
       return;
     }
 
-    if (url.pathname === "/api/huggingface/accounts") {
-      await route.fulfill({
-        json: {
-          accounts: [],
-          references: [],
-        },
-      });
-      return;
-    }
 
     if (url.pathname === `/api/projects/${project.id}/records`) {
       await route.fulfill({ json: { tables: [] } });
@@ -516,14 +509,6 @@ test.describe("ファイラーの選択操作", () => {
       name: "User Files",
       exact: true,
     });
-    const hfTab = page.getByRole("button", {
-      name: "HF",
-      exact: true,
-    });
-    const hydrusTab = page.getByRole("button", {
-      name: "Hydrus",
-      exact: true,
-    });
 
     await expect(
       item(page, paths.folderA),
@@ -538,14 +523,7 @@ test.describe("ファイラーの選択操作", () => {
       runtimeErrors.join("\n"),
     ).toBeVisible();
 
-    await page.keyboard.press("Control+ArrowRight");
-    await expect(hfTab).toHaveClass(/border-primary/);
-    await expect(page.getByText("HFリポジトリは空です。")).toBeVisible();
-
-    await page.keyboard.press("Control+ArrowRight");
-    await expect(hydrusTab).toHaveClass(/border-primary/);
-
-    // right edge wraps Hydrus -> Project Files
+    // right edge wraps User Files -> Project Files
     await page.keyboard.press("Control+ArrowRight");
     await expect(projectTab).toHaveClass(/border-primary/);
     await expect(
@@ -553,14 +531,7 @@ test.describe("ファイラーの選択操作", () => {
       runtimeErrors.join("\n"),
     ).toBeVisible();
 
-    // left edge wraps Project Files -> Hydrus
-    await page.keyboard.press("Control+ArrowLeft");
-    await expect(hydrusTab).toHaveClass(/border-primary/);
-
-    await page.keyboard.press("Control+ArrowLeft");
-    await expect(hfTab).toHaveClass(/border-primary/);
-    await expect(page.getByText("HFリポジトリは空です。")).toBeVisible();
-
+    // left edge wraps Project Files -> User Files
     await page.keyboard.press("Control+ArrowLeft");
     await expect(userTab).toHaveClass(/border-primary/);
     await expect(
@@ -699,8 +670,17 @@ test.describe("ファイラーの選択操作", () => {
 
     await item(page, paths.fileC).click({ modifiers: ["Control"] });
     downloadPromise = page.waitForEvent("download");
+    const nativePost = page.waitForRequest((request) =>
+      request.method() === "POST" &&
+      new URL(request.url()).pathname.endsWith("/explorer/download") &&
+      !request.headers()["x-aoitalk-download-preflight"],
+    );
     await page.keyboard.press("Control+Shift+l");
     download = await downloadPromise;
+    const mountPath = new URL(page.url()).pathname.replace(/\/filer\/?$/, "");
+    expect(new URL((await nativePost).url()).pathname).toBe(
+      `${mountPath}/api/python-proxy/explorer/download`,
+    );
 
     expect(download.suggestedFilename()).toBe("archive.zip");
     await expect.poll(() => downloadOperations().length).toBe(6);
@@ -969,7 +949,7 @@ test.describe("ファイラーの選択操作", () => {
     await expect(dialog).toContainText("現在のタブのホームへ移動");
     await expect(dialog).toContainText("Ctrl+H");
     await expect(dialog).toContainText(
-      "Filesタブ（Project Files / User Files / HF / Hydrus）を切り替え",
+      "Filesタブ（Project Files / User Files）を切り替え",
     );
     await expect(dialog).toContainText("Ctrl+←/→");
   });

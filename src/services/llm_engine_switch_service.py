@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import copy
 import logging
+import threading
 from typing import Any
 
 from ..services.execution_profile_service import (
@@ -15,6 +17,288 @@ from ..services.llm_model_catalog import build_llm_mode_state
 logger = logging.getLogger(__name__)
 
 _MISSING_CONFIG_VALUE = object()
+
+
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            direct = getter(key, _MISSING_CONFIG_VALUE)
+        except TypeError:
+            direct = _MISSING_CONFIG_VALUE
+        if direct is not _MISSING_CONFIG_VALUE:
+            return direct
+    cursor = config
+    for part in str(key).split("."):
+        if isinstance(cursor, dict):
+            if part not in cursor:
+                return default
+            cursor = cursor[part]
+            continue
+        value = getattr(cursor, part, _MISSING_CONFIG_VALUE)
+        if value is _MISSING_CONFIG_VALUE:
+            return default
+        cursor = value
+    return cursor
+
+
+def _managed_local_runtime_scope(
+    config: Any,
+    *,
+    provider: str,
+    model: str,
+    resolve_endpoint: bool = True,
+) -> dict[str, str] | None:
+    """Resolve the exact owned runtime scope for one local route."""
+
+    if str(provider or "").strip().lower() != "openai_compatible_local":
+        return None
+    model_id = str(model or "").strip()
+    if not model_id:
+        return None
+    from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
+    from .provider_runtime_ownership import provider_runtime_ownership
+
+    runtime = managed_local_runtime_for_model(config, model_id)
+    ownership = provider_runtime_ownership(
+        "openai_compatible_local",
+        config,
+        model=model_id,
+    )
+    if ownership.endpoint_classification != "trusted_local":
+        return None
+    if not ownership.managed_runtime:
+        # Candidate overlays can contain an explicit ``None`` for a legacy
+        # llama setting while the route resolver has already classified the
+        # loopback custom target as managed. Preserve that route decision,
+        # but keep the explicit external sentinel and auto_start=false safe.
+        if model_id.casefold() == "local-model":
+            return None
+        auto_start = _config_value(
+            config,
+            "openai_compatible_local.llama_cpp.auto_start",
+            _MISSING_CONFIG_VALUE,
+        )
+        if auto_start is False:
+            return None
+        if runtime not in (None, "llama_cpp"):
+            return None
+    # Legacy/custom loopback llama-server selections predate typed profile
+    # markers and therefore report ``runtime=None`` while still being
+    # AoiTalk-managed. Keep them on the llama.cpp lifecycle boundary; the
+    # explicit ``local-model`` external sentinel is already filtered above by
+    # provider_runtime_ownership.
+    runtime = runtime or "llama_cpp"
+    if runtime not in {"llama_cpp", "freetoken", "strata"}:
+        return None
+    scope: dict[str, str] = {"runtime": runtime, "model": model_id}
+    if resolve_endpoint:
+        try:
+            from ..service_manager import _llama_cpp_generation_lease_identity
+
+            identity = _llama_cpp_generation_lease_identity(config, model=model_id)
+        except Exception:
+            identity = None
+        if identity is not None:
+            scope["endpoint"] = str(identity[0])
+    return scope
+
+
+def switch_managed_local_runtime(
+    config: Any,
+    *,
+    previous_provider: str,
+    previous_model: str,
+    next_provider: str,
+    next_model: str,
+    next_config: Any | None = None,
+    force_restart: bool = False,
+    timeout_seconds: float | None = None,
+    stop_same_scope: bool = False,
+    resolve_endpoints: bool = True,
+    rollback_on_error: bool = True,
+    defer_on_timeout: bool = False,
+    wait_for_model_ready: bool = True,
+    supersedable: bool = False,
+) -> dict[str, Any]:
+    """Stop/reuse/start only AoiTalk-owned local runtime processes.
+
+    This is the synchronous worker boundary used by API/worker switch paths.
+    It scopes stop operations to the previous endpoint, waits for both
+    request and long-lived consumer leases, and never touches an external or
+    operator-owned listener.  ``next_config`` is a staged overlay used only
+    for resolving/starting the candidate route.
+
+    ``supersedable`` marks the candidate start as a selection warm-up: a
+    later selection, or a stop of this scope, cancels it while it is still
+    loading.  A cancelled warm-up raises
+    ``SharedRuntimeAcquisitionSuperseded`` without restoring the previous
+    scope, because the newer selection owns the transition.
+    """
+
+    if resolve_endpoints:
+        previous_scope = _managed_local_runtime_scope(
+            config,
+            provider=previous_provider,
+            model=previous_model,
+        )
+    else:
+        previous_scope = _managed_local_runtime_scope(
+            config,
+            provider=previous_provider,
+            model=previous_model,
+            resolve_endpoint=False,
+        )
+    candidate_config = next_config if next_config is not None else config
+    if resolve_endpoints:
+        next_scope = _managed_local_runtime_scope(
+            candidate_config,
+            provider=next_provider,
+            model=next_model,
+        )
+    else:
+        next_scope = _managed_local_runtime_scope(
+            candidate_config,
+            provider=next_provider,
+            model=next_model,
+            resolve_endpoint=False,
+        )
+    same_scope = bool(
+        previous_scope
+        and next_scope
+        and previous_scope.get("runtime") == next_scope.get("runtime")
+        and previous_scope.get("model") == next_scope.get("model")
+        and previous_scope.get("endpoint") == next_scope.get("endpoint")
+    )
+    stopped = 0
+    started = False
+    from .. import service_manager
+    from ..service_manager._shared_local_runtime import supersedable_route_warmup
+    from ..shared_local_runtime.client import SharedRuntimeAcquisitionSuperseded
+
+    try:
+        if previous_scope and (not same_scope or stop_same_scope):
+            stop_kwargs = {
+                "timeout_seconds": timeout_seconds,
+                "defer_on_timeout": defer_on_timeout,
+            }
+            if previous_scope.get("endpoint"):
+                stop_kwargs.update(previous_scope)
+            else:
+                # Legacy managed selections may not expose a resolved
+                # endpoint until launch-plan resolution. In that case use
+                # runtime/model scope; consumer leases still protect every
+                # active local consumer before termination.
+                stop_kwargs.update(
+                    {
+                        "runtime": previous_scope["runtime"],
+                        "model": previous_scope["model"],
+                    }
+                )
+            stopped = service_manager.stop_owned_openai_compatible_local_servers_respecting_generation_leases(
+                **stop_kwargs,
+            )
+
+        if next_scope:
+            # Only an explicit route transition may cancel a previously
+            # deferred API-away stop. Generic generation ensure calls never
+            # cancel pending cleanup for a still-committed cloud route.
+            try:
+                from ..service_manager import _cancel_deferred_llama_cpp_stops
+                from ..service_manager import _llama_cpp_generation_lease_identity
+
+                next_identity = _llama_cpp_generation_lease_identity(
+                    candidate_config,
+                    model=str(next_scope["model"]),
+                )
+                if next_identity is not None:
+                    _cancel_deferred_llama_cpp_stops(
+                        endpoint=next_identity[0],
+                        alias=next_identity[1],
+                    )
+            except Exception:
+                logger.debug("deferred local runtime stop cancellation failed", exc_info=True)
+            with supersedable_route_warmup() if supersedable else nullcontext():
+                started = bool(
+                    service_manager.ensure_openai_compatible_local_server(
+                        candidate_config,
+                        model=str(next_scope["model"]),
+                        raise_on_launch_error=True,
+                        force_restart=bool(force_restart),
+                        **({"wait_for_model_ready": False}
+                           if next_scope["runtime"] == "llama_cpp" and not wait_for_model_ready
+                           else {}),
+                    )
+                )
+    except SharedRuntimeAcquisitionSuperseded:
+        raise
+    except Exception as exc:
+        # The transition is a worker-level transaction. If the candidate
+        # startup fails after the old owned process was drained, immediately
+        # restore that previous scope before surfacing the error to the API.
+        restored = False
+        if rollback_on_error and (stopped or (same_scope and force_restart)) and previous_scope:
+            try:
+                service_manager.ensure_openai_compatible_local_server(
+                    config,
+                    model=str(previous_scope["model"]),
+                    raise_on_launch_error=False,
+                    force_restart=False,
+                )
+                restored = True
+            except Exception:
+                logger.exception("Failed to restore previous managed local runtime")
+        if restored:
+            try:
+                setattr(exc, "_managed_local_runtime_restored", True)
+            except Exception:
+                pass
+        raise
+
+    return {
+        "stopped": int(stopped),
+        "started": bool(started),
+        "reused": bool(next_scope and same_scope and not force_restart),
+        "previous_scope": previous_scope,
+        "next_scope": next_scope,
+    }
+
+
+def start_session_route_warmup(config: Any, **switch_kwargs: Any) -> threading.Thread:
+    """Run a session-route selection warm-up without holding the HTTP request.
+
+    The WebUI serializes route saves per session, so a save that waited for a
+    cold load kept the user's next selection queued until the obsolete model
+    finished loading, and the supersede/stop cancellation could never reach
+    it.  The route is already persisted when this runs; the warm-up continues
+    here as a supersedable selection, and the next send keeps its own strict
+    ensure path.  Failures are logged instead of returned.
+    """
+
+    from ..shared_local_runtime.client import SharedRuntimeAcquisitionSuperseded
+
+    def run() -> None:
+        try:
+            switch_managed_local_runtime(config, supersedable=True, **switch_kwargs)
+        except SharedRuntimeAcquisitionSuperseded:
+            logger.info(
+                "Session route warm-up for %s was cancelled by a newer selection",
+                switch_kwargs.get("next_model"),
+            )
+        except Exception:
+            logger.warning(
+                "Session route warm-up for %s failed; the next send retries it",
+                switch_kwargs.get("next_model"),
+                exc_info=True,
+            )
+
+    thread = threading.Thread(
+        target=run,
+        name="session-route-warmup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 class ConfigOverlay:
@@ -430,4 +714,5 @@ __all__ = [
     "persist_config_changes",
     "resolve_execution_route_from_changes",
     "restore_llm_client",
+    "switch_managed_local_runtime",
 ]

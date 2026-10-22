@@ -28,6 +28,7 @@ import { AppSelect } from "@/components/ui/app-select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 const API_PREFIX = "/api/python-proxy";
 const DEFAULT_MAX_DURATION_SECONDS = 120;
@@ -52,6 +53,7 @@ export type IrodoriVoiceParameters = Record<string, unknown>;
 export const IRODORI_MODEL_DEFAULT = "v4.1-small" as const;
 export const IRODORI_MODEL_OPTIONS = [
   { value: IRODORI_MODEL_DEFAULT, label: "Irodori-TTS v4.1 Small" },
+  { value: "v4-large", label: "Irodori-TTS v4 Large" },
   { value: "v4.1-anime", label: "Irodori-TTS v4.1 Anime" },
   { value: "v3-voice-design", label: "Irodori-TTS v3 VoiceDesign" },
 ] as const;
@@ -770,15 +772,18 @@ export function IrodoriVoiceSettings({
       <div className="flex items-start gap-2">
         <AudioLines className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
         <div>
-          <p className="text-xs font-medium">{selectedModelLabel} 設定</p>
-          <p className="text-[11px] text-muted-foreground">
-            参照音声は「誰の声か」、captionは「どう話すか」を指定します。両方を同時に利用できます。
+          <p className="inline-flex items-center gap-1 text-xs font-medium">
+            {selectedModelLabel} 設定
+            <HelpPopover label={`${selectedModelLabel} 設定`}>参照音声は「誰の声か」、captionは「どう話すか」を指定します。両方を同時に利用できます。</HelpPopover>
           </p>
         </div>
       </div>
 
       <div className="space-y-1.5">
-        <Label htmlFor="irodori-model" className="text-xs">Irodori-TTSモデル</Label>
+        <div className="inline-flex items-center gap-1">
+          <Label htmlFor="irodori-model" className="text-xs">Irodori-TTSモデル</Label>
+          <HelpPopover label="Irodori-TTSモデル">キャラクターごとに使用するIrodori-TTSモデルを選択します。未指定の場合はv4.1 Smallを使用します。</HelpPopover>
+        </div>
         <AppSelect
           id="irodori-model"
           aria-label="Irodori-TTSモデル"
@@ -792,9 +797,6 @@ export function IrodoriVoiceSettings({
             </option>
           ))}
         </AppSelect>
-        <p className="text-[10px] text-muted-foreground">
-          キャラクターごとに使用するIrodori-TTSモデルを選択します。未指定の場合はv4.1 Smallを使用します。
-        </p>
       </div>
 
       {!hasCharacter && (
@@ -945,8 +947,10 @@ export function IrodoriVoiceSettings({
         <div className="flex items-start gap-2">
           <MonitorSpeaker className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           <div>
-            <p className="text-xs font-medium">PCスピーカー出力を録音</p>
-            <p className="text-[10px] text-muted-foreground">マイクではなく、Windowsで再生中のシステム出力を録音します。</p>
+            <p className="inline-flex items-center gap-1 text-xs font-medium">
+              PCスピーカー出力を録音
+              <HelpPopover label="PCスピーカー出力を録音">マイクではなく、Windowsで再生中のシステム出力を録音します。</HelpPopover>
+            </p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
@@ -980,8 +984,10 @@ export function IrodoriVoiceSettings({
 
       <div className="space-y-2 rounded-md border bg-background/50 p-2.5">
         <div>
-          <p className="text-xs font-medium">試聴</p>
-          <p className="text-[10px] text-muted-foreground">現在の参照音声とcaptionで音声を生成します。</p>
+          <p className="inline-flex items-center gap-1 text-xs font-medium">
+            試聴
+            <HelpPopover label="Irodori試聴">現在の参照音声とcaptionで音声を生成します。</HelpPopover>
+          </p>
         </div>
         <Input
           aria-label="Irodori試聴テキスト"

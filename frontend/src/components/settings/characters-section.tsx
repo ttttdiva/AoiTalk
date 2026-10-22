@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState, useCallback } from "react";
 import useSWR from "swr";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -35,6 +36,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { useConfirm } from "@/hooks/use-confirm";
 import { getLlmModelCatalog } from "@/lib/chat-api";
 import { IrodoriVoiceSettings } from "@/components/settings/irodori-voice-settings";
+import { GeminiVoiceSettings } from "@/components/settings/gemini-voice-settings";
+import { CharacterAnimationSettings } from "@/components/settings/character-animation-settings";
 import type {
   LlmCatalogModelOption,
   LlmCatalogProvider,
@@ -134,8 +137,6 @@ function buildCharacterModelOptions(
 const TYPE_OPTIONS = [
   { value: "assistant", label: "アシスタント" },
   { value: "roleplay", label: "ロールプレイ" },
-  { value: "trpg_npc", label: "TRPG NPC" },
-  { value: "gm", label: "ゲームマスター" },
 ];
 
 const TOOL_OPTIONS = [
@@ -159,7 +160,7 @@ const LEGACY_SPOTIFY_TOOL = "spotify_assistant";
 /**
  * Normalize character tool permissions at the UI boundary.
  *
- * Character runtime remains independent from Agent Team runtime, but old
+ * Character runtime remains independent from Execution Team runtime, but old
  * character records may still contain the former Spotify specialist name.
  * Mapping it on read and on write makes the migration safe without exposing
  * the legacy value in the editor or writing it back to the API.
@@ -193,6 +194,7 @@ const VOICE_ENGINE_OPTIONS = [
   { value: "nijivoice", label: "NijiVoice" },
   { value: "miotts", label: "MioTTS" },
   { value: "irodori_tts", label: "Irodori-TTS" },
+  { value: "gemini_tts", label: "Gemini TTS" },
 ];
 
 const DEFAULT_VOICE_PARAMETER_FIELDS = [
@@ -314,6 +316,7 @@ export function CharactersSection() {
   const [loading, setLoading] = useState(false);
   const [editChar, setEditChar] = useState<Character | null>(null);
   const [isNew, setIsNew] = useState(false);
+  const [editorTab, setEditorTab] = useState("basic");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
@@ -389,6 +392,7 @@ export function CharactersSection() {
     }
     setAliasInput("");
     setGreetingInput("");
+    setEditorTab("basic");
     setEditChar(char || ({ id: "" } as Character));
   }, []);
 
@@ -620,36 +624,41 @@ export function CharactersSection() {
         data-settings-target="characters"
         className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0"
       >
-        <CardHeader
-          className="cursor-pointer select-none"
-          role="button"
-          tabIndex={0}
-          aria-expanded={expanded}
-          aria-controls="characters-content"
-          onClick={handleToggle}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              handleToggle();
-            }
-          }}
-        >
-          <CardTitle className="flex items-center justify-between text-sm">
-            <span className="flex items-center gap-2">
-              <Users className="size-4" />
-              キャラクター
-              {characters.length > 0 && (
-                <Badge variant="secondary" className="text-[10px]">
-                  {enabledCount}/{characters.length}件 有効
-                </Badge>
+        <CardHeader className="flex flex-row items-center gap-1 p-0 !px-0">
+          <div
+            className="flex min-w-0 flex-1 cursor-pointer select-none px-3 py-2"
+            role="button"
+            tabIndex={0}
+            aria-expanded={expanded}
+            aria-controls="characters-content"
+            onClick={handleToggle}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                handleToggle();
+              }
+            }}
+          >
+            <CardTitle className="flex items-center justify-between text-sm">
+              <span className="flex items-center gap-2">
+                <Users className="size-4" />
+                キャラクター
+                {characters.length > 0 && (
+                  <Badge variant="secondary" className="text-[10px]">
+                    {enabledCount}/{characters.length}件 有効
+                  </Badge>
+                )}
+              </span>
+              {expanded ? (
+                <ChevronUp className="size-4" />
+              ) : (
+                <ChevronDown className="size-4" />
               )}
-            </span>
-            {expanded ? (
-              <ChevronUp className="size-4" />
-            ) : (
-              <ChevronDown className="size-4" />
-            )}
-          </CardTitle>
+            </CardTitle>
+          </div>
+          <HelpPopover label="キャラクター" className="mr-2">
+            会話Characterの外見・音声・応答設定を管理します。発信活動のPersonaはOperationsで管理します。
+          </HelpPopover>
         </CardHeader>
         {expanded && (
           <CardContent id="characters-content" className="space-y-3">
@@ -875,14 +884,17 @@ export function CharactersSection() {
 
       {/* 編集ダイアログ */}
       <Dialog open={!!editChar} onOpenChange={(v) => !v && setEditChar(null)}>
-        <DialogContent size="2xl" className="max-h-[85vh] overflow-auto">
+        <DialogContent
+          size="2xl"
+          className={`max-h-[85vh] overflow-y-auto ${editorTab === "appearance" ? "sm:max-w-[min(90rem,calc(100vw-2rem))]" : ""}`}
+        >
           <DialogHeader>
             <DialogTitle>
               {isNew ? "キャラクター作成" : `キャラクター編集: ${form.name}`}
             </DialogTitle>
           </DialogHeader>
-          <Tabs defaultValue="basic">
-            <TabsList>
+          <Tabs value={editorTab} onValueChange={(value) => setEditorTab(String(value))} className="min-w-0">
+            <TabsList className="max-w-full flex-wrap group-data-horizontal/tabs:h-auto">
               <TabsTrigger value="basic">基本情報</TabsTrigger>
               <TabsTrigger value="roleplay">RP設定</TabsTrigger>
               <TabsTrigger value="voice">音声</TabsTrigger>
@@ -1164,35 +1176,46 @@ export function CharactersSection() {
                   />
                 </div>
               </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <Label className="text-xs">
-                    {form.voice_engine === "miotts" ? "プリセットID" : "ボイスID"}
-                  </Label>
-                  <Input
-                    value={form.voice_id}
-                    onChange={(e) => updateForm("voice_id", e.target.value)}
-                    placeholder={
-                      form.voice_engine === "miotts" ? "jp_female" : "aoi_emo_44"
-                    }
-                  />
+              {form.voice_engine !== "gemini_tts" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <Label className="text-xs">
+                      {form.voice_engine === "miotts" ? "プリセットID" : "ボイスID"}
+                    </Label>
+                    <Input
+                      value={form.voice_id}
+                      onChange={(e) => updateForm("voice_id", e.target.value)}
+                      placeholder={
+                        form.voice_engine === "miotts" ? "jp_female" : "aoi_emo_44"
+                      }
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">スピーカーID</Label>
+                    <Input
+                      type="number"
+                      value={form.speaker_id ?? ""}
+                      onChange={(e) =>
+                        updateForm(
+                          "speaker_id",
+                          e.target.value ? Number(e.target.value) : null,
+                        )
+                      }
+                      placeholder="3"
+                    />
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">スピーカーID</Label>
-                  <Input
-                    type="number"
-                    value={form.speaker_id ?? ""}
-                    onChange={(e) =>
-                      updateForm(
-                        "speaker_id",
-                        e.target.value ? Number(e.target.value) : null,
-                      )
-                    }
-                    placeholder="3"
-                  />
-                </div>
-              </div>
-              {form.voice_engine === "irodori_tts" ? (
+              )}
+              {form.voice_engine === "gemini_tts" ? (
+                <GeminiVoiceSettings
+                  voiceId={form.voice_id}
+                  voiceParameters={form.voice_parameters}
+                  onVoiceIdChange={(value) => updateForm("voice_id", value)}
+                  onParametersChange={(value) =>
+                    updateForm("voice_parameters", value)
+                  }
+                />
+              ) : form.voice_engine === "irodori_tts" ? (
                 <IrodoriVoiceSettings
                   characterId={isNew ? "" : form.id}
                   voiceParameters={form.voice_parameters}
@@ -1242,6 +1265,7 @@ export function CharactersSection() {
 
             {/* ── 外見 ── */}
             <TabsContent value="appearance" className="space-y-3 mt-3">
+              <CharacterAnimationSettings characterId={isNew ? "" : form.id} characterName={form.slug} />
               <div className="space-y-1">
                 <Label className="text-xs">画像生成エンジン</Label>
                 <AppSelect

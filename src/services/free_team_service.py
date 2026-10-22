@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import hashlib
+import inspect
+import json
 import uuid
 from fnmatch import fnmatchcase
 from dataclasses import dataclass, field
 from calendar import monthrange
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,10 +25,12 @@ from ..memory.models.free_team import (
     FreeTeamCredentialProfile,
     FreeTeamQuotaPool,
     FreeTeamReservation,
+    OPENAI_DAILY_QUOTA_GROUPS,
+    OPENAI_SAFETY_TOKENS,
 )
 from .agent_team_service import config_get
 from .free_team_defaults import free_team_profile_template
-from ..llm.deployment_resolver import is_retired_model
+from .decision_receipt_service import DecisionReceipt, finalize_decision_receipt
 
 
 ROUTING_PROFILE_PROVIDER = "routing-profile"
@@ -36,6 +42,7 @@ ALLOWED_BILLING_MODES = {
     "promo_credit",
     "subscription_cli",
 }
+OPENAI_BILLING_MODES = {"paid", "complimentary"}
 RETRYABLE_ERROR_CLASSES = {"429", "402", "5xx", "timeout", "connection"}
 CLI_PROVIDERS = {"codex-cli", "antigravity-cli", "grok-cli", "claude-cli"}
 
@@ -93,6 +100,9 @@ class RouteLease:
     team_id: str = ""
     subagent_id: str = ""
     llm_profile_id: str = ""
+    decision_receipt: DecisionReceipt | None = field(default=None, repr=False)
+    billing_scope_id: str = ""
+    billing_mode: str = "paid"
 
     def safe_metadata(self) -> dict[str, Any]:
         return {
@@ -105,6 +115,7 @@ class RouteLease:
             "candidate": self.candidate_id,
             "provider": self.provider,
             "model": self.model,
+            "billing_mode": self.billing_mode,
             "effort": self.effort or None,
             "quota_pool_ids": list(self.quota_pool_ids),
             "reservation_id": str(self.reservation_id),
@@ -120,6 +131,46 @@ def free_team_selected(config: Any) -> bool:
         == FREE_TEAM_MODEL_ID
     )
     return selected and bool(free_team_profile(config).get("enabled", True))
+
+
+def openai_billing_mode(config: Any, model: str | None = None) -> str:
+    """Resolve the billing contract for an official OpenAI request.
+
+    The ordinary OpenAI route is paid unless the configuration explicitly
+    selects the complimentary incentive.  Free Team remains a complimentary
+    route because its candidate credentials and shared quota are owned by that
+    profile, even when an older config has no ``openai.billing_mode`` key.
+
+    A missing ``openai`` branch is treated as the legacy, unconfigured request
+    boundary.  Requests for incentive models still fail through the existing
+    complimentary verification checks instead of silently becoming paid.  A
+    normal application config includes the ``openai`` branch from the
+    canonical defaults, where the existing data-sharing flag is the explicit
+    complimentary-vs-paid intent when no billing-mode override is supplied.
+    """
+
+    raw = config_get(config, "openai.billing_mode", None)
+    if raw is None:
+        if free_team_selected(config) or config_get(
+            config, "openai.data_sharing_incentive_enabled", False
+        ) is True:
+            return "complimentary"
+        if config_get(config, "openai", None) is None:
+            model_text = str(model or "").strip().lower()
+            if complimentary_model_group(model_text) is not None or model_text.startswith(
+                ("gpt-5.6", "gpt-6")
+            ):
+                return "complimentary"
+        return "paid"
+
+    mode = str(raw).strip().lower()
+    if mode not in OPENAI_BILLING_MODES:
+        raise FreeTeamUnavailableError("openai_billing_mode_unsupported")
+    # ``free-team`` owns its own complimentary credential/quota semantics.  A
+    # stale global paid setting must not disable those guards for a pool route.
+    if mode == "paid" and free_team_selected(config):
+        return "complimentary"
+    return mode
 
 
 def free_team_profile(config: Any) -> dict[str, Any]:
@@ -357,6 +408,7 @@ def _candidate_matches(
     required_capabilities: set[str],
     now: datetime,
 ) -> bool:
+    from ..llm.deployment_resolver import is_retired_model
     if is_retired_model(candidate.model):
         return False
     if not candidate.enabled or not credential.enabled:
@@ -367,6 +419,8 @@ def _candidate_matches(
         return False
     if credential.allow_paid_overage:
         # 無料Teamでは有料超過を許可した認証も自動選択しない。
+        return False
+    if credential.billing_mode == "complimentary" and not candidate.quota_pool_ids:
         return False
     if not _credential_configured(credential):
         return False
@@ -463,6 +517,162 @@ def _candidate_score(
     )
 
 
+def _bounded_routing_enabled(config: Any) -> bool:
+    if config is None:
+        return False
+    value = config_get(
+        config,
+        "decision_layer.jev_free_team_routing_enabled",
+        None,
+    )
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return str(value).strip().casefold() not in {"", "0", "false", "off", "no"}
+
+
+async def _semantic_candidate_order(
+    candidates: list[FreeTeamCandidateModel],
+    *,
+    intent: RouteIntent,
+    prompt: str,
+    required_capabilities: set[str],
+    config: Any,
+    now: datetime,
+    quotas: Mapping[str, FreeTeamQuotaPool],
+    receipt_sink: list[DecisionReceipt] | None = None,
+) -> list[FreeTeamCandidateModel]:
+    """Reorder only a near-tied, already-safe cohort; never widen eligibility.
+
+    Billing/quota/credential/capability/provider-health constraints have already
+    been applied by the Host. The returned order is still revalidated under row
+    and quota locks before any lease is created.
+    """
+    if (
+        len(candidates) < 2
+        or not str(prompt or "").strip()
+        or not _bounded_routing_enabled(config)
+    ):
+        return candidates
+
+    # A singular literal candidate is an explicit Host/user constraint. Never
+    # reinterpret it semantically.
+    if (
+        len(intent.candidate_ids) == 1
+        and not any(ch in intent.candidate_ids[0] for ch in "*?[]")
+    ):
+        return candidates
+
+    try:
+        from .candidate_decision_service import (
+            CandidateDecisionError,
+            CandidateDecisionRouter,
+        )
+        from .jev_decision_service import JevDecisionService
+        from .outbound_privacy_service import (
+            ExternalProviderBlocked,
+            OutboundPrivacyGateway,
+            PrivacyError,
+            current_effective_privacy_mode,
+        )
+    except Exception:
+        return candidates
+
+    if current_effective_privacy_mode(config) == "local_only":
+        return candidates
+
+    scored = [(item, _candidate_score(item, now, quotas)) for item in candidates]
+    best = scored[0][1]
+    cohort: list[FreeTeamCandidateModel] = []
+    for item, score in scored:
+        # Preserve billing class and quota/priority pacing. Jev is allowed only
+        # to break a near-tie inside that deterministic safety tier.
+        if score[0] != best[0] or float(score[1]) > float(best[1]) + 3.0:
+            continue
+        cohort.append(item)
+        if len(cohort) >= 8:
+            break
+    if len(cohort) < 2:
+        return candidates
+
+    async def _never_llm(*_args: Any, **_kwargs: Any) -> str:
+        return "none"
+
+    bounded_candidates = {
+        item.id: {
+            "provider": str(item.provider or "")[:80],
+            "model": str(item.model or "")[:120],
+            "quality_class": str(item.quality_class or "")[:40],
+            "capabilities": sorted(str(v) for v in (item.capabilities or []))[:16],
+            "max_input_tokens": int(item.max_input_tokens or 0),
+            "max_output_tokens": int(item.max_output_tokens or 0),
+            "average_latency_ms": round(float(item.average_latency_ms or 0), 2),
+        }
+        for item in cohort
+    }
+    router = CandidateDecisionRouter(
+        llm_choose=_never_llm,
+        jev=JevDecisionService(
+            OutboundPrivacyGateway(config),
+            timeout_seconds=5,
+            max_retries=0,
+            purpose="routing",
+        ),
+        jev_enabled=True,
+        local_only=False,
+        minimum_confidence=0.65,
+        allow_llm_fallback=False,
+        allow_abstain=True,
+    )
+    try:
+        choice = await router.choose(
+            {
+                "task": str(prompt)[:2400],
+                "required_capabilities": sorted(required_capabilities),
+                "routing_profile": str(intent.routing_profile_id or "")[:80],
+                "pool": str(intent.pool_id or "")[:80],
+            },
+            (
+                "Choose the best suited model candidate for the task intent from "
+                "this Host-approved near-tied cohort. Do not optimize around "
+                "billing, quota, credentials, or permissions; the Host owns them."
+            ),
+            bounded_candidates,
+            decision_kind="free_team_route",
+            candidate_metadata={"candidate_count": len(bounded_candidates)},
+        )
+    except asyncio.CancelledError:
+        raise
+    except (CandidateDecisionError, ExternalProviderBlocked, PrivacyError):
+        return candidates
+
+    selected = next((item for item in cohort if item.id == choice.choice), None)
+    shadow = str(config_get(config, "decision_layer.jev_free_team_shadow_mode", False)).strip().casefold() in {"true", "1", "on", "yes"}
+    receipt = finalize_decision_receipt(
+        getattr(choice, "receipt", None),
+        baseline_candidate=candidates[0].id,
+        shadow_candidate=selected.id if shadow and selected is not None else "",
+        agreement=(candidates[0].id == selected.id) if selected is not None else None,
+        shadow_mode=shadow,
+        host_action="preserve_order" if shadow or selected is None else "reorder",
+        outcome="ordering_preserved" if shadow or selected is None else "reordered",
+        validation_result="host_candidate_valid" if selected is not None else "abstained",
+    )
+    if receipt is not None and receipt_sink is not None:
+        receipt_sink.append(receipt)
+    if selected is None:
+        return candidates
+    if shadow:
+        return candidates
+
+    # Host-side identity revalidation before the later locked hard-constraint
+    # revalidation. The remaining deterministic order is preserved.
+    return [selected] + [item for item in candidates if item.id != selected.id]
+
+
 def _lease_effort(intent: RouteIntent, candidate: FreeTeamCandidateModel) -> str:
     if intent.effort:
         return intent.effort
@@ -508,12 +718,17 @@ async def _active_candidate_reservations(
 
 
 def _reset_quota_if_needed(quota: FreeTeamQuotaPool, now: datetime) -> None:
+    now = _utc_naive(now)
     if not quota.window_end or quota.window_end > now:
         return
     policy = dict(quota.reset_policy or {})
     quota.consumed = Decimal("0")
-    quota.reserved = Decimal("0")
+    # In-flight requests can finish in either UTC day. Carry their full hold
+    # into the new window; an old finalizer must never subtract a new hold.
     quota.provider_observed_usage = Decimal("0")
+    quota.provider_sync_state = None
+    quota.provider_sync_version = int(quota.provider_sync_version or 0) + 1
+    quota.last_provider_sync_at = None
     quota.window_start = now
     quota.window_end = _next_window_end(policy, now)
     if quota.status == "exhausted":
@@ -523,7 +738,10 @@ def _reset_quota_if_needed(quota: FreeTeamQuotaPool, now: datetime) -> None:
 def _next_window_end(
     reset_policy: Mapping[str, Any], now: datetime
 ) -> datetime | None:
+    now = _utc_naive(now)
     kind = str(reset_policy.get("kind") or "none")
+    if str(reset_policy.get("timezone") or "UTC").upper() != "UTC":
+        raise FreeTeamUnavailableError("quota_reset_timezone_unsupported")
     if kind == "minute":
         return now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     if kind == "daily":
@@ -547,6 +765,7 @@ def _next_window_end(
 def _initial_window(
     reset_policy: Mapping[str, Any], now: datetime
 ) -> tuple[datetime | None, datetime | None]:
+    now = _utc_naive(now)
     kind = str(reset_policy.get("kind") or "none")
     if kind in {"minute", "daily", "monthly"}:
         return now, _next_window_end(reset_policy, now)
@@ -674,6 +893,424 @@ async def recover_credential_after_auth_update(
         candidate.consecutive_failures = 0
 
 
+def complimentary_model_group(model: str) -> str | None:
+    """Use the canonical pricing catalog; never invent per-model allowances."""
+    from .pricing.catalog import load_catalog_file
+
+    for group, models in load_catalog_file().free_incentive_groups.items():
+        if model in models:
+            return group
+    return None
+
+
+def _utc_naive(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+
+async def _unmapped_central_usage(session: AsyncSession, group: str, now: datetime) -> bool:
+    from ..models.ecc_models import TokenUsage
+    now = _utc_naive(now)
+    return bool((await session.execute(select(func.count()).select_from(TokenUsage).where(
+        TokenUsage.provider == "openai", TokenUsage.free_incentive_group == group,
+        (TokenUsage.billing_scope_id.is_(None) | TokenUsage.billing_scope_id.in_(["", "default"])),
+        TokenUsage.total_tokens > 0,
+        TokenUsage.created_at >= now.replace(hour=0, minute=0, second=0, microsecond=0),
+        TokenUsage.created_at < now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+    ))).scalar_one())
+
+
+async def _central_unmetered_usage(session: AsyncSession, scope: str, group: str, now: datetime, *, included_through: datetime | None = None) -> Decimal:
+    from ..models.ecc_models import TokenUsage
+    now = _utc_naive(now)
+    conditions = [
+        TokenUsage.provider == "openai", TokenUsage.billing_scope_id == scope,
+        TokenUsage.free_incentive_group == group, TokenUsage.quota_reservation_id.is_(None),
+        TokenUsage.created_at >= now.replace(hour=0, minute=0, second=0, microsecond=0),
+        TokenUsage.created_at < now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1),
+    ]
+    if included_through is not None:
+        conditions.append(TokenUsage.created_at <= _utc_naive(included_through))
+    return _decimal((await session.execute(select(func.coalesce(func.sum(TokenUsage.total_tokens), 0)).where(*conditions))).scalar_one())
+
+
+async def _observed_guard_overlap(session: AsyncSession, quota: FreeTeamQuotaPool, included_through: datetime) -> Decimal:
+    start = included_through.replace(hour=0, minute=0, second=0, microsecond=0)
+    reservations = (await session.execute(select(FreeTeamReservation).where(
+        FreeTeamReservation.status == "committed", FreeTeamReservation.finalized_at >= start,
+        FreeTeamReservation.finalized_at <= included_through,
+    ))).scalars().all()
+    overlap = Decimal(0)
+    for item in reservations:
+        estimate = item.estimated_usage or {}
+        if quota.id not in (estimate.get("quota_reservations") or {}):
+            continue
+        try:
+            acquired = _utc_naive(datetime.fromisoformat(estimate["window_start"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Cross-day/legacy requests have no proven overlap with this day's
+        # provider bucket. Keep their consumption in addition to observation.
+        if start <= acquired <= included_through:
+            amount = _decimal((item.actual_usage or {}).get(quota.metric_type))
+            if amount.is_finite() and amount >= 0:
+                overlap += amount
+    return min(_decimal(quota.consumed), overlap)
+
+
+async def sync_provider_observation(session: AsyncSession, quota: FreeTeamQuotaPool, value: Any, *, config: Any, now: datetime | None = None) -> None:
+    """Keep a fixed, nondecreasing external adjustment within one UTC day.
+
+    Numeric legacy observations have no coverage proof and are counted fully.
+    An object may declare ``included_through``: the provider-confirmed coverage
+    cut, never the time the operator fetched a lagging snapshot.
+    """
+    now = _utc_naive(now or _utcnow())
+    raw = value.get("usage") if isinstance(value, Mapping) else value
+    try:
+        observed = Decimal(str(raw))
+        if not observed.is_finite() or observed < 0:
+            raise ValueError
+    except (ValueError, ArithmeticError):
+        raise FreeTeamUnavailableError("provider_observation_invalid") from None
+    included_through = None
+    if isinstance(value, Mapping) and value.get("included_through") is not None:
+        try:
+            cut = datetime.fromisoformat(str(value["included_through"]).replace("Z", "+00:00"))
+            if cut.tzinfo is None:
+                raise ValueError
+            included_through = _utc_naive(cut)
+        except (TypeError, ValueError):
+            raise FreeTeamUnavailableError("provider_observation_invalid") from None
+        if included_through.date() != now.date() or included_through > now:
+            raise FreeTeamUnavailableError("provider_observation_day_mismatch")
+    _reset_quota_if_needed(quota, now)
+    scope = str(config_get(config, "openai.billing_scope_id", "") or "")
+    policy = dict(quota.reset_policy or {})
+    if quota.id in OPENAI_DAILY_QUOTA_GROUPS and scope:
+        if policy.get("billing_scope_id") not in {None, scope}:
+            raise FreeTeamUnavailableError("billing_scope_mismatch")
+        if policy.get("billing_scope_id") is None:
+            if quota.consumed or quota.reserved or quota.provider_observed_usage:
+                raise FreeTeamUnavailableError("billing_scope_unbound_usage")
+            quota.reset_policy = {**policy, "billing_scope_id": scope}
+    previous = _decimal(quota.provider_observed_usage)
+    state = dict(quota.provider_sync_state or {})
+    if observed <= previous and (state or previous > 0):
+        return  # Duplicate/out-of-order snapshots can never erase a hold.
+    external = quota.provider_sync_delta
+    guard_overlap = central_overlap = Decimal(0)
+    if included_through is not None and quota.id in OPENAI_DAILY_QUOTA_GROUPS:
+        if not scope or (quota.reset_policy or {}).get("billing_scope_id") != scope:
+            raise FreeTeamUnavailableError("billing_scope_unverified")
+        guard_overlap = await _observed_guard_overlap(session, quota, included_through)
+        central_overlap = await _central_unmetered_usage(session, scope, OPENAI_DAILY_QUOTA_GROUPS[quota.id], now,
+            included_through=included_through)
+    external = max(external, observed - guard_overlap - central_overlap, Decimal(0))
+    next_state = {"schema_version": 1, "observed_total": str(observed), "external_delta": str(external),
+        "guard_watermark": str(guard_overlap), "central_watermark": str(central_overlap),
+        "included_through": included_through.isoformat() if included_through else None,
+        "utc_day": now.date().isoformat()}
+    version = int(quota.provider_sync_version or 0)
+    await session.flush()
+    result = await session.execute(update(FreeTeamQuotaPool).where(
+        FreeTeamQuotaPool.id == quota.id, FreeTeamQuotaPool.provider_sync_version == version,
+        FreeTeamQuotaPool.consumed == _decimal(quota.consumed), FreeTeamQuotaPool.reserved == _decimal(quota.reserved),
+    ).values(provider_observed_usage=observed, provider_sync_state=next_state, last_provider_sync_at=now,
+        provider_sync_version=FreeTeamQuotaPool.provider_sync_version + 1).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        raise FreeTeamUnavailableError("provider_observation_conflict")
+    from sqlalchemy.orm.attributes import set_committed_value
+    for key, new_value in {"provider_observed_usage": observed, "provider_sync_state": next_state,
+        "last_provider_sync_at": now, "provider_sync_version": version + 1}.items():
+        set_committed_value(quota, key, new_value)
+
+
+def _openai_effective_cap(quota: FreeTeamQuotaPool, config: Any) -> Decimal:
+    from .pricing.free_tier import free_tier_limits_for
+    tier = config_get(config, "openai.usage_tier", "")
+    if tier not in {"tier_1_2", "tier_3_plus"}:
+        return quota.daily_cap
+    limit = Decimal(free_tier_limits_for(tier)[OPENAI_DAILY_QUOTA_GROUPS[quota.id]])
+    return min(quota.daily_cap, max(Decimal(0), limit - OPENAI_SAFETY_TOKENS))
+
+
+def openai_credential_identity(client: Any, config: Any = None) -> dict[str, str]:
+    """Bind evidence to the actual SDK credential without exposing it."""
+    key = getattr(client, "api_key", None)
+    return {
+        "api_key_sha256": hashlib.sha256(key.encode()).hexdigest() if isinstance(key, str) and key else "",
+        "organization_id": str(getattr(client, "organization", "") or ""),
+        "project_id": str(getattr(client, "project", "") or ""),
+        "base_url": str(getattr(client, "base_url", "https://api.openai.com/v1/") or ""),
+    }
+
+
+async def require_cli_provider_enabled(provider: str, *, session: AsyncSession | None = None) -> None:
+    """Use the existing credential switch for explicit Team CLI routes too."""
+    if provider not in CLI_PROVIDERS:
+        return
+    own_session = session is None
+    if own_session:
+        from .token_tracking_service import _database_ready_for_usage
+        if not _database_ready_for_usage():
+            # Standalone CLI embedders have no persisted settings ledger.
+            # Do not initialize/migrate one merely to run their existing CLI.
+            return
+    session = session or await get_db_session()
+    try:
+        credentials = (await session.execute(select(FreeTeamCredentialProfile).where(
+            FreeTeamCredentialProfile.provider == provider
+        ))).scalars().all()
+        if credentials and not any(item.enabled for item in credentials):
+            raise FreeTeamUnavailableError("provider_disabled")
+    finally:
+        if own_session:
+            await session.close()
+
+
+def complimentary_stop_reason(config: Any, identity: Mapping[str, str] | None = None) -> str:
+    """Read administrative evidence only; this never opts into data sharing."""
+    evidence = config_get(config, "openai.complimentary_verification", {})
+    if not isinstance(evidence, dict) or evidence.get("eligible") is not True or evidence.get("enrolled") is not True:
+        return "complimentary_unverified"
+    if not config_get(config, "openai.data_sharing_incentive_enabled", False):
+        return "complimentary_not_enabled"
+    scope = str(config_get(config, "openai.billing_scope_id", "") or "")
+    if not scope or evidence.get("organization_id") != scope:
+        return "billing_scope_unverified"
+    if config_get(config, "openai.usage_tier", "") not in {"tier_1_2", "tier_3_plus"}:
+        return "complimentary_tier_unverified"
+    if evidence.get("usage_tier") != config_get(config, "openai.usage_tier", ""):
+        return "complimentary_tier_unverified"
+    # The owner's existing eligibility/enrollment confirmation is sufficient.
+    # Honor an explicitly supplied expiry without inventing a renewal deadline.
+    if evidence.get("valid_until") is not None:
+        try:
+            valid_until = datetime.fromisoformat(str(evidence["valid_until"]).replace("Z", "+00:00"))
+            if valid_until.tzinfo is None or _utc_naive(valid_until) <= _utc_naive(_utcnow()):
+                return "complimentary_verification_expired"
+        except (TypeError, ValueError):
+            return "complimentary_verification_expired"
+    if identity is not None:
+        if identity.get("base_url", "").rstrip("/") != "https://api.openai.com/v1":
+            return "complimentary_endpoint_unverified"
+        bindings = evidence.get("credentials")
+        if not isinstance(bindings, list) or not any(
+            isinstance(item, dict)
+            and item.get("api_key_sha256") == identity.get("api_key_sha256")
+            and bool(identity.get("api_key_sha256"))
+            and item.get("organization_id") == scope
+            and item.get("project_enrolled") is True
+            and item.get("sdk_project_id", "") == identity.get("project_id", "")
+            and identity.get("organization_id", "") in {"", scope}
+            for item in bindings
+        ):
+            return "credential_project_unverified"
+    return ""
+
+
+def request_budget_estimate(payload: Mapping[str, Any]) -> dict[str, Decimal]:
+    """Bound every wire field, including instructions/history/tool schemas."""
+    if payload.get("previous_response_id") or payload.get("conversation") or payload.get("stream"):
+        raise FreeTeamUnavailableError("complimentary_unbounded_request")
+    output_keys = [key for key in ("max_output_tokens", "max_completion_tokens", "max_tokens") if key in payload]
+    if output_keys:
+        # An explicit wire limit (caller/target setting) is the hard bound.
+        output = payload[output_keys[0]]
+    else:
+        # No limit is injected on the wire.  Reserve the documented model
+        # maximum instead, which already includes reasoning tokens.
+        from ..llm.openai_model_context_registry import openai_model_context_spec
+        spec = openai_model_context_spec(payload.get("model"))
+        output = spec.max_output_tokens if spec is not None else None
+    if type(output) is not int or output <= 0:
+        raise FreeTeamUnavailableError("complimentary_output_limit_required")
+    if payload.get("n", 1) != 1:
+        raise FreeTeamUnavailableError("complimentary_unbounded_request")
+    # Media URLs/file IDs have remote token cost not bounded by their string
+    # length. Only textual payloads and local function schemas are supported.
+    def check(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if value.get("type") in {"image_url", "input_image", "input_audio", "input_file", "file", "audio", "video", "item_reference"}:
+                raise FreeTeamUnavailableError("complimentary_media_unbounded")
+            for item in value.values():
+                check(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                check(item)
+        elif value is not None and type(value) not in {str, int, float, bool}:
+            raise FreeTeamUnavailableError("complimentary_payload_unsupported")
+    check(payload)
+    if payload.get("extra_headers") or payload.get("extra_query"):
+        raise FreeTeamUnavailableError("complimentary_credential_override")
+    extra_body = payload.get("extra_body") or {}
+    if not isinstance(extra_body, dict) or set(extra_body) - {"prompt_cache_key", "prompt_cache_retention"}:
+        raise FreeTeamUnavailableError("complimentary_wire_override")
+    tools = payload.get("tools") or []
+    if any(not isinstance(tool, dict) or tool.get("type") != "function" for tool in tools):
+        raise FreeTeamUnavailableError("complimentary_billable_tool")
+    input_bound = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    # Byte upper bound plus protocol framing. The output hard limit already
+    # includes reasoning; cached inputs and reasoning are not added twice.
+    input_bound += 64 * (1 + len(payload.get("messages") or payload.get("input") or []))
+    return {"input_tokens": Decimal(input_bound), "output_tokens": Decimal(output),
+            "total_tokens": Decimal(input_bound + output), "requests": Decimal(1)}
+
+
+async def acquire_openai_request_lease(
+    payload: Mapping[str, Any], *, config: Any, model: str,
+    identity: Mapping[str, str] | None, session: AsyncSession | None = None,
+) -> RouteLease:
+    """Reserve the existing org-wide pool immediately before one send."""
+    from . import openai_confirmation_service as confirmation
+    if payload.get("model") != model:
+        raise FreeTeamUnavailableError("complimentary_model_mismatch")
+    group = complimentary_model_group(model)
+    if group is None:
+        raise FreeTeamUnavailableError("complimentary_model_unverified")
+    estimates = request_budget_estimate(payload)
+    quota_id = next(key for key, value in OPENAI_DAILY_QUOTA_GROUPS.items() if value == group)
+    scope = str(config_get(config, "openai.billing_scope_id"))
+    own_session = session is None
+    if own_session:
+        from .token_tracking_service import _database_ready_for_usage
+        if not _database_ready_for_usage():
+            raise FreeTeamUnavailableError("usage_ledger_not_ready")
+    session = session or await get_db_session()
+    try:
+        async with session.begin():
+            try:
+                current_config = await confirmation.authoritative_config(session)
+            except confirmation.ConfirmationError as exc:
+                raise FreeTeamUnavailableError(exc.code) from exc
+            if confirmation.managed(current_config):
+                config = current_config
+            reason = complimentary_stop_reason(config, identity or {})
+            if reason:
+                raise FreeTeamUnavailableError(reason)
+            scope = str(config_get(config, "openai.billing_scope_id"))
+            await seed_free_team_defaults(session)
+            # Same lock ordering as route selection: candidate -> quota.
+            candidate = (await session.execute(select(FreeTeamCandidateModel).where(
+                FreeTeamCandidateModel.id == quota_id.removesuffix("-daily")
+            ).with_for_update())).scalar_one()
+            quota = (await session.execute(select(FreeTeamQuotaPool).where(
+                FreeTeamQuotaPool.id == quota_id
+            ).with_for_update())).scalar_one()
+            now = _utcnow()
+            _reset_quota_if_needed(quota, now)
+            policy = dict(quota.reset_policy or {})
+            if policy.get("billing_scope_id") not in {None, scope}:
+                raise FreeTeamUnavailableError("billing_scope_mismatch")
+            if policy.get("billing_scope_id") is None and (quota.consumed or quota.reserved or quota.provider_observed_usage):
+                raise FreeTeamUnavailableError("billing_scope_unbound_usage")
+            if policy.get("kind") != "daily" or str(policy.get("timezone", "UTC")).upper() != "UTC" or policy.get("hour", 0) != 0:
+                raise FreeTeamUnavailableError("complimentary_reset_policy_invalid")
+            credential = await session.get(FreeTeamCredentialProfile, quota.credential_profile_id)
+            if credential is None or not credential.enabled or credential.allow_paid_overage or credential.status not in {"ready", "active"}:
+                raise FreeTeamUnavailableError("provider_disabled")
+            # Import only here so ordinary routing fixtures need no usage DB.
+            if await _unmapped_central_usage(session, group, now):
+                raise FreeTeamUnavailableError("billing_scope_unmapped_usage")
+            central = await _central_unmetered_usage(session, scope, group, now)
+            # Local guard consumption and pre-existing/unmetered central usage
+            # are disjoint. Observation's fixed external adjustment cannot
+            # shrink as new local requests settle.
+            local_used = _decimal(quota.consumed) + _decimal(central)
+            used = local_used + quota.provider_sync_delta
+            cap = _openai_effective_cap(quota, config)
+            amount = estimates["total_tokens"]
+            if quota.status != "active" or used + _decimal(quota.reserved) + amount > cap:
+                raise FreeTeamUnavailableError("budget_insufficient")
+            quota.reset_policy = {**policy, "billing_scope_id": scope}
+            previous_reserved = _decimal(quota.reserved)
+            await session.flush()
+            result = await session.execute(update(FreeTeamQuotaPool).where(
+                FreeTeamQuotaPool.id == quota_id,
+                FreeTeamQuotaPool.reserved == previous_reserved,
+                FreeTeamQuotaPool.consumed == _decimal(quota.consumed),
+                FreeTeamQuotaPool.provider_sync_version == int(quota.provider_sync_version or 0),
+                FreeTeamQuotaPool.status == "active",
+            ).values(reserved=FreeTeamQuotaPool.reserved + amount).execution_options(synchronize_session=False))
+            if result.rowcount != 1:
+                raise FreeTeamUnavailableError("budget_reservation_conflict")
+            # Flush reset/scope changes without writing the stale reserved
+            # value over the atomic SQL increment.
+            from sqlalchemy.orm.attributes import set_committed_value
+            set_committed_value(quota, "reserved", previous_reserved + amount)
+            reservation = FreeTeamReservation(candidate_id=candidate.id,
+                routing_profile_id=FREE_TEAM_PROFILE_ID, pool_id="api-request", status="reserved",
+                estimated_usage={"metrics": {key: float(value) for key, value in estimates.items()},
+                    "quota_reservations": {quota_id: float(amount)}, "billing_scope_id": scope,
+                    "model": model, "window_start": now.isoformat()},
+                quota_pool_ids=[quota_id], expires_at=now + timedelta(seconds=180))
+            session.add(reservation)
+            await session.flush()
+            return RouteLease(reservation_id=reservation.id, provider="openai", model=model,
+                credential_profile_id=quota.credential_profile_id, candidate_id=candidate.id,
+                quota_pool_ids=(quota_id,), effort="", routing_profile_id=FREE_TEAM_PROFILE_ID,
+                pool_id="api-request", max_output_tokens=int(estimates["output_tokens"]), timeout_seconds=120,
+                billing_scope_id=scope, billing_mode="complimentary")
+    finally:
+        if own_session:
+            await session.close()
+
+
+async def execute_budgeted_openai_request(
+    payload: Any, *, config: Any, provider: str, model: str,
+    identity: Mapping[str, str] | None, sender: Any, session: AsyncSession | None = None,
+) -> Any:
+    """Quota ownership only; canonical usage persistence stays with callers."""
+    model = str(model or "")
+    is_openai = provider.strip().lower() == "openai"
+    billing_mode = openai_billing_mode(config, model) if is_openai else "paid"
+    # Paid OpenAI calls stay inside the already-approved privacy transaction and
+    # return to the ordinary sender.  Token/rate-card attribution is performed
+    # by the existing caller after the provider response; this helper owns only
+    # the complimentary shared quota when that mode is selected.
+    guarded = is_openai and billing_mode == "complimentary"
+    if not guarded:
+        result = sender(payload)
+        return await result if inspect.isawaitable(result) else result
+    if not isinstance(payload, Mapping):
+        raise FreeTeamUnavailableError("complimentary_payload_unsupported")
+    lease = await acquire_openai_request_lease(payload, config=config, model=model, identity=identity, session=session)
+    try:
+        result = sender(payload)
+        if inspect.isawaitable(result):
+            result = await result
+    except BaseException:
+        await asyncio.shield(finalize_route_lease(lease, success=False,
+            consume_reserved_on_failure=True, error_class="usage_unknown", session=session))
+        raise
+    raw = result.get("usage") if isinstance(result, dict) else getattr(result, "usage", None)
+    def field(key: str) -> Any:
+        return raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)
+    input_tokens = field("input_tokens") if field("input_tokens") is not None else field("prompt_tokens")
+    output_tokens = field("output_tokens") if field("output_tokens") is not None else field("completion_tokens")
+    complete = all(type(value) is int and value >= 0 for value in (input_tokens, output_tokens))
+    usage = {}
+    if complete:
+        total = input_tokens + output_tokens
+        reported_total = field("total_tokens")
+        if reported_total is not None and (type(reported_total) is not int or reported_total != total):
+            complete = False
+        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                 "total_tokens": total, "requests": 1}
+    await asyncio.shield(finalize_route_lease(lease, actual_usage=usage if complete else None,
+        success=True, session=session))
+    # Preserve canonical attribution while marking this usage as already
+    # included in the guard ledger, so reconciliation cannot charge it twice.
+    marker = {"quota_reservation_id": str(lease.reservation_id),
+              "billing_scope_id": lease.billing_scope_id}
+    if isinstance(raw, dict):
+        raw.update(marker)
+    elif raw is not None:
+        for key, value in marker.items():
+            setattr(raw, key, value)
+    return result
+
+
 async def acquire_route_lease(
     intent: RouteIntent,
     *,
@@ -686,7 +1323,9 @@ async def acquire_route_lease(
     member_key: str = "",
     excluded_candidate_ids: Iterable[str] = (),
     fallback_count: int = 0,
+    config: Any = None,
     session: AsyncSession | None = None,
+    meter_per_request: bool = False,
 ) -> RouteLease:
     """候補と全共有クォータを1トランザクションで予約する。"""
 
@@ -698,6 +1337,8 @@ async def acquire_route_lease(
     excluded = {str(value) for value in excluded_candidate_ids}
     capabilities = {str(value) for value in required_capabilities if str(value)}
     now = _utcnow()
+    decision_receipts: list[DecisionReceipt] = []
+    leased = False
     try:
         # 候補一覧の読み取りではlockしない。全行をSKIP LOCKED付きで一括lockすると、
         # 1本目が全候補を保持している間に2本目が候補0件になってしまう。候補を
@@ -735,7 +1376,18 @@ async def acquire_route_lease(
             candidates.sort(
                 key=lambda item: _candidate_score(item, now, quota_snapshot)
             )
-            ordered_candidate_ids = [item.id for item in candidates]
+
+        candidates = await _semantic_candidate_order(
+            candidates,
+            intent=intent,
+            prompt=prompt,
+            required_capabilities=capabilities,
+            config=config,
+            now=now,
+            quotas=quota_snapshot,
+            receipt_sink=decision_receipts,
+        )
+        ordered_candidate_ids = [item.id for item in candidates]
 
         for candidate_id in ordered_candidate_ids:
             lease: RouteLease | None = None
@@ -812,7 +1464,11 @@ async def acquire_route_lease(
                     if amount > quota.available:
                         can_reserve = False
                         break
-                    reservations[quota_id] = amount
+                    # Official OpenAI requests are metered at the privacy
+                    # gateway's exact wire boundary, including every retry.
+                    # This outer lease only selects the target.
+                    if not (meter_per_request and candidate.provider == "openai"):
+                        reservations[quota_id] = amount
                 if not can_reserve:
                     continue
 
@@ -867,13 +1523,21 @@ async def acquire_route_lease(
                     team_id=team_id or intent.team_id,
                     subagent_id=subagent_id or intent.subagent_id,
                     llm_profile_id=intent.llm_profile_id,
+                    billing_mode=str(credential.billing_mode or "paid"),
                 )
             if lease is not None:
+                leased = True
+                for receipt in decision_receipts:
+                    lease.decision_receipt = finalize_decision_receipt(receipt, host_action="lease", host_candidate=lease.candidate_id,
+                                                                      outcome="leased", validation_result="host_locked_revalidated")
                 return lease
         raise FreeTeamUnavailableError(
             f"無料Teamのプール「{intent.pool_id}」で安全に利用できる候補がありません。"
         )
     finally:
+        if not leased:
+            for receipt in decision_receipts:
+                finalize_decision_receipt(receipt, host_action="no_lease", outcome="not_leased", validation_result="host_lease_unavailable")
         if own_session:
             await session.close()
 
@@ -887,13 +1551,17 @@ async def finalize_route_lease(
     error_class: str = "",
     latency_ms: float | None = None,
     session: AsyncSession | None = None,
+    termination_receipt: Any = None,
 ) -> None:
-    """予約を実使用量で確定する。使用量不明の成功は予約最大量を消費扱いにする。"""
+    """実績で確定する。不明な使用量のholdは日界・再起動でも解放しない。"""
 
     own_session = session is None
     if session is None:
         session = await get_db_session()
     now = _utcnow()
+    from ..llm.generation_cancellation import CLILeaseTerminationReceipt
+    stopped_cli = (isinstance(termination_receipt, CLILeaseTerminationReceipt)
+        and getattr(lease, "provider", None) in CLI_PROVIDERS and termination_receipt.authorizes(lease))
     try:
         async with session.begin():
             reservation_result = await session.execute(
@@ -902,14 +1570,31 @@ async def finalize_route_lease(
                 .with_for_update()
             )
             reservation = reservation_result.scalar_one_or_none()
-            if reservation is None or reservation.status != "reserved":
+            if reservation is None or (reservation.status != "reserved" and not (reservation.status == "uncertain" and stopped_cli)):
                 return
+            retry_uncertain = reservation.status == "uncertain"
+            # Claim this settlement before touching shared quota rows. The
+            # version also makes cleanup retries idempotent on fixture stores
+            # without PostgreSQL row locks.
+            version = int(reservation.settlement_version or 0)
+            claimed = await session.execute(update(FreeTeamReservation).where(
+                FreeTeamReservation.id == reservation.id,
+                FreeTeamReservation.settlement_version == version,
+                FreeTeamReservation.status == reservation.status,
+            ).values(settlement_version=FreeTeamReservation.settlement_version + 1).execution_options(synchronize_session=False))
+            if claimed.rowcount != 1:
+                return
+            from sqlalchemy.orm.attributes import set_committed_value
+            set_committed_value(reservation, "settlement_version", version + 1)
             candidate_result = await session.execute(
                 select(FreeTeamCandidateModel)
                 .where(FreeTeamCandidateModel.id == reservation.candidate_id)
                 .with_for_update()
             )
             candidate = candidate_result.scalar_one()
+            stopped_cli = stopped_cli and candidate.provider == lease.provider and candidate.id == lease.candidate_id
+            if retry_uncertain and not stopped_cli:
+                return
             credential_result = await session.execute(
                 select(FreeTeamCredentialProfile)
                 .where(
@@ -928,23 +1613,47 @@ async def finalize_route_lease(
             )
             quotas = {item.id: item for item in quota_result.scalars().all()}
             estimated = dict((reservation.estimated_usage or {}).get("metrics") or {})
-            reserved = dict(
-                (reservation.estimated_usage or {}).get("quota_reservations") or {}
-            )
-            normalized_actual = {
-                key: _decimal(value) for key, value in dict(actual_usage or {}).items()
-            }
+            accounting = dict(reservation.estimated_usage or {})
+            reserved = dict(accounting.get("remaining_quota_reservations", accounting.get("quota_reservations")) or {})
+            normalized_actual = {}
+            for key, value in dict(actual_usage or {}).items():
+                if type(value) not in {int, float, Decimal}:
+                    continue
+                amount = _decimal(value)
+                if amount.is_finite() and amount >= 0:
+                    normalized_actual[key] = amount
+            uncertain = False
             for quota_id in quota_ids:
                 quota = quotas.get(quota_id)
                 if quota is None:
                     continue
+                if quota_id not in reserved:
+                    continue
+                _reset_quota_if_needed(quota, now)
                 reserved_amount = _decimal(reserved.get(quota_id))
+                actual_amount = _amount_for_metric(quota.metric_type, normalized_actual)
+                actual_metric = {"tpm": "total_tokens", "rpm": "requests", "rpd": "requests"}.get(quota.metric_type, quota.metric_type)
+                concurrency_stopped = stopped_cli and str(quota.metric_type).lower() == "concurrency"
+                if candidate.provider in CLI_PROVIDERS and (success or consume_reserved_on_failure) and str(quota.metric_type).lower() == "concurrency" and not concurrency_stopped:
+                    uncertain = True
+                    continue
+                if retry_uncertain and not concurrency_stopped:
+                    uncertain = True
+                    continue
+                if not concurrency_stopped and (success or consume_reserved_on_failure) and (str(quota.metric_type).lower() != "concurrency" or not success) and (
+                    actual_metric not in normalized_actual or not actual_amount.is_finite() or actual_amount < 0
+                ):
+                    # Neither a timeout nor a crash proves that the provider
+                    # stopped. Retain the full reservation even after midnight.
+                    uncertain = True
+                    continue
                 quota.reserved = max(
                     Decimal("0"), _decimal(quota.reserved) - reserved_amount
                 )
+                reserved.pop(quota_id, None)
                 if success or consume_reserved_on_failure:
                     actual_amount = _amount_for_metric(quota.metric_type, normalized_actual)
-                    if not actual_usage or actual_amount <= 0:
+                    if actual_metric not in normalized_actual:
                         actual_amount = _amount_for_metric(quota.metric_type, estimated)
                     if str(quota.metric_type).lower() != "concurrency":
                         # SDK/providerの報告が事前見積りを超えた場合も実値を台帳へ
@@ -953,15 +1662,19 @@ async def finalize_route_lease(
                         if quota.available <= 0 and quota.status == "active":
                             quota.status = "exhausted"
 
+            accounting["remaining_quota_reservations"] = reserved
+            reservation.estimated_usage = accounting
             reservation.status = (
-                "committed" if success or consume_reserved_on_failure else "released"
+                "uncertain" if uncertain else "committed" if success or consume_reserved_on_failure else "released"
             )
-            reservation.actual_usage = {
+            reservation.actual_usage = {**dict(reservation.actual_usage or {}), **{
                 key: float(value) for key, value in normalized_actual.items()
-            }
+            }}
             reservation.error_class = error_class or None
             reservation.finalized_at = now
-            if success:
+            if retry_uncertain:
+                pass  # Cleanup does not count the original provider outcome twice.
+            elif success:
                 candidate.success_count = int(candidate.success_count or 0) + 1
                 candidate.consecutive_failures = 0
                 candidate.status = "ready"
@@ -987,6 +1700,9 @@ async def finalize_route_lease(
                     candidate.status = "needs_attention"
                     if credential is not None:
                         credential.status = "needs_attention"
+        lease.decision_receipt = finalize_decision_receipt(
+            lease.decision_receipt, outcome="execution_succeeded" if success else "execution_failed",
+        )
     finally:
         if own_session:
             await session.close()
@@ -995,7 +1711,7 @@ async def finalize_route_lease(
 async def release_expired_reservations(
     *, session: AsyncSession | None = None
 ) -> int:
-    """クラッシュ等で残った期限切れ予約を解放する。"""
+    """クラッシュ等で残った予約は使用量不明のholdとして保持する。"""
 
     own_session = session is None
     if session is None:
@@ -1028,6 +1744,7 @@ async def release_expired_reservations(
             await finalize_route_lease(
                 lease,
                 success=False,
+                consume_reserved_on_failure=True,
                 error_class="expired",
                 session=session if not own_session else None,
             )
@@ -1043,6 +1760,7 @@ async def get_free_team_state(
     session: AsyncSession | None = None,
     include_quotas: bool = True,
     include_reservations: bool = True,
+    config: Any = None,
 ) -> dict[str, Any]:
     """秘密を除いた設定・候補・クォータ・台帳状態を返す。"""
 
@@ -1052,6 +1770,9 @@ async def get_free_team_state(
     try:
         async with session.begin():
             await seed_free_team_defaults(session)
+            if include_quotas:
+                for quota in (await session.execute(select(FreeTeamQuotaPool).order_by(FreeTeamQuotaPool.id).with_for_update())).scalars():
+                    _reset_quota_if_needed(quota, _utcnow())
         credentials = list(
             (
                 await session.execute(
@@ -1108,12 +1829,44 @@ async def get_free_team_state(
             data = item.to_safe_dict()
             data["configured"] = _credential_configured(item)
             safe_credentials.append(data)
+        from . import openai_confirmation_service as confirmation
+        verification_reason = complimentary_stop_reason(config)
+        _, _, current_config = await confirmation.config_row(session)
+        if confirmation.managed(current_config):
+            config = current_config
+            verification_reason = await confirmation.binding_stop_reason(session, config) or complimentary_stop_reason(config)
         state = {
             "credentials": safe_credentials,
             "candidates": [item.to_dict() for item in candidates],
+            "verification": {"status": "unverified" if verification_reason else "verified",
+                "stop_reason": verification_reason,
+                "external_usage_visibility": "local_and_manual_observation"},
         }
         if include_quotas:
             state["quota_pools"] = [item.to_dict() for item in quotas]
+            scope = str(config_get(config, "openai.billing_scope_id", "") or "")
+            for model, quota in zip(quotas, state["quota_pools"]):
+                if model.id not in OPENAI_DAILY_QUOTA_GROUPS:
+                    continue
+                central = await _central_unmetered_usage(session, scope, OPENAI_DAILY_QUOTA_GROUPS[model.id], _utcnow()) if scope else Decimal(0)
+                used = _decimal(model.consumed) + central
+                cap = _openai_effective_cap(model, config)
+                # Keep the persisted setting separate from the live Tier guard.
+                # daily_cap remains the effective value for existing consumers.
+                quota.update(daily_cap=float(cap), effective_daily_cap=float(cap),
+                    cap_restriction_reason="usage_tier" if cap < model.daily_cap else "",
+                    usage_tier=str(config_get(config, "openai.usage_tier", "") or ""),
+                    local_consumed=float(_decimal(model.consumed)),
+                    consumed=float(used + model.provider_sync_delta), central_unmetered_usage=float(central),
+                    provider_external_delta=float(model.provider_sync_delta),
+                    available=float(max(Decimal(0), cap - used - model.provider_sync_delta - _decimal(model.reserved))))
+                credential = next((item for item in credentials if item.id == model.credential_profile_id), None)
+                quota["stop_reason"] = verification_reason or (
+                    "provider_disabled" if not credential or not credential.enabled else
+                    "billing_scope_unmapped_usage" if await _unmapped_central_usage(session, OPENAI_DAILY_QUOTA_GROUPS[model.id], _utcnow()) else
+                    "billing_scope_mismatch" if scope and model.reset_policy.get("billing_scope_id") not in {None, scope} else
+                    "billing_scope_unbound_usage" if not model.reset_policy.get("billing_scope_id") and (model.consumed or model.reserved or model.provider_observed_usage) else
+                    model.status if model.status != "active" else "budget_exhausted" if quota["available"] <= 0 else "")
         if include_reservations:
             state["reservations"] = [item.to_dict() for item in reservations]
         return state

@@ -5,11 +5,13 @@ import {
   type AppSelectChangeEvent,
   type AppSelectOpenChangeDetails,
 } from "@/components/ui/app-select";
+import Link from "next/link";
 
 import {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useMemo,
   useSyncExternalStore,
@@ -35,6 +37,9 @@ import {
   AppWindow,
 } from "lucide-react";
 import { MentionMenu, type MentionItem } from "@/components/chat/mention-menu";
+import { ChatIntentDialog } from "@/components/chat/chat-intent-dialog";
+import { useChatIntent } from "@/hooks/use-chat-intent";
+import { appendChatIntent, type ChatIntentCandidate } from "@/lib/chat-intent-api";
 import { ChatComposerInput } from "@/components/chat/chat-composer-input";
 import { ChatQuickPrompts } from "@/components/chat/chat-quick-prompts";
 import {
@@ -78,7 +83,7 @@ import {
   getChatComposerShortcutAction,
   resolveComposerBusyEnterAction,
 } from "@/lib/chat-keyboard-shortcuts";
-import { isOversizedMailAttachment } from "@/lib/chat-attachment-validation";
+import { chatAttachmentError } from "@/lib/chat-attachment-validation";
 import type {
   ContextRequestSnapshot,
   ContextSnapshot,
@@ -104,8 +109,10 @@ import { takeChatDraftHandoff } from "@/lib/chat-draft-handoff";
 import {
   EMPTY_CHAT_COMPOSER_DRAFT,
   NEW_CHAT_COMPOSER_DRAFT_KEY,
+  type ChatComposerDispatchMode,
   type ChatComposerDraft,
   clearChatComposerDraft,
+  flushChatComposerDraftStore,
   getChatComposerDraft,
   gcChatComposerDrafts,
   hydrateChatComposerDraft,
@@ -116,6 +123,7 @@ import {
 import { isChatComposerCursorInCodeBlock } from "@/lib/chat-composer-blocks";
 import { formatRouteLabel } from "@/lib/chat-session-route";
 import { useChatSessionRoute } from "@/hooks/use-chat-session-route";
+import { useLocalRuntimeStatus } from "@/hooks/use-local-runtime-status";
 import {
   completeChatCommandPrefix,
   filterChatCommands,
@@ -130,6 +138,11 @@ import {
   type ChatCommandDefinition,
   type ChatCommandCapability,
 } from "@/lib/chat-commands";
+import {
+  CHAT_SEND_RESTORE_EVENT,
+  type ChatSendAttachmentMetadata,
+  type ChatSendRestoreEventDetail,
+} from "@/lib/chat-send-outbox";
 import { toast } from "sonner";
 import { createDocsNodeWikilink } from "@/lib/docs-references";
 import {
@@ -158,15 +171,20 @@ export type ChatComposerProps = {
     commandCapabilities?: ChatCommandCapability[],
     toolsRequired?: boolean,
     appContext?: ChatAppContextSelection | null,
+    options?: ChatComposerSendOptions,
   ) => void | boolean | ChatComposerSendResult | Promise<void | boolean | ChatComposerSendResult>;
   onSteer?: (content: string) => void;
   onStop?: () => void;
   disabled: boolean;
   busy?: boolean;
+  /** A dedicated controller may keep the composer visible while blocking a
+   * second root-lane submission instead of queueing/steering it. */
+  busySubmitBehavior?: "queue" | "block";
   /** generation reducerが初回terminal遷移時だけ更新する一意キー */
   generationTerminalKey?: string | null;
   attachedFiles: File[];
-  onAttachedFilesChange: Dispatch<SetStateAction<File[]>>;
+  onAttachedFilesChange: (next: SetStateAction<File[]>, sessionKey?: string) => void;
+  onAttachmentsPromoted?: (sessionId: string, submittedFiles: File[]) => void;
   projectContextEnabled?: boolean;
   onProjectContextToggle?: (enabled: boolean) => void;
   deepResearchEnabled?: boolean;
@@ -184,15 +202,49 @@ export type ChatComposerProps = {
    */
   projectScopeReady?: boolean;
   sessionId?: string | null;
+  /** Durable Operations Agent binding for this Chat session, when present. */
+  agentId?: string | null;
   contextSnapshot?: ContextSnapshot | null;
   contextSnapshotStatus?: string;
   appContext?: ChatAppContextSelection | null;
   onAppContextChange?: (value: ChatAppContextSelection | null) => void;
   /** S9 supplies a session for Live Voice when this composer is a new chat. */
   ensureLiveVoiceConversationSession?: () => Promise<string>;
+  /** Latest durable assistant answer used by Local Pipeline TTS. */
+  voiceAssistantMessage?: { id: string; text: string } | null;
+  /** Keep the shared input/attachment behavior while hiding normal Chat controls. */
+  presentation?: "normal" | "aoidots";
+  /** Durable draft namespace for a non-route-owned controller. */
+  draftKey?: string | null;
 };
 
-export type ChatComposerSendResult = "accepted" | "pending" | "failed";
+export type ChatComposerSendResult =
+  | "accepted"
+  | "pending"
+  | "failed"
+  /** The bubble/outbox retained the submission for an inline retry. */
+  | "retained";
+
+export type ChatComposerSendOptions = {
+  /** Called only for this send's new session, immediately before activation. */
+  onSessionPromoted?: (sessionId: string) => void;
+  /** Reuse a durable idempotency key when restoring a failed send. */
+  clientMessageId?: string;
+  /** Replay the route selected when an uncertain draft was first submitted. */
+  dispatchMode?: ChatComposerDispatchMode;
+};
+
+const intentAttachmentIds = new WeakMap<File, number>();
+const UUID_CLIENT_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+let nextIntentAttachmentId = 0;
+function getIntentAttachmentId(file: File): number {
+  let id = intentAttachmentIds.get(file);
+  if (id === undefined) {
+    id = ++nextIntentAttachmentId;
+    intentAttachmentIds.set(file, id);
+  }
+  return id;
+}
 
 const runtimeSelectClassName =
   "h-9 min-w-0 rounded-md border border-input bg-background px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring";
@@ -276,6 +328,8 @@ function draftsMatch(a: ChatComposerDraft, b: ChatComposerDraft): boolean {
       a.activeCommand.capability === b.activeCommand.capability);
   return (
     a.content === b.content &&
+    a.clientMessageId === b.clientMessageId &&
+    a.dispatchMode === b.dispatchMode &&
     a.toolFreeMode === b.toolFreeMode &&
     activeCommandMatches &&
     a.mentions.length === b.mentions.length &&
@@ -287,6 +341,13 @@ function draftsMatch(a: ChatComposerDraft, b: ChatComposerDraft): boolean {
         mention.detail === b.mentions[index]?.detail,
     )
   );
+}
+
+function createComposerClientMessageId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `00000000-0000-4000-8000-${Math.random().toString(16).slice(2, 14).padEnd(12, "0")}`;
 }
 
 export type SubmittedSteeringInstruction = {
@@ -612,6 +673,7 @@ function ModelControl({
   onOpenChange,
   onComposerFocusRequest,
   onLlmModeRefresh,
+  agentId,
 }: {
   runtime: RuntimeContextValue;
   userSettings: UserSettings | null | undefined;
@@ -629,7 +691,10 @@ function ModelControl({
   onOpenChange: (open: boolean) => void;
   onComposerFocusRequest?: () => void;
   onLlmModeRefresh?: () => Promise<void>;
+  agentId?: string | null;
 }) {
+  const normalizedAgentId = agentId?.trim() || null;
+  const agentBound = Boolean(normalizedAgentId);
   const routeState = useChatSessionRoute({
     runtime,
     sessionId,
@@ -790,6 +855,13 @@ function ModelControl({
   const selectedCatalogModel = selectedCatalogModels.find(
     (model) => model.id === selectedRouteModel,
   );
+  const localRuntimeStatus = useLocalRuntimeStatus({
+    provider: selectedRouteProvider,
+    model: selectedRouteModel,
+    runtime: selectedCatalogModel?.runtime,
+    enabled: selectedRouteProvider.trim().toLowerCase() === "openai_compatible_local",
+  });
+  const localRuntimeReadiness = localRuntimeStatus.readiness;
   const effortUnsupported =
     selectedEngine?.supports_reasoning === false ||
     selectedCatalogModel?.supports_reasoning === false;
@@ -816,13 +888,15 @@ function ModelControl({
       : llmMode && effectiveOptions.includes(llmMode)
         ? llmMode
         : (effectiveOptions[0] ?? "");
-  const modeLabel = effortUnsupported
-    ? "推論モード指定なし"
-    : modeRefreshing
-      ? "Syncing…"
-      : effectiveMode
-        ? formatLlmModeLabel(effectiveMode, llmModeLabels)
-        : "—";
+  const modeLabel = agentBound
+      ? "次の依頼から反映"
+      : effortUnsupported
+        ? "推論モード指定なし"
+        : modeRefreshing
+          ? "Syncing…"
+          : effectiveMode
+            ? formatLlmModeLabel(effectiveMode, llmModeLabels)
+            : "—";
   const current = resolveMainContextSnapshot(contextSnapshot);
   const percentage = resolveContextPercentage(current);
   const displayScopeKey = `${userScopeKey ?? ""}:${sessionId ?? "__new_chat__"}`;
@@ -873,15 +947,17 @@ function ModelControl({
     !resolvedDisplayRouteLabel &&
     !lastKnownDisplayRouteLabelForScope &&
     llmStatus === "loading";
-  const modelLabel = fixedDeployment
-    ? effectiveLabel || "Enterprise"
-    : resolvedDisplayRouteLabel
-      ? resolvedDisplayRouteLabel
-      : showInitialModelLoading
-        ? "Model loading…"
-        : llmStatus === "error"
-          ? "Model unavailable · retry"
-          : "No model available";
+  const modelLabel = agentBound
+      ? "Agent設定"
+      : fixedDeployment
+        ? effectiveLabel || "Enterprise"
+        : resolvedDisplayRouteLabel
+          ? resolvedDisplayRouteLabel
+          : showInitialModelLoading
+            ? "Model loading…"
+            : llmStatus === "error"
+              ? "Model unavailable · retry"
+              : "No model available";
   const effortDisabled =
     routeEffortDisabled ||
     healthUnavailable ||
@@ -945,14 +1021,14 @@ function ModelControl({
   // popup opens and restores it asynchronously when it closes.
   const settingsItems = useMemo<ChatSettingsItemState[]>(
     () => [
-      ...(!fixedDeployment &&
+      ...(!agentBound && !fixedDeployment &&
       (routeFields.catalogProviders.length > 0 || selectableModels.length > 0)
         ? [
             { id: "provider" as const, disabled: providerDisabled },
             { id: "model" as const, disabled: modelDisabled },
           ]
         : []),
-      ...(effectiveOptions.length > 0
+      ...(!agentBound && effectiveOptions.length > 0
         ? [
             {
               id: "effort" as const,
@@ -960,8 +1036,12 @@ function ModelControl({
             },
           ]
         : []),
-      { id: "agentTeam", disabled: agentTeamDisabled },
-      { id: "executionProfile", disabled: executionProfileDisabled },
+      ...(!agentBound
+        ? [
+            { id: "agentTeam" as const, disabled: agentTeamDisabled },
+            { id: "executionProfile" as const, disabled: executionProfileDisabled },
+          ]
+        : []),
       ...(characterControlVisible
         ? [
             {
@@ -972,6 +1052,7 @@ function ModelControl({
         : []),
     ],
     [
+      agentBound,
       agentTeamDisabled,
       characterControlVisible,
       characterDisabled,
@@ -1447,7 +1528,11 @@ function ModelControl({
             data-testid="chat-model-control"
             data-runtime-model-control="true"
             data-context-window-current="main"
-            aria-label="モデル・推論・キャラクター・コンテキスト設定"
+            aria-label={
+              agentBound
+                ? "Agent設定・キャラクター・コンテキスト設定"
+                : "モデル・推論・キャラクター・コンテキスト設定"
+            }
             title={`${modelLabel} · ${modeLabel} · ${characterLabel} · Context ${contextLabel}`}
           />
         }
@@ -1470,6 +1555,22 @@ function ModelControl({
             <span className="min-w-0 truncate text-xs font-medium">
               {modelLabel}
             </span>
+            {localRuntimeReadiness && (
+              <span
+                className={cn(
+                  "shrink-0 text-[10px]",
+                  localRuntimeReadiness.state === "ready"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : localRuntimeReadiness.state === "failed"
+                      ? "text-destructive"
+                      : "text-muted-foreground",
+                )}
+                data-testid="chat-local-runtime-readiness-summary"
+                title={localRuntimeReadiness.detail ?? undefined}
+              >
+                · {localRuntimeReadiness.label}
+              </span>
+            )}
             <span className="shrink-0 text-[10px] text-muted-foreground">
               · {modeLabel}
             </span>
@@ -1506,7 +1607,9 @@ function ModelControl({
             <div className="min-w-0">
               <div className="text-sm font-medium">Chat settings</div>
               <div className="truncate text-[10px] text-muted-foreground">
-                provider · model · effort · team · execution profile · character
+                {agentBound
+                  ? "Agent設定 · Character"
+                  : "provider · model · effort · team · execution profile · character"}
               </div>
             </div>
             {runtime.llmChangeError && (
@@ -1516,6 +1619,26 @@ function ModelControl({
             )}
           </div>
 
+          {agentBound ? (
+            <div
+              data-testid="agent-bound-settings-summary"
+              className="space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2 text-xs"
+            >
+              <p className="font-medium">このChatはAgentに紐づいています</p>
+              <p className="text-muted-foreground">
+                職務・モデル・Execution Team・ProfileはAgent管理が正本です。変更は次の依頼から反映されます。
+              </p>
+              {normalizedAgentId ? (
+                <Link
+                  className="inline-block text-primary underline-offset-2 hover:underline"
+                  href={`/operations?tab=agents&agent=${encodeURIComponent(normalizedAgentId)}`}
+                >
+                  Agent管理を開く →
+                </Link>
+              ) : null}
+            </div>
+          ) : (
+            <>
           {fixedDeployment ? (
             <div
               className="rounded-md border border-amber-500/50 bg-amber-50 px-2.5 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
@@ -1557,6 +1680,39 @@ function ModelControl({
                   再取得
                 </button>
               )}
+            </div>
+          )}
+
+          {localRuntimeReadiness && (
+            <div
+              role={localRuntimeStatus.error ? "alert" : "status"}
+              aria-live="polite"
+              data-testid="chat-local-runtime-readiness"
+              className={cn(
+                "flex items-start justify-between gap-2 rounded-md border px-2.5 py-2 text-xs",
+                localRuntimeReadiness.state === "ready"
+                  ? "border-emerald-500/40 bg-emerald-50 text-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-200"
+                  : localRuntimeReadiness.state === "failed" || localRuntimeStatus.error
+                    ? "border-destructive/40 bg-destructive/5 text-destructive"
+                    : "border-border-subtle bg-muted/30 text-muted-foreground",
+              )}
+            >
+              <span className="min-w-0">
+                <span className="font-medium">ローカルモデル: {localRuntimeReadiness.label}</span>
+                {localRuntimeReadiness.detail && (
+                  <span className="mt-0.5 block break-words text-[10px] opacity-80">
+                    {localRuntimeReadiness.detail}
+                  </span>
+                )}
+              </span>
+              <button
+                type="button"
+                className="shrink-0 text-primary underline-offset-2 hover:underline"
+                onClick={() => void localRuntimeStatus.refresh()}
+                disabled={localRuntimeStatus.loading}
+              >
+                再取得
+              </button>
             </div>
           )}
 
@@ -1756,6 +1912,9 @@ function ModelControl({
             </div>
           )}
 
+            </>
+          )}
+
           {characterControlVisible && (
             <label className="grid gap-1 text-xs text-muted-foreground">
               <span>Character</span>
@@ -1912,29 +2071,6 @@ function isImageFile(file: File) {
   return file.type.startsWith("image/");
 }
 
-function isVideoFile(file: File) {
-  return (
-    file.type.startsWith("video/") ||
-    /\.(mp4|mov|mkv)$/i.test(file.name) ||
-    (/\.webm$/i.test(file.name) && !file.type.startsWith("audio/"))
-  );
-}
-
-function isAudioFile(file: File) {
-  return (
-    !isVideoFile(file) &&
-    (file.type.startsWith("audio/") ||
-      /\.(wav|mp3|m4a|flac|ogg|webm)$/i.test(file.name))
-  );
-}
-
-const MAX_IMAGE_ATTACHMENTS = 4;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_AUDIO_ATTACHMENTS = 1;
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-const MAX_VIDEO_ATTACHMENTS = 1;
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-
 function ComposerAttachmentPreview({
   file,
   onRemove,
@@ -1990,6 +2126,7 @@ function ComposerAttachmentPreview({
 const LLM_MODE_DESCRIPTIONS: Record<string, string> = {
   fast: "Quick replies with lightweight reasoning.",
   thinking: "Deeper reasoning for harder prompts.",
+  always: "Always thinking; this model has no non-thinking mode.",
   none: "No extra reasoning effort.",
   minimal: "Minimal reasoning effort.",
   low: "Low reasoning effort.",
@@ -2003,7 +2140,7 @@ function formatLlmModeLabel(
   mode: LlmMode,
   labels: Record<string, string>,
 ): string {
-  const label = labels[mode]?.trim();
+  const label = labels[mode]?.trim() || (mode === "always" ? "Always thinking" : "");
   if (label) return label;
   if (!mode) return "Unknown";
   return mode
@@ -2037,9 +2174,11 @@ export function ChatComposer({
   onStop,
   disabled,
   busy = false,
+  busySubmitBehavior = "queue",
   generationTerminalKey = null,
   attachedFiles,
   onAttachedFilesChange,
+  onAttachmentsPromoted,
   projectContextEnabled = false,
   onProjectContextToggle,
   deepResearchEnabled = false,
@@ -2053,12 +2192,17 @@ export function ChatComposer({
   projectId,
   projectScopeReady = true,
   sessionId,
+  agentId,
   contextSnapshot,
   contextSnapshotStatus,
   appContext = null,
   onAppContextChange,
   ensureLiveVoiceConversationSession,
+  voiceAssistantMessage = null,
+  presentation = "normal",
+  draftKey,
 }: ChatComposerProps) {
+  const isAoiDotsPresentation = presentation === "aoidots";
   const runtime = useOptionalRuntimeContext();
   const { mutate: mutateSWR } = useSWRConfig();
   const refreshLlmMode = useCallback(async () => {
@@ -2067,7 +2211,8 @@ export function ChatComposer({
   // AppLayout の getSession() で確定した ID を使い、認証状態の再取得待ちで
   // 新規チャット下書きが別スコープへ移る競合を避ける。
   const draftUserId = useCurrentUserId();
-  const composerDraftKey = sessionId ?? NEW_CHAT_COMPOSER_DRAFT_KEY;
+  const composerDraftKey =
+    draftKey ?? sessionId ?? NEW_CHAT_COMPOSER_DRAFT_KEY;
   const composerDraft = useSyncExternalStore(
     (listener) =>
       subscribeChatComposerDraft(composerDraftKey, listener, draftUserId),
@@ -2084,40 +2229,198 @@ export function ChatComposer({
   );
   const setValue = useCallback<Dispatch<SetStateAction<string>>>(
     (next) =>
-      updateComposerDraft((current) => ({
-        ...current,
-        content: typeof next === "function" ? next(current.content) : next,
-      })),
+      updateComposerDraft((current) => {
+        const content = typeof next === "function" ? next(current.content) : next;
+        return {
+          ...current,
+          content,
+          ...(content !== current.content
+            ? { clientMessageId: undefined, dispatchMode: undefined }
+            : {}),
+        };
+      }),
     [updateComposerDraft],
   );
   const setMentions = useCallback<Dispatch<SetStateAction<MentionItem[]>>>(
     (next) =>
-      updateComposerDraft((current) => ({
-        ...current,
-        mentions: typeof next === "function" ? next(current.mentions) : next,
-      })),
+      updateComposerDraft((current) => {
+        const mentions = typeof next === "function" ? next(current.mentions) : next;
+        const changed =
+          mentions.length !== current.mentions.length ||
+          mentions.some((mention, index) => {
+            const previous = current.mentions[index];
+            return (
+              mention.type !== previous?.type ||
+              mention.id !== previous?.id ||
+              mention.name !== previous?.name ||
+              mention.detail !== previous?.detail
+            );
+          });
+        return {
+          ...current,
+          mentions,
+          ...(changed
+            ? { clientMessageId: undefined, dispatchMode: undefined }
+            : {}),
+        };
+      }),
     [updateComposerDraft],
   );
   const setActiveCommand = useCallback<
     Dispatch<SetStateAction<ActiveChatCommand | null>>
   >(
     (next) =>
-      updateComposerDraft((current) => ({
-        ...current,
-        activeCommand:
-          typeof next === "function" ? next(current.activeCommand) : next,
-      })),
+      updateComposerDraft((current) => {
+        const activeCommand =
+          typeof next === "function" ? next(current.activeCommand) : next;
+        const changed = activeCommand?.command !== current.activeCommand?.command;
+        return {
+          ...current,
+          activeCommand,
+          ...(changed
+            ? { clientMessageId: undefined, dispatchMode: undefined }
+            : {}),
+        };
+      }),
     [updateComposerDraft],
   );
   const setToolFreeMode = useCallback<Dispatch<SetStateAction<boolean>>>(
     (next) =>
-      updateComposerDraft((current) => ({
-        ...current,
-        toolFreeMode:
-          typeof next === "function" ? next(current.toolFreeMode) : next,
-      })),
+      updateComposerDraft((current) => {
+        const toolFreeMode =
+          typeof next === "function" ? next(current.toolFreeMode) : next;
+        return {
+          ...current,
+          toolFreeMode,
+          ...(toolFreeMode !== current.toolFreeMode
+            ? { clientMessageId: undefined, dispatchMode: undefined }
+            : {}),
+        };
+      }),
     [updateComposerDraft],
   );
+  const setDeepResearchMode = useCallback(
+    (enabled: boolean) => {
+      const dispatchMode: ChatComposerDispatchMode = enabled
+        ? "deep_research"
+        : "chat";
+      updateComposerDraft((current) => {
+        const currentMode = current.dispatchMode ??
+          (deepResearchEnabled ? "deep_research" : "chat");
+        return {
+          ...current,
+          dispatchMode,
+          ...(currentMode !== dispatchMode
+            ? { clientMessageId: undefined }
+            : {}),
+        };
+      });
+      onDeepResearchToggle?.(enabled);
+    },
+    [deepResearchEnabled, onDeepResearchToggle, updateComposerDraft],
+  );
+  const prepareComposerDispatch = useCallback(
+    (
+      submittedDraft: ChatComposerDraft | undefined,
+      commandCapabilities?: ChatCommandCapability[],
+    ): {
+      draft: ChatComposerDraft | undefined;
+      dispatchMode: ChatComposerDispatchMode;
+    } => {
+      const dispatchMode = commandCapabilities?.length
+        ? "chat"
+        : submittedDraft?.dispatchMode ??
+          (submittedDraft?.clientMessageId
+            ? "chat"
+            : deepResearchEnabled
+              ? "deep_research"
+              : "chat");
+      if (!submittedDraft || dispatchMode !== "deep_research") {
+        return { draft: submittedDraft, dispatchMode };
+      }
+
+      const preparedDraft: ChatComposerDraft = {
+        ...submittedDraft,
+        clientMessageId: submittedDraft.clientMessageId &&
+          UUID_CLIENT_MESSAGE_ID.test(submittedDraft.clientMessageId)
+          ? submittedDraft.clientMessageId
+          : createComposerClientMessageId(),
+        dispatchMode,
+      };
+      updateComposerDraft((current) =>
+        draftsMatch(current, submittedDraft) ? preparedDraft : current,
+      );
+      // The server may accept a request while its response is lost. Flush the
+      // stable request key and route before invoking the async send handler.
+      flushChatComposerDraftStore();
+      return { draft: preparedDraft, dispatchMode };
+    },
+    [deepResearchEnabled, updateComposerDraft],
+  );
+  const [intentConfirmation, setIntentConfirmation] = useState({ userId: draftUserId, enabled: false });
+  const intentConfirmationEnabled = intentConfirmation.userId === draftUserId && intentConfirmation.enabled;
+  if (intentConfirmation.userId !== draftUserId) {
+    setIntentConfirmation({ userId: draftUserId, enabled: false });
+  }
+  const setIntentConfirmationEnabled = (enabled: boolean) => setIntentConfirmation({ userId: draftUserId, enabled });
+  const intentSubmissionRef = useRef(false);
+  const restoredAttachmentMetadataRef = useRef<ChatSendAttachmentMetadata[] | null>(null);
+  const restoredAttachmentBaselineRef = useRef<ChatSendAttachmentMetadata[] | null>(null);
+  const latestIntentScopeRef = useRef({ key: composerDraftKey, userId: draftUserId, projectId, attachedFiles });
+  useLayoutEffect(() => {
+    latestIntentScopeRef.current = { key: composerDraftKey, userId: draftUserId, projectId, attachedFiles };
+  }, [composerDraftKey, draftUserId, projectId, attachedFiles]);
+  useEffect(() => {
+    const expected = restoredAttachmentMetadataRef.current;
+    if (!expected) return;
+    const currentMetadata = attachedFiles.map((file) => ({
+      name: file.name,
+      size: file.size,
+      type: file.type || "",
+      lastModified: file.lastModified,
+    }));
+    const baseline = restoredAttachmentBaselineRef.current;
+    if (
+      baseline &&
+      baseline.length === currentMetadata.length &&
+      baseline.every(
+        (attachment, index) =>
+          attachment.name === currentMetadata[index]?.name &&
+          attachment.size === currentMetadata[index]?.size &&
+          attachment.type === currentMetadata[index]?.type &&
+          attachment.lastModified === currentMetadata[index]?.lastModified,
+      )
+    ) {
+      return;
+    }
+    restoredAttachmentBaselineRef.current = null;
+    const matches =
+      expected.length === attachedFiles.length &&
+      expected.every(
+        (attachment, index) => {
+          const file = attachedFiles[index];
+          return (
+            file?.name === attachment.name &&
+            file.size === attachment.size &&
+            (file.type || "") === attachment.type &&
+            file.lastModified === attachment.lastModified
+          );
+        },
+      );
+    if (!matches) {
+      updateComposerDraft(
+        (current) =>
+          current.clientMessageId
+            ? {
+                ...current,
+                clientMessageId: undefined,
+                dispatchMode: undefined,
+              }
+            : current,
+      );
+      restoredAttachmentMetadataRef.current = null;
+    }
+  }, [attachedFiles, updateComposerDraft]);
   const value = composerDraft.content;
   const mentions = composerDraft.mentions;
   const activeCommand = composerDraft.activeCommand;
@@ -2161,9 +2464,6 @@ export function ChatComposer({
   const [modelControlOpen, setModelControlOpen] = useState(false);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const [appContextPickerOpen, setAppContextPickerOpen] = useState(false);
-  const [audioAttachmentEnabled, setAudioAttachmentEnabled] = useState(true);
-  const [videoAttachmentEnabled, setVideoAttachmentEnabled] = useState(true);
-  const [videoMaxBytes, setVideoMaxBytes] = useState(MAX_ATTACHMENT_BYTES);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
@@ -2226,45 +2526,6 @@ export function ChatComposer({
     setPlanningPolicyHydrated(true);
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await fetch("/api/python-proxy/settings", {
-          credentials: "include",
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        const engine =
-          data?.settings?.model_routing?.classes?.audio?.engine ??
-          "speech_recognition";
-        const mageVl = data?.settings?.mage_vl ?? {};
-        const videoMode =
-          data?.settings?.model_routing?.media?.video_mode ?? "auto";
-        const configuredMaxBytes = Number(mageVl.max_video_bytes);
-        if (!cancelled) {
-          setAudioAttachmentEnabled(engine !== "off");
-          setVideoAttachmentEnabled(
-            mageVl.enabled !== false && videoMode !== "off",
-          );
-          setVideoMaxBytes(
-            Number.isFinite(configuredMaxBytes) && configuredMaxBytes > 0
-              ? Math.min(configuredMaxBytes, MAX_ATTACHMENT_BYTES)
-              : MAX_ATTACHMENT_BYTES,
-          );
-        }
-      } catch {
-        if (!cancelled) {
-          setAudioAttachmentEnabled(true);
-          setVideoAttachmentEnabled(true);
-          setVideoMaxBytes(MAX_ATTACHMENT_BYTES);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   const isSteeringMode = busy;
   const isEmpty =
@@ -2314,6 +2575,7 @@ export function ChatComposer({
   }, []);
   const webSearchActive = activeCommand?.capability === "web_search";
   const toolsMenuActive =
+    intentConfirmationEnabled ||
     projectContextEnabled ||
     deepResearchEnabled ||
     webSearchActive ||
@@ -2330,23 +2592,77 @@ export function ChatComposer({
     gcChatComposerDrafts(draftUserId);
   }, [composerDraftKey, draftUserId]);
 
+  // A failed send whose File bytes were not recoverable from IndexedDB can
+  // still restore its text and stable client id. The user can reselect the
+  // displayed attachment(s) before submitting again; never synthesize a File
+  // from metadata alone.
+  useEffect(() => {
+    const handleRestore = (event: Event) => {
+      const detail = (event as CustomEvent<ChatSendRestoreEventDetail>).detail;
+      if (!detail || detail.userId !== draftUserId) return;
+      const targetKey = detail.sessionId.startsWith("__new_chat_optimistic__:")
+        ? NEW_CHAT_COMPOSER_DRAFT_KEY
+        : detail.sessionId;
+      if (targetKey !== composerDraftKey) return;
+      const current = getChatComposerDraft(composerDraftKey, draftUserId);
+      if (
+        current.content.length > 0 &&
+        current.clientMessageId !== detail.clientMessageId
+      ) {
+        return;
+      }
+      updateChatComposerDraft(
+        composerDraftKey,
+        () => ({
+          ...current,
+          content: detail.content,
+          mentions: [...detail.mentions],
+          clientMessageId: detail.clientMessageId,
+          dispatchMode: "chat",
+        }),
+        draftUserId,
+      );
+      restoredAttachmentMetadataRef.current = [...detail.attachments];
+      restoredAttachmentBaselineRef.current = attachedFiles.map((file) => ({
+        name: file.name,
+        size: file.size,
+        type: file.type || "",
+        lastModified: file.lastModified,
+      }));
+      if (detail.attachments.length > 0) {
+        toast.info("元の添付ファイルを再選択してから送信してください");
+      }
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    };
+    window.addEventListener(CHAT_SEND_RESTORE_EVENT, handleRestore);
+    return () => window.removeEventListener(CHAT_SEND_RESTORE_EVENT, handleRestore);
+  }, [attachedFiles, composerDraftKey, draftUserId, updateComposerDraft]);
+
   useEffect(() => {
     const previousDraftKey = previousDraftKeyRef.current;
+    const authorizedPromotion = promotedDraftRef.current;
+    // A blank Chat route can be opened beside any existing conversation. Only
+    // the send path that received onSessionPromoted may move that draft to the
+    // created session; ordinary navigation (for example an AoiDots worker
+    // detail link) must leave __new_chat__ untouched.
     if (
       previousDraftKey === NEW_CHAT_COMPOSER_DRAFT_KEY &&
-      composerDraftKey !== NEW_CHAT_COMPOSER_DRAFT_KEY
+      composerDraftKey !== NEW_CHAT_COMPOSER_DRAFT_KEY &&
+      authorizedPromotion?.sourceKey === previousDraftKey &&
+      authorizedPromotion.targetKey === composerDraftKey &&
+      authorizedPromotion.userId === draftUserId
     ) {
-      const promotedDraft = getChatComposerDraft(
+      const sourceDraft = getChatComposerDraft(
         NEW_CHAT_COMPOSER_DRAFT_KEY,
         draftUserId,
       );
       promoteNewChatComposerDraft(composerDraftKey, draftUserId);
-      if (!draftsMatch(promotedDraft, EMPTY_CHAT_COMPOSER_DRAFT)) {
+      if (!draftsMatch(sourceDraft, EMPTY_CHAT_COMPOSER_DRAFT)) {
         promotedDraftRef.current = {
           sourceKey: NEW_CHAT_COMPOSER_DRAFT_KEY,
           targetKey: composerDraftKey,
           userId: draftUserId,
-          draft: promotedDraft,
+          draft: sourceDraft,
         };
       }
     }
@@ -2665,7 +2981,7 @@ export function ChatComposer({
   }, [selectedSlashMenuIndex, showSlashMenu]);
 
   const clearComposerAfterSendStart = useCallback(
-    (submittedDraft?: ChatComposerDraft) => {
+    (submittedDraft?: ChatComposerDraft, intentFiles?: readonly File[], intentTargetKey?: string) => {
       const currentDraft = getChatComposerDraft(composerDraftKey, draftUserId);
       // 送信開始後に同じキーへ新しい入力が入っていたら、それを消さない。
       if (!submittedDraft || draftsMatch(currentDraft, submittedDraft)) {
@@ -2679,6 +2995,7 @@ export function ChatComposer({
       if (
         promoted &&
         promoted.userId === draftUserId &&
+        (!intentFiles || promoted.targetKey === intentTargetKey) &&
         (!submittedDraft || draftsMatch(promoted.draft, submittedDraft))
       ) {
         const promotedCurrent = getChatComposerDraft(
@@ -2704,7 +3021,13 @@ export function ChatComposer({
         promotedDraftRef.current = null;
       }
 
-      onAttachedFilesChange([]);
+      if (!intentFiles) {
+        onAttachedFilesChange([]);
+      } else if (latestIntentScopeRef.current.userId === draftUserId &&
+          (latestIntentScopeRef.current.key === composerDraftKey ||
+           latestIntentScopeRef.current.key === intentTargetKey)) {
+        onAttachedFilesChange((current) => removeQueuedAttachments(current, intentFiles));
+      }
       requestAnimationFrame(() => {
         if (textareaRef.current) {
           textareaRef.current.style.height = "auto";
@@ -2721,51 +3044,170 @@ export function ChatComposer({
       clearAfterAccepted: boolean,
       ...args: Parameters<ChatComposerProps["onSend"]>
     ) => {
-      let result: ReturnType<ChatComposerProps["onSend"]>;
-      try {
-        result = onSend(...args);
-      } catch {
-        return;
+      const preparedDispatch = prepareComposerDispatch(
+        submittedDraft,
+        args[4],
+      );
+      submittedDraft = preparedDispatch.draft;
+      let restoreDraftKey = composerDraftKey;
+      let promotionSourceScope: typeof latestIntentScopeRef.current | null = null;
+      const sendArgs: Parameters<ChatComposerProps["onSend"]> = [...args];
+      const sendOptions: ChatComposerSendOptions = { ...args[7] };
+      if (submittedDraft?.clientMessageId) {
+        sendOptions.clientMessageId = submittedDraft.clientMessageId;
       }
-
-      const commandCapabilities = args[4];
+      if (
+        submittedDraft?.dispatchMode ||
+        preparedDispatch.dispatchMode === "deep_research"
+      ) {
+        sendOptions.dispatchMode =
+          submittedDraft?.dispatchMode ?? preparedDispatch.dispatchMode;
+      }
+      if (args[7] || Object.keys(sendOptions).length > 0) {
+        sendArgs[7] = sendOptions;
+      }
+      const isNewChatDraftSubmission =
+        Boolean(
+          submittedDraft &&
+            clearAfterAccepted &&
+            composerDraftKey === NEW_CHAT_COMPOSER_DRAFT_KEY,
+        );
+      if (submittedDraft && isNewChatDraftSubmission) {
+        // Persist the captured input before an async create/defaults wait. The
+        // live composer is cleared synchronously below; this snapshot is used
+        // only by explicit legacy failure restoration.
+        flushChatComposerDraftStore();
+        sendArgs[7] = {
+          ...sendOptions,
+          ...(submittedDraft.clientMessageId
+            ? { clientMessageId: submittedDraft.clientMessageId }
+            : {}),
+          onSessionPromoted: (createdSessionId) => {
+            const currentScope = latestIntentScopeRef.current;
+            const currentDraft = getChatComposerDraft(
+              composerDraftKey,
+              draftUserId,
+            );
+            if (
+              currentScope.userId === draftUserId &&
+              currentScope.key === composerDraftKey &&
+              (draftsMatch(currentDraft, submittedDraft) ||
+                draftsMatch(currentDraft, EMPTY_CHAT_COMPOSER_DRAFT))
+            ) {
+              restoreDraftKey = createdSessionId;
+              promotionSourceScope = currentScope;
+              promotedDraftRef.current = {
+                sourceKey: composerDraftKey,
+                targetKey: createdSessionId,
+                userId: draftUserId,
+                draft: submittedDraft,
+              };
+            }
+            args[7]?.onSessionPromoted?.(createdSessionId);
+          },
+        };
+      }
+      const submittedFiles = [...(args[1] ?? [])];
       const isDeepResearchSubmission =
-        deepResearchEnabled && !(commandCapabilities?.length);
+        preparedDispatch.dispatchMode === "deep_research";
       const clearImmediately =
-        clearAfterAccepted &&
-        !isDeepResearchSubmission &&
-        result !== false &&
-        result !== "pending" &&
-        result !== "failed";
+        clearAfterAccepted && !isDeepResearchSubmission;
+      // Clear the captured draft before invoking the async send handler. This
+      // is the boundary that prevents a slow new-chat route/defaults request
+      // from making the input look stuck. The callback below restores only
+      // the same snapshot after an explicit failure.
       if (clearImmediately) {
         clearComposerAfterSendStart(submittedDraft);
+      }
+      let result: ReturnType<ChatComposerProps["onSend"]>;
+      try {
+        result = onSend(...sendArgs);
+      } catch {
+        if (clearImmediately && submittedDraft) {
+          const currentDraft = getChatComposerDraft(
+            restoreDraftKey,
+            draftUserId,
+          );
+          if (draftsMatch(currentDraft, EMPTY_CHAT_COMPOSER_DRAFT)) {
+            updateChatComposerDraft(
+              restoreDraftKey,
+              () => submittedDraft,
+              draftUserId,
+            );
+            flushChatComposerDraftStore();
+            if (submittedFiles.length > 0) {
+              onAttachedFilesChange(
+                (current) => appendQueuedAttachments(current, submittedFiles),
+                restoreDraftKey,
+              );
+            }
+          }
+        }
+        return;
+      }
+      const restoreAfterFailure = () => {
+        if (!clearImmediately || !submittedDraft) return;
+        const currentScope = latestIntentScopeRef.current;
+        if (currentScope.userId !== draftUserId ||
+            (currentScope.key !== restoreDraftKey && currentScope !== promotionSourceScope)) return;
+        if (currentScope.key !== restoreDraftKey &&
+            !draftsMatch(getChatComposerDraft(currentScope.key, draftUserId), EMPTY_CHAT_COMPOSER_DRAFT)) return;
+        const currentDraft = getChatComposerDraft(restoreDraftKey, draftUserId);
+        // A failed send may return after a new message has been composed.
+        // Restore only into its still-visible empty draft; never overwrite it.
+        if (!draftsMatch(currentDraft, EMPTY_CHAT_COMPOSER_DRAFT)) return;
+        updateChatComposerDraft(restoreDraftKey, () => submittedDraft, draftUserId);
+        flushChatComposerDraftStore();
+        if (submittedFiles.length > 0) {
+          onAttachedFilesChange((current) => appendQueuedAttachments(current, submittedFiles), restoreDraftKey);
+        }
+      };
+      // Preserve the historical synchronous rejection contract for callers
+      // that return false/failed directly. This also makes a validation or
+      // preflight rejection visibly restorable in the same event turn.
+      if (result === false || result === "failed") {
+        restoreAfterFailure();
       }
 
       void Promise.resolve(result)
         .then((accepted) => {
-          if (clearImmediately) return;
-          // false/pending/failed はまだ dispatch 成功を確認できないため、
-          // 下書きは残して再送できるようにする。
-          // 既存の void callback は従来どおり成功扱いにする。
-          if (
-            accepted === false ||
-            accepted === "pending" ||
-            accepted === "failed"
-          ) {
+          if (accepted === false || accepted === "failed") {
+            restoreAfterFailure();
             return;
           }
+          if (accepted === "retained") {
+            // The optimistic bubble/outbox owns retry recovery. Keep the
+            // composer empty so retrying cannot create a second client id.
+            promotedDraftRef.current = null;
+            return;
+          }
+          // pending has not settled; do not offer a duplicate retry yet.
+          if (accepted === "pending") return;
+          if (clearImmediately) {
+            // A promoted new-chat scope temporarily contains the snapshot so
+            // that a failure can restore it. Once the send is accepted, clear
+            // that exact promoted scope as well.
+            if (isNewChatDraftSubmission) {
+              clearComposerAfterSendStart(
+                submittedDraft,
+                undefined,
+                restoreDraftKey,
+              );
+            }
+            return;
+          }
+          // Legacy void callbacks retain their successful-send behavior.
           if (clearAfterAccepted) {
             clearComposerAfterSendStart(submittedDraft);
           }
         })
-        .catch(() => {
-          // 通常チャットは送信開始時に分離済み。Deep Research は失敗時も保持する。
-        });
+        .catch(restoreAfterFailure);
     },
-    [clearComposerAfterSendStart, deepResearchEnabled, onSend],
+    [clearComposerAfterSendStart, composerDraftKey, draftUserId,
+      onAttachedFilesChange, onSend, prepareComposerDispatch],
   );
 
-  const enqueue = useCallback(() => {
+  const enqueue = useCallback((candidate?: ChatIntentCandidate): boolean => {
     const text = value.trim();
     const allowsAttachmentOnlySubmission =
       activeCommand?.capability === "work_intake" && attachedFiles.length > 0;
@@ -2774,7 +3216,7 @@ export function ChatComposer({
       activeCommand?.capability !== "aoitalk_help" &&
       !allowsAttachmentOnlySubmission
     ) {
-      return;
+      return false;
     }
     const submission = resolveChatCommandSubmission(
       value,
@@ -2783,7 +3225,7 @@ export function ChatComposer({
     );
     if (submission.error) {
       toast.error(submission.error);
-      return;
+      return false;
     }
     const id = createQueueId();
     const draftSnapshot: ChatComposerDraft = {
@@ -2801,7 +3243,7 @@ export function ChatComposer({
       {
         id,
         sessionId: sessionId ?? null,
-        content: submission.content,
+        content: candidate ? appendChatIntent(submission.content, candidate) : submission.content,
         attachedFiles: [...attachedFiles],
         generationProfile,
         mentions: [...mentions],
@@ -2829,6 +3271,7 @@ export function ChatComposer({
         textareaRef.current.focus();
       }
     });
+    return true;
   }, [
     appContext,
     attachedFiles,
@@ -2847,8 +3290,164 @@ export function ChatComposer({
     setValue,
   ]);
 
+  const handleIntentSend = useCallback(async (
+    candidate: ChatIntentCandidate,
+    onSessionPromoted: (sessionId: string) => void,
+  ): Promise<boolean> => {
+    if (intentSubmissionRef.current || (disabled && !isSteeringMode) || !projectScopeReady || !draftUserId || !value.trim() || /^\/masking(?:\s|$)/i.test(value.trim())) return false;
+    const submission = resolveChatCommandSubmission(value, activeCommand, attachedFiles.length > 0);
+    if (submission.error) { toast.error(submission.error); return false; }
+    if (submission.capabilities.includes("work_intake") && attachedFiles.length > 0 && !projectId) {
+      toast.error("/inbox の添付は保存先プロジェクトを選択してから送信してください");
+      return false;
+    }
+    intentSubmissionRef.current = true;
+    if (isSteeringMode) {
+      try { return enqueue(candidate); }
+      finally { intentSubmissionRef.current = false; }
+    }
+    const currentSubmittedDraft: ChatComposerDraft = {
+      content: value,
+      mentions: [...mentions],
+      activeCommand,
+      toolFreeMode,
+      clientMessageId: composerDraft.clientMessageId,
+      dispatchMode: composerDraft.dispatchMode,
+    };
+    const preparedDispatch = prepareComposerDispatch(
+      currentSubmittedDraft,
+      submission.capabilities,
+    );
+    const submittedDraft = preparedDispatch.draft ?? currentSubmittedDraft;
+    const submittedFiles = [...attachedFiles];
+    let intentTargetKey: string | undefined;
+    const args = [appendChatIntent(submission.content, candidate), submittedFiles.length ? submittedFiles : undefined,
+      mentions.length ? mentions : undefined, generationProfile, submission.capabilities,
+      resolveChatToolsRequired(submission.capabilities, toolFreeMode)] as const;
+    try {
+      const isNewChatIntent = composerDraftKey === NEW_CHAT_COMPOSER_DRAFT_KEY && !sessionId;
+      const options: ChatComposerSendOptions = {
+        ...(submittedDraft.clientMessageId
+          ? { clientMessageId: submittedDraft.clientMessageId }
+          : {}),
+        ...(submittedDraft.dispatchMode
+          ? { dispatchMode: submittedDraft.dispatchMode }
+          : preparedDispatch.dispatchMode === "deep_research"
+            ? { dispatchMode: preparedDispatch.dispatchMode }
+            : {}),
+        onSessionPromoted: (createdSessionId) => {
+          const currentScope = latestIntentScopeRef.current;
+          const currentDraft = getChatComposerDraft(composerDraftKey, draftUserId);
+          if (composerDraftKey !== NEW_CHAT_COMPOSER_DRAFT_KEY ||
+              currentScope.key !== composerDraftKey || currentScope.userId !== draftUserId ||
+              currentScope.projectId !== projectId ||
+              currentScope.attachedFiles.length !== submittedFiles.length ||
+              currentScope.attachedFiles.some((file, index) => file !== submittedFiles[index]) ||
+              (!draftsMatch(currentDraft, submittedDraft) &&
+                !draftsMatch(currentDraft, EMPTY_CHAT_COMPOSER_DRAFT))) return;
+          onAttachmentsPromoted?.(createdSessionId, submittedFiles);
+          intentTargetKey = createdSessionId;
+          promotedDraftRef.current = {
+            sourceKey: composerDraftKey, targetKey: createdSessionId, userId: draftUserId, draft: submittedDraft,
+          };
+          onSessionPromoted(createdSessionId);
+        },
+      };
+      let sendResult: ReturnType<ChatComposerProps["onSend"]>;
+      try {
+        // Invoke first so the optimistic bubble is created synchronously. The
+        // returned promise is observed below; it must not delay clearing the
+        // captured intent snapshot.
+        sendResult = onSend(...args, appContext ?? undefined, options);
+      } catch {
+        return false;
+      }
+      const locallyAccepted = sendResult !== false && sendResult !== "failed";
+      if (!locallyAccepted) return false;
+
+      // Keep source Files available for new-chat promotion: promoteAttachedFiles
+      // needs the original File identities. The source draft is still cleared
+      // immediately for regular sends; Deep Research keeps its durable request
+      // draft until the server confirms acceptance.
+      const isDeepResearchSubmission =
+        preparedDispatch.dispatchMode === "deep_research";
+      if (isNewChatIntent) {
+        if (!isDeepResearchSubmission) {
+          clearChatComposerDraft(composerDraftKey, draftUserId);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
+      } else if (!isDeepResearchSubmission) {
+        clearComposerAfterSendStart(submittedDraft, submittedFiles, intentTargetKey);
+      }
+      const restoreIntentFailure = () => {
+        const currentScope = latestIntentScopeRef.current;
+        const restoreDraftKey = intentTargetKey ?? composerDraftKey;
+        const sameSubmittedFiles =
+          currentScope.attachedFiles.length === submittedFiles.length &&
+          currentScope.attachedFiles.every(
+            (file, index) => file === submittedFiles[index],
+          );
+        if (
+          currentScope.userId !== draftUserId ||
+          (!intentTargetKey && currentScope.key !== composerDraftKey) ||
+          !draftsMatch(
+            getChatComposerDraft(restoreDraftKey, draftUserId),
+            EMPTY_CHAT_COMPOSER_DRAFT,
+          )
+        ) return;
+        updateChatComposerDraft(
+          restoreDraftKey,
+          () => submittedDraft,
+          draftUserId,
+        );
+        flushChatComposerDraftStore();
+        if (
+          !isNewChatIntent &&
+          submittedFiles.length > 0 &&
+          sameSubmittedFiles &&
+          currentScope.key === restoreDraftKey
+        ) {
+          onAttachedFilesChange((existing) => appendQueuedAttachments(existing, submittedFiles));
+        }
+        toast.error("送信に失敗しました。入力を戻しました。もう一度送信してください。");
+      };
+      try {
+        const accepted = await sendResult;
+        if (accepted === false || accepted === "failed") {
+          restoreIntentFailure();
+          return false;
+        }
+        if (accepted === "retained") {
+          promotedDraftRef.current = null;
+          if (preparedDispatch.dispatchMode === "deep_research") return true;
+        }
+        clearComposerAfterSendStart(submittedDraft, submittedFiles, intentTargetKey);
+        return true;
+      } catch {
+        restoreIntentFailure();
+        return false;
+      }
+    } finally { intentSubmissionRef.current = false; }
+  }, [activeCommand, appContext, attachedFiles, clearComposerAfterSendStart,
+    composerDraft.clientMessageId, composerDraft.dispatchMode, disabled, enqueue,
+    generationProfile, isSteeringMode, mentions, onAttachedFilesChange, onSend,
+    onAttachmentsPromoted, prepareComposerDispatch, projectId, projectScopeReady,
+    composerDraftKey, draftUserId, sessionId, toolFreeMode, value]);
+  const intent = useChatIntent({
+    text: value,
+    draftKey: composerDraftKey,
+    scopeKey: JSON.stringify([draftUserId, activeCommand, mentions, toolFreeMode, appContext,
+      attachedFiles.map(getIntentAttachmentId)]),
+    sessionId, projectId,
+    enabled: intentConfirmationEnabled && (!disabled || isSteeringMode) && projectScopeReady && Boolean(draftUserId) && !/^\/masking(?:\s|$)/i.test(value.trim()),
+    onSend: handleIntentSend,
+  });
+
+  const openIntent = intent.open;
   const handleSend = useCallback(
     (options?: { steerImmediately?: boolean }) => {
+      if (intentSubmissionRef.current) return;
+      if (isSteeringMode && busySubmitBehavior === "block") return;
       if (isSteeringMode) {
         const text = value.trim();
         const helpCommandSelected =
@@ -2871,6 +3470,8 @@ export function ChatComposer({
               textareaRef.current.focus();
             }
           });
+        } else if (intentConfirmationEnabled && text && !/^\/masking(?:\s|$)/i.test(text)) {
+          openIntent();
         } else {
           enqueue();
         }
@@ -2899,6 +3500,10 @@ export function ChatComposer({
         activeCommand?.capability === "work_intake" ||
         activeCommand?.capability === "aoitalk_help";
       if ((isEmpty && !emptySubmissionAllowed) || disabled) return;
+      if (intentConfirmationEnabled && value.trim() && !/^\/masking(?:\s|$)/i.test(value.trim())) {
+        openIntent();
+        return;
+      }
       const args = [
         submission.content,
         attachedFiles.length > 0 ? attachedFiles : undefined,
@@ -2912,6 +3517,8 @@ export function ChatComposer({
         mentions: [...mentions],
         activeCommand,
         toolFreeMode,
+        clientMessageId: composerDraft.clientMessageId,
+        dispatchMode: composerDraft.dispatchMode,
       };
       if (appContext) {
         invokeSend(submittedDraft, true, ...args, appContext);
@@ -2921,12 +3528,17 @@ export function ChatComposer({
     },
     [
       value,
+      intentConfirmationEnabled,
+      openIntent,
       isEmpty,
       disabled,
       isSteeringMode,
+      busySubmitBehavior,
       invokeSend,
       onSteer,
       attachedFiles,
+      composerDraft.clientMessageId,
+      composerDraft.dispatchMode,
       mentions,
       generationProfile,
       activeCommand,
@@ -2941,7 +3553,7 @@ export function ChatComposer({
   const handleQuickPromptSend = useCallback(
     (rawContent: string) => {
       const content = rawContent.trim();
-      if (!content || disabled || isSteeringMode) return;
+      if (!content || disabled || isSteeringMode || intentSubmissionRef.current) return;
 
       const submission = resolveChatCommandSubmission(content, null, false);
       if (submission.error) {
@@ -3031,7 +3643,7 @@ export function ChatComposer({
         } else {
           const nextValue = !deepResearchEnabled;
           if (nextValue) setToolFreeMode(false);
-          onDeepResearchToggle?.(nextValue);
+          setDeepResearchMode(nextValue);
           toast.success(`Deep Research: ${nextValue ? "on" : "off"}`);
         }
         requestAnimationFrame(() => textareaRef.current?.focus());
@@ -3045,9 +3657,9 @@ export function ChatComposer({
     },
     [
       deepResearchEnabled,
-      onDeepResearchToggle,
       onProjectContextToggle,
       projectContextEnabled,
+      setDeepResearchMode,
       setActiveCommand,
       setToolFreeMode,
       setValue,
@@ -3075,10 +3687,10 @@ export function ChatComposer({
   const handleDeepResearchMenuToggle = useCallback(
     (checked: boolean) => {
       if (checked) setToolFreeMode(false);
-      onDeepResearchToggle?.(checked);
+      setDeepResearchMode(checked);
       requestAnimationFrame(() => textareaRef.current?.focus());
     },
-    [onDeepResearchToggle, setToolFreeMode],
+    [setDeepResearchMode, setToolFreeMode],
   );
 
   const handleWebSearchMenuToggle = useCallback(
@@ -3343,7 +3955,7 @@ export function ChatComposer({
     // @メンション検出
     const textBeforeCursor = newValue.slice(0, cursorPos);
     const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
-    if (atMatch) {
+    if (atMatch && !/^\/masking(?:\s|$)/i.test(newValue.trimStart())) {
       setShowMentionMenu(true);
       setMentionQuery(atMatch[1]);
     } else {
@@ -3377,77 +3989,20 @@ export function ChatComposer({
     [setMentions, setValue, value],
   );
 
-  // ファイル追加
+  // File selection, paste and drop all pass through this budget boundary.
   const addFiles = useCallback(
     (files: FileList | File[]) => {
       const incoming = Array.from(files);
       onAttachedFilesChange((prev) => {
-        const accepted: File[] = [];
-        let imageCount = prev.filter(isImageFile).length;
-        let audioCount = prev.filter(isAudioFile).length;
-        let videoCount = prev.filter(isVideoFile).length;
+        const accepted = [...prev];
         for (const file of incoming) {
-          if (file.size > MAX_ATTACHMENT_BYTES) {
-            toast.error(
-              `ファイルは 1 件 ${formatBytes(MAX_ATTACHMENT_BYTES)} までです`,
-            );
-            continue;
-          }
-          if (isImageFile(file)) {
-            if (file.size > MAX_IMAGE_BYTES) {
-              toast.error(`画像は1枚 ${formatBytes(MAX_IMAGE_BYTES)} までです`);
-              continue;
-            }
-            if (imageCount >= MAX_IMAGE_ATTACHMENTS) {
-              toast.error(
-                `画像は最大 ${MAX_IMAGE_ATTACHMENTS} 枚まで添付できます`,
-              );
-              continue;
-            }
-            imageCount += 1;
-          } else if (isVideoFile(file)) {
-            if (!videoAttachmentEnabled) {
-              toast.error("動画認識が無効なため動画ファイルは添付できません");
-              continue;
-            }
-            if (file.size > videoMaxBytes) {
-              toast.error(`動画は ${formatBytes(videoMaxBytes)} までです`);
-              continue;
-            }
-            if (videoCount >= MAX_VIDEO_ATTACHMENTS) {
-              toast.error("動画ファイルは1件まで添付できます");
-              continue;
-            }
-            videoCount += 1;
-          } else if (isAudioFile(file)) {
-            if (!audioAttachmentEnabled) {
-              toast.error("音声認識が無効なため音声ファイルは添付できません");
-              continue;
-            }
-            if (file.size > MAX_AUDIO_BYTES) {
-              toast.error(`音声は ${formatBytes(MAX_AUDIO_BYTES)} までです`);
-              continue;
-            }
-            if (audioCount >= MAX_AUDIO_ATTACHMENTS) {
-              toast.error("音声ファイルは1件まで添付できます");
-              continue;
-            }
-            audioCount += 1;
-          } else if (isOversizedMailAttachment(file)) {
-            toast.error("メールファイルは 10 MB までです");
-            continue;
-          }
-          accepted.push(file);
+          const error = chatAttachmentError([...accepted, file]);
+          if (error) toast.error(`${file.name}: ${error}`);
+          else accepted.push(file);
         }
-        return accepted.length > 0 ? [...prev, ...accepted] : prev;
+        return accepted.length > prev.length ? accepted : prev;
       });
-    },
-    [
-      audioAttachmentEnabled,
-      onAttachedFilesChange,
-      videoAttachmentEnabled,
-      videoMaxBytes,
-    ],
+    }, [onAttachedFilesChange],
   );
 
   // ファイル削除
@@ -3483,23 +4038,23 @@ export function ChatComposer({
     [addFiles],
   );
 
-  // クリップボード画像の貼り付け
+  // Clipboard file items share the picker/drop validation for every format.
   const handlePaste = useCallback(
     (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
       const items = event.clipboardData?.items;
       if (!items) return;
 
-      const pastedImages = Array.from(items)
+      const pastedFiles = Array.from(items)
         .filter(
-          (item) => item.kind === "file" && item.type.startsWith("image/"),
+          (item) => item.kind === "file",
         )
         .map((item) => item.getAsFile())
         .filter((file): file is File => file !== null);
 
-      if (pastedImages.length === 0) return;
+      if (pastedFiles.length === 0) return;
 
       event.preventDefault();
-      addFiles(pastedImages);
+      addFiles(pastedFiles);
     },
     [addFiles],
   );
@@ -3516,11 +4071,20 @@ export function ChatComposer({
     [addFiles],
   );
 
+  const handleVoiceTranscript = useCallback(
+    async (text: string) => {
+      const result = await onSend(text);
+      return result === "retained" ? "accepted" : result;
+    },
+    [onSend],
+  );
+
   return (
     <div
-      className="shrink-0 border-t border-border-subtle bg-background px-4 pb-4 pt-3"
+      className="shrink-0 bg-background px-4 py-2"
       data-chat-composer="true"
     >
+      <ChatIntentDialog intent={intent} onClosed={() => textareaRef.current?.focus()} />
       <div className="chat-viewport-center mx-auto w-full max-w-5xl space-y-2">
         {/* 添付ファイルプレビュー */}
         {attachedFiles.length > 0 && (
@@ -3532,6 +4096,15 @@ export function ChatComposer({
                 onRemove={() => removeFile(index)}
               />
             ))}
+            <div className="flex w-full flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span>{attachedFiles.length}/12件 · 合計{formatBytes(attachedFiles.reduce((size, file) => size + file.size, 0))}/100 MB</span>
+              <Button type="button" size="xs" variant="outline" onClick={() => setValue(value.trim()
+                ? `${value}\nこれらの添付を手がかりに、Docs・Knowledge・会話・資料から探してください。`
+                : "これらの添付を手がかりに、Docs・Knowledge・会話・資料から探してください。")}>添付で探す</Button>
+              <Button type="button" size="xs" variant="ghost" onClick={() => setValue(value.trim()
+                ? `${value}\n各添付を個別の手がかりにして検索してください。`
+                : "各添付を個別の手がかりにして検索してください。")}>個別に探す</Button>
+            </div>
           </div>
         )}
 
@@ -3577,30 +4150,29 @@ export function ChatComposer({
           </div>
         )}
 
-        <ChatQuickPrompts
-          sendDisabled={disabled || isSteeringMode}
-          onSendPrompt={handleQuickPromptSend}
-        />
-
-        <div className="flex min-w-0 flex-wrap items-end gap-1.5 rounded-md border border-border-subtle bg-surface-charcoal p-2 xl:flex-nowrap">
-          <GenerationProfileSelector
-            value={generationProfile}
-            onChange={handleGenerationProfileChange}
-            open={generationProfileMenuOpen}
-            onOpenChange={setGenerationProfileMenuOpen}
-            onComposerFocusRequest={() => textareaRef.current?.focus()}
-          />
-          <PlanningPolicySelector
-            value={
-              planningPolicyHydrated
-                ? localPlanningPolicy
-                : DEFAULT_PLANNING_POLICY
-            }
-            onChange={handlePlanningPolicyChange}
-            open={planningPolicyMenuOpen}
-            onOpenChange={setPlanningPolicyMenuOpen}
-            onComposerFocusRequest={() => textareaRef.current?.focus()}
-          />
+        <div className="flex min-w-0 flex-wrap items-end gap-1.5 rounded-md border border-border-subtle bg-surface-charcoal p-1">
+          {!isAoiDotsPresentation && (
+            <>
+              <GenerationProfileSelector
+                value={generationProfile}
+                onChange={handleGenerationProfileChange}
+                open={generationProfileMenuOpen}
+                onOpenChange={setGenerationProfileMenuOpen}
+                onComposerFocusRequest={() => textareaRef.current?.focus()}
+              />
+              <PlanningPolicySelector
+                value={
+                  planningPolicyHydrated
+                    ? localPlanningPolicy
+                    : DEFAULT_PLANNING_POLICY
+                }
+                onChange={handlePlanningPolicyChange}
+                open={planningPolicyMenuOpen}
+                onOpenChange={setPlanningPolicyMenuOpen}
+                onComposerFocusRequest={() => textareaRef.current?.focus()}
+              />
+            </>
+          )}
 
           <DropdownMenu
             open={toolsMenuOpen}
@@ -3633,67 +4205,81 @@ export function ChatComposer({
               align="start"
               className="w-56"
             >
-              <DropdownMenuCheckboxItem
-                mnemonic="P"
-                checked={projectContextEnabled}
-                onCheckedChange={(checked) =>
-                  handleProjectContextMenuToggle(checked === true)
-                }
-                className="gap-2 py-1.5"
-              >
-                <FolderOpen className="size-4" />
-                <span>Project context</span>
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                mnemonic="D"
-                checked={deepResearchEnabled}
-                onCheckedChange={(checked) =>
-                  handleDeepResearchMenuToggle(checked === true)
-                }
-                className="gap-2 py-1.5"
-              >
-                <Brain className="size-4" />
-                <span>Deep Research</span>
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                mnemonic="W"
-                checked={webSearchActive}
-                onCheckedChange={(checked) =>
-                  handleWebSearchMenuToggle(checked === true)
-                }
-                className="gap-2 py-1.5"
-              >
-                <Search className="size-4" />
-                <span>Web検索</span>
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                mnemonic="N"
-                checked={toolFreeMode}
-                disabled={deepResearchEnabled || webSearchActive}
-                onCheckedChange={(checked) => setToolFreeMode(checked === true)}
-                className="gap-2 py-1.5"
-              >
-                <Gauge className="size-4" />
-                <span>ツールなし（無料枠優先）</span>
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                mnemonic="A"
-                onClick={() => {
-                  skipToolsMenuRefocusRef.current = true;
-                  // メニューが閉じてフォーカスが戻った後にpopoverを開く
-                  requestAnimationFrame(() => setAppContextPickerOpen(true));
-                }}
-                className="gap-2 py-1.5"
-              >
-                <AppWindow className="size-4" />
-                <span>
-                  App context
-                  {appContext
-                    ? `: ${appContext.appName} / ${appContext.targetKey}`
-                    : "…"}
-                </span>
-              </DropdownMenuItem>
+              {!isAoiDotsPresentation && (
+                <>
+                  <DropdownMenuCheckboxItem
+                    mnemonic="I"
+                    checked={intentConfirmationEnabled}
+                    disabled={intent.sending}
+                    onCheckedChange={(checked) => setIntentConfirmationEnabled(checked === true)}
+                    className="gap-2 py-1.5"
+                  >
+                    <Brain className="size-4" />
+                    <span>意図確認</span>
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuCheckboxItem
+                    mnemonic="P"
+                    checked={projectContextEnabled}
+                    onCheckedChange={(checked) =>
+                      handleProjectContextMenuToggle(checked === true)
+                    }
+                    className="gap-2 py-1.5"
+                  >
+                    <FolderOpen className="size-4" />
+                    <span>Project context</span>
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    mnemonic="D"
+                    checked={deepResearchEnabled}
+                    onCheckedChange={(checked) =>
+                      handleDeepResearchMenuToggle(checked === true)
+                    }
+                    className="gap-2 py-1.5"
+                  >
+                    <Brain className="size-4" />
+                    <span>Deep Research</span>
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    mnemonic="W"
+                    checked={webSearchActive}
+                    onCheckedChange={(checked) =>
+                      handleWebSearchMenuToggle(checked === true)
+                    }
+                    className="gap-2 py-1.5"
+                  >
+                    <Search className="size-4" />
+                    <span>Web検索</span>
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    mnemonic="N"
+                    checked={toolFreeMode}
+                    disabled={deepResearchEnabled || webSearchActive}
+                    onCheckedChange={(checked) => setToolFreeMode(checked === true)}
+                    className="gap-2 py-1.5"
+                  >
+                    <Gauge className="size-4" />
+                    <span>ツールなし（無料枠優先）</span>
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    mnemonic="A"
+                    onClick={() => {
+                      skipToolsMenuRefocusRef.current = true;
+                      requestAnimationFrame(() => setAppContextPickerOpen(true));
+                    }}
+                    className="gap-2 py-1.5"
+                  >
+                    <AppWindow className="size-4" />
+                    <span>
+                      App context
+                      {appContext
+                        ? `: ${appContext.appName} / ${appContext.targetKey}`
+                        : "…"}
+                    </span>
+                  </DropdownMenuItem>
+                </>
+              )}
               <DropdownMenuItem
                 mnemonic="F"
                 onClick={() => fileInputRef.current?.click()}
@@ -3704,22 +4290,30 @@ export function ChatComposer({
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <VoicePanel
-            conversationSessionId={sessionId}
-            projectId={projectId}
-            includeProjectContext={projectContextEnabled}
-            characterName={runtime?.currentCharacter ?? null}
-            ensureConversationSession={ensureLiveVoiceConversationSession}
-            disabled={disabled}
-          />
-          <AppContextPicker
-            value={appContext}
-            projectId={projectId}
-            onChange={onAppContextChange ?? (() => undefined)}
-            open={appContextPickerOpen}
-            onOpenChange={setAppContextPickerOpen}
-            anchorRef={toolsMenuButtonRef}
-          />
+          {!isAoiDotsPresentation && (
+            <>
+              <VoicePanel
+                conversationSessionId={sessionId}
+                projectId={projectId}
+                includeProjectContext={projectContextEnabled}
+                characterName={runtime?.currentCharacter ?? null}
+                ensureConversationSession={ensureLiveVoiceConversationSession}
+                assistantMessage={voiceAssistantMessage}
+                chatBusy={Boolean(busy)}
+                onSendTranscript={handleVoiceTranscript}
+                onStopGeneration={onStop}
+                disabled={disabled}
+              />
+              <AppContextPicker
+                value={appContext}
+                projectId={projectId}
+                onChange={onAppContextChange ?? (() => undefined)}
+                open={appContextPickerOpen}
+                onOpenChange={setAppContextPickerOpen}
+                anchorRef={toolsMenuButtonRef}
+              />
+            </>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -3729,12 +4323,12 @@ export function ChatComposer({
           />
 
           <div className="relative min-w-[min(100%,16rem)] flex-1">
-            {!isSteeringMode && (Boolean(activeCommand) || toolsMenuActive) && (
+            {((!isSteeringMode && (Boolean(activeCommand) || toolsMenuActive)) || intentConfirmationEnabled) && (
               <div
                 className="mb-1 flex min-w-0 flex-wrap items-center gap-1.5"
                 data-testid="chat-composer-active-chips"
               >
-                {activeCommand && (
+                {!isSteeringMode && activeCommand && (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
                     <span className="truncate">{activeCommand.label}</span>
                     <button
@@ -3749,7 +4343,23 @@ export function ChatComposer({
                   </span>
                 )}
 
-                {projectContextEnabled && (
+                {intentConfirmationEnabled && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">意図確認</span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => setIntentConfirmationEnabled(false)}
+                      disabled={intent.sending}
+                      aria-label="意図確認を解除"
+                      title="意図確認を解除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                )}
+
+                {!isSteeringMode && projectContextEnabled && (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
                     <span className="truncate">Project context</span>
                     <button
@@ -3764,7 +4374,7 @@ export function ChatComposer({
                   </span>
                 )}
 
-                {deepResearchEnabled && (
+                {!isSteeringMode && deepResearchEnabled && (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
                     <span className="truncate">Deep Research</span>
                     <button
@@ -3779,7 +4389,7 @@ export function ChatComposer({
                   </span>
                 )}
 
-                {toolFreeMode && (
+                {!isSteeringMode && toolFreeMode && (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
                     <span className="truncate">ツールなし（無料枠優先）</span>
                     <button
@@ -3794,7 +4404,7 @@ export function ChatComposer({
                   </span>
                 )}
 
-                {appContext && (
+                {!isSteeringMode && appContext && (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
                     <span className="truncate">
                       App: {appContext.appName} / {appContext.targetKey}
@@ -3939,7 +4549,7 @@ export function ChatComposer({
             />
           </div>
 
-          {runtime && (
+          {runtime && !isAoiDotsPresentation && (
             <ModelControl
               runtime={runtime}
               userSettings={userSettings}
@@ -3957,8 +4567,14 @@ export function ChatComposer({
               onOpenChange={setModelControlOpen}
               onComposerFocusRequest={() => textareaRef.current?.focus()}
               onLlmModeRefresh={refreshLlmMode}
+              agentId={agentId}
             />
           )}
+
+          <ChatQuickPrompts
+            sendDisabled={disabled || isSteeringMode}
+            onSendPrompt={handleQuickPromptSend}
+          />
 
           {isSteeringMode ? (
             <>

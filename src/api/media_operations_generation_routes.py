@@ -41,6 +41,11 @@ _MODEL_SELECTION_RE = (
     r"^(?:(?:ims|imd|ien|wsl)_[A-Za-z0-9_-]{8,160})$"
 )
 _SHA256_RE = r"^[0-9a-fA-F]{64}$"
+_MANAGED_PREVIEW_URL_RE = (
+    r"^/api/operations/media/assets/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"/preview\?expected_sha256=[0-9a-f]{64}$"
+)
 
 OpaqueId = Annotated[str, Field(min_length=2, max_length=255, pattern=_OPAQUE_ID_RE)]
 StudioWorkspaceId = Annotated[
@@ -76,6 +81,14 @@ ModelSelectionId = Annotated[
     Field(min_length=12, max_length=164, pattern=_MODEL_SELECTION_RE),
 ]
 Sha256 = Annotated[str, Field(min_length=64, max_length=64, pattern=_SHA256_RE)]
+ManagedPreviewUrl = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=256,
+        pattern=_MANAGED_PREVIEW_URL_RE,
+    ),
+]
 
 
 class _GenerationCommandModel(BaseModel):
@@ -131,6 +144,10 @@ class GenerationWorkspaceCreateRequest(_GenerationCommandModel):
     @classmethod
     def validate_base_url(cls, value: str) -> str:
         return _validate_origin(value)
+
+
+class GenerationWorkspaceRetireRequest(_GenerationCommandModel):
+    expected_config_hash: Sha256
 
 
 class GenerationWorkspaceResponse(_GenerationResponseModel):
@@ -367,6 +384,12 @@ class GenerationRequestSpecRequest(_GenerationCommandModel):
         return self
 
 
+class GenerationRequestSpecResponse(GenerationRequestSpecRequest):
+    # Server-built, immutable provenance is output-only. Keeping a separate
+    # model preserves extra=forbid on the caller's generation request.
+    research_context: dict[str, Any] | None = None
+
+
 class GenerationPlanCreateRequest(_GenerationCommandModel):
     persona_revision_id: str
     creative_recipe_revision_id: str
@@ -388,7 +411,7 @@ class GenerationPlanResponse(_GenerationResponseModel):
     content_item_id: str | None = None
     content_variant_id: str | None = None
     requested_outputs: int = Field(ge=1, le=20)
-    request_spec: GenerationRequestSpecRequest
+    request_spec: GenerationRequestSpecResponse
     # Derived solely from the opaque selection ID/request fields.  The client
     # cannot choose a conflicting kind or smuggle provider metadata here.
     generation_kind: Literal["image", "video"]
@@ -418,6 +441,10 @@ class GenerationOutputResponse(_GenerationResponseModel):
     )
     width: int | None = Field(default=None, ge=1, le=100_000)
     height: int | None = Field(default=None, ge=1, le=100_000)
+    # A preview is available only after MediaAssetService has verified and
+    # bound the managed bytes.  Keep this server-relative so provider URLs or
+    # unverified external payloads can never become media elements.
+    preview_url: ManagedPreviewUrl | None = None
     deep_link: str | None = Field(default=None, max_length=4_000)
     provenance_hash: Sha256
     created_at: str | None = None
@@ -581,6 +608,17 @@ def _safe_public_url(value: Any, *, origin_only: bool = False) -> str | None:
         return None
 
 
+def _safe_managed_preview_url(value: Any) -> str | None:
+    """Project only the verified, server-relative media preview proxy URL."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) > 256 or re.fullmatch(_MANAGED_PREVIEW_URL_RE, text) is None:
+        return None
+    return text
+
+
 def _safe_settings(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
@@ -640,6 +678,12 @@ def _safe_request_spec(value: Any) -> dict[str, Any]:
     payload["generation_settings"] = _safe_settings(payload.get("generation_settings"))
     if not isinstance(payload.get("storyboard"), list):
         payload["storyboard"] = []
+    if "research_context" in value:
+        # Validate the stored context hash and prompt bound using the same
+        # authority as generation. Never rebaseline or silently redact it.
+        service._generation_prompt({"prompt": payload.get("prompt", ""),
+                                    "research_context": value["research_context"]})
+        payload["research_context"] = value["research_context"]
     return payload
 
 
@@ -771,6 +815,7 @@ def _project_output(value: Any) -> dict[str, Any]:
         "mime_type": _field(value, "mime_type", "application/octet-stream"),
         "width": _field(value, "width"),
         "height": _field(value, "height"),
+        "preview_url": _safe_managed_preview_url(_field(value, "preview_url")),
         "deep_link": _safe_public_url(_first(value, "deep_link", "result_deep_link")),
         "provenance_hash": _field(value, "provenance_hash"),
         "created_at": _iso(_field(value, "created_at")),
@@ -1122,6 +1167,19 @@ def create_media_operations_generation_router(
                 generation.get_generation_workspace, session, actor, workspace_id
             ),
         )
+        return _project_workspace(result)
+
+    @router.post(
+        "/generation-workspaces/{workspace_id}/retire",
+        response_model=GenerationWorkspaceResponse,
+        operation_id="media_retire_generation_workspace",
+    )
+    async def retire_generation_workspace(workspace_id: str, payload: GenerationWorkspaceRetireRequest,
+        request: Request, _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        result = await _with_session(get_db_manager, lambda session: _invoke_generation(
+            generation.retire_generation_workspace, session, actor, workspace_id,
+            expected_config_hash=payload.expected_config_hash))
         return _project_workspace(result)
 
     @router.get(

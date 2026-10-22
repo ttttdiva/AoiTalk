@@ -19,6 +19,7 @@ import {
 import { taskApi, type Task } from "@/lib/task-api";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
+import { formatTimerClock, getTrackedTimerSeconds } from "@/lib/task-time";
 import {
   getTaskDisplayAllDay,
   getTaskDisplayEndAt,
@@ -27,7 +28,6 @@ import {
 import { cn } from "@/lib/utils";
 import {
   dateButtonColor,
-  formatDuration,
   getTaskDisplayStatus,
   STATUS_DOT_COLORS,
   STATUS_LABELS,
@@ -65,6 +65,7 @@ export function SubtaskRow({
   showPriorityColumn = false,
   showAssigneeColumn = false,
   showTimeColumn = true,
+  now = Date.now(),
   onStatusChange,
   statusFocusEpochRef,
   rowRef,
@@ -102,6 +103,7 @@ export function SubtaskRow({
   showPriorityColumn?: boolean;
   showAssigneeColumn?: boolean;
   showTimeColumn?: boolean;
+  now?: number;
   onStatusChange?: (task: Task, status: TaskStatusOption) => Promise<void>;
   statusFocusEpochRef?: React.RefObject<number>;
   rowRef?: React.Ref<HTMLTableRowElement>;
@@ -111,6 +113,13 @@ export function SubtaskRow({
   focused?: boolean;
 }) {
   const status = getTaskDisplayStatus(sub);
+  const trackedTimeLabel = formatTimerClock(
+    getTrackedTimerSeconds(
+      sub.total_time_seconds,
+      sub.active_time_entry?.started_at,
+      now,
+    ),
+  );
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const statusFocusSessionRef = useRef<{
     epoch: number;
@@ -474,8 +483,8 @@ export function SubtaskRow({
         </td>
       )}
       {showTimeColumn && (
-        <td className="h-11 px-2 py-0 text-right font-mono text-[13px] leading-5 text-muted-foreground">
-          {(sub.total_time_seconds ?? 0) > 0 ? formatDuration(sub.total_time_seconds ?? 0) : "--:--:--"}
+        <td className="h-11 whitespace-nowrap px-2 py-0 text-right font-mono text-[11px] leading-5 tabular-nums text-muted-foreground">
+          <span title={`実績時間 ${trackedTimeLabel}`}>{trackedTimeLabel}</span>
         </td>
       )}
     </tr>

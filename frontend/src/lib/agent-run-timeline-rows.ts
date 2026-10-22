@@ -327,7 +327,7 @@ function mergeSummary(
 }
 
 /**
- * Agent Teamの開始・完了イベントを1サブエージェント1行へ集約する。
+ * Execution Teamの開始・完了イベントを1サブエージェント1行へ集約する。
  * 既存のagent_operation集約行がある場合は、agent_team.*のライフサイクル行を
  * 同じエージェントの重複カードとして扱わない。
  */

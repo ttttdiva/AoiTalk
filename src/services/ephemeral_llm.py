@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 from typing import Any, Optional
+
+from ..llm.generation_budget import GenerationBudget, current_generation_budget
+from ..llm.generation_cancellation import GenerationCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +22,28 @@ _EPHEMERAL_METHOD_NAMES = (
     "generate_plain_text_async",
     "generate_memory_extraction_async",
 )
+
+
+class EphemeralGenerationStopped(RuntimeError):
+    """A stopped request is not model output eligible for format repair."""
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(f"ephemeral_generation_{status}")
+
+
+def agent_work_generation_timeout(config: Any) -> float:
+    """Shared bounded budget; explicit ephemeral caller timeouts still win."""
+    if isinstance(config, dict):
+        section = config.get("ephemeral_llm", {})
+        value = section.get("timeout_seconds", 600.0) if isinstance(section, dict) else 600.0
+    else:
+        value = config.get("ephemeral_llm.timeout_seconds", 600.0) if hasattr(config, "get") else 600.0
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return 600.0
+    return min(1800.0, max(1.0, timeout)) if math.isfinite(timeout) else 600.0
 
 
 def _get_explicit_method(llm_client: Any, name: str) -> Any:
@@ -75,6 +101,8 @@ async def generate_ephemeral_text_with_llm_client(
     *,
     system_prompt: Optional[str] = None,
     timeout_seconds: Optional[float] = 20.0,
+    provenance: Optional[dict[str, Any]] = None,
+    max_requests: int | None = None,
 ) -> Optional[str]:
     """生成するが、通常の会話履歴へ入力・出力を保存しない。
 
@@ -87,19 +115,30 @@ async def generate_ephemeral_text_with_llm_client(
         return None
 
     effective_system_prompt = system_prompt or DEFAULT_EPHEMERAL_SYSTEM_PROMPT
+    budget = GenerationBudget(timeout_seconds, max_requests=max_requests)
+    token = current_generation_budget.set(budget)
+    status = "unsupported"
 
     async def _generate() -> Optional[str]:
+        nonlocal status
         for method_name in _EPHEMERAL_METHOD_NAMES:
             method = _get_explicit_method(llm_client, method_name)
             if method is None:
                 continue
             try:
-                return await _invoke_ephemeral_method(
+                budget.checkpoint()
+                value = await _invoke_ephemeral_method(
                     method,
                     prompt,
                     system_prompt=effective_system_prompt,
                 )
+                budget.checkpoint()
+                status = "completed" if value else "empty"
+                return value
+            except (TimeoutError, GenerationCancelled):
+                raise
             except Exception as exc:
+                status = "failed"
                 logger.warning(
                     "履歴非保存LLM呼び出しに失敗しました (%s): %s",
                     method_name,
@@ -116,11 +155,25 @@ async def generate_ephemeral_text_with_llm_client(
         if timeout_seconds is None:
             return await _generate()
         return await asyncio.wait_for(_generate(), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    except GenerationCancelled:
+        status = "cancelled"
     except asyncio.TimeoutError:
+        status = "timed_out"
         logger.warning(
             "履歴非保存LLM呼び出しが %.1f 秒でタイムアウトしました",
             timeout_seconds,
         )
     except Exception as exc:
+        status = "failed"
         logger.warning("履歴非保存LLM呼び出しに失敗しました: %s", exc)
+    finally:
+        # to_thread cannot be killed. Its copied context retains this event,
+        # permanently fencing late responses and every subsequent retry.
+        budget.cancelled.set()
+        if provenance is not None:
+            provenance.update(budget.provenance(status))
+        current_generation_budget.reset(token)
     return None

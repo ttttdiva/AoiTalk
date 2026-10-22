@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { ArrowLeft, Boxes, Loader2, Plus } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -75,8 +76,18 @@ export function AppsListPage() {
             ) : null}
             <CardHeader className="flex-row items-start justify-between gap-4 space-y-0 border-b border-border/70">
               <div>
-                <CardTitle className="flex items-center gap-2 text-base"><Plus className="size-4 text-primary" /> 新しいApp</CardTitle>
-                <p className="mt-0.5 text-xs text-muted-foreground">用途と使い方をまとめて管理するAppを作成します。</p>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Plus className="size-4 text-primary" />
+                  <span className="inline-flex items-center gap-1">
+                    新しいApp
+                    <HelpPopover label="新しいApp">
+                      <p>用途と使い方をまとめて管理するAppを作成します。</p>
+                      {originProjectId ? (
+                        <p>作成後はAppの詳細画面でTarget、ファイル、README、実行履歴を設定できます。Projectには必要なときだけ関連付けます。</p>
+                      ) : null}
+                    </HelpPopover>
+                  </span>
+                </CardTitle>
               </div>
               <Link href={originProjectId ? `/apps?project_id=${encodeURIComponent(originProjectId)}` : "/apps"} className={buttonVariants({ variant: "ghost", size: "sm" })}><ArrowLeft className="size-3.5" /> 戻る</Link>
             </CardHeader>
@@ -94,7 +105,6 @@ export function AppsListPage() {
                   <Label htmlFor="app-description">用途</Label>
                   <Textarea id="app-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="何を自動化するAppか" rows={4} />
                 </div>
-                {originProjectId && <p className="text-xs text-muted-foreground md:col-span-2">作成後はAppの詳細画面でTarget、ファイル、README、実行履歴を設定できます。Projectには必要なときだけ関連付けます。</p>}
                 <div className="flex justify-end gap-2 md:col-span-2">
                   <Button type="button" variant="ghost" onClick={() => router.replace(originProjectId ? `/apps?project_id=${encodeURIComponent(originProjectId)}` : "/apps")}>キャンセル</Button>
                   <Button type="submit" disabled={creating || !name.trim()}>{creating && <Loader2 className="size-3.5 animate-spin" />} Appを作成</Button>

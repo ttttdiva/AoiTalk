@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath, withoutBasePath } from "@/lib/base-path";
+
 export const CHAT_SESSION_NAVIGATION_EVENT = "aoitalk:chat-session-navigation";
 
 export function readChatSessionIdFromLocation() {
@@ -13,12 +15,13 @@ export function navigateChatSessionInPlace(href: string) {
   const target = new URL(href, window.location.origin);
   if (
     target.origin !== window.location.origin ||
-    target.pathname !== "/chat" ||
-    window.location.pathname !== "/chat"
+    withoutBasePath(target.pathname) !== "/chat" ||
+    window.location.pathname !== withBasePath("/chat")
   ) {
     return false;
   }
 
+  target.pathname = withBasePath(target.pathname);
   const nextHref = `${target.pathname}${target.search}${target.hash}`;
   const currentHref = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (currentHref === nextHref) return true;

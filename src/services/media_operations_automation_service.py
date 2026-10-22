@@ -5,7 +5,7 @@ Research evidence is written through the existing MediaOps Research domain.
 """
 from __future__ import annotations
 
-import asyncio, hashlib, html, json, os, re, socket
+import asyncio, hashlib, html, json, re, socket
 import ipaddress
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -15,15 +15,17 @@ from urllib.parse import urljoin, urlsplit
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update, and_, or_, not_, func
 from sqlalchemy.exc import IntegrityError
 
 from ..memory.models import AutomationProgram, AutomationProgramRevision, AutomationRun, GenerationWorkspace
+from .generation_studio_auth import GenerationStudioUnavailableError, generation_studio_token_provider
 from .media_execution_adapters import MediaResearchExecutionAdapter
 from .media_operations_generation_service import GenerationStudioAdapter, HttpGenerationStudioAdapter, StudioScope, UnavailableGenerationStudioAdapter
 from .media_operations_research_service import MediaOperationsResearchService
+from .media_generation_budget import reserve_generation_cost, observe_generation_cost, validate_generation_work
 from .media_operations_service import (
-    MediaOperationsConflictError, MediaOperationsNotFoundError, MediaOperationsService,
+    MediaOperationsConflictError, MediaOperationsError, MediaOperationsNotFoundError, MediaOperationsService,
     MediaOperationsValidationError, _as_uuid, _idempotency_key, _optional_text,
     _required_text, sha256_json,
 )
@@ -58,6 +60,34 @@ def _safe_json(value: Any, label: str, depth: int=0) -> Any:
     raise MediaOperationsValidationError(f"{label} must be JSON compatible")
 
 
+_GENERATION_TERMINAL_RECEIPTS = ("succeeded", "complete", "completed", "success", "failed", "cancelled", "quarantined")
+
+
+def _generation_capacity_limit(planning: Mapping[str, Any]) -> int:
+    value = planning.get("max_active_generations", 1)
+    if type(value) is not int or not 0 <= value <= 16:
+        raise MediaOperationsValidationError("planning_policy.max_active_generations must be an integer between 0 and 16")
+    return value
+
+
+def _generation_terminal_ledger(snapshot: Mapping[str, Any] | None, external_run_id: str | None, status: str) -> dict[str, Any]:
+    snapshot=dict(snapshot or {})
+    ledger=dict(snapshot.get("generation_submission") or {})
+    ledger.pop("terminal_status",None)
+    ledger.pop("terminal_run_id",None)
+    if status in _GENERATION_TERMINAL_RECEIPTS and str(external_run_id or "").startswith("run_"):
+        ledger.update(terminal_status=status, terminal_run_id=external_run_id)
+    snapshot["generation_submission"]=ledger
+    return snapshot
+
+
+def _generation_retry_limit(planning: Mapping[str, Any]) -> int:
+    value = planning.get("max_generation_retries", 1)
+    if type(value) is not int or not 0 <= value <= 10:
+        raise MediaOperationsValidationError("planning_policy.max_generation_retries must be an integer between 0 and 10")
+    return value
+
+
 def _normalize_revision(*,execution_mode:Any,trigger:Any,discovery:Any,research_binding:Any,planning_policy:Any,generation_action:Any,fallback:Any)->dict[str,Any]:
     mode=str(execution_mode or "draft").strip().lower()
     if mode not in _EXECUTION_MODES: raise MediaOperationsValidationError("execution_mode is not supported")
@@ -79,6 +109,9 @@ def _normalize_revision(*,execution_mode:Any,trigger:Any,discovery:Any,research_
     except (TypeError,ValueError) as exc: raise MediaOperationsValidationError("planning_policy.candidate_count must be an integer") from exc
     if not 1<=count<=12: raise MediaOperationsValidationError("planning_policy.candidate_count must be between 1 and 12")
     planning_v["candidate_count"]=count
+    # Validate without adding a default to old recipe hashes/idempotency identities.
+    _generation_retry_limit(planning_v)
+    _generation_capacity_limit(planning_v)
     if mode in {"review_before_generate","auto_generate"}:
         kind=str(generation_v.get("kind") or "image").strip().lower(); generation_v["kind"]=kind
         _as_uuid(generation_v.get("studio_workspace_binding_id"),"studio_workspace_binding_id")
@@ -260,7 +293,7 @@ class MediaOperationsAutomationService(MediaOperationsService):
     def __init__(self,session:Any|None=None,*,adapter:GenerationStudioAdapter|None=None,planner:AutomationPlanner|None=None,search_client:Any|None=None,config:Any=None,fetcher:SafeAutomationFetcher|None=None)->None:
         super().__init__(session=session)
         if adapter is not None: self.adapter=adapter
-        elif os.getenv("AOITALK_GENERATION_STUDIO_BEARER_TOKEN") or os.getenv("GENERATION_STUDIO_BEARER_TOKEN"): self.adapter=HttpGenerationStudioAdapter()
+        elif generation_studio_token_provider().configured: self.adapter=HttpGenerationStudioAdapter()
         else: self.adapter=UnavailableGenerationStudioAdapter()
         self.research=MediaOperationsResearchService(session=session)
         self.research_executor=MediaResearchExecutionAdapter(service=self.research,search_client=search_client,config=config)
@@ -268,7 +301,7 @@ class MediaOperationsAutomationService(MediaOperationsService):
 
     async def _get(self,session:Any,model:Any,entity_id:UUID|str,label:str,*,for_update:bool=False)->Any:
         parsed=_as_uuid(entity_id,label); statement=select(model).where(model.id==parsed).limit(1)
-        if for_update: statement=statement.with_for_update()
+        if for_update: statement=statement.with_for_update().execution_options(populate_existing=True)
         row=await self._scalar(session,statement)
         if row is None: raise MediaOperationsNotFoundError(f"{label} not found")
         return row
@@ -345,8 +378,19 @@ class MediaOperationsAutomationService(MediaOperationsService):
         if actor is None: raise MediaOperationsValidationError("actor is required")
         workspace=await self._get(session,GenerationWorkspace,workspace_id,"workspace_id"); await self._assert_entity_access(session,actor,workspace,permission="read")
         if workspace.status not in {"configured","verified"}: return []
-        raw=await self.adapter.get_preset_catalog(StudioScope(workspace.external_workspace_id,workspace.external_project_id,workspace.base_url)); items=raw.get("items") if isinstance(raw,Mapping) else None
-        if not isinstance(items,Sequence) or isinstance(items,(str,bytes)): return []
+        # Only a verified 73 answer may become a list; anything else is an
+        # explicit error so an auth failure never looks like "no Presets".
+        try: raw=await self.adapter.get_preset_catalog(StudioScope(workspace.external_workspace_id,workspace.external_project_id,workspace.base_url))
+        except RuntimeError as exc:
+            if isinstance(exc,MediaOperationsError) or not str(exc).startswith("generation_studio_"): raise
+            raise GenerationStudioUnavailableError("studio_unavailable") from None
+        if not isinstance(raw,Mapping) or raw.get("status") in {"unavailable","failed"}:
+            reason=raw.get("reason_code") if isinstance(raw,Mapping) else None
+            if reason=="studio_auth_failed": raise GenerationStudioUnavailableError("studio_auth_failed")
+            if reason in {"adapter_token_missing","adapter_unavailable","studio_unconfigured"}: raise GenerationStudioUnavailableError("studio_unconfigured")
+            raise GenerationStudioUnavailableError("studio_unavailable")
+        items=raw.get("items")
+        if not isinstance(items,Sequence) or isinstance(items,(str,bytes)): raise GenerationStudioUnavailableError("studio_unavailable")
         allowed={"preset_id","name","description","current_revision_id","current_revision","checksum","model_family","updated_at"}; out=[]
         for item in items[:200]:
             if not isinstance(item,Mapping) or set(item)-allowed: continue
@@ -390,7 +434,7 @@ class MediaOperationsAutomationService(MediaOperationsService):
         binding=dict(revision.research_binding_json or {}); routine_id=binding.get("research_routine_id"); routine_version=binding.get("routine_version")
         observation=run.observation_json or {}
         if not routine_id or routine_version in (None,""):
-            brief={"key_facts":[observation.get("description") or observation.get("title")],"semantic_ideas":[observation.get("title")],"visual_ideas":[observation.get("description") or observation.get("title")],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":[],"source_refs":[observation.get("source_url")] if observation.get("source_url") else []}
+            brief={"key_facts":[],"unverified_signals":[observation.get("description") or observation.get("title")],"research_status":"not_executed","semantic_ideas":[observation.get("title")],"visual_ideas":[observation.get("description") or observation.get("title")],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":[],"source_refs":[observation.get("source_url")] if observation.get("source_url") else []}
             return None,brief
         routine=await self.research.get_research_routine(session,actor,routine_id); revisions=routine.get("revisions") or []; pinned=next((x for x in revisions if int(x.get("version") or 0)==int(routine_version)),None)
         if pinned is None: raise MediaOperationsConflictError("research routine revision is unavailable")
@@ -400,16 +444,17 @@ class MediaOperationsAutomationService(MediaOperationsService):
         if theme:
             queries=list(request.get("queries") or []); request["queries"]=[f"{theme} {q}"[:500] for q in queries] if queries else [theme]
         sources=await self.research_executor._invoke_search(request,actor)
-        for index,source in enumerate(sources[:20]):
+        for index,source in enumerate(sources[:500]):
             projection=self.research_executor._source_projection(source)
             if not projection or not projection["evidence"]: continue
-            try: await self.research.append_research_finding(session,actor,research_run_id,kind="fact",statement=projection["summary"],evidence=projection["evidence"],idempotency_key=f"automation:{run.execution_key}:finding:{index}")
+            source_key=hashlib.sha256((projection.get("source_url") or projection["title"]).encode()).hexdigest()
+            try: await self.research.append_research_finding(session,actor,research_run_id,kind="signal",statement=projection["summary"],evidence=projection["evidence"],idempotency_key=f"automation:{run.execution_key}:finding:{source_key}")
             except MediaOperationsConflictError: pass
-            try: await self.research.create_research_candidate(session,actor,research_run_id=research_run_id,candidate_key=hashlib.sha256((projection.get("source_url") or projection["title"]).encode()).hexdigest(),title=projection["title"],summary=projection["summary"],source_url=projection.get("source_url"),source_published_at=projection.get("source_published_at"),evidence=projection["evidence"],reason="Automation research discovery",idempotency_key=f"automation:{run.execution_key}:candidate:{index}")
+            try: await self.research.create_research_candidate(session,actor,research_run_id=research_run_id,candidate_key=hashlib.sha256((projection.get("source_url") or projection["title"]).encode()).hexdigest(),title=projection["title"],summary=projection["summary"],source_url=projection.get("source_url"),source_published_at=projection.get("source_published_at"),evidence=projection["evidence"],reason="Automation research discovery",idempotency_key=f"automation:{run.execution_key}:candidate:{source_key}")
             except MediaOperationsConflictError: pass
-        findings=await self.research.list_research_findings(session,actor,research_run_id,limit=100); refs=[]; facts=[]; notes=[]; allow=binding.get("allow_domains") or []; deny=binding.get("deny_domains") or []
+        findings=await self.research.list_research_findings(session,actor,research_run_id,limit=100); refs=[]; facts=[]; signals=[]; notes=[]; allow=binding.get("allow_domains") or []; deny=binding.get("deny_domains") or []
         for finding in findings[:50]:
-            facts.append(str(finding.get("statement") or "")[:2000])
+            (facts if finding.get("kind") == "fact" else signals).append(str(finding.get("statement") or "")[:2000])
             for evidence in finding.get("evidence") or []:
                 provenance=evidence.get("provenance") if isinstance(evidence,Mapping) else None
                 url=(evidence.get("source_url") if isinstance(evidence,Mapping) else None) or (provenance.get("url") if isinstance(provenance,Mapping) else None)
@@ -419,7 +464,7 @@ class MediaOperationsAutomationService(MediaOperationsService):
                 try:
                     page=await self.fetcher.fetch(url,allow_domains=allow,deny_domains=deny); notes.append({"url":page["url"],"content_type":page["content_type"],"text":page["text"][:4000]})
                 except Exception: continue
-        brief={"key_facts":facts[:30],"semantic_ideas":facts[:12],"visual_ideas":[x.get("text","")[:1000] for x in notes[:8]] or facts[:8],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":facts[:10],"source_refs":refs[:50],"source_notes":notes[:8],"theme":observation.get("title")}
+        brief={"key_facts":facts[:30],"unverified_signals":signals[:30],"research_status":"partial" if (getattr(sources,"failed_queries",0) + getattr(sources,"failed_providers",0)) else ("sources_only" if findings else "empty"),"completed_queries":getattr(sources,"completed_queries",None),"failed_queries":getattr(sources,"failed_queries",0),"failed_providers":getattr(sources,"failed_providers",0),"scope_mode":"public_search_query_approximation","semantic_ideas":(facts+signals)[:12],"visual_ideas":[x.get("text","")[:1000] for x in notes[:8]] or (facts+signals)[:8],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":(facts+signals)[:10],"source_refs":refs[:50],"source_notes":notes[:8],"theme":observation.get("title")}
         return research_run_id,brief
 
     async def _novelty_snapshot(self,session:Any,program:AutomationProgram,policy:str)->dict[str,Any]:
@@ -464,20 +509,35 @@ class MediaOperationsAutomationService(MediaOperationsService):
             result.append({**program.to_safe_dict(),"current_revision":revision.to_safe_dict(),"trigger_key":trigger_key,"next_due_at":now.isoformat()})
         return result
 
-    async def trigger_program(self,session:Any|None=None,actor:Any|None=None,program_id:UUID|str|None=None,*,trigger_key:Any,trigger_kind:str="manual",execute:bool=True)->dict[str,Any]:
+    async def trigger_program(self,session:Any|None=None,actor:Any|None=None,program_id:UUID|str|None=None,*,trigger_key:Any,trigger_kind:str="manual",execute:bool=True,origin_work_item_id:Any=None)->dict[str,Any]:
         session=self._resolve_session(session)
         if actor is None or program_id is None: raise MediaOperationsValidationError("actor and program_id are required")
         program=await self._get(session,AutomationProgram,program_id,"program_id"); actor_id=await self._assert_entity_access(session,actor,program,permission="write")
         if not program.enabled and trigger_kind!="manual": raise MediaOperationsConflictError("Automation Program is disabled")
         revision=await self._latest_revision(session,program.id)
         if revision is None: raise MediaOperationsConflictError("Automation Program revision history is incomplete")
+        if origin_work_item_id is not None:
+            await validate_generation_work(session,origin_work_item_id,source_type="media.automation.program",source_id=program.id,source_revision=revision.id,project_id=program.project_id)
         trigger_value=_required_text(trigger_key,"trigger_key",255); execution_key=sha256_json({"program_id":str(program.id),"revision_id":str(revision.id),"trigger_key":trigger_value}); existing=await self._scalar(session,select(AutomationRun).where(AutomationRun.execution_key==execution_key).limit(1))
-        if existing is not None: await self._assert_entity_access(session,actor,existing,permission="read"); return existing.to_safe_dict()
+        if existing is not None:
+            await self._assert_entity_access(session,actor,existing,permission="read")
+            if origin_work_item_id is not None and str(origin_work_item_id)!=(existing.novelty_snapshot_json or {}).get("origin_work_item_id"):
+                raise MediaOperationsValidationError("generation_budget_slot_binding_changed")
+            # Resume only an unsent capacity wait. Durable/uncertain intents are
+            # never replayed merely because the Kernel polls the same work.
+            if execute and existing.state=="scheduled" and existing.error_code=="generation_capacity_full" and not existing.generation_request_hash:
+                return await self.execute_run(session,actor,existing.id)
+            return existing.to_safe_dict()
         run=AutomationRun(id=uuid4(),program_id=program.id,program_revision_id=revision.id,owner_user_id=program.owner_user_id,project_id=program.project_id,execution_key=execution_key,trigger_kind=str(trigger_kind or "manual")[:32],state="scheduled",correlation_id=f"aoi-auto-{execution_key[:24]}",created_by=actor_id); session.add(run)
+        if origin_work_item_id is not None:
+            run.novelty_snapshot_json={"origin_work_item_id":str(origin_work_item_id)}
         try: await self._flush_commit(session)
         except IntegrityError:
             await self._rollback(session); recovered=await self._scalar(session,select(AutomationRun).where(AutomationRun.execution_key==execution_key).limit(1))
-            if recovered is not None: return recovered.to_safe_dict()
+            if recovered is not None:
+                if origin_work_item_id is not None and str(origin_work_item_id)!=(recovered.novelty_snapshot_json or {}).get("origin_work_item_id"):
+                    raise MediaOperationsValidationError("generation_budget_slot_binding_changed")
+                return recovered.to_safe_dict()
             raise
         return await self.execute_run(session,actor,run.id) if execute else run.to_safe_dict()
 
@@ -485,7 +545,7 @@ class MediaOperationsAutomationService(MediaOperationsService):
         session=self._resolve_session(session)
         if actor is None or run_id is None: raise MediaOperationsValidationError("actor and run_id are required")
         run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
-        if run.state in _TERMINAL or run.state in {"waiting_review","generation_running","uncertain"}: return run.to_safe_dict()
+        if run.state in _TERMINAL or run.state in {"waiting_review","generation_submitting","generation_running","uncertain"}: return run.to_safe_dict()
         program=await self._get(session,AutomationProgram,run.program_id,"program_id"); revision=await self._get(session,AutomationProgramRevision,run.program_revision_id,"program_revision_id")
         try:
             if not run.observation_json:
@@ -509,11 +569,14 @@ class MediaOperationsAutomationService(MediaOperationsService):
                     if str(fallback.get("research_policy") or "").lower() not in {"observation_only","theme_only"}:
                         raise
                     observation=run.observation_json or {}
-                    research_id=None; brief={"key_facts":[observation.get("description") or observation.get("title")],"semantic_ideas":[observation.get("title")],"visual_ideas":[observation.get("description") or observation.get("title")],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":[],"source_refs":[observation.get("source_url")] if observation.get("source_url") else [],"fallback_used":"observation_only"}
+                    research_id=None; brief={"key_facts":[],"unverified_signals":[observation.get("description") or observation.get("title")],"research_status":"not_executed","semantic_ideas":[observation.get("title")],"visual_ideas":[observation.get("description") or observation.get("title")],"materials":[],"colors":[],"cultural_historical_context":[],"current_trending_context":[],"source_refs":[observation.get("source_url")] if observation.get("source_url") else [],"fallback_used":"observation_only"}
                 run.research_run_id=_as_uuid(research_id,"research_run_id",required=False) if research_id else None; run.state="brief"; run.research_brief_json=_safe_json(brief,"research_brief"); await self._flush_commit(session)
             if revision.execution_mode=="research_only": run.state="complete"; run.completed_at=datetime.utcnow(); await self._flush_commit(session); return run.to_safe_dict()
             if not run.candidates_json:
-                run.state="concept_planning"; await self._flush_commit(session); planning=revision.planning_policy_json or {}; policy=str(planning.get("novelty_policy") or "balanced"); snapshot=await self._novelty_snapshot(session,program,policy); run.novelty_snapshot_json=snapshot; run.state="prompt_planning"; await self._flush_commit(session)
+                run.state="concept_planning"; await self._flush_commit(session); planning=revision.planning_policy_json or {}; policy=str(planning.get("novelty_policy") or "balanced"); snapshot=await self._novelty_snapshot(session,program,policy)
+                if (run.novelty_snapshot_json or {}).get("origin_work_item_id"):
+                    snapshot["origin_work_item_id"]=run.novelty_snapshot_json["origin_work_item_id"]
+                run.novelty_snapshot_json=snapshot; run.state="prompt_planning"; await self._flush_commit(session)
                 action=revision.generation_action_json or {}; values=await self.planner.plan(observation=run.observation_json or {},research_brief=run.research_brief_json or {},novelty_snapshot=snapshot,planning_policy=planning,action_kind=str(action.get("kind") or "image")); candidates=[]
                 for index,value in enumerate(values[:int(planning.get("candidate_count") or 3)]):
                     payload=_safe_json(dict(value),f"candidate[{index}]"); cid="cand_"+sha256_json({"run":str(run.id),"index":index,"payload":payload})[:24]; candidates.append({"candidate_id":cid,"status":"draft","payload":payload})
@@ -535,14 +598,24 @@ class MediaOperationsAutomationService(MediaOperationsService):
 
     async def edit_candidate(self,session:Any|None=None,actor:Any|None=None,run_id:UUID|str|None=None,*,candidate_id:str,payload:Mapping[str,Any])->dict[str,Any]:
         session=self._resolve_session(session); run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
-        if run.state not in {"waiting_review","complete"}: raise MediaOperationsConflictError("candidate can be edited only before generation")
+        if run.state not in {"waiting_review","complete"} or run.generation_request_hash: raise MediaOperationsConflictError("candidate can be edited only before generation")
         values=[]; found=False
         for candidate in run.candidates_json or []:
             item=dict(candidate)
             if item.get("candidate_id")==candidate_id: item["payload"]=_safe_json(dict(payload),"candidate.payload"); item["status"]="edited"; found=True
             values.append(item)
         if not found: raise MediaOperationsNotFoundError("candidate_id not found")
-        run.candidates_json=values; await self._flush_commit(session); return run.to_safe_dict()
+        changed=await session.execute(update(AutomationRun).where(
+            AutomationRun.id==run.id, AutomationRun.state==run.state,
+            AutomationRun.updated_at==run.updated_at, AutomationRun.generation_request_hash.is_(None),
+        ).values(candidates_json=values).execution_options(synchronize_session=False))
+        run_id=run.id
+        if changed.rowcount!=1:
+            await self._rollback(session)
+            return (await self._get(session,AutomationRun,run_id,"run_id",for_update=True)).to_safe_dict()
+        await self._flush_commit(session)
+        await session.refresh(run)
+        return run.to_safe_dict()
 
     async def regenerate_candidates(self,session:Any|None=None,actor:Any|None=None,run_id:UUID|str|None=None,*,idempotency_key:Any)->dict[str,Any]:
         session=self._resolve_session(session); run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
@@ -553,19 +626,60 @@ class MediaOperationsAutomationService(MediaOperationsService):
         revision=await self._get(session,AutomationProgramRevision,run.program_revision_id,"program_revision_id"); program=await self._get(session,AutomationProgram,run.program_id,"program_id")
         previous=[item.get("payload") for item in run.candidates_json or [] if isinstance(item,Mapping) and isinstance(item.get("payload"),Mapping)]
         planning=revision.planning_policy_json or {}; policy=str(planning.get("novelty_policy") or "balanced"); snapshot=await self._novelty_snapshot(session,program,policy)
+        if ledger.get("origin_work_item_id"):
+            snapshot["origin_work_item_id"]=ledger["origin_work_item_id"]
         snapshot["regeneration_avoid"]=[{k:v for k,v in item.items() if k in {"concept","outfit","pose","composition","environment","palette","prompt"}} for item in previous[:12]]
         values=await self.planner.plan(observation=run.observation_json or {},research_brief=run.research_brief_json or {},novelty_snapshot=snapshot,planning_policy=planning,action_kind=str((revision.generation_action_json or {}).get("kind") or "image")); candidates=[]
         for index,value in enumerate(values[:int(planning.get("candidate_count") or 3)]):
             payload=_safe_json(dict(value),f"candidate[{index}]"); cid="cand_"+sha256_json({"run":str(run.id),"regeneration_key":key,"index":index,"payload":payload})[:24]; candidates.append({"candidate_id":cid,"status":"draft","payload":payload})
         if not candidates: raise RuntimeError("automation_planner_returned_no_candidates")
-        snapshot["regeneration_keys"]=(receipts+[key])[-20:]; run.novelty_snapshot_json=snapshot; run.candidates_json=candidates; await self._flush_commit(session); return run.to_safe_dict()
+        snapshot["regeneration_keys"]=(receipts+[key])[-20:]
+        changed=await session.execute(update(AutomationRun).where(
+            AutomationRun.id==run.id, AutomationRun.state=="waiting_review", AutomationRun.updated_at==run.updated_at,
+            AutomationRun.generation_request_hash.is_(None),
+        ).values(novelty_snapshot_json=snapshot,candidates_json=candidates).execution_options(synchronize_session=False))
+        run_id=run.id
+        if changed.rowcount!=1:
+            await self._rollback(session)
+            return (await self._get(session,AutomationRun,run_id,"run_id",for_update=True)).to_safe_dict()
+        await self._flush_commit(session)
+        await session.refresh(run)
+        return run.to_safe_dict()
 
     async def approve_candidate(self,session:Any|None=None,actor:Any|None=None,run_id:UUID|str|None=None,*,candidate_id:str)->dict[str,Any]:
         session=self._resolve_session(session); run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
         if run.state!="waiting_review": raise MediaOperationsConflictError("Automation Run is not waiting for review")
         revision=await self._get(session,AutomationProgramRevision,run.program_revision_id,"program_revision_id"); return await self._submit_candidate(session,actor,run,revision,candidate_id)
 
+    async def _generation_capacity(self, session: Any, run: AutomationRun) -> int:
+        # Serialize program admission in the same transaction as the child intent.
+        # A no-op row update uses PostgreSQL row locking / SQLite's writer lock.
+        await session.execute(update(AutomationProgram).where(AutomationProgram.id==run.program_id).values(
+            updated_at=AutomationProgram.updated_at,
+        ).execution_options(synchronize_session=False))
+        ledger=AutomationRun.novelty_snapshot_json["generation_submission"]
+        linked_terminal=and_(
+            func.coalesce(ledger["terminal_status"].as_string(), "").in_(_GENERATION_TERMINAL_RECEIPTS),
+            func.coalesce(ledger["terminal_run_id"].as_string(), "")==AutomationRun.external_run_id,
+        )
+        confirmed_terminal=and_(
+            func.coalesce(AutomationRun.external_run_id, "").like("run\\_%", escape="\\"),
+            linked_terminal,
+        )
+        possible_submission=or_(
+            AutomationRun.generation_request_hash.is_not(None), AutomationRun.external_run_id.is_not(None),
+            AutomationRun.external_idempotency_key.is_not(None), AutomationRun.selected_candidate_id.is_not(None),
+            AutomationRun.state.in_(("generation_submitting","generation_running","uncertain")),
+        )
+        count=await self._scalar(session,select(func.count(AutomationRun.id)).where(
+            AutomationRun.program_id==run.program_id, AutomationRun.id!=run.id,
+            possible_submission, not_(confirmed_terminal),
+        ))
+        if count is None: raise MediaOperationsConflictError("generation capacity could not be established")
+        return int(count)
+
     async def _submit_candidate(self,session:Any,actor:Any,run:AutomationRun,revision:AutomationProgramRevision,candidate_id:str,*,generation_index:int=1,allow_uncertain_retry:bool=False)->dict[str,Any]:
+        run=await self._get(session,AutomationRun,run.id,"run_id",for_update=True)
         candidate=self._candidate(run,candidate_id); action=dict(revision.generation_action_json or {})
         if str(action.get("kind") or "image")!="image": raise MediaOperationsValidationError("this Generation Studio binding currently supports image execution only")
         workspace=await self._get(session,GenerationWorkspace,action["studio_workspace_binding_id"],"studio_workspace_binding_id"); await self._assert_entity_access(session,actor,workspace,permission="read")
@@ -576,9 +690,60 @@ class MediaOperationsAutomationService(MediaOperationsService):
         request={"preset":preset,"prompt_overlay":{"positive":prompt,"negative_additions":negative},"provenance":{"origin_system":"aoi_talk","automation_run_id":str(run.id),"candidate_id":candidate_id,"correlation_id":run.correlation_id},"idempotency_key":external_key}; request_hash=sha256_json(request)
         if run.generation_request_hash:
             if run.generation_request_hash!=request_hash: raise MediaOperationsConflictError("generation intent payload changed after durable submission intent")
-            if run.state=="uncertain" and not allow_uncertain_retry: return run.to_safe_dict()
-        else:
-            run.generation_request_json=_safe_json(request,"generation_request"); run.generation_request_hash=request_hash; run.external_idempotency_key=external_key; run.selected_candidate_id=candidate_id; run.state="generation_submitting"; await self._flush_commit(session)
+            if run.state!="uncertain" or not allow_uncertain_retry: return run.to_safe_dict()
+        snapshot=dict(run.novelty_snapshot_json or {})
+        ledger=snapshot.get("generation_submission")
+        prior_count=None
+        if ledger is not None:
+            if not isinstance(ledger,Mapping) or type(ledger.get("attempt_count")) is not int or ledger["attempt_count"]<1:
+                raise MediaOperationsConflictError("generation attempt history is invalid; reconcile required")
+            prior_count=ledger["attempt_count"]
+        elif run.generation_request_hash:
+            # Historical uncertain runs may already have been retried. Never guess zero.
+            raise MediaOperationsConflictError("generation attempt history is unknown; reconcile required")
+        retry_limit=_generation_retry_limit(revision.planning_policy_json or {})
+        attempts=prior_count or 0
+        if attempts>=1+retry_limit:
+            raise MediaOperationsConflictError("generation retry limit reached; durable intent preserved")
+        if not run.generation_request_hash:
+            capacity_limit=_generation_capacity_limit(revision.planning_policy_json or {})
+            occupied=await self._generation_capacity(session,run)
+            snapshot["generation_capacity"]={"max_active_generations":capacity_limit,"unresolved_at_check":occupied,"blocked":occupied>=capacity_limit}
+            if occupied>=capacity_limit:
+                run_id=run.id
+                changed=await session.execute(update(AutomationRun).where(
+                    AutomationRun.id==run_id, AutomationRun.updated_at==run.updated_at,
+                    AutomationRun.generation_request_hash.is_(None),
+                ).values(novelty_snapshot_json=snapshot,
+                    state="waiting_review" if run.state=="waiting_review" else "scheduled",
+                    error_code="generation_capacity_full",
+                    error_message="生成枠の上限です。処理中・結果不明の生成を照合してから再開してください。",
+                ).execution_options(synchronize_session=False))
+                if changed.rowcount!=1:
+                    await self._rollback(session)
+                    return (await self._get(session,AutomationRun,run_id,"run_id",for_update=True)).to_safe_dict()
+                await self._flush_commit(session)
+                await session.refresh(run)
+                return run.to_safe_dict()
+        cost_root=await reserve_generation_cost(session,work_item_id=snapshot.get("origin_work_item_id"),source_type="media.automation.program",source_id=run.program_id,source_revision=revision.id,project_id=run.project_id,slot=f"automation:{run.id}:image:{generation_index}",request_hash=request_hash,external_key=external_key,cost_policy=action.get("cost_policy") or {})
+        snapshot["generation_submission"]={"attempt_count":attempts+1,"max_generation_retries":retry_limit}
+        count_column=AutomationRun.novelty_snapshot_json["generation_submission"]["attempt_count"].as_integer()
+        count_matches=count_column.is_(None) if prior_count is None else count_column==prior_count
+        # Compare-and-swap also protects databases where SELECT FOR UPDATE is ignored.
+        claim=await session.execute(update(AutomationRun).where(
+            AutomationRun.id==run.id, AutomationRun.state==run.state, AutomationRun.updated_at==run.updated_at, count_matches,
+        ).values(
+            novelty_snapshot_json=snapshot, generation_request_json=_safe_json(request,"generation_request"),
+            generation_request_hash=request_hash, external_idempotency_key=external_key,
+            selected_candidate_id=candidate_id, state="generation_submitting", error_code=None, error_message=None,
+        ).execution_options(synchronize_session=False))
+        if claim.rowcount!=1:
+            run_id=run.id
+            await self._rollback(session)
+            current=await self._get(session,AutomationRun,run_id,"run_id",for_update=True)
+            return current.to_safe_dict()
+        await self._flush_commit(session)
+        await session.refresh(run)
         scope=StudioScope(workspace.external_workspace_id,workspace.external_project_id,workspace.base_url)
         try: receipt=await self.adapter.submit_preset_image(scope,request)
         except Exception:
@@ -590,8 +755,11 @@ class MediaOperationsAutomationService(MediaOperationsService):
         try: run.preset_revision_number=int(receipt.get("revision_number"))
         except (TypeError,ValueError): run.preset_revision_number=None
         checksum=str(receipt.get("checksum") or ""); run.preset_checksum=checksum if re.fullmatch(r"[0-9a-f]{64}",checksum) else None; run.result_deep_link=_optional_text(receipt.get("result_deep_link"),"result_deep_link",2000)
+        run.novelty_snapshot_json=_generation_terminal_ledger(run.novelty_snapshot_json,run.external_run_id,status)
+        if cost_root is not None:
+            await observe_generation_cost(session,slot=f"automation:{run.id}:image:{generation_index}",request_hash=request_hash,external_key=external_key,external_run_id=external_run_id,status=status,root_id=cost_root)
         if status in {"succeeded","complete","completed","success"}: run.state="complete"; run.completed_at=datetime.utcnow()
-        elif status in {"failed","cancelled","unavailable"}: run.state="failed"; run.completed_at=datetime.utcnow(); run.error_code=str(receipt.get("reason_code") or receipt.get("error_code") or "generation_failed")[:128]
+        elif status in {"failed","cancelled","quarantined","unavailable"}: run.state="failed"; run.completed_at=datetime.utcnow(); run.error_code=str(receipt.get("reason_code") or receipt.get("error_code") or "generation_failed")[:128]
         else: run.state="generation_running"
         await self._flush_commit(session); return run.to_safe_dict()
 
@@ -599,29 +767,47 @@ class MediaOperationsAutomationService(MediaOperationsService):
         session=self._resolve_session(session); run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
         if run.state!="uncertain": raise MediaOperationsConflictError("Automation Run is not uncertain")
         revision=await self._get(session,AutomationProgramRevision,run.program_revision_id,"program_revision_id")
-        if not run.selected_candidate_id: raise MediaOperationsConflictError("uncertain run has no durable candidate intent")
+        if not run.selected_candidate_id or not run.generation_request_hash or not run.external_idempotency_key: raise MediaOperationsConflictError("uncertain run has no durable candidate intent")
         return await self._submit_candidate(session,actor,run,revision,run.selected_candidate_id,allow_uncertain_retry=True)
 
     async def reconcile_run(self,session:Any|None=None,actor:Any|None=None,run_id:UUID|str|None=None)->dict[str,Any]:
         session=self._resolve_session(session); run=await self._get(session,AutomationRun,run_id,"run_id",for_update=True); await self._assert_entity_access(session,actor,run,permission="write")
         if not run.external_run_id: return run.to_safe_dict()
+        observed_updated_at=run.updated_at; external_run_id=run.external_run_id
         revision=await self._get(session,AutomationProgramRevision,run.program_revision_id,"program_revision_id"); action=revision.generation_action_json or {}; workspace=await self._get(session,GenerationWorkspace,action["studio_workspace_binding_id"],"studio_workspace_binding_id"); scope=StudioScope(workspace.external_workspace_id,workspace.external_project_id,workspace.base_url)
-        try: receipt=await self.adapter.get_preset_run(scope,run.external_run_id)
+        try: receipt=await self.adapter.get_preset_run(scope,external_run_id)
         except Exception: return run.to_safe_dict()
+        if not isinstance(receipt,Mapping) or receipt.get("run_id")!=external_run_id:
+            return run.to_safe_dict()
         status=str(receipt.get("status") or "uncertain").lower()
-        if status in {"succeeded","complete","completed","success"}: run.state="complete"; run.completed_at=datetime.utcnow()
-        elif status in {"failed","cancelled","quarantined","unavailable"}: run.state="failed"; run.completed_at=datetime.utcnow(); run.error_code=str(receipt.get("error_code") or "generation_failed")[:128]
-        else: run.state="generation_running"
+        values={"novelty_snapshot_json":_generation_terminal_ledger(run.novelty_snapshot_json,external_run_id,status)}
+        if status in {"succeeded","complete","completed","success"}:
+            values.update(state="complete",completed_at=datetime.utcnow(),error_code=None,error_message=None)
+        elif status in {"failed","cancelled","quarantined","unavailable"}:
+            values.update(state="failed",completed_at=datetime.utcnow(),error_code=str(receipt.get("error_code") or "generation_failed")[:128])
+        else: values.update(state="generation_running",completed_at=None)
         link=receipt.get("result_deep_link")
-        if isinstance(link,str) and len(link)<=2000: run.result_deep_link=link
-        run.generation_result_json=_safe_json({
-            "status": status,
-            "output_asset_ids": list(receipt.get("output_asset_ids") or [])[:20],
-            "output_version_ids": list(receipt.get("output_version_ids") or [])[:20],
-            "outputs": list(receipt.get("outputs") or [])[:20],
-            "result_deep_link": run.result_deep_link,
+        result_link=link if isinstance(link,str) and len(link)<=2000 else run.result_deep_link
+        values["result_deep_link"]=result_link
+        values["generation_result_json"]=_safe_json({
+            "status":status,"run_id":external_run_id,
+            "output_asset_ids":list(receipt.get("output_asset_ids") or [])[:20],
+            "output_version_ids":list(receipt.get("output_version_ids") or [])[:20],
+            "outputs":list(receipt.get("outputs") or [])[:20],"result_deep_link":result_link,
         },"generation_result")
-        await self._flush_commit(session); return run.to_safe_dict()
+        saved_id=run.id
+        changed=await session.execute(update(AutomationRun).where(
+            AutomationRun.id==saved_id,AutomationRun.updated_at==observed_updated_at,
+            AutomationRun.external_run_id==external_run_id,
+        ).values(**values).execution_options(synchronize_session=False))
+        if changed.rowcount!=1:
+            await self._rollback(session)
+            return (await self._get(session,AutomationRun,saved_id,"run_id",for_update=True)).to_safe_dict()
+        if (run.novelty_snapshot_json or {}).get("origin_work_item_id"):
+            await observe_generation_cost(session,slot=f"automation:{run.id}:image:1",request_hash=run.generation_request_hash,external_key=run.external_idempotency_key,external_run_id=external_run_id,status=status)
+        await self._flush_commit(session)
+        await session.refresh(run)
+        return run.to_safe_dict()
 
     async def list_runs(self,session:Any|None=None,actor:Any|None=None,*,program_id:UUID|str|None=None,project_id:UUID|str|None=None,limit:int=100)->list[dict[str,Any]]:
         session=self._resolve_session(session)

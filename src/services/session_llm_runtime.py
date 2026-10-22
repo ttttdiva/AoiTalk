@@ -212,7 +212,7 @@ def _client_route_effort(client: Any) -> str:
         return ""
     if (
         provider == "openai_compatible_local"
-        and managed_local_runtime_for_model(config, model) == "freetoken"
+        and managed_local_runtime_for_model(config, model) in {"freetoken", "strata"}
     ):
         return ""
     key_by_provider = {
@@ -308,7 +308,7 @@ def _overlay_session_llama_cpp_mtp_runtime(turn_client: Any, model: str) -> None
     local["model"] = target_model
     setter = getattr(config, "set", None)
 
-    if managed_runtime == "freetoken":
+    if managed_runtime in {"freetoken", "strata"}:
         local["llama_cpp"] = {}
         if callable(setter):
             setter("openai_compatible_local", local)
@@ -381,8 +381,13 @@ def _session_managed_local_model_already_ready(
     """
 
     selected_model = str(model or "").strip()
-    if not selected_model or managed_runtime not in {"llama_cpp", "freetoken"}:
+    if not selected_model or managed_runtime not in {"llama_cpp", "freetoken", "strata"}:
         return False
+
+    if managed_runtime == "strata":
+        from .strata_runtime import strata_readiness
+
+        return bool(strata_readiness(config, model=selected_model)["ready"])
 
     try:
         # Import through the service-manager facade so its hot-core probes
@@ -450,7 +455,22 @@ def ensure_session_turn_local_server(turn_client: Any) -> None:
         config,
         selected_model,
     )
+
+    def _retain_consumer_lease() -> None:
+        retain = getattr(
+            turn_client,
+            "_acquire_managed_local_runtime_consumer_lease",
+            None,
+        )
+        if callable(retain):
+            retain()
+
     from src.service_manager import ensure_openai_compatible_local_server
+
+    if managed_runtime == "strata":
+        ensure_openai_compatible_local_server(config, model=selected_model, raise_on_launch_error=True)
+        _retain_consumer_lease()
+        return
 
     if managed_runtime == "freetoken":
         from src.service_manager import (
@@ -487,6 +507,7 @@ def ensure_session_turn_local_server(turn_client: Any) -> None:
         model=selected_model,
         managed_runtime=managed_runtime,
     ):
+        _retain_consumer_lease()
         return
 
     ensure_openai_compatible_local_server(
@@ -495,6 +516,7 @@ def ensure_session_turn_local_server(turn_client: Any) -> None:
         raise_on_launch_error=True,
         force_restart=False,
     )
+    _retain_consumer_lease()
 
 
 def build_session_turn_client(source_client: Any, config: Any) -> Any:
@@ -546,22 +568,43 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
         if hasattr(source_client, attr):
             setattr(turn_client, attr, getattr(source_client, attr))
     source_history = getattr(source_client, "history_manager", None)
-    if source_history is not None:
-        # Production provider clients all use HistoryManager-compatible
-        # objects. Lightweight embeddings/tests may expose only add_message;
-        # never replace a fully initialized target HistoryManager with an
-        # object that cannot satisfy the target's session-sync contract.
-        required_history_methods = (
-            "clear",
-            "add_message",
-            "get_all",
-            "get_model_messages",
-        )
-        if all(
-            callable(getattr(source_history, name, None))
-            for name in required_history_methods
+    target_history = getattr(turn_client, "history_manager", None)
+    if source_history is not None and target_history is None:
+        # Lightweight provider/test clients may omit their constructor-owned
+        # manager.  Materialize a new HistoryManager rather than transplanting
+        # the source object and reintroducing cross-session aliasing.
+        try:
+            from ..memory.history import HistoryManager
+
+            target_history = HistoryManager(
+                max_history_length=int(
+                    getattr(source_history, "max_history_length", 20) or 20
+                ),
+                context_window_size=int(
+                    getattr(source_history, "context_window_size", 10) or 10
+                ),
+            )
+            turn_client.history_manager = target_history
+        except Exception:
+            target_history = None
+    if source_history is not None and target_history is not None:
+        # Never transplant the source HistoryManager object.  The long-lived
+        # Character client may be serving another session concurrently; a
+        # shared object would let either turn mutate the other's transcript.
+        # Copy only the bounded mutable fields into the target's own manager.
+        for name in (
+            "history",
+            "model_history",
+            "summary",
+            "summary_version",
+            "summary_checkpoint",
         ):
-            turn_client.history_manager = source_history
+            if not hasattr(source_history, name) or not hasattr(target_history, name):
+                continue
+            try:
+                setattr(target_history, name, copy.deepcopy(getattr(source_history, name)))
+            except Exception:
+                continue
 
     isolated_prompt = str(
         getattr(source_client, "_isolated_system_prompt_override", "") or ""
@@ -608,7 +651,24 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
     if callable(rebuild_agent):
         turn_client.agent = rebuild_agent()
 
-    ensure_session_turn_local_server(turn_client)
+    try:
+        ensure_session_turn_local_server(turn_client)
+    except BaseException:
+        # Target construction may already have registered a long-lived local
+        # runtime consumer lease.  If preflight/startup fails before the
+        # caller receives the target, release that lease synchronously so a
+        # later engine switch is not pinned by a dead session target.
+        release_consumer = getattr(
+            turn_client,
+            "_release_managed_local_runtime_consumer_lease",
+            None,
+        )
+        if callable(release_consumer):
+            try:
+                release_consumer(all=True)
+            except Exception:
+                pass
+        raise
     return turn_client
 
 

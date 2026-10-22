@@ -14,9 +14,11 @@
 | [DISCORD_BOT_SETUP.md](DISCORD_BOT_SETUP.md) | Discord。`src/bot/handlers/command_handler.py` と bot/service 設定 |
 | [live_voice_backend.md](live_voice_backend.md) | Live Voice。`src/services/live_voice_service.py`, live voice routes/defaults |
 | [llama_cpp_muse_glimmer_setup.md](llama_cpp_muse_glimmer_setup.md) | managed llama.cpp / GGUF。model profile registry と local provider 実装 |
+| [local_llm_storage_policy.md](local_llm_storage_policy.md) | managed GGUFの保存先、外部root必須guard、hash検証付き移設手順 |
 | [irodori_tts.md](irodori_tts.md) | Irodori-TTS runtime/setup。`pyproject.toml`, setup scripts, vendored runtime |
 | [irodori_character_voice_integration.md](irodori_character_voice_integration.md) | Irodori character voice assets/API |
 | [miotts_tts.md](miotts_tts.md) | MioTTS integration |
+| [gemini_tts.md](gemini_tts.md) | Gemini TTS（`gemini-3.8-flash-tts` / `gemini-3.8-flash-lite-tts`）のキャラクター音声・API・外部送信 |
 | [yomi_linter.md](yomi_linter.md) | TTS 共通読みリスク検出 |
 | [mage_vl.md](mage_vl.md) | Mage-VL / SGLang video route |
 | [growi-rag-setup.md](growi-rag-setup.md) | GROWI knowledge source |
@@ -26,24 +28,26 @@
 | [pricing_catalog.md](pricing_catalog.md) | cost catalog。実単価の正本は `config/pricing_catalog.json` |
 | [openapi_typegen.md](openapi_typegen.md) | FastAPI OpenAPI → TypeScript 型生成 |
 | [schema_drift_check.md](schema_drift_check.md) | Alembic と Drizzle の schema drift 検知 |
-| [public_publish.md](public_publish.md) | private development tree → public `ttttdiva/AoiTalk` 同期 |
 | [mobile-auto-update-standard.md](mobile-auto-update-standard.md) | APK / `latest.json` / mobile release |
 | [release-checklist.md](release-checklist.md) | 通常 push、mobile、public publish、Enterprise handoff の入口 |
 | [enterprise_project_permissions.md](enterprise_project_permissions.md) | Enterprise project ACL / migration operation |
 | [enterprise_secrets.md](enterprise_secrets.md) | Enterprise secret boundary |
 | [chatgpt_web_director.md](chatgpt_web_director.md) | ChatGPT Web Director の利用・CLI |
+| [local_agent_tasks.md](local_agent_tasks.md) | Home MCP Gateway からのローカルLLM多段階タスク委譲。`src/services/local_agent_tasks.py`, `src/api/local_agent_task_routes.py` |
 | [ai_webui_qa.md](ai_webui_qa.md) | WebUI 変更時の独立 AI browser QA |
 | [task_workspace_rebuild.md](task_workspace_rebuild.md) | 現行 task workspace の構成と参照先。歴史的なファイル名は維持 |
+| [media_brand_portfolio.md](media_brand_portfolio.md) | MediaOps ブランドポートフォリオ配置表と簡易設定手順。47素材・15アカウント・8下書き・9管理参照 |
 
 ## 2. 現行の実装契約 / データ契約
 
 以下は一般ユーザー向け runbook ではなく、特定機能のデータ形・writer・curation の不変条件です。コード変更時に契約として扱います。
 
+- [feature_terminology.md](feature_terminology.md) — Agent / Execution Team / Character / Personaの正式名称、runner境界、互換性契約
+- [agent_domain_model.md](agent_domain_model.md) — Agent identity・職務版・所属・権限とWork / Runの対応
+- [ai_employee_platform.md](ai_employee_platform.md) — Agent運用・model routing・自動化・外部action境界（既存ファイル名を維持）
+- [employee_delegation_workflow.md](employee_delegation_workflow.md) — Agent組織と委任workflow（既存API識別子を維持）
 - [clip_ingest_contract.md](clip_ingest_contract.md) — ClipIngest plan / provenance / editable typed-content / sync 契約
 - [docs_editing_invariants.md](docs_editing_invariants.md) — Docs writer / node 形状の不変条件
-- [docs_curation_contract.md](docs_curation_contract.md) — 現在の Docs DB 整理契約
-- [docs_content_audit_runbook.md](docs_content_audit_runbook.md) — Docs DB の content audit 運用
-- `docs_content_audit_ledger.jsonl` — audit ledger。一般文書として手編集しない
 - `latest.json.example` — mobile 配布 metadata の例
 
 ## 3. 設計・再構築・履歴文書
@@ -53,7 +57,6 @@
 
 これらは重要な設計根拠ですが、**現在の runtime 仕様そのものではありません**。過去時点の DB 件数、未実装項目、ファイル行数、API の有無を現行仕様として引用しないでください。
 
-- [scenario_studio_rebuild_plan.md](scenario_studio_rebuild_plan.md) — Scenario Studio 再構築時点の調査・設計。2026-08-02 の実データ計測など時点情報を含む
 - [project_information_docs_supertag_design.md](project_information_docs_supertag_design.md) — Project Information を Docs 正本へ寄せる設計記録。`推奨` や移行条件を含む
 - [adr/2026-08-07-scoped-memory-v2.md](adr/2026-08-07-scoped-memory-v2.md) — ADR。採用判断の履歴として保持
 - [reference/spotify/genre_search_investigation.md](reference/spotify/genre_search_investigation.md) — Spotify genre search の調査記録
@@ -73,8 +76,6 @@
 - `README.md` — 日本語の現行概要 / public publish でも利用
 - `README.en.md` — 英語の現行概要 / public publish でも利用
 - `README.zh-CN.md` — 中国語の現行概要
-- `README.enterprise.md` — Enterprise handoff の唯一の人間向け runbook
-- [AGENTS.md](../AGENTS.md) — AI agent / repository workflow。製品仕様書ではない
 
 ## 文書更新ルール
 

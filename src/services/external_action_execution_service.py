@@ -16,6 +16,51 @@ from .integration_action_registry import ActionPolicyError, DefinitelyNotSent, I
 from .procurement_action import validate_quote
 
 
+async def _origin_agent_routing(session, action) -> dict | None:
+    """Safe, immutable routing of the exact run that proposed the action.
+
+    Only genuinely human/legacy actions without an Agent origin return None.
+    An invalid Agent origin carries a safe error so model-using adapters cannot
+    mistake damaged pins for permission to use the mutable global Main model.
+    """
+
+    from .agent_model_routing import AgentModelRouteError, load_pinned_agent_pins
+
+    run_id = getattr(action, "origin_agent_run_id", None)
+    origin_agent_id = getattr(action, "origin_agent_id", None)
+    if not run_id:
+        return {"error": "agent_route_snapshot_missing"} if origin_agent_id else None
+    run = await session.get(AgentRun, run_id)
+    if run is None or run.agent_revision_id is None:
+        return {"error": "agent_route_revision_missing"}
+    if origin_agent_id is not None and run.agent_id != origin_agent_id:
+        return {"error": "agent_route_revision_mismatch"}
+    try:
+        pins = await load_pinned_agent_pins(
+            session,
+            agent_revision_id=run.agent_revision_id,
+            agent_id=origin_agent_id or run.agent_id,
+            run={
+                "id": str(run.id),
+                "agent_revision_id": str(run.agent_revision_id),
+                # Validate the raw stored manifest, before safe projection, so
+                # its recorded hash is checked against exactly its source.
+                "resolved_execution_manifest": run.resolved_execution_manifest,
+                "execution_manifest_hash": run.execution_manifest_hash,
+            },
+        )
+    except AgentModelRouteError as exc:
+        return {"error": exc.code}
+    return {
+        "agent_id": pins.agent_id,
+        "agent_revision_id": pins.agent_revision_id,
+        "agent_team_id": pins.agent_team_id,
+        "execution_profile_id": pins.execution_profile_id,
+        "allowed_subagent_ids": list(pins.allowed_subagent_ids),
+        "route_snapshot": dict(pins.route_snapshot or {}),
+    }
+
+
 def action_source_revision(action):
     from .agent_identity_service import sha256_json
     return sha256_json({"action_version": action.action_version, "payload_hash": action.payload_hash,
@@ -202,16 +247,22 @@ class ExternalActionExecutionService:
                     raise ActionPolicyError("action_not_retryable", 409)
             revision, definition, connection, ready, _, _ = await self.policies.authorize_action(session, action, allow_unapproved=True)
             capability = "telephony.control" if action.action_type == "telephony.transfer_call" else action.action_type
-            credential = await self.policies._vault().resolve_for_execution(session, connection.id,
-                owner_user_id=connection.owner_user_id, project_id=connection.project_id,
-                expected_revision=action.credential_revision, expected_state_hash=action.credential_state_hash,
-                required_capabilities=(capability,))
+            if getattr(definition, "credential_mode", "vault") == "browser_session":
+                credential = None
+            else:
+                credential = await self.policies._vault().resolve_for_execution(session, connection.id,
+                    owner_user_id=connection.owner_user_id, project_id=connection.project_id,
+                    expected_revision=action.credential_revision, expected_state_hash=action.credential_state_hash,
+                    required_capabilities=(capability,))
             adapter = definition.adapter_factory()
             if (adapter.adapter_key, adapter.adapter_version) != (action.adapter_key, action.adapter_version):
                 raise ActionPolicyError("action_registry_changed", 409)
             binding = {"id": str(connection.id), "provider_key": connection.provider_key,
                        "remote_account_ref": connection.remote_account_ref,
-                       "policy_constraints": revision.constraints_json}
+                       "owner_user_id": str(connection.owner_user_id),
+                       "device_id": ready.get("device_id") if isinstance(ready, dict) else None,
+                       "policy_constraints": revision.constraints_json,
+                       "origin_agent_routing": await _origin_agent_routing(session, action)}
             payload = {k: v for k, v in action.payload_json.items() if k != "quote"}
             # Quote lookup is read-only. Release DB locks around network then
             # reacquire/recheck every mutable gate before persisting Attempt.

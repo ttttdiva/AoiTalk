@@ -66,6 +66,12 @@ class DreamingMemoryWorker:
             ),
             retry_base_seconds=retry_base_seconds,
             max_retry_seconds=max_retry_seconds,
+            skipped_run_heartbeat_seconds=float(
+                os.getenv(
+                    "AOITALK_DREAMING_SKIPPED_RUN_HEARTBEAT_SECONDS",
+                    str(6 * 60 * 60),
+                )
+            ),
         )
         self.llm_client = llm_client
         self.llm_client_factory = llm_client_factory

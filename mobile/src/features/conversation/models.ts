@@ -21,7 +21,6 @@ export type SessionCapability =
   | "canUseTools"
   | "canManageRuntime"
   | "canGroupRespond"
-  | "canSteer"
   | "canSync"
   | "canEdit";
 
@@ -31,12 +30,7 @@ export type ConnectionCapability =
   | "offline"
   | "local-only";
 
-export type SessionKind =
-  | "normal"
-  | "group"
-  | "scenario-writing"
-  | "scenario-roleplay"
-  | "trpg-linked";
+export type SessionKind = "normal" | "group";
 
 export type TransportState =
   | "websocket-connected"
@@ -96,7 +90,6 @@ export type ConversationCommandId =
   | "attach-file"
   | "deep-research"
   | "group-respond"
-  | "scenario-steering"
   | "edit-message"
   | "rerun-message"
   | "switch-model"
@@ -135,6 +128,8 @@ export type PermissionRequest = {
   description: string;
   riskSummary?: string;
   toolArgs: Record<string, unknown>;
+  /** Present only for a validated, request-bound HumanInteractionManager approval. */
+  materialApproval?: { sessionId: string; response: Record<string, unknown> };
   receivedAt: string;
   status: "pending" | "approved" | "denied" | "expired" | "completed";
 };
@@ -143,7 +138,6 @@ export type ConversationJobType =
   | "deep_research"
   | "agent_run"
   | "file_analysis"
-  | "scenario_generation"
   | "sync_repair"
   | "future";
 
@@ -211,10 +205,14 @@ export type SendConversationCommand = {
   submissionId?: string;
   retryMessageId?: string;
   projectId?: string | null;
+  /** Context-only project hint; never binds a projectless root session. */
+  contextProjectHintId?: string | null;
   appId?: string | null;
   appTargetId?: string | null;
   includeProjectContext?: boolean;
   agentMode?: string;
+  /** Agent binding snapshot to include in the server dispatch CAS guard. */
+  expectedAgentId?: string | null;
   editMessageId?: string;
   target?:
     | { kind: "server"; responseModel?: ChatResponseModelSelection }

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .database import get_db_session
+from .conversation_titles import update_title_in_transaction
 from .models import ConversationSession, ConversationMessage, ConversationArchive, ConversationHistory
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,13 @@ class ConversationRepository:
     def __init__(self, enable_search: bool = True):
         self.enable_search = enable_search
     
-    async def create_session(self, user_id: str, character_name: str) -> ConversationSession:
+    async def create_session(
+        self,
+        user_id: str,
+        character_name: str,
+        *,
+        agent_id: Optional[Union[str, uuid.UUID]] = None,
+    ) -> ConversationSession:
         """Create a new conversation session
         
         Args:
@@ -43,7 +50,8 @@ class ConversationRepository:
         async with await get_db_session() as session:
             conv_session = ConversationSession(
                 user_id=user_id,
-                character_name=character_name
+                character_name=character_name,
+                agent_id=(uuid.UUID(str(agent_id)) if agent_id else None),
             )
             session.add(conv_session)
             await session.commit()
@@ -139,30 +147,15 @@ class ConversationRepository:
             # A generated title is presentation metadata, not a new chat
             # activity. Keeping last_activity unchanged prevents a title job
             # racing with mark-as-read from creating a false unread marker.
-            values = {"title": title}
-            if source:
-                result = await session.execute(
-                    select(ConversationSession.context).where(
-                        ConversationSession.id == session_id
-                    )
-                )
-                current_context = result.scalar_one_or_none()
-                context = (
-                    dict(current_context) if isinstance(current_context, dict) else {}
-                )
-                context["title_generation"] = {"source": source}
-                values["context"] = context
-
-            stmt = (
-                update(ConversationSession)
-                .where(ConversationSession.id == session_id)
-                .values(**values)
+            updated = await update_title_in_transaction(
+                session,
+                session_id,
+                title,
+                source=source,
+                expected_title=expected_title,
             )
-            if expected_title is not None:
-                stmt = stmt.where(ConversationSession.title == expected_title)
-            result = await session.execute(stmt)
             await session.commit()
-            return result.rowcount > 0
+            return updated
     
     async def update_session_activity(self, session_id: Union[str, uuid.UUID]):
         """Update session last activity timestamp

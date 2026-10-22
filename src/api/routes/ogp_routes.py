@@ -592,9 +592,13 @@ async def _safe_ogp_get(
             return response
         if redirect_count >= OGP_MAX_REDIRECTS:
             raise OGPFetchError("リダイレクト回数が上限を超えました")
-        if "value" in approved_payload:
-            active_payload = approved_payload["value"]
-        current = urljoin(current, location)
+        next_url = urljoin(current, location)
+        # A redirect is a NEW outbound transaction. Bind its payload to the
+        # new destination before the next loop validates DNS and invokes the
+        # privacy gateway again. Reusing the previous URL incorrectly rejects
+        # legitimate redirects (publish.twitter.com now redirects to X).
+        active_payload = {**approved_payload.get("value", {}), "url": next_url}
+        current = next_url
     raise OGPFetchError("リダイレクト回数が上限を超えました")
 
 
@@ -704,35 +708,75 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                 "mobile.twitter.com",
             }:
                 return False
-            return re.match(r"^/[^/]+/status(?:es)?/\d+", parsed.path) is not None
+            return re.match(r"^/[^/]+/status(?:es)?/\d+(?:/|$)", parsed.path) is not None
 
         try:
             # Validate the requested URL before contacting the X oEmbed service
             # (the service would otherwise receive an attacker-controlled URL).
             await _resolve_public_ogp_endpoint(url)
 
+            async def fetch_x_photo(post_id: str):
+                # Optional enrichment: any failure leaves the text card as-is.
+                try:
+                    enrich_resp = await _safe_fetch(
+                        "https://cdn.syndication.twimg.com/tweet-result?"
+                        + urlencode({"id": post_id, "lang": "ja"})
+                    )
+                    enrich_resp.raise_for_status()
+                    enrich = enrich_resp.json()
+                    if str(enrich.get("id_str") or enrich.get("id") or "") != post_id:
+                        return None
+                    items = enrich.get("mediaDetails")
+                    items = items if isinstance(items, list) else []
+                    photo_url = next(
+                        (
+                            item.get("media_url_https")
+                            for item in items
+                            if isinstance(item, dict) and item.get("type") == "photo"
+                        ),
+                        None,
+                    )
+                    return _sanitize_metadata_url(photo_url, url)
+                except Exception as exc:
+                    logger.warning("X photo enrichment skipped (%s)", type(exc).__name__)
+                    return None
+
             if is_x_status_url(url):
                 try:
+                    # Canonical URL strips tracking parameters and uses the
+                    # hostname understood by the public oEmbed endpoint.
+                    parsed_x = urlsplit(url)
+                    post_path = re.match(r"^/([^/]+)/status(?:es)?/(\d+)", parsed_x.path)
+                    canonical_x = f"https://twitter.com/{post_path[1]}/status/{post_path[2]}"
                     oembed_url = "https://publish.twitter.com/oembed?" + urlencode(
-                        {"url": url, "omit_script": "true", "dnt": "true"}
+                        {"url": canonical_x, "omit_script": "true", "dnt": "true", "hide_thread": "true"}
                     )
                     oembed_resp = await _safe_fetch(oembed_url)
                     oembed_resp.raise_for_status()
                     oembed = oembed_resp.json()
                     embed_html = oembed.get("html")
                     if embed_html:
+                        embed_soup = BeautifulSoup(str(embed_html), "html.parser")
+                        for unsafe in embed_soup.find_all(["script", "style", "iframe", "object"]):
+                            unsafe.decompose()
+                        paragraph = embed_soup.find("p")
+                        description = paragraph.get_text(" ", strip=True) if paragraph else ""
+                        if not description:
+                            raise OGPFetchError("X post body unavailable")
                         author = oembed.get("author_name")
                         title = f"{author} on X" if author else "X post"
+                        x_image = await fetch_x_photo(post_path[2])
                         return JSONResponse(
                             {
                                 "success": True,
                                 "title": title,
-                                "description": None,
-                                "image": None,
+                                "description": description[:12000],
+                                "image": x_image,
                                 "url": url,
                                 "favicon": "https://abs.twimg.com/favicons/twitter.3.ico",
                                 "embed_type": "x-post",
-                                "embed_html": embed_html,
+                                # Consumers render data, never remote scripts.
+                                "embed_html": str(embed_soup),
                                 "provider_name": oembed.get("provider_name")
                                 or "Twitter",
                             }
@@ -743,6 +787,23 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                         _redact_url_for_log(url),
                         type(exc).__name__,
                     )
+
+                # Public structured fallback, with exact ID matching. No login
+                # cookies or operator credentials are used by link previews.
+                try:
+                    tweet_id = re.match(r"^/[^/]+/status(?:es)?/(\d+)", urlsplit(url).path)[1]
+                    syndication_url = "https://cdn.syndication.twimg.com/tweet-result?" + urlencode({"id": tweet_id, "lang": "ja"})
+                    syndication_resp = await _safe_fetch(syndication_url)
+                    syndication_resp.raise_for_status()
+                    post = syndication_resp.json()
+                    body = post.get("text")
+                    if str(post.get("id_str") or post.get("id") or "") == tweet_id and isinstance(body, str) and body.strip():
+                        author = post.get("user") if isinstance(post.get("user"), dict) else {}
+                        media = post.get("mediaDetails") if isinstance(post.get("mediaDetails"), list) else []
+                        photo = next((item.get("media_url_https") for item in media if isinstance(item, dict) and item.get("type") == "photo"), None)
+                        return JSONResponse({"success": True, "title": f"{author.get('name') or author.get('screen_name') or 'X'} on X", "description": body[:12000], "image": _sanitize_metadata_url(photo, url), "url": url, "embed_type": "x-post", "provider_name": "X"}, headers={"Cache-Control": "private, max-age=300"})
+                except Exception as exc:
+                    logger.warning("X public preview unavailable (%s)", type(exc).__name__)
 
             resp = await _safe_fetch(url)
             resp.raise_for_status()
@@ -766,7 +827,11 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                 response_url = str(resp.url)
             except (AttributeError, RuntimeError):
                 response_url = url
-            image = _sanitize_metadata_url(og("image"), response_url)
+            image_meta = og("image")
+            if not image_meta:
+                twitter_image = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", property="twitter:image")
+                image_meta = twitter_image.get("content") if twitter_image else None
+            image = _sanitize_metadata_url(image_meta, response_url)
 
             # favicon
             favicon = None

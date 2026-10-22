@@ -1,5 +1,7 @@
 "use client";
 
+import { revenueEvidenceClass, revenueCurrency, revenueAmountText, UNTYPED_MONETARY_METRICS, revenueCostClass, REVENUE_COST_SCOPE_NOTE } from "@/lib/media-revenue-display";
+
 import { BarChart3, CircleDollarSign, FlaskConical, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
@@ -8,8 +10,10 @@ import {
   type MediaResultsResponse,
 } from "@/lib/media-operations-overview-api";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { cn } from "@/lib/utils";
+import { RevenueCostSummary } from "./revenue-cost-summary";
 
 function readableError(error: unknown): string {
   return error instanceof Error && error.message
@@ -75,8 +79,10 @@ export function MediaResultsPanel() {
     <div className="space-y-4" data-testid="media-results-panel">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">結果</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Persona・媒体・実験・Revenueの保存済み結果を、証拠の件数とともに確認します。</p>
+          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
+            結果
+            <HelpPopover label="結果">Persona・媒体・実験・Revenueの保存済み結果を、証拠の件数とともに確認します。</HelpPopover>
+          </h2>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={() => void load()} disabled={loading}><RefreshCw className={cn("size-3.5", loading && "animate-spin")} /> 更新</Button>
       </div>
@@ -93,29 +99,34 @@ export function MediaResultsPanel() {
           </div>
           <div className="grid gap-4 xl:grid-cols-4">
             <Card size="sm">
-              <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">媒体別メトリクス</CardTitle><CardDescription>正規化された値のみを集計しています。Providerの生レスポンスは表示しません。</CardDescription></CardHeader>
+              <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">媒体別メトリクス<HelpPopover label="媒体別メトリクス">正規化された値のみを集計しています。Providerの生レスポンスは表示しません。</HelpPopover></CardTitle></CardHeader>
               <CardContent className="space-y-2 pt-3">
-                {result.metric_snapshots.by_platform.length ? result.metric_snapshots.by_platform.map((item) => <div key={item.platform} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.platform}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>) : <p className="text-sm text-muted-foreground">Metric snapshotはまだありません。</p>}
+                {result.metric_snapshots.by_platform.length ? result.metric_snapshots.by_platform.map((item) => <div key={item.platform} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.platform}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).filter(([key]) => !UNTYPED_MONETARY_METRICS.has(key)).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>) : <p className="text-sm text-muted-foreground">Metric snapshotはまだありません。</p>}
               </CardContent>
             </Card>
             <Card size="sm">
-              <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">アカウント / コンテンツ</CardTitle><CardDescription>アカウントとContentVariant単位の集計です。</CardDescription></CardHeader>
+              <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">アカウント / コンテンツ<HelpPopover label="アカウント / コンテンツ">アカウントとContentVariant単位の集計です。</HelpPopover></CardTitle></CardHeader>
               <CardContent className="space-y-2 pt-3">
-                {result.metric_snapshots.by_account.map((item) => <div key={`account-${item.account_ref}`} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.account_label || "アカウント"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>)}
-                {result.metric_snapshots.by_content.map((item) => <div key={`content-${item.content_ref}`} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.content_label || "コンテンツ"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>)}
+                {result.metric_snapshots.by_account.map((item) => <div key={`account-${item.account_ref}`} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.account_label || "アカウント"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).filter(([key]) => !UNTYPED_MONETARY_METRICS.has(key)).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>)}
+                {result.metric_snapshots.by_content.map((item) => <div key={`content-${item.content_ref}`} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.content_label || "コンテンツ"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).filter(([key]) => !UNTYPED_MONETARY_METRICS.has(key)).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>)}
                 {!result.metric_snapshots.by_account.length && !result.metric_snapshots.by_content.length ? <p className="text-sm text-muted-foreground">アカウント / コンテンツ別のMetric snapshotはまだありません。</p> : null}
               </CardContent>
             </Card>
             <Card size="sm">
-              <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Persona別メトリクス</CardTitle><CardDescription>Persona名を優先表示し、参照可能な証拠だけを集計します。</CardDescription></CardHeader>
+              <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Persona別メトリクス<HelpPopover label="Persona別メトリクス">Persona名を優先表示し、参照可能な証拠だけを集計します。</HelpPopover></CardTitle></CardHeader>
               <CardContent className="space-y-2 pt-3">
-                {result.metric_snapshots.by_persona.length ? result.metric_snapshots.by_persona.map((item) => <div key={item.persona_ref} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.persona_label || "Persona"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>) : <p className="text-sm text-muted-foreground">Persona別のMetric snapshotはまだありません。</p>}
+                {result.metric_snapshots.by_persona.length ? result.metric_snapshots.by_persona.map((item) => <div key={item.persona_ref} className="rounded-md border border-border/70 px-3 py-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">{item.persona_label || "Persona"}</span><span className="text-xs text-muted-foreground">{item.snapshot_count}件</span></div><p className="mt-1 text-xs text-muted-foreground">{Object.entries(item.metrics).filter(([key]) => !UNTYPED_MONETARY_METRICS.has(key)).map(([key, value]) => `${key}: ${number(value)}`).join(" · ") || "値なし"}</p></div>) : <p className="text-sm text-muted-foreground">Persona別のMetric snapshotはまだありません。</p>}
               </CardContent>
             </Card>
             <Card size="sm">
-              <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Revenue / 学習</CardTitle><CardDescription>通貨別の売上集計と、提案された学習のレビュー状態です。</CardDescription></CardHeader>
+              <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Revenue / 学習<HelpPopover label="Revenue / 学習">通貨・記録種別別の収入です。通貨未指定の金額Metricは集計対象外です。</HelpPopover></CardTitle></CardHeader>
               <CardContent className="space-y-3 pt-3">
-                {result.revenue.by_currency.length ? result.revenue.by_currency.map((item) => <div key={item.currency} className="flex items-center justify-between rounded-md border border-border/70 px-3 py-2 text-sm"><span>{item.currency} <span className="text-xs text-muted-foreground">{item.event_count}件</span></span><span className="tabular-nums">Net {number(item.net)} / Gross {number(item.gross)}</span></div>) : <p className="text-sm text-muted-foreground">Revenue eventはまだありません。</p>}
+                {result.revenue.by_currency.length ? result.revenue.by_currency.map((item) => {
+                  const classification = revenueEvidenceClass(item.revenue_authority, item.event_type);
+                  const currency = revenueCurrency(item.currency);
+                  return <div data-testid="revenue-bucket" key={JSON.stringify([currency, classification.authority, classification.eventType, revenueCostClass(item.cost_authority).authority])} className="rounded-md border border-border/70 px-3 py-2 text-sm"><p>{currency ?? "通貨不明"} · {classification.eventLabel} · {classification.authorityLabel} <span className="text-xs text-muted-foreground">{item.event_count}件</span></p><p className="tabular-nums">総額 {revenueAmountText(currency ? item.gross : null)} · 手取り {revenueAmountText(currency ? item.net : null)}</p><RevenueCostSummary item={item} currency={currency} revenueAuthority={item.revenue_authority} /></div>;
+                }) : <p className="text-sm text-muted-foreground">Revenue eventはまだありません。</p>}
+                <p className="text-[11px] text-muted-foreground">{REVENUE_COST_SCOPE_NOTE}</p>
                 <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2"><p className="text-xs font-medium">Experimentの状態</p><p className="mt-1 text-xs text-muted-foreground">{Object.entries(result.experiments.by_status).map(([key, value]) => `${statusLabel(key)}: ${value}`).join(" · ") || "記録なし"}</p></div>
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2"><p className="text-xs font-medium">学習提案</p><p className="mt-1 text-xs text-muted-foreground">{Object.entries(result.learning.by_status).map(([key, value]) => `${statusLabel(key)}: ${value}`).join(" · ") || "記録なし"}</p></div>
                 <p className="text-[11px] text-muted-foreground">参照可能なEvidence: {number(result.evidence_count)}件</p>

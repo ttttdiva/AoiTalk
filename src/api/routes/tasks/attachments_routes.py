@@ -246,6 +246,8 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
             await session.commit()
             committed = True
             await session.refresh(attachment)
+            from ....services.media_index_worker import notify_media_source
+            notify_media_source(user_id, "task_attachment", attachment.id)
             return _serialize_attachment(attachment)
         except TaskManagementError as exc:
             await session.rollback()
@@ -409,6 +411,7 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
                 if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
                     raise HTTPException(status_code=400, detail="Invalid attachment path")
                 target.unlink()
+            source_id = attachment.id
             await session.delete(attachment)
             usage = await asyncio.to_thread(
                 calculate_storage_usage,
@@ -417,6 +420,8 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
             )
             project.storage_used_mb = usage["total_bytes"] / (1024 * 1024)
             await session.commit()
+            from ....services.media_index_worker import notify_media_source
+            notify_media_source(user_id, "task_attachment", source_id)
             return Response(status_code=204)
         except TaskManagementError as exc:
             raise _translate_service_error(exc)

@@ -9,7 +9,7 @@ function requestTargetFrame(callback: () => void): number {
 }
 
 /**
- * Open and focus a settings target after a category/quick-settings hash has
+ * Open and focus a settings target after a direct settings hash has
  * been resolved. The DOM lookup is intentionally scoped to the page so a
  * matching sidebar link can never steal focus from the real panel.
  */
@@ -25,22 +25,41 @@ export function openSettingsTarget(
   const page = document.querySelector<HTMLElement>("[data-settings-page]");
   const target = page?.querySelector<HTMLElement>(selector) || document.getElementById(targetId);
   if (!target) return;
-  const trigger = target.matches("[aria-expanded]")
+  // Only section-owned activation hooks may toggle a target.  Falling back to
+  // the first arbitrary `[aria-expanded]` descendant can activate an unrelated
+  // nested control (or a destructive action) in rich settings panels.
+  const explicitActivation = target.matches(
+    `[data-settings-target-activation="${targetId}"]`,
+  )
     ? target
-    : target.querySelector<HTMLElement>("[aria-expanded]");
-  const handlesTarget =
-    (target.getAttribute("data-settings-disclosure") === "true" &&
-      target.getAttribute("data-settings-target") === targetId) ||
-    Boolean(
-      trigger?.closest(
+    : target.querySelector<HTMLElement>(
+        `[data-settings-target-activation="${targetId}"]`,
+      );
+  const disclosure = target.matches(
+    `[data-settings-disclosure="true"][data-settings-target="${targetId}"]`,
+  )
+    ? target
+    : target.querySelector<HTMLElement>(
         `[data-settings-disclosure="true"][data-settings-target="${targetId}"]`,
-      ),
-    );
-  if (!handlesTarget && trigger?.getAttribute("aria-expanded") === "false") {
+      );
+  const trigger =
+    explicitActivation ||
+    disclosure?.querySelector<HTMLElement>("[aria-expanded]") ||
+    (target.matches("[aria-expanded]") ? target : null);
+  const usesDisclosureEvent = Boolean(disclosure) && !explicitActivation;
+  if (
+    !usesDisclosureEvent &&
+    trigger?.getAttribute("aria-expanded") === "false"
+  ) {
     trigger.click();
   }
   if (!isCurrent()) return;
-  const focusTarget = trigger || target;
+  const focusTarget =
+    trigger ||
+    target.querySelector<HTMLElement>(
+      `[data-settings-target-focus-anchor="${targetId}"]`,
+    ) ||
+    target;
   focusTarget.focus({ preventScroll: true });
 
   let attempts = 0;

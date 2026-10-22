@@ -8,6 +8,8 @@ WS02/WS03 are rolling out by using lazy imports and small duck-typed seams.
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
@@ -70,6 +72,10 @@ class MediaExecutionOutcome(Mapping[str, Any]):
     evidence: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     retryable: bool = False
     awaiting_approval: bool = False
+    retry_after_seconds: float | None = None
+    # Internal handoff only.  This sealed object is intentionally omitted from
+    # ``to_dict`` so it cannot cross an HTTP/JSON boundary.
+    receipt_evidence: Any | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         status = str(self.status or "failed").strip().lower()
@@ -80,6 +86,13 @@ class MediaExecutionOutcome(Mapping[str, Any]):
         object.__setattr__(self, "result_summary", _text(self.result_summary, MAX_TEXT))
         object.__setattr__(self, "domain_ref", _id(self.domain_ref))
         object.__setattr__(self, "domain_status", _text(self.domain_status, 64))
+        delay = self.retry_after_seconds
+        if delay is not None:
+            try:
+                delay = max(1.0, min(float(delay), 86_400.0))
+            except (TypeError, ValueError):
+                delay = None
+        object.__setattr__(self, "retry_after_seconds", delay)
         projected_evidence: list[Mapping[str, Any]] = []
         for item in self.evidence[:MAX_EVIDENCE]:
             if not isinstance(item, Mapping):
@@ -118,12 +131,31 @@ class MediaExecutionOutcome(Mapping[str, Any]):
             "domain_status": self.domain_status,
             "evidence": [dict(item) for item in self.evidence],
             "retryable": bool(self.retryable),
+            "retry_after_seconds": self.retry_after_seconds,
             "awaiting_approval": bool(self.awaiting_approval),
             "metadata": {
                 "domain_ref": self.domain_ref,
                 "domain_status": self.domain_status,
             },
         }
+
+    def with_receipt_evidence(self, evidence: Any) -> "MediaExecutionOutcome":
+        """Carry sealed generation evidence to the coordinator privately."""
+
+        if evidence is None:
+            return self
+        return MediaExecutionOutcome(
+            status=self.status,
+            reason_code=self.reason_code,
+            result_summary=self.result_summary,
+            domain_ref=self.domain_ref,
+            domain_status=self.domain_status,
+            evidence=self.evidence,
+            retryable=self.retryable,
+            awaiting_approval=self.awaiting_approval,
+            retry_after_seconds=self.retry_after_seconds,
+            receipt_evidence=evidence,
+        )
 
     def __getitem__(self, key: str) -> Any:
         return self.to_dict()[key]
@@ -153,6 +185,8 @@ class MediaExecutionOutcome(Mapping[str, Any]):
         }
         raw_status = str(payload.get("status") or payload.get("outcome") or "failed").strip().lower()
         status = aliases.get(raw_status, raw_status)
+        if raw_status == "pending" and payload.get("receipt_recovery"):
+            status = "uncertain"
         if status not in _OUTCOME_STATUSES:
             status = "failed"
         raw_evidence = payload.get("evidence") or payload.get("evidence_refs") or []
@@ -169,6 +203,7 @@ class MediaExecutionOutcome(Mapping[str, Any]):
             evidence=tuple(item for item in raw_evidence if isinstance(item, Mapping)),
             retryable=bool(payload.get("retryable", status == "transient")),
             awaiting_approval=bool(payload.get("awaiting_approval", status == "awaiting_approval")),
+            retry_after_seconds=payload.get("retry_after_seconds"),
         )
 
 
@@ -277,7 +312,19 @@ def _safe_result(result: Any, *, default_ref: Any = None) -> MediaExecutionOutco
     elif raw_status in {"failed", "error"}:
         status = "failed"
     elif raw_status in {"pending", "proposed", "awaiting_approval", "pending_review"}:
-        status = "awaiting_approval"
+        # Generation receipt persistence failures use a bounded pending marker
+        # while the provider outcome is recovered by GET.  That marker is an
+        # execution uncertainty, never a human approval state.  Publication
+        # and learning domains retain their approval classification.
+        recovery = result.get("receipt_recovery")
+        if recovery or result.get("reason_code") in {
+            "generation_receipt_pending",
+            "generation_receipt_persistence_failed",
+            "generation_recovery_lookup_unknown",
+        }:
+            status = "uncertain"
+        else:
+            status = "awaiting_approval"
     elif raw_status in {
         "transient",
         "permanent",
@@ -292,9 +339,9 @@ def _safe_result(result: Any, *, default_ref: Any = None) -> MediaExecutionOutco
             status = "succeeded"
         else:
             status = raw_status
-    elif raw_status in {"rejected", "stale"}:
+    elif raw_status in {"rejected", "stale", "quarantined"}:
         status = "permanent"
-    elif raw_status in {"running", "queued"}:
+    elif raw_status in {"draft", "claimed", "running", "queued", "output_pending"}:
         status = "transient"
     else:
         status = "failed"
@@ -313,6 +360,7 @@ def _safe_result(result: Any, *, default_ref: Any = None) -> MediaExecutionOutco
         evidence=tuple(item for item in evidence[:MAX_EVIDENCE] if isinstance(item, Mapping)),
         retryable=status == "transient",
         awaiting_approval=status == "awaiting_approval",
+        retry_after_seconds=result.get("retry_after_seconds"),
     )
 
 
@@ -536,6 +584,7 @@ class MediaAutomationExecutionAdapter(MediaExecutionAdapter):
                     "trigger_key": trigger_key,
                     "trigger_kind": "agent_work",
                     "execute": True,
+                    "origin_work_item_id": item.get("work_item_id") or item.get("id"),
                 },
             )
         except Exception as exc:
@@ -599,6 +648,18 @@ class MediaAutomationExecutionAdapter(MediaExecutionAdapter):
         )
 
 
+class MediaResearchSearchFailed(MediaExecutionAdapterError):
+    """All bounded read queries failed; this is not an empty search."""
+
+
+class _ResearchSearchResults(list):
+    def __init__(self):
+        super().__init__()
+        self.completed_queries = 0
+        self.failed_queries = 0
+        self.failed_providers = 0
+
+
 class MediaResearchExecutionAdapter(MediaExecutionAdapter):
     """Execute a pinned research routine and append findings/candidates."""
 
@@ -621,73 +682,112 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
     def _search_request(self, item: Mapping[str, Any]) -> dict[str, Any]:
         payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else item
         revision = payload.get("routine_revision") if isinstance(payload.get("routine_revision"), Mapping) else payload
-        queries = revision.get("search_queries") or revision.get("queries") or []
-        if isinstance(queries, str):
-            queries = [queries]
-        queries = [_text(query, 500) for query in list(queries)[:20] if _text(query, 500)]
-        if not queries and _text(revision.get("objective"), 1_000):
-            queries = [_text(revision.get("objective"), 1_000)]
-        known_engines = {"searxng", "google", "bing", "brave", "duckduckgo", "local"}
-        engines = revision.get("engines") or revision.get("source_types") or ["searxng"]
-        if isinstance(engines, str):
-            engines = [engines]
-        engines = [engine for engine in engines if str(engine).strip().casefold() in known_engines] or ["searxng"]
+        def values(key: str, limit: int = 50) -> list[str]:
+            raw = revision.get(key) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            return list(dict.fromkeys(_text(value, 500) for value in list(raw)[:limit] if _text(value, 500)))
+        queries = values("search_queries", 20) or values("queries", 20)
+        if not queries and _text(revision.get("objective"), 1000):
+            queries = [_text(revision.get("objective"), 1000)]
+        accounts, tags = values("follow_accounts"), values("follow_tags")
+        selectors = accounts + ["#" + value.lstrip("#") for value in tags]
+        # Public search is an approximation of account/tag following, never a
+        # claim that an authenticated native timeline was read.
+        if selectors:
+            base = queries or [""]
+            queries = [f'{query} "{selector.replace(chr(34), chr(32))}"'.strip()
+                       for query in base for selector in selectors]
+        known_engines = set(import_module(".deep_research_service", package=__package__).SUPPORTED_ENGINES)
+        engines = values("engines", 16) or values("source_types", 16) or ["searxng"]
+        engines = [value for value in engines if value.casefold() in known_engines] or ["searxng"]
+        max_candidates = max(1, min(int(revision.get("max_candidates") or 20), 500))
         return {
-            "queries": queries[:20],
-            "engines": [_text(engine, 64) for engine in list(engines)[:16] if _text(engine, 64)],
-            "max_results_per_engine": max(1, min(int(revision.get("max_candidates") or 20), 100)),
+            "queries": queries[:20], "engines": engines,
+            "max_results_per_engine": min(max_candidates, 100),
+            "max_candidates": max_candidates,
             "project_id": _id(item.get("project_id")),
-            "domains": [_text(domain, 255) for domain in list(revision.get("domains") or [])[:20] if _text(domain, 255)],
+            "domains": values("domains"), "follow_accounts": accounts,
+            "follow_tags": tags, "exclusions": values("exclusions"),
+            "freshness_hours": max(1, min(int(revision.get("freshness_hours") or 168), 8760)),
+            "scope_mode": "public_search_query_approximation",
+            "omissions": ([f"query_limit:{len(queries) - 20}"] if len(queries) > 20 else []),
         }
 
     async def _invoke_search(self, request: Mapping[str, Any], actor: Any) -> list[Any]:
         if self.search_client is None:
             try:
-                client_type = import_module(
-                    ".deep_research_service", package=__package__
-                ).DeepResearchSearchClient
-                self.search_client = client_type(
-                    self.config,
-                    project_id=request.get("project_id"),
-                )
-            except Exception:
-                return []
+                client_type = import_module(".deep_research_service", package=__package__).DeepResearchSearchClient
+                self.search_client = client_type(self.config, project_id=request.get("project_id"))
+            except Exception as exc:
+                raise MediaExecutionUnavailable("research_provider_unavailable") from exc
         method = _callable(self.search_client, "search", "run", "query")
         if method is None:
-            return []
-        results: list[Any] = []
-        actor_kind = str(
-            _field(actor, "actor_type")
-            or _field(actor, "kind")
-            or _field(actor, "principal_kind")
-            or ""
-        ).strip().lower()
-        actor_user_id = None if actor_kind == "agent" else _id(
-            _field(actor, "id") or _field(actor, "user_id")
-        )
+            raise MediaExecutionUnavailable("research_provider_unavailable")
+        results = _ResearchSearchResults()
+        seen: set[str] = set()
+        actor_kind = str(_field(actor, "actor_type") or _field(actor, "kind") or _field(actor, "principal_kind") or "").strip().lower()
+        actor_user_id = None if actor_kind == "agent" else _id(_field(actor, "id") or _field(actor, "user_id"))
+        domains = []
+        for value in request.get("domains") or []:
+            domain = str(value).strip().lower().removeprefix("site:").removeprefix("*.")
+            if "://" in domain:
+                domain = urlsplit(domain).hostname or ""
+            domains.append(domain.strip("."))
+        exclusions = [str(value).casefold().strip() for value in request.get("exclusions") or [] if str(value).strip()]
+        limit = max(1, min(int(request.get("max_candidates") or 20), 500))
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(request["freshness_hours"]))) if request.get("freshness_hours") else None
         for query in list(request.get("queries") or [])[:20]:
-            value = await _call_compatible(
-                method,
-                positional=(query,),
-                kwargs={
+            try:
+                value = await _call_compatible(method, positional=(query,), kwargs={
                     "engines": request.get("engines") or ["searxng"],
                     "max_results_per_engine": request.get("max_results_per_engine", 20),
-                    "project_id": request.get("project_id"),
-                    "actor_user_id": actor_user_id,
-                    "user_id": actor_user_id,
-                    "include_local_knowledge": False,
+                    "project_id": request.get("project_id"), "actor_user_id": actor_user_id,
+                    "user_id": actor_user_id, "include_local_knowledge": False,
+                    "require_provider_success": True,
                     "domains": request.get("domains") or [],
-                },
-            )
-            if isinstance(value, Mapping):
-                values = value.get("sources") or value.get("results") or value.get("items") or []
-            else:
-                values = value
-            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                results.extend(list(values)[:MAX_EVIDENCE])
-            elif values is not None:
-                results.append(values)
-        return results[:MAX_EVIDENCE]
+                })
+                results.completed_queries += 1
+                results.failed_providers += max(0, int(getattr(value, "failed_providers", 0)))
+            except Exception as exc:
+                if any(base.__name__ in {"PermissionError", "ExternalProviderBlocked", "PrivacyError"} for base in type(exc).__mro__):
+                    raise MediaExecutionUnavailable("research_permission_denied") from exc
+                results.failed_queries += 1
+                continue
+            values = value.get("sources") or value.get("results") or value.get("items") or [] if isinstance(value, Mapping) else value
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                values = [values] if values is not None else []
+            for source in list(values)[:500]:
+                url = _safe_url(_field(source, "url") or _field(source, "source_url"))
+                if not url:
+                    continue
+                parts = urlsplit(url)
+                host = (parts.hostname or "").lower()
+                if domains and not any(host == domain or host.endswith("." + domain) for domain in domains):
+                    continue
+                haystack = " ".join(str(_field(source, field) or "") for field in ("url", "source_url", "title", "snippet", "summary", "description")).casefold()
+                if any(value in haystack for value in exclusions):
+                    continue
+                published = _field(source, "published_at") or _field(source, "source_published_at")
+                if published:
+                    try:
+                        stamp = published if isinstance(published, datetime) else datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+                        if stamp.tzinfo is None:
+                            stamp = stamp.replace(tzinfo=timezone.utc)
+                        if cutoff is not None and stamp < cutoff:
+                            continue
+                    except (TypeError, ValueError):
+                        pass  # Unknown dates remain explicitly unverified signals.
+                key = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), parts.query, ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(source)
+                if len(results) >= limit:
+                    return results
+        if results.failed_queries and not results.completed_queries:
+            raise MediaResearchSearchFailed("research_search_failed")
+        return results
 
     @staticmethod
     def _source_projection(source: Any) -> dict[str, Any] | None:
@@ -756,6 +856,22 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
         routine_version = payload.get("routine_version") or item.get("routine_version")
         if not routine_id or routine_version in (None, ""):
             return MediaExecutionOutcome(status="blocked", reason_code="research_routine_pin_missing")
+        search_request = self._search_request(item)
+        get_routine = _callable(self.service, "get_research_routine")
+        if get_routine is not None:
+            try:
+                detail = await _call_compatible(get_routine, kwargs={"session": session, "actor": actor, "routine_id": routine_id})
+                revisions = list(_field(detail, "revisions") or [])
+                current = _field(detail, "current_revision")
+                if current is not None:
+                    revisions.append(current)
+                pinned = next((revision for revision in revisions if int(_field(revision, "version", 0) or 0) == int(routine_version)), None)
+                expected_hash = payload.get("routine_revision_hash")
+                if pinned is None or (expected_hash and _field(pinned, "content_hash") != expected_hash):
+                    return MediaExecutionOutcome(status="blocked", reason_code="research_routine_pin_mismatch")
+                search_request = self._search_request({"project_id": item.get("project_id"), "payload": {"routine_revision": pinned}})
+            except Exception:
+                return MediaExecutionOutcome(status="blocked", reason_code="research_routine_reload_failed")
         start_method = _callable(self.service, "start_research_run")
         if start_method is None:
             return MediaExecutionOutcome(status="blocked", reason_code="research_service_unavailable")
@@ -773,7 +889,7 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
                     "routine_version": int(routine_version),
                     "focus_note": _text(payload.get("focus_note"), 4_000),
                     "source_refs": [],
-                    "omissions": [],
+                    "omissions": ["public_search_query_approximation", "search_excerpts_unverified", "undated_sources_freshness_unverified", "native_timeline_and_pagination_not_used", *search_request.get("omissions", [])],
                     # ResearchRun is an immutable occurrence; the existing
                     # service has no post-hoc status mutator.  Start it as a
                     # terminal recorded snapshot so a successful adapter
@@ -791,7 +907,12 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
         if not research_run_id:
             return MediaExecutionOutcome(status="failed", reason_code="research_run_reference_missing")
         try:
-            sources = await self._invoke_search(self._search_request(item), actor)
+            sources = await self._invoke_search(search_request, actor)
+        except MediaExecutionUnavailable as exc:
+            code = "research_permission_denied" if str(exc) == "research_permission_denied" else "research_provider_unavailable"
+            return MediaExecutionOutcome(status="blocked", reason_code=code, domain_ref=research_run_id)
+        except MediaResearchSearchFailed:
+            return MediaExecutionOutcome(status="failed", reason_code="research_search_failed", domain_ref=research_run_id)
         except Exception:
             # The run intent is already durable; never ask the coordinator to
             # blind-retry an unknown external search result.
@@ -800,21 +921,26 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
                 reason_code="research_search_outcome_unknown",
                 domain_ref=research_run_id,
             )
+        if not sources and (getattr(sources, "failed_queries", 0) + getattr(sources, "failed_providers", 0)):
+            return MediaExecutionOutcome(status="uncertain", reason_code="research_search_partial", domain_ref=research_run_id, result_summary="No matching sources from completed queries; other queries failed")
         if not sources:
             return MediaExecutionOutcome(
-                status="failed",
-                reason_code="research_provider_unavailable",
+                status="succeeded",
+                reason_code="research_no_results",
                 domain_ref=research_run_id,
+                domain_status="recorded",
+                result_summary="Search completed with no matching sources; no facts were verified",
             )
         finding_method = _callable(self.service, "append_research_finding")
         candidate_method = _callable(self.service, "create_research_candidate")
         findings = candidates = 0
         failures = 0
         evidence_refs: list[Mapping[str, Any]] = []
-        for index, source in enumerate(sources[:MAX_EVIDENCE]):
+        for index, source in enumerate(sources[:500]):
             projection = self._source_projection(source)
             if projection is None or not projection["evidence"]:
                 continue
+            source_key = _hash_ref(projection.get("source_url") or projection["title"])
             evidence_refs.extend(projection["evidence"][:2])
             if finding_method is not None:
                 try:
@@ -824,10 +950,10 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
                             "session": session,
                             "actor": actor,
                             "run_id": research_run_id,
-                            "kind": "fact",
+                            "kind": "signal",
                             "statement": projection["summary"],
                             "evidence": projection["evidence"],
-                            "idempotency_key": f"{run_key}:finding:{index}",
+                            "idempotency_key": f"{run_key[:180]}:finding:{source_key}",
                         },
                     )
                     findings += 1
@@ -848,7 +974,7 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
                             "source_published_at": projection.get("source_published_at"),
                             "evidence": projection["evidence"],
                             "reason": "discovered by assigned MediaOps research routine",
-                            "idempotency_key": f"{run_key}:candidate:{index}",
+                            "idempotency_key": f"{run_key[:180]}:candidate:{source_key}",
                         },
                     )
                     candidates += 1
@@ -860,6 +986,8 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
                 reason_code="research_evidence_persistence_failed",
                 domain_ref=research_run_id,
             )
+        if (getattr(sources, "failed_queries", 0) + getattr(sources, "failed_providers", 0)):
+            return MediaExecutionOutcome(status="uncertain", reason_code="research_search_partial", domain_ref=research_run_id, domain_status="recorded", result_summary=f"Recorded {findings} findings and {candidates} candidates; {sources.failed_queries} queries and {sources.failed_providers} provider attempts failed", evidence=tuple(evidence_refs[:MAX_EVIDENCE]))
         if failures:
             return MediaExecutionOutcome(
                 status="uncertain",
@@ -880,7 +1008,7 @@ class MediaResearchExecutionAdapter(MediaExecutionAdapter):
 def _hash_ref(value: Any) -> str:
     import hashlib
 
-    return hashlib.sha256(str(value or "source").strip().lower().encode("utf-8")).hexdigest()[:48]
+    return hashlib.sha256(str(value or "source").strip().encode("utf-8")).hexdigest()[:48]
 
 
 class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
@@ -926,7 +1054,7 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
         authority = await self._check_authority(item=item, session=session)
         if authority is not None:
             return authority
-        if session is None or actor is None:
+        if session is None:
             return MediaExecutionOutcome(status="blocked", reason_code="domain_actor_missing")
         payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else item
         plan_id = _id(item.get("source_id") or item.get("plan_id"))
@@ -934,34 +1062,120 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
         if not plan_id or not plan_hash:
             return MediaExecutionOutcome(status="blocked", reason_code="generation_plan_pin_missing")
         mode = str(payload.get("mode") or "submit").strip().lower()
+        if mode not in {"submit", "reconcile", "recover"}:
+            return MediaExecutionOutcome(
+                status="blocked",
+                reason_code="generation_mode_unsupported",
+                domain_ref=plan_id,
+            )
+        execution_guard = None
+        if coordinator is not None:
+            async def execution_guard() -> Mapping[str, Any]:
+                refresh = getattr(coordinator, "_refresh_source", None)
+                if not callable(refresh):
+                    return {"allowed": False, "reason_code": "source_guard_unavailable"}
+                if not await refresh(session, work_item):
+                    return {"allowed": False, "reason_code": "source_not_executable"}
+                authority_check = getattr(coordinator, "_authority_allows", None)
+                if not callable(authority_check):
+                    return {"allowed": False, "reason_code": "authority_guard_unavailable"}
+                authority_ok, authority_reason = await authority_check(work_item)
+                if not authority_ok:
+                    return {
+                        "allowed": False,
+                        "reason_code": authority_reason or "authority_denied",
+                    }
+                renew = getattr(coordinator, "renew_lease", None)
+                if not callable(renew) or not await renew(work_item):
+                    return {"allowed": False, "reason_code": "lease_lost"}
+                return {"allowed": True}
+
         acknowledge = payload.get("acknowledge_metered_generation", False)
         method = _callable(
             self.service,
-            "reconcile_generation_plan" if mode == "reconcile" else "submit_generation_plan",
+            "recover_generation_plan_for_agent"
+            if mode == "recover"
+            else "reconcile_generation_plan_for_agent"
+            if mode == "reconcile"
+            else "submit_generation_plan_for_agent",
+            # Older rolling service instances expose only the common
+            # reconcile spelling; recovery remains read-only there.
+            "reconcile_generation_plan_for_agent"
+            if mode == "recover"
+            else "__never__",
         )
         if method is None:
             return MediaExecutionOutcome(status="blocked", reason_code="generation_service_unavailable")
         call_kwargs: dict[str, Any] = {
             "session": session,
-            "actor": actor,
             "plan_id": plan_id,
             "expected_plan_hash": plan_hash,
             "acknowledge_metered_generation": bool(acknowledge),
             "idempotency_key": _text(item.get("intent_key"), 255),
+            "origin_work_item_id": item.get("work_item_id") or item.get("id"),
+            "agent_id": item.get("assigned_agent_id") or item.get("agent_id"),
+            "agent_revision_id": item.get("agent_revision_id") or item.get("agent_revision"),
+            "project_id": item.get("project_id"),
+            "space_id": item.get("space_id"),
+            "persona_id": item.get("persona_id"),
+            "authority_resolver": self.authority_resolver,
+            "execution_guard": execution_guard,
         }
-        if mode == "reconcile":
+        if mode in {"reconcile", "recover"}:
             intent_hash = _id(payload.get("intent_request_hash"))
             if not intent_hash:
                 return MediaExecutionOutcome(status="blocked", reason_code="generation_intent_pin_missing")
             call_kwargs["expected_intent_request_hash"] = intent_hash
         try:
             result = await _call_compatible(method, kwargs=call_kwargs)
+            # A successful 73 submit commonly returns a durable run in
+            # ``queued``/``running``/``output_pending`` state.  The submit
+            # intent has already fenced duplicate provider calls, so poll the
+            # same opaque run through the explicit reconcile boundary instead
+            # of settling AgentWork as success with no usable output.
+            if mode == "submit" and isinstance(result, Mapping):
+                submitted_run = result.get("run")
+                submitted_status = str(
+                    _field(submitted_run, "status", "") or ""
+                ).strip().lower()
+                intent = result.get("intent")
+                intent_hash = _id(_field(intent, "request_hash"))
+                reconcile = _callable(
+                    self.service, "reconcile_generation_plan_for_agent"
+                )
+                if (
+                    submitted_status in {"draft", "claimed", "queued", "running", "output_pending"}
+                    and intent_hash
+                    and reconcile is not None
+                ):
+                    reconcile_kwargs = dict(call_kwargs)
+                    reconcile_kwargs.update(
+                        {
+                            "expected_intent_request_hash": intent_hash,
+                            "idempotency_key": (
+                                f"{_text(item.get('intent_key'), 220) or 'generation'}:reconcile"
+                            )[:255],
+                        }
+                    )
+                    result = await _call_compatible(
+                        reconcile, kwargs=reconcile_kwargs
+                    )
         except Exception as exc:
             # submit_generation_plan commits GenerationRunIntent before the
             # provider call.  Any exception afterward is ambiguous, not a
             # generic retry opportunity.
             name = exc.__class__.__name__.casefold()
-            if any(marker in name for marker in ("authorization", "validation", "notfound", "not_found")):
+            if any(
+                marker in name
+                for marker in (
+                    "authorization",
+                    "validation",
+                    "notfound",
+                    "not_found",
+                    "conflict",
+                    "stale",
+                )
+            ):
                 return MediaExecutionOutcome(
                     status="blocked",
                     reason_code=_safe_error_code(exc, "generation_authority_denied"),
@@ -972,7 +1186,158 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                 reason_code="generation_submit_outcome_unknown" if mode != "reconcile" else _safe_error_code(exc, "generation_reconcile_failed"),
                 domain_ref=plan_id,
             )
+        # ``pending``/``submitted`` with no local run is an ambiguous receipt
+        # after the provider boundary.  It is a read-only recovery state, not
+        # a human approval request; classify it before the generic result
+        # mapper (which intentionally treats pending as approval for other
+        # MediaOps domains).
+        if isinstance(result, Mapping):
+            receipt_recovery = result.get("receipt_recovery")
+            local_run = result.get("run")
+            intent_value = result.get("intent")
+            intent_status = str(
+                _field(intent_value, "status", "") or ""
+            ).strip().lower()
+            result_status = str(
+                result.get("status") or ""
+            ).strip().lower()
+            if (
+                local_run is None
+                and (
+                    receipt_recovery
+                    or (
+                        result_status in {"pending", "submitted"}
+                        and intent_status in {"pending", "submitted"}
+                    )
+                )
+            ):
+                recovery_reason = _text(
+                    _field(receipt_recovery, "reason_code"), 128
+                ) or "generation_receipt_pending"
+                return MediaExecutionOutcome(
+                    status="uncertain",
+                    reason_code=recovery_reason,
+                    result_summary="Generation receipt requires read-only reconciliation",
+                    domain_ref=plan_id,
+                    domain_status="receipt_pending",
+                    retryable=False,
+                )
+        receipt_evidence = (
+            result.get("_generation_receipt_evidence")
+            if isinstance(result, Mapping)
+            else None
+        )
         outcome = _safe_result(result, default_ref=plan_id)
+        latest_run = result.get("run") if isinstance(result, Mapping) else None
+        latest_run_status = str(
+            _field(latest_run, "status", "") or ""
+        ).strip().lower()
+        intent_status = str(
+            _field(result.get("intent") if isinstance(result, Mapping) else None, "status", "")
+            or ""
+        ).strip().lower()
+        recovery_marker = bool(
+            result.get("receipt_recovery") if isinstance(result, Mapping) else False
+        )
+        if latest_run_status in {
+            "draft",
+            "claimed",
+            "queued",
+            "running",
+            "output_pending",
+        } and (intent_status == "uncertain" or recovery_marker):
+            # The stale local status is the last known snapshot after a
+            # failed GET.  It is not evidence of current provider progress;
+            # keep the outcome uncertain so it cannot enter the 60-poll lane.
+            return MediaExecutionOutcome(
+                status="uncertain",
+                reason_code=(
+                    outcome.reason_code or "generation_recovery_lookup_unknown"
+                ),
+                result_summary=outcome.result_summary,
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status="receipt_pending",
+                evidence=outcome.evidence,
+                retryable=False,
+            )
+        if latest_run_status in {
+            "draft",
+            "claimed",
+            "queued",
+            "running",
+            "output_pending",
+        }:
+            return MediaExecutionOutcome(
+                status="transient",
+                reason_code="generation_run_in_progress",
+                result_summary=outcome.result_summary,
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status=latest_run_status,
+                evidence=outcome.evidence,
+                retryable=True,
+                retry_after_seconds=30,
+            )
+        if latest_run_status == "uncertain":
+            return MediaExecutionOutcome(
+                status="uncertain",
+                reason_code=outcome.reason_code or "generation_outcome_uncertain",
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status=latest_run_status,
+                evidence=outcome.evidence,
+            )
+        if latest_run_status in {"cancelled", "quarantined", "failed", "unavailable"}:
+            terminal_status = {
+                "cancelled": "cancelled",
+                "quarantined": "permanent",
+                "failed": "failed",
+                "unavailable": "blocked",
+            }[latest_run_status]
+            return MediaExecutionOutcome(
+                status=terminal_status,
+                reason_code=(
+                    outcome.reason_code
+                    or f"generation_run_{latest_run_status}"
+                ),
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status=latest_run_status,
+                evidence=outcome.evidence,
+            )
+        execution_guard_report = (
+            result.get("execution_guard") if isinstance(result, Mapping) else None
+        )
+        if str(
+            _field(execution_guard_report, "status", "") or ""
+        ).strip().lower() == "blocked":
+            return MediaExecutionOutcome(
+                status="blocked",
+                reason_code=(
+                    _text(_field(execution_guard_report, "reason_code"), 128)
+                    or "agent_execution_guard_denied"
+                ),
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status=outcome.domain_status,
+                evidence=outcome.evidence,
+            )
+        asset_ingest = result.get("asset_ingest") if isinstance(result, Mapping) else None
+        asset_status = str(
+            _field(asset_ingest, "status", "") or ""
+        ).strip().lower()
+        if asset_status in {"blocked", "failed", "transient"}:
+            return MediaExecutionOutcome(
+                status=asset_status,
+                reason_code=(
+                    _text(_field(asset_ingest, "reason_code"), 128)
+                    or (
+                        "generation_asset_ingest_transient"
+                        if asset_status == "transient"
+                        else "generation_asset_ingest_failed"
+                    )
+                ),
+                result_summary="Generation provider receipt succeeded but managed asset retrieval is incomplete",
+                domain_ref=outcome.domain_ref or plan_id,
+                domain_status=latest_run_status or outcome.domain_status,
+                evidence=outcome.evidence,
+            )
         if outcome.domain_status == "unavailable":
             return MediaExecutionOutcome(
                 status="blocked",
@@ -989,24 +1354,33 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                 domain_status=outcome.domain_status,
                 evidence=outcome.evidence,
             )
-        return outcome
+        return outcome.with_receipt_evidence(receipt_evidence)
 
 
 class MediaPublicationExecutionAdapter(MediaExecutionAdapter):
     """Create proposal-only ExternalActions and require human approval."""
 
     adapter_name = "media.publication"
-    CAPABILITIES = ("media",)
+    CAPABILITIES = ("media", "external_action_propose")
     adapter_key = "media.publication"
 
     def __init__(self, service: Any | None = None, **kwargs: Any) -> None:
+        provider_readiness = kwargs.pop("provider_readiness", None)
         if service is None:
             try:
                 service = import_module(
                     ".operations_service", package=__package__
-                ).OperationsService()
+                ).create_operations_service()
             except Exception:
                 service = None
+        if provider_readiness is None:
+            try:
+                provider_readiness = import_module(
+                    ".media_provider_readiness_service", package=__package__
+                ).MediaProviderReadinessService()
+            except Exception:
+                provider_readiness = None
+        self.provider_readiness = provider_readiness
         super().__init__(service, **kwargs)
 
     async def execute(
@@ -1134,10 +1508,35 @@ class MediaPublicationExecutionAdapter(MediaExecutionAdapter):
         if any(payload.get(name) in (None, "") for name in required):
             return MediaExecutionOutcome(status="blocked", reason_code="publication_binding_missing")
         platform = _text(payload.get("platform"), 32)
+        publication_payload = _safe_mapping(
+            payload.get("publication_payload") or {}, max_depth=2
+        )
+        from .media_publication_contract import publication_operation
+        provider_operation = publication_operation("media.publish_content", publication_payload)
+        provider_binding = None
+        resolver = _callable(self.provider_readiness, "resolve_execution_binding")
+        if resolver is not None and platform in {"x", "youtube"} and payload.get("platform_account_id"):
+            try:
+                provider_binding = await _call_compatible(
+                    resolver,
+                    kwargs={
+                        "session": session,
+                        "actor": actor,
+                        "account_id": _id(payload.get("platform_account_id")),
+                        "operation": provider_operation,
+                    },
+                )
+            except Exception:
+                # Readiness is advisory at proposal time.  Missing/stale scope
+                # evidence falls back to the audited manual path; it never
+                # grants provider authority or blocks proposal creation.
+                provider_binding = None
+        provider_ready = isinstance(provider_binding, Mapping)
         linked_run_id = _id(run_id) or _run_id(run) or await _active_run_id(
             session,
             item.get("work_item_id") or item.get("id"),
         )
+        intent_key = _text(item.get("intent_key"), 255) or "media-publication"
         try:
             result = await _call_compatible(
                 method,
@@ -1151,9 +1550,9 @@ class MediaPublicationExecutionAdapter(MediaExecutionAdapter):
                     "content_variant_revision_id": _id(payload.get("content_variant_revision_id")),
                     "persona_revision_id": _id(payload.get("persona_revision_id")),
                     "connection_id": _id(payload.get("connection_id")),
-                    "idempotency_key": _text(item.get("intent_key"), 255) or "media-publication",
+                    "idempotency_key": intent_key,
                     "platform": platform,
-                    "payload": _safe_mapping(payload.get("publication_payload") or {}, max_depth=2),
+                    "payload": publication_payload,
                     "artifact_hashes": list(payload.get("artifact_hashes") or [])[:MAX_EVIDENCE],
                     "project_id": _id(item.get("project_id")),
                     "content_item_hash": _id(payload.get("content_item_hash")),
@@ -1164,12 +1563,34 @@ class MediaPublicationExecutionAdapter(MediaExecutionAdapter):
                     "platform_account_id": _id(payload.get("platform_account_id")),
                     "platform_account_revision_id": _id(payload.get("platform_account_revision_id")),
                     "platform_account_revision_hash": _id(payload.get("platform_account_revision_hash")),
-                    "execution_mode": "manual",
+                    "execution_mode": "provider" if provider_ready else "manual",
+                    "capability_snapshot_id": (
+                        provider_binding.get("capability_snapshot_id")
+                        if provider_ready else None
+                    ),
+                    "capability_snapshot_hash": (
+                        provider_binding.get("capability_snapshot_hash")
+                        if provider_ready else None
+                    ),
+                    "adapter_key": (
+                        provider_binding.get("adapter_key") if provider_ready else None
+                    ),
+                    "adapter_version": (
+                        provider_binding.get("adapter_version") if provider_ready else None
+                    ),
+                    "credential_state_hash": (
+                        provider_binding.get("credential_state_hash")
+                        if provider_ready else None
+                    ),
+                    "execution_key": (
+                        f"{intent_key}:provider"[:255] if provider_ready else None
+                    ),
                     "adapter_target": {
                         "platform": platform,
-                        "status": "manual",
-                        "mode": "manual",
-                        "provider_calls": False,
+                        "status": "verified" if provider_ready else "manual",
+                        "mode": "provider" if provider_ready else "manual",
+                        "provider_calls": provider_ready,
+                        "operation": provider_operation,
                     },
                     "origin_agent_id": _id(item.get("assigned_agent_id") or item.get("agent_id")),
                     "origin_agent_run_id": linked_run_id or _id(item.get("origin_agent_run_id")),

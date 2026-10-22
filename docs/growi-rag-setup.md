@@ -1,7 +1,7 @@
 # 社内Wiki (GROWI) を RAG 取り込みする手順
 
 AoiTalk のナレッジソースに GROWI 社内Wiki を登録すると、Wiki ページの本文が
-bge-m3 + Qdrant のハイブリッド検索インデックスに取り込まれ、Agent の Knowledge 検索で
+EmbeddingGemma 2 + Qdrant のハイブリッド検索インデックスに取り込まれ、Agent の Knowledge 検索で
 出典URL付きの回答ができるようになります。
 
 ## 1. 情シス（IT 管理者）に依頼すること

@@ -18,7 +18,7 @@ const CHARACTER_CACHE_PREFIX = "aoitalk_character_profiles_v3";
  */
 export const OFFLINE_DEFAULT_CHARACTER: ManagedCharacter = {
   id: "offline-project-manager",
-  name: "案件管理アシスタント",
+  name: "シビュラ",
   slug: "project_manager",
   character_type: "assistant",
   description: "案件・タスク・予定の整理を支援する標準キャラクターです。",
@@ -28,13 +28,18 @@ export const OFFLINE_DEFAULT_CHARACTER: ManagedCharacter = {
   invalid_content_reply: "その内容は扱えない。別の形で整理しよう。",
   fallback_reply: "うまく整理できなかった。対象案件か、やりたい操作をもう少し具体的に教えて。",
   goodbye_reply: "また必要になったら呼んで。",
-  recognition_aliases: ["案件管理", "案件管理アシスタント", "プロジェクト管理", "進行管理", "PM"],
+  recognition_aliases: ["シビュラ", "案件管理", "案件管理アシスタント", "プロジェクト管理", "進行管理", "PM"],
   is_enabled: true,
 };
 
 type CharacterCache = {
   cached_at: string;
   characters: ManagedCharacter[];
+};
+
+export type CharacterProfileCacheScope = {
+  authScope?: string | null;
+  serverIdentity?: string | null;
 };
 
 export class CharacterSlugRequiredError extends Error {
@@ -61,12 +66,30 @@ function isManagedCharacter(value: unknown): value is ManagedCharacter {
   );
 }
 
-async function characterCacheKey(enabledOnly: boolean): Promise<string> {
-  const [baseUrl, token] = await Promise.all([getConfiguredApiServerFingerprint(), getToken()]);
-  const normalizedBaseUrl = normalizeApiUrl(baseUrl).toLowerCase();
-  const authScope = getTokenAuthScope(token);
+async function resolveCharacterCacheScope(
+  scope: CharacterProfileCacheScope = {},
+): Promise<{ server: string; authScope: string }> {
+  const explicitServer = String(scope.serverIdentity ?? "").trim();
+  const explicitAuthScope = String(scope.authScope ?? "").trim();
+  const [configuredServer, token] = await Promise.all([
+    explicitServer
+      ? Promise.resolve(explicitServer)
+      : getConfiguredApiServerFingerprint(),
+    explicitAuthScope ? Promise.resolve<string | null>(null) : getToken(),
+  ]);
+  return {
+    server: normalizeApiUrl(configuredServer).toLowerCase(),
+    authScope: explicitAuthScope || getTokenAuthScope(token),
+  };
+}
+
+async function characterCacheKey(
+  enabledOnly: boolean,
+  scope: CharacterProfileCacheScope = {},
+): Promise<string> {
+  const resolved = await resolveCharacterCacheScope(scope);
   const mode = enabledOnly ? "enabled" : "all";
-  return `${CHARACTER_CACHE_PREFIX}:${encodeURIComponent(normalizedBaseUrl)}:${encodeURIComponent(authScope)}:${mode}`;
+  return `${CHARACTER_CACHE_PREFIX}:${encodeURIComponent(resolved.server)}:${encodeURIComponent(resolved.authScope)}:${mode}`;
 }
 
 async function cacheCharacters(
@@ -99,15 +122,27 @@ async function readCachedCharacters(
 
 // 旧版の経路別キャッシュを、現在設定されている同一サーバーの候補からのみ移行する。
 // 到達性probeやHTTP要求は行わない。新形式が存在する場合、古い定義を復活させない。
-async function readProfileCache(enabledOnly: boolean): Promise<ManagedCharacter[]> {
-  const key = await characterCacheKey(enabledOnly);
+async function readProfileCache(
+  enabledOnly: boolean,
+  scope: CharacterProfileCacheScope = {},
+): Promise<ManagedCharacter[]> {
+  const key = await characterCacheKey(enabledOnly, scope);
   if (await AsyncStorage.getItem(key)) return readCachedCharacters(key);
-  const [server, token, routing] = await Promise.all([
-    getConfiguredApiServerFingerprint(), getToken(), getNetworkEndpointRoutingConfig(),
+
+  const [resolved, configuredServer, routing] = await Promise.all([
+    resolveCharacterCacheScope(scope),
+    getConfiguredApiServerFingerprint(),
+    getNetworkEndpointRoutingConfig(),
   ]);
-  const candidates = [server, ...(routing.enabled ? [routing.wifiApiUrl, routing.cellularApiUrl] : [])];
+  const normalizedConfiguredServer = normalizeApiUrl(configuredServer).toLowerCase();
+  const candidates = [
+    resolved.server,
+    ...(resolved.server === normalizedConfiguredServer && routing.enabled
+      ? [routing.wifiApiUrl, routing.cellularApiUrl]
+      : []),
+  ];
   for (const url of candidates.filter(Boolean)) {
-    const oldKey = `aoitalk_character_profiles_v2:${encodeURIComponent(normalizeApiUrl(url).toLowerCase())}:${encodeURIComponent(getTokenAuthScope(token))}:${enabledOnly ? "enabled" : "all"}`;
+    const oldKey = `aoitalk_character_profiles_v2:${encodeURIComponent(normalizeApiUrl(url).toLowerCase())}:${encodeURIComponent(resolved.authScope)}:${enabledOnly ? "enabled" : "all"}`;
     const cached = await readCachedCharacters(oldKey);
     if (cached.length) {
       await cacheCharacters(key, cached);
@@ -120,14 +155,18 @@ async function readProfileCache(enabledOnly: boolean): Promise<ManagedCharacter[
 async function readOfflineCharacters(
   enabledOnly: boolean,
   savedSlug?: string | null,
+  scope: CharacterProfileCacheScope = {},
 ): Promise<ManagedCharacter[]> {
   let cached: ManagedCharacter[] = [];
   try {
     // full cacheを読むことで、enabled_only取得だけを先に行った端末でも
     // ローカル一覧の組み立ては常に同じになる。
-    cached = await readProfileCache(false);
-    if (!cached.length && !(await AsyncStorage.getItem(await characterCacheKey(false)))) {
-      cached = await readProfileCache(true);
+    cached = await readProfileCache(false, scope);
+    if (
+      !cached.length &&
+      !(await AsyncStorage.getItem(await characterCacheKey(false, scope)))
+    ) {
+      cached = await readProfileCache(true, scope);
     }
   } catch {
     // SecureStore/AsyncStorageの読み取り失敗でも同梱定義は返す。
@@ -225,9 +264,12 @@ export const characterApi = {
   },
 
   /** Directは端末の完全な定義だけで開始する。保存slugの表示用placeholderは使わない。 */
-  async getDirectProfile(slug: string): Promise<ManagedCharacter | null> {
+  async getDirectProfile(
+    slug: string,
+    scope: CharacterProfileCacheScope = {},
+  ): Promise<ManagedCharacter | null> {
     const normalized = requireCharacterSlug(slug);
-    const characters = await readOfflineCharacters(false);
+    const characters = await readOfflineCharacters(false, undefined, scope);
     return characters.find((character) =>
       character.slug === normalized && character.is_enabled !== false,
     ) ?? null;

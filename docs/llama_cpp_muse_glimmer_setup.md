@@ -2,7 +2,7 @@
 
 AoiTalk の `openai_compatible_local` から、所有プロセスとして汎用の
 `llama-server` を起動し、ローカル GGUF モデルを OpenAI 互換 API として使う手順です。
-Muse Glimmer、Qwen3.8、Gemma 4、Dark Scarlett は同じ `llama_cpp` runtime を共有します。Ollama、
+Muse Glimmer、Qwen3.8、Hemmingway-1、Gemma 4、Dark Scarlett は同じ `llama_cpp` runtime を共有します。Ollama、
 第三者製の OpenAI 互換サーバーはこの手順の対象外です。
 
 ## 1. プロファイルと runtime
@@ -21,6 +21,7 @@ profile を 1 件追加するだけで登録できます。既存の `local-mode
 | `muse-glimmer-30b` | `muse-glimmer-30B-kquant-17gb.gguf` | 公式 k-quant 17GB（公式 repo に literal `Q4_K_M` はない） | 131072 | profile に記載なし | b10353 以上 | `--jinja`、text-only |
 | `qwen3.8-27b` | `Qwen3.8-27B-UD-Q4_K_XL.gguf` + `mmproj-F16.gguf` | UD-Q4_K_XL | **32768（AoiTalk の tested default）** | **262144** | b7990 以上。reasoning/tool parser は b10227 以上 | `--jinja`、reasoning / tool calling、**image 対応**。managed runtime が `--mmproj` を付与 |
 | `qwen3.8-27b-heretic-uncensored` | `Qwen3.8-27B-Heretic-Q4_K_M.gguf` | Q4_K_M | **32768（AoiTalk の tested default）** | **262144** | b7990 以上。reasoning/tool parser は b10227 以上 | `--jinja`、reasoning / tool calling。media は非対応 |
+| `hemmingway-1` | `Altworld_Hemmingway-1-Q4_K_M.gguf` | Q4_K_M | **32768** | **262144** | **b10964 以上** | `--jinja`、reasoning / tool calling、text-only。primary GGUF内蔵MTPを既定ON |
 | `qwen3.8-flash-next` | `Qwen3.8-Flash-Next-UD-IQ4_XS` 3-shard | UD-IQ4_XS | **16384** | **262144** | llama.cpp b10660 以上 | `--jinja`、text-only |
 | `qwen3.8-flash-next-uncensored` | `Qwen3.8-Flash-Next-Uncensored-IQ4_XS` 3-shard | IQ4_XS | **16384** | **262144** | llama.cpp b10660 以上 | `--jinja`、text-only。mmproj / vision / MTP なし |
 | `gemma-4-26b-a4b-it-qat-q4-0` | `gemma-4-26B_q4_0-it.gguf` | QAT Q4_0 | **32768** | **262144** | b8637 以上。reasoning/tool parser は [b8665](https://github.com/ggml-org/llama.cpp/releases/tag/b8665) 以上 | `--jinja`、reasoning / tool calling。media は非対応 |
@@ -33,14 +34,20 @@ parser が入った b10227 以上を使ってください。AoiTalk は環境ご
 `context_size` を変更できますが、32768 を 262144 と取り違えないでください。後者は
 モデルの native metadata であり、常に起動する値ではありません。
 
+Hemmingway-1 は Qwen3.8-27B 派生ですが、配布GGUFのMTP contractを含めてb10964で
+量子化されたartifactです。AoiTalkはこのprofileだけを保守的にb10964以上へ固定します。
+詳細は [Hemmingway-1 managed setup](llama_cpp_hemmingway1_setup.md) を参照してください。
+
 ## 2. llama.cpp の準備
 
-AoiTalk の既定 managed storage は repository-local の Git 非追跡領域です。runtime は
+AoiTalk の互換既定 managed storage は repository-local の Git 非追跡領域です。runtime は
 `<repository>/.aoitalk-local-llm/runtime/runtimes/llama_cpp/current`、llama.cpp の
 managed model は `<repository>/.aoitalk-local-llm/models/llama_cpp` に分離されます。
-Settings の `model_root` から任意の外部 directory を指定できます。この端末固有の
-absolute path は documentation や tracked config に記録しません。QA helper / logs は
-repository の既存の ignored な QA 領域へ置きます。
+容量を管理する継続運用端末では、managed prepareの前にSettingsまたは
+`LLAMA_CPP_MODEL_ROOT`で外部物理directoryを指定し、必要に応じて
+`AOITALK_REQUIRE_EXTERNAL_LLM_MODEL_ROOT=true`でrepository-local fallbackを禁止します。
+保存先と移設の正本は [ローカルLLMストレージ運用規約](local_llm_storage_policy.md) です。
+QA helper / logs はrepositoryの既存のignoredなQA領域へ置きます。
 
 1. AoiTalk の通常セットアップ（[セットアップガイド](setup_guide.md)）を完了します。
 2. [llama.cpp の公式 Releases](https://github.com/ggml-org/llama.cpp/releases) から
@@ -52,6 +59,7 @@ repository の既存の ignored な QA 領域へ置きます。
    - Muse Glimmer: **b10353 以上**
    - Dark Scarlett 27B v2.0: **b10227 以上**（AoiTalkのconservative profile floor。b10437でmain+mmprojの画像入力を実測確認）
    - Qwen3.8-Flash-Next / Uncensored: **b10660 以上**
+   - Hemmingway-1: **b10964 以上**（primary GGUF内蔵MTPを含むprofile-local floor）
 現行 llama.cpp の multimodal 契約では、local file は `-m model.gguf --mmproj file.gguf` で
 本体と projector を指定し、`llama-server` の OpenAI-compatible `/chat/completions` が画像入力を
 受けます。AoiTalk の managed profile はこの `--mmproj` を generic auxiliary artifact から組み立てます。
@@ -172,9 +180,10 @@ MTP artifact/flag は今回管理しません。`--model` には primary（`0000
 
 managed runtime root の既定値は `<repository>/.aoitalk-local-llm/runtime` です。
 AoiTalk はその配下の `runtimes/llama_cpp/current` を llama-server の managed install
-として扱い、約 97.47 GB のGGUF artifact と一時領域は、分離された `model_root`
-（既定値: `<repository>/.aoitalk-local-llm/models/llama_cpp`）へ保存します。
-容量や既存モデルを優先する場合は Settings の model root に外部 directory を指定してください。
+として扱い、約 97.47 GB のGGUF artifact と一時領域は、分離された `model_root`へ
+保存します。継続運用端末ではrepository-local既定値を使わず、
+[ローカルLLMストレージ運用規約](local_llm_storage_policy.md)に従って、十分な空き容量を持つ
+外部物理directoryをprepare前に設定してください。
 
 ## 3.5 Dark Scarlett を使う場合
 
@@ -239,11 +248,12 @@ AoiTalk repository、Public publish、Enterprise handoffへ同梱・再配布し
 
 「設定 → LLM」で provider に **`openai_compatible_local`**、model に通常版
 **`qwen3.8-27b`**、Heretic 版 **`qwen3.8-27b-heretic-uncensored`**、または
-Flash-Next aligned 版 **`qwen3.8-flash-next`**、Dark Scarlett 27B v2.0
+Flash-Next aligned 版 **`qwen3.8-flash-next`**、Hemmingway-1 **`hemmingway-1`**、Dark Scarlett 27B v2.0
 **`dark-scarlett-27b-v2.0`**、Dark Scarlett 26B A4B v1.0
 **`dark-scarlett-26b-a4b-v1.0`** を選択します。
 表示名は「Qwen3.8-27B 通常版 UD-Q4_K_XL」と「Qwen3.8-27B Heretic Abliterated
 Uncensored Q4_K_M」、および「Qwen3.8-Flash-Next Uncensored IQ4_XS」で区別します。
+Hemmingway-1の表示名は「Hemmingway-1 27B Q4_K_M」です。
 Dark Scarlett は「Dark Scarlett 27B v2.0 Q4_K_M」と「Dark Scarlett 26B-A4B v1.0
 Q4_K_M」で区別します。aligned `qwen3.8-flash-next` と OrcaRouter 版 `qwen3.8-flash-next-uncensored` は
 別 profile / served alias です。各 Qwen profile の `served_alias` も同じ文字列です。
@@ -252,13 +262,13 @@ Q4_K_M」で区別します。aligned `qwen3.8-flash-next` と OrcaRouter 版 `q
 | --- | --- | --- | --- |
 | 実行ファイル | `executable` | 空欄（`PATH`） | `llama-server(.exe)`。見つからない場合は絶対パス。 |
 | モデルパス | `model_path` | **必須（managed起動）** | 上記 GGUF の絶対パス。HF cache の場所も可。 |
-| モデルroot | `model_root` / `LLAMA_CPP_MODEL_ROOT` | `<repository>/.aoitalk-local-llm/models/llama_cpp` | 手動配置した profile の正確な GGUF filename を探す directory。Settings の model root override は trusted managed profile の保存先にもなります。外部 `local-model` / 任意手動 path は自動取得しません。 |
+| モデルroot | `model_root` / `LLAMA_CPP_MODEL_ROOT` | 互換既定は`<repository>/.aoitalk-local-llm/models/llama_cpp`。継続運用は外部root必須 | 手動配置したprofileの正確なGGUF filenameを探すdirectory。Settingsのoverrideはtrusted managed profileの保存先にもなります。[保存先規約](local_llm_storage_policy.md)に従い、外部`local-model` / 任意手動pathは自動取得しません。 |
 | runtime root | `openai_compatible_local.runtime_root` | `<repository>/.aoitalk-local-llm/runtime` | manager が `runtimes/llama_cpp/current` に llama-server executable を管理します。モデルrootとは分離します。 |
-| served alias | `model_alias` | `qwen3.8-27b`、`qwen3.8-27b-heretic-uncensored`、`qwen3.8-flash-next`、`qwen3.8-flash-next-uncensored`、`dark-scarlett-27b-v2.0`、または `dark-scarlett-26b-a4b-v1.0` | `/v1/models` の `data[].id` と完全一致。profile 管理対象では編集不可。 |
+| served alias | `model_alias` | `qwen3.8-27b`、`qwen3.8-27b-heretic-uncensored`、`qwen3.8-flash-next`、`qwen3.8-flash-next-uncensored`、`hemmingway-1`、`dark-scarlett-27b-v2.0`、または `dark-scarlett-26b-a4b-v1.0` | `/v1/models` の `data[].id` と完全一致。profile 管理対象では編集不可。 |
 | host / port | `host` / `port` | `127.0.0.1` / `8080` | Base URL は `http://127.0.0.1:8080/v1`。 |
-| context | `context_size` | **32768（Qwen3.8-27B／Dark Scarlett）／16384（Flash-Next）** | tested default。262144 native は必要な場合だけ、メモリを確認して指定。 |
-| GPU offload | `gpu_layers` | `999（Qwen3.8-27B／Dark Scarlett）／auto（Flash-Next）` | `--n-gpu-layers`。VRAM 不足時は下げ、CPU のみなら 0。 |
-| MTP / Multi-Token Prediction | `mtp_enabled` | Qwen3.8-27B は **ON**、Flash-Next は **OFF**、Dark Scarlett は **非対応** | Qwen の既存契約だけが MTP artifact を扱います。Dark Scarlett には MTP flags を追加しません。 |
+| context | `context_size` | **32768（Qwen3.8-27B／Hemmingway-1／Dark Scarlett）／16384（Flash-Next）** | tested default。262144 native は必要な場合だけ、メモリを確認して指定。 |
+| GPU offload | `gpu_layers` | `999（Qwen3.8-27B／Hemmingway-1／Dark Scarlett）／auto（Flash-Next）` | `--n-gpu-layers`。VRAM 不足時は下げ、CPU のみなら 0。 |
+| MTP / Multi-Token Prediction | `mtp_enabled` | Qwen3.8-27B／Hemmingway-1 は **ON**、Flash-Next は **OFF**、Dark Scarlett は **非対応** | Hemmingway-1はprimary GGUF内蔵MTPで、別sidecarを使いません。 |
 | 追加引数 | `extra_args` | `[]`（profile の required/default は `--jinja`） | `--model`、`--alias`、`--host`、`--port`、`--ctx-size`、`--n-gpu-layers` は重複指定しない。`--jinja` も重複させない。 |
 | auto-start | `auto_start` | `true` | 選択 profile の `llama-server` を AoiTalk が所有・起動。 |
 | readiness timeout | `readiness_timeout` | `180` 秒 | `/v1/models` に alias が現れるまで。`readiness_timeout_seconds` も可。 |
@@ -266,6 +276,12 @@ Q4_K_M」で区別します。aligned `qwen3.8-flash-next` と OrcaRouter 版 `q
 `base_url` は host/port から自動反映されます。手動起動した外部サーバーへ接続する
 場合は `auto_start=false` とし、同じポートで AoiTalk が別プロセスを起動しないように
 します。
+
+### Hemmingway-1 の primary内蔵MTP
+
+Hemmingway-1は同じ `Altworld_Hemmingway-1-Q4_K_M.gguf` にMTP layersを含みます。
+MTP ONかつruntime build/capabilityを確認できた場合だけ `--spec-type draft-mtp` を追加し、
+`--spec-draft-model` は追加しません。OFFまたは未確認時はprimary GGUFの通常推論へ安全に戻ります。
 
 ### Qwen3.8-27B の MTP / Multi-Token Prediction
 
@@ -453,6 +469,8 @@ profile と異なる場合は、外部 server を自分で停止するか、host
 
 | 根拠 | 確認した内容（短い原文） |
 | --- | --- |
+| [Hemmingway-1 base card / LICENSE](https://huggingface.co/Altworld/Hemmingway-1) / [GGUF card](https://huggingface.co/bartowski/Altworld_Hemmingway-1-GGUF) | 27B、262144 context、English-first writing fine-tune。現行upstream weightsはCC BY-NC 4.0（商用利用は別途合意）。固定GGUF cardには古いApache-2.0 metadataが残る。GGUFは`Q4_K_M`、llama.cpp `b10964`、MTP layers内蔵、`--spec-type draft-mtp`を明記。 |
+| [Hemmingway-1 GGUF API](https://huggingface.co/api/models/bartowski/Altworld_Hemmingway-1-GGUF?blobs=true) | revision `259605e...`、exact size `17,442,400,320`、SHA-256 `c029ba6c...7085e`、architecture `qwen35`、context `262144`。 |
 | [unsloth HF README](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | 原文: `a native vision-language model that understands images and videos` / `Vision-Language Understanding: Native support for image and video understanding`。`UD-Q4_K_XL` と mmproj 配布も確認。 |
 | [unsloth HF Files/API](https://huggingface.co/api/models/unsloth/Qwen3.8-27B-GGUF) | 実ファイル `Qwen3.8-27B-UD-Q4_K_XL.gguf`、architecture `qwen35`、`context_length: 262144`、chat template。 |
 | [Unsloth Qwen3.8 実行ガイド](https://unsloth.ai/docs/models/qwen3.8) | `hf download ... --include "*UD-Q4_K_XL*"` と `Qwen3.8-27B-UD-Q4_K_XL.gguf` を標準 llama.cpp で実行。IQ1_XXXS 専用 branch は 2.4T 向け。 |

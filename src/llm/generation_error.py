@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, Optional
 
 
@@ -26,13 +27,18 @@ class GenerationErrorKind:
     AUTHENTICATION = "authentication"
     PERMISSION_DENIED = "permission_denied"
     MODEL_NOT_FOUND = "model_not_found"
+    PRICE_LIMIT = "price_limit"
     INVALID_REQUEST = "invalid_request"
     CONTEXT_LENGTH = "context_length"
     CONNECTION = "connection"
     TIMEOUT = "timeout"
     SERVER_ERROR = "server_error"
     EMPTY_RESPONSE = "empty_response"
+    OUTPUT_INCOMPLETE = "output_incomplete"
     LLM_NOT_CONFIGURED = "llm_not_configured"
+    TOOL_FAILURE_CIRCUIT_OPEN = "tool_failure_circuit_open"
+    TOOL_EXECUTION_BLOCKED = "tool_execution_blocked"
+    READ_STAGNATION = "read_stagnation"
     UNKNOWN = "unknown"
 
 
@@ -52,6 +58,10 @@ _USER_MESSAGES: Dict[str, str] = {
     GenerationErrorKind.PERMISSION_DENIED: (
         "このAPIキーでは指定されたモデルまたは機能を利用する権限がありません。"
         "OpenAIのプロジェクト権限とモデル設定を確認してください。"
+    ),
+    GenerationErrorKind.PRICE_LIMIT: (
+        "指定された上限価格を満たす接続先がありません。"
+        "モデルと価格条件を確認してください。"
     ),
     GenerationErrorKind.MODEL_NOT_FOUND: (
         "指定されたモデルが利用できません。モデル設定を確認してください。"
@@ -79,9 +89,25 @@ _USER_MESSAGES: Dict[str, str] = {
     GenerationErrorKind.EMPTY_RESPONSE: (
         "モデルから応答が返りませんでした。しばらく待ってから再試行してください。"
     ),
+    GenerationErrorKind.OUTPUT_INCOMPLETE: (
+        "モデルの出力が上限で打ち切られたか本文が空だったため、結果を保存しませんでした。"
+        "出力上限・推論強度の設定を確認してから再試行してください。"
+    ),
     GenerationErrorKind.LLM_NOT_CONFIGURED: (
         "クリップ取り込み用LLMが設定されていません。"
         "管理者にLLM設定を確認してください。"
+    ),
+    GenerationErrorKind.TOOL_FAILURE_CIRCUIT_OPEN: (
+        "同じツールの失敗が繰り返されたため、自動処理を停止しました。"
+        "途中の結果と保存状態を確認してください。"
+    ),
+    GenerationErrorKind.READ_STAGNATION: (
+        "新しい情報が得られない読取が繰り返され、変更や検証に進めなかったため、自動処理を停止しました。"
+        "ここまでの調査結果と未達の内容を確認してください。"
+    ),
+    GenerationErrorKind.TOOL_EXECUTION_BLOCKED: (
+        "ツール実行が許可されていないため、自動処理を停止しました。"
+        "権限・承認状態を確認してください。"
     ),
 }
 
@@ -114,12 +140,121 @@ class GenerationFailure:
         return self.kind == GenerationErrorKind.EMPTY_RESPONSE
 
 
+class ModelOutputIncompleteError(RuntimeError):
+    """A helper model call returned a truncated or empty body.
+
+    Callers must not substitute a fixed fallback for this error: the request
+    was accepted and billed, but the requested artifact was never produced.
+    """
+
+    def __init__(self, reason: str, *, transport: str, request_type: str = "") -> None:
+        self.reason = str(reason or "unknown")
+        self.transport = str(transport or "")
+        self.request_type = str(request_type or "")
+        super().__init__(
+            f"model output incomplete: reason={self.reason} "
+            f"transport={self.transport} request_type={self.request_type}"
+        )
+
+
+def _response_field(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def require_complete_model_output(
+    response: Any,
+    text: str,
+    *,
+    transport: str,
+    request_type: str = "",
+) -> str:
+    """Return ``text`` only when the provider reports a complete, non-empty body.
+
+    Responses API: ``status == "incomplete"`` (e.g. ``incomplete_details.reason
+    == "max_output_tokens"`` when reasoning consumed the output budget).
+    Chat Completions: ``finish_reason == "length"``.
+    """
+
+    if transport == "openai.responses":
+        if str(_response_field(response, "status") or "") == "incomplete":
+            details = _response_field(response, "incomplete_details")
+            reason = str(_response_field(details, "reason") or "incomplete")
+            raise ModelOutputIncompleteError(reason, transport=transport, request_type=request_type)
+    else:
+        choices = _response_field(response, "choices") or []
+        first = choices[0] if choices else None
+        if first is not None and str(_response_field(first, "finish_reason") or "") == "length":
+            raise ModelOutputIncompleteError("length", transport=transport, request_type=request_type)
+    if not str(text or "").strip():
+        raise ModelOutputIncompleteError("empty_output", transport=transport, request_type=request_type)
+    return text
+
+
 def empty_response_failure() -> GenerationFailure:
     """例外ではなく純粋に空応答だった場合の分類結果。"""
     return GenerationFailure(
         kind=GenerationErrorKind.EMPTY_RESPONSE,
         user_message=_USER_MESSAGES[GenerationErrorKind.EMPTY_RESPONSE],
         technical_detail="Assistant generation returned no response (empty response)",
+    )
+
+
+def tool_failure_circuit_open_failure(
+    *,
+    family: str,
+    signature: str = "",
+) -> GenerationFailure:
+    """Return the terminal failure for a framework-owned tool circuit.
+
+    ``family`` and ``signature`` are already normalized by the breaker.  Keep
+    the technical detail limited to those bounded identifiers so provider or
+    tool output can never be copied into a persisted generation failure.
+    """
+
+    safe_family = str(family or "unknown").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,127}", safe_family):
+        safe_family = "unknown"
+    safe_signature = str(signature or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,255}", safe_signature):
+        safe_signature = ""
+    detail = f"tool_failure_circuit_open family={safe_family}"
+    if safe_signature:
+        detail += f" signature={safe_signature}"
+    return GenerationFailure(
+        kind=GenerationErrorKind.TOOL_FAILURE_CIRCUIT_OPEN,
+        user_message=_USER_MESSAGES[GenerationErrorKind.TOOL_FAILURE_CIRCUIT_OPEN],
+        technical_detail=detail,
+    )
+
+
+def read_stagnation_failure(*, signature: str = "") -> GenerationFailure:
+    """Return the terminal checkpoint failure for repeated no-new-information reads."""
+
+    safe_signature = str(signature or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,255}", safe_signature):
+        safe_signature = ""
+    detail = "read_stagnation"
+    if safe_signature:
+        detail += f" signature={safe_signature}"
+    return GenerationFailure(
+        kind=GenerationErrorKind.READ_STAGNATION,
+        user_message=_USER_MESSAGES[GenerationErrorKind.READ_STAGNATION],
+        technical_detail=detail,
+    )
+
+
+def tool_execution_blocked_failure(*, source: str) -> GenerationFailure:
+    """Return a safe terminal failure for a framework-owned execution block."""
+
+    safe_source = str(source or "framework").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,63}", safe_source):
+        safe_source = "framework"
+    return GenerationFailure(
+        kind=GenerationErrorKind.TOOL_EXECUTION_BLOCKED,
+        user_message=_USER_MESSAGES[GenerationErrorKind.TOOL_EXECUTION_BLOCKED],
+        technical_detail=f"tool_execution_blocked source={safe_source}",
     )
 
 
@@ -225,6 +360,23 @@ def _classify_by_code(code: str) -> Optional[str]:
     return None
 
 
+
+def _is_price_routing_failure(exc: BaseException) -> bool:
+    """A routing 404 is not proof that the requested model does not exist."""
+    if _status_code(exc) != 404:
+        return False
+    payload = _error_payload(exc)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        step = metadata.get("failed_routing_step")
+        if isinstance(step, str) and step.strip().lower() == "filter by max price":
+            return True
+    # Narrow phrase only, including gateways that flatten their JSON body.
+    marker = "no endpoints found that satisfy the max price for this request"
+    message = payload.get("message")
+    return (isinstance(message, str) and marker in message.lower()) or marker in str(exc).lower()
+
+
 def _classify_by_status(status: Optional[int]) -> Optional[str]:
     if status is None:
         return None
@@ -294,9 +446,17 @@ def classify_generation_error(exc: BaseException) -> GenerationFailure:
         GenerationFailure: 種別・ユーザー向け日本語文言・技術詳細。
     """
     technical_detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, ModelOutputIncompleteError):
+        return GenerationFailure(
+            kind=GenerationErrorKind.OUTPUT_INCOMPLETE,
+            user_message=_USER_MESSAGES[GenerationErrorKind.OUTPUT_INCOMPLETE],
+            technical_detail=technical_detail,
+        )
 
     # code / type による判別を最優先する（429 の意味分岐がここに依存する）。
     kind = _classify_by_code(_error_code(exc))
+    if kind in (None, GenerationErrorKind.MODEL_NOT_FOUND) and _is_price_routing_failure(exc):
+        kind = GenerationErrorKind.PRICE_LIMIT
     if kind is None:
         kind = _classify_by_exception_type(exc)
     if kind is None:

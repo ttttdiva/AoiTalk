@@ -35,6 +35,7 @@ const folderPath = `${rootPath}/docs`;
 const textPath = `${rootPath}/notes.txt`;
 const imagePath = `${rootPath}/cover.png`;
 const outsideFolderTextPath = `${folderPath}/guide.md`;
+const customIconBookmarkName = "Guide favorite";
 const recordPath = `aoitalk-record-table:${project.id}:table-1`;
 const root2Path = `_projects/project_${project2.id}`;
 const userRootPath = `_users/user_${E2E_USER_ID}`;
@@ -48,6 +49,7 @@ type Bookmark = {
   path: string;
   sort_order: number;
   kind?: "bookmark" | "folder";
+  icon?: string;
   parent_id?: string | null;
 };
 
@@ -86,6 +88,14 @@ async function mockFilesApis(page: import("@playwright/test").Page) {
         name: "Second project root",
         path: root2Path,
         sort_order: 1,
+      },
+      {
+        id: "bookmark-custom-icon",
+        user_id: E2E_USER_ID,
+        name: customIconBookmarkName,
+        path: outsideFolderTextPath,
+        sort_order: 2,
+        icon: "⭐",
       },
     ],
     launchers: [
@@ -279,6 +289,31 @@ async function mockFilesApis(page: import("@playwright/test").Page) {
       });
       return;
     }
+    if (url.pathname === "/api/python-proxy/explorer/info") {
+      const requestedPath = url.searchParams.get("path") || rootPath;
+      const fileNames = new Map<string, string>([
+        [textPath, "notes.txt"],
+        [imagePath, projectImage.name],
+        [outsideFolderTextPath, "guide.md"],
+        [userTextPath, "todo.txt"],
+      ]);
+      const name = fileNames.get(requestedPath) ??
+        requestedPath.split(/[\\/]/).filter(Boolean).pop() ??
+        requestedPath;
+      await route.fulfill({
+        json: {
+          success: true,
+          name,
+          path: requestedPath,
+          is_directory: !fileNames.has(requestedPath),
+          size_bytes: 0,
+          size_display: "0 B",
+          created_at: "2026-01-01T00:00:00Z",
+          modified_at: "2026-01-01T00:00:00Z",
+        },
+      });
+      return;
+    }
     if (
       (url.pathname === "/api/python-proxy/explorer/rename" ||
         url.pathname === `/api/python-proxy/projects/${project.id}/files/rename`) &&
@@ -332,6 +367,7 @@ async function mockFilesApis(page: import("@playwright/test").Page) {
           path: body.path,
           sort_order: state.bookmarks.length,
           kind: body.kind ?? "bookmark",
+          icon: body.icon,
           parent_id: body.parent_id ?? null,
         };
         state.bookmarks.push(bookmark);
@@ -409,13 +445,8 @@ async function mockFilesApis(page: import("@playwright/test").Page) {
       await route.fulfill({ status: 503, json: { ok: false } });
       return;
     }
-    if (url.pathname === "/api/hydrus/settings") {
-      await route.fulfill({ json: { success: true, settings: {} } });
-      return;
-    }
-
-    // HF root/accounts and unrelated shell requests are intentionally empty in
-    // this stateful smoke fixture; the Files tab still renders its bookmark UI.
+    // Unrelated shell requests are intentionally empty in this stateful smoke
+    // fixture; the Files tab still renders its bookmark UI.
     await route.fulfill({ json: {} });
   });
 }
@@ -495,23 +526,6 @@ test.describe("Files bookmark/launcher sidebar", () => {
     await expect(page.locator('[data-shell-region="files-canvas"]')).toBeFocused();
   });
 
-  test("hides launchers for HF and Hydrus while keeping bookmarks available", async ({ page }) => {
-    await page.goto("/filer");
-    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
-    await expect(sidebar).toBeVisible();
-
-    await page.getByRole("button", { name: "HF", exact: true }).click();
-    await expect(sidebar.getByRole("tab", { name: /ブックマーク/ })).toBeVisible();
-    await expect(sidebar.getByRole("tab", { name: /ランチャー/ })).toHaveCount(0);
-
-    await page.getByRole("button", { name: "Hydrus", exact: true }).click();
-    await expect(sidebar.getByRole("tab", { name: /ブックマーク/ })).toBeVisible();
-    await expect(sidebar.getByRole("tab", { name: /ランチャー/ })).toHaveCount(0);
-
-    await page.getByRole("button", { name: "Project Files", exact: true }).click();
-    await expect(sidebar.getByRole("tab", { name: /ランチャー/ })).toBeVisible();
-  });
-
   test("accepts folder drops into bookmarks and file drops into launchers", async ({ page }) => {
     await page.goto("/filer");
     const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
@@ -541,6 +555,205 @@ test.describe("Files bookmark/launcher sidebar", () => {
     await expect(sidebar.getByRole("option", { name: "cover.png" })).toBeVisible();
     await expect(page.locator(`[data-explorer-item-path="${imagePath}"]`)).toBeVisible();
     expect(sourceMutationRequests).toEqual([]);
+  });
+
+  test("adds mixed folder and file drops to bookmarks with independent metadata", async ({ page }) => {
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const bookmarkPosts: Array<{ path?: string; name?: string; icon?: string }> = [];
+    const sourceMutationRequests: string[] = [];
+    page.on("request", (request) => {
+      const pathname = new URL(request.url()).pathname;
+      if (pathname.endsWith("/explorer/bookmarks") && request.method() === "POST") {
+        bookmarkPosts.push(JSON.parse(request.postData() ?? "{}"));
+      }
+      if (/(?:\/explorer|\/files)\/(?:move|copy|delete)$/.test(pathname)) {
+        sourceMutationRequests.push(pathname);
+      }
+    });
+
+    await sidebar.evaluate((element, paths) => {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.setData("application/x-explorer-paths", JSON.stringify(paths));
+      element.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer }));
+    }, [folderPath, imagePath]);
+
+    await expect(sidebar.getByRole("option", { name: "docs" })).toBeVisible();
+    await expect(sidebar.getByRole("option", { name: "cover.png" })).toBeVisible();
+    await expect.poll(() => bookmarkPosts.filter((post) =>
+      post.path === folderPath || post.path === imagePath,
+    )).toHaveLength(2);
+    expect(bookmarkPosts).toEqual(expect.arrayContaining([
+      { name: "docs", path: folderPath },
+      { name: "cover.png", path: imagePath, icon: "📄" },
+    ]));
+    expect(sourceMutationRequests).toEqual([]);
+  });
+
+  test("adds a folder from its context menu and opens the favorite as a folder", async ({ page }) => {
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const folder = page.locator(`[data-explorer-item-path="${folderPath}"]`);
+    await expect(folder).toBeVisible();
+
+    const bookmarkPost = page.waitForRequest((request) => {
+      const pathname = new URL(request.url()).pathname;
+      if (!pathname.endsWith("/explorer/bookmarks") || request.method() !== "POST") return false;
+      return JSON.parse(request.postData() ?? "{}").path === folderPath;
+    });
+    await folder.click({ button: "right" });
+    await page.getByRole("menuitem", { name: /お気に入りに登録/ }).click();
+    const request = await bookmarkPost;
+    expect(JSON.parse(request.postData() ?? "{}").path).toBe(folderPath);
+    await expect(sidebar.getByRole("option", { name: "docs" })).toBeVisible();
+
+    await sidebar.getByRole("option", { name: "docs" }).click();
+    await expect(page.locator(`[data-explorer-item-path="${outsideFolderTextPath}"]`)).toBeVisible();
+  });
+
+  test("adds a selected file from the toolbar and reopens the file favorite after reload", async ({ page }) => {
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const file = page.locator(`[data-explorer-item-path="${textPath}"]`);
+    await expect(file).toBeVisible();
+    await file.click();
+
+    const bookmarkPost = page.waitForRequest((request) => {
+      const pathname = new URL(request.url()).pathname;
+      return pathname.endsWith("/explorer/bookmarks") &&
+        request.method() === "POST" &&
+        JSON.parse(request.postData() ?? "{}").path === textPath;
+    });
+    await page.getByRole("button", { name: "お気に入りに登録" }).click();
+    const request = await bookmarkPost;
+    expect(JSON.parse(request.postData() ?? "{}")).toMatchObject({
+      name: "notes.txt",
+      path: textPath,
+      icon: "📄",
+    });
+    await expect(sidebar.getByRole("option", { name: "notes.txt" })).toBeVisible();
+
+    await page.reload();
+    await expect(sidebar.getByRole("option", { name: "notes.txt" })).toBeVisible();
+    await sidebar.getByRole("option", { name: "notes.txt" }).click();
+    await expect(page.locator('[data-shell-region="files-editor"]')).toBeVisible();
+  });
+
+  test("opens a custom-icon file bookmark through explorer metadata without launcher or script execution", async ({ page }) => {
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const bookmark = sidebar.getByRole("option", { name: customIconBookmarkName });
+    await expect(bookmark).toBeVisible();
+    await sidebar.getByRole("tab", { name: /ランチャー/ }).click();
+    await expect(sidebar.getByRole("option", { name: "Notes" })).toBeVisible();
+    await sidebar.getByRole("tab", { name: /ブックマーク/ }).click();
+
+    const requestsAfterClick: string[] = [];
+    page.on("request", (request) => {
+      const pathname = new URL(request.url()).pathname;
+      requestsAfterClick.push(pathname);
+    });
+    const infoRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === "/api/python-proxy/explorer/info" &&
+        url.searchParams.get("path") === outsideFolderTextPath;
+    });
+
+    await bookmark.click();
+    const request = await infoRequest;
+    expect(JSON.parse(request.postData() ?? "null")).toBeNull();
+    await expect(page.locator('[data-shell-region="files-editor"]')).toBeVisible();
+    expect(requestsAfterClick.some((pathname) => /launchers|scripts?|execute/i.test(pathname))).toBe(false);
+  });
+
+  test("shows the bookmark drop target and ignores a persisted duplicate file drop", async ({ page }) => {
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const posts: string[] = [];
+    page.on("request", (request) => {
+      const pathname = new URL(request.url()).pathname;
+      if (pathname.endsWith("/explorer/bookmarks") && request.method() === "POST") {
+        posts.push(JSON.parse(request.postData() ?? "{}").path);
+      }
+    });
+
+    const dispatchDrop = async (eventType: "dragover" | "drop") => {
+      await sidebar.evaluate((element, { path, eventType }) => {
+        const dataTransfer = new DataTransfer();
+        dataTransfer.setData("application/x-explorer-paths", JSON.stringify([path]));
+        element.dispatchEvent(new DragEvent(eventType, { bubbles: true, dataTransfer }));
+      }, { path: imagePath, eventType });
+    };
+
+    await dispatchDrop("dragover");
+    await expect(sidebar.getByTestId("files-bookmark-drop-target")).toBeVisible();
+    await dispatchDrop("drop");
+    await expect(sidebar.getByRole("option", { name: "cover.png" })).toBeVisible();
+    await expect.poll(() => posts).toEqual([imagePath]);
+
+    await dispatchDrop("drop");
+    await expect(sidebar.getByRole("option", { name: "cover.png" })).toHaveCount(1);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    expect(posts).toEqual([imagePath]);
+  });
+
+  test("uses personal bookmark storage for User Files current-folder and file favorites", async ({ page }) => {
+    await page.goto("/filer");
+    await page.getByRole("button", { name: "User Files", exact: true }).click();
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    await expect(page.locator(`[data-explorer-item-path="${userFolderPath}"]`)).toBeVisible();
+
+    const currentFolderPost = page.waitForRequest((request) => {
+      const pathname = new URL(request.url()).pathname;
+      return pathname === "/api/python-proxy/explorer/bookmarks" &&
+        request.method() === "POST" &&
+        JSON.parse(request.postData() ?? "{}").path === userRootPath;
+    });
+    await page.getByRole("button", { name: "お気に入りに登録" }).click();
+    expect(JSON.parse((await currentFolderPost).postData() ?? "{}").path).toBe(userRootPath);
+    await expect(sidebar.getByRole("option", { name: `user_${E2E_USER_ID}` })).toBeVisible();
+
+    const folder = page.locator(`[data-explorer-item-path="${userFolderPath}"]`);
+    await expect(folder).toBeVisible();
+    await folder.dblclick();
+    const file = page.locator(`[data-explorer-item-path="${userTextPath}"]`);
+    await expect(file).toBeVisible();
+    await file.click();
+
+    const filePost = page.waitForRequest((request) => {
+      const pathname = new URL(request.url()).pathname;
+      return pathname === "/api/python-proxy/explorer/bookmarks" &&
+        request.method() === "POST" &&
+        JSON.parse(request.postData() ?? "{}").path === userTextPath;
+    });
+    await page.getByRole("button", { name: "お気に入りに登録" }).click();
+    expect(JSON.parse((await filePost).postData() ?? "{}")).toMatchObject({
+      path: userTextPath,
+      icon: "📄",
+    });
+  });
+
+  test("shows a visible error and no favorite when bookmark persistence fails", async ({ page }) => {
+    await page.route((url) => url.pathname.endsWith("/explorer/bookmarks"), async (route) => {
+      if (route.request().method() === "POST") {
+        await route.fulfill({ status: 503, json: { detail: "bookmark store unavailable" } });
+      } else {
+        await route.fallback();
+      }
+    });
+    await page.goto("/filer");
+    const sidebar = page.getByTestId("files-bookmark-launcher-sidebar");
+    const file = page.locator(`[data-explorer-item-path="${textPath}"]`);
+    await file.click();
+    const failedPost = page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname.endsWith("/explorer/bookmarks") &&
+      response.status() === 503,
+    );
+    await page.getByRole("button", { name: "お気に入りに登録" }).click();
+    await failedPost;
+    await expect(page.locator("[data-sonner-toast], [role=alert]").filter({ hasText: "bookmark store unavailable" }).first()).toBeVisible();
+    await expect(sidebar.getByRole("option", { name: "notes.txt" })).toHaveCount(0);
   });
 
   test("persists a non-duplicate Project Files folder registered with Ctrl+D across reload", async ({ page }) => {

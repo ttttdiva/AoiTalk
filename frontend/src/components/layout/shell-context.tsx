@@ -5,9 +5,11 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   useId,
+  useRef,
   isValidElement,
   type ReactElement,
   type ReactNode,
@@ -37,6 +39,13 @@ export type WorkspaceShellRegistrationOptions = {
    * transient shell toggle.  Mobile callers must provide their own drawer.
    */
   contextRailPersistent?: boolean;
+  /**
+   * Persistent desktop rails may opt into a route-owned visibility preference.
+   * Omitted keeps the legacy visible-by-default behavior.
+   */
+  contextRailPersistentVisible?: boolean;
+  /** Route-local presentation; preserves normal rail state and mounted content. */
+  contextRailPresentation?: { open: boolean; onOpenChange: (open: boolean) => void };
 };
 
 type WorkspaceShellRegistrationEntry = {
@@ -47,6 +56,8 @@ type WorkspaceShellRegistrationEntry = {
   desktopPersistent?: boolean;
   contextRail?: ReactNode | null;
   contextRailPersistent?: boolean;
+  contextRailPersistentVisible?: boolean;
+  contextRailPresentation?: WorkspaceShellRegistrationOptions["contextRailPresentation"];
   token: object;
 };
 
@@ -145,12 +156,19 @@ function areRegistrationsEquivalent(
     left.priority === right.priority &&
     left.desktopPersistent === right.desktopPersistent &&
     left.contextRailPersistent === right.contextRailPersistent &&
+    left.contextRailPersistentVisible === right.contextRailPersistentVisible &&
+    Boolean(left.contextRailPresentation) === Boolean(right.contextRailPresentation) &&
+    left.contextRailPresentation?.open === right.contextRailPresentation?.open &&
     areReactNodesEquivalent(left.workspaceNavigation, right.workspaceNavigation) &&
     areReactNodesEquivalent(left.contextRail, right.contextRail)
   );
 }
 
 export type ShellChromeContextValue = {
+  /** AoiDots is an always-mounted owner-scoped consultation surface. */
+  aoiDotsOpen: boolean;
+  setAoiDotsOpen: (open: boolean) => void;
+  toggleAoiDots: () => void;
   runtimePanelOpen: boolean;
   setRuntimePanelOpen: (open: boolean) => void;
   toggleRuntimePanel: () => void;
@@ -176,62 +194,98 @@ export type ShellChromeContextValue = {
 const ShellChromeContext = createContext<ShellChromeContextValue | null>(null);
 
 export function ShellChromeProvider({ children }: { children: ReactNode }) {
+  const [aoiDotsOpen, setAoiDotsOpen] = useState(false);
   const [runtimePanelOpen, setRuntimePanelOpen] = useState(false);
   const [notificationPanelOpen, setNotificationPanelOpenState] =
     useState(false);
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
-  const [contextRailOpen, setContextRailOpenState] = useState(false);
+  const [normalContextRailOpen, setContextRailOpenState] = useState(false);
   const [workspaceShellRegistrations, setWorkspaceShellRegistrations] = useState<
     Record<string, WorkspaceShellRegistrationEntry>
   >({});
+  const pathname = useOptionalPathname();
+  const contextRailPresentation = Object.values(workspaceShellRegistrations)
+    .filter(entry => entry.routeKey === (pathname ?? "/") && entry.contextRail !== undefined)
+    .sort((left, right) => right.priority - left.priority || left.id.localeCompare(right.id))[0]?.contextRailPresentation;
+  const presentationRef = useRef(contextRailPresentation);
+  useLayoutEffect(() => { presentationRef.current = contextRailPresentation; }, [contextRailPresentation]);
+  const contextRailOpen = contextRailPresentation?.open ?? normalContextRailOpen;
+  // Keep the public callbacks stable so presentation changes cannot tear down
+  // the route registration or remount an editing rail.
+  const setDisplayedContextRailOpen = useCallback((open: boolean) => {
+    const presentation = presentationRef.current;
+    if (presentation) presentation.onOpenChange(open);
+    else setContextRailOpenState(open);
+  }, []);
   const closeShellTransients = useCallback(() => {
+    setAoiDotsOpen(false);
     setRuntimePanelOpen(false);
     setNotificationPanelOpenState(false);
-    setContextRailOpenState(false);
-  }, []);
+    setDisplayedContextRailOpen(false);
+  }, [setDisplayedContextRailOpen]);
 
   const toggleRuntimePanel = useCallback(() => {
     setRuntimePanelOpen((open) => {
       const next = !open;
       if (next) {
+        setAoiDotsOpen(false);
         setNotificationPanelOpenState(false);
-        setContextRailOpenState(false);
+        setDisplayedContextRailOpen(false);
       }
       return next;
     });
+  }, [setDisplayedContextRailOpen]);
+
+  const toggleAoiDots = useCallback(() => {
+    setAoiDotsOpen((open) => !open);
   }, []);
 
   const setNotificationPanelOpen = useCallback((open: boolean) => {
     setNotificationPanelOpenState(open);
     if (open) {
+      setAoiDotsOpen(false);
       setRuntimePanelOpen(false);
-      setContextRailOpenState(false);
+      setDisplayedContextRailOpen(false);
     }
-  }, []);
+  }, [setDisplayedContextRailOpen]);
 
   const toggleNotificationPanel = useCallback(() => {
     setNotificationPanelOpenState((open) => {
       const next = !open;
       if (next) {
+        setAoiDotsOpen(false);
         setRuntimePanelOpen(false);
-        setContextRailOpenState(false);
+        setDisplayedContextRailOpen(false);
       }
       return next;
     });
-  }, []);
+  }, [setDisplayedContextRailOpen]);
 
   const setContextRailOpen = useCallback((open: boolean) => {
-    setContextRailOpenState(open);
+    setDisplayedContextRailOpen(open);
     if (open) {
+      setAoiDotsOpen(false);
       setRuntimePanelOpen(false);
       setNotificationPanelOpenState(false);
     }
-  }, []);
+  }, [setDisplayedContextRailOpen]);
 
   const toggleContextRail = useCallback(() => {
+    const presentation = presentationRef.current;
+    if (presentation) {
+      const next = !presentation.open;
+      presentation.onOpenChange(next);
+       if (next) {
+         setAoiDotsOpen(false);
+         setRuntimePanelOpen(false);
+         setNotificationPanelOpenState(false);
+       }
+      return;
+    }
     setContextRailOpenState((open) => {
       const next = !open;
       if (next) {
+        setAoiDotsOpen(false);
         setRuntimePanelOpen(false);
         setNotificationPanelOpenState(false);
       }
@@ -335,6 +389,13 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
         window.dispatchEvent(new Event(DOUBLE_ESCAPE_RESET_EVENT));
         return;
       }
+      if (aoiDotsOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        setAoiDotsOpen(false);
+        window.dispatchEvent(new Event(DOUBLE_ESCAPE_RESET_EVENT));
+      }
     };
     // Capture before workspace/document handlers so a transient shell panel
     // always receives Escape even when the focused workspace control consumes
@@ -343,6 +404,7 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
     contextRailOpen,
+    aoiDotsOpen,
     notificationPanelOpen,
     runtimePanelOpen,
     setContextRailOpen,
@@ -351,6 +413,9 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<ShellChromeContextValue>(
     () => ({
+      aoiDotsOpen,
+      setAoiDotsOpen,
+      toggleAoiDots,
       runtimePanelOpen,
       setRuntimePanelOpen,
       toggleRuntimePanel,
@@ -367,6 +432,9 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
       workspaceShellRegistrations: Object.values(workspaceShellRegistrations),
     }),
     [
+      aoiDotsOpen,
+      setAoiDotsOpen,
+      toggleAoiDots,
       contextRailOpen,
       runtimePanelOpen,
       notificationPanelOpen,
@@ -437,6 +505,8 @@ export function useWorkspaceShellRegistration(
       desktopPersistent: options.desktopPersistent ?? false,
       contextRail: options.contextRail,
       contextRailPersistent: options.contextRailPersistent ?? false,
+      contextRailPersistentVisible: options.contextRailPersistentVisible,
+      contextRailPresentation: options.contextRailPresentation,
       token,
     }),
     [
@@ -444,6 +514,8 @@ export function useWorkspaceShellRegistration(
       options.workspaceNavigation,
       options.desktopPersistent,
       options.contextRailPersistent,
+      options.contextRailPersistentVisible,
+      options.contextRailPresentation,
       priority,
       registrationId,
       routeKey,
@@ -472,6 +544,8 @@ export function useWorkspaceShellRegistration(
     options.contextRail,
     options.desktopPersistent,
     options.workspaceNavigation,
+    options.contextRailPersistent,
+    options.contextRailPersistentVisible,
     priority,
     registrationId,
     routeKey,

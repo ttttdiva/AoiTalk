@@ -1,4 +1,7 @@
 "use client";
+
+import { useConfirm } from "@/hooks/use-confirm";
+import { FileViewer, isImage, isVideo } from "./file-viewer";
 import { StorageControls, StorageWorkspace, StorageWorkspacePanel, useStorageWorkspace } from "@/components/explorer/storage-workspace";
 import { scrollExplorerItemIntoView } from "./scroll-explorer-item";
 
@@ -21,6 +24,7 @@ import {
   type FilerTab,
   useExplorer,
 } from "@/contexts/explorer-context";
+import { useProject } from "@/contexts/project-context";
 import { useSnippets } from "@/contexts/snippets-context";
 import { ExplorerToolbar } from "@/components/explorer/explorer-toolbar";
 import { FileGrid } from "@/components/explorer/file-grid";
@@ -31,12 +35,6 @@ import { NewItemNameInput } from "@/components/explorer/new-item-name-input";
 import { RenameDialog } from "@/components/explorer/rename-dialog";
 import { UploadZone } from "@/components/explorer/upload-zone";
 import { FilePreviewPanel } from "@/components/explorer/file-preview-panel";
-import {
-  HydrusSearchBar,
-  type HydrusSearchError,
-  type HydrusPagingController,
-} from "@/components/hf-browser/hydrus-search-bar";
-import { HfReferenceDialog } from "@/components/hf-browser/hf-reference-dialog";
 import { RecordTableEditor } from "@/components/records/record-table-editor";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -57,12 +55,12 @@ import {
   Search,
   FileIcon,
   Folder,
-  Play,
-  Info,
 } from "lucide-react";
+import { withBasePath } from "@/lib/base-path";
 import type {
   ExplorerDirectory,
   ExplorerFile,
+  ExplorerSearchResponse,
   SearchResult,
 } from "@/lib/explorer-api";
 import {
@@ -72,8 +70,6 @@ import {
   explorerErrorMessage,
   explorerExtract,
   explorerFullContent,
-  explorerInfo,
-  explorerList,
   explorerUpload,
   explorerSearch,
 } from "@/lib/explorer-api";
@@ -88,28 +84,33 @@ import { type FilerSearchItem } from "@/lib/migemo-lite";
 import { useIncrementalSearch } from "@/hooks/use-incremental-search";
 import {
   isRecordTableFile,
-  RECORD_TABLE_EXTENSION,
-  RECORD_TABLE_TYPE,
 } from "@/lib/record-tables-api";
-import { getFileServeUrl, getImageThumbnailUrl } from "@/lib/explorer-serve-url";
 import { cn } from "@/lib/utils";
-import { HF_PREFIX, isHfPath } from "@/lib/hf/virtual-path";
-import { isHydrusPath, parseHydrusFileId } from "@/lib/hydrus/virtual-path";
-import { hydrusGetMetadata, type HydrusFileMetadata } from "@/lib/hf-api";
 import { replaceFilerName } from "@/lib/explorer/filer-search";
 import { resolveFilerCreationShortcut } from "@/lib/explorer/filer-creation-shortcuts";
+import {
+  buildExplorerProjectScopeIdentity,
+  useExplorerOpenPath,
+} from "@/lib/explorer-open-path";
 import { FilesBookmarkLauncherSidebar } from "@/components/explorer/files-bookmark-launcher-sidebar";
+import {
+  FilesIndexDialog,
+  FilesIndexStatusBar,
+  FilesSemanticResults,
+  filesScopeLabel,
+} from "@/components/explorer/files-semantic-search";
+import { useFilesSemanticSearch } from "@/hooks/use-files-semantic-search";
+import {
+  resolveFilesSemanticScope,
+  type FilesSemanticResult,
+} from "@/lib/explorer/files-semantic-search";
 import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
-import { FILES_DOWNLOAD_PATH_EVENT, FILES_OPEN_PATH_EVENT } from "@/lib/files-sidebar-events";
+import {
+  FILES_DOWNLOAD_PATH_EVENT,
+  requestFilesBookmark,
+} from "@/lib/files-sidebar-events";
 import dynamic from "next/dynamic";
 import { toast } from "sonner";
-import {
-  boundaryViewerFile,
-  adjacentViewerFile,
-  preloadViewerFiles,
-  viewerFiles,
-} from "@/lib/viewer-navigation";
-import { hfExplorerSearch } from "@/lib/hf/explorer-loader";
 import {
   DOUBLE_ESCAPE_RESET_EVENT,
   EMPTY_DOUBLE_ESCAPE_STATE,
@@ -117,6 +118,17 @@ import {
   transitionDoubleEscapeKey,
   type DoubleEscapeState,
 } from "@/lib/double-escape";
+import {
+  CLEAN_EDITOR_EDIT_STATE,
+  DIRTY_ESCAPE_NOTICE,
+  DOCUMENT_EDITOR_SELECTOR,
+  focusDocumentEditorSurface,
+  isEditorTransientEscapeSurface,
+  isOrphanedFocusTarget,
+  nextOrphanedFocusOwner,
+  shouldHoldDirtyEditorClose,
+  type EditorEditState,
+} from "@/lib/double-escape-focus";
 
 const DocumentEditor = dynamic(
   () =>
@@ -142,13 +154,6 @@ const InlineChatPanel = dynamic(
 );
 
 // ─── ファイル配信URL ───
-const getFilerFileUrl = getFileServeUrl;
-function isImage(type: string) {
-  return type.startsWith("image");
-}
-function isVideo(type: string) {
-  return type.startsWith("video");
-}
 function isAudio(type: string) {
   return type.startsWith("audio");
 }
@@ -156,8 +161,6 @@ type ExplorerItem = ExplorerDirectory | ExplorerFile;
 const FILER_TAB_ORDER: readonly FilerTab[] = [
   "workspace",
   "user",
-  "hf",
-  "hydrus",
 ];
 const SUPPORTED_ARCHIVE_SUFFIXES = [
   ".tar.bz2",
@@ -214,11 +217,21 @@ function isFilesWorkspaceTarget(
 function isFilesWorkspaceKeyboardTarget(
   target: EventTarget | null,
   canvasRoot: HTMLElement | null,
+  filesOwnsOrphanedFocus: boolean,
 ): boolean {
-  return (
+  if (
     isFilesWorkspaceTarget(target, canvasRoot) ||
     isFilesWorkspaceTarget(document.activeElement, canvasRoot)
-  );
+  ) {
+    return true;
+  }
+  // Disabling the focused Save button, hiding the editor for the Markdown
+  // preview, unmounting a menu, or clicking a non-focusable spot drops focus
+  // to <body> without moving it anywhere else.  Keys then target <body>, so
+  // without this fallback Esc×2 silently stopped working depending on what
+  // the user last clicked.  Accept that orphaned focus only while Files was
+  // the last keyboard/pointer owner (see filesOwnsOrphanedFocusRef).
+  return filesOwnsOrphanedFocus && isOrphanedFocusTarget(target);
 }
 
 /**
@@ -253,478 +266,41 @@ function searchResultToFile(item: SearchResult): ExplorerFile {
   };
 }
 
+/** 検索パネルのモード: 名前・本文の文字列検索 / 内容（意味）検索。 */
+type FileSearchMode = "string" | "semantic";
+/** 文字列検索の対象: ファイル名・フォルダ名 / テキストファイル本文。 */
+type FileSearchTarget = "name" | "content";
+
+interface ContentSearchHit {
+  path: string;
+  name: string;
+  matchCount: number;
+  matches: { line: number; text: string }[];
+}
+
+interface ContentSearchSummary {
+  hits: ContentSearchHit[];
+  limitReason: ExplorerSearchResponse["limit_reason"];
+  skippedLargeFiles: number;
+}
+
+const CONTENT_LIMIT_LABELS: Record<string, string> = {
+  results: "件数上限に達したため、残りは表示していません",
+  scan: "走査上限（10,000項目）に達したため、一部のフォルダは未検索です",
+  bytes: "読み取り量の上限に達したため、一部のファイルは未検索です",
+};
+
+function normalizeFilerPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function filerParentPath(path: string): string {
+  const normalized = normalizeFilerPath(path);
+  const index = normalized.lastIndexOf("/");
+  return index > 0 ? normalized.slice(0, index) : "";
+}
+
 // ─── ファイルビューア（画像/動画全画面モーダル） ───
-export function FileViewer({
-  file,
-  files,
-  onClose,
-  onNavigate,
-  onBoundaryNavigate,
-  onAdjacentFiles,
-  returnFocusRef,
-}: {
-  file: ExplorerFile;
-  files: ExplorerFile[];
-  onClose: () => void;
-  onNavigate: (file: ExplorerFile) => void;
-  onBoundaryNavigate?: (direction: -1 | 1) => Promise<ExplorerFile | null>;
-  onAdjacentFiles?: (direction: -1 | 1) => Promise<ExplorerFile[]>;
-  returnFocusRef?: React.RefObject<HTMLElement | null>;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const mediaSurfaceRef = useRef<HTMLDivElement>(null);
-  const initialFocusRef = useRef<HTMLButtonElement>(null);
-  const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(
-    null,
-  );
-  const viewableFiles = useMemo(() => viewerFiles(files), [files]);
-  const currentIndex = viewableFiles.findIndex((f) => f.path === file.path);
-  const isImageFile = isImage(file.type || "");
-  // Keep a synchronous path cursor in addition to React state.  Key events
-  // can arrive several times before the parent re-renders `file`; using the
-  // rendered index in that window would navigate to the same item repeatedly.
-  const navigationPathRef = useRef(file.path);
-  const navigatingRef = useRef(false);
-  const navigationGenerationRef = useRef(0);
-  const viewerMountedRef = useRef(true);
-  const preloadedImagesRef = useRef(new Map<string, HTMLImageElement>());
-
-  const handleClose = useCallback(() => {
-    onClose();
-    window.setTimeout(() => {
-      returnFocusRef?.current?.focus({ preventScroll: true });
-    }, 0);
-  }, [onClose, returnFocusRef]);
-
-  useEffect(() => {
-    viewerMountedRef.current = true;
-    return () => {
-      viewerMountedRef.current = false;
-      navigationGenerationRef.current += 1;
-    };
-  }, []);
-
-  useEffect(() => {
-    navigationPathRef.current = file.path;
-  }, [file.path]);
-
-  const navigateTo = useCallback(
-    (target: ExplorerFile) => {
-      // A direct thumbnail/button selection supersedes any in-flight
-      // boundary fetch.  Advance the generation so a late page response
-      // cannot overwrite the user's newer choice.
-      navigationGenerationRef.current += 1;
-      navigatingRef.current = false;
-      navigationPathRef.current = target.path;
-      onNavigate(target);
-    },
-    [onNavigate],
-  );
-
-  const goPrev = useCallback(async () => {
-    if (navigatingRef.current) return;
-    const cursorPath = navigationPathRef.current;
-    const adjacent = adjacentViewerFile(files, cursorPath, -1);
-    if (adjacent) {
-      navigateTo(adjacent);
-      return;
-    }
-    if (!onBoundaryNavigate) return;
-    navigatingRef.current = true;
-    const generation = ++navigationGenerationRef.current;
-    try {
-      const target = await onBoundaryNavigate(-1);
-      if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
-        navigateTo(target);
-      }
-    } catch (error) {
-      if (viewerMountedRef.current) {
-        toast.error(error instanceof Error ? error.message : "前のページを読み込めませんでした");
-      }
-    } finally {
-      if (generation === navigationGenerationRef.current) navigatingRef.current = false;
-    }
-  }, [files, navigateTo, onBoundaryNavigate]);
-
-  const goNext = useCallback(async () => {
-    if (navigatingRef.current) return;
-    const cursorPath = navigationPathRef.current;
-    const adjacent = adjacentViewerFile(files, cursorPath, 1);
-    if (adjacent) {
-      navigateTo(adjacent);
-      return;
-    }
-    if (!onBoundaryNavigate) return;
-    navigatingRef.current = true;
-    const generation = ++navigationGenerationRef.current;
-    try {
-      const target = await onBoundaryNavigate(1);
-      if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
-        navigateTo(target);
-      }
-    } catch (error) {
-      if (viewerMountedRef.current) {
-        toast.error(error instanceof Error ? error.message : "次のページを読み込めませんでした");
-      }
-    } finally {
-      if (generation === navigationGenerationRef.current) navigatingRef.current = false;
-    }
-  }, [files, navigateTo, onBoundaryNavigate]);
-
-  // 前後の画像をviewer存続中のブラウザキャッシュへ載せる（動画は容量的に除外）
-  useEffect(() => {
-    if (currentIndex < 0) return;
-    let cancelled = false;
-    const PRELOAD_RADIUS = 3;
-    const targets = preloadViewerFiles(files, file.path, PRELOAD_RADIUS);
-    const preload = (items: ExplorerFile[]) => {
-      if (cancelled) return;
-      for (const item of items) {
-        if (!isImage(item.type || "")) continue;
-        const url = getFilerFileUrl(item.path);
-        if (preloadedImagesRef.current.has(url)) continue;
-        while (preloadedImagesRef.current.size >= 12) {
-          const oldest = preloadedImagesRef.current.keys().next().value as string | undefined;
-          if (!oldest) break;
-          preloadedImagesRef.current.get(oldest)!.src = "";
-          preloadedImagesRef.current.delete(oldest);
-        }
-        const img = new window.Image();
-        img.decoding = "async";
-        img.src = url;
-        preloadedImagesRef.current.set(url, img);
-      }
-    };
-    preload(targets);
-    if (onAdjacentFiles && currentIndex < PRELOAD_RADIUS) {
-      void onAdjacentFiles(-1)
-        .then((items) => preload(items.slice(-PRELOAD_RADIUS)))
-        .catch(() => undefined);
-    }
-    if (
-      onAdjacentFiles &&
-      viewableFiles.length - 1 - currentIndex < PRELOAD_RADIUS
-    ) {
-      void onAdjacentFiles(1)
-        .then((items) => preload(items.slice(0, PRELOAD_RADIUS)))
-        .catch(() => undefined);
-    }
-    return () => {
-      cancelled = true;
-    };
-  }, [currentIndex, file.path, files, onAdjacentFiles, viewableFiles]);
-
-  useEffect(
-    () => () => {
-      for (const image of preloadedImagesRef.current.values()) image.src = "";
-      preloadedImagesRef.current.clear();
-    },
-    [],
-  );
-
-  // スワイプでページ送り（画像表示時のみ。動画はネイティブコントロール優先）
-  const handleTouchStart = useCallback(
-    (e: React.TouchEvent) => {
-      if (!isImageFile) return;
-      if (e.touches.length !== 1) {
-        touchStartRef.current = null;
-        return;
-      }
-      const t = e.touches[0];
-      touchStartRef.current = { x: t.clientX, y: t.clientY, t: Date.now() };
-    },
-    [isImageFile],
-  );
-
-  const handleTouchEnd = useCallback(
-    (e: React.TouchEvent) => {
-      if (!isImageFile) return;
-      const start = touchStartRef.current;
-      touchStartRef.current = null;
-      if (!start) return;
-      const end = e.changedTouches[0];
-      if (!end) return;
-      const dx = end.clientX - start.x;
-      const dy = end.clientY - start.y;
-      const dt = Date.now() - start.t;
-      // 水平方向に 50px 以上、縦より明確に水平、1秒以内
-      if (dt > 1000) return;
-      if (Math.abs(dx) < 50) return;
-      if (Math.abs(dx) < Math.abs(dy) * 1.3) return;
-      if (dx > 0) void goPrev();
-      else void goNext();
-    },
-    [isImageFile, goPrev, goNext],
-  );
-
-  const toggleFullscreen = useCallback(async () => {
-    try {
-      if (document.fullscreenElement) {
-        if (typeof document.exitFullscreen === "function") {
-          await document.exitFullscreen();
-        }
-        return;
-      }
-      // Video keeps its native fullscreen target.  For images, fullscreen a
-      // media surface that also owns the viewer's sizing/padding rather than
-      // the bare <img>, so controls and the visual framing remain natural.
-      const target =
-        videoRef.current ?? (isImageFile ? mediaSurfaceRef.current : null);
-      if (target && typeof target.requestFullscreen === "function") {
-        await target.requestFullscreen();
-      }
-    } catch {
-      // Fullscreen can be rejected by browser policy (or by a test/runtime
-      // double).  It is an optional enhancement and must never surface an
-      // unhandled promise rejection from the keyboard handler.
-    }
-  }, [isImageFile]);
-
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      // video要素自体がフォーカスされている場合はネイティブ処理に任せる（二重発火防止）
-      if (e.target === videoRef.current) return;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        e.stopPropagation();
-        void goPrev();
-        return;
-      }
-      if (e.key === "ArrowRight") {
-        e.preventDefault();
-        e.stopPropagation();
-        void goNext();
-        return;
-      }
-      const video = videoRef.current;
-      if (e.key === "f" || e.key === "F") {
-        e.preventDefault();
-        void toggleFullscreen();
-        return;
-      }
-      if (!video) return;
-      if (e.key === " " || e.key === "k" || e.key === "K") {
-        e.preventDefault();
-        if (video.paused) {
-          void video.play().catch(() => undefined);
-        } else {
-          video.pause();
-        }
-      }
-      if (e.key === "j" || e.key === "J") video.currentTime -= 10;
-      if (e.key === "l" || e.key === "L") video.currentTime += 10;
-      if (e.key === "m" || e.key === "M") video.muted = !video.muted;
-    };
-    // Capture before Base UI's DialogPopup, which consumes arrow keys while
-    // focus is inside the modal and otherwise prevents viewer navigation.
-    window.addEventListener("keydown", handleKey, true);
-    return () => window.removeEventListener("keydown", handleKey, true);
-  }, [goPrev, goNext, toggleFullscreen]);
-
-  const [fileInfo, setFileInfo] = useState<{
-    size_bytes?: number;
-    created_at?: string;
-    modified_at?: string;
-  } | null>(null);
-  const [imageError, setImageError] = useState<string | null>(null);
-  const [hydrusMetadata, setHydrusMetadata] = useState<HydrusFileMetadata | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setFileInfo(null);
-    setHydrusMetadata(null);
-    if (isHydrusPath(file.path)) {
-      const fileId = parseHydrusFileId(file.path);
-      if (fileId == null) return () => { cancelled = true; };
-      hydrusGetMetadata([fileId], false)
-        .then((result) => {
-          if (!cancelled && result.metadata?.[0]?.file_id === fileId) {
-            setHydrusMetadata(result.metadata[0]);
-          }
-        })
-        .catch(() => {
-          if (!cancelled) setHydrusMetadata(null);
-        });
-      return () => { cancelled = true; };
-    }
-    if (isHfPath(file.path)) return () => { cancelled = true; };
-    explorerInfo(file.path)
-      .then((info) => {
-        if (!cancelled) setFileInfo(info);
-      })
-      .catch(() => {
-        if (!cancelled) setFileInfo(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [file.path]);
-
-  useEffect(() => {
-    setImageError(null);
-  }, [file.path]);
-
-  const handleOverlayClick = (event: React.MouseEvent) => {
-    if (event.target === event.currentTarget) handleClose();
-  };
-
-  const extLabel = file.extension?.replace(/^\./, "").toUpperCase() || "MEDIA";
-  const metadataRows = [
-    ["Size", hydrusMetadata?.size ?? fileInfo?.size_bytes ?? file.size],
-    ["Created", fileInfo?.created_at],
-    ["Modified", hydrusMetadata?.time_modified ? new Date(hydrusMetadata.time_modified * 1000).toISOString() : fileInfo?.modified_at ?? file.modified_at],
-    ["Path", file.path],
-    ["MIME", hydrusMetadata?.mime],
-    ["Resolution", hydrusMetadata?.width && hydrusMetadata?.height ? `${hydrusMetadata.width} × ${hydrusMetadata.height}` : undefined],
-    ["Duration", typeof hydrusMetadata?.duration === "number" ? `${Math.round(hydrusMetadata.duration)} s` : undefined],
-  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
-
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open) handleClose();
-      }}
-    >
-      <DialogContent
-        showCloseButton={false}
-        initialFocus={initialFocusRef}
-        finalFocus={returnFocusRef}
-        aria-modal="true"
-        data-shell-region="files-viewer"
-        className="fixed inset-0 z-[100] flex h-dvh w-screen max-w-none translate-x-0 translate-y-0 gap-0 rounded-none border-0 bg-black p-0 text-foreground shadow-none sm:max-w-none"
-        onClick={handleOverlayClick}
-        onTouchStart={handleTouchStart}
-        onTouchEnd={handleTouchEnd}
-      >
-      <div
-        ref={mediaSurfaceRef}
-        data-files-viewer-media-surface="true"
-        className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-black"
-      >
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between p-4">
-          <div className="pointer-events-auto flex min-w-0 items-center gap-3 rounded-md border border-border bg-card/90 px-4 py-2 backdrop-blur">
-            <DialogTitle className="min-w-0 truncate text-[16px] font-medium">{file.name}</DialogTitle>
-            <span className="shrink-0 rounded border border-border bg-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{extLabel}</span>
-            {viewableFiles.length > 1 && <span className="shrink-0 text-xs text-muted-foreground">{currentIndex + 1} / {viewableFiles.length}</span>}
-          </div>
-          <Button ref={initialFocusRef} variant="ghost" size="icon" className="pointer-events-auto text-muted-foreground hover:bg-muted hover:text-foreground" onClick={handleClose} aria-label="閉じる">
-            <X className="size-5" />
-          </Button>
-        </div>
-
-        <div className="group relative flex min-h-0 flex-1 items-center justify-center">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="absolute left-4 z-20 rounded-full border border-border bg-card/80 text-foreground opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100"
-            onClick={(event) => { event.stopPropagation(); void goPrev(); }}
-            aria-label="前のファイル"
-          >
-            <ChevronRight className="size-5 rotate-180" />
-          </Button>
-          <div
-            className="flex h-full w-full items-center justify-center overflow-auto p-4 sm:p-8"
-            onClick={handleOverlayClick}
-          >
-            {isImage(file.type || "") && !imageError && (
-              <div
-                className="flex h-full w-full items-center justify-center overflow-auto"
-                onClick={handleOverlayClick}
-              >
-                <img
-                  key={file.path}
-                  src={getFilerFileUrl(file.path)}
-                  alt={file.name}
-                  className="max-h-full max-w-full select-none object-contain"
-                  draggable={false}
-                  onError={() => setImageError("画像を表示できませんでした（404 / 認証 / パス解決失敗の可能性）")}
-                />
-              </div>
-            )}
-            {isImage(file.type || "") && imageError && (
-              <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-border bg-card/80 px-8 py-10 text-center text-muted-foreground">
-                <FileIcon className="size-10 opacity-60" />
-                <span className="text-sm">画像を表示できませんでした</span>
-                <span className="max-w-[60vw] truncate text-xs">{file.path}</span>
-                <span className="text-[11px] opacity-70">{imageError}</span>
-              </div>
-            )}
-            {isVideo(file.type || "") && (
-              <video
-                ref={videoRef}
-                src={getFilerFileUrl(file.path)}
-                controls
-                autoPlay
-                className="max-h-full max-w-full object-contain"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <track kind="captions" />
-              </video>
-            )}
-          </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="absolute right-4 z-20 rounded-full border border-border bg-card/80 text-foreground opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100"
-            onClick={(event) => { event.stopPropagation(); void goNext(); }}
-            aria-label="次のファイル"
-          >
-            <ChevronRight className="size-5" />
-          </Button>
-        </div>
-
-        <div className="absolute inset-x-0 bottom-4 z-20 flex flex-col items-center gap-3 px-4">
-          {viewableFiles.length > 1 && (
-            <div className="flex max-w-full items-center gap-3 overflow-x-auto rounded-xl border border-border bg-card/90 px-4 py-3 backdrop-blur">
-              {viewableFiles.map((item) => {
-                const active = item.path === file.path;
-                const itemIsImage = isImage(item.type || "");
-                return (
-                  <button key={item.path} type="button" className={cn("relative size-16 shrink-0 overflow-hidden rounded-md border border-border bg-muted/40 opacity-60 transition-opacity hover:opacity-100", active && "border-2 border-primary opacity-100 ring-2 ring-primary/20")} onClick={() => navigateTo(item)} title={item.name}>
-                    {itemIsImage ? <img src={getImageThumbnailUrl(item.path, 128)} alt="" className="size-full object-cover" loading="lazy" /> : <span className="flex size-full items-center justify-center text-muted-foreground">{isVideo(item.type || "") ? <Play className="size-5" /> : <FileIcon className="size-5" />}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      </div>
-
-      <aside className="hidden w-[300px] shrink-0 flex-col border-l border-border bg-card md:flex">
-        <div className="flex h-14 items-center justify-between border-b border-border px-4">
-          <div className="flex items-center gap-2"><Info className="size-4 text-muted-foreground" /><span className="text-[16px] font-semibold">File Properties</span></div>
-          <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-muted hover:text-foreground" onClick={handleClose} aria-label="閉じる"><X className="size-4" /></Button>
-        </div>
-        <div className="flex-1 space-y-6 overflow-auto p-4">
-          <section className="space-y-3">
-            <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">General</h3>
-            <div className="space-y-3 text-[13px]">
-              <div className="flex flex-col gap-1"><span className="text-muted-foreground">Name</span><span className="break-all font-medium">{file.name}</span></div>
-              <div className="grid grid-cols-2 gap-3 border-t border-border pt-3"><div className="flex flex-col gap-1"><span className="text-muted-foreground">Size</span><span className="font-mono text-xs">{typeof fileInfo?.size_bytes === "number" ? formatBytes(fileInfo.size_bytes) : typeof file.size === "number" ? formatBytes(file.size) : "-"}</span></div><div className="flex flex-col gap-1 text-right"><span className="text-muted-foreground">Format</span><span className="font-mono text-xs">{extLabel}</span></div></div>
-            </div>
-          </section>
-          <section className="space-y-3">
-            <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">File metadata</h3>
-            <div className="space-y-3 rounded-md border border-border bg-muted/30 p-3 text-xs">
-              {metadataRows.map(([label, value]) => <div key={label} className="flex items-start justify-between gap-3"><span className="text-muted-foreground">{label}</span><span className={cn("max-w-[11rem] break-all text-right", label === "Path" && "font-mono text-[10px] text-muted-foreground")}>{label === "Size" && typeof value === "number" ? formatBytes(value) : (label === "Modified" || label === "Created") && typeof value === "string" ? new Date(value).toLocaleString() : String(value)}</span></div>)}
-            </div>
-          </section>
-        </div>
-      </aside>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function formatBytes(bytes?: number): string {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "-";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
 // 絶対パス判定（ブックマーク権限フィルタ用）
 // ─── ファイルエクスプローラメインコンテンツ ───
 // テキストファイル拡張子
@@ -762,9 +338,11 @@ function EditorPane({
   handleFileClick,
   onContextMenu,
   onBackgroundContextMenu,
+  onEditStateChange,
 }: {
   editingFile: { path: string; name: string; extension: string };
   closeEditor: () => void;
+  onEditStateChange?: (state: EditorEditState) => void;
   handleFileClick: (file: ExplorerFile) => void;
   onContextMenu: (
     e: React.MouseEvent,
@@ -917,6 +495,7 @@ function EditorPane({
               snippets={snippets}
               autoFocus
               onClose={closeEditor}
+              onEditStateChange={onEditStateChange}
               onAskAI={(text) => {
                 setSelectedText(text);
                 setShowChat(true);
@@ -949,18 +528,20 @@ function NewTextFileDialog({
   onCreated: (path: string, name: string) => void;
 }) {
   const { currentPath, refresh } = useExplorer();
+  const confirmOverwrite = useConfirm();
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleCreate = async () => {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || loading) return;
     const fileName = trimmed.includes(".") ? trimmed : trimmed + ".md";
     const filePath = currentPath ? `${currentPath}/${fileName}` : fileName;
     setLoading(true);
     try {
       const file = new File([""], fileName, { type: "text/plain" });
-      await explorerUpload(currentPath, [file]);
+      const result = await explorerUpload(currentPath, [file], { confirmOverwrite });
+      if (result.successCount === 0) return;
       refresh();
       setName("");
       onOpenChange(false);
@@ -1008,6 +589,18 @@ function ExplorerContent() {
   const explorerRootRef = useRef<HTMLDivElement>(null);
   const explorerScrollRef = useRef<HTMLDivElement>(null);
   const pendingEditorEscapeFocusExitFrameRef = useRef<number | null>(null);
+  // True while Files was the last surface to receive focus or a pointer
+  // press.  Lets the Esc×2 boundary accept keys whose focus fell back to
+  // <body> from a Files control, while a click/focus elsewhere in the shell
+  // (header, nav rail, other panels) still excludes them.
+  const filesOwnsOrphanedFocusRef = useRef(false);
+  // Unsaved / failed-save state reported by the Files DocumentEditor; the
+  // Esc×2 boundary must never discard such edits from a newly enabled path.
+  const editorEditStateRef = useRef<EditorEditState>(CLEAN_EDITOR_EDIT_STATE);
+  const handleEditorEditStateChange = useCallback((state: EditorEditState) => {
+    editorEditStateRef.current = state;
+  }, []);
+  const contextMenuFocusFrameRef = useRef<number | null>(null);
   const pendingIncrementalSearchRef = useRef("");
   const quickFilterInputRef = useRef<HTMLInputElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
@@ -1027,6 +620,7 @@ function ExplorerContent() {
   const consumedHistoryScrollRestoreRef = useRef<string | null>(null);
   const searchParams = useSearchParams();
   const {isDefaultStorage, selectDefaultStorage} = useStorageWorkspace();
+  const { selectedSpaceId, selectedProjectId, selectedProject } = useProject();
   const {
     currentPath,
     navigate,
@@ -1046,8 +640,6 @@ function ExplorerContent() {
     contextRootPath,
     isAbsoluteFilerPath,
     isRemoteWorkspace,
-    isHfMode,
-    isHydrusMode,
     capabilities,
     setBrowseData,
     selectedItems,
@@ -1063,22 +655,13 @@ function ExplorerContent() {
     editingFile,
     openEditor,
     closeEditor,
-    hfCreatorMapping,
-    hfSearchQuery,
-    setHfSearchQuery,
     userId,
   } = useExplorer();
-  const hydrusPagingRef = useRef<HydrusPagingController | null>(null);
 
   // Homeボタンと Ctrl+H のナビゲート先。
   const homeNavigate = useCallback(() => {
-    if (filerTab === "hydrus") return;
-    if (filerTab === "hf" || isHfMode || isHfPath(currentPath)) {
-      navigate(HF_PREFIX);
-    } else {
-      navigate(homeRootPath || "");
-    }
-  }, [navigate, homeRootPath, currentPath, filerTab, isHfMode]);
+    navigate(homeRootPath || "");
+  }, [navigate, homeRootPath]);
 
   const cycleFilerTab = useCallback(
     (direction: -1 | 1) => {
@@ -1096,15 +679,11 @@ function ExplorerContent() {
   );
 
   // 削除・移動・Undo/Redo の実行は filer-operations 側へ集約。
-  // Hydrus タブの表示反映は ExplorerProvider の prune/restore が担う。
   const { deleteTargets, transfer, undo, redo, renameBatch } = useFilerOperations({
     capabilities,
     refresh,
   });
 
-  // Hydrus 検索エラー（検索結果そのものは context の browseData に流し込む）
-  const [hydrusError, setHydrusError] = useState<HydrusSearchError | null>(null);
-  const hydrusRetryRef = useRef<(() => void) | null>(null);
   const [fileSearchQuery, setFileSearchQuery] = useState("");
   const [fileSearchReplaceQuery, setFileSearchReplaceQuery] = useState("");
   const [fileSearchRegex, setFileSearchRegex] = useState(false);
@@ -1114,13 +693,19 @@ function ExplorerContent() {
   const [fileSearchError, setFileSearchError] = useState<string | null>(null);
   const [fileSearchCount, setFileSearchCount] = useState(0);
   const [fileSearchTruncated, setFileSearchTruncated] = useState(false);
+  const [fileSearchMode, setFileSearchMode] = useState<FileSearchMode>("string");
+  const [fileSearchTarget, setFileSearchTarget] = useState<FileSearchTarget>("name");
+  const [contentSearchSummary, setContentSearchSummary] =
+    useState<ContentSearchSummary | null>(null);
+  const [semanticUnderFolder, setSemanticUnderFolder] = useState(true);
+  const [filesIndexDialogOpen, setFilesIndexDialogOpen] = useState(false);
+  // 「Filesで場所を開く」で移動した後、読み込み完了時に選択するファイル。
+  const pendingRevealPathRef = useRef<string | null>(null);
+  const fileSearchModeRef = useRef<FileSearchMode>("string");
+  useEffect(() => {
+    fileSearchModeRef.current = fileSearchMode;
+  }, [fileSearchMode]);
   const fileSearchGenerationRef = useRef(0);
-  // Preserve the repository list shown before a root-level HF search replaces
-  // browseData with search results.  Subsequent query changes must keep using
-  // that bounded snapshot rather than refetching every repository.
-  const hfRootDirectoriesRef = useRef<readonly ExplorerDirectory[] | null>(
-    null,
-  );
   const [quickFilterOpen, setQuickFilterOpen] = useState(false);
   const [quickFilterQuery, setQuickFilterQuery] = useState("");
   // `openEditorFromFiler` is also used by the URL-open effect.  Keep the
@@ -1149,7 +734,6 @@ function ExplorerContent() {
   const [viewerFile, setViewerFile] = useState<ExplorerFile | null>(null);
   const viewerReturnFocusRef = useRef<HTMLElement | null>(null);
   const [previewFile, setPreviewFile] = useState<ExplorerFile | null>(null);
-  const [hfReferenceOpen, setHfReferenceOpen] = useState(false);
   const [recordTableFile, setRecordTableFile] = useState<ExplorerFile | null>(
     null,
   );
@@ -1165,48 +749,8 @@ function ExplorerContent() {
     setCtxPos(null);
     setRenameTarget(null);
     setRecordTableFile(null);
-    setHfReferenceOpen(false);
-    setHydrusError(null);
-    hydrusRetryRef.current = null;
     closeEditor();
   }, [closeEditor, userId]);
-
-  const loadHydrusBoundary = useCallback(
-    async (direction: -1 | 1): Promise<ExplorerFile | null> => {
-      if (!isHydrusMode) return null;
-      const controller = hydrusPagingRef.current;
-      if (!controller) return null;
-      let targetPage = controller.page + direction;
-      let totalPages = controller.totalPages;
-      while (targetPage >= 1 && targetPage <= totalPages) {
-        const result = await controller.loadPage(targetPage);
-        if (!result) return null;
-        totalPages = result.totalPages;
-        const candidates = viewerFiles(result.data.files).filter(
-          (item) => item.path !== viewerFile?.path,
-        );
-        const target = boundaryViewerFile(candidates, direction);
-        if (target) return target;
-        targetPage += direction;
-      }
-      return null;
-    },
-    [isHydrusMode, viewerFile?.path],
-  );
-
-  const preloadHydrusAdjacent = useCallback(
-    async (direction: -1 | 1): Promise<ExplorerFile[]> => {
-      if (!isHydrusMode) return [];
-      const controller = hydrusPagingRef.current;
-      if (!controller) return [];
-      const targetPage = controller.page + direction;
-      if (targetPage < 1 || targetPage > controller.totalPages) return [];
-      const result = await controller.prefetchPage(targetPage);
-      if (!result) return [];
-      return viewerFiles(result.data.files);
-    },
-    [isHydrusMode],
-  );
 
   // コンテキストメニュー
   const [ctxItem, setCtxItem] = useState<
@@ -1285,10 +829,9 @@ function ExplorerContent() {
       ? focusedItemPath
       : (selectedPaths[0] ?? null);
   const activeItem = activePath ? (itemByPath.get(activePath) ?? null) : null;
-  const canUseFileShortcuts =
-    !isRemoteWorkspace && !isHfMode && filerTab !== "hydrus";
-  const canUseDownloadShortcut = !isHfMode && filerTab !== "hydrus";
-  const canUseExplorerSearch = filerTab !== "hydrus";
+  const canUseFileShortcuts = !isRemoteWorkspace;
+  const canUseDownloadShortcut = true;
+  const canUseExplorerSearch = true;
   const isExplorerInteractionBlocked =
     loading ||
     !!editingFile ||
@@ -1306,7 +849,6 @@ function ExplorerContent() {
     !!renameTarget ||
     newFolderOpen ||
     newTextFileOpen ||
-    hfReferenceOpen ||
     quickFilterOpen ||
     !!ctxPos;
 
@@ -1344,6 +886,10 @@ function ExplorerContent() {
         );
         pendingEditorEscapeFocusExitFrameRef.current = null;
       }
+      if (contextMenuFocusFrameRef.current !== null) {
+        window.cancelAnimationFrame(contextMenuFocusFrameRef.current);
+        contextMenuFocusFrameRef.current = null;
+      }
     };
   }, []);
 
@@ -1376,6 +922,8 @@ function ExplorerContent() {
         key: string;
         repeat: boolean;
         defaultPrevented?: boolean;
+        isComposing?: boolean;
+        keyCode?: number;
         preventDefault: () => void;
         stopPropagation: () => void;
         stopImmediatePropagation?: () => void;
@@ -1388,11 +936,30 @@ function ExplorerContent() {
         resetEditorEscape();
         return;
       }
+      // React's SyntheticKeyboardEvent has no isComposing, and the first
+      // handler to run (React capture) marks the native event as handled, so
+      // read the IME state from the native event.
+      const composing = nativeEvent as KeyboardEvent;
       const next = transitionDoubleEscapeKey(
         editorEscapeStateRef.current,
-        event,
         {
-          blocked: isEditorEscapeBlocked || isBookmarkQuickLauncherOpen(),
+          key: event.key,
+          repeat: event.repeat,
+          defaultPrevented: event.defaultPrevented,
+          isComposing: composing.isComposing,
+          keyCode: composing.keyCode,
+        },
+        {
+          // An open completion popup / search panel consumes its own
+          // Escape; that press must neither arm nor complete the sequence.
+          blocked:
+            isEditorEscapeBlocked ||
+            isBookmarkQuickLauncherOpen() ||
+            isEditorTransientEscapeSurface(
+              nativeEvent.target,
+              explorerRootRef.current?.querySelector(DOCUMENT_EDITOR_SELECTOR) ??
+                null,
+            ),
           now: performance.now(),
         },
       );
@@ -1401,6 +968,19 @@ function ExplorerContent() {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation?.();
+      if (
+        shouldHoldDirtyEditorClose(
+          editorEditStateRef.current,
+          nativeEvent.target,
+        )
+      ) {
+        toast.warning(DIRTY_ESCAPE_NOTICE, { id: "files-editor-dirty-escape" });
+        focusDocumentEditorSurface(
+          explorerRootRef.current?.querySelector(DOCUMENT_EDITOR_SELECTOR) ??
+            null,
+        );
+        return;
+      }
       closeEditor();
     },
     [closeEditor, editingFile, isEditorEscapeBlocked, resetEditorEscape],
@@ -1422,6 +1002,7 @@ function ExplorerContent() {
         !isFilesWorkspaceKeyboardTarget(
           event.target,
           explorerRootRef.current,
+          filesOwnsOrphanedFocusRef.current,
         )
       ) {
         return;
@@ -1431,6 +1012,26 @@ function ExplorerContent() {
     document.addEventListener("keydown", handleFilesKeyDown, true);
     return () => document.removeEventListener("keydown", handleFilesKeyDown, true);
   }, [processEditorEscape]);
+
+  useEffect(() => {
+    const trackOwner = (event: Event) => {
+      filesOwnsOrphanedFocusRef.current = nextOrphanedFocusOwner(
+        filesOwnsOrphanedFocusRef.current,
+        event.target,
+        (target) => isFilesWorkspaceTarget(target, explorerRootRef.current),
+      );
+    };
+    document.addEventListener("focusin", trackOwner, true);
+    document.addEventListener("pointerdown", trackOwner, true);
+    filesOwnsOrphanedFocusRef.current = isFilesWorkspaceTarget(
+      document.activeElement,
+      explorerRootRef.current,
+    );
+    return () => {
+      document.removeEventListener("focusin", trackOwner, true);
+      document.removeEventListener("pointerdown", trackOwner, true);
+    };
+  }, []);
 
   // The canvas owns a React blur handler, but the persistent sidebar (and its
   // mobile Sheet/Portal copy) is rendered outside that subtree.  Observe
@@ -1468,17 +1069,31 @@ function ExplorerContent() {
     [resetEditorEscape, scheduleEditorEscapeFocusExitCheck],
   );
 
+  // 内容（意味）検索は User Files / Project Files の中だけで使える。
+  const semanticScope = useMemo(
+    () =>
+      isRemoteWorkspace || isAbsoluteFilerPath
+        ? null
+        : resolveFilesSemanticScope(currentPath),
+    [currentPath, isAbsoluteFilerPath, isRemoteWorkspace],
+  );
+  const semanticSearch = useFilesSemanticSearch(
+    semanticScope,
+    fileSearchOpen && fileSearchMode === "semantic",
+  );
+  const resetSemanticSearch = semanticSearch.reset;
+
   const resetFileSearchState = useCallback((clearQuery = false) => {
     fileSearchGenerationRef.current += 1;
     if (clearQuery) {
       setFileSearchQuery("");
-      hfRootDirectoriesRef.current = null;
     }
     setFileSearchActive(false);
     setFileSearchError(null);
     setFileSearchCount(0);
     setFileSearchTruncated(false);
     setFileSearchLoading(false);
+    setContentSearchSummary(null);
   }, []);
 
   const clearFileSearch = useCallback(() => {
@@ -1501,11 +1116,12 @@ function ExplorerContent() {
     setFileSearchOpen(false);
     setFileSearchReplaceQuery("");
     setFileSearchRegex(false);
+    resetSemanticSearch();
     clearFileSearch();
     window.requestAnimationFrame(() => {
       explorerRootRef.current?.focus({ preventScroll: true });
     });
-  }, [clearFileSearch]);
+  }, [clearFileSearch, resetSemanticSearch]);
 
   const closeQuickFilter = useCallback(() => {
     setQuickFilterOpen(false);
@@ -1535,6 +1151,7 @@ function ExplorerContent() {
       setFileSearchReplaceQuery("");
       setFileSearchRegex(false);
       resetFileSearchState(true);
+      resetSemanticSearch();
       if (hadFileSearch) {
         // Search replaces browseData with a result set.  Restore the current
         // directory without the focus side effect of closeFileSearch(), since
@@ -1549,7 +1166,13 @@ function ExplorerContent() {
       resetEditorEscape();
       openEditor(file);
     },
-    [clearSelection, openEditor, resetEditorEscape, resetFileSearchState],
+    [
+      clearSelection,
+      openEditor,
+      resetEditorEscape,
+      resetFileSearchState,
+      resetSemanticSearch,
+    ],
   );
 
   // URL ?open=path パラメータでファイルを自動オープン
@@ -1576,12 +1199,17 @@ function ExplorerContent() {
     }
   }, [openEditorFromFiler, searchParams]);
 
-  const runFileSearch = useCallback(async () => {
+  const runFileSearch = useCallback(async (
+    override?: { target?: FileSearchTarget },
+  ) => {
     const query = fileSearchQuery.trim();
     if (!query) {
       clearFileSearch();
       return;
     }
+    const target: FileSearchTarget = isRemoteWorkspace
+      ? "name"
+      : (override?.target ?? fileSearchTarget);
 
     const requestGeneration = ++fileSearchGenerationRef.current;
     const requestPath = currentPath;
@@ -1592,32 +1220,12 @@ function ExplorerContent() {
     setFileSearchError(null);
     setFileSearchActive(false);
     setFileSearchTruncated(false);
+    setContentSearchSummary(null);
     try {
-      // HF virtual paths must never cross into the local filesystem search
-      // API.  The dedicated helper keeps HF credentials server-side and
-      // preserves virtual paths in its Explorer-compatible results.  At the
-      // HF root, constrain the search to the repository snapshot already
-      // visible in the UI instead of discovering every repository again.
-      let data;
-      if (isHfMode || isHfPath(currentPath)) {
-        let rootDirectories: readonly ExplorerDirectory[] | undefined;
-        if (currentPath === HF_PREFIX) {
-          if (hfRootDirectoriesRef.current === null) {
-            hfRootDirectoriesRef.current = [
-              ...(browseData?.directories ?? []),
-            ];
-          }
-          rootDirectories = hfRootDirectoriesRef.current;
-        }
-        data = await hfExplorerSearch(currentPath, query, 200, {
-          regex: fileSearchRegex,
-          rootDirectories,
-        });
-      } else {
-        data = await explorerSearch(query, currentPath, 200, {
-          regex: fileSearchRegex,
-        });
-      }
+      const data = await explorerSearch(query, currentPath, 200, {
+        regex: fileSearchRegex,
+        mode: target,
+      });
       if (
         requestGeneration !== fileSearchGenerationRef.current ||
         requestPath !== currentPath ||
@@ -1650,6 +1258,20 @@ function ExplorerContent() {
       setFileSearchActive(true);
       setFileSearchCount(directories.length + files.length);
       setFileSearchTruncated(Boolean(data.truncated));
+      setContentSearchSummary(
+        target === "content"
+          ? {
+              hits: data.results.map((item) => ({
+                path: item.path,
+                name: item.name,
+                matchCount: item.match_count ?? item.matches?.length ?? 0,
+                matches: item.matches ?? [],
+              })),
+              limitReason: data.limit_reason ?? null,
+              skippedLargeFiles: data.skipped_large_files ?? 0,
+            }
+          : null,
+      );
       clearSelection();
     } catch (error) {
       if (requestGeneration === fileSearchGenerationRef.current) {
@@ -1662,7 +1284,6 @@ function ExplorerContent() {
     }
   }, [
     browseData?.can_go_up,
-    browseData?.directories,
     browseData?.is_admin_mode,
     browseData?.parent_path,
     clearFileSearch,
@@ -1670,15 +1291,23 @@ function ExplorerContent() {
     currentPath,
     fileSearchQuery,
     fileSearchRegex,
+    fileSearchTarget,
     filerTab,
-    isHfMode,
+    isRemoteWorkspace,
     setBrowseData,
     userId,
   ]);
 
   const replaceFileSearch = useCallback(async () => {
     const query = fileSearchQuery.trim();
-    if (!query || !fileSearchActive || !browseData || !capabilities.canRename) {
+    if (
+      !query ||
+      !fileSearchActive ||
+      fileSearchMode !== "string" ||
+      fileSearchTarget !== "name" ||
+      !browseData ||
+      !capabilities.canRename
+    ) {
       return;
     }
 
@@ -1717,9 +1346,11 @@ function ExplorerContent() {
     browseData,
     capabilities.canRename,
     fileSearchActive,
+    fileSearchMode,
     fileSearchQuery,
     fileSearchRegex,
     fileSearchReplaceQuery,
+    fileSearchTarget,
     fileSearchTruncated,
     renameBatch,
     runFileSearch,
@@ -1727,15 +1358,72 @@ function ExplorerContent() {
 
   useEffect(() => {
     resetFileSearchState();
-    setFileSearchOpen(false);
-    setFileSearchQuery("");
     setFileSearchReplaceQuery("");
     setFileSearchRegex(false);
-    hfRootDirectoriesRef.current = null;
+    // 内容検索の結果は「Filesで場所を開く」でフォルダを移動しても残す。
+    // タブ・プロジェクト・ユーザーの切替では下の effect と hook 側で破棄する。
+    if (fileSearchModeRef.current === "semantic") return;
+    setFileSearchOpen(false);
+    setFileSearchQuery("");
   }, [currentPath, filerTab, resetFileSearchState]);
 
   useEffect(() => {
-    hfRootDirectoriesRef.current = null;
+    // タブ・ユーザー切替では内容検索のパネルも閉じる（別タブの結果を残さない）。
+    setFileSearchOpen(false);
+    setFileSearchQuery("");
+    pendingRevealPathRef.current = null;
+  }, [filerTab, userId]);
+
+  const switchFileSearchMode = useCallback(
+    (mode: FileSearchMode) => {
+      if (mode === fileSearchModeRef.current) return;
+      if (fileSearchStateRef.current.active) {
+        // 文字列検索の結果一覧（browseData の置換）を通常一覧へ戻す。
+        resetFileSearchState();
+        clearSelection();
+        void refresh();
+      } else {
+        resetFileSearchState();
+      }
+      resetSemanticSearch();
+      setFileSearchMode(mode);
+      window.requestAnimationFrame(() => fileSearchInputRef.current?.focus());
+    },
+    [clearSelection, refresh, resetFileSearchState, resetSemanticSearch],
+  );
+
+  const switchFileSearchTarget = useCallback(
+    (target: FileSearchTarget) => {
+      if (target === fileSearchTarget) return;
+      if (fileSearchStateRef.current.active) {
+        resetFileSearchState();
+        clearSelection();
+        void refresh();
+      }
+      setFileSearchTarget(target);
+      window.requestAnimationFrame(() => fileSearchInputRef.current?.focus());
+    },
+    [clearSelection, fileSearchTarget, refresh, resetFileSearchState],
+  );
+
+  const runSemantic = semanticSearch.run;
+  const runSemanticSearch = useCallback(() => {
+    if (!semanticScope) return;
+    void runSemantic(fileSearchQuery, semanticUnderFolder);
+  }, [fileSearchQuery, runSemantic, semanticScope, semanticUnderFolder]);
+
+  /** 0件・縮退時の導線: 同じ語で本文の文字列検索を実行する。 */
+  const switchToStringSearch = useCallback(() => {
+    resetSemanticSearch();
+    setFileSearchMode("string");
+    setFileSearchTarget("content");
+    if (fileSearchQuery.trim()) {
+      void runFileSearch({ target: "content" });
+    }
+    window.requestAnimationFrame(() => fileSearchInputRef.current?.focus());
+  }, [fileSearchQuery, resetSemanticSearch, runFileSearch]);
+
+  useEffect(() => {
     resetFileSearchState();
   }, [resetFileSearchState, userId]);
 
@@ -1788,64 +1476,25 @@ function ExplorerContent() {
 
   // Shell launchers dispatch into the canonical Files open/download handlers
   // so editor, media viewer, audio player, and download behavior stay aligned
-  // with normal Files interactions.
+  // with normal Files interactions.  Keep the open listener stable across
+  // ordinary browseData or Project/User Files transitions; the hook applies
+  // the authenticated and target project boundaries and later open requests.
+  const openScopeIdentity = buildExplorerProjectScopeIdentity({
+    selectedSpaceId,
+    selectedProjectId,
+    projectSource: selectedProject?.source,
+    currentPath,
+  });
+  useExplorerOpenPath({
+    browseData,
+    currentPath,
+    authIdentity: userId ?? "",
+    scopeIdentity: openScopeIdentity,
+    handleFileClick,
+    navigate,
+  });
+
   useEffect(() => {
-    const parentPath = (path: string): string | null => {
-      const normalized = path.replace(/[\\/]+$/, "");
-      const index = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
-      return index > 0 ? normalized.slice(0, index) : null;
-    };
-    const resolveCanonicalFile = async (path: string, displayName?: string): Promise<ExplorerFile | null> => {
-      const direct = browseData?.files.find((candidate) => candidate.path === path);
-      if (direct) return direct;
-      // Record-table launchers use a canonical virtual path and may not be
-      // present in a filesystem directory listing. Preserve the metadata
-      // required by the existing record-table viewer instead of inferring an
-      // opaque binary file.
-      const recordPrefix = "aoitalk-record-table:";
-      if (path.startsWith(recordPrefix)) {
-        const [projectId, recordTableId] = path.slice(recordPrefix.length).split(":", 2);
-        if (projectId && recordTableId) {
-          return {
-            name: displayName?.trim() || `${recordTableId}${RECORD_TABLE_EXTENSION}`,
-            path,
-            type: RECORD_TABLE_TYPE,
-            extension: RECORD_TABLE_EXTENSION,
-            virtual_kind: "record_table",
-            project_id: projectId,
-            record_table_id: recordTableId,
-          };
-        }
-      }
-      // A launcher can point outside the currently visible directory. Fetch
-      // its parent so record-table metadata (`virtual_kind`, project/table IDs)
-      // is preserved instead of falling through to an octet-stream preview.
-      const candidates = [parentPath(path), currentPath].filter(
-        (candidate, index, all): candidate is string => Boolean(candidate) && all.indexOf(candidate) === index,
-      );
-      for (const candidate of candidates) {
-        try {
-          const data = await explorerList(candidate);
-          const exact = data.files.find((file) => file.path === path);
-          if (exact) return exact;
-        } catch {
-          // Try the current directory fallback before reporting an error.
-        }
-      }
-      return null;
-    };
-    const onOpen = async (event: Event) => {
-      const detail = (event as CustomEvent<{ path?: unknown; name?: unknown }>).detail;
-      const path = detail?.path;
-      if (typeof path !== "string" || !path) return;
-      const name = typeof detail.name === "string" ? detail.name : undefined;
-      const item = await resolveCanonicalFile(path, name);
-      if (item) {
-        handleFileClick(item);
-      } else {
-        toast.error("ファイル情報を取得できないため開けませんでした");
-      }
-    };
     const onDownload = (event: Event) => {
       const path = (event as CustomEvent<{ path?: unknown }>).detail?.path;
       if (typeof path !== "string" || !path) return;
@@ -1853,13 +1502,11 @@ function ExplorerContent() {
         toast.error(`ダウンロードに失敗しました: ${explorerErrorMessage(error)}`);
       });
     };
-    window.addEventListener(FILES_OPEN_PATH_EVENT, onOpen);
     window.addEventListener(FILES_DOWNLOAD_PATH_EVENT, onDownload);
     return () => {
-      window.removeEventListener(FILES_OPEN_PATH_EVENT, onOpen);
       window.removeEventListener(FILES_DOWNLOAD_PATH_EVENT, onDownload);
     };
-  }, [browseData?.files, currentPath, handleFileClick]);
+  }, []);
 
   // F7 / Shift+F7 と Ctrl/Cmd+N / Ctrl/Cmd+Shift+N（作成可能時のみ）
   useEffect(() => {
@@ -1910,8 +1557,18 @@ function ExplorerContent() {
       paths: clipboard.paths,
       destDir: currentPath,
       operation: clipboard.operation === "cut" ? "move" : "copy",
-      onTransferred: () => {
-        if (clipboard.operation === "cut") setClipboard(null);
+      onTransferred: (transferredPaths) => {
+        if (clipboard.operation === "cut") {
+          const transferred = new Set(transferredPaths);
+          const remainingPaths = clipboard.paths.filter(
+            (path) => !transferred.has(path),
+          );
+          setClipboard(
+            remainingPaths.length > 0
+              ? { ...clipboard, paths: remainingPaths }
+              : null,
+          );
+        }
         clearSelection();
       },
     });
@@ -2273,6 +1930,66 @@ function ExplorerContent() {
     visibleItems,
   ]);
 
+  // 「Filesで場所を開く」: 移動先フォルダの読み込み完了後に対象ファイルを選択する。
+  // 先頭項目の自動フォーカス（上の effect）より後に登録し、同じフレームで上書きする。
+  useEffect(() => {
+    const pending = pendingRevealPathRef.current;
+    if (!pending || loading || !browseData) return;
+    if (normalizeFilerPath(currentPath) !== filerParentPath(pending)) return;
+    pendingRevealPathRef.current = null;
+    const target = Array.from(itemByPath.keys()).find(
+      (path) => normalizeFilerPath(path) === pending,
+    );
+    if (!target) {
+      toast.error("ファイルが見つかりません。移動・削除された可能性があります");
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => focusRenderedItemPath(target));
+    return () => window.cancelAnimationFrame(frame);
+  }, [browseData, currentPath, focusRenderedItemPath, itemByPath, loading]);
+
+  const openFilesLocation = useCallback(
+    (filePath: string) => {
+      const normalized = normalizeFilerPath(filePath);
+      const folder = filerParentPath(normalized);
+      setQuickFilterOpen(false);
+      setQuickFilterQuery("");
+      pendingRevealPathRef.current = normalized;
+      if (folder === normalizeFilerPath(currentPath)) {
+        if (!fileSearchActive) {
+          const target = Array.from(itemByPath.keys()).find(
+            (path) => normalizeFilerPath(path) === normalized,
+          );
+          if (target) {
+            pendingRevealPathRef.current = null;
+            focusRenderedItemPath(target);
+            return;
+          }
+        } else {
+          // 文字列検索の結果一覧を表示中なら、通常一覧へ戻してから選択する。
+          resetFileSearchState();
+        }
+        void refresh();
+        return;
+      }
+      navigate(folder);
+    },
+    [
+      currentPath,
+      fileSearchActive,
+      focusRenderedItemPath,
+      itemByPath,
+      navigate,
+      refresh,
+      resetFileSearchState,
+    ],
+  );
+
+  const openSemanticResultLocation = useCallback(
+    (result: FilesSemanticResult) => openFilesLocation(result.filePath),
+    [openFilesLocation],
+  );
+
   useLayoutEffect(() => {
     incrementalSearch.reset();
     if (loading) return;
@@ -2361,6 +2078,14 @@ function ExplorerContent() {
         if (!canUseExplorerSearch || isExplorerInteractionBlocked) return;
         e.preventDefault();
         openFileSearch();
+        return;
+      }
+      // 検索パネル内のボタン・チェックボックス・結果リストのキー操作は
+      // そのコントロールに任せる（一覧の Enter/Space/単発キー操作へ流さない）。
+      if (
+        e.target instanceof Element &&
+        e.target.closest("[data-filer-search-panel]")
+      ) {
         return;
       }
       if (isQuickFilterShortcut && quickFilterOpen) {
@@ -2483,8 +2208,6 @@ function ExplorerContent() {
       }
 
       // ソート切替（F8 名前昇順 / F9 更新日時降順）。
-      // Hydrus タブでは検索時に Hydrus 側でインポート日時降順に並べており、
-      // フロント側の並べ替えは行わない（FileGrid/FileList 側で抑止）。
       if (!primaryModifier && !e.altKey && !e.shiftKey) {
         if (e.key === "F8") {
           e.preventDefault();
@@ -2504,8 +2227,7 @@ function ExplorerContent() {
         !e.metaKey &&
         !e.altKey &&
         !e.shiftKey &&
-        key === "h" &&
-        filerTab !== "hydrus"
+        key === "h"
       ) {
         e.preventDefault();
         homeNavigate();
@@ -2660,7 +2382,6 @@ function ExplorerContent() {
         }
         return;
       }
-      // Delete は HF / Hydrus でも有効（HF は確認ポップアップ経由）
       if (
         capabilities.canDelete &&
         selectedPaths.length > 0 &&
@@ -2742,11 +2463,122 @@ function ExplorerContent() {
     viewerFile,
   ]);
 
+  const isSemanticMode = fileSearchMode === "semantic";
+  const effectiveSearchTarget: FileSearchTarget = isRemoteWorkspace
+    ? "name"
+    : fileSearchTarget;
+  const fileSearchInputLabel = isSemanticMode
+    ? "内容（意味）で検索"
+    : effectiveSearchTarget === "content"
+      ? "本文の文字列検索"
+      : "ファイル名・フォルダ名の検索";
+  const fileSearchPlaceholder = isSemanticMode
+    ? "探したい内容を言葉で（例: 昨年の見積もり条件の説明）"
+    : effectiveSearchTarget === "content"
+      ? "本文に含まれる文字列を検索..."
+      : "ファイル名・フォルダ名を検索...";
+  const semanticFolderLabel = semanticScope
+    ? `${filesScopeLabel(semanticScope)}${
+        semanticScope.relativeFolder ? ` / ${semanticScope.relativeFolder}` : ""
+      }`
+    : "";
+  const segmentClass = (active: boolean) =>
+    cn(
+      "h-6 rounded px-2 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+      active
+        ? "bg-background font-medium text-foreground shadow-sm"
+        : "text-muted-foreground hover:text-foreground",
+    );
+
   const fileSearchControl = fileSearchOpen ? (
     <div
-      className="flex max-w-2xl flex-col gap-1 rounded-md bg-muted/50 px-2 py-1.5"
+      className="flex w-full max-w-2xl flex-col gap-1 rounded-md bg-muted/50 px-2 py-1.5"
       data-testid="filer-search-panel"
+      data-filer-search-panel=""
+      data-search-mode={fileSearchMode}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || event.defaultPrevented) return;
+        event.preventDefault();
+        event.stopPropagation();
+        closeFileSearch();
+      }}
     >
+      <div className="flex flex-wrap items-center gap-2">
+        <div
+          role="radiogroup"
+          aria-label="検索モード"
+          className="inline-flex shrink-0 items-center gap-0.5 rounded-md bg-muted p-0.5"
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!isSemanticMode}
+            className={segmentClass(!isSemanticMode)}
+            onClick={() => switchFileSearchMode("string")}
+            title="ファイル名・フォルダ名、またはテキストの本文に含まれる文字列で探します"
+          >
+            名前・本文の文字列
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={isSemanticMode}
+            className={segmentClass(isSemanticMode)}
+            onClick={() => switchFileSearchMode("semantic")}
+            disabled={!semanticScope}
+            title={
+              semanticScope
+                ? "言葉の意味が近い箇所を、索引済みの文書・PDF・音声・動画から探します"
+                : "User Files / Project Files の中で利用できます"
+            }
+          >
+            内容（意味）
+          </button>
+        </div>
+        {!isSemanticMode && (
+          <div
+            role="radiogroup"
+            aria-label="文字列検索の対象"
+            className="inline-flex shrink-0 items-center gap-0.5 rounded-md bg-muted p-0.5"
+          >
+            <button
+              type="button"
+              role="radio"
+              aria-checked={effectiveSearchTarget === "name"}
+              className={segmentClass(effectiveSearchTarget === "name")}
+              onClick={() => switchFileSearchTarget("name")}
+            >
+              名前
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={effectiveSearchTarget === "content"}
+              className={segmentClass(effectiveSearchTarget === "content")}
+              onClick={() => switchFileSearchTarget("content")}
+              disabled={isRemoteWorkspace}
+              title={
+                isRemoteWorkspace
+                  ? "リモートのファイルでは本文検索を利用できません"
+                  : "テキストファイルの本文を検索します（Office/PDFは内容検索を使用）"
+              }
+            >
+              本文
+            </button>
+          </div>
+        )}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="ml-auto"
+          onClick={closeFileSearch}
+          aria-label="ファイル検索を閉じる"
+          title="検索を閉じる (Esc)"
+        >
+          <X className="size-3.5" />
+        </Button>
+      </div>
       <div className="flex items-center gap-2">
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Input
@@ -2760,29 +2592,42 @@ function ExplorerContent() {
               closeFileSearch();
               return;
             }
-            if (event.key === "Enter") {
+            if (event.key === "Enter" && !event.nativeEvent.isComposing) {
               event.preventDefault();
-              void runFileSearch();
+              if (isSemanticMode) runSemanticSearch();
+              else void runFileSearch();
             }
           }}
-          placeholder="ファイル名・フォルダ名を検索..."
-          aria-label="ファイル名・フォルダ名の検索"
+          placeholder={fileSearchPlaceholder}
+          aria-label={fileSearchInputLabel}
           disabled={fileSearchLoading}
-          className="h-7 min-w-40 flex-1"
+          className="h-7 min-w-0 flex-1 sm:min-w-40"
         />
-        <label
-          htmlFor="filer-search-regex"
-          className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-muted-foreground"
-        >
-          <Checkbox
-            id="filer-search-regex"
-            checked={fileSearchRegex}
-            onCheckedChange={(checked) => setFileSearchRegex(checked === true)}
-            disabled={isRemoteWorkspace || fileSearchLoading}
-          />
-          正規表現
-        </label>
-        {fileSearchLoading ? (
+        {!isSemanticMode && (
+          <label
+            htmlFor="filer-search-regex"
+            className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-muted-foreground"
+          >
+            <Checkbox
+              id="filer-search-regex"
+              checked={fileSearchRegex}
+              onCheckedChange={(checked) => setFileSearchRegex(checked === true)}
+              disabled={isRemoteWorkspace || fileSearchLoading}
+            />
+            正規表現
+          </label>
+        )}
+        {isSemanticMode ? (
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            onClick={runSemanticSearch}
+            disabled={!fileSearchQuery.trim() || semanticSearch.search.phase === "loading"}
+          >
+            検索
+          </Button>
+        ) : fileSearchLoading ? (
           <span className="shrink-0 text-[11px] text-muted-foreground">
             検索中...
           </span>
@@ -2792,53 +2637,123 @@ function ExplorerContent() {
             {fileSearchTruncated ? "+" : ""}件
           </span>
         ) : null}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          onClick={closeFileSearch}
-          aria-label="ファイル検索を閉じる"
-          title="検索を閉じる (Esc)"
-        >
-          <X className="size-3.5" />
-        </Button>
       </div>
-      <div className="flex items-center gap-2 pl-6">
-        <Input
-          ref={fileSearchReplaceInputRef}
-          value={fileSearchReplaceQuery}
-          onChange={(event) => setFileSearchReplaceQuery(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              event.preventDefault();
-              event.stopPropagation();
-              closeFileSearch();
-              return;
+      {!isSemanticMode && effectiveSearchTarget === "name" && (
+        <div className="flex items-center gap-2 pl-6">
+          <Input
+            ref={fileSearchReplaceInputRef}
+            value={fileSearchReplaceQuery}
+            onChange={(event) => setFileSearchReplaceQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeFileSearch();
+                return;
+              }
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void replaceFileSearch();
+              }
+            }}
+            placeholder="置換後の文字列..."
+            aria-label="置換後の文字列"
+            className="h-7 min-w-0 flex-1 sm:min-w-40"
+          />
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => void replaceFileSearch()}
+            disabled={
+              fileSearchLoading ||
+              !fileSearchActive ||
+              !fileSearchQuery.trim() ||
+              !capabilities.canRename
             }
-            if (event.key === "Enter") {
-              event.preventDefault();
-              void replaceFileSearch();
-            }
-          }}
-          placeholder="置換後の文字列..."
-          aria-label="置換後の文字列"
-          className="h-7 min-w-40 flex-1"
-        />
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={() => void replaceFileSearch()}
-          disabled={
-            fileSearchLoading ||
-            !fileSearchActive ||
-            !fileSearchQuery.trim() ||
-            !capabilities.canRename
-          }
-        >
-          すべて置換
-        </Button>
-      </div>
+          >
+            すべて置換
+          </Button>
+        </div>
+      )}
+      {!isSemanticMode && contentSearchSummary && (
+        <div className="flex flex-col gap-1 pl-6" data-testid="filer-content-search-matches">
+          {contentSearchSummary.limitReason && (
+            <span className="text-[11px] text-amber-600">
+              {CONTENT_LIMIT_LABELS[contentSearchSummary.limitReason] ??
+                "上限に達したため一部のみ表示しています"}
+            </span>
+          )}
+          {contentSearchSummary.skippedLargeFiles > 0 && (
+            <span className="text-[11px] text-muted-foreground">
+              2MBを超える {contentSearchSummary.skippedLargeFiles}件のテキストは本文検索の対象外です
+            </span>
+          )}
+          {contentSearchSummary.hits.length > 0 && (
+            <ul className="max-h-40 overflow-y-auto rounded border border-border bg-background text-left text-xs">
+              {contentSearchSummary.hits.map((hit) => (
+                <li key={hit.path} className="border-b border-border/60 last:border-b-0">
+                  <button
+                    type="button"
+                    className="flex w-full flex-col gap-0.5 px-2 py-1 text-left hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
+                    onClick={() => focusRenderedItemPath(hit.path)}
+                    title={hit.path}
+                  >
+                    <span className="flex items-center gap-2">
+                      <span className="truncate font-medium">{hit.name}</span>
+                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                        {hit.matchCount}箇所
+                      </span>
+                    </span>
+                    {hit.matches.map((match) => (
+                      <span
+                        key={match.line}
+                        className="truncate font-mono text-[11px] text-muted-foreground"
+                      >
+                        {match.line}: {match.text}
+                      </span>
+                    ))}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {isSemanticMode && semanticScope && (
+        <div className="flex flex-col gap-1.5 pl-6">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            <span className="truncate" title={semanticFolderLabel}>
+              対象: <span className="text-foreground">{semanticFolderLabel}</span>
+            </span>
+            <label
+              htmlFor="filer-semantic-under-folder"
+              className="flex shrink-0 cursor-pointer items-center gap-1"
+            >
+              <Checkbox
+                id="filer-semantic-under-folder"
+                checked={semanticUnderFolder && Boolean(semanticScope.relativeFolder)}
+                disabled={!semanticScope.relativeFolder}
+                onCheckedChange={(checked) => setSemanticUnderFolder(checked === true)}
+              />
+              このフォルダ配下のみ
+            </label>
+          </div>
+          <FilesIndexStatusBar
+            status={semanticSearch.status}
+            error={semanticSearch.statusError}
+            loading={semanticSearch.statusLoading}
+            onRefresh={() => void semanticSearch.refreshStatus()}
+            onOpenDetails={() => setFilesIndexDialogOpen(true)}
+          />
+          <FilesSemanticResults
+            controller={semanticSearch}
+            scope={semanticScope}
+            onOpenLocation={openSemanticResultLocation}
+            onSwitchToString={switchToStringSearch}
+          />
+        </div>
+      )}
       {fileSearchError && (
         <span className="pl-6 text-xs text-destructive">{fileSearchError}</span>
       )}
@@ -2901,19 +2816,6 @@ function ExplorerContent() {
   // パンくず: コンテキストルート以降の相対パスのみ表示
   const breadcrumbs = useMemo(() => {
     if (!currentPath) return [];
-    // HF 仮想パスは "HF|<account>|<type>|<repoId>|<subPath>" なので
-    // "HF" を先頭、リポ名（表示用に簡略化）、サブパスセグメントを並べる
-    if (isHfMode) {
-      if (currentPath === HF_PREFIX) return ["HF"];
-      const parts = currentPath.split("|");
-      // parts[0]="HF", parts[1]=accountId, parts[2]=repoType, parts[3]=repoId, parts[4..]=subPath
-      if (parts.length < 4) return [currentPath];
-      const repoLabel = parts[3]; // "owner/name"
-      const subPath = parts.slice(4).join("|");
-      const crumbs = ["HF", repoLabel];
-      if (subPath) crumbs.push(...subPath.split("/").filter(Boolean));
-      return crumbs;
-    }
     // 絶対パス閲覧時はフルパス表示
     if (isAbsoluteFilerPath) {
       return currentPath.split(/[/\\]/).filter(Boolean);
@@ -2926,7 +2828,7 @@ function ExplorerContent() {
       return relative ? relative.split(/[/\\]/).filter(Boolean) : [];
     }
     return currentPath.split(/[/\\]/).filter(Boolean);
-  }, [currentPath, contextRootPath, isAbsoluteFilerPath, isHfMode]);
+  }, [currentPath, contextRootPath, isAbsoluteFilerPath]);
 
   return (
     <div
@@ -2957,6 +2859,7 @@ function ExplorerContent() {
           handleFileClick={handleFileClick}
           onContextMenu={handleContextMenu}
           onBackgroundContextMenu={handleBackgroundContextMenu}
+          onEditStateChange={handleEditorEditStateChange}
         />
       ) : (
         <UploadZone disabled={!isDefaultStorage} onContextMenu={isDefaultStorage ? handleBackgroundContextMenu : undefined}>
@@ -2971,15 +2874,21 @@ function ExplorerContent() {
                 <h1 className="text-[16px] font-semibold">Files</h1>
                 {isRemoteWorkspace && <span className="rounded border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-medium text-amber-300">Read-only</span>}
               </div>
-              {isDefaultStorage && filerTab !== "hydrus" ? (
+              {isDefaultStorage ? (
                 <ExplorerToolbar
                   onNewFolder={() => setNewFolderOpen(true)}
-                  onAddHfReference={() => setHfReferenceOpen(true)}
+                  onAddBookmark={isRemoteWorkspace
+                    ? undefined
+                    : () => requestFilesBookmark(activePath ?? currentPath, activeItem?.name)}
+                  onDownloadSelection={() => void downloadSelectedItems()}
+                  hasDownloadSelection={
+                    canUseDownloadShortcut && selectedRegularPaths.length > 0
+                  }
                 />
               ) : null}
             </div>
 
-            {/* Files tabs: project files / user files / HF / Hydrus */}
+            {/* Files tabs: project files / user files */}
             <div className="flex shrink-0 items-center gap-3 border-b border-border px-3 pt-1 sm:px-6" data-files-toolbar="source-storage">
               <div className="flex min-w-0 flex-1 items-center gap-5 overflow-x-auto">
                 <Button
@@ -2998,22 +2907,6 @@ function ExplorerContent() {
                 >
                   {FILER_TAB_LABELS.user}
                 </Button>
-                <Button
-                  variant={isDefaultStorage && filerTab === "hf" ? "default" : "outline"}
-                  size="sm"
-                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "hf" && "border-primary text-primary")}
-                  onClick={() => {selectDefaultStorage(); setFilerTab("hf");}}
-                >
-                  {FILER_TAB_LABELS.hf}
-                </Button>
-                <Button
-                  variant={isDefaultStorage && filerTab === "hydrus" ? "default" : "outline"}
-                  size="sm"
-                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "hydrus" && "border-primary text-primary")}
-                  onClick={() => {selectDefaultStorage(); setFilerTab("hydrus");}}
-                >
-                  {FILER_TAB_LABELS.hydrus}
-                </Button>
               </div>
               <div className="ml-auto flex min-w-0 shrink-0 items-center gap-3 pb-1">
                 {isDefaultStorage && selectedPaths.length > 0 && (
@@ -3027,88 +2920,8 @@ function ExplorerContent() {
 
             <StorageWorkspacePanel />
             {isDefaultStorage && <>
-            {/* Hydrus 検索バー（カスタムUIはこれだけ。結果は context の browseData に流す） */}
-            {filerTab === "hydrus" && (
-              <HydrusSearchBar
-                onPagingChange={(controller) => {
-                  hydrusPagingRef.current = controller;
-                }}
-                onRetryChange={(retry) => {
-                  hydrusRetryRef.current = retry;
-                }}
-                onResults={(data) => {
-                  setBrowseData(data);
-                  setHydrusError(null);
-                }}
-                onError={(nextError) => setHydrusError(nextError)}
-              />
-            )}
-            {filerTab === "hydrus" && hydrusError && (
-              <div
-                className="mx-6 my-2 space-y-1 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
-                role="alert"
-                aria-live="polite"
-                data-hydrus-error-code={hydrusError.code ?? "unknown"}
-              >
-                <p>{hydrusError.message}</p>
-                {hydrusError.code === "hydrus_endpoint_policy_rejected" && (
-                  <p>
-                    同じPCのHydrus Clientは loopback（localhost / 127.0.0.1 / ::1）を使用してください。LAN上のprivate endpointは安全ポリシーで制限されます。
-                  </p>
-                )}
-                {hydrusError.code === "hydrus_auth_failed" && (
-                  <p>Access KeyとHydrus API権限を確認してください。</p>
-                )}
-                <div className="flex flex-wrap items-center gap-2 pt-1">
-                  {hydrusError.retryable && (
-                    <Button
-                      type="button"
-                      size="xs"
-                      variant="outline"
-                      onClick={() => hydrusRetryRef.current?.()}
-                    >
-                      再試行
-                    </Button>
-                  )}
-                  <a
-                    href="/settings#hydrus"
-                    className="underline underline-offset-2"
-                  >
-                    Hydrus設定を開く
-                  </a>
-                  {hydrusError.traceId && (
-                    <span className="text-[10px] opacity-80">
-                      トレースID: {hydrusError.traceId}
-                    </span>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* HF タグ/作者フィルタ（creator_mapping.json があるリポのみ表示） */}
-            {filerTab === "hf" && isHfMode && hfCreatorMapping && (
-              <div className="mx-6 flex items-center gap-2 rounded-md border border-border bg-card/40 p-2">
-                <Input
-                  value={hfSearchQuery}
-                  onChange={(e) => setHfSearchQuery(e.target.value)}
-                  placeholder="作者名・フォルダ名・タグで検索..."
-                  className="h-8"
-                />
-                {hfSearchQuery && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setHfSearchQuery("")}
-                  >
-                    クリア
-                  </Button>
-                )}
-              </div>
-            )}
-
             {/* ナビゲーション（ホーム・上位移動・パンくず） */}
-            {filerTab !== "hydrus" && (
-              <div className="flex shrink-0 items-center gap-2 border-b border-border px-6 py-1 text-sm">
+            <div className="flex shrink-0 items-center gap-2 border-b border-border px-6 py-1 text-sm">
                 <Button
                   variant="ghost"
                   size="xs"
@@ -3133,22 +2946,7 @@ function ExplorerContent() {
                   {breadcrumbs.slice(-4).map((segment, i, arr) => {
                     const fullIndex = breadcrumbs.length - arr.length + i;
                     let partialPath: string;
-                    if (isHfMode) {
-                      // HF: breadcrumbs[0]="HF", [1]="owner/name", [2..]=subPath
-                      if (fullIndex === 0) {
-                        partialPath = HF_PREFIX;
-                      } else {
-                        const parts = currentPath.split("|");
-                        // リポジトリルートまで
-                        const repoBase = parts.slice(0, 4).join("|");
-                        if (fullIndex === 1) {
-                          partialPath = repoBase;
-                        } else {
-                          const subCrumbs = breadcrumbs.slice(2, fullIndex + 1);
-                          partialPath = repoBase + "|" + subCrumbs.join("/");
-                        }
-                      }
-                    } else if (isAbsoluteFilerPath) {
+                    if (isAbsoluteFilerPath) {
                       const allSegments = currentPath
                         .split(/[/\\]/)
                         .filter(Boolean);
@@ -3181,10 +2979,9 @@ function ExplorerContent() {
                   })}
                 </div>
               </div>
-            )}
 
             {/* ローディング */}
-            {filerTab !== "hydrus" && loading && (
+            {loading && (
               <div className="grid grid-cols-2 gap-3 p-6 sm:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
                 {Array.from({ length: 12 }).map((_, i) => (
                   <Skeleton key={i} className="h-32 rounded-md bg-muted/40" />
@@ -3199,7 +2996,7 @@ function ExplorerContent() {
               </div>
             )}
 
-            {/* ファイル一覧: HF/Workspace/User/Hydrus すべて同じ FileGrid/FileList で描画 */}
+            {/* ファイル一覧: Workspace/User すべて同じ FileGrid/FileList で描画 */}
             {!loading &&
               browseData &&
               (viewMode === "grid" ? (
@@ -3221,15 +3018,13 @@ function ExplorerContent() {
               ))}
 
             {/* 空フォルダ */}
-            {(filerTab !== "hydrus" ||
-              (quickFilterOpen && !!normalizedQuickFilter)) &&
-              !loading &&
+            {!loading &&
               browseData &&
               visibleDirectories.length === 0 &&
               visibleFiles.length === 0 && (
                 <div className="mx-6 my-8 flex max-w-lg flex-col items-center overflow-hidden rounded-md border border-border bg-card/40 text-center text-sm text-muted-foreground">
                   <img
-                    src="/images/ui/empty-files.png"
+                    src={withBasePath("/images/ui/empty-files.png")}
                     alt=""
                     className="aspect-[16/7] w-full object-cover"
                   />
@@ -3238,9 +3033,7 @@ function ExplorerContent() {
                       ? "一致する項目はありません。"
                       : fileSearchActive
                       ? "検索結果はありません。"
-                      : isHfMode
-                        ? "HFリポジトリは空です。"
-                        : "このフォルダは空です。ファイルをドラッグ&ドロップでアップロードできます。"}
+                      : "このフォルダは空です。ファイルをドラッグ&ドロップでアップロードできます。"}
                   </div>
                 </div>
               )}
@@ -3257,6 +3050,20 @@ function ExplorerContent() {
         onClose={() => {
           setCtxItem(null);
           setCtxPos(null);
+          // The menu unmounts with focus on <body>.  Return focus to Files
+          // only when Files still owns it (Esc / menu item); dismissing the
+          // menu by pressing outside Files must not pull focus back in.
+          if (contextMenuFocusFrameRef.current !== null) {
+            window.cancelAnimationFrame(contextMenuFocusFrameRef.current);
+          }
+          contextMenuFocusFrameRef.current = window.requestAnimationFrame(() => {
+            contextMenuFocusFrameRef.current = null;
+            if (!filesOwnsOrphanedFocusRef.current) return;
+            const active = document.activeElement;
+            if (!active || active === document.body) {
+              explorerRootRef.current?.focus({ preventScroll: true });
+            }
+          });
         }}
         onRename={(item) => {
           setRenameTarget(item);
@@ -3277,6 +3084,17 @@ function ExplorerContent() {
         onNewTextFile={() => setNewTextFileOpen(true)}
         activeSelectionPaths={selectedPaths}
       />
+      {semanticScope && (
+        <FilesIndexDialog
+          open={filesIndexDialogOpen}
+          onOpenChange={setFilesIndexDialogOpen}
+          scope={semanticScope}
+          status={semanticSearch.status}
+          statusError={semanticSearch.statusError}
+          onRefreshStatus={() => void semanticSearch.refreshStatus()}
+          onOpenPath={openFilesLocation}
+        />
+      )}
       <NewFolderDialog open={newFolderOpen} onOpenChange={setNewFolderOpen} />
       <NewTextFileDialog
         open={newTextFileOpen}
@@ -3298,8 +3116,6 @@ function ExplorerContent() {
           files={browseData.files}
           onClose={() => setViewerFile(null)}
           onNavigate={(f) => setViewerFile(f)}
-          onBoundaryNavigate={isHydrusMode ? loadHydrusBoundary : undefined}
-          onAdjacentFiles={isHydrusMode ? preloadHydrusAdjacent : undefined}
           returnFocusRef={viewerReturnFocusRef}
         />
       )}
@@ -3313,14 +3129,6 @@ function ExplorerContent() {
           }}
         />
       )}
-      <HfReferenceDialog
-        open={hfReferenceOpen}
-        onOpenChange={setHfReferenceOpen}
-        onAdded={(path) => {
-          if (path) navigate(path);
-          else navigate(HF_PREFIX);
-        }}
-      />
     </div>
   );
 }

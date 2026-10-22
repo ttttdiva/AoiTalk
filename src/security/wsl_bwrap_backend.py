@@ -15,6 +15,9 @@ unscoped operations.
 from __future__ import annotations
 
 import os
+import contextlib
+import base64
+import errno
 import re
 import shutil
 import subprocess
@@ -24,13 +27,131 @@ import stat
 import threading
 import filecmp
 import time
+import shlex
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence, Iterable
 
+from .sensitive_files import is_sensitive_relative_path
+
 
 class WslBwrapError(RuntimeError):
     """Raised when the file-scoped WSL/bwrap backend cannot be used safely."""
+
+
+_GUEST_ENV_ALLOWLIST = frozenset(
+    {
+        "BROWSER", "CI", "HOST", "HOSTNAME", "LANG", "LC_ALL", "NODE_ENV",
+        "NO_COLOR", "PATH", "PORT", "PYTHON_DOTENV_DISABLED", "PYTHONIOENCODING",
+        "PYTHONUNBUFFERED", "TZ", "CLAUDE_CONFIG_DIR",
+        "AOITALK_PROVIDER_AUTH_STDIN", "AOITALK_PROVIDER_HIDE_PROC",
+    }
+)
+_SCOPED_PROVIDER_ENV_MARKER = "SCOPED_ENV_V1"
+_SCOPED_PROVIDER_ENV_NAMES = frozenset(
+    {
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "AOITALK_AGENT_RUN_ID",
+        "AOITALK_AGENT_WORK_ITEM_ID",
+        "AOITALK_AGENT_SESSION_ID",
+        "AOITALK_AGENT_ID",
+        "AOITALK_AGENT_REVISION_ID",
+        "AOITALK_AGENT_BINDING_ID",
+        "AOITALK_AGENT_BINDING_SNAPSHOT_HASH",
+        "AOITALK_AGENT_CAPABILITY_MANIFEST_DIGEST",
+        "AOITALK_AGENT_AUTHORITY_DIGEST",
+        "AOITALK_AGENT_LEASE_OWNER",
+        "AOITALK_AGENT_LEASE_TOKEN",
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+    }
+)
+_SCOPED_GUEST_PATH = "/opt/aoitalk/toolchain/bin:/usr/bin:/bin"
+_TOOLCHAIN_GUEST_ROOT = "/opt/aoitalk/toolchain"
+_CODEX_GUEST_EXECUTABLE = "/opt/aoitalk/providers/codex"
+_COMMAND_TRANSPORT_PATH = "/tmp/.aoitalk-command.sh"
+_ORIGINAL_MKDTEMP = tempfile.mkdtemp
+
+
+def _guest_bootstrap_command(
+    command: str,
+    *,
+    provider_auth_env: str | None = None,
+) -> str:
+    """Serialize one command before crossing the Windows/WSL argv boundary.
+
+    ``wsl.exe`` performs a command-line expansion before it invokes the
+    requested guest process.  Passing the user's script as the argument to
+    ``bash -lc`` therefore lets that intermediate parser consume shell
+    operators such as ``$?`` and ``$result``.  The payload is UTF-8 encoded
+    and base64 wrapped so only a fixed, shell-safe bootstrap reaches
+    ``wsl.exe``.  The guest decodes the exact bytes into its private tmpfs and
+    sources the file from the same bash process; sourcing keeps the original
+    stdin and exit status semantics for foreground and interactive jobs.
+
+    The command itself is validated by the caller before this helper is used,
+    including the existing NUL check.  Base64's alphabet contains no shell
+    operators, quotes, whitespace, or non-ASCII characters.
+    """
+
+    payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    auth_prefix = ""
+    if provider_auth_env is not None:
+        if provider_auth_env != _SCOPED_PROVIDER_ENV_MARKER:
+            raise WslBwrapError("unsupported scoped provider authentication environment")
+        # Provider values are delivered as base64 encoded stdin lines.  They
+        # therefore never appear in WSL/bwrap argv, the command payload, or a
+        # temporary file. The remaining stdin bytes are left for the provider.
+        allowed_names = "|".join(sorted(_SCOPED_PROVIDER_ENV_NAMES))
+        auth_prefix = (
+            "IFS= read -r __aoitalk_provider_auth_version || exit 78; "
+            f"test \"$__aoitalk_provider_auth_version\" = {provider_auth_env} || exit 78; "
+            "while IFS=' ' read -r __aoitalk_provider_env_name __aoitalk_provider_env_value; do "
+            "if [ \"$__aoitalk_provider_env_name\" = AOITALK_END ]; then break; fi; "
+            f"case \"$__aoitalk_provider_env_name\" in {allowed_names}) ;; *) exit 78 ;; esac; "
+            "test -n \"$__aoitalk_provider_env_value\" || exit 78; "
+            "__aoitalk_provider_env_decoded=$(printf '%s' \"$__aoitalk_provider_env_value\" | base64 -d) || exit 78; "
+            "export \"$__aoitalk_provider_env_name=$__aoitalk_provider_env_decoded\"; "
+            "done; "
+            "test \"$__aoitalk_provider_env_name\" = AOITALK_END || exit 78; "
+            "unset __aoitalk_provider_auth_version __aoitalk_provider_env_name "
+            "__aoitalk_provider_env_value __aoitalk_provider_env_decoded; "
+        )
+    return (
+        "printf '%s' '"
+        + payload
+        + "' | base64 -d > "
+        + _COMMAND_TRANSPORT_PATH
+        + "; "
+        + auth_prefix
+        + ". "
+        + _COMMAND_TRANSPORT_PATH
+    )
+
+
+def _verification_temp_dir() -> Path:
+    """Return the repository-owned scratch root for private verification data."""
+
+    root = Path(__file__).resolve().parents[2] / ".local" / "wsl-bwrap-verification"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _mkdtemp_for_verification(prefix: str) -> Path:
+    """Create private verification storage under the repository scratch root.
+
+    Test fixtures replace ``tempfile.mkdtemp`` to keep their own artifacts in
+    pytest's temporary tree.  Preserve that explicit test injection while the
+    real runtime always uses the repository-owned ``.local`` scratch area.
+    """
+
+    maker = tempfile.mkdtemp
+    if maker is _ORIGINAL_MKDTEMP:
+        return Path(maker(prefix=prefix, dir=str(_verification_temp_dir())))
+    return Path(maker(prefix=prefix))
 
 
 @dataclass(frozen=True)
@@ -70,6 +191,58 @@ class _StageTree:
     exclude_sensitive: bool = False
 
 
+class _VerificationWorkspace:
+    """Private, bounded dependency storage shared by verification commands.
+
+    Only these fixed workspace subdirectories are overlaid. They are never
+    copied from or published to the canonical checkout. In particular, ordinary
+    package-manager/venv symlinks stay inside the sandbox and do not weaken the
+    canonical publication policy.
+    """
+
+    relative_dirs = ("node_modules", ".verify")
+
+    def __init__(self, scope: Any) -> None:
+        self._owner = (str(scope.run_id), str(scope.repo_identity), _path_key(scope.canonical_root))
+        self.root = _mkdtemp_for_verification(prefix="aoitalk-wsl-verify-")
+        self._lock = threading.Lock()
+        self._users = 0
+        self._closed = False
+        try:
+            for name in self.relative_dirs:
+                (self.root / name).mkdir()
+        except Exception:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
+
+    def assert_owner(self, scope: Any) -> None:
+        owner = (str(scope.run_id), str(scope.repo_identity), _path_key(scope.canonical_root))
+        with self._lock:
+            if self._closed or owner != self._owner:
+                raise WslBwrapError("verification workspace does not belong to this active run")
+
+    def retain(self, scope: Any) -> None:
+        self.assert_owner(scope)
+        with self._lock:
+            if self._closed:
+                raise WslBwrapError("verification workspace is closed")
+            self._users += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._users -= 1
+            remove = self._closed and self._users == 0
+        if remove:
+            shutil.rmtree(self.root, ignore_errors=True)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            remove = self._users == 0
+        if remove:
+            shutil.rmtree(self.root, ignore_errors=True)
+
+
 class _FinalizationState:
     """Exactly-once publication state shared by foreground and async callers."""
 
@@ -82,31 +255,44 @@ class _FinalizationState:
         stage_parent: Path | None = None,
         monitor_roots: Sequence[Path] = (),
         max_disk_bytes: int | None = None,
+        verification_workspace: _VerificationWorkspace | None = None,
     ) -> None:
         self.backend = backend
         self.scope = scope
         self.trees = tuple(trees)
         self._lock = threading.Lock()
         self._event = threading.Event()
+        self.finalizing = False
         self.finalized = False
+        self.publication_committed = False
         self.cancelled = False
         self.cancel_reason = ""
         self.outcome: dict[str, Any] | None = None
         self.max_disk_bytes = max_disk_bytes
         self.stage_parent = stage_parent
         self.monitor_roots = tuple(monitor_roots)
+        self.verification_workspace = verification_workspace
+        self._verification_released = False
+        limits = backend._trusted_resource_limits(scope)
+        self.finalization_timeout_seconds = float(getattr(limits, "timeout_seconds", 10.0))
+        self._finalization_deadline: float | None = None
         self.baseline_bytes = sum(
             entry.size
             for tree in self.trees
             for entry in tree.baseline.values()
             if entry.kind == "file"
         ) + sum(_regular_tree_bytes(root) for root in self.monitor_roots)
+        if verification_workspace is not None:
+            # Shared dependencies count against the complete budget on every
+            # command, rather than gaining a fresh growth allowance per step.
+            self.baseline_bytes -= _regular_tree_bytes(verification_workspace.root)
+            verification_workspace.retain(scope)
 
     def cancel(self, reason: str = "process stopped") -> None:
         """Discard staged changes when a process is stopped or times out."""
 
         with self._lock:
-            if self.finalized:
+            if self.finalized or self.publication_committed:
                 return
             self.cancelled = True
             self.cancel_reason = str(reason or "process stopped")
@@ -115,9 +301,16 @@ class _FinalizationState:
         with self._lock:
             if self.finalized:
                 return dict(self.outcome or {"success": False, "error": "finalization unavailable"})
-            self.finalized = True
+            already_running = self.finalizing
+            if not already_running:
+                self.finalizing = True
+                self._finalization_deadline = time.monotonic() + self.finalization_timeout_seconds
             cancelled = self.cancelled
             cancel_reason = self.cancel_reason
+        if already_running:
+            return self.wait(self.finalization_timeout_seconds) or {
+                "success": False, "error": "staged publication finalization timeout"
+            }
         if cancelled or (exit_code is not None and exit_code != 0):
             # A killed/failed process may have left partial writes in staging;
             # never publish those implicitly.  The canonical host remains
@@ -128,12 +321,11 @@ class _FinalizationState:
                 "discarded": True,
                 "reason": cancel_reason or f"process exited with status {exit_code}",
             }
-            with self._lock:
-                self.outcome = dict(outcome)
-                self._event.set()
             self.cleanup()
+            self._complete(outcome)
             return dict(outcome)
         try:
+            self.checkpoint()
             if self.max_disk_bytes is not None:
                 current_bytes = sum(
                     _regular_tree_bytes(tree.stage_root) for tree in self.trees
@@ -143,15 +335,33 @@ class _FinalizationState:
                         "sandbox disk growth exceeded trusted max_disk_bytes "
                         f"({self.max_disk_bytes})"
                     )
-            outcome = self.backend._finalize_staging(self.scope, self.trees)
+            self.checkpoint()
+            outcome = self.backend._finalize_staging(self.scope, self.trees, state=self)
         except Exception as exc:  # pragma: no cover - defensive fail-closed guard
             outcome = {"success": False, "error": f"staged publication failed: {exc}"}
         finally:
             self.cleanup()
+        self._complete(outcome)
+        return dict(outcome)
+
+    def _complete(self, outcome: Mapping[str, Any]) -> None:
         with self._lock:
             self.outcome = dict(outcome)
+            self.finalizing = False
+            self.finalized = True
             self._event.set()
-        return dict(outcome)
+
+    def checkpoint(self, *, commit: bool = False) -> None:
+        """Serialize cancellation with the journal's last rollback boundary."""
+
+        with self._lock:
+            if self._finalization_deadline is not None and time.monotonic() >= self._finalization_deadline:
+                self.cancelled = True
+                self.cancel_reason = "staged publication finalization timeout"
+            if self.cancelled:
+                raise WslBwrapError(self.cancel_reason or "staged publication cancelled")
+            if commit:
+                self.publication_committed = True
 
     def wait(self, timeout: float | None = None) -> dict[str, Any] | None:
         if not self._event.wait(timeout):
@@ -160,6 +370,13 @@ class _FinalizationState:
             return dict(self.outcome or {})
 
     def cleanup(self) -> None:
+        shared = None
+        with self._lock:
+            if not self._verification_released:
+                self._verification_released = True
+                shared = self.verification_workspace
+        if shared is not None:
+            shared.release()
         # ``TemporaryDirectory`` is deliberately not retained here: process
         # watchers and foreground runs both need deterministic cleanup, and a
         # best-effort rmtree is safe after publication has completed.
@@ -206,6 +423,33 @@ def _is_link_or_reparse(path: Path) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & flag)
 
 
+def _reject_hardlink(path: Path, info: os.stat_result | None = None) -> None:
+    """Reject regular hardlinks before a tree can cross the guest boundary."""
+
+    try:
+        info = info or os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise WslBwrapError(f"cannot inspect potential hardlink: {path}: {exc}") from exc
+    if stat.S_ISREG(info.st_mode) and int(getattr(info, "st_nlink", 1) or 1) > 1:
+        raise WslBwrapError(f"hardlink is not allowed in a mounted workspace: {path}")
+
+
+def _reject_hardlinks(root: Path) -> None:
+    """Fail closed when any regular file aliases another host inode."""
+
+    if not root.exists() or not root.is_dir():
+        return
+
+    def onerror(exc: OSError) -> None:
+        raise WslBwrapError(f"cannot inspect mounted workspace: {root}: {exc}") from exc
+
+    for current, _dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=onerror):
+        for name in files:
+            _reject_hardlink(Path(current) / name)
+
+
 def _safe_alias(path: Path, prefix: str) -> str:
     """Return a deterministic, shell-safe mount alias for one canonical path."""
 
@@ -213,6 +457,77 @@ def _safe_alias(path: Path, prefix: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(leaf)).strip(".-") or "root"
     digest = hashlib.sha256(_path_key(path).encode("utf-8", "surrogatepass")).hexdigest()[:12]
     return f"{prefix}-{slug[:40]}-{digest}"
+
+
+def scoped_scratch_guest_path(scope: Any, root: Path | str) -> str:
+    """Map one server-issued scratch root to its deterministic guest mount."""
+
+    candidate = Path(root)
+    candidate_key = _path_key(candidate)
+    for value in getattr(scope, "scratch_roots", ()) or ():
+        scratch = Path(value)
+        if _path_key(scratch) == candidate_key:
+            return f"/scratch/{_safe_alias(scratch, 'scratch')}"
+    raise WslBwrapError("requested guest scratch root is not in the issued scope")
+
+
+def _nested_limited_proc_command(command: str, *, bwrap_executable: str) -> str:
+    """Hide proc aliases inside the already file-scoped outer sandbox.
+
+    The selected self files are read-only runtime hints bound to the live
+    setup process, not a complete provider-self procfs implementation.
+    """
+
+    argv = [
+        bwrap_executable,
+        "--die-with-parent",
+        "--cap-drop", "ALL",
+        "--unshare-user",
+        "--disable-userns",
+        # Inherit only the outer sandbox's restricted mount view. dev-bind
+        # preserves its private /dev; a normal bind makes /dev/null unusable.
+        # Existing read-only submounts stay read-only.
+        "--dev-bind", "/", "/",
+        "--tmpfs", "/proc",
+        "--dir", "/proc/sys",
+        "--dir", "/proc/sys/vm",
+        "--dir", "/proc/self",
+        "--dir", "/proc/self/fd",
+        "--ro-bind", "/proc-runtime/stat", "/proc/stat",
+        "--ro-bind", "/proc-runtime/sys/vm/overcommit_memory", "/proc/sys/vm/overcommit_memory",
+        "--ro-bind", "/proc-runtime/sys/vm/mmap_min_addr", "/proc/sys/vm/mmap_min_addr",
+        "--ro-bind", "/proc-runtime/self/maps", "/proc/self/maps",
+        "--ro-bind", "/proc-runtime/self/cgroup", "/proc/self/cgroup",
+        "--ro-bind", "/proc-runtime/self/statm", "/proc/self/statm",
+        "--symlink", "/workspace", "/proc/self/fd/8",
+        "--tmpfs", "/proc-runtime",
+        "/bin/bash", "-lc", command,
+    ]
+    return shlex.join(argv)
+
+
+def _runtime_etc_mount_args() -> list[str]:
+    """Expose only public system metadata needed by provider runtimes.
+
+    Never bind /etc wholesale: WSL may run as uid 0, and read-only mounts
+    would still expose shadow files, SSH private keys and service secrets.
+    """
+
+    paths = (
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/gai.conf",
+        "/etc/localtime",
+        "/etc/timezone",
+        "/etc/ld.so.cache",
+        "/etc/ssl/certs",
+    )
+    return ["--dir", "/etc", *(
+        item for path in paths for item in ("--ro-bind-try", path, path)
+    )]
 
 
 def _snapshot_signature(path: Path) -> _SnapshotEntry:
@@ -234,6 +549,7 @@ def _snapshot_signature(path: Path) -> _SnapshotEntry:
     if stat.S_ISDIR(info.st_mode):
         return _SnapshotEntry("dir", mode=mode)
     if stat.S_ISREG(info.st_mode):
+        _reject_hardlink(path, info)
         digest = hashlib.sha256()
         try:
             with path.open("rb") as handle:
@@ -251,19 +567,7 @@ def _snapshot_signature(path: Path) -> _SnapshotEntry:
 
 
 def _sensitive_relative_path(relative: str) -> bool:
-    for part in relative.replace("\\", "/").split("/"):
-        name = part.casefold()
-        if (
-            name in {
-                "credentials", "credential", "secrets", "secret",
-                ".ssh", "id_rsa", "id_ed25519",
-            }
-            or name == ".env"
-            or name.startswith(".env.")
-            or name.endswith((".key", ".pem", ".p12", ".pfx", ".secret", ".secrets"))
-        ):
-            return True
-    return False
+    return is_sensitive_relative_path(relative)
 
 
 def _snapshot_tree(
@@ -271,6 +575,7 @@ def _snapshot_tree(
     *,
     excluded_prefixes: Sequence[str] = (),
     exclude_sensitive: bool = False,
+    checkpoint: Any = None,
 ) -> dict[str, _SnapshotEntry]:
     """Snapshot direct children of *root* while never following symlink dirs."""
 
@@ -279,10 +584,14 @@ def _snapshot_tree(
     excludes = tuple(str(item).replace("\\", "/").strip("/") for item in excluded_prefixes)
     result: dict[str, _SnapshotEntry] = {}
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        if checkpoint is not None:
+            checkpoint()
         current_path = Path(current)
         # Remove link/reparse directories from traversal; retain them as an
         # entry so a newly-created link is rejected during finalization.
         for name in list(dirs):
+            if checkpoint is not None:
+                checkpoint()
             rel = (current_path / name).relative_to(root).as_posix()
             if (
                 any(rel == ex or rel.startswith(ex + "/") for ex in excludes)
@@ -295,6 +604,8 @@ def _snapshot_tree(
             if _is_link_or_reparse(child):
                 dirs.remove(name)
         for name in files:
+            if checkpoint is not None:
+                checkpoint()
             rel = (current_path / name).relative_to(root).as_posix()
             if (
                 any(rel == ex or rel.startswith(ex + "/") for ex in excludes)
@@ -310,21 +621,44 @@ def _regular_tree_bytes(root: Path) -> int:
     """Return regular-file bytes without following links/reparse directories."""
 
     total = 0
-    if not root.exists():
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
         return 0
-    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+    except OSError as exc:
+        raise WslBwrapError(f"cannot measure staged disk usage: {root}: {exc}") from exc
+
+    def onerror(exc: OSError) -> None:
+        # A live build can atomically rename/delete a temporary file between
+        # scandir and stat.  A vanished node consumes no current disk bytes;
+        # permission and other I/O failures remain fail-closed.
+        if isinstance(exc, FileNotFoundError) or getattr(exc, "errno", None) == errno.ENOENT:
+            return
+        raise WslBwrapError(f"cannot measure staged disk usage: {exc}") from exc
+
+    for current, dirs, files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=onerror,
+    ):
         current_path = Path(current)
         for name in list(dirs):
             if _is_link_or_reparse(current_path / name):
                 dirs.remove(name)
         for name in files:
             path = current_path / name
-            if _is_link_or_reparse(path):
-                continue
             try:
-                total += int(path.stat().st_size)
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
             except OSError as exc:
                 raise WslBwrapError(f"cannot measure staged disk usage: {path}: {exc}") from exc
+            attrs = getattr(info, "st_file_attributes", 0)
+            if stat.S_ISLNK(info.st_mode) or bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += int(info.st_size)
     return total
 
 
@@ -383,6 +717,7 @@ def _copy_tree(
                     raise WslBwrapError(f"cannot stage link {child}: {exc}") from exc
             else:
                 try:
+                    _reject_hardlink(child)
                     shutil.copy2(child, target, follow_symlinks=False)
                 except OSError as exc:
                     raise WslBwrapError(f"cannot stage file {child}: {exc}") from exc
@@ -511,6 +846,8 @@ class WslBwrapBackend:
         wsl_executable: str = "wsl.exe",
         bwrap_executable: str = "/usr/bin/bwrap",
         workspace_mount: str = "/workspace",
+        toolchain_root: str | None = None,
+        codex_linux_executable: str | None = None,
         # A cold WSL distribution can take several seconds to start on
         # Windows; keep this bounded but above the observed cold-start cost.
         translation_timeout_seconds: float = 30.0,
@@ -521,6 +858,168 @@ class WslBwrapBackend:
         self.workspace_mount = str(workspace_mount or "/workspace").rstrip("/") or "/workspace"
         self.translation_timeout_seconds = max(float(translation_timeout_seconds), 0.1)
         self._publication_lock = threading.Lock()
+        # Deployment-owned Linux executable only. Never mount a Windows npm
+        # package, host home directory, credentials, or a provider config tree.
+        self.codex_linux_executable = str(codex_linux_executable or "").strip() or None
+        if self.codex_linux_executable is not None:
+            value = self.codex_linux_executable
+            path = PurePosixPath(value)
+            if (
+                not path.is_absolute() or path == PurePosixPath("/")
+                or ".." in path.parts
+                or any(char in value for char in ("\x00", "\r", "\n", "\\"))
+            ):
+                raise WslBwrapError("codex_linux_executable must be an absolute WSL file path")
+        self.toolchain_root = str(toolchain_root or "").strip() or None
+        if self.toolchain_root is not None:
+            value = self.toolchain_root
+            path = PurePosixPath(value)
+            if (
+                not path.is_absolute() or path == PurePosixPath("/")
+                or ".." in path.parts or any(char in value for char in ("\x00", "\r", "\n", "\\"))
+            ):
+                raise WslBwrapError("toolchain_root must be a non-root absolute WSL path")
+
+    def _run_codex_deployment_probe(self, argv: Sequence[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                list(argv), capture_output=True,
+                timeout=min(self.translation_timeout_seconds, 10.0), check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WslBwrapError(f"Codex deployment probe failed: {type(exc).__name__}") from exc
+
+    def _canonical_wsl_path(self, value: str, *, must_exist: bool) -> str:
+        result = self._run_codex_deployment_probe(
+            [
+                self.wsl_executable, "-d", self.distribution, "--exec",
+                "/usr/bin/realpath", "-e" if must_exist else "-m", "--", value,
+            ],
+        )
+        try:
+            output = result.stdout.decode("utf-8", "strict").strip()
+        except UnicodeError as exc:
+            raise WslBwrapError("cannot resolve Codex deployment path inside WSL") from exc
+        if result.returncode != 0 or not output.startswith("/") or any(
+            char in output for char in ("\x00", "\r", "\n")
+        ):
+            raise WslBwrapError("cannot resolve Codex deployment path inside WSL")
+        return output
+
+    def _codex_mount_args(self, scope: Any | None = None) -> list[str]:
+        if self.codex_linux_executable is None:
+            return []
+        source = self._canonical_wsl_path(self.codex_linux_executable, must_exist=True)
+        if scope is not None:
+            # Read-only bind flags cannot protect a deployment artifact which
+            # is writable through another workspace/scratch alias. Resolve
+            # parent links before comparison and mount that canonical source.
+            writable = (
+                *self._roots(scope, "write_roots"),
+                *self._roots(scope, "delete_roots"),
+                *self._roots(scope, "scratch_roots"),
+            )
+            for root in writable:
+                resolved = self._canonical_wsl_path(
+                    self.translate_windows_path(root), must_exist=False
+                )
+                left, right = source, resolved
+                if source.startswith("/mnt/") and resolved.startswith("/mnt/"):
+                    left, right = source.casefold(), resolved.casefold()
+                if PurePosixPath(left).is_relative_to(PurePosixPath(right)):
+                    raise WslBwrapError("Codex deployment artifact overlaps a writable run scope")
+        # A directory or npm shell wrapper must not accidentally expose its
+        # contents. Check one explicit source using fixed shell text and a
+        # positional argument, never interpolate deployment paths into code.
+        probe = self._run_codex_deployment_probe(
+            [
+                self.wsl_executable, "-d", self.distribution, "--exec",
+                "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/sh", "-c",
+                'test -f "$1" && test ! -L "$1" && test -x "$1" && '
+                '[ "$(head -c 4 -- "$1" | od -An -tx1 | tr -d " \n")" = 7f454c46 ]',
+                "codex-binary-probe", source,
+            ],
+        )
+        if probe.returncode != 0:
+            raise WslBwrapError("configured Codex runtime must be one executable Linux ELF file")
+        return ["--ro-bind", source, _CODEX_GUEST_EXECUTABLE]
+
+    def _runtime_probe_command(self) -> list[str]:
+        commands = []
+        if self.toolchain_root is not None:
+            commands.append("/opt/aoitalk/toolchain/bin/node --version")
+        if self.codex_linux_executable is not None:
+            commands.append(f"{_CODEX_GUEST_EXECUTABLE} --version")
+        if self.codex_linux_executable is not None:
+            return ["/bin/sh", "-c", " && ".join(commands)]
+        if self.toolchain_root is not None:
+            return ["/opt/aoitalk/toolchain/bin/node", "--version"]
+        return ["/bin/true"]
+
+    def _toolchain_mount_args(self) -> list[str]:
+        """Return the minimal read-only mounts for the approved Node runtime.
+
+        The customer workspace must never be able to select an arbitrary
+        executable tree through ``PATH``.  Deployment supplies one immutable
+        WSL path and this backend exposes only Node's executable and the npm
+        launcher files needed by the verification commands.  In particular,
+        the complete toolchain root is never bind-mounted into the guest.
+        """
+
+        if self.toolchain_root is None:
+            return []
+        self._validate_toolchain()
+        root = PurePosixPath(self.toolchain_root)
+        guest_root = PurePosixPath(_TOOLCHAIN_GUEST_ROOT)
+        mounts = [
+            (root / "bin" / "node", guest_root / "bin" / "node"),
+            (
+                root / "lib" / "node_modules" / "npm",
+                guest_root / "lib" / "node_modules" / "npm",
+            ),
+        ]
+        args = [
+            item
+            for source, destination in mounts
+            for item in ("--ro-bind", str(source), str(destination))
+        ]
+        # The official Node tarball exposes npm/npx as relative symlinks. Keep
+        # that layout inside the guest so npm-cli.js resolves ../lib/cli.js
+        # relative to its real package directory instead of /opt/.../bin.
+        args.extend(
+            [
+                "--symlink",
+                "../lib/node_modules/npm/bin/npm-cli.js",
+                str(guest_root / "bin" / "npm"),
+                "--symlink",
+                "../lib/node_modules/npm/bin/npx-cli.js",
+                str(guest_root / "bin" / "npx"),
+            ]
+        )
+        return args
+
+    def _validate_toolchain(self, scope: Any | None = None) -> None:
+        """Validate deployment-owned toolchain metadata before constructing mounts.
+
+        ``toolchain_root`` is a WSL path, so its host-side existence cannot be
+        checked from this Windows process.  Runtime readiness probes the actual
+        namespace separately; this method only enforces the lexical contract
+        and prevents a request scope from replacing deployment configuration.
+        """
+
+        if self.toolchain_root is None:
+            return
+        value = str(self.toolchain_root)
+        path = PurePosixPath(value)
+        if (
+            not path.is_absolute()
+            or path == PurePosixPath("/")
+            or ".." in path.parts
+            or any(char in value for char in ("\x00", "\r", "\n", "\\"))
+        ):
+            raise WslBwrapError("toolchain_root must be a non-root absolute WSL path")
+        if scope is not None and not bool(getattr(scope, "file_scoped", True)):
+            raise WslBwrapError("toolchain mount requires a file-scoped run")
 
     def is_available(self) -> bool:
         """Return whether the configured WSL executable is discoverable."""
@@ -529,6 +1028,69 @@ class WslBwrapBackend:
         # inject a fake executable or monkeypatch this method when exercising
         # argv construction on another host.
         return os.name == "nt" and shutil.which(self.wsl_executable) is not None
+
+    def is_runtime_ready(self) -> bool:
+        """Smoke-test the configured distribution and the backend's safe flags.
+
+        ``is_available`` only tells callers that ``wsl.exe`` exists.  CrowdWorks
+        must not treat that as an executable customer-code boundary: the
+        selected distribution, bubblewrap binary, and the namespace flags used
+        by :meth:`_build_argv_and_plan` also have to work.  When deployment
+        supplies a dedicated Node toolchain, the probe executes that mounted
+        Node binary. A configured Linux Codex executable is also probed with
+        ``--version``; without either runtime it probes only ``/bin/true``.
+        It installs nothing and does not touch a customer workspace.
+        """
+
+        if not self.is_available():
+            return False
+        try:
+            self._validate_toolchain()
+            toolchain_mounts = self._toolchain_mount_args()
+            result = subprocess.run(
+                [
+                    self.wsl_executable,
+                    "-d",
+                    self.distribution,
+                    "--",
+                    "/usr/bin/env",
+                    "-i",
+                    "PATH=/usr/bin:/bin",
+                    self.bwrap_executable,
+                    "--clearenv",
+                    "--die-with-parent",
+                    "--cap-drop",
+                    "ALL",
+                    "--unshare-user",
+                    "--disable-userns",
+                    "--unshare-pid",
+                    "--unshare-ipc",
+                    "--unshare-uts",
+                    "--unshare-cgroup-try",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/usr",
+                    "/usr",
+                    "--ro-bind",
+                    "/bin",
+                    "/bin",
+                    "--ro-bind",
+                    "/lib",
+                    "/lib",
+                    "--ro-bind",
+                    "/lib64",
+                    "/lib64",
+                    *toolchain_mounts,
+                    *self._codex_mount_args(),
+                    *self._runtime_probe_command(),
+                ],
+                capture_output=True,
+                timeout=min(max(self.translation_timeout_seconds, 0.1), 10.0),
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, WslBwrapError):
+            return False
+        return result.returncode == 0
 
     def _require_available(self) -> None:
         if not self.is_available():
@@ -771,6 +1333,50 @@ class WslBwrapBackend:
         return result
 
     @staticmethod
+    def _sensitive_mount_masks(root: Path, destination: str) -> list[str]:
+        """Mask credential-like descendants of a directly mounted tree."""
+
+        if not root.exists() or not root.is_dir():
+            return []
+        if is_sensitive_relative_path(root.name):
+            raise WslBwrapError(f"mounted workspace root is sensitive: {root}")
+        _reject_hardlinks(root)
+        argv: list[str] = []
+        count = 0
+        for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            for name in list(dirs):
+                child = current_path / name
+                relative = child.relative_to(root).as_posix()
+                if not _sensitive_relative_path(relative):
+                    continue
+                dirs.remove(name)
+                argv.extend(
+                    [
+                        "--tmpfs",
+                        str(PurePosixPath(destination, relative)),
+                    ]
+                )
+                count += 1
+            for name in files:
+                relative = (current_path / name).relative_to(root).as_posix()
+                if not _sensitive_relative_path(relative):
+                    continue
+                argv.extend(
+                    [
+                        "--ro-bind",
+                        "/dev/null",
+                        str(PurePosixPath(destination, relative)),
+                    ]
+                )
+                count += 1
+            if count > 4096:
+                raise WslBwrapError(
+                    "mounted workspace contains too many sensitive paths to mask"
+                )
+        return argv
+
+    @staticmethod
     def _external_sensitive_masks(
         roots: Sequence[Path],
         aliases: Mapping[Path, str],
@@ -780,6 +1386,9 @@ class WslBwrapBackend:
         argv: list[str] = []
         count = 0
         for root in roots:
+            if is_sensitive_relative_path(root.name):
+                raise WslBwrapError(f"external read grant root is sensitive: {root}")
+            _reject_hardlinks(root)
             alias = aliases[root]
             for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
                 current_path = Path(current)
@@ -912,6 +1521,40 @@ class WslBwrapBackend:
             return "--ro-bind"
         return "--bind"
 
+    @staticmethod
+    def _guest_env(values: Mapping[str, str] | None) -> dict[str, str]:
+        """Validate the small scalar env projection visible inside bwrap."""
+
+        result: dict[str, str] = {}
+        for name, value in (values or {}).items():
+            key = str(name)
+            if key not in _GUEST_ENV_ALLOWLIST:
+                continue
+            text = str(value)
+            if not text or "\x00" in text or "\r" in text or "\n" in text:
+                raise WslBwrapError(f"invalid guest environment value: {key}")
+            if len(text) > 512:
+                raise WslBwrapError(f"guest environment value is too long: {key}")
+            if key == "PATH":
+                text = _SCOPED_GUEST_PATH
+            elif key == "CLAUDE_CONFIG_DIR":
+                path = PurePosixPath(text)
+                if (
+                    not path.is_absolute()
+                    or len(path.parts) < 3
+                    or path.parts[1] != "scratch"
+                    or ".." in path.parts
+                ):
+                    raise WslBwrapError("Claude config directory must be under /scratch")
+            elif key == "AOITALK_PROVIDER_AUTH_STDIN":
+                if text != _SCOPED_PROVIDER_ENV_MARKER:
+                    raise WslBwrapError("unsupported scoped provider authentication environment")
+            elif key == "AOITALK_PROVIDER_HIDE_PROC":
+                if text != "1":
+                    raise WslBwrapError("invalid scoped provider proc policy")
+            result[key] = text
+        return result
+
     def build_argv(
         self,
         scope: Any,
@@ -919,6 +1562,7 @@ class WslBwrapBackend:
         *,
         cwd: str | os.PathLike[str] | None = None,
         shell: str | None = None,
+        guest_env: Mapping[str, str] | None = None,
     ) -> list[str]:
         """Build the complete WSL+bwrap argv for one scoped command.
 
@@ -927,12 +1571,28 @@ class WslBwrapBackend:
         construct argv and then removed; :meth:`spawn` owns a retained plan.
         """
 
-        argv, state = self._build_argv_and_plan(scope, command, cwd=cwd, shell=shell)
+        argv, state = self._build_argv_and_plan(scope, command, cwd=cwd, shell=shell, guest_env=guest_env)
         if state is not None:
             state.cleanup()
         return argv
 
-    def _prepare_stage_trees(self, scope: Any) -> tuple[Path | None, tuple[_StageTree, ...]]:
+    @contextlib.contextmanager
+    def verification_workspace(self, scope: Any):
+        """Own transient dependency storage for one trusted verification plan."""
+
+        if self._trusted_upper_scope(scope) is None:
+            raise WslBwrapError("verification workspace requires a trusted harness scope")
+        if str(getattr(scope, "workspace_access_level", "")) != "write":
+            raise WslBwrapError("verification workspace requires a writable verification scope")
+        state = _VerificationWorkspace(scope)
+        try:
+            yield state
+        finally:
+            state.close()
+
+    def _prepare_stage_trees(
+        self, scope: Any, *, excluded_workspace_dirs: Sequence[str] = (),
+    ) -> tuple[Path | None, tuple[_StageTree, ...]]:
         """Create private copies for roots that cannot be safely bound RW."""
 
         target = Path(scope.canonical_root)
@@ -975,7 +1635,7 @@ class WslBwrapBackend:
                     pass
 
         if stage_target:
-            excludes = (".git", *nested_scratch)
+            excludes = (".git", *nested_scratch, *excluded_workspace_dirs)
             baseline = _snapshot_tree(
                 target,
                 excluded_prefixes=excludes,
@@ -1041,6 +1701,8 @@ class WslBwrapBackend:
         *,
         cwd: str | os.PathLike[str] | None = None,
         shell: str | None = None,
+        guest_env: Mapping[str, str] | None = None,
+        verification_workspace: _VerificationWorkspace | None = None,
     ) -> tuple[list[str], _FinalizationState | None]:
         if not getattr(scope, "file_scoped", True):
             raise WslBwrapError("an AgentRunScope is required for the file-scoped backend")
@@ -1056,14 +1718,46 @@ class WslBwrapBackend:
                 f"shell={shell_name!r} is unavailable inside the POSIX WSL sandbox; use bash/auto"
             )
         self._require_available()
+        self._validate_toolchain(scope)
+        codex_mounts = self._codex_mount_args(scope)
         network_flags = self._network_flags(scope)
         trusted_limits = self._trusted_resource_limits(scope)
+        guest_values = self._guest_env(guest_env)
+        provider_auth_env = guest_values.pop("AOITALK_PROVIDER_AUTH_STDIN", None)
+        hide_provider_proc = guest_values.pop("AOITALK_PROVIDER_HIDE_PROC", None) == "1"
         command_for_shell = self._resource_limited_command(scope, command)
+        if hide_provider_proc:
+            command_for_shell = _nested_limited_proc_command(
+                command_for_shell,
+                bwrap_executable=self.bwrap_executable,
+            )
+        if verification_workspace is not None:
+            if not isinstance(verification_workspace, _VerificationWorkspace) or trusted_limits is None:
+                raise WslBwrapError("invalid trusted verification workspace")
+            verification_workspace.assert_owner(scope)
+            if str(getattr(scope, "workspace_access_level", "")) != "write":
+                raise WslBwrapError("verification workspace cannot widen a read-only scope")
 
         stage_parent: Path | None = None
         state: _FinalizationState | None = None
         try:
-            stage_parent, trees = self._prepare_stage_trees(scope)
+            stage_parent, trees = self._prepare_stage_trees(
+                scope,
+                excluded_workspace_dirs=(
+                    verification_workspace.relative_dirs if verification_workspace is not None else ()
+                ),
+            )
+            # Read-only trusted scopes do not need a copy of the target tree,
+            # but finite limits still require host-backed ephemeral mounts and
+            # exactly-once cleanup/finalization.  Keep an empty stage plan so
+            # the process cannot inherit the host WSL temp/root namespace.
+            if trusted_limits is not None and stage_parent is None:
+                stage_parent = Path(tempfile.mkdtemp(prefix="aoitalk-wsl-stage-"))
+            if hide_provider_proc:
+                if trusted_limits is None or stage_parent is None:
+                    raise WslBwrapError(
+                        "provider limited proc view requires a finite trusted scope"
+                    )
             stage_by_canonical = {_path_key(tree.canonical_root): tree for tree in trees}
             target = Path(scope.canonical_root)
             target_tree = stage_by_canonical.get(_path_key(target))
@@ -1100,6 +1794,8 @@ class WslBwrapBackend:
                 for alias in scratch_aliases.values():
                     (ephemeral_mounts["scratch"] / alias).mkdir(parents=True)
                 monitor_roots = (ephemeral_base,)
+                if verification_workspace is not None:
+                    monitor_roots += (verification_workspace.root,)
 
             git_metadata = target / ".git"
             translated_git = None
@@ -1122,7 +1818,7 @@ class WslBwrapBackend:
             self.wsl_executable,
             "-d",
             self.distribution,
-            "--",
+            "--exec",
             # Strip WSL-injected interop/display/host PATH variables before
             # bwrap becomes namespace PID 1.  bwrap --clearenv only affects
             # the final child; without this prefix /proc/1/environ leaks the
@@ -1140,7 +1836,9 @@ class WslBwrapBackend:
             "--cap-drop",
             "ALL",
             "--unshare-user",
-            "--disable-userns",
+            # The proc-hiding setup needs one more user namespace. Its inner
+            # boundary disables userns before any provider code executes.
+            *([] if hide_provider_proc else ["--disable-userns"]),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
@@ -1160,8 +1858,14 @@ class WslBwrapBackend:
             "--ro-bind",
             "/lib64",
             "/lib64",
-            "--proc",
-            "/proc",
+            *_runtime_etc_mount_args(),
+            *self._toolchain_mount_args(),
+            *codex_mounts,
+            *(
+                ["--proc", "/proc", "--proc", "/proc-runtime"]
+                if hide_provider_proc
+                else ["--proc", "/proc"]
+            ),
             "--dev",
             "/dev",
             *(
@@ -1199,6 +1903,20 @@ class WslBwrapBackend:
             self.workspace_mount,
             ]
 
+            # A trusted read-only target is mounted directly because there is
+            # no publication plan.  Keep credential-like descendants hidden in
+            # that direct mount just as forced copy-on-write staging does.
+            if trusted_limits is not None and target_tree is None:
+                argv.extend(self._sensitive_mount_masks(target, self.workspace_mount))
+
+            if verification_workspace is not None:
+                for relative in verification_workspace.relative_dirs:
+                    argv.extend([
+                        "--bind",
+                        self.translate_windows_path(verification_workspace.root / relative),
+                        str(PurePosixPath(self.workspace_mount, relative)),
+                    ])
+
             # Mount every scratch root at a deterministic path.  A staged root
             # is RW only inside the temporary namespace; direct RW is reserved
             # for roots with both write and delete authority.
@@ -1209,6 +1927,13 @@ class WslBwrapBackend:
                     raise WslBwrapError(f"scratch root does not exist: {scratch}")
                 mode = "--bind" if tree or self._scratch_full_mutation(scope, scratch) else "--ro-bind"
                 argv.extend([mode, self.translate_windows_path(source), f"/scratch/{scratch_aliases[scratch]}"])
+                if trusted_limits is not None and tree is None:
+                    argv.extend(
+                        self._sensitive_mount_masks(
+                            scratch,
+                            f"/scratch/{scratch_aliases[scratch]}",
+                        )
+                    )
 
             # Explicit external read grants are always read-only and are never
             # exposed through their host /mnt path.
@@ -1218,6 +1943,11 @@ class WslBwrapBackend:
                 self._external_sensitive_masks(external_roots, external_aliases)
             )
 
+            # Never pass the customer script itself as the final ``wsl.exe``
+            # argument.  That executable performs one more command-line
+            # expansion before ``bash -lc`` receives it; the fixed bootstrap
+            # below decodes the script inside the guest instead, preserving
+            # shell variables, quoting, Unicode/newlines, stdin, and status.
             argv.extend([
             *(
                 ["--ro-bind", translated_git, f"{self.workspace_mount}/.git"]
@@ -1228,7 +1958,7 @@ class WslBwrapBackend:
             workspace_cwd,
             "--setenv",
             "PATH",
-            "/usr/bin:/bin",
+            _SCOPED_GUEST_PATH,
             # Do not allow a scoped worker to invoke a Windows executable via
             # WSL interop.  Such an executable would leave the Linux mount
             # namespace and could mutate arbitrary host paths.
@@ -1250,14 +1980,22 @@ class WslBwrapBackend:
             "--setenv",
             "HOME",
             "/root",
+            *(
+                item
+                for name, value in sorted(guest_values.items())
+                for item in ("--setenv", name, value)
+            ),
             # bash supplies the trusted ``ulimit -u`` primitive used by the
             # process-count capability. Debian's /bin/sh (dash) rejects -u,
             # which would silently leave that limit unenforced.
             "/bin/bash",
             "-lc",
-            command_for_shell,
+            _guest_bootstrap_command(
+                command_for_shell,
+                provider_auth_env=provider_auth_env,
+            ),
             ])
-            if trees:
+            if trees or (trusted_limits is not None and stage_parent is not None):
                 max_disk = (
                     getattr(trusted_limits, "max_disk_bytes", None)
                     if trusted_limits is not None
@@ -1270,6 +2008,7 @@ class WslBwrapBackend:
                     stage_parent=stage_parent,
                     monitor_roots=monitor_roots,
                     max_disk_bytes=(int(max_disk) if max_disk is not None else None),
+                    verification_workspace=verification_workspace,
                 )
             return argv, state
         except Exception:
@@ -1327,15 +2066,18 @@ class WslBwrapBackend:
         except FileNotFoundError:
             return None
 
-    def _collect_tree_diffs(self, tree: _StageTree) -> list[tuple[Path, Path | None, _SnapshotEntry | None, _SnapshotEntry | None]]:
+    def _collect_tree_diffs(self, tree: _StageTree, *, checkpoint: Any = None) -> list[tuple[Path, Path | None, _SnapshotEntry | None, _SnapshotEntry | None]]:
         current = _snapshot_tree(
             tree.stage_root,
             excluded_prefixes=tree.excluded_prefixes,
             exclude_sensitive=tree.exclude_sensitive,
+            checkpoint=checkpoint,
         )
         keys = sorted(set(tree.baseline) | set(current), key=lambda item: (item.count("/"), item))
         result: list[tuple[Path, Path | None, _SnapshotEntry | None, _SnapshotEntry | None]] = []
         for rel in keys:
+            if checkpoint is not None:
+                checkpoint()
             before = tree.baseline.get(rel)
             after = current.get(rel)
             if self._entry_equal(before, after):
@@ -1467,10 +2209,12 @@ class WslBwrapBackend:
         finally:
             shutil.rmtree(journal_root, ignore_errors=True)
 
-    def _finalize_staging(self, scope: Any, trees: Sequence[_StageTree]) -> dict[str, Any]:
+    def _finalize_staging(self, scope: Any, trees: Sequence[_StageTree], *, state: _FinalizationState | None = None) -> dict[str, Any]:
         """Validate and atomically publish every staged tree, or publish none."""
 
         if not trees:
+            if state is not None:
+                state.checkpoint(commit=True)
             return {"success": True, "published": 0}
         all_diffs: list[
             tuple[
@@ -1481,8 +2225,14 @@ class WslBwrapBackend:
         with self._publication_lock:
             try:
                 for tree in trees:
-                    diffs = self._collect_tree_diffs(tree)
+                    if state is not None:
+                        state.checkpoint()
+                    diffs = self._collect_tree_diffs(tree, checkpoint=state.checkpoint if state is not None else None)
+                    if state is not None:
+                        state.checkpoint()
                     self._validate_tree_diffs(scope, tree, diffs)
+                    if state is not None:
+                        state.checkpoint()
                     all_diffs.append((tree, diffs))
                 flattened: list[tuple[Path, Path | None, _SnapshotEntry | None, _SnapshotEntry | None]] = []
                 seen_paths: set[str] = set()
@@ -1493,7 +2243,7 @@ class WslBwrapBackend:
                             raise WslBwrapError(f"overlapping staged publication paths: {operation[0]}")
                         seen_paths.add(key)
                         flattened.append(operation)
-                published = self._apply_all_tree_diffs(flattened)
+                published = self._apply_all_tree_diffs(flattened, state=state)
             except Exception as exc:
                 return {"success": False, "published": 0, "error": str(exc)}
         return {"success": True, "published": published}
@@ -1501,21 +2251,29 @@ class WslBwrapBackend:
     def _apply_all_tree_diffs(
         self,
         diffs: Sequence[tuple[Path, Path | None, _SnapshotEntry | None, _SnapshotEntry | None]],
+        *,
+        state: _FinalizationState | None = None,
     ) -> int:
         """Apply all tree operations under one journal and rollback boundary."""
 
         if not diffs:
+            if state is not None:
+                state.checkpoint(commit=True)
             return 0
         journal_root = Path(tempfile.mkdtemp(prefix="aoitalk-wsl-journal-"))
         backups: dict[Path, Path | None] = {}
         try:
             for index, (canonical, _staged, before, _after) in enumerate(diffs):
+                if state is not None:
+                    state.checkpoint()
                 if before is None:
                     backups[canonical] = None
                 else:
                     backup = journal_root / str(index)
                     self._copy_node(canonical, backup)
                     backups[canonical] = backup
+                if state is not None:
+                    state.checkpoint()
 
             removals = [
                 item
@@ -1525,12 +2283,18 @@ class WslBwrapBackend:
             for canonical, _staged, _before, _after in sorted(
                 removals, key=lambda item: (len(item[0].parts), item[0].as_posix()), reverse=True
             ):
+                if state is not None:
+                    state.checkpoint()
                 self._remove_node(canonical)
+                if state is not None:
+                    state.checkpoint()
 
             for canonical, staged, _before, after in sorted(
                 (item for item in diffs if item[3] is not None),
                 key=lambda item: (len(item[0].parts), item[0].as_posix()),
             ):
+                if state is not None:
+                    state.checkpoint()
                 assert after is not None
                 canonical.parent.mkdir(parents=True, exist_ok=True)
                 if after.kind == "dir":
@@ -1546,14 +2310,23 @@ class WslBwrapBackend:
                         f".{canonical.name}.aoitalk-{os.getpid()}-{threading.get_ident()}"
                     )
                     self._remove_node(temp)
-                    shutil.copy2(staged, temp, follow_symlinks=False)
-                    os.replace(temp, canonical)
+                    try:
+                        shutil.copy2(staged, temp, follow_symlinks=False)
+                        if state is not None:
+                            state.checkpoint()
+                        os.replace(temp, canonical)
+                    finally:
+                        self._remove_node(temp)
                     try:
                         os.chmod(canonical, after.mode)
                     except OSError:
                         pass
                 else:
                     raise WslBwrapError(f"unsupported staged node type: {canonical}")
+                if state is not None:
+                    state.checkpoint()
+            if state is not None:
+                state.checkpoint(commit=True)
             return len(diffs)
         except Exception:
             rollback_error: Exception | None = None
@@ -1580,6 +2353,8 @@ class WslBwrapBackend:
         shell: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        guest_env: Mapping[str, str] | None = None,
+        verification_workspace: _VerificationWorkspace | None = None,
         popen_kwargs: Mapping[str, Any] | None = None,
     ) -> subprocess.Popen:
         """Spawn a scoped command for callers that need stream/process control."""
@@ -1588,12 +2363,22 @@ class WslBwrapBackend:
             limits = self._trusted_resource_limits(scope)
             if limits is not None:
                 background_limit = getattr(limits, "max_background_seconds", None)
-                timeout = float(
-                    background_limit
-                    if background_limit is not None
-                    else getattr(limits, "timeout_seconds")
-                )
-        argv, state = self._build_argv_and_plan(scope, command, cwd=cwd, shell=shell)
+                timeout = float(getattr(limits, "timeout_seconds"))
+                if background_limit is not None:
+                    timeout = min(timeout, float(background_limit))
+        else:
+            limits = self._trusted_resource_limits(scope)
+            if limits is not None:
+                ceiling = float(getattr(limits, "timeout_seconds"))
+                timeout = min(float(timeout), ceiling)
+        argv, state = self._build_argv_and_plan(
+            scope,
+            command,
+            cwd=cwd,
+            shell=shell,
+            guest_env=guest_env,
+            verification_workspace=verification_workspace,
+        )
         kwargs: dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
@@ -1729,6 +2514,7 @@ class WslBwrapBackend:
         shell: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        guest_env: Mapping[str, str] | None = None,
     ) -> SandboxResult:
         """Run a bounded command and kill the WSL wrapper on timeout."""
 
@@ -1752,6 +2538,7 @@ class WslBwrapBackend:
                 shell=shell,
                 timeout=effective_timeout,
                 env=env,
+                guest_env=guest_env,
                 popen_kwargs={"text": False},
             )
         except WslBwrapError as exc:
@@ -1842,18 +2629,40 @@ class WslBwrapBackend:
         if state is None:
             return None
         try:
-            outcome = state.wait(timeout=10)
+            outcome = state.wait(timeout=float(getattr(state, "finalization_timeout_seconds", 10.0)))
         except Exception:
             outcome = None
         if outcome is None:
-            return {"success": False, "error": "staged publication finalization timed out"}
-        return outcome
+            state.cancel("staged publication finalization timeout")
+            return {"success": False, "error": "staged publication finalization timeout"}
+        if not isinstance(outcome, Mapping):
+            return {"success": False, "error": "staged publication finalization returned invalid result"}
+        if outcome.get("discarded", False):
+            return dict(outcome, success=False, error=str(outcome.get("reason") or "staged publication discarded"))
+        return dict(outcome)
+
+
+def scoped_codex_executable(configured_bin: str) -> str:
+    """Select the explicitly deployed Linux CLI inside the scoped namespace.
+
+    The ordinary Windows CLI remains untouched. Without a Linux deployment,
+    retain the configured command so the existing fail-closed lane reports its
+    unavailability; never probe or launch a Windows wrapper as a fallback.
+    """
+    if os.environ.get("AOITALK_CODEX_LINUX_EXECUTABLE", "").strip():
+        return _CODEX_GUEST_EXECUTABLE
+    return configured_bin
 
 
 def get_wsl_bwrap_backend() -> WslBwrapBackend:
     """Return a fresh backend (configuration is immutable per invocation)."""
 
-    return WslBwrapBackend()
+    return WslBwrapBackend(
+        distribution=os.environ.get("AOITALK_WSL_DISTRIBUTION", "Debian"),
+        bwrap_executable=os.environ.get("AOITALK_BWRAP_EXECUTABLE", "/usr/bin/bwrap"),
+        toolchain_root=os.environ.get("AOITALK_CLIENT_TOOLCHAIN_ROOT") or None,
+        codex_linux_executable=os.environ.get("AOITALK_CODEX_LINUX_EXECUTABLE") or None,
+    )
 
 
 __all__ = [

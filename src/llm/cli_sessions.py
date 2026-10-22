@@ -44,6 +44,17 @@ class CLINativeSessionScope:
     project_key: str
     working_directory: str
     fingerprint: str
+    # Agent-native continuations carry the immutable identity/policy tuple
+    # that was revalidated for this invocation. ``agent_run_id`` is audit
+    # metadata only; a fresh run may resume the same conversation handle when
+    # every immutable continuation key below is unchanged.
+    agent_run_id: str | None = None
+    agent_revision_id: str | None = None
+    binding_snapshot_hash: str | None = None
+    capability_manifest_digest: str | None = None
+    authority_digest: str | None = None
+    policy_fingerprint: str | None = None
+    provider_cache_root: str | None = None
 
     @property
     def scope_key(self) -> str:
@@ -56,11 +67,21 @@ class CLINativeSessionScope:
             "working_directory": self.working_directory,
             "fingerprint": self.fingerprint,
         }
+        agent_key_values = {
+            "agent_revision_id": self.agent_revision_id,
+            "binding_snapshot_hash": self.binding_snapshot_hash,
+            "capability_manifest_digest": self.capability_manifest_digest,
+            "authority_digest": self.authority_digest,
+            "policy_fingerprint": self.policy_fingerprint,
+            "provider_cache_root": self.provider_cache_root,
+        }
+        if any(value not in (None, "") for value in agent_key_values.values()):
+            payload.update(agent_key_values)
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     def as_dict(self) -> dict[str, str]:
-        return {
+        result = {
             "chat_session_id": self.chat_session_id,
             "branch_key": self.branch_key,
             "provider": self.provider,
@@ -70,6 +91,19 @@ class CLINativeSessionScope:
             "fingerprint": self.fingerprint,
             "scope_key": self.scope_key,
         }
+        for key in (
+            "agent_run_id",
+            "agent_revision_id",
+            "binding_snapshot_hash",
+            "capability_manifest_digest",
+            "authority_digest",
+            "policy_fingerprint",
+            "provider_cache_root",
+        ):
+            value = getattr(self, key, None)
+            if value not in (None, ""):
+                result[key] = str(value)
+        return result
 
 
 @dataclass(frozen=True)
@@ -206,6 +240,16 @@ class CLISessionStore:
         *,
         force_new: bool = False,
     ) -> CLISessionLease:
+        if scope.agent_revision_id:
+            required = (
+                scope.binding_snapshot_hash,
+                scope.capability_manifest_digest,
+                scope.authority_digest,
+                scope.policy_fingerprint,
+                scope.provider_cache_root,
+            )
+            if any(value in (None, "") for value in required):
+                raise ValueError("Agent native continuation proof is incomplete")
         generation_id = str(uuid.uuid4())
         now = _utc_now()
         expires = now + timedelta(seconds=self.lease_seconds)
@@ -250,6 +294,8 @@ class CLISessionStore:
                     entry["native_session_id"] = None
                     entry["state"] = "invalidated"
                 entry.update(scope.as_dict())
+                if scope.agent_run_id:
+                    entry["last_agent_run_id"] = scope.agent_run_id
                 entry["last_used_at"] = _iso(now)
 
             native_session_id = (
@@ -294,7 +340,7 @@ class CLISessionStore:
             if entry is None:
                 return False
             owner = str(entry.get("active_generation_id") or "")
-            if owner and owner != lease.generation_id:
+            if owner != lease.generation_id:
                 raise CLISessionBusyError("CLI session lease ownership changed")
             entry["native_session_id"] = normalized
             entry["state"] = "active" if normalized else "unsupported"
@@ -326,6 +372,8 @@ class CLISessionStore:
             entry = next((item for item in entries if _entry_matches(item, lease.scope)), None)
             if entry is None:
                 return False
+            if str(entry.get("active_generation_id") or "") != lease.generation_id:
+                return False
             entry["native_session_id"] = None
             entry["state"] = "invalid"
             entry["last_error"] = str(reason or "resume_failed")[:500]
@@ -353,11 +401,12 @@ class CLISessionStore:
             entry = next((item for item in entries if _entry_matches(item, lease.scope)), None)
             if entry is None:
                 return False
-            if str(entry.get("active_generation_id") or "") == lease.generation_id:
-                entry["active_generation_id"] = None
-                entry["lease_expires_at"] = None
-                entry["state"] = "active" if entry.get("native_session_id") else "invalid"
-                entry["last_used_at"] = _iso(_utc_now())
-                conversation.context = _set_entries(context, entries)
-                await db.commit()
+            if str(entry.get("active_generation_id") or "") != lease.generation_id:
+                return False
+            entry["active_generation_id"] = None
+            entry["lease_expires_at"] = None
+            entry["state"] = "active" if entry.get("native_session_id") else "invalid"
+            entry["last_used_at"] = _iso(_utc_now())
+            conversation.context = _set_entries(context, entries)
+            await db.commit()
             return True

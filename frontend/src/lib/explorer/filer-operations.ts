@@ -18,20 +18,16 @@ import {
   explorerErrorMessage,
 } from "@/lib/explorer-api";
 import {
-  hfDeleteFiles,
-  hydrusDeleteFiles,
-  hydrusUndeleteFiles,
-  type HfDeleteItem,
-} from "@/lib/hf-api";
-import {
   deleteProjectRecordTable,
   isRecordTableFile,
   updateProjectRecordTable,
   RECORD_TABLE_EXTENSION,
 } from "@/lib/record-tables-api";
-import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
-import { isHfPath } from "@/lib/hf/virtual-path";
-import { isHydrusPath, parseHydrusFileId } from "@/lib/hydrus/virtual-path";
+import type {
+  ExplorerDirectory,
+  ExplorerFile,
+  ExplorerMoveResult,
+} from "@/lib/explorer-api";
 import type { ConfirmOptions } from "@/hooks/use-confirm";
 import type { FilerCapabilities } from "./filer-capabilities";
 import {
@@ -39,6 +35,7 @@ import {
   createFilerUndoState,
   pushFilerRedoEntry,
   pushFilerUndoEntry,
+  restoreFilerRedoEntry,
   restoreFilerUndoEntry,
   takeFilerRedoEntry,
   takeFilerUndoEntry,
@@ -55,6 +52,7 @@ export type FilerRefresh = () => void | boolean | Promise<void | boolean>;
 
 let undoState: FilerUndoState = createFilerUndoState();
 let undoScopeGeneration = 0;
+let historyBoundaryGeneration = 0;
 const listeners = new Set<() => void>();
 
 function setUndoState(next: FilerUndoState) {
@@ -77,40 +75,15 @@ export function getFilerUndoSnapshot(): FilerUndoState {
 /** タブ切り替えなどでスタックを全消去する。 */
 export function clearFilerUndoHistory(): void {
   undoScopeGeneration += 1;
+  historyBoundaryGeneration += 1;
   setUndoState(clearFilerUndoState());
-}
-
-// ─── Hydrus 表示ハンドラ ───
-
-/**
- * Hydrus タブは explorer の一覧 API を持たない検索結果ビューで、
- * ページ結果は HydrusSearchBar 側にキャッシュされる。そのため削除後の
- * `refresh()`（= explorerList("Hydrus")）は失敗し、再検索しても削除が反映されない。
- * 代わりに ExplorerProvider が表示側の除外/復帰を担い、ここへ登録する。
- */
-export interface HydrusViewHandlers {
-  /** 削除済み file_id を一覧表示から除外する */
-  prune: (fileIds: number[]) => void;
-  /** Undo で復元した file_id を一覧表示へ戻す */
-  restore: (fileIds: number[]) => void;
-}
-
-let hydrusViewHandlers: HydrusViewHandlers | null = null;
-
-export function registerHydrusViewHandlers(
-  handlers: HydrusViewHandlers,
-): () => void {
-  hydrusViewHandlers = handlers;
-  return () => {
-    if (hydrusViewHandlers === handlers) hydrusViewHandlers = null;
-  };
 }
 
 // ─── Explorer 表示ハンドラ ───
 
 /**
  * 通常の Files 一覧で削除中の項目を即時反映するための表示側ハンドラ。
- * Hydrus/HF/レコードテーブルはそれぞれ専用の削除経路を持つため、
+ * レコードテーブルは専用の削除経路を持つため、
  * runFilerDelete からは通常の explorer ターゲットにだけ呼び出す。
  */
 export interface ExplorerDeleteViewHandlers {
@@ -240,7 +213,7 @@ export interface RunFilerDeleteParams {
 }
 
 /**
- * 選択項目をまとめて削除する。タブ種別に応じて explorer / HF / Hydrus /
+ * 選択項目をまとめて削除する。タブ種別に応じて explorer /
  * レコードテーブルへ振り分け、Undo 可能なものだけスタックへ積む。
  */
 export async function runFilerDelete(
@@ -249,21 +222,16 @@ export async function runFilerDelete(
   const { targets, capabilities, confirm, refresh, onDeleted } = params;
   if (!capabilities.canDelete || targets.length === 0) return false;
   const operationUndoScopeGeneration = undoScopeGeneration;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
 
   // Capture singleton registrations before any confirmation/network await.
   // A principal/tab switch may replace the current Provider while this
   // operation is in flight; its opaque handle must remain bound to this
   // captured registration and never be applied to the replacement Provider.
   const deleteViewHandlers = explorerDeleteViewHandlers;
-  const operationHydrusHandlers = hydrusViewHandlers;
 
   const recordTables = targets.filter((t) => t.isRecordTable);
-  const others = targets.filter((t) => !t.isRecordTable);
-  const hfTargets = others.filter((t) => isHfPath(t.path));
-  const hydrusTargets = others.filter((t) => isHydrusPath(t.path));
-  const regularTargets = others.filter(
-    (t) => !isHfPath(t.path) && !isHydrusPath(t.path),
-  );
+  const regularTargets = targets.filter((t) => !t.isRecordTable);
 
   // レコードテーブルは元に戻せないため常に確認する
   if (recordTables.length > 0) {
@@ -273,20 +241,6 @@ export async function runFilerDelete(
         recordTables.length === 1
           ? `「${recordTables[0].name}」を削除します。元に戻せません。`
           : `${recordTables.length}件のレコードテーブルを削除します。元に戻せません。`,
-      confirmLabel: "削除",
-      destructive: true,
-    });
-    if (!ok) return false;
-  }
-
-  // HF はゴミ箱が無いので確認必須
-  if (capabilities.deleteNeedsConfirm && hfTargets.length > 0) {
-    const ok = await askConfirm(confirm, {
-      title: "HF上のファイルを削除",
-      description:
-        hfTargets.length === 1
-          ? `「${hfTargets[0].name}」をHFリポジトリから削除します。元に戻せません。`
-          : `${hfTargets.length}件をHFリポジトリから削除します。元に戻せません。`,
       confirmLabel: "削除",
       destructive: true,
     });
@@ -308,7 +262,7 @@ export async function runFilerDelete(
   }
 
   // 確認がすべて完了した時点で、通常の Files だけを表示から先に隠す。
-  // HF / Hydrus / レコードテーブルにはこの tombstone を適用しない。
+  // レコードテーブルにはこの tombstone を適用しない。
   const regularPaths = regularTargets.map((target) => target.path);
   const deleteViewOperation = createExplorerDeleteViewOperation(
     deleteViewHandlers,
@@ -317,12 +271,11 @@ export async function runFilerDelete(
 
   // 途中で失敗しても、成功済み分は必ず Undo スタックへ積む
   const trashed: FilerDeleteUndoItem[] = [];
-  const hydrusDeletedIds: number[] = [];
   const deletedRegularPaths: string[] = [];
   const successfulDeletedPathSet = new Set<string>();
   // 識別子が欠けていて削除できなかった .dbtable
   const skippedNames: string[] = [];
-  let touchedNonHydrus = false;
+  let touchedRegular = false;
 
   const markDeleted = (path: string) => {
     successfulDeletedPathSet.add(path);
@@ -343,11 +296,13 @@ export async function runFilerDelete(
   };
 
   const commitUndoEntries = () => {
-    if (operationUndoScopeGeneration !== undoScopeGeneration) return false;
-    const entries: FilerUndoEntry[] = [];
-    if (capabilities.deleteUndoable && hydrusDeletedIds.length > 0) {
-      entries.push({ kind: "hydrus-delete", fileIds: [...hydrusDeletedIds] });
+    if (
+      operationUndoScopeGeneration !== undoScopeGeneration ||
+      operationHistoryBoundaryGeneration !== historyBoundaryGeneration
+    ) {
+      return false;
     }
+    const entries: FilerUndoEntry[] = [];
     if (capabilities.deleteUndoable && trashed.length > 0) {
       entries.push({ kind: "delete", entries: [...trashed] });
     }
@@ -364,41 +319,13 @@ export async function runFilerDelete(
         skippedNames.push(target.name);
         continue;
       }
-      touchedNonHydrus = true;
+      touchedRegular = true;
       await deleteProjectRecordTable(table.projectId, table.tableId);
       markDeleted(target.path);
     }
 
-    if (hfTargets.length > 0) {
-      touchedNonHydrus = true;
-      const items: HfDeleteItem[] = hfTargets.map((target) => ({
-        path: target.path,
-        isDirectory: target.isDirectory,
-      }));
-      await hfDeleteFiles(items);
-      for (const target of hfTargets) markDeleted(target.path);
-    }
-
-    if (hydrusTargets.length > 0) {
-      const hydrusItems = hydrusTargets.flatMap((target) => {
-        const fileId = parseHydrusFileId(target.path);
-        return fileId === null ? [] : [{ target, fileId }];
-      });
-      for (const target of hydrusTargets) {
-        if (parseHydrusFileId(target.path) === null) skippedNames.push(target.name);
-      }
-      const fileIds = hydrusItems.map(({ fileId }) => fileId);
-      if (fileIds.length > 0) {
-        await hydrusDeleteFiles(fileIds);
-        hydrusDeletedIds.push(...fileIds);
-        // Hydrus は refresh が使えないので表示側から直接取り除く
-        operationHydrusHandlers?.prune(fileIds);
-        for (const { target } of hydrusItems) markDeleted(target.path);
-      }
-    }
-
     for (const target of regularTargets) {
-      touchedNonHydrus = true;
+      touchedRegular = true;
       const result = await explorerDelete(target.path);
       // API の成功直後に記録する。後続ターゲットが失敗してもこの項目は
       // commit 対象として確定し、未試行分だけ rollback する。
@@ -425,7 +352,7 @@ export async function runFilerDelete(
     if (rollbackPaths.length > 0) {
       deleteViewOperation?.rollback(rollbackPaths);
     }
-    if (touchedNonHydrus) scheduleDeleteRefresh(refresh);
+    if (touchedRegular) scheduleDeleteRefresh(refresh);
     toast.error(`削除に失敗しました: ${explorerErrorMessage(error)}`);
     return false;
   }
@@ -435,8 +362,7 @@ export async function runFilerDelete(
     deleteViewOperation?.commit(deletedRegularPaths);
   }
   notifyDeleted();
-  // Hydrus のみの削除では explorer の一覧APIを叩かない（失敗してエラー表示になるため）
-  if (touchedNonHydrus) scheduleDeleteRefresh(refresh);
+  if (touchedRegular) scheduleDeleteRefresh(refresh);
 
   const deletedCount = successfulDeletedPaths().length;
   if (deletedCount === 0) {
@@ -449,12 +375,12 @@ export async function runFilerDelete(
       ? `「${targets.find((t) => successfulDeletedPathSet.has(t.path))?.name ?? targets[0].name}」を削除しました`
       : `${deletedCount}件を削除しました`;
   if (undoable) {
-    // .dbtable / HF は元に戻せないため、混在時は対象範囲を明示する
-    const undoableCount = trashed.length + hydrusDeletedIds.length;
+    // .dbtable は元に戻せないため、混在時は対象範囲を明示する
+    const undoableCount = trashed.length;
     toast.success(message, {
       description:
         undoableCount < deletedCount
-          ? `元に戻せるのは${undoableCount}件（レコードテーブル・HFは復元できません）`
+          ? `元に戻せるのは${undoableCount}件（レコードテーブルは復元できません）`
           : undefined,
       action: {
         label: "元に戻す",
@@ -506,6 +432,8 @@ export async function runFilerRename(
   if (!capabilities.canRename || !newName || newName === currentName) {
     return false;
   }
+  const operationUndoScopeGeneration = undoScopeGeneration;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
 
   // Keep the server-confirmed path/name separate from the requested values.
   // In particular, a project API may normalize the name or return a path that
@@ -532,14 +460,19 @@ export async function runFilerRename(
       committedPath = result.new_path || path;
       committedName = result.new_name || newName;
       // 実際に確定したパス（new_path）を保持して Undo の対象を取り違えないようにする
-      setUndoState(
-        pushFilerUndoEntry(undoState, {
-          kind: "rename",
-          path: committedPath,
-          fromName: currentName,
-          toName: committedName,
-        }),
-      );
+      if (
+        operationUndoScopeGeneration === undoScopeGeneration &&
+        operationHistoryBoundaryGeneration === historyBoundaryGeneration
+      ) {
+        setUndoState(
+          pushFilerUndoEntry(undoState, {
+            kind: "rename",
+            path: committedPath,
+            fromName: currentName,
+            toName: committedName,
+          }),
+        );
+      }
     }
   } catch (error) {
     toast.error(`名前の変更に失敗しました: ${explorerErrorMessage(error)}`);
@@ -594,6 +527,8 @@ export async function runFilerRenameBatch(
   if (!params.capabilities.canRename || params.items.length === 0) {
     return { renamed: 0, failed: 0 };
   }
+  const operationUndoScopeGeneration = undoScopeGeneration;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
 
   // 子のパスを先に変更してから親を変更する。検索結果に親子が混在しても
   // 後続のパスが移動で無効にならないようにする。
@@ -619,7 +554,11 @@ export async function runFilerRenameBatch(
     }
   }
 
-  if (renamed.length > 0) {
+  if (
+    renamed.length > 0 &&
+    operationUndoScopeGeneration === undoScopeGeneration &&
+    operationHistoryBoundaryGeneration === historyBoundaryGeneration
+  ) {
     setUndoState(
       pushFilerUndoEntry(undoState, {
         kind: "rename-batch",
@@ -645,56 +584,392 @@ export interface RunFilerTransferParams {
   operation: "move" | "copy";
   capabilities: FilerCapabilities;
   refresh?: FilerRefresh;
-  onTransferred?: () => void;
+  confirm?: ConfirmFn;
+  /** Called only with source paths that completed successfully. */
+  onTransferred?: (transferredPaths: string[]) => void;
+}
+
+interface FilerMoveRequest<T> {
+  src: string;
+  destDir: string;
+  context: T;
+}
+
+interface FilerMoveSuccess<T> {
+  request: FilerMoveRequest<T>;
+  newPath: string;
+  overwroteExisting: boolean;
+  undoable: boolean;
+  undoLimitation?: string;
+}
+
+interface FilerMoveFailure<T> {
+  request: FilerMoveRequest<T>;
+  error: unknown;
+}
+
+interface FilerMoveBatchResult<T> {
+  succeeded: FilerMoveSuccess<T>[];
+  skipped: FilerMoveRequest<T>[];
+  overwriteBlocked: FilerMoveRequest<T>[];
+  failures: FilerMoveFailure<T>[];
+  attempted: boolean;
+}
+
+const FALLBACK_OVERWRITE_UNDO_LIMITATION =
+  "上書き移動では移動先の以前の内容を保持しないため、通常のUndo/Redoでは元に戻せません";
+
+function moveResultMetadata(
+  result: ExplorerMoveResult,
+  overwriteRequested: boolean,
+): Pick<FilerMoveSuccess<unknown>, "overwroteExisting" | "undoable" | "undoLimitation"> {
+  // The retry is sent only after a confirmed collision.  Prefer the backend's
+  // explicit outcome because the collided target may disappear before retry;
+  // use the request flag only for older endpoints without metadata.
+  const overwroteExisting =
+    typeof result.overwrote_existing === "boolean"
+      ? result.overwrote_existing
+      : typeof result.undoable === "boolean"
+        ? !result.undoable
+        : overwriteRequested;
+  const undoable =
+    typeof result.undoable === "boolean" ? result.undoable : !overwroteExisting;
+  return {
+    overwroteExisting,
+    undoable,
+    undoLimitation: overwroteExisting
+      ? result.undo_limitation || FALLBACK_OVERWRITE_UNDO_LIMITATION
+      : undefined,
+  };
+}
+
+function isAlreadyExistsConflict(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const apiError = error as Error & { status?: unknown; code?: unknown };
+  return apiError.status === 409 && apiError.code === "already_exists";
+}
+
+function normalizeFilerPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isMoveNoop(src: string, destDir: string): boolean {
+  return (
+    normalizeFilerPath(src) === normalizeFilerPath(destDir) ||
+    normalizeFilerPath(parentDir(src)) === normalizeFilerPath(destDir)
+  );
+}
+
+function overwriteConfirmOptions<T>(
+  conflicts: FilerMoveRequest<T>[],
+): ConfirmOptions {
+  const fileList = conflicts
+    .map(({ src }) => `• ${normalizeFilerPath(src)}`)
+    .join("\n");
+  return {
+    title: "同名ファイルを一括確認",
+    description: `${conflicts.length}件の同名ファイルが見つかりました。すべて上書きするか、すべてスキップするか選択してください。\n\n${fileList}`,
+    confirmLabel: `すべて上書き (${conflicts.length}件)`,
+    cancelLabel: "すべてスキップ",
+    destructive: true,
+  };
+}
+
+/** First try every move without overwrite, then confirm and retry only named conflicts. */
+async function runMoveBatchWithOverwrite<T>(
+  requests: FilerMoveRequest<T>[],
+  confirm?: ConfirmFn,
+  options: { allowOverwrite?: boolean } = {},
+): Promise<FilerMoveBatchResult<T>> {
+  const succeeded: FilerMoveSuccess<T>[] = [];
+  const conflicts: FilerMoveRequest<T>[] = [];
+  const skipped: FilerMoveRequest<T>[] = [];
+  const overwriteBlocked: FilerMoveRequest<T>[] = [];
+  const failures: FilerMoveFailure<T>[] = [];
+  const allowOverwrite = options.allowOverwrite !== false;
+
+  for (const request of requests) {
+    try {
+      const result = await explorerMove(request.src, request.destDir);
+      succeeded.push({
+        request,
+        newPath: result.new_path || request.src,
+        ...moveResultMetadata(result, false),
+      });
+    } catch (error) {
+      if (isAlreadyExistsConflict(error)) {
+        conflicts.push(request);
+      } else {
+        failures.push({ request, error });
+      }
+    }
+  }
+
+  if (conflicts.length === 0) {
+    return {
+      succeeded,
+      skipped,
+      overwriteBlocked,
+      failures,
+      attempted: requests.length > 0,
+    };
+  }
+
+  if (!allowOverwrite) {
+    overwriteBlocked.push(...conflicts);
+    skipped.push(...conflicts);
+    return {
+      succeeded,
+      skipped,
+      overwriteBlocked,
+      failures,
+      attempted: requests.length > 0,
+    };
+  }
+
+  let approved = false;
+  if (confirm) {
+    try {
+      approved = await confirm(overwriteConfirmOptions(conflicts));
+    } catch (error) {
+      failures.push({ request: conflicts[0], error });
+    }
+  }
+
+  if (!approved) {
+    skipped.push(...conflicts);
+    return {
+      succeeded,
+      skipped,
+      overwriteBlocked,
+      failures,
+      attempted: requests.length > 0,
+    };
+  }
+
+  for (const request of conflicts) {
+    try {
+      const result = await explorerMove(request.src, request.destDir, {
+        overwrite: true,
+      });
+      succeeded.push({
+        request,
+        newPath: result.new_path || request.src,
+        ...moveResultMetadata(result, true),
+      });
+    } catch (error) {
+      failures.push({ request, error });
+    }
+  }
+
+  return {
+    succeeded,
+    skipped,
+    overwriteBlocked,
+    failures,
+    attempted: requests.length > 0,
+  };
+}
+
+interface FilerMoveHistoryResult {
+  inverse: FilerUndoEntry | null;
+  remaining: FilerUndoEntry | null;
+  skippedCount: number;
+  overwriteBlockedCount: number;
+  failures: unknown[];
+  succeededCount: number;
+  attempted: boolean;
+}
+
+async function applyFilerMoveHistoryEntry(
+  entry: Extract<FilerUndoEntry, { kind: "move" }>,
+  confirm?: ConfirmFn,
+): Promise<FilerMoveHistoryResult> {
+  const requests = entry.entries.map((item) => ({
+    src: item.to,
+    destDir: parentDir(item.from),
+    context: item,
+  }));
+  const alreadyAtDestination = requests.filter((request) =>
+    isMoveNoop(request.src, request.destDir),
+  );
+  const pending = requests.filter(
+    (request) => !isMoveNoop(request.src, request.destDir),
+  );
+  const result = await runMoveBatchWithOverwrite(pending, confirm, {
+    // Undo/Redo has no retained destination backup.  Refuse an overwrite so
+    // a conflict cannot be reported as a fully restored history entry.
+    allowOverwrite: false,
+  });
+  const reversibleSucceeded = result.succeeded.filter(
+    ({ undoable }) => undoable,
+  );
+  const succeededItems = new Set(
+    [
+      ...alreadyAtDestination.map(({ context }) => context),
+      ...reversibleSucceeded.map(({ request }) => request.context),
+    ],
+  );
+  const inverseEntries = reversibleSucceeded
+    .filter(({ request, newPath }) => newPath !== request.src)
+    .map(({ request, newPath }) => ({ from: request.src, to: newPath }));
+  const remainingEntries = entry.entries.filter(
+    (item) => !succeededItems.has(item),
+  );
+
+  return {
+    inverse:
+      inverseEntries.length > 0
+        ? { kind: "move", entries: inverseEntries }
+        : null,
+    remaining:
+      remainingEntries.length > 0
+        ? { kind: "move", entries: remainingEntries }
+        : null,
+    skippedCount: result.skipped.length,
+    overwriteBlockedCount:
+      result.overwriteBlocked.length +
+      result.succeeded.filter(({ undoable }) => !undoable).length,
+    failures: result.failures.map(({ error }) => error),
+    succeededCount: succeededItems.size,
+    attempted: result.attempted,
+  };
 }
 
 /** 切り取り＆貼り付け / D&D / コピー貼り付けの共通実装。 */
 export async function runFilerTransfer(
   params: RunFilerTransferParams,
 ): Promise<boolean> {
-  const { paths, destDir, operation, capabilities, refresh, onTransferred } =
-    params;
+  const {
+    paths,
+    destDir,
+    operation,
+    capabilities,
+    refresh,
+    confirm,
+    onTransferred,
+  } = params;
+  const operationUndoScopeGeneration = undoScopeGeneration;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
   if (paths.length === 0) return false;
   if (operation === "move" && !capabilities.canMove) return false;
   if (operation === "copy" && !capabilities.canCopy) return false;
 
-  const moved: { from: string; to: string }[] = [];
-  try {
-    for (const src of paths) {
-      // 自分自身へのドロップは無視
-      if (src === destDir) continue;
-      if (operation === "move") {
-        const result = await explorerMove(src, destDir);
-        const newPath = result.new_path || src;
-        // 親フォルダへ戻すなど、移動先が現在位置と同じ場合は成功した no-op。
-        // このケースを Undo スタックへ積むと、Undo が意図せず再移動になる。
-        if (newPath !== src) moved.push({ from: src, to: newPath });
-      } else {
+  if (operation === "copy") {
+    const copiedPaths: string[] = [];
+    let attempted = false;
+    try {
+      for (const src of paths) {
+        // Dropping a folder onto itself is ignored.
+        if (src === destDir) continue;
+        attempted = true;
         await explorerCopy(src, destDir);
+        copiedPaths.push(src);
       }
+    } catch (error) {
+      if (attempted) await runRefresh(refresh);
+      toast.error(`コピーに失敗しました: ${explorerErrorMessage(error)}`);
+      return false;
     }
-  } catch (error) {
-    // 成功済みの移動分は Undo できるようスタックへ積んでから通知する
-    if (moved.length > 0) {
-      setUndoState(
-        pushFilerUndoEntry(undoState, { kind: "move", entries: moved }),
-      );
-    }
-    await runRefresh(refresh);
-    toast.error(
-      `${operation === "move" ? "移動" : "コピー"}に失敗しました: ${explorerErrorMessage(error)}`,
-    );
-    return false;
+
+    if (copiedPaths.length > 0) onTransferred?.(copiedPaths);
+    if (attempted) await runRefresh(refresh);
+    return copiedPaths.length > 0;
   }
 
-  if (moved.length > 0) {
-    setUndoState(
-      pushFilerUndoEntry(undoState, { kind: "move", entries: moved }),
+  const moved: { from: string; to: string }[] = [];
+  const overwrittenDestinations = new Set<string>();
+  const transferredPaths: string[] = [];
+  const overwriteLimitations: string[] = [];
+  const failures: unknown[] = [];
+  const requests = paths
+    .filter((src) => !isMoveNoop(src, destDir))
+    .map((src) => ({ src, destDir, context: src }));
+  const result = await runMoveBatchWithOverwrite(requests, confirm);
+  failures.push(...result.failures.map(({ error }) => error));
+  for (const {
+    request,
+    newPath,
+    overwroteExisting,
+    undoable,
+    undoLimitation,
+  } of result.succeeded) {
+    // A server-confirmed no-op is not a clipboard transfer or an Undo entry.
+    if (newPath === request.src) continue;
+    transferredPaths.push(request.src);
+    if (undoable) {
+      moved.push({ from: request.src, to: newPath });
+    } else {
+      overwriteLimitations.push(
+        undoLimitation || FALLBACK_OVERWRITE_UNDO_LIMITATION,
+      );
+      if (overwroteExisting) {
+        overwrittenDestinations.add(normalizeFilerPath(newPath));
+      }
+    }
+  }
+
+  // A later successful overwrite in this batch may replace a path recorded by
+  // an earlier reversible move.  That earlier inverse would then move the
+  // replacement content, so retain only moves to other destinations.
+  const reversibleMoves = moved.filter(
+    ({ to }) => !overwrittenDestinations.has(normalizeFilerPath(to)),
+  );
+
+  if (operationUndoScopeGeneration === undoScopeGeneration) {
+    // A successful overwrite has no inverse that can restore the previous
+    // destination content.  Older Undo/Redo entries may now point at that
+    // replaced path, so treat it as a history boundary even when another
+    // overwrite advanced the boundary while this operation was in flight.
+    const boundaryWasCurrent =
+      operationHistoryBoundaryGeneration === historyBoundaryGeneration;
+    const historyBase =
+      overwriteLimitations.length > 0 ? clearFilerUndoState() : undoState;
+    if (overwriteLimitations.length > 0) {
+      historyBoundaryGeneration += 1;
+    }
+    // Reversible moves from this same batch remain safe only when the
+    // operation started in the current history boundary.  A stale operation
+    // must not re-add entries after clearing newer history.
+    if (reversibleMoves.length > 0 && boundaryWasCurrent) {
+      setUndoState(
+        pushFilerUndoEntry(historyBase, {
+          kind: "move",
+          entries: reversibleMoves,
+        }),
+      );
+    } else if (historyBase !== undoState) {
+      setUndoState(historyBase);
+    }
+  }
+  if (transferredPaths.length > 0) onTransferred?.(transferredPaths);
+  if (result.attempted) await runRefresh(refresh);
+
+  if (overwriteLimitations.length > 0) {
+    toast.info(
+      `${overwriteLimitations.length}件を上書き移動しました。${overwriteLimitations[0]}`,
     );
   }
-  onTransferred?.();
-  await runRefresh(refresh);
-  return true;
+
+  if (failures.length > 0) {
+    const completed = transferredPaths.length;
+    const completedMessage = completed > 0 ? `${completed}件は移動しました。` : "";
+    const otherFailureCount = failures.length - 1;
+    const suffix = otherFailureCount > 0 ? `（ほか${otherFailureCount}件）` : "";
+    const skippedMessage =
+      result.skipped.length > 0
+        ? ` ${result.skipped.length}件はスキップしました。`
+        : "";
+    toast.error(
+      `${completedMessage}移動に失敗しました${suffix}: ${explorerErrorMessage(failures[0])}${skippedMessage}`,
+    );
+  } else if (result.skipped.length > 0) {
+    toast.info(
+      `${transferredPaths.length > 0 ? `${transferredPaths.length}件を移動しました。` : ""}${result.skipped.length}件をスキップしました`,
+    );
+  }
+
+  return transferredPaths.length > 0;
 }
 
 // ─── Undo / Redo ───
@@ -787,30 +1062,9 @@ async function applyFilerUndoEntry(
     return { kind: "rename-batch", entries: reversed };
   }
 
-  if (entry.kind === "move") {
-    const reversed: { from: string; to: string }[] = [];
-    for (const item of entry.entries) {
-      const result = await explorerMove(item.to, parentDir(item.from));
-      reversed.push({ from: item.to, to: result.new_path || item.from });
-    }
-    return { kind: "move", entries: reversed };
-  }
-
-  // hydrus-delete: 表示側もページキャッシュを迂回して直接更新する
-  const operationHydrusHandlers = hydrusViewHandlers;
-  if (direction === "undo") {
-    await hydrusUndeleteFiles(entry.fileIds);
-    operationHydrusHandlers?.restore(entry.fileIds);
-  } else {
-    await hydrusDeleteFiles(entry.fileIds);
-    operationHydrusHandlers?.prune(entry.fileIds);
-  }
-  return { kind: "hydrus-delete", fileIds: entry.fileIds };
-}
-
-/** Hydrus は explorer の一覧APIを持たないため refresh を呼ばない。 */
-function entryNeedsRefresh(entry: FilerUndoEntry): boolean {
-  return entry.kind !== "hydrus-delete";
+  // Move entries are intercepted by the partial-safe, conflict-aware path
+  // before reaching this generic history handler.
+  throw new Error("Move history requires the conflict-aware handler");
 }
 
 export function canUndoFiler(): boolean {
@@ -821,22 +1075,131 @@ export function canRedoFiler(): boolean {
   return undoState.redo.length > 0;
 }
 
+async function applyMoveHistoryIfNeeded(
+  direction: "undo" | "redo",
+  refresh?: FilerRefresh,
+  confirm?: ConfirmFn,
+  capabilities?: FilerCapabilities,
+): Promise<boolean | null> {
+  const pendingEntry =
+    direction === "undo" ? undoState.undo.at(-1) : undoState.redo.at(-1);
+  if (pendingEntry?.kind !== "move") return null;
+  if (!capabilities?.canMove) return false;
+
+  const taken =
+    direction === "undo"
+      ? takeFilerUndoEntry(undoState)
+      : takeFilerRedoEntry(undoState);
+  if (!taken) return false;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
+  setUndoState(taken.state);
+
+  try {
+    const applied = await applyFilerMoveHistoryEntry(
+      taken.entry as Extract<FilerUndoEntry, { kind: "move" }>,
+      confirm,
+    );
+    if (operationHistoryBoundaryGeneration === historyBoundaryGeneration) {
+      let nextState = getFilerUndoSnapshot();
+      if (direction === "undo") {
+        if (applied.inverse) {
+          nextState = pushFilerRedoEntry(nextState, applied.inverse);
+        }
+        if (applied.remaining) {
+          nextState = restoreFilerUndoEntry(nextState, applied.remaining);
+        }
+      } else {
+        if (applied.inverse) {
+          nextState = restoreFilerUndoEntry(nextState, applied.inverse);
+        }
+        if (applied.remaining) {
+          nextState = restoreFilerRedoEntry(nextState, applied.remaining);
+        }
+      }
+      setUndoState(nextState);
+    }
+
+    if (applied.attempted || applied.succeededCount > 0) {
+      await runRefresh(refresh);
+    }
+
+    const verb = direction === "undo" ? "元に戻す" : "やり直す";
+    if (applied.failures.length > 0) {
+      const completedMessage =
+        applied.succeededCount > 0
+          ? `${applied.succeededCount}件は処理しました。`
+          : "";
+      const skippedMessage =
+        applied.skippedCount > 0
+          ? ` ${applied.skippedCount}件はスキップしました。`
+          : "";
+      const otherFailureCount = applied.failures.length - 1;
+      const suffix = otherFailureCount > 0 ? `（ほか${otherFailureCount}件）` : "";
+      toast.error(
+        `${verb}に失敗しました。${completedMessage}${explorerErrorMessage(applied.failures[0])}${suffix}${skippedMessage}`,
+      );
+      if (applied.overwriteBlockedCount > 0) {
+        toast.info(
+          `${verb}できない項目があります。${applied.overwriteBlockedCount}件は上書きが必要なため、既存項目を失う操作を避けて${verb}を停止しました`,
+        );
+      }
+    } else if (applied.overwriteBlockedCount > 0) {
+      toast.info(
+        `${verb}できない項目があります。${applied.overwriteBlockedCount}件は上書きが必要なため、既存項目を失う操作を避けて${verb}を停止しました`,
+      );
+    } else if (applied.skippedCount > 0) {
+      toast.info(
+        `${applied.succeededCount > 0 ? `${applied.succeededCount}件を処理しました。` : ""}${applied.skippedCount}件をスキップしました`,
+      );
+    } else {
+      toast.success(direction === "undo" ? "元に戻しました" : "やり直しました");
+    }
+    return applied.succeededCount > 0;
+  } catch (error) {
+    if (operationHistoryBoundaryGeneration === historyBoundaryGeneration) {
+      let nextState = getFilerUndoSnapshot();
+      nextState =
+        direction === "undo"
+          ? restoreFilerUndoEntry(nextState, taken.entry)
+          : restoreFilerRedoEntry(nextState, taken.entry);
+      setUndoState(nextState);
+    }
+    await runRefresh(refresh);
+    toast.error(
+      `${direction === "undo" ? "元に戻せませんでした" : "やり直せませんでした"}: ${explorerErrorMessage(error)}`,
+    );
+    return false;
+  }
+}
+
 export async function undoFilerOperation(
   refresh?: FilerRefresh,
+  confirm?: ConfirmFn,
+  capabilities?: FilerCapabilities,
 ): Promise<boolean> {
+  const moveResult = await applyMoveHistoryIfNeeded(
+    "undo",
+    refresh,
+    confirm,
+    capabilities,
+  );
+  if (moveResult !== null) return moveResult;
+
   const taken = takeFilerUndoEntry(undoState);
   if (!taken) return false;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
   setUndoState(taken.state);
-  const needsRefresh = entryNeedsRefresh(taken.entry);
   try {
     const inverse = await applyFilerUndoEntry(taken.entry, "undo");
-    setUndoState(pushFilerRedoEntry(getFilerUndoSnapshot(), inverse));
-    if (needsRefresh) await runRefresh(refresh);
+    if (operationHistoryBoundaryGeneration === historyBoundaryGeneration) {
+      setUndoState(pushFilerRedoEntry(getFilerUndoSnapshot(), inverse));
+    }
+    await runRefresh(refresh);
     toast.success("元に戻しました");
     return true;
   } catch (error) {
     // 失敗したエントリは復元不能とみなし、スタックから捨てる
-    if (needsRefresh) await runRefresh(refresh);
+    await runRefresh(refresh);
     toast.error(`元に戻せませんでした: ${explorerErrorMessage(error)}`);
     return false;
   }
@@ -844,19 +1207,31 @@ export async function undoFilerOperation(
 
 export async function redoFilerOperation(
   refresh?: FilerRefresh,
+  confirm?: ConfirmFn,
+  capabilities?: FilerCapabilities,
 ): Promise<boolean> {
+  const moveResult = await applyMoveHistoryIfNeeded(
+    "redo",
+    refresh,
+    confirm,
+    capabilities,
+  );
+  if (moveResult !== null) return moveResult;
+
   const taken = takeFilerRedoEntry(undoState);
   if (!taken) return false;
+  const operationHistoryBoundaryGeneration = historyBoundaryGeneration;
   setUndoState(taken.state);
-  const needsRefresh = entryNeedsRefresh(taken.entry);
   try {
     const inverse = await applyFilerUndoEntry(taken.entry, "redo");
-    setUndoState(restoreFilerUndoEntry(getFilerUndoSnapshot(), inverse));
-    if (needsRefresh) await runRefresh(refresh);
+    if (operationHistoryBoundaryGeneration === historyBoundaryGeneration) {
+      setUndoState(restoreFilerUndoEntry(getFilerUndoSnapshot(), inverse));
+    }
+    await runRefresh(refresh);
     toast.success("やり直しました");
     return true;
   } catch (error) {
-    if (needsRefresh) await runRefresh(refresh);
+    await runRefresh(refresh);
     toast.error(`やり直せませんでした: ${explorerErrorMessage(error)}`);
     return false;
   }

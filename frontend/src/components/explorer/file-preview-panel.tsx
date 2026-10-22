@@ -15,18 +15,10 @@ import {
 } from "@/lib/explorer-api";
 import { Button } from "@/components/ui/button";
 import { X, Download, FileIcon, Info, ExternalLink, Pencil } from "lucide-react";
-import { hfServeUrl, hfTextUrl, isHfPath } from "@/lib/hf/virtual-path";
-import { isHydrusPath, parseHydrusFileId } from "@/lib/hydrus/virtual-path";
-import {
-  hydrusGetMetadata,
-  type HydrusFileMetadata,
-} from "@/lib/hf-api";
-import { getFileServeUrl } from "@/lib/explorer-serve-url";
 import { formatExplorerDateTime } from "@/lib/explorer-format";
 import { getFileExt } from "@/lib/utils";
 import { toast } from "sonner";
 
-const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"]);
 const TEXT_EXTS = new Set([
   "txt",
   "md",
@@ -53,44 +45,6 @@ const TEXT_EXTS = new Set([
   "vbs",
 ]);
 
-async function loadHfPreview(file: ExplorerFile): Promise<FilePreview | null> {
-  const ext = getFileExt(file.name);
-  if (IMAGE_EXTS.has(ext)) {
-    const url = hfServeUrl(file.path);
-    return url ? { success: true, type: "image", data_url: url } : null;
-  }
-  if (TEXT_EXTS.has(ext)) {
-    const url = hfTextUrl(file.path);
-    if (!url) return null;
-    try {
-      const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) return null;
-      const j = await res.json();
-      return {
-        success: true,
-        type: "text",
-        content: j.text ?? "",
-        truncated: !!j.truncated,
-      };
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function loadHydrusPreview(file: ExplorerFile): FilePreview | null {
-  const mime = file.type || "";
-  if (mime.startsWith("image/")) {
-    return {
-      success: true,
-      type: "image",
-      data_url: getFileServeUrl(file.path),
-    };
-  }
-  return null;
-}
-
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -98,48 +52,6 @@ function formatSize(bytes: number): string {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-function formatDuration(seconds?: number): string | null {
-  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
-  const rounded = Math.max(0, Math.round(seconds));
-  const hours = Math.floor(rounded / 3600);
-  const minutes = Math.floor((rounded % 3600) / 60);
-  const rest = rounded % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
-    : `${minutes}:${String(rest).padStart(2, "0")}`;
-}
-
-function hydrusRows(
-  file: ExplorerFile,
-  metadata: HydrusFileMetadata | null,
-): Array<[string, string]> {
-  const rows: Array<[string, string]> = [];
-  const size = metadata?.size ?? file.size;
-  if (typeof size === "number") rows.push(["Size", formatSize(size)]);
-  const mime = metadata?.mime ?? file.type;
-  if (mime) rows.push(["MIME", mime]);
-  const width = metadata?.width;
-  const height = metadata?.height;
-  if (typeof width === "number" && typeof height === "number") {
-    rows.push(["Resolution", `${width} × ${height}`]);
-  }
-  const duration = formatDuration(metadata?.duration);
-  if (duration) rows.push(["Duration", duration]);
-  const modified = metadata?.time_modified
-    ? new Date(metadata.time_modified * 1000).toISOString()
-    : file.modified_at;
-  if (modified) rows.push(["Modified", formatExplorerDateTime(modified)]);
-  if (typeof metadata?.file_id === "number") rows.push(["Hydrus File ID", String(metadata.file_id)]);
-  const hash = typeof metadata?.hash === "string" ? metadata.hash : "";
-  if (hash) rows.push(["Hash", hash]);
-  if (typeof metadata?.num_frames === "number") rows.push(["Frames", String(metadata.num_frames)]);
-  if (metadata?.has_audio != null) rows.push(["Audio", metadata.has_audio ? "あり" : "なし"]);
-  if (metadata?.is_inbox != null) rows.push(["Inbox", metadata.is_inbox ? "あり" : "なし"]);
-  if (metadata?.is_local != null) rows.push(["Local", metadata.is_local ? "あり" : "なし"]);
-  if (metadata?.is_trashed != null) rows.push(["Trash", metadata.is_trashed ? "あり" : "なし"]);
-  return rows;
 }
 
 interface FilePreviewPanelProps {
@@ -163,65 +75,12 @@ export function FilePreviewPanel({
     preview: FilePreview | null;
     info: FileInfo | null;
   }>({ path: null, identity: null, preview: null, info: null });
-  const [hydrusMetadata, setHydrusMetadata] = useState<HydrusFileMetadata | null>(null);
-  const [hydrusMetadataKey, setHydrusMetadataKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (!file) return;
 
     let cancelled = false;
     const identity = `${userId ?? "anonymous"}:${file.path}`;
-
-    // HF / Hydrus は explorer API を使わず専用ルートで解決
-    if (isHfPath(file.path)) {
-      // Clear metadata from a previous Hydrus selection before loading HF.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setHydrusMetadata(null);
-      setHydrusMetadataKey(null);
-      loadHfPreview(file).then((preview) => {
-        if (cancelled) return;
-        setPreviewState({ path: file.path, identity, preview, info: null });
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
-    if (isHydrusPath(file.path)) {
-      const preview = loadHydrusPreview(file);
-      const fileId = parseHydrusFileId(file.path);
-      // Set the preview path immediately so metadata latency does not hide the
-      // fallback ExplorerFile properties or the image preview.
-      setHydrusMetadata(null);
-      setHydrusMetadataKey(null);
-      setPreviewState({ path: file.path, identity, preview, info: null });
-      if (fileId == null) {
-        return () => {
-          cancelled = true;
-        };
-      }
-      hydrusGetMetadata([fileId], false)
-        .then((result) => {
-          if (cancelled) return;
-          const metadata = result.metadata?.[0] ?? null;
-          // Hydrus returns an array even for one id.  Do not attach a row for
-          // another file (or a response from a previous principal/path).
-          if (metadata?.file_id !== fileId) {
-            setHydrusMetadata(null);
-            return;
-          }
-          setHydrusMetadata(metadata);
-          setHydrusMetadataKey(identity);
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setHydrusMetadata(null);
-            setHydrusMetadataKey(null);
-          }
-        });
-      return () => {
-        cancelled = true;
-      };
-    }
 
     Promise.all([explorerPreview(file.path), explorerInfo(file.path)])
       .then(([preview, info]) => {
@@ -244,28 +103,9 @@ export function FilePreviewPanel({
   const loading = previewState.path !== file.path || previewState.identity !== identity;
   const preview = loading ? null : previewState.preview;
   const info = loading ? null : previewState.info;
-  const metadataForFile =
-    !loading && hydrusMetadataKey === `${userId ?? "anonymous"}:${file.path}`
-      ? hydrusMetadata
-      : null;
-  const hydrusProperties = isHydrusPath(file.path)
-    ? hydrusRows(file, metadataForFile)
-    : [];
 
   const handleDownload = async () => {
     try {
-      if (isHfPath(file.path)) {
-        const url = hfServeUrl(file.path);
-        if (!url) throw new Error("ダウンロードURLを解決できませんでした");
-        await explorerDownloadResource(url, file.name);
-        return;
-      }
-      if (isHydrusPath(file.path)) {
-        const url = getFileServeUrl(file.path);
-        if (!url) throw new Error("ダウンロードURLを解決できませんでした");
-        await explorerDownloadResource(url, file.name);
-        return;
-      }
       await explorerDownloadResource(
         explorerDownloadUrl(file.path),
         file.name,
@@ -280,10 +120,7 @@ export function FilePreviewPanel({
   // deciding whether the canonical workspace editor can open this file.
   const normalizedExt = (file.extension || getFileExt(file.name)).replace(/^\./, "").toLowerCase();
   const canOpenWorkspace = Boolean(
-    onOpenWorkspace &&
-      !isHydrusPath(file.path) &&
-      !isHfPath(file.path) &&
-      TEXT_EXTS.has(normalizedExt),
+    onOpenWorkspace && TEXT_EXTS.has(normalizedExt),
   );
   const fileKind = file.extension?.replace(/^\./, "").toUpperCase() || "FILE";
 
@@ -332,11 +169,11 @@ export function FilePreviewPanel({
           <dl className="space-y-3 text-[13px]">
             <div className="grid grid-cols-[5.5rem,1fr] gap-2">
               <dt className="text-muted-foreground">Size</dt>
-              <dd className="break-words">{isHydrusPath(file.path) ? hydrusProperties.find(([label]) => label === "Size")?.[1] ?? "-" : info ? formatSize(info.size_bytes) : typeof file.size === "number" ? formatSize(file.size) : "-"}</dd>
+              <dd className="break-words">{info ? formatSize(info.size_bytes) : typeof file.size === "number" ? formatSize(file.size) : "-"}</dd>
             </div>
             <div className="grid grid-cols-[5.5rem,1fr] gap-2">
               <dt className="text-muted-foreground">Modified</dt>
-              <dd className="break-words">{isHydrusPath(file.path) ? hydrusProperties.find(([label]) => label === "Modified")?.[1] ?? "-" : info ? formatExplorerDateTime(info.modified_at) : formatExplorerDateTime(file.modified_at)}</dd>
+              <dd className="break-words">{info ? formatExplorerDateTime(info.modified_at) : formatExplorerDateTime(file.modified_at)}</dd>
             </div>
             {info?.created_at ? (
               <div className="grid grid-cols-[5.5rem,1fr] gap-2">
@@ -400,19 +237,6 @@ export function FilePreviewPanel({
           </div>
         )}
         </section>
-        {isHydrusPath(file.path) && hydrusProperties.length > 0 ? (
-          <section className="space-y-2">
-            <h4 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Hydrus</h4>
-            <div className="space-y-2 rounded-md border border-border bg-muted/20 p-3 text-xs">
-              {hydrusProperties.filter(([label]) => !["Size", "Modified"].includes(label)).map(([label, value]) => (
-                <div key={label} className="flex items-start justify-between gap-2">
-                  <span className="text-muted-foreground">{label}</span>
-                  <span className="max-w-[10rem] break-all text-right">{value}</span>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
       </div>
 
       {canOpenWorkspace ? (

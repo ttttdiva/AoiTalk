@@ -600,6 +600,13 @@ def _compact_candidate(value: Any) -> dict[str, Any]:
             for key in ("id", "title", "status", "completed_at")
             if seed_task.get(key) is not None
         }
+    adoption_required = row.get("_publication_guard_adoption_required")
+    if not isinstance(adoption_required, bool):
+        guard_row = (
+            {"published_node_id": value.published_node_id, "draft": value.draft_json}
+            if hasattr(value, "draft_json") else row
+        )
+        adoption_required = _publication_guard_adoption_required(guard_row, status)
     return {
         "id": candidate_id,
         "project_id": project_id,
@@ -622,9 +629,7 @@ def _compact_candidate(value: Any) -> dict[str, Any]:
         "published": _compact_published(
             _value(row, "published", "publication", "published_node")
         ),
-        "publication_guard_adoption_required": _publication_guard_adoption_required(
-            row, status
-        ),
+        "publication_guard_adoption_required": adoption_required,
         "created_at": _value(row, "created_at"),
         "updated_at": _value(row, "updated_at"),
     }
@@ -641,6 +646,14 @@ def _candidate_safe_row(candidate: Any) -> dict[str, Any]:
             row = dict(safe_method())
     else:
         row = _row_mapping(candidate)
+
+    # A bounded DTO can truncate the hidden guard.  Validate the durable
+    # publication before projection and expose only the adoption boolean.
+    if hasattr(candidate, "draft_json"):
+        row["_publication_guard_adoption_required"] = _publication_guard_adoption_required(
+            {"published_node_id": candidate.published_node_id, "draft": candidate.draft_json},
+            str(candidate.status),
+        )
 
     seed_task = getattr(candidate, "seed_task", None)
     if seed_task is not None:
@@ -1410,6 +1423,65 @@ def create_knowledge_capture_router(
                     "session": session,
                     "candidate": candidate,
                     "question": question,
+                    "actor": user_info,
+                    "expected_candidate_version": payload.expected_candidate_version,
+                    "text": payload.text,
+                    "thread": [item.model_dump() for item in payload.thread],
+                    "config": config,
+                },
+            )
+            # Stateless boundary: no commit, answer call, question transition,
+            # notification mutation, or Docs publication is performed here.
+            return _row_mapping(result)
+        except Exception as exc:
+            _raise_http_error(exc)
+        finally:
+            await _close_session(session)
+
+    @router.post(
+        "/api/projects/{project_id}/knowledge-capture/candidates/{candidate_id}/review",
+        response_model=KnowledgeCaptureReviewResponse,
+    )
+    async def review_knowledge_capture_draft(
+        project_id: UUID,
+        candidate_id: UUID,
+        payload: KnowledgeCaptureReviewRequest,
+        request: Request,
+        _: None = Depends(require_auth_dependency),
+    ) -> dict[str, Any]:
+        user_info, user_id = await actor(request)
+        session = await _open_session(get_db_manager)
+        try:
+            if session is None:
+                raise KnowledgeCaptureUnavailable("Database unavailable")
+            await _require_project_permission(
+                session,
+                project_id=project_id,
+                user_id=user_id,
+                permission="read",
+            )
+            candidate = await _read_candidate(session, candidate_id=candidate_id)
+            candidate_project_id = _uuid(candidate.get("project_id"), "project_id")
+            if candidate_project_id != project_id:
+                raise HTTPException(status_code=404, detail="Knowledge Capture candidate not found")
+            try:
+                live_version = int(candidate.get("version") or 0)
+            except (TypeError, ValueError):
+                live_version = 0
+            if live_version != payload.expected_candidate_version:
+                raise HTTPException(status_code=409, detail="Knowledge Capture candidate version conflict")
+            if str(candidate.get("status") or "").casefold() != "draft_ready":
+                raise HTTPException(status_code=409, detail="Knowledge Capture candidate is no longer ready for draft review")
+            result = await _invoke(
+                _research_module(),
+                ("review_candidate_draft",),
+                session=session,
+                session_factory=session_factory,
+                config=config,
+                kwargs={
+                    "session_factory": session_factory,
+                    "session": session,
+                    "candidate": candidate,
                     "actor": user_info,
                     "expected_candidate_version": payload.expected_candidate_version,
                     "text": payload.text,

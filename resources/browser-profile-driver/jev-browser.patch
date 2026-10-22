@@ -1,0 +1,330 @@
+diff --git a/src/library.ts b/src/library.ts
+index 070098e..798b805 100644
+--- a/src/library.ts
++++ b/src/library.ts
+@@ -1,7 +1,7 @@
+ // Public library entry, side-effect free: importing this module starts no
+ // server and no CLI. The MCP server and CLI entry is index.ts (the bin).
+ export { navigate } from "./navigate.js";
+-export type { NavigateOptions, StepRecord, ConsoleEvent, JevUsage } from "./navigate.js";
++export type { NavigateOptions, StepRecord, ConsoleEvent, JevUsage, BeforeActionInfo, BeforeActionDecision } from "./navigate.js";
+ export type { TypingGenerator, TypingTextResult } from "./navigate.js";
+ export type { TypingWarning, TypingWarningCode, TypingSelection } from "./lib.js";
+ export type { JevTransport, JevTransportInput, JevTransportReply, AskResult } from "./provider.js";
+diff --git a/src/navigate.ts b/src/navigate.ts
+index 575f168..6a9f077 100644
+--- a/src/navigate.ts
++++ b/src/navigate.ts
+@@ -41,6 +41,41 @@ const STATE_EXCERPT_CHARS = 1_500;
+ // Capture windows are these plus the longest secret representation.
+ const CREDENTIAL_VISIBLE = { label: 80, option: 120, href: 120 };
+ 
++export interface BeforeActionInfo {
++  step: number;
++  /**
++   * "propose": after Jev's proposal and the stop gates, before any text is
++   * generated or any second Jev call is made. "commit": immediately before a
++   * DOM mutation, after text generation and option selection.
++   */
++  phase: "propose" | "commit";
++  /** Set on "commit": the single mutation about to run. */
++  mutation: "fill" | "press_enter" | "select_option" | "click" | "fill_password" | "back" | "scroll" | null;
++  /** Chosen action id, e.g. `click_e3`, `type_e5`, `scroll_down`, `back`. */
++  action: string;
++  /** Redacted description of the target element, or null for page-level actions. */
++  elementDescription: string | null;
++  /** The concrete target reference the mutation is bound to, or null for page-level actions. */
++  target: { id: string; selector: string; kind: string; submitVia: string | null } | null;
++  /** "commit" only: length of the text about to be typed (never the text itself). */
++  textLength?: number;
++  /** "commit" + select_option only: the redacted label of the option about to be selected. */
++  optionLabel?: string;
++  url: string;
++}
++
++export type BeforeActionDecision = { allow: true } | { allow: false; reason?: string };
++
++class HostRefused extends Error {
++  constructor(readonly reason: string) {
++    super("host refused");
++  }
++}
++
++function hostTarget(element: { id: string; attr: string; kind: string; submitVia?: string }): NonNullable<BeforeActionInfo["target"]> {
++  return { id: element.id, selector: `[data-jev-id="${element.attr}"]`, kind: element.kind, submitVia: element.submitVia ?? null };
++}
++
+ export interface NavigateOptions {
+   task: string;
+   /** Start URL for an internally-created page. Omit when `page` is supplied. */
+@@ -49,6 +84,32 @@ export interface NavigateOptions {
+   page?: Page;
+   /** Override judgment transport for this run, independent of JEV_PROVIDER and credentials. */
+   transport?: JevTransport;
++  /**
++   * Host gate. Called with phase "propose" once per proposed action (after
++   * Jev's proposal and the done/goal/stuck stop gates) and again with phase
++   * "commit" immediately before each DOM mutation, after any text generation
++   * or second Jev call. Return `{ allow: true }` to proceed; anything else
++   * records the step as not executed and ends the run with status "blocked",
++   * with no fallback candidate. A thrown error aborts the run. It receives
++   * action id, target reference, description and URL, never page content or
++   * typed text. Omit it for the unchanged behaviour.
++   */
++  beforeAction?: (info: BeforeActionInfo, signal: AbortSignal) => Promise<BeforeActionDecision> | BeforeActionDecision;
++  /**
++   * Host-provided text for a type/search action, used instead of the built-in
++   * provider-backed generator (so no provider key is needed in this process).
++   * It receives only the redacted element description and the URL.
++   */
++  typingText?: (request: { elementDescription: string; url: string }, signal: AbortSignal) => Promise<TypingTextResult>;
++  /** Injected hosts with a fixed tab can refuse automatic adoption of new Pages. */
++  followNewPages?: boolean;
++  /**
++   * End the run (status "action_failed") when an action errors, instead of
++   * Jev's built-in recovery that switches to the next-best candidate.
++   */
++  stopOnActionError?: boolean;
++  /** Host memory for the same owned run, including human login handoffs. */
++  history?: Array<{ step: number; action: string; outcome: string }>;
+   maxSteps?: number;
+   maxSeconds?: number;
+   allowTyping?: boolean;
+@@ -474,7 +535,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+   } = options;
+   const maxChars = options.maxChars ?? DEFAULT_CAPS[format];
+   const started = performance.now();
+-  const deadlineAt = started + maxSeconds * 1000;
++  let deadlineAt = started + maxSeconds * 1000;
+ 
+   // Credential-run guards run before any timer, listener, or browser is
+   // armed: a rejected direct-library call must not leak the deadline timer
+@@ -543,13 +604,13 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+   // valid key for the named one) refuses to start instead of silently using
+   // another provider. Runs with typing disabled ignore typing config at all,
+   // so a broken config can always be worked around with allowTyping: false.
+-  const typingGenerator = allowTyping ? createTypingGenerator() : null;
++  const typingGenerator = allowTyping && !options.typingText ? createTypingGenerator() : null;
+   const transport = options.transport ?? resolveTransport();
+ 
+   // One abort source per run: the wall-clock deadline, optionally composed
+   // with caller cancellation (the MCP layer forwards its signal).
+   const controller = new AbortController();
+-  const deadlineTimer = setTimeout(() => controller.abort(new Error("deadline-exceeded")), maxSeconds * 1000);
++  let deadlineTimer = setTimeout(() => controller.abort(new Error("deadline-exceeded")), maxSeconds * 1000);
+   const onExternalAbort = () => controller.abort(new Error("cancelled-by-caller"));
+   externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+   if (externalSignal?.aborted) controller.abort(new Error("cancelled-by-caller"));
+@@ -567,6 +628,21 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+     provider: null,
+   };
+   const remaining = () => Math.max(0, deadlineAt - performance.now());
++  // Human approval consumes no action budget; external cancellation remains
++  // active while the host waits. Resume both the loop and provider deadlines.
++  const hostGate = async (info: BeforeActionInfo) => {
++    if (controller.signal.aborted) throw controller.signal.reason;
++    const pausedAt = performance.now();
++    clearTimeout(deadlineTimer);
++    try {
++      return await options.beforeAction!(info, controller.signal);
++    } finally {
++      deadlineAt += performance.now() - pausedAt;
++      budget.deadlineAt = deadlineAt;
++      if (!controller.signal.aborted)
++        deadlineTimer = setTimeout(() => controller.abort(new Error("deadline-exceeded")), remaining());
++    }
++  };
+   const bounded = (cap: number) => Math.max(250, Math.min(cap, remaining() || 250));
+ 
+   // Credential runs size each capture window as visible limit + the longest
+@@ -696,6 +772,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+     observerCleanups.push(() => runPage.off("response", onResponse));
+     let pendingPage: Page | null = null;
+     onNewPage = (p) => {
++      if (options.followNewPages === false) return;
+       attachPageObservers(p); // adopted tabs keep producing diagnostics
+       pendingPage = p;
+     };
+@@ -752,7 +829,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+     // "typed" (a fill happened but the page did not change) and "no_change"
+     // (nothing observable happened) both make a repeat proposal redundant.
+     let lastRedundant: "typed" | "no_change" | null = null;
+-    const history: Array<{ step: number; action: string; outcome: string }> = [];
++    const history = options.history ?? [];
+ 
+     for (let step = 1; step <= maxSteps; step++) {
+       currentStep.n = step;
+@@ -866,14 +943,42 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+           chosen === `fill_password_${e.id}`,
+       );
+ 
++      if (options.beforeAction) {
++        const verdict = await hostGate(
++          { step, phase: "propose", mutation: null, action: chosen, elementDescription: element ? R(element.description) : null, target: element ? hostTarget(element) : null, url: R(page.url()) },
++        );
++        if (controller.signal.aborted) throw controller.signal.reason;
++        if (!verdict || verdict.allow !== true) {
++          const why = verdict && "reason" in verdict && verdict.reason ? `: ${R(String(verdict.reason)).slice(0, 160)}` : "";
++          steps.push({ ...base, executed_action: null, detail: `host refused before acting${why}`, outcome: "action refused by host before acting" });
++          status = "blocked";
++          break;
++        }
++      }
++
+       let detail = chosen;
+       let actionError: string | undefined;
+       let typedIntoLabel: string | null = null;
++      let hostRefusal: string | null = null;
++      let mutationAttempted = false;
++      const commitGate = async (mutation: NonNullable<BeforeActionInfo["mutation"]>, extra: { textLength?: number; optionLabel?: string } = {}) => {
++        if (!options.beforeAction) return;
++        const verdict = await hostGate(
++          { step, phase: "commit", mutation, action: chosen, elementDescription: element ? R(element.description) : null, target: element ? hostTarget(element) : null, url: R(page.url()), ...extra },
++        );
++        if (controller.signal.aborted) throw controller.signal.reason;
++        if (!verdict || verdict.allow !== true) {
++          throw new HostRefused(verdict && "reason" in verdict && verdict.reason ? R(String(verdict.reason)).slice(0, 160) : "");
++        }
++        mutationAttempted = true;
++      };
+       try {
+         if (chosen === "back") {
++          await commitGate("back");
+           const wentBack = await page.goBack({ waitUntil: "domcontentloaded", timeout: bounded(10_000) }).catch(() => null);
+           detail = wentBack ? "went back" : "no history to go back to";
+         } else if (chosen === "scroll_down" || chosen === "scroll_up") {
++          await commitGate("scroll");
+           await page.evaluate(
+             (dir) => window.scrollBy(0, dir * window.innerHeight * 0.8),
+             chosen === "scroll_down" ? 1 : -1,
+@@ -884,13 +989,15 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+         } else if (chosen.startsWith("type_")) {
+           if (!allowTyping) {
+             actionError = "typing disabled by caller";
+-          } else if (!typingGenerator) {
++          } else if (!typingGenerator && !options.typingText) {
+             // An ordinary field is never filled with a guess: no typing
+             // provider means nothing gets typed, loudly.
+             actionError = "typing generator failed; nothing was typed";
+             recordTypingWarning(step, "typing_fallback_no_provider", "no typing provider is configured; ordinary fields are left empty rather than filled with a guess");
+           } else {
+-            const generated = await generateTextToType(budget.signal, typingGenerator, safeTask, element.description, R(page.url()));
++            const generated = options.typingText
++              ? await options.typingText({ elementDescription: R(element.description), url: R(page.url()) }, budget.signal)
++              : await generateTextToType(budget.signal, typingGenerator!, safeTask, element.description, R(page.url()));
+             if (!generated.ok) {
+               // A failed or empty generation types nothing: keyword soup in a
+               // username or email field guarantees failure while looking like
+@@ -900,6 +1007,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+             } else {
+               // Fill only: submitting is a separate submit_eN decision, so an
+               // ordinary form is never submitted mid-task by a field fill.
++              await commitGate("fill", { textLength: generated.text.length });
+               await page.fill(selectorFor(element), generated.text, { timeout: bounded(4_000) });
+               detail = `typed "${generated.text}" via ${generated.via}`;
+               typedIntoLabel = element.description.match(/"([^"]*)"/)?.[1] ?? element.kind;
+@@ -911,12 +1019,14 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+           } else {
+             let text: string;
+             let via: string;
+-            if (!typingGenerator) {
++            if (!typingGenerator && !options.typingText) {
+               text = heuristicQuery(safeTask);
+               via = "keyword-heuristic";
+               recordTypingWarning(step, "typing_fallback_no_provider", "no typing provider is configured; search fields fall back to the task-keyword heuristic", { fallback: "keyword-heuristic" });
+             } else {
+-              const generated = await generateTextToType(budget.signal, typingGenerator, safeTask, element.description, R(page.url()));
++              const generated = options.typingText
++              ? await options.typingText({ elementDescription: R(element.description), url: R(page.url()) }, budget.signal)
++              : await generateTextToType(budget.signal, typingGenerator!, safeTask, element.description, R(page.url()));
+               if (generated.ok) {
+                 text = generated.text;
+                 via = generated.via;
+@@ -929,16 +1039,21 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+                 recordTypingWarning(step, generated.code, generated.message, { finishReason: generated.finishReason, fallback: "keyword-heuristic" });
+               }
+             }
++            await commitGate("fill", { textLength: text.length });
+             await page.fill(selectorFor(element), text, { timeout: bounded(4_000) });
++            typedIntoLabel = element.description.match(/"([^"]*)"/)?.[1] ?? element.kind;
++            detail = `typed into search field via ${via}; not submitted`;
++            await commitGate("press_enter");
+             await page.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
+             detail = `searched "${text}" via ${via}`;
+-            typedIntoLabel = element.description.match(/"([^"]*)"/)?.[1] ?? element.kind;
+           }
+         } else if (chosen.startsWith("submit_")) {
+           if (element.submitVia === "click") {
++            await commitGate("click");
+             await page.click(selectorFor(element), { timeout: bounded(4_000) });
+             detail = `submitted form: ${element.description}`;
+           } else {
++            await commitGate("press_enter");
+             await page.press(selectorFor(element), "Enter", { timeout: bounded(4_000) });
+             detail = `submitted form: Enter on ${element.description}`;
+           }
+@@ -961,6 +1076,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+             });
+             const pickedIndex = Number((optionAnswer.option as Extract<JevAnswer, { type: "choice" }>).choice.slice(1));
+             const opt = opts[pickedIndex];
++            await commitGate("select_option", { optionLabel: R(opt.label) });
+             await page.selectOption(selectorFor(element), { index: opt.i }, { timeout: bounded(4_000) });
+             detail = `selected "${opt.label}"`;
+           }
+@@ -975,6 +1091,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+             // and assignment. The value is set through the native setter and
+             // announced with input/change events, matching fill() semantics
+             // for framework-controlled inputs.
++            await commitGate("fill_password");
+             credentialUsed = true; // even a failed attempt suppresses the screenshot
+             const handle = page.locator(selectorFor(element));
+             const fill = await handle
+@@ -1007,13 +1124,37 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+             }
+           }
+         } else {
++          await commitGate("click");
+           await page.click(selectorFor(element), { timeout: bounded(4_000) });
+           detail = element.description;
+         }
+       } catch (error) {
+         if (controller.signal.aborted) throw error; // deadline/cancellation propagates
+-        if (error instanceof InvalidJevAnswer) throw error; // malformed second-stage answer is a run error, never an action fallback
+-        actionError = R((error as Error).message).slice(0, 160);
++        if (error instanceof HostRefused) {
++          hostRefusal = error.reason;
++        } else {
++          if (error instanceof InvalidJevAnswer) throw error; // malformed second-stage answer is a run error, never an action fallback
++          actionError = R((error as Error).message).slice(0, 160);
++        }
++      }
++
++      if (hostRefusal !== null) {
++        // Refused at the commit gate: nothing further runs and no alternate
++        // candidate is tried. A partial effect (typed but not submitted) is
++        // reported as executed, because the field was changed.
++        steps.push({
++          ...base,
++          executed_action: typedIntoLabel !== null ? chosen : null,
++          detail: R(`host refused at commit${hostRefusal ? `: ${hostRefusal}` : ""}${typedIntoLabel !== null ? "; " + detail : ""}`),
++          outcome: "action refused by host before acting",
++        });
++        status = "blocked";
++        break;
++      }
++      if (options.stopOnActionError && actionError) {
++        steps.push({ ...base, executed_action: mutationAttempted ? chosen : null, detail: R(detail), action_error: R(actionError), outcome: "action failed; run ended by host policy" });
++        status = "action_failed";
++        break;
+       }
+ 
+       await settle(page, bounded);
+@@ -1054,7 +1195,7 @@ export async function navigate(options: NavigateOptions, externalSignal?: AbortS
+       lastRedundant = pageUnchanged ? (typedIntoLabel !== null ? "typed" : "no_change") : null;
+ 
+       lastExecuted = chosen;
+-      history.push({ step, action: chosen, outcome: R(outcome) });
++      history.push({ step, action: element ? `${chosen}: ${R(element.description)}` : chosen, outcome: R(outcome) });
+       steps.push({
+         ...base,
+         executed_action: chosen,

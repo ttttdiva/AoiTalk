@@ -32,6 +32,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   Dialog,
   DialogContent,
@@ -576,7 +577,17 @@ export function UserManagementConsole({
       <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
         <CardHeader
           className="cursor-pointer select-none gap-3"
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          data-settings-target-activation="user-management"
           onClick={() => setExpanded((v) => !v)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setExpanded((v) => !v);
+            }
+          }}
         >
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
@@ -588,10 +599,10 @@ export function UserManagementConsole({
                     {visibleUsers.length}件
                   </span>
                 )}
+                <HelpPopover label="ユーザー管理">
+                  ユーザーの状態、権限、ログイン復旧を一覧から管理します。
+                </HelpPopover>
               </CardTitle>
-              <p className="mt-1 text-xs text-muted-foreground">
-                ユーザーの状態、権限、ログイン復旧を一覧から管理します。
-              </p>
             </div>
             <div
               className="flex flex-wrap items-center gap-2"

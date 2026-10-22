@@ -246,6 +246,7 @@ export default function FilesTextEditorScreen() {
             loading={saving}
             onPress={() => void handleSave()}
             accessibilityLabel="保存"
+            contentStyle={styles.headerButtonContent}
           >
             保存
           </Button>
@@ -330,6 +331,10 @@ const styles = StyleSheet.create({
   },
   retryButton: {
     borderColor: "#45475a",
+  },
+  headerButtonContent: {
+    minHeight: 44,
+    paddingHorizontal: 8,
   },
   editorInput: {
     flex: 1,

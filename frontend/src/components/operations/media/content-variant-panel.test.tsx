@@ -96,4 +96,39 @@ describe("MediaContentVariantPanel", () => {
     const [input] = vi.mocked(mediaContentApi.recordQa).mock.calls[0];
     expect(input.checks[0]).toEqual(expect.objectContaining({ code: "alt_text", mandatory: true }));
   });
+  it("requires explicit TikTok privacy and sends the video rights declaration", async () => {
+    render(<MediaContentVariantPanel />);
+    await waitFor(() => expect(mediaContentApi.listVariants).toHaveBeenCalled());
+    await userEvent.click(screen.getByLabelText("Platform"));
+    await userEvent.click(await screen.findByRole("option", { name: "TikTok" }));
+    await userEvent.type(screen.getByLabelText("ContentItem ID"), "item-2");
+    await userEvent.type(screen.getByLabelText("Persona Revision ID"), "persona-2");
+    await userEvent.type(screen.getByLabelText("PlatformAccount ID"), "account-2");
+    await userEvent.type(screen.getByLabelText("Video Asset ID"), "video-1");
+    await userEvent.click(screen.getByRole("button", { name: "Variantを作成" }));
+    expect(mediaContentApi.createVariant).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByLabelText("公開範囲（選択必須）"));
+    await userEvent.click(await screen.findByRole("option", { name: "自分のみ" }));
+    await userEvent.click(screen.getByLabelText("音源の権利"));
+    await userEvent.click(await screen.findByRole("option", { name: "音楽なし" }));
+    await userEvent.click(screen.getByRole("button", { name: "Variantを作成" }));
+    await waitFor(() => expect(mediaContentApi.createVariant).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(mediaContentApi.createVariant).mock.calls[0][0].payload).toEqual(expect.objectContaining({
+      type: "tiktok_video", privacy: "SELF_ONLY", music_rights: "no_music", ai_disclosure: false,
+    }));
+  });
+
+  it("exposes distinct FANZA storefront and AI usage without claiming publication", async () => {
+    render(<MediaContentVariantPanel />);
+    await waitFor(() => expect(mediaContentApi.listVariants).toHaveBeenCalled());
+    await userEvent.click(screen.getByLabelText("Platform"));
+    await userEvent.click(await screen.findByRole("option", { name: "FANZA" }));
+    expect(screen.getByLabelText("FANZA売場")).toBeInTheDocument();
+    expect(screen.getByLabelText("販売者参照")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("AI利用区分"));
+    await userEvent.click(await screen.findByRole("option", { name: "一部AI利用" }));
+    expect(screen.getByText(/商品下書きです/)).toBeInTheDocument();
+    expect(mediaContentApi.createVariant).not.toHaveBeenCalled();
+  });
+
 });

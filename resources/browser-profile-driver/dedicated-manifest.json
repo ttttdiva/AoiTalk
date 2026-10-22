@@ -1,0 +1,30 @@
+{
+  "commands": [
+    "act",
+    "auth_status",
+    "back",
+    "cancel_login",
+    "checkpoint_clear",
+    "checkpoint_load",
+    "checkpoint_save",
+    "end_run",
+    "jev_run",
+    "navigate",
+    "observe",
+    "pause_login",
+    "resolve_tab",
+    "resume_login",
+    "scroll",
+    "show",
+    "verify"
+  ],
+  "driver_sha256": "111d71ff839bd55d64c9e77ce7128e91818c50aeb8c508b4f0af8dc600f5f008",
+  "jev_lib_sha256": "abe13cf607c1d8f7dfabdab1426694eb6828fcb87708fa31032e1aaf63d47e70",
+  "protocol": 1,
+  "material_state_guard": 3,
+  "controller_sha256": {
+    "background.js": "a179baed15d66cebe11dfe154afc65f088eb48c0f82d77164f4553cf1cfbf275",
+    "content.js": "1bfe44a42b82daa1fc8b24802fe386ed6c19ba03a265c7880fdd0e633b6bf620"
+  },
+  "jev_provenance_sha256": "182b51358bcacd2015140228d1a58944f1952eb47d5ea0897a9c868528c25c96"
+}

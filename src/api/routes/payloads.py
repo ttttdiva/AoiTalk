@@ -2,8 +2,10 @@
 
 import json
 from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
+from ...services.chat_attachment_limits import MAX_CHAT_ATTACHMENTS
 
 class ChatMessage(BaseModel):
     type: str  # 'user', 'assistant', 'system'
@@ -46,11 +48,20 @@ class ResponseModelSelection(BaseModel):
 
 class ConversationDispatchRequest(BaseModel):
     message: str = Field(max_length=131_072)
+    # Offline/mobile senders may echo the Agent identity they saw when the
+    # message was queued.  The server compares it against the canonical
+    # ConversationSession binding; omission keeps legacy clients compatible,
+    # while an explicit null means "the session must currently have no Agent".
+    expected_agent_id: Optional[str] = None
     # Structured @mentions are carried through REST, durable outbox and the
     # WebSocket worker.  The resolver re-checks every ID; ``name`` is display
     # only and never an identity source.
     mentions: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=32)
     project_id: Optional[str] = None
+    # AoiDots root turns remain projectless.  This optional, ACL-checked hint
+    # is carried to a child dialogue/work projection and never attaches the
+    # root ConversationSession to the Project.
+    context_project_hint_id: Optional[UUID] = None
     app_id: Optional[str] = None
     app_target_id: Optional[str] = None
     generation_profile: Optional[str] = None
@@ -69,7 +80,7 @@ class ConversationDispatchRequest(BaseModel):
     persisted_user_message_id: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        max_length=8,
+        max_length=MAX_CHAT_ATTACHMENTS,
     )
     attachment_context: Optional[str] = Field(
         default=None,

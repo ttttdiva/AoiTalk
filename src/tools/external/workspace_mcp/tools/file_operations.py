@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from pydantic import StrictBool
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
@@ -131,13 +133,19 @@ def register(mcp: FastMCP, service_module):
         return json.dumps(result, ensure_ascii=False, default=str)
 
     @mcp.tool()
-    async def upload_workspace_file(path: str, filename: str, content_base64: str) -> str:
+    async def upload_workspace_file(
+        path: str,
+        filename: str,
+        content_base64: str,
+        overwrite: StrictBool = False,
+    ) -> str:
         """ワークスペースにファイルをアップロードする（Base64エンコード）
 
         Args:
             path: アップロード先ディレクトリのパス（空文字でルート）
             filename: ファイル名
             content_base64: Base64エンコードされたファイル内容
+            overwrite: 同名ファイルが存在する場合に上書きするか（既定値: False）
         """
         try:
             content = base64.b64decode(content_base64)
@@ -166,6 +174,7 @@ def register(mcp: FastMCP, service_module):
             scoped_path,
             filename,
             content,
+            allow_overwrite=overwrite,
         )
         return json.dumps(result, ensure_ascii=False, default=str)
 

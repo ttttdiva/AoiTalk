@@ -1,4 +1,4 @@
-"""Persistence models for AI employee automation and action policy state.
+"""Persistence models for Agent automation and action policy state.
 
 ``Agent`` remains the canonical employee identity.  These tables only add
 automation/policy bindings and immutable evidence around that identity; they

@@ -84,6 +84,89 @@ def _acl_json_text(value: ColumnElement) -> ColumnElement:
     )
 
 
+def _membership_permission_predicate(member_model: Any, required: str) -> ColumnElement:
+    """Apply the strict Project permission decoder to ordinary or aliased members."""
+    from .project_permissions import PROJECT_PERMISSION_KEYS
+
+    if required not in PROJECT_PERMISSION_KEYS:
+        return false()
+    # Deployment/CI target PostgreSQL 16. CASE, not AND evaluation order,
+    # protects casts of legacy JSON strings and non-JSONB-compatible data.
+    # JSONB resolves duplicate keys as the Python JSON decoder does.
+    empty_object = cast(literal("{}"), JSONB)
+    raw_text = _acl_json_text(cast(member_model.permissions, String))
+    raw = case(
+        (
+            func.pg_input_is_valid(raw_text, "jsonb"),
+            cast(raw_text, JSONB),
+        ),
+        else_=empty_object,
+    )
+    decoded_text = _acl_json_text(raw.op("#>>")(cast(literal("{}"), ARRAY(String))))
+    normalized = case(
+        (
+            func.jsonb_typeof(raw) == "string",
+            case(
+                (func.pg_input_is_valid(decoded_text, "jsonb"), cast(decoded_text, JSONB)),
+                else_=empty_object,
+            ),
+        ),
+        else_=raw,
+    )
+    permission_object = case(
+        (func.jsonb_typeof(normalized) == "object", normalized),
+        else_=empty_object,
+    )
+    entries = func.jsonb_each(permission_object).table_valued("key", "value")
+    invalid_entry = select(literal(1)).select_from(entries).where(
+        or_(
+            entries.c.key.not_in(sorted(PROJECT_PERMISSION_KEYS)),
+            func.jsonb_typeof(entries.c.value) != "boolean",
+        ),
+    ).correlate(member_model).exists()
+    return and_(
+        ~invalid_entry,
+        permission_object.op("->")(required) == cast(literal("true"), JSONB),
+    )
+
+
+def _space_read_predicate(space_column: ColumnElement, *, user_id: UUID) -> ColumnElement:
+    """SQL equivalent of SpaceAccessPolicy.get_readable_space (including Inbox)."""
+    from ..memory.models import ProjectMember, Space, User
+
+    space = aliased(Space)
+    actor = aliased(User)
+    project = aliased(Project)
+    member = aliased(ProjectMember)
+    member_space = select(literal(1)).select_from(project).outerjoin(
+        member, and_(member.project_id == project.id, member.user_id == user_id),
+    ).where(
+        project.space_id == space.id,
+        project.deleted_at.is_(None),
+        or_(project.owner_id == user_id, _membership_permission_predicate(member, "read")),
+    ).correlate(space).exists()
+    inbox = func.coalesce(space.slug, "") == func.concat(literal("inbox-"), space.owner_id)
+    return or_(
+        space_column.is_(None),
+        select(literal(1)).select_from(space).join(actor, actor.id == user_id).where(
+            space.id == space_column,
+            or_(
+                space.owner_id == user_id,
+                and_(~inbox, or_(actor.role == "admin", member_space)),
+            ),
+        ).exists(),
+    )
+
+
+def _project_space_predicate(project_column: ColumnElement, *, user_id: UUID) -> ColumnElement:
+    # Keep owner-private stale identity cleanup when its Project no longer
+    # exists. Ordinary Project nodes still require a live Project ACL below.
+    return ~select(literal(1)).select_from(Project).where(
+        Project.id == project_column,
+        ~_space_read_predicate(Project.space_id, user_id=user_id),
+    ).exists()
+
+
 def _project_permission_predicate(
     project_column: ColumnElement,
     *,
@@ -95,8 +178,9 @@ def _project_permission_predicate(
     ``ProjectRepository.has_permission`` is the point-read authority and
     applies the same policy: a live project is visible to its owner, a global
     administrator, or a membership carrying an explicit boolean permission.
-    Keeping this as a correlated ``EXISTS`` avoids fetching project IDs into
-    Python for every Docs listing.
+    Keep the authorized Project relation inside SQL. An uncorrelated ``IN``
+    permits one hash/semi-join instead of decoding membership JSON per node;
+    no Project IDs are fetched into Python.
     """
 
     try:
@@ -105,46 +189,9 @@ def _project_permission_predicate(
 
         if required not in PROJECT_PERMISSION_KEYS:
             return false()
-        # Deployment/CI target PostgreSQL 16. CASE, not AND evaluation order,
-        # protects casts of legacy JSON strings and non-JSONB-compatible data.
-        # JSONB resolves duplicate keys as the Python JSON decoder does.
-        empty_object = cast(literal("{}"), JSONB)
-        raw_text = _acl_json_text(cast(ProjectMember.permissions, String))
-        raw = case(
-            (
-                func.pg_input_is_valid(raw_text, "jsonb"),
-                cast(raw_text, JSONB),
-            ),
-            else_=empty_object,
-        )
-        decoded_text = _acl_json_text(raw.op("#>>")(cast(literal("{}"), ARRAY(String))))
-        normalized = case(
-            (
-                func.jsonb_typeof(raw) == "string",
-                case(
-                    (func.pg_input_is_valid(decoded_text, "jsonb"), cast(decoded_text, JSONB)),
-                    else_=empty_object,
-                ),
-            ),
-            else_=raw,
-        )
-        permission_object = case(
-            (func.jsonb_typeof(normalized) == "object", normalized),
-            else_=empty_object,
-        )
-        entries = func.jsonb_each(permission_object).table_valued("key", "value")
-        invalid_entry = select(literal(1)).select_from(entries).where(
-            or_(
-                entries.c.key.not_in(sorted(PROJECT_PERMISSION_KEYS)),
-                func.jsonb_typeof(entries.c.value) != "boolean",
-            ),
-        ).correlate(ProjectMember).exists()
-        membership_grant = and_(
-            ~invalid_entry,
-            permission_object.op("->")(required) == cast(literal("true"), JSONB),
-        )
+        membership_grant = _membership_permission_predicate(ProjectMember, required)
         membership = ProjectMember.user_id == user_id
-        return select(literal(1)).select_from(Project).join(
+        return project_column.in_(select(Project.id).select_from(Project).join(
             User, User.id == user_id
         ).outerjoin(
             ProjectMember,
@@ -153,14 +200,14 @@ def _project_permission_predicate(
                 membership,
             ),
         ).where(
-            Project.id == project_column,
             Project.deleted_at.is_(None),
+            _space_read_predicate(Project.space_id, user_id=user_id),
             or_(
                 Project.owner_id == user_id,
                 func.lower(User.role) == "admin",
                 membership_grant,
             ),
-        ).exists()
+        ).correlate(None))
     except Exception:
         # Keep imports/compilation working during rolling deploys before the
         # ProjectMember model is available.  Deny project-bound candidates.
@@ -389,11 +436,12 @@ def docs_readable_node_predicate(
     # Match the point-read cleanup shortcuts before ordinary project ACLs.
     # A malformed project-bound hub is owner-only; an unbound hub must have
     # the canonical navigation shape even for its owner.
-    owner_identity = and_(identity_prefix, library_owner)
+    cleanup_space = _project_space_predicate(node_model.project_id, user_id=actor)
+    owner_identity = and_(identity_prefix, library_owner, cleanup_space)
     hub_nodes = and_(
         system_key == "project_information_root",
         or_(
-            and_(node_model.project_id.is_not(None), library_owner),
+            and_(node_model.project_id.is_not(None), library_owner, cleanup_space),
             and_(
                 node_model.project_id.is_(None),
                 personal_library,
@@ -411,6 +459,25 @@ def docs_readable_node_predicate(
         node_model.docs_library_id == docs_library_id,
         or_(project_nodes, personal_nodes, owner_identity, hub_nodes),
     )
+
+
+def apply_docs_search_visibility(stmt: Any, *, user_id: UUID | str | None) -> Any:
+    """Search content requires current Project/Space read, including owner cleanup.
+
+    Docs editing retains owner-private stale identity navigation. That cleanup
+    exception must never make deleted/inaccessible Project content searchable.
+    Compose this before vector candidates/LIMIT and reuse it on fresh results.
+    """
+    actor = _uuid(user_id)
+    project_read = (_project_permission_predicate(KnowledgeNode.project_id, user_id=actor)
+                    if actor is not None else false())
+    # Ordinary Project nodes already pass the same Project/Space predicate in
+    # canonical visibility. Only owner cleanup can bypass that read boundary;
+    # avoid repeating its expensive correlated JSON ACL for every ordinary row.
+    system_key = func.coalesce(_sql_stripped(KnowledgeNode.system_key), "")
+    cleanup = or_(system_key == "project_information_root",
+                  system_key.startswith("project_information:", autoescape=True))
+    return stmt.where(or_(KnowledgeNode.project_id.is_(None), ~cleanup, project_read))
 
 
 def apply_docs_visibility(
@@ -513,6 +580,23 @@ def _permission_allows(permission: Any, required: str) -> bool:
     return value in {"write", "owner", "admin"}
 
 
+async def _project_space_permission(session: AsyncSession, project_id: UUID, user_id: UUID) -> bool:
+    from ..memory.models import Space, User
+    from .space_access import get_readable_space
+
+    try:
+        row = (await session.execute(select(Project.space_id).where(Project.id == project_id))).one_or_none()
+        if row is None or row[0] is None:
+            return True
+        if await session.get(Space, row[0], populate_existing=True) is None:
+            return False
+        role = await session.scalar(select(User.role).where(User.id == user_id))
+        return await get_readable_space(session, space_id=row[0], user_id=user_id,
+                                        user_info={"role": role}) is not None
+    except Exception:
+        return False
+
+
 async def _project_permission(
     session: AsyncSession,
     project_id: UUID | None,
@@ -522,6 +606,8 @@ async def _project_permission(
     if project_id is None:
         return True
     try:
+        if not await _project_space_permission(session, project_id, user_id):
+            return False
         return await ProjectRepository.has_permission(
             session,
             project_id=project_id,
@@ -706,6 +792,7 @@ async def _batch_project_permissions(
                             ids_list[offset : offset + _ACL_IN_CHUNK_SIZE]
                         ),
                         Project.deleted_at.is_(None),
+                        _space_read_predicate(Project.space_id, user_id=user_id),
                     )
                     .execution_options(populate_existing=True)
                 )
@@ -1025,6 +1112,12 @@ async def can_read_node(
         return False
     required_permission = "write" if required == "write" else "read"
     system_key = str(getattr(row, "system_key", "") or "").strip()
+    # Owner cleanup shortcuts also obey a currently bound Space. A Personal
+    # library owner must not bypass another owner's Inbox through node metadata.
+    cleanup_project = _uuid(getattr(row, "project_id", None))
+    if (system_key == "project_information_root" or system_key.startswith("project_information:")) and cleanup_project is not None:
+        if not await _project_space_permission(session, cleanup_project, actor):
+            return False
     # The 案件情報 hub is owner-private navigation metadata.  Check its
     # identity before the generic project_id branch so a malformed hub carrying
     # a Project id cannot leak to that project's members or grant writes.
@@ -1456,6 +1549,7 @@ __all__ = [
     "accessible_node_ids",
     "accessible_project_ids",
     "apply_docs_visibility",
+    "apply_docs_search_visibility",
     "batch_sync_node_access",
     "can_read",
     "can_read_node",

@@ -159,6 +159,7 @@ ensure_python_venv() {
     else
         python -m pip install -e '.[test]'
     fi
+    python scripts/setup_embeddinggemma2_worker.py --host-check
 }
 
 ensure_postgres() {

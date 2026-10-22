@@ -277,6 +277,18 @@ class _StreamingTextValidator:
             raise BinaryFileError("Printable character ratio is too low for a text file")
 
 
+DEFAULT_MAX_LINE_PREVIEW_CHARS = 20_000
+
+
+def _line_preview_marker(line_number: int, kept: int, total: int) -> str:
+    return (
+        f" …[AoiTalk: line {line_number} preview truncated: showing the first "
+        f"{kept} of {total} characters; {total - kept} characters omitted. "
+        "This is not the full line; read a narrower source or use a search "
+        "tool for the rest before editing it.]"
+    )
+
+
 def _scan_text_lines(
     target: Path,
     *,
@@ -286,34 +298,80 @@ def _scan_text_lines(
     end_line: int | None,
     max_selected_lines: int,
     max_bytes: int,
+    max_line_chars: int | None = DEFAULT_MAX_LINE_PREVIEW_CHARS,
 ) -> tuple[list[str], int]:
+    """Stream-validate the file and retain only a bounded selected window.
+
+    Validation still covers every decoded character.  Non-selected lines are
+    never buffered, and a selected line keeps at most ``max_line_chars``
+    characters followed by an explicit truncation marker (omitted count and
+    continuation hint), so a giant single-line file cannot grow memory without
+    bound and a clipped preview is never presented as the full line.
+    """
+
     decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
     validator = _StreamingTextValidator()
     selected: list[str] = []
-    pending = ""
+    line_cap = None if max_line_chars is None else max(1, int(max_line_chars))
     current_line = 1
     bytes_read = skip_bytes
+    parts: list[str] = []
+    kept_chars = 0
+    line_chars = 0
+
+    def selecting() -> bool:
+        return (
+            current_line >= start_line
+            and (end_line is None or current_line <= end_line)
+            and len(selected) < max_selected_lines
+        )
+
+    line_selected = selecting()
+
+    def append_segment(segment: str) -> None:
+        nonlocal kept_chars, line_chars
+        if not segment:
+            return
+        line_chars += len(segment)
+        if not line_selected:
+            return
+        if line_cap is None:
+            parts.append(segment)
+            kept_chars += len(segment)
+            return
+        room = line_cap - kept_chars
+        if room > 0:
+            piece = segment[:room]
+            parts.append(piece)
+            kept_chars += len(piece)
+
+    def finish_line() -> None:
+        nonlocal kept_chars, line_chars
+        if line_selected:
+            text = "".join(parts)
+            if line_chars > kept_chars:
+                text += _line_preview_marker(current_line, kept_chars, line_chars)
+            selected.append(text)
+        parts.clear()
+        kept_chars = 0
+        line_chars = 0
 
     def consume(decoded: str, *, final: bool = False) -> None:
-        nonlocal pending, current_line
+        nonlocal current_line, line_selected
         validator.feed(decoded)
-        parts = (pending + decoded).split("\n")
-        pending = parts.pop()
-        for line in parts:
-            if (
-                current_line >= start_line
-                and (end_line is None or current_line <= end_line)
-                and len(selected) < max_selected_lines
-            ):
-                selected.append(line)
+        position = 0
+        while True:
+            newline = decoded.find("\n", position)
+            if newline == -1:
+                append_segment(decoded[position:])
+                break
+            append_segment(decoded[position:newline])
+            finish_line()
             current_line += 1
+            line_selected = selecting()
+            position = newline + 1
         if final:
-            if (
-                current_line >= start_line
-                and (end_line is None or current_line <= end_line)
-                and len(selected) < max_selected_lines
-            ):
-                selected.append(pending)
+            finish_line()
 
     with target.open("rb") as source:
         source.seek(skip_bytes)
@@ -341,12 +399,15 @@ def read_safe_text_lines(
     max_selected_lines: int = 101,
     max_bytes: int,
     known_text_extensions: set[str] | frozenset[str] = frozenset(),
+    max_line_chars: int | None = DEFAULT_MAX_LINE_PREVIEW_CHARS,
 ) -> tuple[list[str], int, str]:
     """Safely classify a file while retaining only a bounded line window.
 
     The complete byte stream is decoded and validated so binary content after
     the requested window cannot evade classification, but at most
-    ``max_selected_lines`` lines are retained in memory.
+    ``max_selected_lines`` lines are retained in memory.  Each retained line
+    is a preview of at most ``max_line_chars`` characters; a longer line ends
+    with an explicit truncation marker (``None`` keeps full lines).
     """
 
     target = Path(path)
@@ -381,6 +442,7 @@ def read_safe_text_lines(
                 end_line=end_line,
                 max_selected_lines=max_selected_lines,
                 max_bytes=max_bytes,
+                max_line_chars=max_line_chars,
             )
         except UnicodeDecodeError as exc:
             raise TextContentError(f"Invalid {reported_encoding} text") from exc
@@ -399,6 +461,7 @@ def read_safe_text_lines(
             end_line=end_line,
             max_selected_lines=max_selected_lines,
             max_bytes=max_bytes,
+            max_line_chars=max_line_chars,
         )
         return lines, total_lines, "utf-8"
     except UnicodeDecodeError as utf8_error:
@@ -414,6 +477,7 @@ def read_safe_text_lines(
                 end_line=end_line,
                 max_selected_lines=max_selected_lines,
                 max_bytes=max_bytes,
+                max_line_chars=max_line_chars,
             )
         except UnicodeDecodeError as cp932_error:
             raise BinaryFileError("File bytes are not valid supported text") from cp932_error

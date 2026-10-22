@@ -25,7 +25,26 @@ _RUNTIME_ENV_NAMES = ("AOITALK_LOCAL_LLM_RUNTIME_ROOT",)
 # LLAMA_CPP name remains first to preserve the existing service-manager
 # precedence when both variables are present.
 _MODEL_ENV_NAMES = ("LLAMA_CPP_MODEL_ROOT", "AOITALK_LLAMA_CPP_MODEL_ROOT")
+_LLAMA_CPP_EXECUTABLE_ENV_NAMES = ("LLAMA_CPP_EXECUTABLE", "LLAMA_SERVER_EXE")
+_REQUIRE_EXTERNAL_MODEL_ROOT_ENV = "AOITALK_REQUIRE_EXTERNAL_LLM_MODEL_ROOT"
+_BOOLEAN_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOLEAN_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _WINDOWS_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
+
+
+def llama_cpp_executable_setting(configured: Any = None) -> tuple[str, str]:
+    """Select one operator override in the same order for status and launch.
+
+    Existence/compatibility checks happen after selection. In particular, a
+    missing or incompatible environment override must not select another exe.
+    """
+
+    for name in _LLAMA_CPP_EXECUTABLE_ENV_NAMES:
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value, "environment"
+    value = str(configured or "").strip()
+    return (value, "configured") if value else ("", "")
 
 
 def repository_root() -> Path:
@@ -45,6 +64,18 @@ def default_runtime_root() -> Path:
     """Return the repository-local managed runtime root."""
 
     return local_llm_storage_root() / "runtime"
+
+
+def _repository_runtime_allowed_roots() -> tuple[Path, ...]:
+    """Return the repository-local runtime subtrees accepted by the guard."""
+
+    # The hidden storage path is the historical default.  The dedicated cache
+    # subtree is reserved for validated, revision-pinned runtimes such as
+    # Strata; the rest of ``cache`` remains outside the managed-root contract.
+    return (
+        default_runtime_root(),
+        repository_root() / "cache" / "local-llm-runtime",
+    )
 
 
 def default_managed_models_root() -> Path:
@@ -155,6 +186,17 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def _environment_flag(name: str) -> bool:
+    value = _text(os.getenv(name)).casefold()
+    if not value:
+        return False
+    if value in _BOOLEAN_TRUE_VALUES:
+        return True
+    if value in _BOOLEAN_FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
 def _relative_to_repository(value: str) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
@@ -236,15 +278,22 @@ def _canonicalize(value: Any, *, kind: str, create: bool) -> Path:
         first = relative.parts[0].casefold() if relative.parts else ""
         if first in {".git", "src", "frontend", "mobile", "tests", "scripts", "docs"}:
             raise ValueError(f"{kind} root cannot be inside an AoiTalk source directory")
-        allowed = (
-            (storage / "runtime")
-            if kind == "runtime"
-            else (storage / "models")
-        ).resolve(strict=False)
-        if resolved != allowed and allowed not in resolved.parents:
+        if kind == "runtime":
+            allowed_roots = tuple(
+                root.resolve(strict=False)
+                for root in _repository_runtime_allowed_roots()
+            )
+        else:
+            allowed_roots = ((storage / "models").resolve(strict=False),)
+        if not any(
+            resolved == allowed or allowed in resolved.parents
+            for allowed in allowed_roots
+        ):
             raise ValueError(
                 f"{kind} root inside the repository must use the dedicated "
-                f"{allowed.relative_to(repo)} subtree"
+                "managed subtree ("
+                f"{', '.join(str(allowed.relative_to(repo)) for allowed in allowed_roots)}"
+                ")"
             )
     # Runtime and model trees must stay separate even when a caller supplies a
     # path under the repository-local storage directory.
@@ -278,6 +327,30 @@ def _create_default(path: Path, kind: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ValueError(f"unable to create {kind} root") from exc
+
+
+def _enforce_external_model_root(path: Path) -> Path:
+    if not _environment_flag(_REQUIRE_EXTERNAL_MODEL_ROOT_ENV):
+        return path
+    repository = repository_root().resolve(strict=False)
+    try:
+        path.relative_to(repository)
+    except ValueError:
+        return path
+    raise ValueError(
+        "model root must be outside the AoiTalk repository when "
+        f"{_REQUIRE_EXTERNAL_MODEL_ROOT_ENV} is enabled"
+    )
+
+
+def _canonicalize_model_root(value: Any, *, create: bool) -> Path:
+    path = _canonicalize(value, kind="model", create=False)
+    _enforce_external_model_root(path)
+    if create:
+        _create_default(path, "model")
+        path = _canonicalize(path, kind="model", create=False)
+        _enforce_external_model_root(path)
+    return path
 
 
 def resolve_managed_runtime_root(
@@ -315,8 +388,9 @@ def canonicalize_llama_cpp_model_root_override(
 
     text = _text(value)
     if not text:
+        _enforce_external_model_root(default_llama_cpp_model_root().resolve(strict=False))
         return None
-    return _canonicalize(text, kind="model", create=create)
+    return _canonicalize_model_root(text, create=create)
 
 
 def resolve_llama_cpp_model_root(
@@ -337,21 +411,22 @@ def resolve_llama_cpp_model_root(
     if explicit is not None:
         text = _text(explicit)
         if text:
-            path = _canonicalize(text, kind="model", create=create)
+            path = _canonicalize_model_root(text, create=create)
             return ResolvedLocalLlmRoot(path, "explicit", default, text)
+        _enforce_external_model_root(default)
         if create:
             _create_default(default, "model")
         return ResolvedLocalLlmRoot(default, "default", default, "")
 
     environment, _name = _env_value(_MODEL_ENV_NAMES)
     if environment:
-        path = _canonicalize(environment, kind="model", create=create)
+        path = _canonicalize_model_root(environment, create=create)
         return ResolvedLocalLlmRoot(path, "environment", default, environment)
 
     raw = _raw_llama_settings(config, settings)
     configured = _text(raw.get("model_root"))
     if configured:
-        path = _canonicalize(configured, kind="model", create=create)
+        path = _canonicalize_model_root(configured, create=create)
         return ResolvedLocalLlmRoot(path, "persisted", default, configured)
     legacy = _text(raw.get("model_dir"))
     # ``model_dir`` was an early persisted key.  It is a compatibility
@@ -360,8 +435,9 @@ def resolve_llama_cpp_model_root(
     # explicit empty value must suppress the legacy path rather than silently
     # restoring an old machine-specific directory.
     if "model_root" not in raw and legacy:
-        path = _canonicalize(legacy, kind="model", create=create)
+        path = _canonicalize_model_root(legacy, create=create)
         return ResolvedLocalLlmRoot(path, "legacy_config", default, legacy)
+    _enforce_external_model_root(default)
     if create:
         _create_default(default, "model")
     return ResolvedLocalLlmRoot(default, "default", default, "")

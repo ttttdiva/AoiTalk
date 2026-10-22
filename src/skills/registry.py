@@ -5,10 +5,15 @@ ToolRegistry と同じシングルトンパターンでスキルを管理する�
 """
 import logging
 from typing import Dict, List, Optional
+import unicodedata
 
 from .models import SkillDefinition, SkillTriggerMode
 
 logger = logging.getLogger(__name__)
+
+
+def _identity(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
 
 
 class SkillRegistry:
@@ -26,16 +31,23 @@ class SkillRegistry:
             key = str(project_id)
             skills = self._project_skills.setdefault(key, {})
             aliases = self._project_aliases.setdefault(key, {})
+            if any(aliases.get(_identity(v), skill.name) != skill.name for v in [skill.name, *skill.aliases]):
+                raise ValueError("Skill canonical name or alias is ambiguous")
+            for alias in [alias for alias, name in aliases.items() if name == skill.name]:
+                del aliases[alias]
             skills[skill.name] = skill
-            aliases[skill.name.lower()] = skill.name
+            aliases[_identity(skill.name)] = skill.name
             for alias in skill.aliases:
-                aliases[alias.lower()] = skill.name
+                aliases[_identity(alias)] = skill.name
             return
+        if any(self._alias_map.get(_identity(v), skill.name) != skill.name for v in [skill.name, *skill.aliases]):
+            raise ValueError("Skill canonical name or alias is ambiguous")
+        self._alias_map = {alias: name for alias, name in self._alias_map.items() if name != skill.name}
         self._skills[skill.name] = skill
         # エイリアスマップ構築（名前自体もエイリアス）
-        self._alias_map[skill.name.lower()] = skill.name
+        self._alias_map[_identity(skill.name)] = skill.name
         for alias in skill.aliases:
-            self._alias_map[alias.lower()] = skill.name
+            self._alias_map[_identity(alias)] = skill.name
         logger.debug(f"[SkillRegistry] 登録: {skill.name}")
 
     def unregister(self, name: str) -> bool:
@@ -64,10 +76,10 @@ class SkillRegistry:
     def get_by_alias(self, alias: str, project_id: str | None = None) -> Optional[SkillDefinition]:
         """エイリアスでスキル取得"""
         if project_id is not None:
-            project_name = self._project_aliases.get(str(project_id), {}).get(alias.lower())
+            project_name = self._project_aliases.get(str(project_id), {}).get(_identity(alias))
             if project_name:
                 return self._project_skills[str(project_id)].get(project_name)
-        skill_name = self._alias_map.get(alias.lower())
+        skill_name = self._alias_map.get(_identity(alias))
         if skill_name:
             return self._skills.get(skill_name)
         return None

@@ -60,6 +60,7 @@ from .docs_sync import (
     serialize_docs_field,
     serialize_docs_field_value,
     serialize_docs_node,
+    serialize_docs_node_for_sync,
     serialize_docs_node_supertag,
     serialize_docs_placement,
     serialize_docs_supertag,
@@ -2905,9 +2906,15 @@ def create_docs_router(
                     )
                 )).scalars().all()
             ) if supertag_ids else []
+            serialized_node = await serialize_docs_node_for_sync(
+                session,
+                node,
+                library=library,
+                user_id=user_id,
+            )
             return {
-                "node": serialize_docs_node(node),
-                "nodes": [serialize_docs_node(node)],
+                "node": serialized_node,
+                "nodes": [serialized_node],
                 "supertags": [serialize_docs_supertag(item) for item in supertags],
                 "node_supertags": [serialize_docs_node_supertag(item) for item in node_supertags],
                 "supertag_fields": [serialize_docs_supertag_field(item) for item in supertag_fields],
@@ -3008,5 +3015,11 @@ def create_docs_router(
         payload = body.model_dump(exclude_none=True)
         entity = await _write(request, "knowledge_supertags", "create", "", payload)
         return {"ok": True, "entity": entity}
+
+    from .daily_capture_routes import create_daily_capture_router
+    router.include_router(create_daily_capture_router(
+        get_db_manager=get_db_manager, get_current_user=_get_current_user,
+        require_auth_dependency=require_auth_dependency,
+    ))
 
     return router

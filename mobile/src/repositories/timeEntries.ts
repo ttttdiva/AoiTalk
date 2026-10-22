@@ -1,10 +1,12 @@
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { decodeTokenPayload, getToken } from "../lib/auth";
 import { taskApi } from "../lib/task-api";
 import { canAttemptAoiTalkServer } from "../stores/network";
 import type { TimeEntry, TimeReport, TimeReportBucket } from "../types/api";
-import { enqueueOutbox, randomId } from "./outbox";
+import { enqueueOutbox, getOutboxMutationWakeScope, randomId } from "./outbox";
+import { notifyMutationQueued } from "../sync/task-mutation-wake";
 import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
 import {
   compareTombstoneTimestamps,
@@ -445,6 +447,7 @@ export const timeEntriesRepo = {
     note?: string | null,
   ): Promise<TimeEntry> {
     const hasToken = Boolean(await getToken());
+    let wakeScope: string | null = null;
     if (await canUseServer()) {
       try {
         const entry = await taskApi.startTimer(taskId, occurrenceId, note);
@@ -458,6 +461,8 @@ export const timeEntriesRepo = {
     const db = getDb();
     const now = new Date().toISOString();
     const currentUser = (await currentUserId()) ?? "";
+    // Both timer operations must finish before publishing their wake hints.
+    const wakeScopes = new Set<string>();
     const active = await this.getActiveLocal();
     if (active?.id) {
       await db
@@ -465,13 +470,17 @@ export const timeEntriesRepo = {
         .set({ endedAt: now, updatedAt: now })
         .where(eq(schema.timeEntries.id, active.id));
       if (hasToken) {
-        await enqueueOutbox({
+        const opId = await enqueueOutbox({
           table: "time_entries",
           action: "update",
           entityId: active.id,
           payload: { ended_at: now },
           baseUpdatedAt: active.updated_at ?? null,
         });
+        wakeScope = await runForegroundSqliteWrite(() =>
+          getOutboxMutationWakeScope(opId),
+        );
+        if (wakeScope) wakeScopes.add(wakeScope);
       }
     }
 
@@ -492,7 +501,7 @@ export const timeEntriesRepo = {
 
     await applyRemoteTimeEntries([local]);
     if (hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "time_entries",
         action: "create",
         entityId: local.id,
@@ -505,8 +514,14 @@ export const timeEntriesRepo = {
           note: note ?? null,
         },
       });
+      wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      if (wakeScope) wakeScopes.add(wakeScope);
     }
-    return (await this.getActiveLocal(taskId)) ?? local;
+    const result = (await this.getActiveLocal(taskId)) ?? local;
+    for (const scope of wakeScopes) notifyMutationQueued(scope);
+    return result;
   },
 
   /**
@@ -521,6 +536,7 @@ export const timeEntriesRepo = {
     occurrenceId?: string | null,
   ): Promise<TimeEntry> {
     const hasToken = Boolean(await getToken());
+    let wakeScope: string | null = null;
     if (await canUseServer()) {
       try {
         const entry = await taskApi.logTime({
@@ -558,7 +574,7 @@ export const timeEntriesRepo = {
     };
     await applyRemoteTimeEntries([local]);
     if (hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "time_entries",
         action: "create",
         entityId: local.id,
@@ -571,12 +587,17 @@ export const timeEntriesRepo = {
           note: note ?? null,
         },
       });
+      wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
     }
+    notifyMutationQueued(wakeScope);
     return local;
   },
 
   async stopTimer(entryId?: string): Promise<TimeEntry> {
     const hasToken = Boolean(await getToken());
+    let wakeScope: string | null = null;
     if (await canUseServer()) {
       try {
         const entry = await taskApi.stopTimer(entryId);
@@ -608,15 +629,18 @@ export const timeEntriesRepo = {
         ),
       );
     if (hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "time_entries",
         action: "update",
         entityId: active.id,
         payload: { ended_at: now },
         baseUpdatedAt: active.updated_at ?? null,
       });
+      wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
     }
-    return (
+    const result = (
       (await this.listLocal()).find((entry) => entry.id === active.id) ?? {
         ...active,
         ended_at: now,
@@ -627,6 +651,8 @@ export const timeEntriesRepo = {
         updated_at: now,
       }
     );
+    notifyMutationQueued(wakeScope);
+    return result;
   },
 
   async update(
@@ -634,6 +660,7 @@ export const timeEntriesRepo = {
     data: Record<string, unknown>,
   ): Promise<TimeEntry> {
     const hasToken = Boolean(await getToken());
+    let wakeScope: string | null = null;
     if (await canUseServer()) {
       try {
         const entry = await taskApi.updateTimeEntry(entryId, data);
@@ -682,22 +709,28 @@ export const timeEntriesRepo = {
         ),
       );
     if (hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "time_entries",
         action: "update",
         entityId: entryId,
         payload: data,
         baseUpdatedAt: before?.updatedAt ?? null,
       });
+      wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
     }
-    return (await this.listLocal()).find(
+    const result = (await this.listLocal()).find(
       (entry) => entry.id === entryId,
     ) as TimeEntry;
+    notifyMutationQueued(wakeScope);
+    return result;
   },
 
   async delete(entryId: string): Promise<void> {
     const db = getDb();
     const hasToken = Boolean(await getToken());
+    let wakeScope: string | null = null;
     const userId = await currentUserId();
     let shouldQueue = hasToken;
     if (await canUseServer()) {
@@ -721,13 +754,16 @@ export const timeEntriesRepo = {
           )
       )[0];
       if (!before) throw new Error("Time entry not found");
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "time_entries",
         action: "delete",
         entityId: entryId,
         payload: {},
         baseUpdatedAt: before?.updatedAt ?? null,
       });
+      wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
     }
     const now = new Date().toISOString();
     await db
@@ -739,5 +775,6 @@ export const timeEntriesRepo = {
           localUserCondition(userId),
         ),
       );
+    notifyMutationQueued(wakeScope);
   },
 };

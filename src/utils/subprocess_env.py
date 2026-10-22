@@ -232,8 +232,37 @@ def build_aoitalk_subprocess_env(
     return env
 
 
+def _windows_cmd_quote(value: object) -> str:
+    """Quote one argument for a Windows ``cmd.exe`` wrapper invocation."""
+
+    text = str(value)
+    pieces = ['"']
+    backslashes = 0
+    for char in text:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            pieces.append("\\" * (backslashes * 2 + 1))
+            pieces.append('"')
+        else:
+            pieces.append("\\" * backslashes)
+            pieces.append(char)
+        backslashes = 0
+    pieces.append("\\" * (backslashes * 2))
+    pieces.append('"')
+    return "".join(pieces)
+
+
+def windows_batch_command(argv: Iterable[object]) -> str:
+    """Build a quoted ``call`` command for a ``.cmd``/``.bat`` executable."""
+
+    return "call " + " ".join(_windows_cmd_quote(value) for value in argv)
+
+
 __all__ = [
     "SUBPROCESS_ENV_ALLOWLIST",
     "SUBPROCESS_SECRET_ENV_NAMES",
     "build_aoitalk_subprocess_env",
+    "windows_batch_command",
 ]

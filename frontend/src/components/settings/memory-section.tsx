@@ -18,6 +18,7 @@ export function MemorySection() {
         tabIndex={0}
         aria-expanded={expanded}
         aria-controls="memory-content"
+        data-settings-target-activation="memory"
         onClick={() => setExpanded((value) => !value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {

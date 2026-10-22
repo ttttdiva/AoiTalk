@@ -14,7 +14,7 @@ export const SOURCE_LABELS: Record<FilesSource, string> = {
 };
 
 export const SCOPE_LABELS: Record<FilesScope, string> = {
-  workspace: "ワークスペース",
+  workspace: "プロジェクト",
   user: "ユーザー",
 };
 
@@ -46,6 +46,13 @@ export type ClipboardState = {
   authScope?: string;
   sourcePath?: string;
   projectId?: string | null;
+  projectRoot: string | null;
+};
+export type ClipboardDestinationContext = {
+  source: FilesSource;
+  scope: FilesScope;
+  path: string;
+  authScope?: string;
   projectRoot: string | null;
 };
 export type FilesPressAction =
@@ -119,6 +126,34 @@ export function isFilesPathWithinRoot(path: string, root: string): boolean {
     (normalized === prefix || normalized.startsWith(`${prefix}/`));
 }
 
+/**
+ * Keep member server requests inside the active Project/User root while
+ * allowing administrators to follow the server's namespace parents. The
+ * API performs the authorization check as well; this is the navigation-side
+ * guard that prevents a stale selected Project from snapping an admin back to
+ * its old root during an Up transition.
+ */
+export function resolveFilesServerRequestPath(options: {
+  scope: FilesScope;
+  requestedPath: string;
+  serverRootPath: string;
+  isAdmin: boolean;
+}): string {
+  if (
+    options.isAdmin ||
+    !options.serverRootPath
+  ) {
+    return options.requestedPath;
+  }
+  // An empty path is the server namespace root. Members must still start at
+  // their active Project/User root; only administrators may request it.
+  if (!options.requestedPath) return options.serverRootPath;
+  if (isFilesPathWithinRoot(options.requestedPath, options.serverRootPath)) {
+    return options.requestedPath;
+  }
+  return options.serverRootPath;
+}
+
 /** A visible Up control must always have a usable, authorized destination. */
 export function resolveFilesParentPath(options: {
   source: FilesSource;
@@ -126,19 +161,36 @@ export function resolveFilesParentPath(options: {
   currentPath: string;
   isAdmin: boolean;
   projectRoot: string;
+  /**
+   * Root for the active server scope.  `projectRoot` is retained for the
+   * existing workspace callers, while User Files needs its own user root.
+   */
+  scopeRoot?: string;
   parentPath: string | null;
   canGoUp: boolean;
 }): string | null {
   const workspace = options.source === "server" && options.scope === "workspace";
-  if (workspace && options.isAdmin) {
+  const server = options.source === "server";
+  if (server && options.isAdmin) {
     const current = options.currentPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    if (!current) return null;
-    // Some project-root listings omit parent metadata. An administrator can
-    // still return through _projects to the administrator root.
+    // `__drives__` is the synthetic admin listing and has no parent.  Do not
+    // derive an empty path for it from the lexical string below.
+    if (!current || current === "__drives__") return null;
+    // Some namespace-root listings omit parent metadata. An administrator can
+    // still return through _projects/_users to the administrator root. This
+    // mirrors the Web explorer's direct use of the server parent path while
+    // keeping the fallback scoped to a server/admin listing.
     return options.parentPath ?? current.split("/").slice(0, -1).join("/");
   }
   if (!options.canGoUp || options.parentPath == null) return null;
-  if (workspace && !isFilesPathWithinRoot(options.parentPath, options.projectRoot)) return null;
+  if (server) {
+    const scopeRoot = options.scopeRoot ?? (workspace ? options.projectRoot : "");
+    // Regular users may move within their selected Project/User root only.
+    // The API already enforces this, but keeping the UI fail-closed prevents
+    // a malformed parent response or stale cache from exposing an Up route
+    // outside the active account/scope.
+    if (!scopeRoot || !isFilesPathWithinRoot(options.parentPath, scopeRoot)) return null;
+  }
   return options.parentPath;
 }
 
@@ -248,18 +300,110 @@ export function filesLocationIdentityKey(options: {
   ]);
 }
 
+/**
+ * Drop clipboard state only when its security boundary changed.
+ *
+ * A local copy is intentionally independent from the currently selected
+ * source/scope/project so it can be uploaded after switching to Server.
+ * Server workspace entries remain bound to the project that captured them.
+ */
+export function reconcileClipboardForSecurityContext(
+  clipboard: ClipboardState | null,
+  context: {
+    authScope?: string;
+    projectId?: string | null;
+    source?: FilesSource;
+    scope?: FilesScope;
+  },
+): ClipboardState | null {
+  if (!clipboard) return null;
+  if ((clipboard.authScope ?? "") !== (context.authScope ?? "")) return null;
+
+  // Only a COPY from Local is portable across the Local/Server and scope
+  // switch used to select its upload destination. Preserve the old boundary
+  // invalidation behavior for local MOVE and every server clipboard.
+  if (clipboard.source === "local" && clipboard.operation === "copy") {
+    return clipboard;
+  }
+  if (context.source && clipboard.source !== context.source) return null;
+  if (context.scope && clipboard.scope !== context.scope) return null;
+  if (
+    clipboard.source === "server" &&
+    clipboard.scope === "workspace" &&
+    (clipboard.projectId ?? null) !== (context.projectId ?? null)
+  ) {
+    return null;
+  }
+  return clipboard;
+}
+
+/**
+ * Check whether a clipboard can target the visible Files location.
+ *
+ * The sole cross-source route is local -> server COPY. MOVE is deliberately
+ * excluded so a failed upload can never delete the device-local source.
+ */
+export function clipboardMatchesFilesLocation(
+  clipboard: ClipboardState | null,
+  destination: ClipboardDestinationContext,
+): boolean {
+  if (!clipboard) return false;
+  if ((clipboard.authScope ?? "") !== (destination.authScope ?? "")) {
+    return false;
+  }
+  if (clipboard.source !== destination.source) {
+    return (
+      clipboard.source === "local" &&
+      destination.source === "server" &&
+      clipboard.operation === "copy"
+    );
+  }
+  if (clipboard.scope !== destination.scope) return false;
+  if (destination.source === "server" && destination.scope === "workspace") {
+    return clipboard.projectRoot === destination.projectRoot;
+  }
+  return true;
+}
+
 /** Validate every clipboard entry against a destination before mutation. */
 export function canRouteClipboardEntries(
   clipboard: ClipboardState | null,
   destinationPath: string,
+  destinationSource: FilesSource = clipboard?.source ?? "local",
 ): boolean {
   if (!clipboard || clipboard.entries.length === 0 || !destinationPath) {
     return false;
+  }
+  if (clipboard.source !== destinationSource) {
+    return (
+      clipboard.source === "local" &&
+      destinationSource === "server" &&
+      clipboard.operation === "copy" &&
+      clipboard.entries.every(
+        (entry) => entry.source === "local" && entry.type === "file",
+      )
+    );
   }
   return clipboard.entries.every(
     (entry) =>
       entry.source === clipboard.source &&
       canRouteServerFileTransfer(entry.path, destinationPath),
+  );
+}
+
+export function canPasteClipboardToFilesLocation(
+  clipboard: ClipboardState | null,
+  destination: ClipboardDestinationContext,
+  canWriteDestination: boolean,
+): boolean {
+  return (
+    canWriteDestination &&
+    clipboardMatchesFilesLocation(clipboard, destination) &&
+    canRouteClipboardEntries(
+      clipboard,
+      destination.path,
+      destination.source,
+    )
   );
 }
 

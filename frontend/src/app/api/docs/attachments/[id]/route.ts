@@ -18,7 +18,7 @@ function workspaceRoots() {
   return Array.from(new Set([
     process.env.AOITALK_WORKSPACES_DIR,
     resolve(process.cwd(), "workspaces"),
-    resolve(process.cwd(), "../workspaces"),
+    resolve(/* turbopackIgnore: true */ process.cwd(), "../workspaces"),
   ]
     .filter((root): root is string => Boolean(root))
     .map((root) => resolve(root))));

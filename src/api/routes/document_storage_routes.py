@@ -165,11 +165,14 @@ def _office_conversion_child(
                 # Import in the child so this target remains picklable under
                 # Windows ``spawn`` and does not depend on monkeypatched
                 # parent globals.
+                # This route already owns a bounded multiprocessing child.
+                # Call the in-process worker implementation here so the
+                # route timeout cannot leave a nested converter orphan alive.
                 from ...tools.documents.office_reader import (
-                    convert_office_bytes_to_markdown,
+                    _convert_office_in_process,
                 )
 
-                result = convert_office_bytes_to_markdown(content, filename)
+                result = _convert_office_in_process(content, filename)
     except BaseException:
         result = {"success": False, "error": "ファイル変換に失敗しました"}
     _write_office_child_result(result_path, result)

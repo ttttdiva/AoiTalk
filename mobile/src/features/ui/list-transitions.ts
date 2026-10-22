@@ -16,7 +16,14 @@ export function areConversationListsEqual(
       candidate.character_name === session.character_name &&
       candidate.message_count === session.message_count &&
       candidate.last_activity === session.last_activity &&
+      candidate.session_start === session.session_start &&
+      candidate.project_id === session.project_id &&
+      candidate.is_pinned === session.is_pinned &&
+      candidate.pinned_at === session.pinned_at &&
+      candidate.pin_updated_at === session.pin_updated_at &&
       candidate.development_status === session.development_status &&
+      candidate.history_status === session.history_status &&
+      candidate.history_completed_at === session.history_completed_at &&
       candidate.is_unread === session.is_unread
     );
   });

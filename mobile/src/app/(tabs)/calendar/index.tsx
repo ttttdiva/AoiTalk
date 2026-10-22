@@ -1,23 +1,39 @@
-import React, { useState, useCallback, useMemo, useEffect } from "react";
-import { Alert, View, FlatList, StyleSheet, Pressable } from "react-native";
+import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import {
+  Alert,
+  AppState,
+  FlatList,
+  Pressable,
+  StyleSheet,
+  View,
+  useWindowDimensions,
+} from "react-native";
+import type {
+  LayoutChangeEvent,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+} from "react-native";
 import {
   Text,
   Surface,
   IconButton,
   Switch,
 } from "react-native-paper";
-import { Calendar, LocaleConfig } from "react-native-calendars";
+import { CalendarList, LocaleConfig } from "react-native-calendars";
 import { useFocusEffect, useRouter } from "expo-router";
 import {
   endOfMonth,
   format,
   parseISO,
   startOfMonth,
-  subDays,
-  addDays,
+  startOfWeek,
+  endOfWeek,
+  addMonths,
+  differenceInCalendarMonths,
 } from "date-fns";
 import { ja } from "date-fns/locale";
 import { tasksRepo, occurrencesRepo } from "../../../repositories";
+import { useSyncStatusStore } from "../../../stores/sync-status";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import { taskApi } from "../../../lib/task-api";
@@ -36,6 +52,7 @@ import {
 } from "../../../components/remote-task-dialog";
 import { ScreenHeader } from "../../../components/screen-header";
 import { ScopeSwitcher } from "../../../components/scope-switcher";
+import { scheduleAfterNavigation } from "../../../lib/after-navigation";
 
 LocaleConfig.locales["ja"] = {
   monthNames: [
@@ -89,8 +106,6 @@ const STATUS_COLORS: Record<string, string> = {
   review: "#89dceb",
 };
 
-const UNCOLORED_PROJECT_DOT = "#585b70";
-
 const STATUS_LABELS: Record<string, string> = {
   open: "未着手",
   in_progress: "進行中",
@@ -119,6 +134,34 @@ type CalendarItem = {
   startAt?: string | null;
   endAt?: string | null;
 };
+
+const CALENDAR_MONTH_SCROLL_RANGE = 3;
+const CALENDAR_DAY_MIN_HEIGHT = 62;
+const CALENDAR_WEEK_VERTICAL_MARGIN = 14;
+const CALENDAR_HEADER_HEIGHT = 72;
+
+// Subset of react-native-calendars' CalendarListImperativeMethods (the type is
+// not exported from the package entry point).
+type CalendarListHandle = {
+  scrollToDay: (date: string, offset: number, animated: boolean) => void;
+};
+
+type CalendarScrollPhase = "idle" | "dragging" | "settling" | "arrow";
+
+function monthKey(dateString: string): string {
+  return dateString.slice(0, 7);
+}
+
+function firstDateOfMonth(month: string): string {
+  return `${month}-01`;
+}
+
+function addMonthKeys(month: string, count: number): string {
+  return format(
+    addMonths(parseISO(`${firstDateOfMonth(month)}T00:00:00`), count),
+    "yyyy-MM",
+  );
+}
 
 function buildDateKey(value: string | null | undefined): string | null {
   if (!value) return null;
@@ -204,18 +247,50 @@ function toRemoteTaskItem(
 
 export default function CalendarScreen() {
   const router = useRouter();
-  const { isAuthenticated } = useAuth();
-  const {
-    selectedProjectId,
-    selectedSpaceId,
-    selectedSpace,
-    selectedProject,
-  } = useProject();
+  const { fontScale } = useWindowDimensions();
+  const { isAuthenticated, isAnonymous, user } = useAuth();
+  const authScope = isAuthenticated
+    ? `auth:${user?.user_id ?? "unknown"}`
+    : isAnonymous ? "anonymous" : "signed_out";
+  const { selectedProjectId, selectedSpaceId } = useProject();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [occurrences, setOccurrences] = useState<TaskOccurrence[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>(
     format(new Date(), "yyyy-MM-dd"),
   );
+  const [calendarWidth, setCalendarWidth] = useState(0);
+  // The CalendarList window is anchored to this month. Page index N of the
+  // list is always `anchor + (N - RANGE)` months, so every settled offset maps
+  // to an absolute month without remounting the list on ordinary swipes.
+  const [calendarAnchorMonth, setCalendarAnchorMonth] = useState(
+    monthKey(selectedDate),
+  );
+  // Explicit jumps are day presses that cross the displayed month. Re-anchoring
+  // on such a press can land on the anchor month the window already points at
+  // (swipe away, then tap an adjacent-month day of the anchor month), so the
+  // anchor value alone cannot express "remount and show that page again". This
+  // revision counts only those presses and participates in the list key, which
+  // keeps ordinary swipes and in-month taps on the same mounted instance.
+  const [calendarJumpRevision, setCalendarJumpRevision] = useState(0);
+  const selectedMonthRef = useRef(monthKey(selectedDate));
+  const calendarAnchorMonthRef = useRef(calendarAnchorMonth);
+  const calendarListRef = useRef<CalendarListHandle | null>(null);
+  const calendarWidthRef = useRef(0);
+  const calendarWindowEpochRef = useRef(0);
+  const activeScrollEpochRef = useRef<number | null>(null);
+  const activeArrowEpochRef = useRef<number | null>(null);
+  const scrollPhaseRef = useRef<CalendarScrollPhase>("idle");
+  const fontScaleRef = useRef(fontScale);
+  if (fontScaleRef.current !== fontScale) {
+    fontScaleRef.current = fontScale;
+    calendarAnchorMonthRef.current = selectedMonthRef.current;
+    setCalendarAnchorMonth(selectedMonthRef.current);
+    calendarWindowEpochRef.current += 1;
+    activeScrollEpochRef.current = null;
+    activeArrowEpochRef.current = null;
+    scrollPhaseRef.current = "idle";
+  }
+  const calendarWindowEpoch = calendarWindowEpochRef.current;
   const [showClosed, setShowClosed] = useState(false);
   const [hideRecurring, setHideRecurring] = useState(false);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
@@ -230,9 +305,171 @@ export default function CalendarScreen() {
   } = useRemoteTasks(isAuthenticated, {
     projectId: selectedProjectId,
     spaceId: selectedSpaceId,
-  });
+  }, { deferInitialLoad: true });
   const [remoteDialogTarget, setRemoteDialogTarget] =
     useState<RemoteTaskDialogTarget | null>(null);
+
+  useEffect(() => {
+    selectedMonthRef.current = monthKey(selectedDate);
+  }, [selectedDate]);
+
+  const handleCalendarLayout = useCallback((event: LayoutChangeEvent) => {
+    const nextWidth = event.nativeEvent.layout.width;
+    if (nextWidth <= 0 || nextWidth === calendarWidthRef.current) return;
+    calendarWidthRef.current = nextWidth;
+    calendarAnchorMonthRef.current = selectedMonthRef.current;
+    setCalendarAnchorMonth(selectedMonthRef.current);
+    calendarWindowEpochRef.current += 1;
+    activeScrollEpochRef.current = null;
+    activeArrowEpochRef.current = null;
+    scrollPhaseRef.current = "idle";
+    setCalendarWidth(nextWidth);
+  }, []);
+
+  const handleCalendarDatePress = useCallback((dateString: string) => {
+    if (calendarWindowEpoch !== calendarWindowEpochRef.current) return;
+    const nextMonth = monthKey(dateString);
+    const previousMonth = selectedMonthRef.current;
+    activeScrollEpochRef.current = null;
+    activeArrowEpochRef.current = null;
+    scrollPhaseRef.current = "idle";
+    selectedMonthRef.current = nextMonth;
+    setSelectedDate(dateString);
+    if (nextMonth !== previousMonth) {
+      // Selecting an adjacent-month day outside the visible page is an
+      // explicit jump: re-anchor the window on that month.
+      calendarAnchorMonthRef.current = nextMonth;
+      setCalendarAnchorMonth(nextMonth);
+      setCalendarJumpRevision((revision) => revision + 1);
+      calendarWindowEpochRef.current += 1;
+    }
+  }, [calendarWindowEpoch]);
+
+  const handleCalendarScrollBeginDrag = useCallback(
+    (_event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      if (calendarWindowEpoch !== calendarWindowEpochRef.current) return;
+      activeArrowEpochRef.current = null;
+      activeScrollEpochRef.current = calendarWindowEpochRef.current;
+      scrollPhaseRef.current = "dragging";
+    },
+    [calendarWindowEpoch],
+  );
+
+  const handleCalendarScrollEndDrag = useCallback(
+    (_event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      if (calendarWindowEpoch !== calendarWindowEpochRef.current) return;
+      if (scrollPhaseRef.current === "dragging") {
+        scrollPhaseRef.current = "settling";
+      }
+    },
+    [calendarWindowEpoch],
+  );
+
+  // CalendarList's own arrow path (addMonth -> scrollToMonth) follows
+  // `animateScroll`, which is disabled so that automatic mount/re-anchor
+  // scrolls never animate. A non-animated scroll emits no momentum end, so the
+  // arrow would never settle. Drive the arrow through the imperative animated
+  // scroll instead; its momentum end settles the month like a swipe.
+  const handleCalendarArrowStep = useCallback(
+    (delta: -1 | 1) => {
+      if (calendarWindowEpoch !== calendarWindowEpochRef.current) return;
+      // Do not replace an in-flight drag or arrow animation. On Android an
+      // old animation-cancel momentum event can arrive after that replacement
+      // and would otherwise settle the wrong page.
+      if (scrollPhaseRef.current !== "idle") return;
+      const list = calendarListRef.current;
+      if (!list) return;
+      const targetMonth = addMonthKeys(selectedMonthRef.current, delta);
+      const pageIndex =
+        differenceInCalendarMonths(
+          parseISO(`${firstDateOfMonth(targetMonth)}T00:00:00`),
+          parseISO(
+            `${firstDateOfMonth(calendarAnchorMonthRef.current)}T00:00:00`,
+          ),
+        ) + CALENDAR_MONTH_SCROLL_RANGE;
+      if (pageIndex < 0 || pageIndex > CALENDAR_MONTH_SCROLL_RANGE * 2) return;
+      if (pageIndex === 0) {
+        // The library skips a scroll to offset 0, which would leave the arrow
+        // phase unsettled. Jump by re-anchoring on the target month instead.
+        selectedMonthRef.current = targetMonth;
+        calendarAnchorMonthRef.current = targetMonth;
+        setSelectedDate(firstDateOfMonth(targetMonth));
+        setCalendarAnchorMonth(targetMonth);
+        calendarWindowEpochRef.current += 1;
+        return;
+      }
+      activeScrollEpochRef.current = null;
+      activeArrowEpochRef.current = calendarWindowEpochRef.current;
+      scrollPhaseRef.current = "arrow";
+      list.scrollToDay(firstDateOfMonth(targetMonth), 0, true);
+    },
+    [calendarWindowEpoch],
+  );
+  const handleCalendarArrowLeft = useCallback(
+    () => handleCalendarArrowStep(-1),
+    [handleCalendarArrowStep],
+  );
+  const handleCalendarArrowRight = useCallback(
+    () => handleCalendarArrowStep(1),
+    [handleCalendarArrowStep],
+  );
+
+  const handleCalendarMomentumScrollEnd = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      if (calendarWindowEpoch !== calendarWindowEpochRef.current) return;
+      // React Native may emit onScrollBeginDrag while stopping an earlier
+      // momentum animation. Keep the newer gesture armed until its own
+      // onScrollEndDrag arrives; the earlier momentum end must be ignored.
+      if (scrollPhaseRef.current === "dragging") return;
+      const hasCurrentDrag =
+        activeScrollEpochRef.current === calendarWindowEpochRef.current &&
+        scrollPhaseRef.current === "settling";
+      const hasCurrentArrow =
+        activeArrowEpochRef.current === calendarWindowEpochRef.current &&
+        scrollPhaseRef.current === "arrow";
+      if (!hasCurrentDrag && !hasCurrentArrow) return;
+
+      activeScrollEpochRef.current = null;
+      activeArrowEpochRef.current = null;
+      scrollPhaseRef.current = "idle";
+      const width = calendarWidthRef.current;
+      const endOffset = event.nativeEvent.contentOffset.x;
+      if (width <= 0) return;
+      const pageIndex = Math.round(endOffset / width);
+      // Page indexes are logical (data order) on every supported platform:
+      // react-native-calendars only mirrors offsets for RN < 0.73
+      // (`shouldFixRTL`), and this app pins RN 0.81. RTL therefore needs no
+      // flip here, matching the unflipped offsets scrollToDay/scrollToMonth use.
+      const anchorOffset = pageIndex - CALENDAR_MONTH_SCROLL_RANGE;
+
+      // The offset is absolute within the window, so map it from the anchor
+      // month (not from the previously selected month).
+      const targetMonth = addMonthKeys(
+        calendarAnchorMonthRef.current,
+        anchorOffset,
+      );
+
+      // A drag that snaps back to its original page must not change the
+      // selected day or trigger a settings/query refresh.
+      if (targetMonth === selectedMonthRef.current) return;
+
+      selectedMonthRef.current = targetMonth;
+      setSelectedDate(firstDateOfMonth(targetMonth));
+
+      // Keep the list mounted for ordinary swipes. Re-anchor (remount) only
+      // when the settled page is at the window edge, so the finite window
+      // has room to continue in both directions.
+      if (
+        pageIndex <= 0 ||
+        pageIndex >= CALENDAR_MONTH_SCROLL_RANGE * 2
+      ) {
+        calendarAnchorMonthRef.current = targetMonth;
+        setCalendarAnchorMonth(targetMonth);
+        calendarWindowEpochRef.current += 1;
+      }
+    },
+    [calendarWindowEpoch],
+  );
 
   useEffect(() => {
     let active = true;
@@ -246,7 +483,6 @@ export default function CalendarScreen() {
         const settings = await taskApi.getUserSettings();
         if (!active) return;
         const view = settings.calendar_view;
-        if (view?.selected_date) setSelectedDate(view.selected_date);
         if (typeof view?.show_closed === "boolean")
           setShowClosed(view.show_closed);
         if (typeof view?.hide_recurring === "boolean")
@@ -283,15 +519,29 @@ export default function CalendarScreen() {
   useFocusEffect(
     useCallback(() => {
       let active = true;
-      const load = async () => {
-        const monthStart = subDays(
-          startOfMonth(parseISO(`${selectedDate}T00:00:00`)),
-          31,
+      let requestGeneration = 0;
+      let loadInFlight = false;
+      let appActive = AppState.currentState === "active";
+      let needsLoadOnActive = false;
+      let reloadAfterInFlight = false;
+      let pendingLocalRefresh = false;
+      let scheduledLoad: { cancel: () => void; localOnly: boolean } | null = null;
+      const performLoad = async (localOnly = false) => {
+        const request = ++requestGeneration;
+        const isCurrent = () => active && request === requestGeneration;
+        // Cover the whole mounted pager window. It is anchored to the list
+        // anchor, which stays fixed while ordinary swipes move the selection.
+        const anchorMonth = startOfMonth(
+          parseISO(`${firstDateOfMonth(calendarAnchorMonth)}T00:00:00`),
         );
-        const monthEnd = addDays(
-          endOfMonth(parseISO(`${selectedDate}T00:00:00`)),
-          90,
+        const monthWindowStart = startOfMonth(
+          addMonths(anchorMonth, -CALENDAR_MONTH_SCROLL_RANGE),
         );
+        const monthWindowEnd = endOfMonth(
+          addMonths(anchorMonth, CALENDAR_MONTH_SCROLL_RANGE),
+        );
+        const monthStart = startOfWeek(monthWindowStart, { weekStartsOn: 0 });
+        const monthEnd = endOfWeek(monthWindowEnd, { weekStartsOn: 0 });
         const startIso = monthStart.toISOString();
         const endIso = monthEnd.toISOString();
         let localLoaded = false;
@@ -311,7 +561,7 @@ export default function CalendarScreen() {
             ),
           ]);
           localLoaded = true;
-          if (!active) return;
+          if (!isCurrent()) return;
           setTasks(localTaskList);
           setOccurrences(localOccurrenceList);
         } catch (error) {
@@ -320,6 +570,8 @@ export default function CalendarScreen() {
             error,
           );
         }
+
+        if (localOnly || !isCurrent()) return;
 
         try {
           const [taskList, occurrenceList] = await Promise.all([
@@ -335,25 +587,110 @@ export default function CalendarScreen() {
               endIso,
             ),
           ]);
-          if (!active) return;
+          if (!isCurrent()) return;
           setTasks(taskList);
           setOccurrences(occurrenceList);
         } catch (error) {
           console.error("カレンダーの同期データ取得に失敗しました", error);
-          if (!active || localLoaded) return;
+          if (!isCurrent() || localLoaded) return;
           setTasks([]);
           setOccurrences([]);
         }
       };
-      void load();
+      const load = async (localOnly = false) => {
+        loadInFlight = true;
+        try {
+          await performLoad(localOnly);
+        } finally {
+          loadInFlight = false;
+          if (!active || !appActive) return;
+          if (reloadAfterInFlight) {
+            reloadAfterInFlight = false;
+            scheduleLoad();
+          } else if (pendingLocalRefresh) {
+            pendingLocalRefresh = false;
+            scheduleLoad(true);
+          }
+        }
+      };
+      const scheduleLoad = (localOnly = false) => {
+        if (!appActive) {
+          if (localOnly) pendingLocalRefresh = true;
+          else needsLoadOnActive = true;
+          return;
+        }
+        if (loadInFlight) {
+          if (localOnly) pendingLocalRefresh = true;
+          else reloadAfterInFlight = true;
+          return;
+        }
+        if (scheduledLoad) {
+          // A pending full load already includes the local refresh and its
+          // remote phase. Do not replace it with a local-only revision wake.
+          // A full request does supersede a pending local-only wake.
+          if (!localOnly && scheduledLoad.localOnly) {
+            scheduledLoad.cancel();
+            scheduledLoad = null;
+          } else {
+            return;
+          }
+        }
+        const interaction = scheduleAfterNavigation(() => {
+          scheduledLoad = null;
+          if (active && appActive) {
+            void load(localOnly);
+          } else if (localOnly) {
+            pendingLocalRefresh = true;
+          } else {
+            needsLoadOnActive = true;
+          }
+        });
+        scheduledLoad = { cancel: () => interaction.cancel(), localOnly };
+      };
+      const unsubscribeGeneral = useSyncStatusStore.subscribe((state, previous) => {
+        if (state.generalAuthScope !== previous.generalAuthScope &&
+            state.generalAuthScope !== authScope) {
+          ++requestGeneration;
+          return;
+        }
+        if (state.generalRevision === previous.generalRevision ||
+            state.generalAuthScope !== authScope ||
+            !appActive) return;
+        // A revision refresh must never enter the remote portion of load.
+        scheduleLoad(true);
+      });
+      const appStateSubscription = AppState.addEventListener("change", (state) => {
+        appActive = state === "active";
+        if (!appActive) {
+          ++requestGeneration;
+          needsLoadOnActive = true;
+          scheduledLoad?.cancel();
+          scheduledLoad = null;
+          return;
+        }
+        if (needsLoadOnActive) {
+          needsLoadOnActive = false;
+          scheduleLoad();
+        }
+      });
+      // The calendar tab is often entered from Docs, whose focus work can
+      // still be settling. Defer SQLite/network reads until the tab
+      // transition has yielded so the destination becomes interactive first.
+      scheduleLoad();
       return () => {
         active = false;
+        ++requestGeneration;
+        scheduledLoad?.cancel();
+        scheduledLoad = null;
+        unsubscribeGeneral();
+        appStateSubscription.remove();
       };
     }, [
+      authScope,
       completionRefreshToken,
       selectedProjectId,
       selectedSpaceId,
-      selectedDate,
+      calendarAnchorMonth,
       calendarRefreshToken,
     ]),
   );
@@ -432,47 +769,12 @@ export default function CalendarScreen() {
     [remoteProfiles],
   );
 
-  const markedDates = useMemo(() => {
-    const marks: Record<
-      string,
-      {
-        marked: boolean;
-        dots: { key: string; color: string }[];
-        selected?: boolean;
-        selectedColor?: string;
-      }
-    > = {};
-
-    for (const [date, items] of Object.entries(itemsByDate)) {
-      const dots = items.slice(0, 3).map((item, index) => ({
-        key: `${item.id}-${index}`,
-        color: item.projectColor || UNCOLORED_PROJECT_DOT,
-      }));
-      marks[date] = { marked: true, dots };
-    }
-
-    if (marks[selectedDate]) {
-      marks[selectedDate] = {
-        ...marks[selectedDate],
-        selected: true,
-        selectedColor: "#4c1d95",
-      };
-    } else {
-      marks[selectedDate] = {
-        marked: false,
-        dots: [],
-        selected: true,
-        selectedColor: "#4c1d95",
-      };
-    }
-
-    return marks;
-  }, [itemsByDate, selectedDate]);
-
   const selectedItems = useMemo(
     () => itemsByDate[selectedDate] || [],
     [itemsByDate, selectedDate],
   );
+
+  const todayKey = format(new Date(), "yyyy-MM-dd");
 
   const handleStatusToggle = async (item: CalendarItem) => {
     const next = item.status === "closed" ? "open" : "closed";
@@ -576,18 +878,21 @@ export default function CalendarScreen() {
     );
   }, []);
 
+  const calendarDayMinHeight = Math.max(
+    CALENDAR_DAY_MIN_HEIGHT,
+    Math.ceil(CALENDAR_DAY_MIN_HEIGHT * fontScale),
+  );
+  const calendarHeight =
+    (calendarDayMinHeight + CALENDAR_WEEK_VERTICAL_MARGIN) * 6 +
+    CALENDAR_HEADER_HEIGHT;
+
   return (
     <View style={styles.container}>
       <ScreenHeader
-        title="カレンダー"
-        subtitle={
-          selectedProject?.name ||
-          selectedSpace?.name ||
-          "すべてのプロジェクト"
-        }
+        title="Calendar"
         right={
           <View style={styles.headerActions}>
-            <ScopeSwitcher />
+            <ScopeSwitcher variant="chip" allLabel="全体" projectNameOnly />
             <IconButton
               icon="plus"
               iconColor="#cdd6f4"
@@ -604,64 +909,164 @@ export default function CalendarScreen() {
           </View>
         }
       />
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.toggleRow}>
-          <View style={styles.toggleItem}>
-            <Text style={styles.toggleLabel}>完了を表示</Text>
-            <Switch value={showClosed} onValueChange={setShowClosed} />
-          </View>
-          <View style={styles.toggleItem}>
-            <Text style={styles.toggleLabel}>繰り返しを非表示</Text>
-            <Switch value={hideRecurring} onValueChange={setHideRecurring} />
-          </View>
-        </View>
-      </Surface>
-
-      <Calendar
-        markingType="multi-dot"
-        markedDates={markedDates}
-        onDayPress={(day: { dateString: string }) =>
-          setSelectedDate(day.dateString)
-        }
-        firstDay={0}
-        enableSwipeMonths
-        theme={{
-          calendarBackground: "#181825",
-          monthTextColor: "#cdd6f4",
-          textMonthFontWeight: "bold",
-          textMonthFontSize: 16,
-          arrowColor: "#7c3aed",
-          todayTextColor: "#7c3aed",
-          todayBackgroundColor: "transparent",
-          dayTextColor: "#cdd6f4",
-          textDisabledColor: "#585b70",
-          selectedDayBackgroundColor: "#4c1d95",
-          selectedDayTextColor: "#cdd6f4",
-          textDayFontSize: 14,
-          textDayHeaderFontSize: 12,
-          textSectionTitleColor: "#a6adc8",
-          stylesheet: {
-            calendar: {
-              header: {
-                dayTextAtIndex0: { color: "#f38ba8" },
-                dayTextAtIndex6: { color: "#89b4fa" },
-              },
-            },
-          },
-        }}
-      />
-
-      <Surface style={styles.taskListHeader} elevation={0}>
-        <Text style={styles.taskListTitle}>
-          {format(parseISO(`${selectedDate}T00:00:00`), "M月d日 (E)", {
-            locale: ja,
-          })}{" "}
-          • {selectedItems.length}件
-        </Text>
-      </Surface>
-
       <FlatList
         data={selectedItems}
+        style={styles.taskList}
+        ListHeaderComponent={
+          <View style={styles.calendarHeader}>
+            <Surface style={styles.header} elevation={1}>
+              <View style={styles.toggleRow}>
+                <View style={styles.toggleItem}>
+                  <Text style={styles.toggleLabel}>完了</Text>
+                  <Switch value={showClosed} onValueChange={setShowClosed} />
+                </View>
+                <View style={styles.toggleItem}>
+                  <Text style={styles.toggleLabel}>繰り返し非表示</Text>
+                  <Switch value={hideRecurring} onValueChange={setHideRecurring} />
+                </View>
+              </View>
+            </Surface>
+
+            <View
+              testID="calendar-month-swipe"
+              style={styles.calendarViewport}
+              onLayout={handleCalendarLayout}
+            >
+              {calendarWidth > 0 ? (
+                <CalendarList
+                  ref={calendarListRef}
+                  key={`calendar-${calendarWidth}-${fontScale}-${calendarAnchorMonth}-${calendarJumpRevision}`}
+                  current={firstDateOfMonth(calendarAnchorMonth)}
+                  firstDay={0}
+                  horizontal
+                  pagingEnabled
+                  staticHeader
+                  hideArrows={false}
+                  animateScroll={false}
+                  pastScrollRange={CALENDAR_MONTH_SCROLL_RANGE}
+                  futureScrollRange={CALENDAR_MONTH_SCROLL_RANGE}
+                  calendarWidth={calendarWidth}
+                  calendarHeight={calendarHeight}
+                  hideExtraDays={false}
+                  showScrollIndicator={false}
+                  dayComponent={({ date, state }) => {
+                    if (!date)
+                      return (
+                        <View
+                          style={[
+                            styles.monthDay,
+                            { minHeight: calendarDayMinHeight },
+                          ]}
+                        />
+                      );
+                    const dayItems = itemsByDate[date.dateString] || [];
+                    const isSelected = selectedDate === date.dateString;
+                    const isToday = todayKey === date.dateString;
+                    return (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          date.dateString + " " + dayItems.length + "件"
+                        }
+                        onPress={() =>
+                          handleCalendarDatePress(date.dateString)
+                        }
+                        style={[
+                          styles.monthDay,
+                          { minHeight: calendarDayMinHeight },
+                          isSelected && styles.monthDaySelected,
+                          state === "disabled" && styles.monthDayOutside,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.monthDayNumber,
+                            state === "disabled" &&
+                              styles.monthDayNumberOutside,
+                            isToday && styles.monthDayNumberToday,
+                            isSelected && styles.monthDayNumberSelected,
+                          ]}
+                        >
+                          {date.day}
+                        </Text>
+                        <View style={styles.monthTaskStack}>
+                          {dayItems.slice(0, 2).map((item) => (
+                            <View key={item.id} style={styles.monthTaskLine}>
+                              <View
+                                style={[
+                                  styles.monthTaskDot,
+                                  {
+                                    backgroundColor:
+                                      item.projectColor ||
+                                      STATUS_COLORS[item.status] ||
+                                      "#585b70",
+                                  },
+                                ]}
+                              />
+                              <Text
+                                numberOfLines={1}
+                                style={[
+                                  styles.monthTaskTitle,
+                                  item.status === "closed" &&
+                                    styles.monthTaskClosed,
+                                ]}
+                              >
+                                {item.title}
+                              </Text>
+                            </View>
+                          ))}
+                          {dayItems.length > 2 ? (
+                            <Text style={styles.monthTaskMore}>
+                              +{dayItems.length - 2}
+                            </Text>
+                          ) : null}
+                        </View>
+                      </Pressable>
+                    );
+                  }}
+                  onPressArrowLeft={handleCalendarArrowLeft}
+                  onPressArrowRight={handleCalendarArrowRight}
+                  onScrollBeginDrag={handleCalendarScrollBeginDrag}
+                  onScrollEndDrag={handleCalendarScrollEndDrag}
+                  onMomentumScrollEnd={handleCalendarMomentumScrollEnd}
+                  theme={{
+                    calendarBackground: "#181825",
+                    monthTextColor: "#cdd6f4",
+                    textMonthFontWeight: "bold",
+                    textMonthFontSize: 16,
+                    arrowColor: "#7c3aed",
+                    todayTextColor: "#7c3aed",
+                    todayBackgroundColor: "transparent",
+                    dayTextColor: "#cdd6f4",
+                    textDisabledColor: "#585b70",
+                    selectedDayBackgroundColor: "#4c1d95",
+                    selectedDayTextColor: "#cdd6f4",
+                    textDayFontSize: 14,
+                    textDayHeaderFontSize: 12,
+                    textSectionTitleColor: "#a6adc8",
+                    stylesheet: {
+                      calendar: {
+                        header: {
+                          dayTextAtIndex0: { color: "#f38ba8" },
+                          dayTextAtIndex6: { color: "#89b4fa" },
+                        },
+                      },
+                    },
+                  }}
+                />
+              ) : null}
+            </View>
+
+            <Surface style={styles.taskListHeader} elevation={0}>
+              <Text style={styles.taskListTitle}>
+                {format(parseISO(`${selectedDate}T00:00:00`), "M月d日 (E)", {
+                  locale: ja,
+                })}{" "}
+                • {selectedItems.length}件
+              </Text>
+            </Surface>
+          </View>
+        }
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => (
           <Surface style={styles.taskItem} elevation={0}>
@@ -788,13 +1193,67 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     backgroundColor: "#1e1e2e",
   },
-  toggleRow: { gap: 8 },
+  toggleRow: { flexDirection: "row", gap: 12 },
   toggleItem: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
   toggleLabel: { color: "#a6adc8", fontSize: 12 },
+  taskList: { flex: 1 },
+  calendarHeader: { marginHorizontal: -8 },
+  calendarViewport: { width: "100%" },
+  monthDay: {
+    minHeight: 62,
+    paddingHorizontal: 2,
+    paddingTop: 2,
+    borderRadius: 6,
+    justifyContent: "flex-start",
+  },
+  monthDaySelected: { backgroundColor: "#313244" },
+  monthDayOutside: { opacity: 0.45 },
+  monthDayNumber: {
+    color: "#cdd6f4",
+    fontSize: 12,
+    fontWeight: "700",
+    textAlign: "center",
+    marginBottom: 2,
+  },
+  monthDayNumberOutside: { color: "#6c7086" },
+  monthDayNumberToday: { color: "#cba6f7" },
+  monthDayNumberSelected: { color: "#ffffff" },
+  monthTaskStack: { gap: 1 },
+  monthTaskLine: {
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 1,
+  },
+  monthTaskDot: {
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+    marginRight: 2,
+    flexShrink: 0,
+  },
+  monthTaskTitle: {
+    minWidth: 0,
+    flexShrink: 1,
+    color: "#cdd6f4",
+    fontSize: 8,
+    lineHeight: 10,
+  },
+  monthTaskClosed: {
+    color: "#7f849c",
+    textDecorationLine: "line-through",
+  },
+  monthTaskMore: {
+    color: "#9399b2",
+    fontSize: 8,
+    lineHeight: 10,
+    paddingLeft: 6,
+  },
   taskListHeader: {
     backgroundColor: "#11111b",
     paddingHorizontal: 16,

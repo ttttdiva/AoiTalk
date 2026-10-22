@@ -381,11 +381,6 @@ async function mockTimelineApis(
       return;
     }
 
-    if (url.pathname.includes("/scenarios/logs/by-conversation/")) {
-      await route.fulfill({ json: null });
-      return;
-    }
-
     await route.fulfill({ json: {} });
   });
 }

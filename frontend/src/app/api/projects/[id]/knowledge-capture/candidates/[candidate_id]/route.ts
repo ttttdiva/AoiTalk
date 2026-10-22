@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import {
   getAccessibleProject,
   getProjectSettingsProject,
+  getWritableProject,
 } from "@/lib/server/project-access";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 
@@ -37,10 +38,24 @@ export async function GET(
   if (access === undefined) return projectNotFound();
   if (access === null) return forbidden();
 
-  return proxyRequestToPythonApi(request, {
+  const response = await proxyRequestToPythonApi(request, {
     path: ["knowledge-capture", "candidates", candidateId],
     user,
   });
+  if (!response.ok) return response;
+  const body: unknown = await response.clone().json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return response;
+  const [writable, manageable] = await Promise.all([
+    getWritableProject(id, user),
+    getProjectSettingsProject(id, user),
+  ]);
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return NextResponse.json({
+    ...body,
+    can_write: Boolean(writable),
+    can_publish: Boolean(manageable),
+  }, { status: response.status, headers });
 }
 
 export async function PATCH(

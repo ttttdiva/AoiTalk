@@ -28,17 +28,28 @@ def _load_voice_aliases() -> dict:
     }
 
     try:
-        csv_path = Path(__file__).resolve().parents[3] / 'docs' / 'characters_voiceroid2.csv'
-        if csv_path.exists():
-            with csv_path.open(encoding='utf-8') as csv_file:
+        repository_root = Path(__file__).resolve().parents[3]
+        # The canonical character registry lives with the other maintained
+        # reference tables. Keep the historical path as a read-only fallback
+        # for packaged/older installations, but never require it.
+        candidates = (
+            repository_root / 'docs' / 'reference' / 'characters' / 'voiceroid2.csv',
+            repository_root / 'docs' / 'characters_voiceroid2.csv',
+        )
+        csv_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if csv_path is not None:
+            with csv_path.open(encoding='utf-8-sig', newline='') as csv_file:
                 reader = csv.DictReader(csv_file)
                 for row in reader:
-                    name = row.get('name')
-                    voice = row.get('voice')
+                    if str(row.get('engine') or '').strip().casefold() not in {'voiceroid', 'voiceroid2'}:
+                        continue
+                    name = str(row.get('name') or '').strip()
+                    voice = str(row.get('voice') or '').strip()
                     if name and voice:
-                        aliases[_normalize_voice_key(name)] = voice.strip()
-    except Exception:
-        # 失敗時は手動マップのみ使用
+                        aliases[_normalize_voice_key(name)] = voice
+    except (OSError, UnicodeError, csv.Error):
+        # Keep explicit aliases usable when optional documentation assets are
+        # unavailable or malformed. Credential/config data is never read.
         pass
 
     return aliases
@@ -130,10 +141,12 @@ class VoiceroidEngine:
         except Exception as e:
             print(f"[VOICEROID] Initialization failed: {type(e).__name__}: {e}")
             if self.vc:
-                try:
-                    self.vc.close()
-                except:
-                    pass
+                close = getattr(self.vc, 'close', None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
                 self.vc = None
             return False
             
@@ -351,10 +364,12 @@ class VoiceroidEngine:
     def cleanup(self):
         """Cleanup VOICEROID resources"""
         if self.vc:
-            try:
-                self.vc.close()
-            except:
-                pass
+            close = getattr(self.vc, 'close', None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
             self.vc = None
         self.is_initialized = False
         

@@ -91,9 +91,15 @@ def _trusted_stream_output_limit(*, default: int = 32_768) -> int:
 
 
 def build_process_group_kwargs() -> dict:
-    """プロセスツリーごと停止できるよう独立グループで起動するための Popen 引数"""
+    """プロセスツリーごと停止できるよう独立グループで起動するための Popen 引数。
+
+    出力を捕捉する非対話実行専用のため、Windows ではコンソール窓も作らない。
+    """
     if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        }
     return {"start_new_session": True}
 
 
@@ -113,7 +119,11 @@ def _run_taskkill(pid: int, force: bool) -> None:
     if force:
         args.insert(1, "/F")
     try:
-        subprocess.run(args, capture_output=True, timeout=10)
+        kwargs: dict = {}
+        if os.name == "nt":
+            # コンソールを持たない親から起動しても taskkill の窓を出さない
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(args, capture_output=True, timeout=10, **kwargs)
     except Exception:
         pass
 
@@ -400,14 +410,11 @@ class CommandExecutor:
         )
 
     def _get_scoped_backend(self, scope_override=None):
-        """Resolve the concrete file-scoped backend for an active run."""
+        """Resolve the server-selected backend for an active run."""
 
         try:
             from ...security.agent_run_scope import get_current_run_scope
-            from ...security.wsl_bwrap_backend import (
-                WslBwrapError,
-                get_wsl_bwrap_backend,
-            )
+            from ...security.harness_execution_scope import resolve_command_backend_kind
         except ImportError as exc:  # pragma: no cover - defensive for stripped builds
             return None, f"file-scoped command backend is unavailable: {exc}"
 
@@ -415,6 +422,15 @@ class CommandExecutor:
         if scope is None:
             return None, None
         try:
+            backend_kind = resolve_command_backend_kind(run_scope=scope)
+            if backend_kind == "native_windows":
+                return (scope, "native_windows"), None
+            if backend_kind != "wsl_bwrap":
+                return None, "run-scoped command backend is unavailable"
+            try:
+                from ...security.wsl_bwrap_backend import get_wsl_bwrap_backend
+            except ImportError as exc:  # pragma: no cover - defensive for stripped builds
+                return None, f"file-scoped command backend is unavailable: {exc}"
             backend = get_wsl_bwrap_backend()
             if not getattr(backend, "file_scoped", False):
                 return None, "configured command backend is not file-scoped"
@@ -424,7 +440,7 @@ class CommandExecutor:
                     "run-scoped shell execution was denied"
                 )
             return (scope, backend), None
-        except WslBwrapError as exc:
+        except Exception as exc:
             return None, str(exc)
 
     @staticmethod
@@ -484,24 +500,31 @@ class CommandExecutor:
         scoped_backend, backend_error = self._get_scoped_backend()
         if backend_error:
             return CommandResult(success=False, error_message=backend_error)
+        native_scoped = False
         if scoped_backend is not None:
             scope, backend = scoped_backend
-            try:
-                result = backend.run(
-                    scope,
-                    command,
-                    cwd=cwd_path,
-                    shell=shell,
-                    timeout=timeout,
-                    env=build_aoitalk_subprocess_env(),
-                )
-            except Exception as exc:
-                logger.error("Scoped backend execution failed: %s", exc, exc_info=True)
-                return CommandResult(
-                    success=False,
-                    error_message=f"file-scoped command backend failed: {exc}",
-                )
-            return self._from_scoped_backend_result(result)
+            if backend == "native_windows":
+                # The server-issued scope has already validated cwd. Native
+                # Windows runs under the current OS user and has no filesystem
+                # isolation; it still uses the established Popen/timeout path.
+                native_scoped = True
+            else:
+                try:
+                    result = backend.run(
+                        scope,
+                        command,
+                        cwd=cwd_path,
+                        shell=shell,
+                        timeout=timeout,
+                        env=build_aoitalk_subprocess_env(),
+                    )
+                except Exception as exc:
+                    logger.error("Scoped backend execution failed: %s", exc, exc_info=True)
+                    return CommandResult(
+                        success=False,
+                        error_message=f"file-scoped command backend failed: {exc}",
+                    )
+                return self._from_scoped_backend_result(result)
 
         try:
             full_cmd = build_shell_command(command, shell)
@@ -514,6 +537,11 @@ class CommandExecutor:
         try:
             # Set up environment
             env = build_aoitalk_subprocess_env()
+            process_group_kwargs = build_process_group_kwargs()
+            if native_scoped and os.name == "nt":
+                process_group_kwargs["creationflags"] |= getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0
+                )
 
             process = subprocess.Popen(
                 full_cmd,
@@ -525,7 +553,7 @@ class CommandExecutor:
                 env=env,
                 encoding="utf-8",
                 errors="replace",
-                **build_process_group_kwargs()
+                **process_group_kwargs
             )
 
             try:
@@ -638,16 +666,19 @@ class CommandExecutor:
         if backend_error:
             return CommandResult(success=False, error_message=backend_error)
 
+        native_scoped = False
         if scoped_backend is not None:
             scope, backend = scoped_backend
-            return (yield from self._execute_streaming_with_backend(
-                backend,
-                scope,
-                command,
-                cwd=cwd_path,
-                timeout=timeout,
-                shell=shell,
-            ))
+            if backend != "native_windows":
+                return (yield from self._execute_streaming_with_backend(
+                    backend,
+                    scope,
+                    command,
+                    cwd=cwd_path,
+                    timeout=timeout,
+                    shell=shell,
+                ))
+            native_scoped = True
             
         logger.info(f"Executing (streaming): {command[:50]}...")
         
@@ -658,6 +689,11 @@ class CommandExecutor:
 
         try:
             env = build_aoitalk_subprocess_env()
+            process_group_kwargs = build_process_group_kwargs()
+            if native_scoped and os.name == "nt":
+                process_group_kwargs["creationflags"] |= getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0
+                )
             
             process = subprocess.Popen(
                 full_cmd,
@@ -669,7 +705,7 @@ class CommandExecutor:
                 env=env,
                 encoding="utf-8",
                 errors="replace",
-                **build_process_group_kwargs(),
+                **process_group_kwargs,
             )
             
             output_queue: queue.Queue = queue.Queue()

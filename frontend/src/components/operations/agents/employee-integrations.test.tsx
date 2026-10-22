@@ -102,6 +102,7 @@ describe("EmployeeIntegrations", () => {
     render(<EmployeeIntegrations {...props} />);
     const apiKey = await screen.findByLabelText("APIキー");
     const webhook = screen.getByLabelText("Webhookシークレット（任意）");
+    expect(screen.getByText(/入力値は送信時に消去します。保存後に秘密を再表示することはできません/)).toBeVisible();
     expect(apiKey).toHaveAttribute("type", "password");
     await user.type(apiKey, "private-api-key");
     await user.type(webhook, "private-webhook-secret");

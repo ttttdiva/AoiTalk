@@ -5,10 +5,10 @@ import { ScopedMemoryManager } from "@/components/memory/scoped-memory-manager";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 export function ProjectMemoryPanel({
   projectId,
@@ -25,8 +25,15 @@ export function ProjectMemoryPanel({
   return (
     <Card className="mx-auto w-full max-w-5xl border-border bg-card shadow-none">
       <CardHeader className="border-b border-border">
-        <CardTitle className="flex items-center gap-2 text-base font-semibold"><Brain className="size-4" />プロジェクトメモリ</CardTitle>
-        <CardDescription>このプロジェクトで再利用する確定メモリと、確認待ちの候補を管理します。</CardDescription>
+        <CardTitle className="flex items-center gap-2 text-base font-semibold">
+          <Brain className="size-4" />
+          <span className="inline-flex items-center gap-1">
+            プロジェクトメモリ
+            <HelpPopover label="プロジェクトメモリ">
+              このプロジェクトで再利用する確定メモリと、確認待ちの候補を管理します。
+            </HelpPopover>
+          </span>
+        </CardTitle>
       </CardHeader>
       <CardContent className="pt-5">
         {!canWrite && (

@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ttttdiva/87_see-though_rig.git",
+  "revision": "0f27ade82e081dd8d1369db72d5f1dcd908df668",
+  "protocol_version": 1,
+  "runtime": {
+    "abi": 1,
+    "version": "0.4.0"
+  }
+}

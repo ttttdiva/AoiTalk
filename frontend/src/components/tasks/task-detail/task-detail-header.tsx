@@ -119,7 +119,7 @@ export function TaskDetailHeader({
   readOnly?: boolean;
 }) {
   return (
-    <div className="border-b border-border pb-4 pt-1">
+    <div className="min-w-0 border-b border-border pb-4 pt-1">
       {editingTitle && !readOnly ? (
         <SlashCommandInput
           inputRef={titleInputRef}
@@ -132,7 +132,7 @@ export function TaskDetailHeader({
           onSubmitIntent={onTitleSubmitIntent}
           submitOnEnter={!effectiveTaskId}
           onParseSlashCommands={onParseSlashCommands}
-          className="h-auto border-none px-0 py-0 text-2xl font-semibold tracking-tight shadow-none focus-visible:ring-0 md:text-2xl"
+          className="h-auto border-none py-0 pl-0 pr-8 text-2xl font-semibold tracking-tight shadow-none focus-visible:ring-0 md:text-2xl"
           autoFocus
           onNavigateDown={focusDescriptionEditor}
         />
@@ -140,8 +140,8 @@ export function TaskDetailHeader({
         <h1
           className={
             readOnly
-              ? "text-2xl font-semibold tracking-tight"
-              : "cursor-pointer text-2xl font-semibold tracking-tight transition-colors hover:text-primary/80"
+              ? "min-w-0 whitespace-normal pr-8 text-2xl font-semibold leading-snug tracking-tight [overflow-wrap:anywhere]"
+              : "min-w-0 cursor-pointer whitespace-normal pr-8 text-2xl font-semibold leading-snug tracking-tight transition-colors [overflow-wrap:anywhere] hover:text-primary/80"
           }
           onClick={readOnly ? undefined : () => setEditingTitle(true)}
         >

@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import json
 import logging
 import os
 import urllib.error
 import urllib.request
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from ..api.public_base_path import with_public_base_path
 from ..tools.file_explorer.file_explorer_service import (
     get_trash_retention_days,
     purge_trash,
@@ -264,7 +267,8 @@ class ContentRetentionWorker:
         if not internal_key:
             return None
         base_url = os.environ.get("NEXTJS_URL", "http://127.0.0.1:3002").rstrip("/")
-        url = f"{base_url}/api/internal/content-retention"
+        path = with_public_base_path("/api/internal/content-retention")
+        url = f"{base_url}{path}"
         request = urllib.request.Request(
             url,
             method="POST",
@@ -277,9 +281,39 @@ class ContentRetentionWorker:
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 payload = response.read().decode("utf-8")
+                ContentRetentionWorker._log_next_housekeeping_result(response.status, payload)
                 return {"status": response.status, "body": payload[:4096]}
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"Next.js retention endpoint returned {exc.code}") from exc
+
+    @staticmethod
+    def _log_next_housekeeping_result(status: int, payload: str) -> None:
+        """Persist only the canonical counts, never response content or IDs."""
+
+        try:
+            result = json.loads(payload)
+            conversations = result["conversations"]
+            counts = (
+                conversations["expiredSessionCount"],
+                conversations["deletedSessionCount"],
+                result["docs_purged"],
+            )
+            if status != 200 or any(type(count) is not int or count < 0 for count in counts):
+                raise ValueError("unexpected retention summary")
+        except (ValueError, TypeError, KeyError):
+            logger.warning(
+                "Next.jsコンテンツ保持期間掃除の成功応答を確認できませんでした: status=%s",
+                status,
+            )
+            return
+
+        logger.info(
+            "Next.jsコンテンツ保持期間掃除が完了しました: "
+            "completed_at_utc=%s status=%s expired_sessions=%d deleted_sessions=%d docs_purged=%d",
+            datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            status,
+            *counts,
+        )
 
     @staticmethod
     def _invoke_sync(function: Callable[..., Any], values: Mapping[str, Any]) -> Any:

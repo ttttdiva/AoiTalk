@@ -105,6 +105,16 @@ class AgentStateRequest(_CommandModel):
     )
 
 
+class AgentThumbnailPatchRequest(_CommandModel):
+    artifact_id: UUID | None
+    expected_artifact_id: UUID | None
+
+
+class AgentThumbnailResponse(BaseModel):
+    agent_id: UUID
+    artifact_id: UUID | None
+
+
 class CreateRevisionRequest(_CommandModel):
     display_name: str = Field(min_length=1, max_length=160)
     mission: str = Field(default="", max_length=10_000)
@@ -187,6 +197,11 @@ class PersonaOperatorAssignmentRequest(_CommandModel):
     capability_ceiling: list[str] = Field(default_factory=list, max_length=_MAX_LIST_ITEMS)
     active_from: datetime | None = None
     active_until: datetime | None = None
+
+
+class PersonaOperatorCeilingRequest(_CommandModel):
+    capability_ceiling: list[str] = Field(max_length=_MAX_LIST_ITEMS)
+    expected_capability_ceiling: list[str] = Field(max_length=_MAX_LIST_ITEMS)
 
 
 class AssignmentStateRequest(_CommandModel):
@@ -410,6 +425,11 @@ def create_agent_identity_router(
             raise HTTPException(status_code=404, detail="Agent not found")
         return _response("agent", result)
 
+    @router.patch("/agents/{agent_id}/thumbnail", response_model=AgentThumbnailResponse)
+    async def patch_agent_thumbnail(agent_id: str, payload: AgentThumbnailPatchRequest, request: Request, _: Any = Depends(require_auth_dependency)) -> Any:
+        actor_id = await admin_actor(request)
+        return await _invoke(identity.update_thumbnail, agent_id=agent_id, artifact_id=payload.artifact_id, expected_artifact_id=payload.expected_artifact_id, actor_user_id=actor_id)
+
     @router.patch("/agents/{agent_id}/state")
     async def patch_agent_state(
         agent_id: str,
@@ -603,6 +623,20 @@ def create_agent_identity_router(
         actor_id = await admin_actor(request)
         return assignment_response("persona_operator_assignment", await _invoke(identity.create_persona_operator_assignment, agent_id=agent_id, **_dump(payload), actor_user_id=actor_id), status_code=201)
 
+    @router.patch("/agents/{agent_id}/persona-operator-assignments/{assignment_id}")
+    async def patch_persona_operator_ceiling(
+        agent_id: str,
+        assignment_id: str,
+        payload: PersonaOperatorCeilingRequest,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> JSONResponse:
+        company_enabled()
+        actor_id = await admin_actor(request)
+        return assignment_response("persona_operator_assignment", await _invoke(
+            identity.update_persona_operator_ceiling, agent_id=agent_id, assignment_id=assignment_id,
+            **_dump(payload), actor_user_id=actor_id))
+
     @router.get("/agents/{agent_id}/persona-operator-assignments")
     async def get_persona_operator_assignments(
         agent_id: str,
@@ -685,6 +719,7 @@ __all__ = [
     "ProjectGrantRequest",
     "TaskAssignmentRequest",
     "PersonaOperatorAssignmentRequest",
+    "PersonaOperatorCeilingRequest",
     "AssignmentStateRequest",
     "create_agent_identity_router",
     "create_agent_router",

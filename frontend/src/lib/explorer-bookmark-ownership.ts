@@ -258,7 +258,7 @@ export type ExplorerBookmarkTargetContext = {
   spaceId?: string | null;
   selectedProjectId?: string | null;
   currentProjectId?: string | null;
-  filerTab?: "workspace" | "user" | "hf" | "hydrus" | string;
+  filerTab?: "workspace" | "user" | string;
   scopeRoot?: string | null;
   spaceProjectIds?: Iterable<string>;
   sameSpaceProjectIds?: Iterable<string>;
@@ -353,7 +353,7 @@ export type ExplorerBookmarkTargetClassification =
       status: "personal";
       owner: { scope: "personal" };
       path: string;
-      reason: "absolute" | "user" | "provider";
+      reason: "absolute" | "user";
     }
   | {
       kind: "shared";
@@ -456,19 +456,6 @@ export function classifyBookmarkTarget(
     };
   }
 
-  if (
-    normalized === "hydrus" ||
-    normalized.toLowerCase().startsWith("hydrus/") ||
-    normalized.toLowerCase().startsWith("hydrus|")
-  ) {
-    return {
-      kind: "rejected",
-      status: "rejected",
-      owner: null,
-      path: raw,
-      reason: "unsupported",
-    };
-  }
   if (normalized.toLowerCase().startsWith("remote://")) {
     return {
       kind: "rejected",
@@ -476,15 +463,6 @@ export function classifyBookmarkTarget(
       owner: null,
       path: raw,
       reason: "unsupported",
-    };
-  }
-  if (normalized === "hf" || normalized.toLowerCase().startsWith("hf|")) {
-    return {
-      kind: "personal",
-      status: "personal",
-      owner: { scope: "personal" },
-      path: raw,
-      reason: "provider",
     };
   }
   if (
@@ -519,10 +497,11 @@ type ProjectionOwnerItem = ExplorerBookmark & {
 export type ExplorerBookmarkProjectionContext =
   ExplorerBookmarkTargetContext & {
     scopeRoot?: string | null;
-    filerTab?: "workspace" | "user" | "hf" | "hydrus" | string;
+    filerTab?: "workspace" | "user" | string;
     includePersonalAbsolute?: boolean;
-    includeProviderPersonal?: boolean;
     includeEmptyFolders?: boolean;
+    /** Additional owner whose otherwise-unprojected folders belong in the current view. */
+    emptyFolderOwner?: ExplorerBookmarkOwner | BookmarkOwnerLike;
   };
 
 function pathWithinRoot(path: string, root: string): boolean {
@@ -544,15 +523,9 @@ function directPersonalProjectionEligible(
   if (classification.kind !== "personal") return false;
   if (classification.reason === "absolute") {
     // Absolute targets are local Files entries.  They may be projected into
-    // Workspace/User views (including while a shared Project is selected), but
-    // never into provider-specific virtual trees such as HF.
+    // Workspace/User views (including while a shared Project is selected).
     return context.includePersonalAbsolute !== false &&
       (!context.filerTab || context.filerTab === "workspace" || context.filerTab === "user");
-  }
-  if (classification.reason === "provider") {
-    return (
-      context.includeProviderPersonal === true || context.filerTab === "hf"
-    );
   }
   if (classification.reason === "user") {
     if (context.filerTab && context.filerTab !== "user") return false;
@@ -581,7 +554,7 @@ function directSharedProjectionEligible(
 
 /**
  * Return a scope-safe sidebar projection.  Personal absolute bookmarks are
- * intentionally retained while a shared Project is active; User/HF/remote
+ * intentionally retained while a shared Project is active; User/remote
  * rows are not.  Ancestor folders are added only when their owner matches the
  * descendant owner, preventing cross-collection `parent_id` relationships.
  */
@@ -613,6 +586,10 @@ export function projectExplorerBookmarks(
       ? (context as ExplorerBookmarkProjectionContext)
       : { owner: context as ExplorerBookmarkOwner };
   const activeOwner = ownerFromContextValue(options);
+  const emptyFolderOwners = [
+    activeOwner,
+    ...(options.emptyFolderOwner ? [bookmarkOwnerFromScope(options.emptyFolderOwner)] : []),
+  ];
   const directIds = new Set<string>();
   const visible = new Set<ProjectionOwnerItem>();
   for (const item of bookmarks) {
@@ -655,7 +632,9 @@ export function projectExplorerBookmarks(
     if (includedIds.has(item.id)) visible.add(item);
     else if (
       options.includeEmptyFolders &&
-      sameBookmarkOwner(bookmarkOwnerFromItem(item, activeOwner), activeOwner)
+      emptyFolderOwners.some((owner) =>
+        sameBookmarkOwner(bookmarkOwnerFromItem(item, activeOwner), owner),
+      )
     ) {
       visible.add(item);
     }

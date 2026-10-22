@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .strata_manifest import STRATA_MANIFEST
+
 DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
 EXO_BASE_URL = "http://127.0.0.1:52415/v1"
 MLX_LM_BASE_URL = DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL
@@ -18,6 +20,44 @@ FREETOKEN_DEFAULT_PORT = 1919
 FREETOKEN_DEFAULT_READINESS_TIMEOUT = 180.0
 FREETOKEN_BASE_URL = "http://127.0.0.1:1919/v1"
 FREETOKEN_QWEN3_06B_MODEL_ID = "Qwen/Qwen3-0.6B"
+
+# Strata is a runtime of this transport, never a separate LLM client.
+STRATA_SOURCE_REPOSITORY = STRATA_MANIFEST.repository
+STRATA_SOURCE_REVISION = STRATA_MANIFEST.revision
+STRATA_DEFAULT_MODEL = "qwen3.8-flash-next-iq2_xs"
+STRATA_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
+    f"qwen3.8-flash-next-{quant.lower()}": {
+        "id": f"qwen3.8-flash-next-{quant.lower()}",
+        "label": f"Strata / Qwen3.8-Flash-Next {quant}",
+        "description": "Strata公式setupで準備するWindows/Linux専用runtime。大容量モデルの初回準備が必要です。",
+        "runtime": "strata",
+        "served_alias": f"qwen3.8-flash-next-{quant.lower()}",
+        "source_repository": STRATA_SOURCE_REPOSITORY,
+        "source_revision": STRATA_SOURCE_REVISION,
+        "source_url": f"https://github.com/{STRATA_SOURCE_REPOSITORY}/tree/{STRATA_SOURCE_REVISION}",
+        "model_format": "GGUF",
+        "setup_family": "qwen",
+        "setup_model": quant,
+        "config_filename": f"strata-{quant.lower()}.json",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        "download_gb": size,
+        "capabilities": {"reasoning": True, "tools": True, "media": {"image": False, "audio": False}},
+        # Plain Strata chat does not need the generic verifier round.  Work,
+        # review, and explicit tool-required turns still use their own policy.
+        "chat_agentic_completion_review_enabled": False,
+    }
+    for quant, size in (("Q2_0", 66.4), ("IQ2_XS", 68.0), ("IQ3_XXS", 75.8), ("IQ3_S", 83.6))
+}
+
+
+def strata_model_profile(model: str | None = None) -> Optional[Dict[str, Any]]:
+    return copy.deepcopy(STRATA_MODEL_PROFILES.get(str(model or "").strip().lower()))
+
+
+def strata_model_profiles() -> List[Dict[str, Any]]:
+    return copy.deepcopy(list(STRATA_MODEL_PROFILES.values()))
+
 
 # llama.cpp/llama-server is deliberately modelled as one runtime of the
 # existing OpenAI-compatible local provider.  Model-specific launch and UI
@@ -41,6 +81,13 @@ LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_SHA256 = (
 )
 LLAMA_CPP_QWEN38_OFFICIAL_MTP_REPOSITORY = "ggml-org/Qwen3.8-27B-GGUF"
 LLAMA_CPP_QWEN38_OFFICIAL_MTP_REVISION = "efbb3b1f70a21d97fd4495240648405f7228554f"
+LLAMA_CPP_HEMMINGWAY1_MODEL_ALIAS = "hemmingway-1"
+LLAMA_CPP_HEMMINGWAY1_MODEL_FILENAME = "Altworld_Hemmingway-1-Q4_K_M.gguf"
+LLAMA_CPP_HEMMINGWAY1_SOURCE_REVISION = "259605e26a47f2dcc8731ae1aa7305f8047d2c6d"
+LLAMA_CPP_HEMMINGWAY1_MODEL_SIZE_BYTES = 17_442_400_320
+LLAMA_CPP_HEMMINGWAY1_MODEL_SHA256 = (
+    "c029ba6cc24bc022a65d00e4d81796ff0bd678e371a36c9a7d1119a0acc7085e"
+)
 LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS = "qwen3.8-flash-next"
 LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAME = "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
 LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAMES = [
@@ -123,6 +170,21 @@ LLAMA_CPP_BONSAI2_MMPROJ_SIZE_BYTES = 629_246_976
 LLAMA_CPP_BONSAI2_MMPROJ_SHA256 = (
     "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"
 )
+# Liquid AI's official LFM2.5-24B-A2B GGUF profile.  Keep the quantization
+# in the stable ID because the selected Q6_K artifact is a distinct managed
+# model from the other official quantizations in the same repository.
+LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_ALIAS = "lfm2.5-24b-a2b-q6_k"
+LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_FILENAME = "LFM2.5-24B-A2B-Q6_K.gguf"
+LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REPOSITORY = (
+    "LiquidAI/LFM2.5-24B-A2B-GGUF"
+)
+LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REVISION = (
+    "0912d33141f77e10705345a6732bfd83f0252fdc"
+)
+LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SIZE_BYTES = 19_689_405_728
+LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SHA256 = (
+    "4c5f34cb94d4a29f0360d04eaa274bb1361ceae163f40f6361cb75d1bee139c2"
+)
 # Short spelling aliases keep imports consistent with other model-family
 # constants while the versioned names above remain canonical.
 LLAMA_CPP_DARK_SCARLETT_27B_MODEL_ALIAS = LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS
@@ -153,6 +215,12 @@ QWEN38_REASONING_EFFORT_WIRE = {
     "transport": "extra_body",
     "path": "chat_template_kwargs.reasoning_effort",
 }
+
+# Some managed profiles are reasoning models without a user-selectable
+# reasoning effort or a supported non-thinking template branch.  Keep this
+# contract explicit so request/runtime layers can fail closed instead of
+# borrowing the generic fast/thinking mode.
+LLAMA_CPP_THINKING_MODE_ALWAYS = "always"
 
 # MTP is intentionally described as profile metadata rather than inferred
 # from a model-id substring.  ``mode=embedded`` means the selected GGUF is
@@ -299,6 +367,67 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             ),
         },
     },
+    LLAMA_CPP_HEMMINGWAY1_MODEL_ALIAS: {
+        "id": LLAMA_CPP_HEMMINGWAY1_MODEL_ALIAS,
+        "label": "Hemmingway-1 27B Q4_K_M",
+        "description": (
+            "Altworld/Hemmingway-1 のbartowski配布Q4_K_M GGUFを "
+            "llama-serverで提供します。英語優先の文章作成モデルです。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_HEMMINGWAY1_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "bartowski/Altworld_Hemmingway-1-GGUF",
+        "source_revision": LLAMA_CPP_HEMMINGWAY1_SOURCE_REVISION,
+        "source_url": "https://huggingface.co/bartowski/Altworld_Hemmingway-1-GGUF",
+        "upstream_model_repository": "Altworld/Hemmingway-1",
+        "license": "CC-BY-NC-4.0",
+        "license_url": "https://huggingface.co/Altworld/Hemmingway-1/blob/main/LICENSE",
+        "license_notice": (
+            "現行upstream weightsはCC BY-NC 4.0で、商用利用には別途合意が必要です。"
+            "固定GGUF revisionのcardに残るApache-2.0表記よりupstream LICENSEを優先します。"
+        ),
+        "gguf_filename": LLAMA_CPP_HEMMINGWAY1_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_HEMMINGWAY1_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_HEMMINGWAY1_MODEL_SHA256,
+        "quantization": "Q4_K_M",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        # The publisher generated these GGUFs with llama.cpp b10964 and
+        # explicitly documents that release for the embedded MTP contract.
+        # Keep the conservative floor profile-local; other AoiTalk models retain
+        # their existing independent minimum-build declarations.
+        "minimum_llama_cpp_build": 10964,
+        "reasoning_tools_minimum_llama_cpp_build": 10964,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
+        "capabilities": {
+            "reasoning": True,
+            "tools": True,
+            "media": {"image": False, "audio": False},
+        },
+        "reasoning_effort_options": list(QWEN38_REASONING_EFFORT_OPTIONS),
+        "reasoning_effort_default": QWEN38_REASONING_EFFORT_DEFAULT,
+        "reasoning_effort_supports_disable": False,
+        "reasoning_effort_wire": dict(QWEN38_REASONING_EFFORT_WIRE),
+        "mtp": {
+            "supported": True,
+            "default_enabled": True,
+            "mode": LLAMA_CPP_MTP_MODE_EMBEDDED,
+            "embedded_in_primary": True,
+            "minimum_llama_cpp_build": 10964,
+            "reason": (
+                "配布元GGUFにMTP layersが内蔵されています。llama.cpp b10964以上で "
+                "--spec-type draft-mtp を使用し、別sidecarは不要です。"
+            ),
+        },
+        "ui_notice": (
+            "約17.44GBのtext-only GGUFです。native contextは262144ですが、"
+            "AoiTalkの既定起動contextは32768です。現行upstream licenseは"
+            "CC BY-NC 4.0で、商用利用には別途合意が必要です。"
+        ),
+    },
     LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS: {
         "id": LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS,
         "label": "Qwen3.8-Flash-Next UD-IQ4_XS",
@@ -380,10 +509,19 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "default_context_size": 16384,
         "native_context_size": 262144,
         "default_gpu_layers": "auto",
-        "minimum_llama_cpp_build": 10660,
+        "minimum_llama_cpp_build": 11541,
+        # This 90.8GiB model took 635s on the existing SATA model volume.
+        # Keep the larger load budget local to this profile.  Lazy PLE reads
+        # avoid eagerly loading its additional 26.8GiB embedding tensor.
+        "default_readiness_timeout": 900.0,
+        "startup_min_initial_available_memory_gib": 82.0,
+        "startup_min_available_memory_gib": 12.0,
         "chat_agentic_completion_review_enabled": False,
         "required_args": ["--jinja"],
-        "default_args": ["--jinja"],
+        "default_args": [
+            "--jinja", "--n-cpu-moe", "34", "--load-mode", "none",
+            "--lazy-mode", "on",
+        ],
         "jinja_required": True,
     },
     LLAMA_CPP_GEMMA4_MODEL_ALIAS: {
@@ -566,6 +704,70 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             "tools": True,
             "media": {"image": True, "audio": False},
         },
+    },
+    LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_ALIAS: {
+        "id": LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_ALIAS,
+        "label": "LFM2.5-24B-A2B Q6_K",
+        "description": (
+            "LiquidAI公式LFM2.5-24B-A2BのQ6_K GGUFを llama-serverで提供します。"
+            "公式chat templateは常時thinkingを行うため、non-thinking modeには切り替えません。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REPOSITORY,
+        "source_revision": LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REVISION,
+        "source_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REPOSITORY}"
+        ),
+        "license": "lfm1.0",
+        "license_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REPOSITORY}/blob/"
+            f"{LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REVISION}/LICENSE"
+        ),
+        "gguf_filename": LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SHA256,
+        "quantization": "Q6_K",
+        # AoiTalk's initial 8192-context acceptance run showed the 35% output
+        # reserve (2867 tokens) truncating long reasoning-first answers.  Use
+        # 16384 as the practical launch default after that measurement; this
+        # is an application tuning value, not the model's 131072 native limit.
+        "default_context_size": 16384,
+        "native_context_size": 131072,
+        "default_parallel": 1,
+        "default_args": [
+            "--parallel",
+            "1",
+            "--log-verbosity",
+            "4",
+        ],
+        "required_args": ["--jinja"],
+        "jinja_required": True,
+        # The upstream template always opens an assistant turn with <think>;
+        # this declaration is consumed by request/runtime layers so a generic
+        # fast or enable_thinking=false path cannot be reused accidentally.
+        "thinking_mode": "always",
+        "sampling_defaults": {
+            "temperature": 0.1,
+            "top_k": 50,
+            "repeat_penalty": 1.05,
+        },
+        "capabilities": {
+            "reasoning": True,
+            "tools": True,
+            "media": {"image": False, "audio": False},
+        },
+        # Plain chat does not need the generic verifier round.  Assisted,
+        # autonomous-work, review, and explicit tool-required turns continue
+        # through their existing policy-owned paths.
+        "chat_agentic_completion_review_enabled": False,
+        "ui_notice": (
+            "公式推奨samplingは temperature=0.1 / top_k=50 / "
+            "repeat_penalty=1.05。常時thinkingのためnon-thinkingへ切り替えません。"
+        ),
     },
 }
 
@@ -987,13 +1189,20 @@ def llama_cpp_mtp_metadata(
             raise ValueError("mtp.required_llama_cpp_commit must be a git SHA")
         result["required_llama_cpp_commit"] = required_commit
 
-    embedded_variant = _llama_cpp_mtp_embedded_variant(
-        raw.get("embedded_variant")
-    )
+    embedded_variant = _llama_cpp_mtp_embedded_variant(raw.get("embedded_variant"))
+    embedded_in_primary = _llama_cpp_metadata_bool(raw.get("embedded_in_primary"))
     if embedded_variant is not None:
         if mode != LLAMA_CPP_MTP_MODE_EMBEDDED:
             raise ValueError("mtp.embedded_variant requires mode=embedded")
         result["embedded_variant"] = embedded_variant
+    if embedded_in_primary:
+        if mode != LLAMA_CPP_MTP_MODE_EMBEDDED:
+            raise ValueError("mtp.embedded_in_primary requires mode=embedded")
+        if embedded_variant is not None:
+            raise ValueError(
+                "mtp.embedded_in_primary cannot be combined with embedded_variant"
+            )
+        result["embedded_in_primary"] = True
     if "required" in raw:
         result["required"] = _llama_cpp_metadata_bool(raw.get("required"))
     return copy.deepcopy(result)
@@ -1020,6 +1229,27 @@ def llama_cpp_profile_capabilities(
     if not isinstance(capabilities, dict):
         return None
     return copy.deepcopy(capabilities)
+
+
+def llama_cpp_thinking_mode(
+    model: str | None = None,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return an explicitly declared thinking-mode contract for a profile.
+
+    ``None`` preserves generic local-server behavior.  ``always`` is used by
+    models whose official chat template always emits a reasoning section and
+    therefore must never inherit a non-thinking fallback.
+    """
+
+    selected = profile
+    if selected is None and model:
+        selected = llama_cpp_model_profile(model)
+    if not isinstance(selected, dict):
+        return None
+    value = str(selected.get("thinking_mode") or "").strip().lower()
+    return value or None
 
 
 def llama_cpp_reasoning_effort_metadata(
@@ -1182,6 +1412,7 @@ MLX_LM_MODEL_IDS = (
 _EXO_MODEL_SET = {model.casefold() for model in EXO_MODEL_IDS}
 _MLX_LM_MODEL_SET = {model.casefold() for model in MLX_LM_MODEL_IDS}
 SUPPORTED_SERVER_PROFILES = (
+    "strata",
     "auto",
     "sglang",
     "vllm",
@@ -1231,7 +1462,7 @@ def managed_local_runtime_for_model(
     config: Any = None,
     model: str | None = None,
 ) -> Optional[str]:
-    """Return llama_cpp/freetoken for a managed nested runtime, else None.
+    """Return the selected local runtime identity, independently of ownership.
 
     The selected model identity is authoritative. Stale nested runtime state
     from a previous selection is never allowed to override a trusted profile.
@@ -1247,6 +1478,8 @@ def managed_local_runtime_for_model(
     if not selected_model or selected_model.casefold() == "local-model":
         return None
 
+    if strata_model_profile(selected_model) is not None:
+        return "strata"
     if freetoken_model_profile(selected_model) is not None:
         return "freetoken"
     if llama_cpp_model_profile(selected_model) is not None:
@@ -1457,6 +1690,13 @@ def openai_compatible_local_base_url(
         or ""
     ).strip()
 
+    if strata_model_profile(selected_model) is not None:
+        # Strata's runtime settings own Personal loopback; manual/LAN endpoints
+        # remain operator-owned. Never fall through to stale llama.cpp fields.
+        from src.services.strata_runtime import strata_base_url
+
+        return strata_base_url(config, model=selected_model)
+
     freetoken_runtime_url = _freetoken_runtime_base_url(
         config,
         model=selected_model,
@@ -1595,7 +1835,9 @@ def openai_compatible_server_profile(
         selected_model,
     )
     if configured == "auto":
-        if managed_runtime == "freetoken":
+        if managed_runtime == "strata":
+            name = "strata"
+        elif managed_runtime == "freetoken":
             name = "freetoken"
         elif managed_runtime == "llama_cpp":
             name = "llama.cpp"
@@ -1619,6 +1861,7 @@ def openai_compatible_server_profile(
         "vllm": "automatic_prefix_caching",
         "llama.cpp": "slot_kv_cache",
         "freetoken": "server-managed",
+        "strata": "server-managed",
         "ollama": "cache_prompt",
         "lm-studio": "server-managed",
         "custom": "custom",

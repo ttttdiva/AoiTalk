@@ -11,7 +11,10 @@ import {
   hasEffectiveTaskOccurrence,
   updateEffectiveTaskOccurrenceStatus,
 } from "@/lib/task-occurrence-status";
-import { getTaskDisplayStatus } from "@/lib/tasks-page-utils";
+import {
+  applyTaskTimerStart,
+  getTaskDisplayStatus,
+} from "@/lib/tasks-page-utils";
 import { cn } from "@/lib/utils";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import type { UndoEntry } from "@/components/tasks/hooks/use-task-undo";
@@ -195,7 +198,31 @@ export function useTaskContextMenu({
           task.id,
           task.effective_occurrence_id ?? undefined,
         );
-        applyTaskPatchLocally(task.id, { active_time_entry: started });
+        const startedTask = applyTaskTimerStart(task, started);
+        applyTaskPatchLocally(task.id, {
+          active_time_entry: startedTask.active_time_entry,
+          status: startedTask.status,
+          ...(startedTask.effective_occurrence_status
+            ? {
+                effective_occurrence_status:
+                  startedTask.effective_occurrence_status,
+              }
+            : {}),
+        });
+        if (hasEffectiveTaskOccurrence(task)) {
+          try {
+            await updateEffectiveTaskOccurrenceStatus({
+              task,
+              status: "in_progress",
+              applyTaskPatchLocally,
+              refreshTasks,
+            });
+          } catch (err) {
+            // タスク本体はサーバー側で進行中になっているため、戻さず正本を再取得する。
+            console.error("タイマー開始後の発生回ステータス更新失敗:", err);
+            await refreshTasks?.();
+          }
+        }
         window.dispatchEvent(
           new CustomEvent("timer-changed", {
             detail: { activeEntry: started, taskId: task.id },
@@ -205,7 +232,12 @@ export function useTaskContextMenu({
     } catch (err) {
       console.error("タイマー操作失敗:", err);
     }
-  }, [applyTaskPatchLocally, contextMenu, closeContextMenu]);
+  }, [
+    applyTaskPatchLocally,
+    closeContextMenu,
+    contextMenu,
+    refreshTasks,
+  ]);
 
   const handleDuplicate = useCallback(async () => {
     if (!contextMenu) return;

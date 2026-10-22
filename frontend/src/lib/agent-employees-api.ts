@@ -1,4 +1,4 @@
-/** AI employee management uses the authenticated FastAPI proxy, never the projection writer. */
+/** Agent management uses the authenticated FastAPI proxy, never the projection writer. */
 export class EmployeeApiError extends Error {
   constructor(public readonly status: number) {
     super(status === 409 ? "他の更新と競合しました。再読み込みして変更を確認してください。"
@@ -28,7 +28,7 @@ export async function employeeScopeRequest<T>(path: string): Promise<T> {
   if (!response.ok) throw new EmployeeApiError(response.status);
   return response.json() as Promise<T>;
 }
-export type Employee = { id: string; display_name: string; slug: string; state: "draft" | "active" | "paused" | "retired"; character_id?: string | null; updated_at?: string };
+export type Employee = { id: string; display_name: string; slug: string; state: "draft" | "active" | "paused" | "retired"; character_id?: string | null; thumbnail_artifact_id?: string | null; updated_at?: string };
 export type EmployeeRevision = {
   id: string; agent_id: string; version: number; display_name: string; mission: string;
   responsibility_summary: string; operational_instructions: string; agent_team_id: string;
@@ -36,19 +36,42 @@ export type EmployeeRevision = {
   budget_policy: { max_run_cost_micros?: number; max_daily_cost_micros?: number; currency?: string };
   concurrency_policy: { max_parallel_runs?: number; max_parallel_tasks?: number; queue_class?: string };
   wake_policy?: Record<string, string | number>; created_at?: string;
+  route_warnings?: { code: string; subagent_id: string; message: string }[];
+};
+/** Read-only effective model route of one Subagent (identifiers only, never credentials). */
+export type EmployeeSubagentRoute = {
+  subagent_id: string; name: string; provider?: string; model?: string; effort?: string | null;
+  route_source?: "subagent_override" | "profile_default" | "standard_model" | "free_team" | "legacy_profile" | string;
+  inherits_main?: boolean; backend?: "local" | "api" | "cli" | string; error_code?: string;
+  /** Newer catalog responses may attach a canonical role/phase projection. */
+  role?: string; phase?: string; route_label?: string; acting_subagent_id?: string;
+};
+export type EmployeePhaseRoute = EmployeeSubagentRoute & {
+  phase: string;
+  role?: string;
+  acting_subagent_id?: string;
+};
+export type EmployeeExecutionProfile = {
+  profile_id?: string; name: string; description?: string; team_id?: string;
+  routes?: EmployeeSubagentRoute[];
+  phase_routes?: EmployeePhaseRoute[] | Record<string, EmployeePhaseRoute>;
+  preset_id?: string; preset?: boolean;
 };
 export type EmployeeCatalog = {
   can_manage: boolean; runtime_profile?: string;
-  teams: { team_id: string; name: string; subagents: { subagent_id: string; name: string; capability_ids: string[] }[]; execution_profiles: { profile_id: string; name: string }[] }[];
+  teams: { team_id: string; name: string; subagents: { subagent_id: string; name: string; capability_ids: string[] }[]; execution_profiles?: EmployeeExecutionProfile[]; execution_profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>; profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile> }[];
+  execution_profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>;
+  profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>;
   capabilities: { id: string; family: string; access: string; native: boolean }[];
 };
 export type EmployeeProfile = { job_title?: string; responsibility_summary?: string; primary_space_id?: string | null; autonomy_level?: string; employment_state?: string };
 export type ScopeOption = { id: string; name?: string; display_name?: string; title?: string; project_id?: string | null; space_id?: string | null; current_revision?: { display_name?: string } };
 export type AssignmentKind = "space-assignments" | "project-grants" | "task-assignments" | "persona-operator-assignments";
-export type EmployeeAssignment = { id: string; state: string; space_id?: string; project_id?: string; task_id?: string; persona_id?: string; role?: string; assignment_kind?: string; assignment_role?: string };
+export type EmployeeAssignment = { id: string; state: string; space_id?: string; project_id?: string; task_id?: string; persona_id?: string; role?: string; assignment_kind?: string; assignment_role?: string; capability_ceiling?: string[] };
 export type ActionDefinition = { action_type: string; display_name: string; category: string; status: string; connection_provider_keys: string[]; required_capabilities: string[]; constraints_schema: Record<string, unknown> | null };
 export type ProcurementConstraints = { fixed_item_ref: string; fixed_ship_to_ref: string; min_quantity: number; max_quantity: number; default_quantity: number; currency: string; max_order_total_minor: number; require_quote_before_execute: boolean };
-export type PolicyRevision = { id: string; version: number; action_type: string; connection_id: string; authorization_mode: "human_approval" | "bounded_auto"; constraints: Partial<ProcurementConstraints> & { route_id?: string; allowed_destination_keys?: string[] }; rate_limit: { window_seconds: number; max_actions: number }; dedupe_window_seconds: number; fallback_behavior: string; active_from?: string | null; active_until?: string | null };
+export type CrowdWorksConstraints = { search_urls: string[]; scan_interval_minutes: number; max_pages_per_scan: number; max_opportunities_per_scan: number; max_applications_per_scan: number; min_expected_profit: number; min_profit_per_hour: number; currency: string; llm_provider?: string | null; llm_model?: string | null; llm_effort?: string | null };
+export type PolicyRevision = { id: string; version: number; action_type: string; connection_id: string; authorization_mode: "human_approval" | "bounded_auto"; constraints: Partial<ProcurementConstraints & CrowdWorksConstraints> & { route_id?: string; allowed_destination_keys?: string[] }; rate_limit: { window_seconds: number; max_actions: number }; dedupe_window_seconds: number; fallback_behavior: string; active_from?: string | null; active_until?: string | null };
 export type EmployeePolicy = { id: string; display_name: string; state: string; version: number; current_revision: PolicyRevision | null };
 export const assignmentEnvelope: Record<AssignmentKind, string> = { "space-assignments": "space_assignments", "project-grants": "project_grants", "task-assignments": "task_assignments", "persona-operator-assignments": "persona_operator_assignments" };
 export const employeePath = (id: string) => `/api/agents/${encodeURIComponent(id)}`;
@@ -60,6 +83,7 @@ export const employeeApi = {
   profile: (id: string) => employeeRequest<{ organization_profile: EmployeeProfile }>(`${employeePath(id)}/organization-profile`),
   create: (body: { display_name: string; slug?: string; character_id?: string; idempotency_key: string }) => employeeRequest<{ agent: Employee }>("/api/agents", "POST", body),
   state: (id: string, state: Employee["state"], expected_state: Employee["state"]) => employeeRequest<{ agent: Employee }>(`${employeePath(id)}/state`, "PATCH", { state, expected_state }),
+  thumbnail: (id: string, body: import("@/lib/api-types.gen").components["schemas"]["AgentThumbnailPatchRequest"]) => employeeRequest<import("@/lib/api-types.gen").components["schemas"]["AgentThumbnailResponse"]>(`${employeePath(id)}/thumbnail`, "PATCH", body),
   revision: (id: string, body: Omit<EmployeeRevision, "id" | "agent_id" | "created_at"> & { idempotency_key: string }) => employeeRequest<{ revision: EmployeeRevision }>(`${employeePath(id)}/revisions`, "POST", body),
   saveProfile: (id: string, body: EmployeeProfile) => employeeRequest<{ organization_profile: EmployeeProfile }>(`${employeePath(id)}/organization-profile`, "PATCH", body),
 };

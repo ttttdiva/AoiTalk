@@ -3,12 +3,14 @@
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { cn } from "@/lib/utils";
 
 export function SettingsDisclosure({
   title,
   icon,
   summary,
+  help,
   children,
   contentClassName,
   onOpenChange,
@@ -20,6 +22,8 @@ export function SettingsDisclosure({
   title: string;
   icon?: ReactNode;
   summary?: ReactNode;
+  /** 見出し横の「？」に載せる静的な補足説明。 */
+  help?: ReactNode;
   children: ReactNode;
   contentClassName?: string;
   onOpenChange?: (open: boolean) => void;
@@ -68,24 +72,31 @@ export function SettingsDisclosure({
       className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0"
     >
       <CardHeader className="p-0 !px-0">
-        <button
-          type="button"
-          className="flex min-h-10 w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm font-semibold transition-colors hover:bg-muted dark:bg-[#242426]"
-          aria-expanded={open}
-          aria-controls={contentId}
-          onClick={toggle}
-        >
-          <span className="flex min-w-0 items-center gap-2">
-            {icon}
-            <span>{title}</span>
-            {summary}
-          </span>
-          {open ? (
-            <ChevronUp className="size-4 shrink-0" />
-          ) : (
-            <ChevronDown className="size-4 shrink-0" />
-          )}
-        </button>
+        <div className="flex min-h-10 items-stretch gap-1">
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center justify-between gap-3 px-3 py-2 text-left text-sm font-semibold transition-colors hover:bg-muted dark:bg-[#242426]"
+            aria-expanded={open}
+            aria-controls={contentId}
+            onClick={toggle}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              {icon}
+              <span>{title}</span>
+              {summary}
+            </span>
+            {open ? (
+              <ChevronUp className="size-4 shrink-0" />
+            ) : (
+              <ChevronDown className="size-4 shrink-0" />
+            )}
+          </button>
+          {help ? (
+            <span className="flex shrink-0 items-center self-center pr-2">
+              <HelpPopover label={title}>{help}</HelpPopover>
+            </span>
+          ) : null}
+        </div>
       </CardHeader>
       {open && (
         <CardContent

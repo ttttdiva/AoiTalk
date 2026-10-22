@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 
 type Settings = {
@@ -167,12 +168,13 @@ export function YomiLinterSection() {
         title="誤読リスク検出"
         targetId="yomi-linter"
         contentClassName="space-y-4"
+        help="誤読候補を検出します。読みの推測や原文の書換えは行いません。"
         onOpenChange={loadWhenOpened}
       >
         {initialLoading && <p className="text-xs text-muted-foreground">読み設定を取得中...</p>}
         <fieldset disabled={!ready} className="contents disabled:opacity-60">
           <div className="flex items-center justify-between gap-4">
-            <div><Label>Yomi Linter</Label><p className="text-xs text-muted-foreground">誤読候補を検出します。読みの推測や原文の書換えは行いません。</p></div>
+            <div><Label>Yomi Linter</Label></div>
             <Checkbox checked={settings.enabled} onCheckedChange={(value) => void saveSetting("enabled", value === true)} />
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
@@ -203,8 +205,7 @@ export function YomiLinterSection() {
         <fieldset disabled={!ready} className="contents disabled:opacity-60">
         <div className="grid gap-2 md:grid-cols-[1fr_1fr_8rem_auto]"><Input placeholder="表記（例: 魔王魂）" value={surface} onChange={(e) => setSurface(e.target.value)} /><Input placeholder="読み（例: マオウダマシイ）" value={reading} onChange={(e) => setReading(e.target.value)} /><Input type="number" min="0" placeholder="アクセント任意" value={accentType} onChange={(e) => setAccentType(e.target.value)} /><Button onClick={() => void addEntry()}>登録</Button></div>
         <Input placeholder="備考（任意）" value={notes} onChange={(event) => setNotes(event.target.value)} />
-        <div className="flex flex-wrap gap-4 text-xs"><span className="text-muted-foreground">適用対象:</span>{["voicevox", "aivisspeech", "irodori_tts", "miotts", "voiceroid", "aivoice", "cevio", "nijivoice"].map((target) => <label key={target} className="flex items-center gap-1"><Checkbox checked={targets.includes(target)} onCheckedChange={(value) => toggleTarget(target, value === true)} />{target}</label>)}</div>
-        <p className="text-xs text-muted-foreground">初期状態ではVOICEVOX / AivisSpeechのユーザー辞書へ反映します。他のTTSは検出のみです。</p>
+        <div className="flex flex-wrap gap-4 text-xs"><span className="inline-flex items-center gap-1 text-muted-foreground">適用対象:<HelpPopover label="共通読み辞書の適用対象">初期状態ではVOICEVOX / AivisSpeechのユーザー辞書へ反映します。他のTTSは検出のみです。</HelpPopover></span>{["voicevox", "aivisspeech", "irodori_tts", "miotts", "voiceroid", "aivoice", "cevio", "nijivoice", "gemini_tts"].map((target) => <label key={target} className="flex items-center gap-1"><Checkbox checked={targets.includes(target)} onCheckedChange={(value) => toggleTarget(target, value === true)} />{target}</label>)}</div>
         {dictionary.map((item) => <div key={item.id} className="flex items-center justify-between gap-3 rounded-md border p-2 text-sm"><div><span className="font-medium">{item.surface}</span><span className="mx-2 text-muted-foreground">→</span>{item.reading}{item.accent_type != null && <span className="ml-2 text-xs text-muted-foreground">アクセント {item.accent_type}</span>}<p className="text-xs text-muted-foreground">{item.target_tts.join(", ") || "すべて"}{item.notes ? ` / ${item.notes}` : ""}</p></div><div className="flex items-center gap-2"><Checkbox checked={item.enabled} onCheckedChange={(value) => void setEntryEnabled(item, value === true)} /><Button size="sm" variant="ghost" onClick={() => void deleteEntry(item.id)}>削除</Button></div></div>)}
         {!dictionary.length && <p className="text-xs text-muted-foreground">辞書項目はありません。</p>}
         </fieldset>

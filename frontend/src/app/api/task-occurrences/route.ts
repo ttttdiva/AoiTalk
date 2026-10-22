@@ -27,7 +27,7 @@ import {
   isRecurrenceSkipSourceKind,
   resolveOccurrenceOriginalStartAt,
 } from "@/lib/recurrence-exceptions";
-import { normalizeTaskStatus } from "@/lib/task-status";
+import { isClosedTaskStatus, normalizeTaskStatus } from "@/lib/task-status";
 import { estimateOccurrenceCount, parseRrule } from "@/lib/recurrence-rrule";
 import {
   resolveReadScope,
@@ -40,6 +40,7 @@ import {
   serializeDbTimestamp,
   type DbTimestampValue,
 } from "@/lib/server/db-time";
+import { todayOccurrenceCondition } from "@/lib/server/home-today-query";
 
 function extractProjectColor(value: unknown): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -143,6 +144,7 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const startFrom = searchParams.get("start_from");
   const endTo = searchParams.get("end_to");
+  const todaySummaryOnly = searchParams.get("today_summary") === "true";
 
   if (!startFrom || !endTo) {
     return NextResponse.json(
@@ -222,12 +224,14 @@ export async function GET(request: NextRequest) {
       .innerJoin(taskRecurrenceRules, eq(taskRecurrenceRules.taskId, tasks.id))
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(
-        and(
-          inArray(tasks.projectId, scopedProjectIds),
-          isNull(tasks.deletedAt),
-          isNull(taskOccurrences.deletedAt),
-          isNull(projects.deletedAt),
-        ),
+        todaySummaryOnly
+          ? todayOccurrenceCondition(scopedProjectIds, { stored: true })
+          : and(
+              inArray(tasks.projectId, scopedProjectIds),
+              isNull(tasks.deletedAt),
+              isNull(taskOccurrences.deletedAt),
+              isNull(projects.deletedAt),
+            ),
       );
 
     const recurringTasks = await db
@@ -257,9 +261,13 @@ export async function GET(request: NextRequest) {
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(
         and(
-          inArray(tasks.projectId, scopedProjectIds),
-          isNull(tasks.deletedAt),
-          isNull(projects.deletedAt),
+          todaySummaryOnly
+            ? todayOccurrenceCondition(scopedProjectIds, { stored: false })
+            : and(
+                inArray(tasks.projectId, scopedProjectIds),
+                isNull(tasks.deletedAt),
+                isNull(projects.deletedAt),
+              ),
           isNotNull(tasks.endAt),
         ),
       );
@@ -477,20 +485,26 @@ export async function GET(request: NextRequest) {
 
       const actualKey = occurrenceKey(row.taskId, actualStartAt);
       const key = originalKey ?? actualKey;
+      const status = resolveFutureRecurringStatus({
+        status: row.status,
+        resetStatusTo: row.resetStatusTo,
+        triggerStatus: row.triggerStatus,
+        sourceKind: row.sourceKind,
+        startAt: actualStartAt,
+        now,
+      });
+      if (todaySummaryOnly && isClosedTaskStatus(status)) {
+        hiddenOccurrences.add(key);
+        removeCanonicalOccurrences(key);
+        continue;
+      }
       occurrences.set(key, {
         id: row.id,
         task_id: row.taskId,
         project_id: row.projectId,
         title: row.title,
         project_name: row.projectName,
-        status: resolveFutureRecurringStatus({
-          status: row.status,
-          resetStatusTo: row.resetStatusTo,
-          triggerStatus: row.triggerStatus,
-          sourceKind: row.sourceKind,
-          startAt: actualStartAt,
-          now,
-        }),
+        status,
         start_at: serializeOccurrenceTimestamp(actualStartAt, actualAllDay),
         end_at: serializeOccurrenceTimestamp(actualEndAt, actualAllDay),
         all_day: actualAllDay,
@@ -678,6 +692,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(result);
   } catch (err) {
     console.error("Occurrences fetch error:", err);
-    return NextResponse.json([], { status: 200 });
+    if (!todaySummaryOnly) return NextResponse.json([], { status: 200 });
+    return NextResponse.json(
+      { detail: "予定を取得できませんでした" },
+      { status: 500 },
+    );
   }
 }

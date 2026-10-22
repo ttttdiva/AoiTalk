@@ -94,39 +94,44 @@ class MetricSummary(_OverviewModel):
     by_content: list[MetricContentSummary] = Field(default_factory=list)
 
 
-class RevenueCurrencySummary(_OverviewModel):
-    currency: str
+class RevenueBucketSummary(_OverviewModel):
+    currency: str | None = None
     event_count: int = Field(ge=1)
-    gross: float
-    net: float
+    gross: float | None
+    net: float | None
+    event_type: str = "unknown"
+    source: str = "unknown"
+    settlement_status: str = "unknown"
+    revenue_authority: str = "unknown"
+    cost_authority: str = "unknown"
+    fee_amount: float | None = None
+    production_cost_amount: float | None = None
+    human_cost_amount: float | None = None
+    human_minutes: float | None = None
+    cost_coverage_complete: bool = False
+    profit_amount: float | None = None
+    profit_status: str = "unavailable_cost_record"
+    profit_unavailable_reasons: list[str] = Field(default_factory=list)
 
 
-class RevenuePlatformSummary(_OverviewModel):
+class RevenueCurrencySummary(RevenueBucketSummary):
+    pass
+
+
+class RevenuePlatformSummary(RevenueBucketSummary):
     platform: str
-    event_count: int = Field(ge=1)
-    gross: float
-    net: float
 
 
-class RevenueAccountSummary(_OverviewModel):
+class RevenueAccountSummary(RevenueBucketSummary):
     account_ref: str
-    event_count: int = Field(ge=1)
-    gross: float
-    net: float
 
 
-class RevenueContentSummary(_OverviewModel):
+class RevenueContentSummary(RevenueBucketSummary):
     content_ref: str
-    event_count: int = Field(ge=1)
-    gross: float
-    net: float
 
 
-class RevenueProductSummary(_OverviewModel):
+class RevenueProductSummary(RevenueBucketSummary):
     product_ref: str
-    event_count: int = Field(ge=1)
-    gross: float
-    net: float
 
 
 class RevenueSummary(_OverviewModel):

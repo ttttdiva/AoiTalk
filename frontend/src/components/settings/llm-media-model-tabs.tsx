@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   defaultModeForOptions,
   providerSelection,
@@ -111,7 +112,12 @@ export function LlmMediaModelTabs({
   return (
     <>
       <TabsContent value="vision" className="mt-3 space-y-3">
-        <p className="text-xs text-muted-foreground">既定では言語モデルを使います。対応しないモデルの場合のみ、画像対応モデルを指定してください。</p>
+        <div className="inline-flex items-center gap-1 text-xs font-medium">
+          画像認識
+          <HelpPopover label="画像認識">
+            既定では言語モデルを使います。対応しないモデルの場合のみ、画像対応モデルを指定してください。
+          </HelpPopover>
+        </div>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
             <Label className="text-xs">プロバイダー</Label>
@@ -173,7 +179,12 @@ export function LlmMediaModelTabs({
       </TabsContent>
 
       <TabsContent value="audio" className="mt-3 space-y-3">
-        <p className="text-xs text-muted-foreground">音声対応が確認できるモデルだけを選べます。ローカルSTTは設定済みの実モデル名を表示します。</p>
+        <div className="inline-flex items-center gap-1 text-xs font-medium">
+          音声認識
+          <HelpPopover label="音声認識">
+            音声対応が確認できるモデルだけを選べます。ローカルSTTは設定済みの実モデル名を表示します。
+          </HelpPopover>
+        </div>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
             <Label className="text-xs">プロバイダー</Label>
@@ -213,9 +224,12 @@ export function LlmMediaModelTabs({
       </TabsContent>
 
       <TabsContent value="video" className="mt-3 space-y-3">
-        <p className="text-xs text-muted-foreground">
-          Microsoft Mage-VLをSGLangのOpenAI互換サーバーとして使います。動画は保存済みパスから等間隔フレームを抽出し、1回の認識リクエストにまとめて送信します。
-        </p>
+        <div className="inline-flex items-center gap-1 text-xs font-medium">
+          動画認識
+          <HelpPopover label="動画認識">
+            Microsoft Mage-VLをSGLangのOpenAI互換サーバーとして使います。動画は保存済みパスから等間隔フレームを抽出し、1回の認識リクエストにまとめて送信します。
+          </HelpPopover>
+        </div>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
             <Label className="text-xs">動画認識</Label>
@@ -334,7 +348,12 @@ export function LlmMediaModelTabs({
       </TabsContent>
 
       <TabsContent value="clip_ingest" className="mt-3 space-y-3">
-        <p className="text-xs text-muted-foreground">クリップ取り込み（Docsへの保存計画の生成）に使うモデルです。既定では言語モデルを使います。</p>
+        <div className="inline-flex items-center gap-1 text-xs font-medium">
+          クリップ取り込み
+          <HelpPopover label="クリップ取り込み">
+            Docsへの保存計画の生成に使うモデルです。既定では言語モデルを使います。
+          </HelpPopover>
+        </div>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
             <Label className="text-xs">プロバイダー</Label>
@@ -381,7 +400,7 @@ export function LlmMediaModelTabs({
           <div className="space-y-1">
             <Label className="text-xs">モデル</Label>
             <AppSelect
-              value={clipIngestDraft.model}
+              value={clipIngestDraft.customModel.trim() || clipIngestDraft.model}
               onChange={(event) => {
                 const nextModel = event.target.value;
                 const effortOptions = clipIngestReasoningEffortOptions(
@@ -406,42 +425,13 @@ export function LlmMediaModelTabs({
               disabled={savingRouting || clipIngestInherit}
               className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
             >
+              {clipIngestDraft.customModel.trim() && !(clipIngestProvider?.models ?? []).some((item) => item.id === clipIngestDraft.customModel.trim()) && (
+                <option value={clipIngestDraft.customModel.trim()}>{clipIngestDraft.customModel.trim()}</option>
+              )}
               {(clipIngestProvider?.models ?? []).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
             </AppSelect>
           </div>
         </div>
-        {!clipIngestInherit && (
-          <div className="space-y-1">
-            <Label className="text-xs">カスタムモデルID</Label>
-            <Input
-              value={clipIngestDraft.customModel}
-              onChange={(event) => {
-                const customModel = event.target.value;
-                const effectiveModel = customModel.trim() || clipIngestDraft.model;
-                const effortOptions = clipIngestReasoningEffortOptions(
-                  clipIngestProvider,
-                  effectiveModel,
-                );
-                setClassDrafts((current) => ({
-                  ...current,
-                  clip_ingest: {
-                    ...current.clip_ingest,
-                    customModel,
-                    mode: effortOptions.length
-                      ? defaultModeForOptions(
-                        effortOptions,
-                        current.clip_ingest.mode || "medium",
-                      )
-                      : "",
-                  },
-                }));
-              }}
-              placeholder="候補にないモデルIDを直接入力"
-              disabled={savingRouting}
-              className="h-8"
-            />
-          </div>
-        )}
         {showClipIngestEffort && (
           <div className="max-w-xs space-y-1">
             <Label className="text-xs">Effort</Label>

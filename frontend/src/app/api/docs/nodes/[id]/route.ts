@@ -1,5 +1,6 @@
 ﻿import { NextRequest, NextResponse } from "next/server";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
+import { docsIdIn } from "@/lib/server/docs-id-condition";
 import { db } from "@/db";
 import { knowledgeNodes, projects } from "@/db/schema";
 import { getSession } from "@/lib/auth";
@@ -408,7 +409,7 @@ export async function PATCH(
   }
   // 削除は子孫ごとアーカイブするので、復元も同じ操作の timestamp を
   // transaction 内で再確認して戻す。 preflight の配列は競合中に stale になり得る。
-  let restoreDescendantIds: string[] = [];
+  const restoreDescendantIds: string[] = [];
 
   let descendantIds: string[] = [];
   if ("parent_id" in body) {
@@ -443,7 +444,7 @@ export async function PATCH(
         const pointerRows = await db
           .select({ id: projects.id })
           .from(projects)
-          .where(inArray(projects.knowledgeNodeId, [access.node.id, ...descendantIds]))
+          .where(docsIdIn(projects.knowledgeNodeId, [access.node.id, ...descendantIds]))
           .limit(1);
         if (pointerRows.length > 0) {
           return NextResponse.json(
@@ -585,6 +586,7 @@ export async function PATCH(
       let lockedTarget: typeof knowledgeNodes.$inferSelect = access.node;
       let restoreParentId: string | null = null;
       let earlyDescendantSnapshotIds: string[] = [];
+      let earlyRestoreSnapshotIds: string[] = [];
       const lifecycleOnlyRestoreRequest =
         "archived" in body
         && body.archived === false
@@ -676,6 +678,7 @@ export async function PATCH(
               id,
             )
             : [];
+          earlyRestoreSnapshotIds = earlyRestoreDescendantIds;
           const earlyClosureIds = [
             id,
             ...earlyDescendantIds,
@@ -685,7 +688,7 @@ export async function PATCH(
             const earlyPointers = await tx
               .select({ id: projects.id })
               .from(projects)
-              .where(inArray(projects.knowledgeNodeId, earlyClosureIds))
+              .where(docsIdIn(projects.knowledgeNodeId, earlyClosureIds))
               .orderBy(asc(projects.id))
               .for("update");
             if (earlyPointers.length > 0) {
@@ -757,7 +760,7 @@ export async function PATCH(
               .where(
                 and(
                   eq(knowledgeNodes.docsLibraryId, access.workspace.id),
-                  inArray(knowledgeNodes.id, orderedEarlyNodeLockIds),
+                  docsIdIn(knowledgeNodes.id, orderedEarlyNodeLockIds),
                 ),
               )
               .orderBy(asc(knowledgeNodes.id))
@@ -838,6 +841,13 @@ export async function PATCH(
             access.workspace.id,
             id,
           );
+          if (lifecycleOnlyRestoreRequest) {
+            const earlyRestoreSet = new Set(earlyRestoreSnapshotIds);
+            if (restoreCandidates.length !== earlyRestoreSet.size
+              || restoreCandidates.some((nodeId) => !earlyRestoreSet.has(nodeId))) {
+              throw new DocsNodeInvariantError("復元対象のDocs subtreeが同時変更されたため復元を中止しました");
+            }
+          }
           if (restoreCandidates.length > 0) {
             // Compare a second structural snapshot before locking any
             // descendant.  A child committed after the first snapshot may be
@@ -858,19 +868,41 @@ export async function PATCH(
               throw new DocsNodeInvariantError("復元対象のDocs subtreeが同時変更されたため復元を中止しました");
             }
             const lockedRestoreRows = await tx
-              .select({ id: knowledgeNodes.id, archivedAt: knowledgeNodes.archivedAt })
+              .select({ id: knowledgeNodes.id, parentId: knowledgeNodes.parentId })
               .from(knowledgeNodes)
               .where(
                 and(
                   eq(knowledgeNodes.docsLibraryId, access.workspace.id),
-                  inArray(knowledgeNodes.id, restoreCandidates),
+                  docsIdIn(knowledgeNodes.id, restoreCandidates),
+                  // Compare in PostgreSQL: Date.getTime() drops Python's
+                  // microseconds and can merge independent archive batches.
+                  sql`${knowledgeNodes.archivedAt} = (
+                    select archived_at from knowledge_nodes
+                    where id = ${id} and docs_library_id = ${access.workspace.id}
+                  )`,
                 ),
               )
               .orderBy(asc(knowledgeNodes.id))
               .for("update");
-            restoreDescendantIds = lockedRestoreRows
-              .filter((row) => row.archivedAt && row.archivedAt.getTime() === lockedTarget.archivedAt!.getTime())
-              .map((row) => row.id);
+            // A separately archived ancestor is a restoration boundary.
+            // Even a matching batch below it must not become an active orphan.
+            const children = new Map<string, string[]>();
+            for (const row of lockedRestoreRows) {
+              if (!row.parentId) continue;
+              const siblings = children.get(row.parentId) ?? [];
+              siblings.push(row.id);
+              children.set(row.parentId, siblings);
+            }
+            const pending = [id];
+            const seen = new Set([id]);
+            while (pending.length > 0) {
+              for (const childId of children.get(pending.pop()!) ?? []) {
+                if (seen.has(childId)) continue;
+                seen.add(childId);
+                restoreDescendantIds.push(childId);
+                pending.push(childId);
+              }
+            }
           }
         }
         if (lockedPointerRows.length > 0 && !canonicalProjectRoot) {
@@ -919,7 +951,7 @@ export async function PATCH(
         const identityRows = await tx
           .select({ id: knowledgeNodes.id, systemKey: knowledgeNodes.systemKey })
           .from(knowledgeNodes)
-          .where(inArray(knowledgeNodes.id, closureIds));
+          .where(docsIdIn(knowledgeNodes.id, closureIds));
         if (identityRows.some((candidate) =>
           candidate.id !== id
           && (String(candidate.systemKey ?? "").trim() === "project_information_root"
@@ -932,7 +964,7 @@ export async function PATCH(
         const pointers = await tx
           .select({ id: projects.id })
           .from(projects)
-          .where(inArray(projects.knowledgeNodeId, closureIds))
+          .where(docsIdIn(projects.knowledgeNodeId, closureIds))
           .for("update");
         if (pointers.length > 0) {
           throw new DocsNodeInvariantError(
@@ -942,7 +974,7 @@ export async function PATCH(
         await tx
           .select({ id: knowledgeNodes.id })
           .from(knowledgeNodes)
-          .where(inArray(knowledgeNodes.id, closureIds))
+          .where(docsIdIn(knowledgeNodes.id, closureIds))
           .orderBy(asc(knowledgeNodes.id))
           .for("update");
         if (updates.parentId) {
@@ -1065,7 +1097,11 @@ export async function PATCH(
     }
 
       await upsertKnowledgeSearchIndex(tx, row, effectiveDocsSearchBodyText(row));
-      await syncKnowledgeNodeReferenceEdges(tx, row, user.id);
+      if (!lifecycleOnlyRestoreRequest) {
+        // Pure lifecycle restores preserve existing edge metadata. Content or
+        // mixed PATCHes retain the historical root reference re-resolution.
+        await syncKnowledgeNodeReferenceEdges(tx, row, user.id);
+      }
       await appendKnowledgeRevision(tx, row, user.id, "nodeを更新");
       return row;
     });
@@ -1210,7 +1246,7 @@ export async function DELETE(
             displayProps: knowledgeNodes.displayProps,
           })
           .from(knowledgeNodes)
-          .where(inArray(knowledgeNodes.id, closure.map((row) => row.id)))
+          .where(docsIdIn(knowledgeNodes.id, closure.map((row) => row.id)))
           .orderBy(asc(knowledgeNodes.id))
           .for("update");
         const managedClosureNode = lockedClosureNodes.find((node) =>
@@ -1230,7 +1266,7 @@ export async function DELETE(
         const identityDescendants = await tx
           .select({ id: knowledgeNodes.id, systemKey: knowledgeNodes.systemKey })
           .from(knowledgeNodes)
-          .where(inArray(knowledgeNodes.id, closure.map((row) => row.id)));
+          .where(docsIdIn(knowledgeNodes.id, closure.map((row) => row.id)));
         if (identityDescendants.some((row) =>
           row.id !== id
           && (String(row.systemKey ?? "").trim() === "project_information_root"
@@ -1338,6 +1374,7 @@ export async function DELETE(
     if (root.docsLibraryId !== access.workspace.id) {
       return { kind: "integrity_failure" } as const;
     }
+    let activeNodeIds = new Set(closure.map((row) => row.id));
     if (typeof tx.select === "function") {
       const [lockedTarget] = await tx
         .select()
@@ -1353,6 +1390,9 @@ export async function DELETE(
       try {
         if (!lockedTarget) return { kind: "missing" } as const;
         await lockAndAssertGenericDocsMutationAllowed(lockedTarget, tx, user);
+        if (lockedTarget.archivedAt) {
+          return { kind: "archived", row: lockedTarget, archivedNodeIds: [] } as const;
+        }
       } catch (error) {
         if (error instanceof ManagedDocsMutationError) {
           return { kind: "managed", detail: error.message } as const;
@@ -1375,11 +1415,18 @@ export async function DELETE(
           projectId: knowledgeNodes.projectId,
           systemKey: knowledgeNodes.systemKey,
           displayProps: knowledgeNodes.displayProps,
+          archivedAt: knowledgeNodes.archivedAt,
         })
         .from(knowledgeNodes)
-        .where(inArray(knowledgeNodes.id, closure.map((row) => row.id)))
+        .where(docsIdIn(knowledgeNodes.id, closure.map((row) => row.id)))
         .orderBy(asc(knowledgeNodes.id))
         .for("update");
+      if (lockedClosureNodes.length !== activeNodeIds.size) {
+        throw new DocsNodeInvariantError("Docs subtreeが同時変更されたためアーカイブを中止しました");
+      }
+      activeNodeIds = new Set(lockedClosureNodes
+        .filter((node) => node.archivedAt === null)
+        .map((node) => node.id));
       const managedClosureNode = lockedClosureNodes.find((node) =>
         managedDocsDomain(node) !== null,
       );
@@ -1397,7 +1444,7 @@ export async function DELETE(
       const identityDescendants = await tx
         .select({ id: knowledgeNodes.id, systemKey: knowledgeNodes.systemKey })
         .from(knowledgeNodes)
-        .where(inArray(knowledgeNodes.id, closure.map((row) => row.id)));
+        .where(docsIdIn(knowledgeNodes.id, closure.map((row) => row.id)));
       if (identityDescendants.some((row) =>
         row.id !== id
         && (String(row.systemKey ?? "").trim() === "project_information_root"
@@ -1422,7 +1469,7 @@ export async function DELETE(
     }
 
     const descendantIds = Array.from(
-      new Set(closure.filter((row) => row.id !== id).map((row) => row.id)),
+      new Set(closure.filter((row) => row.id !== id && activeNodeIds.has(row.id)).map((row) => row.id)),
     );
     const row = await updateDocsNodeLifecycle(tx, id, {
       archivedAt,

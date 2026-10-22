@@ -43,12 +43,14 @@ _SAFE_EXECUTION_MANIFEST_KEYS = frozenset(
         "capabilities",
         "project_id",
         "task_id",
+        "work_item_id",
         "persona_id",
         "workspace_access",
         "network_access",
         "run_scope_hash",
         "authority_hash",
         "source",
+        "route_snapshot",
     }
 )
 
@@ -62,6 +64,16 @@ def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
     for key, item in value.items():
         name = str(key)
         if name not in _SAFE_EXECUTION_MANIFEST_KEYS:
+            continue
+        if name == "route_snapshot":
+            try:
+                from ...services.agent_model_routing import safe_route_snapshot
+
+                snapshot = safe_route_snapshot(item)
+            except Exception:
+                snapshot = {}
+            if snapshot:
+                result[name] = snapshot
             continue
         if isinstance(item, str):
             if len(item) > 512 or "/" in item or "\\" in item:

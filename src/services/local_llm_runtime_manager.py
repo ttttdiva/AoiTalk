@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import logging
 import os
 import platform
 import re
@@ -16,6 +17,7 @@ import tarfile
 import threading
 import uuid
 import zipfile
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Iterable
@@ -29,21 +31,27 @@ from src.llm.openai_compatible_local_profiles import (
     LLAMA_CPP_RUNTIME_DISTRIBUTION_PRISMML,
     LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK,
     freetoken_model_profile,
+    strata_model_profile,
     llama_cpp_auxiliary_artifacts,
     llama_cpp_model_profile,
     llama_cpp_runtime_distribution,
     managed_local_runtime_for_model,
 )
 from .local_llm_paths import (
+    ResolvedLocalLlmRoot,
     canonicalize_llama_cpp_model_root_override,
     default_managed_models_root,
+    llama_cpp_executable_setting,
     llama_cpp_model_discovery_roots,
     resolve_llama_cpp_model_root,
     resolve_managed_runtime_root,
     validate_managed_child,
+    _contains_symlink,
 )
 
-_MANAGED_RUNTIMES = frozenset({"llama_cpp", "freetoken"})
+logger = logging.getLogger(__name__)
+
+_MANAGED_RUNTIMES = frozenset({"llama_cpp", "freetoken", "strata"})
 _LLAMA_CPP_BUILD_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9])b(\d{3,})(?!\d)", re.IGNORECASE),
     re.compile(r"\bbuild(?:\s+number)?\s*[:=]?\s*(\d{3,})\b", re.IGNORECASE),
@@ -103,6 +111,67 @@ _LLAMA_CPP_RUNTIME_DISTRIBUTIONS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+def llama_cpp_required_commit(profile: dict[str, Any] | None) -> str | None:
+    """Resolve the trusted distribution/profile commit without filesystem discovery."""
+    contract = ManagedLocalRuntimeManager._llama_cpp_distribution(profile)
+    distribution_commit = str(contract.get("required_commit") or "").strip().casefold()
+    profile_commit = (
+        str((profile or {}).get("required_llama_cpp_commit") or "").strip().casefold()
+    )
+    for value in (distribution_commit, profile_commit):
+        if value and not re.fullmatch(r"[0-9a-f]{7,40}", value):
+            raise RuntimeError("trusted llama.cpp runtime has invalid required commit")
+    if distribution_commit and profile_commit and not (
+        distribution_commit.startswith(profile_commit)
+        or profile_commit.startswith(distribution_commit)
+    ):
+        raise RuntimeError(
+            "llama.cpp profile required commit conflicts with runtime distribution"
+        )
+    return distribution_commit or profile_commit or None
+
+
+def recover_llama_cpp_profile_executable(
+    manager: Any,
+    configured: str,
+    profile: dict[str, Any] | None,
+    *,
+    source: str,
+    executable: str = "",
+) -> dict[str, str]:
+    """Share the marker/profile-validated recovery policy for status and launch.
+
+    Only a persisted override may recover, first through the current managed
+    install and then the trusted legacy anchor. Never recover env overrides,
+    unregistered models, or a missing persisted path through arbitrary PATH.
+    """
+
+    empty = {"executable": "", "source": "", "recovery": ""}
+    if source != "configured" or not configured or profile is None:
+        return empty
+    fallback = str(manager.compatible_managed_llama_cpp_executable(profile) or "").strip()
+    recovery = "current"
+    if not fallback:
+        legacy = getattr(manager, "compatible_marker_backed_legacy_llama_cpp_executable", None)
+        if callable(legacy):
+            fallback = str(legacy(configured, profile) or "").strip()
+            recovery = "legacy"
+    if not fallback:
+        return empty
+    if executable:
+        try:
+            same_path = Path(fallback).expanduser().resolve(strict=False) == Path(
+                executable
+            ).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            same_path = os.path.normcase(os.path.normpath(fallback)) == os.path.normcase(
+                os.path.normpath(executable)
+            )
+        if same_path:
+            return empty
+    return {"executable": fallback, "source": "managed", "recovery": recovery}
 
 
 def _fetch_llama_cpp_release_json(url: str) -> dict[str, Any]:
@@ -461,6 +530,11 @@ def verify_release_asset_digest(path: Path, asset: dict[str, Any]) -> None:
 class ManagedLocalRuntimeManager:
     """Prepare trusted model artifacts without accepting arbitrary URLs/paths."""
 
+    _ARTIFACT_VERIFY_CACHE_MAX = 256
+    _ARTIFACT_VERIFY_CACHE: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
+    _ARTIFACT_VERIFY_INFLIGHT: dict[tuple[Any, ...], threading.Event] = {}
+    _ARTIFACT_VERIFY_LOCK = threading.RLock()
+
     def __init__(
         self,
         config: Any = None,
@@ -473,7 +547,8 @@ class ManagedLocalRuntimeManager:
     ) -> None:
         self.config = config
         self._runtime_root_explicit = root is not None
-        self.root = self._resolve_runtime_root(root)
+        self._runtime_root_resolution = self._resolve_runtime_root_info(root)
+        self.root = self._runtime_root_resolution.path
         self.platform_name = str(platform_name or sys.platform).strip().lower()
         self.machine = str(machine or platform.machine()).strip().lower()
         self._release_provider = release_provider or _default_llama_cpp_release_provider
@@ -485,6 +560,13 @@ class ManagedLocalRuntimeManager:
         self._runtime_install_lock = threading.Lock()
         self._tasks: dict[str, dict[str, Any]] = {}
         self._active: dict[tuple[str, str], str] = {}
+        self._task_callbacks: dict[
+            str,
+            tuple[Callable[[], None] | None, Callable[[BaseException], None] | None],
+        ] = {}
+        self._task_cancel_events: dict[str, threading.Event] = {}
+        self._task_setup_processes: dict[str, Any] = {}
+        self._task_state_locks: dict[str, threading.Lock] = {}
 
     def _config_get(self, key: str, default: Any = None) -> Any:
         getter = getattr(self.config, "get", None)
@@ -507,11 +589,17 @@ class ManagedLocalRuntimeManager:
         self,
         explicit_root: str | Path | None,
     ) -> Path:
+        return self._resolve_runtime_root_info(explicit_root).path
+
+    def _resolve_runtime_root_info(
+        self,
+        explicit_root: str | Path | None,
+    ) -> ResolvedLocalLlmRoot:
         return resolve_managed_runtime_root(
             self.config,
             explicit=explicit_root,
             create=False,
-        ).path
+        )
 
     @staticmethod
     def _llama_cpp_distribution(
@@ -529,26 +617,7 @@ class ManagedLocalRuntimeManager:
         self,
         profile: dict[str, Any] | None,
     ) -> str | None:
-        contract = self._llama_cpp_distribution(profile)
-        distribution_commit = str(
-            contract.get("required_commit") or ""
-        ).strip().casefold()
-        profile_commit = str(
-            (profile or {}).get("required_llama_cpp_commit") or ""
-        ).strip().casefold()
-        for value in (distribution_commit, profile_commit):
-            if value and not re.fullmatch(r"[0-9a-f]{7,40}", value):
-                raise RuntimeError(
-                    "trusted llama.cpp runtime has invalid required commit"
-                )
-        if distribution_commit and profile_commit and not (
-            distribution_commit.startswith(profile_commit)
-            or profile_commit.startswith(distribution_commit)
-        ):
-            raise RuntimeError(
-                "llama.cpp profile required commit conflicts with runtime distribution"
-            )
-        return distribution_commit or profile_commit or None
+        return llama_cpp_required_commit(profile)
 
     def _llama_cpp_distribution_root(
         self,
@@ -621,7 +690,7 @@ class ManagedLocalRuntimeManager:
         value = str(runtime).strip().lower()
         if value not in _MANAGED_RUNTIMES:
             raise ValueError(
-                "runtime must be one of: llama_cpp, freetoken"
+                "runtime must be one of: llama_cpp, freetoken, strata"
             )
         return value
 
@@ -645,7 +714,9 @@ class ManagedLocalRuntimeManager:
                 f"requested={requested_runtime!r}, resolved={resolved_runtime!r}"
             )
 
-        if resolved_runtime == "freetoken":
+        if resolved_runtime == "strata":
+            profile = strata_model_profile(model_id)
+        elif resolved_runtime == "freetoken":
             profile = freetoken_model_profile(model_id)
         elif resolved_runtime == "llama_cpp":
             profile = llama_cpp_model_profile(model_id)
@@ -755,6 +826,36 @@ class ManagedLocalRuntimeManager:
         except OSError:
             return False
 
+    @staticmethod
+    def _cheap_artifact_file(
+        path: Path,
+        *,
+        expected_size: int | None = None,
+    ) -> bool:
+        """Check one prepared artifact without reading its whole contents.
+
+        Status polling must remain responsive while a multi-gigabyte GGUF is
+        loading.  Preparation keeps using :meth:`_verify_hf_artifact`; this
+        helper only proves that the path is a regular, non-empty file and that
+        any trusted size metadata still matches.  Reading a tiny prefix also
+        catches an empty/placeholder file without turning a poll into a hash.
+        """
+
+        if not ManagedLocalRuntimeManager._regular_non_symlink_file(path):
+            return False
+        try:
+            metadata = path.stat()
+            if expected_size is not None and int(metadata.st_size) != int(
+                expected_size
+            ):
+                return False
+            if int(metadata.st_size) <= 0:
+                return False
+            with path.open("rb") as stream:
+                return bool(stream.read(4))
+        except OSError:
+            return False
+
     def _llama_cpp_discovery_roots(self) -> list[Path]:
         return llama_cpp_model_discovery_roots(self.config)
 
@@ -845,28 +946,94 @@ class ManagedLocalRuntimeManager:
         expected_size: int | None = None,
         expected_sha256: str | None = None,
     ) -> None:
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or _contains_symlink(path):
             raise RuntimeError("managed Hugging Face artifact is not a regular file")
-        if expected_size is not None and path.stat().st_size != expected_size:
+        try:
+            canonical = path.resolve(strict=True)
+            metadata = canonical.stat()
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("managed Hugging Face artifact cannot be stat'ed") from exc
+        if not canonical.is_file() or canonical.is_symlink() or _contains_symlink(canonical):
+            raise RuntimeError("managed Hugging Face artifact is not a regular file")
+        if expected_size is not None and metadata.st_size != expected_size:
             raise RuntimeError(
                 f"managed Hugging Face artifact size mismatch: {path.name}"
             )
-        if expected_sha256:
-            digest = str(expected_sha256).strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise RuntimeError("managed Hugging Face artifact SHA-256 is invalid")
+        digest = str(expected_sha256 or "").strip().lower()
+        if not digest:
+            return
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError("managed Hugging Face artifact SHA-256 is invalid")
+        key = (
+            os.path.normcase(str(canonical)),
+            int(getattr(metadata, "st_dev", 0)),
+            int(getattr(metadata, "st_ino", 0)),
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+            int(metadata.st_ctime_ns),
+            int(expected_size) if expected_size is not None else None,
+            digest,
+        )
+        while True:
+            with ManagedLocalRuntimeManager._ARTIFACT_VERIFY_LOCK:
+                if key in ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE:
+                    ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE.move_to_end(key)
+                    return
+                waiter = ManagedLocalRuntimeManager._ARTIFACT_VERIFY_INFLIGHT.get(key)
+                if waiter is None:
+                    waiter = threading.Event()
+                    ManagedLocalRuntimeManager._ARTIFACT_VERIFY_INFLIGHT[key] = waiter
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            waiter.wait()
+
+        try:
             actual = hashlib.sha256()
-            with path.open("rb") as stream:
+            with canonical.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     actual.update(chunk)
             if actual.hexdigest() != digest:
                 raise RuntimeError(
                     f"managed Hugging Face artifact checksum mismatch: {path.name}"
                 )
+            # Re-stat the exact path after hashing. A replacement, symlink,
+            # junction, or metadata change during the long read must never
+            # become a successful cache entry.
+            if path.is_symlink() or _contains_symlink(path):
+                raise RuntimeError("managed Hugging Face artifact changed during verification")
+            canonical_after = path.resolve(strict=True)
+            metadata_after = canonical_after.stat()
+            if (
+                os.path.normcase(str(canonical_after))
+                != os.path.normcase(str(canonical))
+                or int(getattr(metadata_after, "st_dev", 0))
+                != int(getattr(metadata, "st_dev", 0))
+                or int(getattr(metadata_after, "st_ino", 0))
+                != int(getattr(metadata, "st_ino", 0))
+                or int(metadata_after.st_size) != int(metadata.st_size)
+                or int(metadata_after.st_mtime_ns) != int(metadata.st_mtime_ns)
+                or int(metadata_after.st_ctime_ns) != int(metadata.st_ctime_ns)
+            ):
+                raise RuntimeError("managed Hugging Face artifact changed during verification")
+            with ManagedLocalRuntimeManager._ARTIFACT_VERIFY_LOCK:
+                ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE[key] = True
+                ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE.move_to_end(key)
+                while len(ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE) > ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE_MAX:
+                    ManagedLocalRuntimeManager._ARTIFACT_VERIFY_CACHE.popitem(last=False)
+        finally:
+            with ManagedLocalRuntimeManager._ARTIFACT_VERIFY_LOCK:
+                event = ManagedLocalRuntimeManager._ARTIFACT_VERIFY_INFLIGHT.pop(key, None)
+                if event is not None:
+                    event.set()
 
     def _discover_existing_llama_cpp_artifact(
         self,
         profile: dict[str, Any],
+        *,
+        verify_artifacts: bool = True,
     ) -> Path | None:
         primary, filenames, repository_subdir = self._llama_cpp_artifact_contract(
             profile
@@ -955,24 +1122,31 @@ class ManagedLocalRuntimeManager:
                         )
                         if not self._regular_non_symlink_file(auxiliary_path):
                             raise ValueError("required auxiliary artifact is missing")
-                        self._verify_hf_artifact(
+                        if verify_artifacts:
+                            self._verify_hf_artifact(
+                                auxiliary_path,
+                                expected_size=artifact.get("size_bytes"),
+                                expected_sha256=artifact.get("sha256"),
+                            )
+                        elif not self._cheap_artifact_file(
                             auxiliary_path,
                             expected_size=artifact.get("size_bytes"),
-                            expected_sha256=artifact.get("sha256"),
-                        )
+                        ):
+                            raise ValueError("required auxiliary artifact is incomplete")
                         auxiliary_paths.append(auxiliary_path)
                 except (OSError, RuntimeError, ValueError):
                     continue
-                try:
-                    for artifact in required_auxiliaries:
-                        self._verify_hf_artifact(
-                            parent / str(artifact["filename"]),
-                            expected_size=artifact.get("size_bytes"),
-                            expected_sha256=artifact.get("sha256"),
-                        )
-                    return safe_candidate.resolve(strict=True)
-                except (OSError, RuntimeError):
-                    continue
+                if verify_artifacts:
+                    try:
+                        for artifact in required_auxiliaries:
+                            self._verify_hf_artifact(
+                                parent / str(artifact["filename"]),
+                                expected_size=artifact.get("size_bytes"),
+                                expected_sha256=artifact.get("sha256"),
+                            )
+                    except (OSError, RuntimeError):
+                        continue
+                return safe_candidate.resolve(strict=True)
         return None
 
     @staticmethod
@@ -1063,6 +1237,8 @@ class ManagedLocalRuntimeManager:
         runtime: str,
         profile: dict[str, Any],
         destination: Path,
+        *,
+        verify_artifacts: bool = True,
     ) -> bool:
         try:
             if runtime == "freetoken":
@@ -1110,17 +1286,32 @@ class ManagedLocalRuntimeManager:
                 return False
             primary_size = profile.get("gguf_size_bytes")
             primary_sha256 = profile.get("gguf_sha256")
-            ManagedLocalRuntimeManager._verify_hf_artifact(
-                directory / primary,
-                expected_size=primary_size,
-                expected_sha256=primary_sha256,
-            )
-            for artifact in required_auxiliaries:
+            if verify_artifacts:
                 ManagedLocalRuntimeManager._verify_hf_artifact(
-                    directory / str(artifact["filename"]),
-                    expected_size=artifact.get("size_bytes"),
-                    expected_sha256=artifact.get("sha256"),
+                    directory / primary,
+                    expected_size=primary_size,
+                    expected_sha256=primary_sha256,
                 )
+                for artifact in required_auxiliaries:
+                    ManagedLocalRuntimeManager._verify_hf_artifact(
+                        directory / str(artifact["filename"]),
+                        expected_size=artifact.get("size_bytes"),
+                        expected_sha256=artifact.get("sha256"),
+                    )
+            else:
+                if not ManagedLocalRuntimeManager._cheap_artifact_file(
+                    directory / primary,
+                    expected_size=primary_size,
+                ):
+                    return False
+                if not all(
+                    ManagedLocalRuntimeManager._cheap_artifact_file(
+                        directory / str(artifact["filename"]),
+                        expected_size=artifact.get("size_bytes"),
+                    )
+                    for artifact in required_auxiliaries
+                ):
+                    return False
             return True
         except (OSError, RuntimeError):
             return False
@@ -1240,20 +1431,22 @@ class ManagedLocalRuntimeManager:
         self,
         profile: dict[str, Any] | None = None,
     ) -> dict[str, str]:
-        configured = str(
+        configured, source = llama_cpp_executable_setting(
             self._config_get(
                 "openai_compatible_local.llama_cpp.executable",
                 "",
             )
-            or ""
-        ).strip()
+        )
         if configured:
             candidate = Path(configured).expanduser()
             if candidate.is_file():
-                return {"executable": str(candidate), "source": "configured"}
+                return {"executable": str(candidate), "source": source}
             located = shutil.which(configured)
             if located:
-                return {"executable": located, "source": "configured"}
+                return {"executable": located, "source": source}
+            # The requested override must be validated or recovered through
+            # the shared marker/profile policy, never silently through PATH.
+            return {"executable": str(candidate), "source": source}
 
         managed_info = self._managed_llama_executable_info(profile)
         if managed_info["executable"]:
@@ -1269,19 +1462,6 @@ class ManagedLocalRuntimeManager:
         if located:
             return {"executable": str(located), "source": "path"}
 
-        for legacy in (
-            os.getenv("LLAMA_CPP_EXECUTABLE"),
-            os.getenv("LLAMA_SERVER_EXE"),
-        ):
-            value = str(legacy or "").strip()
-            if not value:
-                continue
-            candidate = Path(value).expanduser()
-            if candidate.is_file():
-                return {"executable": str(candidate), "source": "legacy"}
-            located = shutil.which(value)
-            if located:
-                return {"executable": str(located), "source": "legacy"}
         return {"executable": "", "source": ""}
 
     def _llama_executable(self, profile: dict[str, Any] | None = None) -> str:
@@ -1477,8 +1657,14 @@ class ManagedLocalRuntimeManager:
     def _llama_runtime_details(
         self,
         profile: dict[str, Any] | None = None,
+        *,
+        managed_only: bool = False,
     ) -> dict[str, Any]:
-        info = self._llama_executable_info(profile)
+        info = (
+            self._managed_llama_executable_info(profile)
+            if managed_only
+            else self._llama_executable_info(profile)
+        )
         executable = info["executable"]
         if not executable:
             supported = (
@@ -1509,6 +1695,7 @@ class ManagedLocalRuntimeManager:
             except (TypeError, ValueError):
                 minimum = None
             required_commit = self._llama_cpp_required_commit(profile)
+        error: RuntimeError | None = None
         try:
             version = validate_llama_cpp_executable(
                 executable,
@@ -1516,12 +1703,32 @@ class ManagedLocalRuntimeManager:
                 required_commit=required_commit,
             )
         except RuntimeError as exc:
+            error = exc
+        if error is not None and not managed_only:
+            configured, _source = llama_cpp_executable_setting(
+                self._config_get("openai_compatible_local.llama_cpp.executable", "")
+            )
+            recovered = recover_llama_cpp_profile_executable(
+                self, configured, profile, source=info["source"], executable=executable,
+            )
+            if recovered["executable"]:
+                info = recovered
+                executable = recovered["executable"]
+                try:
+                    version = validate_llama_cpp_executable(
+                        executable, minimum_build=minimum, required_commit=required_commit,
+                    )
+                except RuntimeError as exc:
+                    error = exc
+                else:
+                    error = None
+        if error is not None:
             managed = info["source"] == "managed"
             return {
                 "installed": False,
                 "path": executable,
                 "status": "runtime_missing" if managed else "runtime_invalid",
-                "error": str(exc),
+                "error": f"{error}; executable={executable}",
                 "executable": executable,
                 "install_source": info["source"],
             }
@@ -2064,12 +2271,115 @@ class ManagedLocalRuntimeManager:
             return
         raise RuntimeError("unsupported llama.cpp archive type")
 
+    def install_llama_cpp_runtime_only(
+        self,
+        model: str,
+        *,
+        release_tag: str,
+        backend: str = "vulkan",
+    ) -> dict[str, Any]:
+        """Install one official release in a separate external root, without GGUFs.
+
+        Existing releases are never replaced by this operator entry point.
+        Select its returned executable through the existing setting/env path;
+        restoring that path is the rollback, independent of the 41 process.
+        """
+        from .local_llm_paths import repository_root
+
+        repo = repository_root().resolve(strict=False)
+        if (
+            not self._runtime_root_explicit
+            or self.root == repo
+            or repo in self.root.parents
+        ):
+            raise ValueError(
+                "runtime-only install requires an explicit external runtime root"
+            )
+        _runtime, profile = self._resolve_profile(
+            model, "llama_cpp", require_trusted=True
+        )
+        assert profile is not None
+        if (
+            llama_cpp_runtime_distribution(profile=profile)
+            != LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK
+        ):
+            raise ValueError(
+                "runtime-only release selection supports official stock profiles only"
+            )
+        tag = str(release_tag or "").strip().lower()
+        if parse_llama_cpp_release_build(tag) is None:
+            raise ValueError("release_tag must be an exact bNNNNN official release tag")
+        if backend not in {"vulkan", "cpu"}:
+            raise ValueError("backend must be vulkan or cpu")
+        if self.platform_name.startswith("win"):
+            asset_name = f"llama-{tag}-bin-win-{backend}-x64.zip"
+        elif self.platform_name.startswith("linux"):
+            suffix = "-vulkan" if backend == "vulkan" else ""
+            asset_name = f"llama-{tag}-bin-ubuntu{suffix}-x64.tar.gz"
+        else:
+            raise RuntimeError("managed llama.cpp install supports only Windows/Linux x86_64")
+        current_dir = self._llama_cpp_current_dir(profile)
+        if current_dir.exists():
+            marker = self._managed_llama_metadata(profile, current_dir=current_dir)
+            if not marker or marker.get("release") != tag:
+                raise RuntimeError("runtime root already contains another install; choose a separate root")
+            current = self._llama_runtime_details(profile, managed_only=True)
+            if not current["installed"]:
+                raise RuntimeError(str(current.get("error") or "existing runtime is invalid"))
+            if (
+                current.get("build") != parse_llama_cpp_release_build(tag)
+                or current.get("asset") != asset_name
+            ):
+                raise RuntimeError(
+                    "existing runtime does not match the requested release/backend; "
+                    "choose a separate root"
+                )
+            return {**current, "model": model, "inference_verified": False}
+        release = _fetch_llama_cpp_release_json(
+            f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}"
+        )
+        if release.get("tag_name") != tag or release.get("draft"):
+            raise RuntimeError("official release response does not match the requested tag")
+        asset = select_llama_cpp_release_asset(release, allowed_names={asset_name})
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", str(asset.get("digest") or "")):
+            raise RuntimeError("official release asset has no verifiable SHA-256 digest")
+        pinned = {**release, "assets": [asset]}
+        # A separate manager avoids mutating this manager's release provider,
+        # environment/configured executable or any live prepare tasks.
+        installer = ManagedLocalRuntimeManager(
+            self.config,
+            root=self.root,
+            platform_name=self.platform_name,
+            machine=self.machine,
+            release_provider=lambda: pinned,
+            asset_downloader=self._asset_downloader,
+        )
+        installed = installer._install_llama_cpp_runtime(profile, managed_only=True)
+        if (
+            installed.get("release") != tag
+            or installed.get("build") != parse_llama_cpp_release_build(tag)
+            or installed.get("asset") != asset_name
+        ):
+            raise RuntimeError(
+                "runtime root changed during install; requested release/backend was not installed"
+            )
+        return {**installed, "model": model, "inference_verified": False}
+
     def _install_llama_cpp_runtime(
         self,
         profile: dict[str, Any],
+        *,
+        managed_only: bool = False,
     ) -> dict[str, Any]:
+        def runtime_details() -> dict[str, Any]:
+            return (
+                self._llama_runtime_details(profile, managed_only=True)
+                if managed_only
+                else self._llama_runtime_details(profile)
+            )
+
         with self._runtime_install_lock:
-            current = self._llama_runtime_details(profile)
+            current = runtime_details()
             if current["installed"]:
                 return current
             invalid_managed_runtime = (
@@ -2185,6 +2495,10 @@ class ManagedLocalRuntimeManager:
                     # validation enough time for that first launch.
                     timeout_seconds=60,
                 )
+                if managed_only and version.get("build") != parse_llama_cpp_release_build(
+                    release.get("tag_name")
+                ):
+                    raise RuntimeError("downloaded executable build does not match the requested release")
                 distribution = self._llama_cpp_distribution(profile)
                 marker = {
                     "distribution": distribution["id"],
@@ -2211,6 +2525,8 @@ class ManagedLocalRuntimeManager:
                     raise RuntimeError(str(exc)) from exc
                 if current_dir.is_symlink():
                     raise RuntimeError("refusing symlink llama.cpp current directory")
+                if managed_only and current_dir.exists():
+                    raise RuntimeError("runtime root changed during install; refusing to replace it")
                 if current_dir.exists():
                     os.replace(current_dir, backup)
                 try:
@@ -2223,15 +2539,15 @@ class ManagedLocalRuntimeManager:
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
 
-            installed = self._llama_runtime_details(profile)
+            installed = runtime_details()
             if not installed["installed"]:
                 raise RuntimeError(
                     str(installed.get("error") or "installed llama.cpp runtime is invalid")
                 )
             return installed
 
-    @staticmethod
     def _payload(
+        self,
         *,
         task_id: str | None,
         model: str,
@@ -2295,6 +2611,13 @@ class ManagedLocalRuntimeManager:
             "started_at": started_at,
             "updated_at": updated_at or _utc_now(),
             "prepare_supported": bool(prepare_supported),
+            # Keep the root/provenance on the internal state so an alternate
+            # linked worktree cannot be mistaken for a missing installation.
+            # The public API projection deliberately redacts the path.
+            "runtime_root": str(self.root),
+            "runtime_root_source": str(
+                self._runtime_root_resolution.source or ""
+            ),
             "runtime_path": runtime_path,
             "model_path": model_path,
             "auxiliary_artifacts": auxiliary_artifacts,
@@ -2309,6 +2632,14 @@ class ManagedLocalRuntimeManager:
                 or metadata.get("runtime_executable")
                 or runtime_path
             ),
+            # Private diagnostics: this is a next-launch/artifact snapshot
+            # unless it was obtained from a validated live owned process.
+            # The public API allowlist never exposes executable paths or PIDs.
+            "runtime_executable_scope": str(
+                metadata.get("executable_scope")
+                or ("launch_candidate" if runtime == "llama_cpp" else "")
+            ),
+            "runtime_pid": metadata.get("pid"),
             "runtime_install_source": str(
                 metadata.get("install_source")
                 or metadata.get("runtime_install_source")
@@ -2326,6 +2657,8 @@ class ManagedLocalRuntimeManager:
         self,
         model: str,
         runtime: str | None = None,
+        *,
+        verify_artifacts: bool = True,
     ) -> dict[str, Any]:
         model_id = self._validate_model_identifier(model)
         resolved_runtime, profile = self._resolve_profile(
@@ -2361,17 +2694,57 @@ class ManagedLocalRuntimeManager:
         if active and not active["done"]:
             return active
 
+        if resolved_runtime == "strata":
+            from .strata_runtime import (
+                relocate_strata_artifact_paths,
+                strata_external,
+                strata_prepared_config,
+                strata_settings,
+            )
+
+            settings = strata_settings(self.config, model=canonical_model, platform_name=self.platform_name)
+            external = strata_external(self.config) or not settings["auto_start"]
+            supported = settings["platform_supported"] and self.machine in {"x86_64", "amd64"}
+            installed = False
+            error = None
+            if not external and supported:
+                try:
+                    relocate_strata_artifact_paths(settings, apply=False)
+                    strata_prepared_config(settings)
+                    installed = True
+                except (OSError, ValueError) as exc:
+                    error = str(exc)
+            state = self._payload(
+                task_id=None, model=canonical_model, runtime="strata",
+                phase="external" if external else "complete" if installed else "setup",
+                status="external" if external else "unsupported" if not supported else "ready" if installed else "setup_required",
+                runtime_installed=installed, model_installed=installed, done=True,
+                error=error, started_at=None, prepare_supported=supported and not external,
+                runtime_path=settings["source_root"], model_path=settings["data_dir"],
+                runtime_metadata={"version": settings["runtime_profile"]["source_revision"], "install_source": "official-setup"},
+            )
+            state["setup_required"] = not installed and not external
+            return state
+
         destination = self._model_dir(
             resolved_runtime,
             canonical_model,
         )
         model_artifact: Path | None = (
             destination
-            if self._model_installed(resolved_runtime, profile, destination)
+            if self._model_installed(
+                resolved_runtime,
+                profile,
+                destination,
+                verify_artifacts=verify_artifacts,
+            )
             else None
         )
         if resolved_runtime == "llama_cpp" and model_artifact is None:
-            model_artifact = self._discover_existing_llama_cpp_artifact(profile)
+            model_artifact = self._discover_existing_llama_cpp_artifact(
+                profile,
+                verify_artifacts=verify_artifacts,
+            )
         model_installed = model_artifact is not None
 
         if resolved_runtime == "llama_cpp":
@@ -2484,10 +2857,170 @@ class ManagedLocalRuntimeManager:
             runtime_metadata=runtime_metadata,
         )
 
+    def status_for_poll(
+        self,
+        model: str,
+        runtime: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a bounded status snapshot for UI polling.
+
+        The strict :meth:`status` path remains the source of truth for
+        prepare/install decisions.  Polling may only inspect regular-file
+        metadata and a tiny artifact prefix; it must never hash a cold GGUF.
+        Keep the compatibility fallback for lightweight test/integration
+        doubles that still expose the historical one-argument ``status``.
+        """
+
+        try:
+            return self.status(
+                model,
+                runtime,
+                verify_artifacts=False,
+            )
+        except TypeError as exc:
+            if "verify_artifacts" not in str(exc):
+                raise
+            if runtime is None:
+                return self.status(model)
+            return self.status(model, runtime)
+
+    def status_for_owned_llama_cpp(
+        self,
+        model: str,
+        process: object,
+    ) -> dict[str, Any] | None:
+        """Return a cheap snapshot for a live, exact owned llama.cpp worker.
+
+        The process controller already validated the executable/model before
+        registering this worker.  Trusting that live ownership proof keeps a
+        status poll from rehashing a multi-gigabyte GGUF; strict artifact
+        checks remain in :meth:`status` and the prepare path.
+        """
+
+        model_id = self._validate_model_identifier(model)
+        resolved_runtime, profile = self._resolve_profile(
+            model_id,
+            "llama_cpp",
+            require_trusted=False,
+        )
+        if resolved_runtime != "llama_cpp" or not profile:
+            return None
+        try:
+            if process.poll() is not None:
+                return None
+        except Exception:
+            return None
+        if str(getattr(process, "_aoi_local_runtime", "") or "") != "llama_cpp":
+            return None
+        expected_alias = str(
+            profile.get("served_alias") or profile.get("id") or model_id
+        ).strip()
+        if str(getattr(process, "_aoi_local_model_alias", "") or "").strip() != expected_alias:
+            return None
+        endpoint = str(
+            getattr(process, "_aoi_local_base_url", None)
+            or getattr(process, "_aoi_llama_cpp_base_url", "")
+            or ""
+        ).strip()
+        if not endpoint:
+            return None
+        recorded_executable = str(
+            getattr(process, "_aoi_local_executable", "") or ""
+        ).strip()
+        if not recorded_executable:
+            # Older workers still have Popen.args; never re-resolve current
+            # config/env as evidence of what this PID actually launched.
+            args = getattr(process, "args", None)
+            if isinstance(args, (list, tuple)) and args:
+                recorded_executable = str(args[0] or "").strip()
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            pid = None
+        return self._payload(
+            task_id=None,
+            model=str(profile.get("id") or model_id),
+            runtime="llama_cpp",
+            phase="complete",
+            status="ready",
+            runtime_installed=True,
+            model_installed=True,
+            done=True,
+            error=None,
+            started_at=None,
+            prepare_supported=True,
+            runtime_path="",
+            model_path="",
+            runtime_metadata={
+                "install_source": "managed",
+                "distribution": llama_cpp_runtime_distribution(profile=profile),
+                "executable": recorded_executable,
+                "executable_scope": "owned_process",
+                "pid": pid,
+            },
+        )
+
+    def status_for_owned_strata(
+        self,
+        model: str,
+        process: object,
+    ) -> dict[str, Any] | None:
+        """Return a cheap snapshot for an already validated owned Strata process.
+
+        Generation startup validates the prepared config before registering the
+        process.  While that process is loading, repeating the full artifact
+        walk from :meth:`status` can block the settings/status UI on a slow
+        model volume.  The process boundary is checked here; health and the
+        allow-listed startup projection are supplied by the route separately.
+        """
+
+        model_id = self._validate_model_identifier(model)
+        resolved_runtime, profile = self._resolve_profile(
+            model_id,
+            "strata",
+            require_trusted=False,
+        )
+        if resolved_runtime != "strata" or not profile:
+            return None
+        try:
+            if process.poll() is not None:
+                return None
+        except Exception:
+            return None
+        if str(getattr(process, "_aoi_local_runtime", "") or "") != "strata":
+            return None
+        if str(getattr(process, "_aoi_local_model_alias", "") or "") != str(
+            profile.get("id") or model_id
+        ):
+            return None
+        state = self._payload(
+            task_id=None,
+            model=str(profile.get("id") or model_id),
+            runtime="strata",
+            phase="complete",
+            status="ready",
+            runtime_installed=True,
+            model_installed=True,
+            done=True,
+            error=None,
+            started_at=None,
+            prepare_supported=True,
+            runtime_metadata={
+                "version": str(profile.get("source_revision") or ""),
+                "install_source": "official-setup",
+            },
+        )
+        state["setup_required"] = False
+        return state
+
     def start_prepare(
         self,
         model: str,
         runtime: str | None = None,
+        *,
+        setup_confirmed: bool = False,
+        strata_settings_override: dict[str, Any] | None = None,
+        on_success: Callable[[], None] | None = None,
+        on_failure: Callable[[BaseException], None] | None = None,
     ) -> dict[str, Any]:
         resolved_runtime, profile = self._resolve_profile(
             model,
@@ -2497,9 +3030,12 @@ class ManagedLocalRuntimeManager:
         assert resolved_runtime is not None
         assert profile is not None
 
+        if resolved_runtime == "strata" and not setup_confirmed:
+            raise ValueError("Strata公式setupの実行と大容量downloadを明示確認してください")
+
         canonical_model = str(profile.get("id") or model).strip()
         current = self.status(canonical_model, resolved_runtime)
-        if current["prepared"]:
+        if current["prepared"] and resolved_runtime != "strata":
             return current
         if not current["prepare_supported"]:
             return current
@@ -2533,8 +3069,23 @@ class ManagedLocalRuntimeManager:
                 model_path=str(current.get("model_path") or ""),
                 runtime_metadata=current,
             )
+            if resolved_runtime == "strata":
+                from .strata_runtime import strata_settings
+
+                task["strata_settings"] = copy.deepcopy(
+                    strata_settings_override
+                    if strata_settings_override is not None
+                    else strata_settings(
+                        self.config,
+                        model=canonical_model,
+                        platform_name=self.platform_name,
+                    )
+                )
             self._tasks[task_id] = task
             self._active[key] = task_id
+            self._task_callbacks[task_id] = (on_success, on_failure)
+            self._task_cancel_events[task_id] = threading.Event()
+            self._task_state_locks[task_id] = threading.Lock()
 
         thread = threading.Thread(
             target=self._run_prepare,
@@ -2544,6 +3095,71 @@ class ManagedLocalRuntimeManager:
         )
         thread.start()
         return copy.deepcopy(task)
+
+    def cancel_prepare(self, task_id: str) -> dict[str, Any]:
+        """Cancel one active preparation and terminate only its child process."""
+
+        value = str(task_id or "").strip()
+        with self._lock:
+            task = self._tasks.get(value)
+            if task is None:
+                return self._payload(
+                    task_id=value or None,
+                    model="",
+                    runtime=None,
+                    phase="error",
+                    status="not_found",
+                    runtime_installed=False,
+                    model_installed=False,
+                    done=True,
+                    error="local runtime prepare task not found",
+                    started_at=None,
+                    prepare_supported=False,
+                )
+            if str(task.get("runtime") or "") != "strata":
+                raise ValueError("キャンセルはStrata setupにのみ対応しています")
+            task_lock = self._task_state_locks.get(value)
+            event = self._task_cancel_events.get(value)
+        if task_lock is None:
+            raise ValueError("準備taskの状態管理が見つかりません")
+        with task_lock:
+            with self._lock:
+                task = self._tasks.get(value)
+                if task is None:
+                    raise ValueError("準備taskの状態管理が見つかりません")
+                if task.get("done") or task.get("_completion_claimed"):
+                    raise ValueError(
+                        "Strata setupは完了処理中または完了済みのためキャンセルできません"
+                    )
+                task["cancel_requested"] = True
+                task["phase"] = "cancelling"
+                task["status"] = "cancelling"
+                task["updated_at"] = _utc_now()
+        if event is not None:
+            event.set()
+        self._terminate_task_process(value)
+        with self._lock:
+            return copy.deepcopy(self._tasks.get(value, task))
+
+    def _terminate_task_process(self, task_id: str) -> None:
+        """Terminate the setup process explicitly registered for one task."""
+
+        from src.service_manager import (
+            _remove_tracked_process,
+            _terminate_process_tree,
+        )
+
+        with self._lock:
+            process = self._task_setup_processes.get(task_id)
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+        except Exception:
+            return
+        _terminate_process_tree(process)
+        _remove_tracked_process(process)
 
     def get_task(self, task_id: str) -> dict[str, Any]:
         value = str(task_id or "").strip()
@@ -2581,7 +3197,7 @@ class ManagedLocalRuntimeManager:
     ) -> None:
         with self._lock:
             previous = self._tasks[task_id]
-            self._tasks[task_id] = self._payload(
+            payload = self._payload(
                 task_id=task_id,
                 model=str(previous["model"]),
                 runtime=str(previous["runtime"]),
@@ -2596,6 +3212,14 @@ class ManagedLocalRuntimeManager:
                 model_path=model_path or str(previous.get("model_path") or ""),
                 runtime_metadata=runtime_metadata or previous,
             )
+            if previous.get("cancel_requested"):
+                payload["cancel_requested"] = True
+            for internal_key in ("strata_settings",):
+                if internal_key in previous:
+                    payload[internal_key] = previous[internal_key]
+            if previous.get("_completion_claimed"):
+                payload["_completion_claimed"] = True
+            self._tasks[task_id] = payload
 
     def _run_prepare(
         self,
@@ -2605,7 +3229,83 @@ class ManagedLocalRuntimeManager:
     ) -> None:
         model = str(profile["id"])
         key = (runtime, model)
+        cancel_event = self._task_cancel_events.get(task_id)
         try:
+            if runtime == "strata":
+                from .strata_runtime import run_strata_setup
+
+                with self._lock:
+                    settings = copy.deepcopy(self._tasks[task_id]["strata_settings"])
+                def _register_setup_process(process: Any) -> None:
+                    with self._lock:
+                        self._task_setup_processes[task_id] = process
+                        should_cancel = bool(
+                            cancel_event is not None and cancel_event.is_set()
+                        )
+                    if should_cancel:
+                        self._terminate_task_process(task_id)
+
+                def _finish_setup_process(process: Any) -> None:
+                    with self._lock:
+                        if self._task_setup_processes.get(task_id) is process:
+                            self._task_setup_processes.pop(task_id, None)
+
+                if cancel_event is not None and cancel_event.is_set():
+                    self._set_task(
+                        task_id,
+                        phase="cancelled",
+                        status="cancelled",
+                        runtime_installed=False,
+                        model_installed=False,
+                        done=True,
+                        error="Strata setup was cancelled.",
+                    )
+                    return
+                self._set_task(task_id, phase="setup", status="running", runtime_installed=False,
+                               model_installed=False, done=False, error=None)
+                with self._runtime_install_lock:
+                    run_strata_setup(
+                        settings,
+                        platform_name=self.platform_name,
+                        cancel_event=cancel_event,
+                        on_process_started=_register_setup_process,
+                        on_process_finished=_finish_setup_process,
+                    )
+                task_lock = self._task_state_locks.get(task_id)
+                if task_lock is None:
+                    raise RuntimeError("Strata setup task state lock is missing")
+                with task_lock:
+                    with self._lock:
+                        task_state = self._tasks.get(task_id, {})
+                        cancelled = bool(
+                            (cancel_event is not None and cancel_event.is_set())
+                            or task_state.get("cancel_requested")
+                        )
+                        if not cancelled:
+                            task_state["_completion_claimed"] = True
+                            task_state["phase"] = "committing"
+                            task_state["status"] = "committing"
+                            task_state["updated_at"] = _utc_now()
+                if cancelled:
+                    self._set_task(
+                        task_id,
+                        phase="cancelled",
+                        status="cancelled",
+                        runtime_installed=False,
+                        model_installed=False,
+                        done=True,
+                        error="Strata setup was cancelled.",
+                    )
+                    return
+                callback, _ = self._task_callbacks.get(task_id, (None, None))
+                if callback is not None:
+                    callback_result = callback()
+                    if callback_result is False:
+                        raise RuntimeError("Strata setup commit was rejected")
+                self._set_task(task_id, phase="complete", status="succeeded", runtime_installed=True,
+                               model_installed=True, done=True, error=None,
+                               runtime_path=settings["source_root"], model_path=settings["data_dir"])
+                return
             if runtime == "llama_cpp":
                 runtime_metadata = self._llama_runtime_details(profile)
                 runtime_installed = bool(runtime_metadata["installed"])
@@ -2731,6 +3431,23 @@ class ManagedLocalRuntimeManager:
                 runtime_metadata=runtime_metadata,
             )
         except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                self._set_task(
+                    task_id,
+                    phase="cancelled",
+                    status="cancelled",
+                    runtime_installed=False,
+                    model_installed=False,
+                    done=True,
+                    error="Strata setup was cancelled.",
+                )
+                return
+            _, failure_callback = self._task_callbacks.get(task_id, (None, None))
+            if failure_callback is not None:
+                try:
+                    failure_callback(exc)
+                except Exception:
+                    logger.exception("Managed local runtime failure callback failed")
             runtime_metadata = locals().get("runtime_metadata") or {}
             self._set_task(
                 task_id,
@@ -2747,6 +3464,10 @@ class ManagedLocalRuntimeManager:
             with self._lock:
                 if self._active.get(key) == task_id:
                     self._active.pop(key, None)
+                self._task_callbacks.pop(task_id, None)
+                self._task_cancel_events.pop(task_id, None)
+                self._task_setup_processes.pop(task_id, None)
+                self._task_state_locks.pop(task_id, None)
 
     def _prepare_model(
         self,

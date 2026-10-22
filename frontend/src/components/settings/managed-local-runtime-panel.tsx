@@ -5,10 +5,10 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import type {
   FreeTokenRuntimeSettings,
   LlamaCppRuntimeSettings,
@@ -18,6 +18,7 @@ import type {
 } from "./llm-model-section-types";
 
 function runtimeLabel(runtime: string | null | undefined): string {
+  if (runtime === "strata") return "Strata";
   if (runtime === "freetoken") return "FreeToken";
   if (runtime === "llama_cpp") return "llama.cpp";
   return runtime || "Managed local runtime";
@@ -242,14 +243,16 @@ export function ManagedLocalRuntimePanel({
     >
       <CardHeader className="border-b px-3 py-3">
         <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
-          <span>{runtimeLabel(runtime)}</span>
+          <span className="inline-flex items-center gap-1">
+            <span>{runtimeLabel(runtime)}</span>
+            <HelpPopover label={runtimeLabel(runtime)}>
+              モデル設定の保存後、サーバーの起動状態を確認できます。準備完了後に利用できます。
+            </HelpPopover>
+          </span>
           <Badge variant={statusVariant(effectiveStatus)}>
             {loading ? "確認中" : statusLabel(effectiveStatus)}
           </Badge>
         </CardTitle>
-        <CardDescription className="text-xs">
-          選択中モデルは準備が完了するまで現在の実行モデルへ切り替えません。
-        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 px-3 py-3" aria-live="polite">
         <dl className="grid gap-2 text-xs sm:grid-cols-3">

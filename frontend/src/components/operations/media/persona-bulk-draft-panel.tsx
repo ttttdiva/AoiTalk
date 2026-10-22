@@ -20,10 +20,10 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Textarea } from "@/components/ui/textarea";
 
 
@@ -265,22 +265,16 @@ export function PersonaBulkDraftPanel({
       data-testid="persona-bulk-draft-panel"
     >
       <CardHeader className="border-b border-border/70">
-        <CardTitle className="text-sm">
+        <CardTitle className="inline-flex items-center gap-1 text-sm">
           9人一括 draft
+          <HelpPopover label="9人一括 draft">
+            <p>JSON / YAML / Markdown / free-formの9 slot案をimportし、explicit / inferred / unknownを確認してから一括適用します。inferredは自動適用されません。</p>
+            <p>backendはPersona内容を推測・補完しません。unknownはvalue=null、inferredはevidence必須です。inferredが1件でも残っているdraftはApplyできません。</p>
+          </HelpPopover>
         </CardTitle>
-          <CardDescription>
-          JSON / YAML / Markdown / free-formの9 slot案をimportし、
-          explicit / inferred / unknownを確認してから一括適用します。
-          inferredは自動適用されません。
-        </CardDescription>
       </CardHeader>
 
       <CardContent className="space-y-4 pt-4">
-        <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          backendはPersona内容を推測・補完しません。
-          unknownはvalue=null、inferredはevidence必須です。
-          inferredが1件でも残っているdraftはApplyできません。
-        </div>
 
         {!preview ? (
           <>

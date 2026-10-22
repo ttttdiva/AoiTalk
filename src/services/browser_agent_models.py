@@ -73,6 +73,7 @@ class BrowserAgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool = True
     jev_enabled: bool = True
+    dedicated_enabled: bool = False
     max_steps: int = Field(default=24, ge=1, le=60)
     timeout_seconds: int = Field(default=300, ge=15, le=900)
     jev_model: str = JEV_DEFAULT_MODEL

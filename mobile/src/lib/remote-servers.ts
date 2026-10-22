@@ -4,7 +4,10 @@
  */
 
 import { fetchApi, getBaseUrl } from "./api-client";
-import { getToken } from "./auth";
+import { protectedFetch } from "./protected-fetch";
+import { sendWithTransportAuth } from "./transport-auth";
+
+const secureFetch: typeof fetch = protectedFetch;
 
 export type RemoteCapabilities = {
   version?: string;
@@ -87,16 +90,15 @@ export async function deleteRemoteServer(id: string): Promise<void> {
 export async function testRemoteServer(
   id: string,
 ): Promise<ConnectionTestResult> {
-  const token = await getToken();
   const baseUrl = await getBaseUrl();
   try {
-    const res = await fetch(`${baseUrl}/api/remote-servers/${id}/test`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
+    const url = `${baseUrl}/api/remote-servers/${id}/test`;
+    const res = await sendWithTransportAuth(url, { targetBaseUrl: baseUrl }, (headers) =>
+      secureFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+      }),
+    );
     const data = (await res.json().catch(() => ({}))) as ConnectionTestResult;
     if (data && typeof data.success === "boolean") return data;
     return { success: false, status: "error", error: res.statusText };

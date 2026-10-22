@@ -14,6 +14,7 @@ from ...features import Features
 from ..ecc_helpers import ecc_cookie_auth_dependency
 from .characters_routes import build_characters_router
 from .character_voice_routes import build_character_voice_router
+from .character_rig_routes import build_character_rig_router
 from .common import make_get_user_id
 from .context_routes import build_context_router
 if not Features.is_enterprise():
@@ -47,6 +48,7 @@ def create_ecc_router(app_instance: Any) -> APIRouter:
     root_router = APIRouter()
     root_router.include_router(build_characters_router(require_auth))
     root_router.include_router(build_character_voice_router(app_instance, require_auth))
+    root_router.include_router(build_character_rig_router(app_instance, require_auth))
     root_router.include_router(build_usage_router(app_instance, require_auth))
     root_router.include_router(build_skill_router(require_auth))
     if build_mcp_router is not None:

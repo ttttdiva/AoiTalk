@@ -10,21 +10,53 @@ import { type Range, StateEffect } from "@codemirror/state";
 import { fetchOgp, type OgpData } from "@/lib/explorer-api";
 
 const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/g;
-const TWITTER_WIDGETS_SCRIPT = "https://platform.twitter.com/widgets.js";
 
-const ogpCache = new Map<string, OgpData>();
+const OGP_STORAGE_KEY = "aoitalk.linkEmbed.metadata.v2";
+const OGP_MAX_ENTRIES = 128;
+const OGP_SUCCESS_TTL = 6 * 60 * 60 * 1000;
+const OGP_FAILURE_TTL = 60 * 1000;
+const ogpCache = new Map<string, { data: OgpData; expires: number }>();
 const ogpInFlight = new Map<string, Promise<OgpData>>();
-
+let ogpStorageLoaded = false;
 const EMBED_INTERSECTION_ROOT_MARGIN = "800px 0px";
-const LINK_EMBED_CARD_HEIGHT = 56;
-const X_EMBED_FALLBACK_HEIGHT = 420;
-const X_EMBED_MIN_HEIGHT = 180;
-const X_EMBED_MAX_HEIGHT = 1400;
-const X_EMBED_HEIGHT_STORAGE_KEY = "aoitalk.linkEmbed.xHeights.v1";
-const X_EMBED_HEIGHT_MAX_ENTRIES = 128;
-const xEmbedHeightCache = new Map<string, number>();
-let xEmbedHeightStorageLoaded = false;
-let xEmbedHeightStorageWriteScheduled = false;
+const LINK_EMBED_CARD_HEIGHT = 136;
+const X_EMBED_CARD_HEIGHT = 220;
+
+function boundedOgp(url: string, data: OgpData): OgpData {
+  const result: OgpData = {success:data.success === true, url};
+  for (const key of ["title", "description", "image", "favicon", "embed_html", "provider_name", "error"] as const) {
+    if (typeof data[key] === "string") result[key] = data[key].slice(0, key === "embed_html" ? 24000 : key === "description" ? 12000 : 2048);
+  }
+  if (data.embed_type === "x-post") result.embed_type = "x-post";
+  return result;
+}
+
+function cachedOgp(url: string): OgpData | null {
+  if (!ogpStorageLoaded && typeof window !== "undefined") {
+    ogpStorageLoaded = true;
+    try {
+      const entries: unknown = JSON.parse(window.sessionStorage.getItem(OGP_STORAGE_KEY) || "[]");
+      if (Array.isArray(entries)) for (const row of entries.slice(-OGP_MAX_ENTRIES)) {
+        if (!Array.isArray(row) || typeof row[0] !== "string") continue;
+        const value = row[1];
+        if (value && typeof value.expires === "number" && value.expires > Date.now() &&
+            value.data && typeof value.data.success === "boolean" && value.data.url === row[0]) {
+          ogpCache.set(row[0], { data: boundedOgp(row[0], value.data), expires: Math.min(value.expires, Date.now() + OGP_SUCCESS_TTL) });
+        }
+      }
+    } catch { /* Storage is optional; the bounded memory cache remains usable. */ }
+  }
+  const entry = ogpCache.get(url);
+  if (!entry) return null;
+  if (entry.expires <= Date.now()) { ogpCache.delete(url); return null; }
+  return entry.data;
+}
+function cacheOgp(url: string, data: OgpData) {
+  ogpCache.delete(url);
+  ogpCache.set(url, { data: boundedOgp(url, data), expires: Date.now() + (data.success ? OGP_SUCCESS_TTL : OGP_FAILURE_TTL) });
+  while (ogpCache.size > OGP_MAX_ENTRIES) ogpCache.delete(ogpCache.keys().next().value!);
+  try { window.sessionStorage.setItem(OGP_STORAGE_KEY, JSON.stringify([...ogpCache])); } catch { /* quota/privacy */ }
+}
 
 const viewOgpSubscriptions = new WeakMap<EditorView, Set<string>>();
 const viewRebuildFrames = new WeakMap<EditorView, number>();
@@ -39,75 +71,8 @@ function isDestroyedView(view: EditorView) {
   );
 }
 
-function clampXEmbedHeight(value: number) {
-  return Math.max(
-    X_EMBED_MIN_HEIGHT,
-    Math.min(X_EMBED_MAX_HEIGHT, Math.round(value)),
-  );
-}
-
-function loadXEmbedHeightCache() {
-  if (xEmbedHeightStorageLoaded) return;
-  xEmbedHeightStorageLoaded = true;
-  if (typeof window === "undefined") return;
-  try {
-    const raw = window.sessionStorage.getItem(X_EMBED_HEIGHT_STORAGE_KEY);
-    if (!raw) return;
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
-    for (const [url, value] of Object.entries(parsed)) {
-      if (typeof value !== "number" || !Number.isFinite(value)) continue;
-      xEmbedHeightCache.set(url, clampXEmbedHeight(value));
-      if (xEmbedHeightCache.size >= X_EMBED_HEIGHT_MAX_ENTRIES) break;
-    }
-  } catch {
-    // sessionStorage is best effort and may be unavailable in privacy modes.
-  }
-}
-
-function persistXEmbedHeightCache() {
-  if (xEmbedHeightStorageWriteScheduled || typeof window === "undefined") return;
-  xEmbedHeightStorageWriteScheduled = true;
-  const write = () => {
-    xEmbedHeightStorageWriteScheduled = false;
-    try {
-      const values = Object.fromEntries(xEmbedHeightCache);
-      window.sessionStorage.setItem(
-        X_EMBED_HEIGHT_STORAGE_KEY,
-        JSON.stringify(values),
-      );
-    } catch {
-      // Ignore storage quota/security failures; memory cache still works.
-    }
-  };
-  if (typeof window.requestIdleCallback === "function") {
-    window.requestIdleCallback(write, { timeout: 500 });
-  } else {
-    window.setTimeout(write, 0);
-  }
-}
-
-function getCachedXEmbedHeight(url: string) {
-  loadXEmbedHeightCache();
-  return xEmbedHeightCache.get(url);
-}
-
-function cacheXEmbedHeight(url: string, value: number) {
-  const height = clampXEmbedHeight(value);
-  const previous = xEmbedHeightCache.get(url);
-  if (previous !== undefined && Math.abs(previous - height) < 3) return;
-  xEmbedHeightCache.delete(url);
-  xEmbedHeightCache.set(url, height);
-  while (xEmbedHeightCache.size > X_EMBED_HEIGHT_MAX_ENTRIES) {
-    const oldest = xEmbedHeightCache.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    xEmbedHeightCache.delete(oldest);
-  }
-  persistXEmbedHeightCache();
-}
-
 function requestOgp(url: string): Promise<OgpData> {
-  const cached = ogpCache.get(url);
+  const cached = cachedOgp(url);
   if (cached) return Promise.resolve(cached);
   const existing = ogpInFlight.get(url);
   if (existing) return existing;
@@ -115,7 +80,7 @@ function requestOgp(url: string): Promise<OgpData> {
   const request = fetchOgp(url)
     .catch((): OgpData => ({ success: false, url }))
     .then((data) => {
-      ogpCache.set(url, data);
+      cacheOgp(url, data);
       return data;
     })
     .finally(() => {
@@ -198,7 +163,7 @@ function requestOgpForView(view: EditorView, url: string) {
     viewOgpSubscriptions.set(view, subscribed);
   }
   if (subscribed.has(url)) return;
-  if (ogpCache.has(url)) {
+  if (cachedOgp(url)) {
     // Another EditorView may have populated the shared cache before this
     // widget's observer fired.  Rebuild this view so its placeholder observes
     // the cached result instead of remaining stuck indefinitely.
@@ -467,57 +432,6 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
 }
 
-type TwitterWidgets = {
-  widgets?: {
-    load?: (element?: HTMLElement) => void;
-  };
-};
-
-let twitterScriptPromise: Promise<void> | null = null;
-
-declare global {
-  interface Window {
-    twttr?: TwitterWidgets;
-  }
-}
-
-function loadTwitterWidgets(container: HTMLElement) {
-  if (typeof window === "undefined") return;
-
-  const render = () => window.twttr?.widgets?.load?.(container);
-  if (window.twttr?.widgets?.load) {
-    render();
-    return;
-  }
-
-  if (!twitterScriptPromise) {
-    const existing = document.querySelector<HTMLScriptElement>(
-      `script[src="${TWITTER_WIDGETS_SCRIPT}"]`,
-    );
-    if (existing) {
-      twitterScriptPromise = new Promise<void>((resolve) => {
-        if (window.twttr?.widgets?.load) {
-          resolve();
-        } else {
-          existing.addEventListener("load", () => resolve(), { once: true });
-          existing.addEventListener("error", () => resolve(), { once: true });
-        }
-      });
-    } else {
-      twitterScriptPromise = new Promise<void>((resolve) => {
-        const script = document.createElement("script");
-        script.src = TWITTER_WIDGETS_SCRIPT;
-        script.async = true;
-        script.charset = "utf-8";
-        script.addEventListener("load", () => resolve(), { once: true });
-        script.addEventListener("error", () => resolve(), { once: true });
-        document.head.appendChild(script);
-      });
-    }
-  }
-  void twitterScriptPromise.then(render);
-}
-
 /** URL のデコレーション範囲を削除してテキストごと消す */
 function deleteUrl(url: string, view: EditorView) {
   const doc = view.state.doc;
@@ -632,114 +546,6 @@ function appendActionBar(
   container.appendChild(bar);
 }
 
-function findNearestScrollableAncestor(element: HTMLElement): HTMLElement | null {
-  let parent = element.parentElement;
-  while (parent) {
-    try {
-      const style = window.getComputedStyle(parent);
-      const overflowY = style.overflowY;
-      if (
-        (overflowY === "auto" ||
-          overflowY === "scroll" ||
-          overflowY === "overlay") &&
-        parent.scrollHeight > parent.clientHeight + 1
-      ) {
-        return parent;
-      }
-    } catch {
-      // Ignore detached/partially mocked DOM nodes.
-    }
-    parent = parent.parentElement;
-  }
-  return null;
-}
-
-function findOverflowAncestors(element: HTMLElement): HTMLElement[] {
-  const ancestors: HTMLElement[] = [];
-  let parent = element.parentElement;
-  while (parent) {
-    try {
-      const overflowY = window.getComputedStyle(parent).overflowY;
-      if (
-        overflowY === "auto" ||
-        overflowY === "scroll" ||
-        overflowY === "overlay"
-      ) {
-        // Scroll listeners are only installed on ancestors that can actually
-        // scroll.  This keeps the hot scroll path geometry-free; the one-time
-        // overflow check happens while the widget is being mounted instead.
-        if (parent.scrollHeight > parent.clientHeight + 1) {
-          ancestors.push(parent);
-        }
-      }
-    } catch {
-      // Ignore detached/partially mocked DOM nodes.
-    }
-    parent = parent.parentElement;
-  }
-  return ancestors;
-}
-
-function readScrollTop(container: HTMLElement | null) {
-  if (container) return container.scrollTop;
-  return typeof window !== "undefined"
-    ? window.scrollY || window.pageYOffset || 0
-    : 0;
-}
-
-function readElementHeight(element: HTMLElement | null) {
-  if (!element) return 0;
-  const rectHeight = element.getBoundingClientRect().height;
-  // jsdom and a few embedded browser implementations report zero rects while
-  // still exposing offset/scroll dimensions.  Prefer the largest available
-  // content measurement, but never use the X shell wrapper (whose min-height
-  // is deliberately reserved) as the source of truth.
-  return Math.max(rectHeight, element.offsetHeight, element.scrollHeight);
-}
-
-function readXEmbedContentHeight(embed: HTMLElement) {
-  const rendered = embed.querySelector<HTMLElement>(
-    "iframe, .twitter-tweet-rendered, [data-twitter-widget]",
-  );
-  return Math.max(readElementHeight(rendered), readElementHeight(embed));
-}
-
-function preserveScrollAnchor(
-  element: HTMLElement,
-  previousHeight: number,
-  nextHeight: number,
-  previousScrollTop: number,
-  container: HTMLElement | null,
-) {
-  const delta = nextHeight - previousHeight;
-  if (Math.abs(delta) < 2 || typeof window === "undefined") return;
-
-  const rect = element.getBoundingClientRect();
-  const viewportTop = container
-    ? container.getBoundingClientRect().top
-    : 0;
-  const viewportBottom = container
-    ? container.getBoundingClientRect().bottom
-    : window.innerHeight;
-  // Measure visibility against the pre-resize footprint.  After a widget
-  // expands, its current bottom can overlap the viewport even though the
-  // entire previous placeholder was above it; using the current bottom would
-  // incorrectly skip the compensation and let the reader jump.
-  const previousBottom = rect.top + previousHeight;
-  if (previousBottom > viewportTop + 2 || rect.top >= viewportBottom) return;
-
-  const currentScrollTop = readScrollTop(container);
-  const expectedScrollTop = previousScrollTop + delta;
-  if (Math.abs(currentScrollTop - expectedScrollTop) <= 4) return;
-  if (Math.abs(currentScrollTop - previousScrollTop) > 4) return;
-
-  if (container) {
-    container.scrollTop = expectedScrollTop;
-  } else if (typeof window.scrollTo === "function") {
-    window.scrollTo(window.scrollX || 0, expectedScrollTop);
-  }
-}
-
 type WidgetCleanup = () => void;
 
 // ─── Embed モード: OGP プレビューカード ───
@@ -771,212 +577,42 @@ class EmbedWidget extends WidgetType {
 
   toDOM() {
     const xStatus = isXStatusUrl(this.url);
-    const xPost =
-      this.data?.success &&
-      this.data.embed_type === "x-post" &&
-      this.data.embed_html;
-
-    // Keep every X status URL in the X shell, including metadata failures or
-    // responses that are not an x-post.  Falling through to the generic 56px
-    // OGP card after a failed request causes a visible collapse and can make a
-    // previously cached 760px reservation disappear.
+    // Fixed-size, first-party cards never recreate third-party iframes when a
+    // modal is reopened. OEmbed HTML is used only as inert text fallback.
     if (xStatus) {
       const wrap = document.createElement("div");
       wrap.className = "cm-link-embed cm-link-embed-x-post";
-      wrap.style.cssText =
-        "position: relative; max-width: 550px; margin: 6px 0; user-select: none; overflow-anchor: none;";
-      const reservedHeight =
-        getCachedXEmbedHeight(this.url) ?? X_EMBED_FALLBACK_HEIGHT;
-      wrap.style.minHeight = `${reservedHeight}px`;
-
-      const embed = document.createElement("div");
-      embed.style.cssText =
-        "overflow: hidden; border-radius: 8px;";
-      if (typeof xPost === "string") {
-        embed.innerHTML = xPost;
-      } else {
-        embed.textContent = this.data
-          ? "Xポストを表示できませんでした。リンクを開いて確認してください。"
-          : "Xポストを読み込み中...";
-        embed.style.cssText +=
-          "min-height: 0; height: 100%; display: flex; align-items: center; justify-content: center; color: var(--muted-foreground, #888); padding: 12px; text-align: center;";
+      wrap.style.cssText = `position:relative; box-sizing:border-box; max-width:500px; height:${X_EMBED_CARD_HEIGHT}px; margin:6px 0; border:1px solid var(--border,#333); border-radius:8px; background:var(--muted,#1e1e2e); overflow:hidden; font-size:13px;`;
+      const card = document.createElement("a");
+      card.href = this.url; card.target = "_blank"; card.rel = "noopener noreferrer";
+      card.style.cssText = "display:flex; flex-direction:column; gap:8px; padding:12px; height:100%; box-sizing:border-box; color:inherit; text-decoration:none; overflow:hidden;";
+      const title = document.createElement("strong");
+      title.textContent = this.data?.title || "X ポスト";
+      title.style.cssText = "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:50px;";
+      card.appendChild(title);
+      const body = document.createElement("div");
+      let text = this.data?.description;
+      if (!text && typeof this.data?.embed_html === "string") {
+        const template = document.createElement("template");
+        template.innerHTML = this.data.embed_html;
+        template.content.querySelectorAll("script,style,iframe,object").forEach((node) => node.remove());
+        text = (template.content.querySelector("p") || template.content).textContent || undefined;
       }
-      wrap.appendChild(embed);
-
-      wrap.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest(".cm-le-actions")) return;
-        if (typeof xPost !== "string") {
-          window.open(this.url, "_blank", "noopener,noreferrer");
-        }
-      });
+      body.textContent = text || (this.data ? "投稿を取得できませんでした。Xで開いて確認" : "Xポストを読み込み中...");
+      body.style.cssText = "white-space:pre-wrap; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:5; line-height:1.45; flex:1; min-height:0;";
+      card.appendChild(body);
+      const imageUrl = sanitizeMetadataImageUrl(this.data?.image, this.url);
+      if (imageUrl) {
+        const image = document.createElement("img"); image.src = imageUrl; image.alt = "投稿の画像";
+        image.style.cssText = "width:100%; height:72px; object-fit:contain; flex-shrink:0; border-radius:4px;";
+        image.onerror = () => { image.style.visibility = "hidden"; };
+        card.appendChild(image);
+      }
+      const more = document.createElement("span"); more.textContent = "Xでポスト全体を開く ↗";
+      more.style.cssText = "font-size:11px; color:var(--muted-foreground,#888); flex-shrink:0;";
+      card.appendChild(more); wrap.appendChild(card);
       appendActionBar(wrap, this.url, this.view, "embed", this.controller);
-
-      // A resolved failure is terminal for this editor session: requestOgp
-      // caches the failed result, and this branch intentionally does not
-      // install another observer that could retry it indefinitely.
-      if (typeof xPost !== "string" && this.data) {
-        return wrap;
-      }
-      if (typeof xPost !== "string") {
-        this.cleanup = observeNearViewport(wrap, () =>
-          requestOgpForView(this.view, this.url),
-        );
-        return wrap;
-      }
-
-      let scrollContainer = findNearestScrollableAncestor(wrap);
-      const overflowAncestors = findOverflowAncestors(wrap);
-      let renderStarted = false;
-      let lastHeight = reservedHeight;
-      let lastScrollTop = readScrollTop(scrollContainer);
-      let lastMeasuredScrollTop = lastScrollTop;
-      let resizePending = false;
-      let windowScrollListenerAttached = false;
-      const trackScrollPosition = (event: Event) => {
-        const target = event.currentTarget;
-        if (typeof Window !== "undefined" && target instanceof Window) {
-          lastScrollTop = readScrollTop(null);
-          if (!resizePending) {
-            lastMeasuredScrollTop = lastScrollTop;
-          }
-          return;
-        }
-        const element = target as HTMLElement | null;
-        if (!element) return;
-        // `overflowAncestors` is filtered for scrollability at mount time;
-        // keep this hot event path free of synchronous layout reads.  The
-        // nearest container remains the anchor source when nested scroll roots
-        // also receive the bubbled event.
-        if (scrollContainer && element !== scrollContainer) return;
-        lastScrollTop = readScrollTop(scrollContainer ?? element);
-        if (!resizePending) {
-          lastMeasuredScrollTop = lastScrollTop;
-        }
-      };
-      for (const ancestor of overflowAncestors) {
-        ancestor.addEventListener("scroll", trackScrollPosition, {
-          passive: true,
-        });
-      }
-      if (overflowAncestors.length === 0 && typeof window !== "undefined") {
-        window.addEventListener("scroll", trackScrollPosition, {
-          passive: true,
-        });
-        windowScrollListenerAttached = true;
-      }
-      const measure = () => {
-        if (!renderStarted) return;
-        if (!scrollContainer) {
-          scrollContainer = findNearestScrollableAncestor(wrap);
-          if (scrollContainer && !resizePending) {
-            lastScrollTop = readScrollTop(scrollContainer);
-            lastMeasuredScrollTop = lastScrollTop;
-          }
-        }
-        if (
-          scrollContainer &&
-          !overflowAncestors.includes(scrollContainer)
-        ) {
-          if (windowScrollListenerAttached && typeof window !== "undefined") {
-            window.removeEventListener("scroll", trackScrollPosition);
-            windowScrollListenerAttached = false;
-          }
-          overflowAncestors.push(scrollContainer);
-          scrollContainer.addEventListener("scroll", trackScrollPosition, {
-            passive: true,
-          });
-        }
-        const ready = Boolean(
-          embed.querySelector(
-            "iframe, .twitter-tweet-rendered, [data-twitter-widget]",
-          ),
-        );
-        if (!ready) {
-          const shellHeight = Math.round(readElementHeight(wrap));
-          if (shellHeight > 0 && Math.abs(shellHeight - lastHeight) < 2) {
-            resizePending = false;
-            lastScrollTop = readScrollTop(scrollContainer);
-            lastMeasuredScrollTop = lastScrollTop;
-          }
-          return;
-        }
-
-        // The shell reserves the previous height before the widget renders.
-        // Remove that reservation before measuring the rendered content so a
-        // cached 760px value can legitimately shrink to a 300px iframe.
-        const reservedMinHeight = wrap.style.minHeight;
-        wrap.style.removeProperty("min-height");
-        const measured = Math.round(readXEmbedContentHeight(embed));
-        if (!measured) {
-          wrap.style.minHeight = reservedMinHeight;
-          return;
-        }
-        const nextHeight = clampXEmbedHeight(measured);
-        const currentScrollTop = readScrollTop(scrollContainer);
-        const delta = nextHeight - lastHeight;
-        const expectedNativeScrollTop = lastMeasuredScrollTop + delta;
-        if (Math.abs(currentScrollTop - lastMeasuredScrollTop) <= 4) {
-          preserveScrollAnchor(
-            wrap,
-            lastHeight,
-            nextHeight,
-            lastMeasuredScrollTop,
-            scrollContainer,
-          );
-        } else if (Math.abs(currentScrollTop - expectedNativeScrollTop) > 4) {
-          // A user scroll happened while the widget was resizing.  Do not
-          // force the reader back to an older position.
-          lastMeasuredScrollTop = currentScrollTop;
-        }
-        if (Math.abs(nextHeight - lastHeight) >= 3) {
-          cacheXEmbedHeight(this.url, nextHeight);
-          lastHeight = nextHeight;
-        }
-        // Keep a stable reservation after measuring.  Since it is derived
-        // from content rather than the wrapper, this assignment also records
-        // shrinkage instead of pinning the old cached height forever.
-        wrap.style.minHeight = `${nextHeight}px`;
-        lastScrollTop = readScrollTop(scrollContainer);
-        lastMeasuredScrollTop = lastScrollTop;
-        resizePending = false;
-      };
-      const resizeObserver =
-        typeof ResizeObserver === "undefined"
-          ? null
-          : new ResizeObserver(() => {
-              resizePending = true;
-              measure();
-            });
-      resizeObserver?.observe(wrap);
-      // Observe the content independently of the reserved shell.  A cached
-      // 760px wrapper can hide a 300px iframe resize, so observing only the
-      // wrapper would never deliver the shrink measurement.
-      resizeObserver?.observe(embed);
-      const mutationObserver =
-        typeof MutationObserver === "undefined"
-          ? null
-          : new MutationObserver(() => {
-              resizePending = true;
-              queueMicrotask(measure);
-            });
-      mutationObserver?.observe(embed, { childList: true, subtree: true });
-      const stopNearViewport = observeNearViewport(wrap, () => {
-        renderStarted = true;
-        loadTwitterWidgets(embed);
-        queueMicrotask(measure);
-      });
-      this.cleanup = () => {
-        stopNearViewport();
-        resizeObserver?.disconnect();
-        mutationObserver?.disconnect();
-        for (const ancestor of overflowAncestors) {
-          ancestor.removeEventListener("scroll", trackScrollPosition);
-        }
-        if (windowScrollListenerAttached && typeof window !== "undefined") {
-          window.removeEventListener("scroll", trackScrollPosition);
-          windowScrollListenerAttached = false;
-        }
-      };
+      if (!this.data) this.cleanup = observeNearViewport(wrap, () => requestOgpForView(this.view, this.url));
       return wrap;
     }
 
@@ -984,24 +620,55 @@ class EmbedWidget extends WidgetType {
     wrap.className = "cm-link-embed";
     wrap.style.cssText =
       "position: relative; max-width: 500px; margin: 2px 0; border: 1px solid var(--border, #333); border-radius: 8px; background: var(--muted, #1e1e2e); cursor: pointer; font-size: 12px; user-select: none;";
-    wrap.style.minHeight = `${LINK_EMBED_CARD_HEIGHT}px`;
+    wrap.style.boxSizing = "border-box";
+    wrap.style.overflow = "hidden";
 
-    if (this.loading || !this.data) {
-      wrap.style.cssText +=
-        "padding: 8px 12px; color: var(--muted-foreground, #888);";
-      wrap.textContent = "リンク情報を取得中...";
-      this.cleanup = observeNearViewport(wrap, () =>
-        requestOgpForView(this.view, this.url),
-      );
+    const pageUrl = this.data?.url || this.url;
+    const imageUrl = this.data?.success
+      ? sanitizeMetadataImageUrl(this.data.image, pageUrl)
+      : null;
+    const title = this.data?.title?.trim();
+    const hasPreview = this.data?.success && (
+      (title && title !== this.url && title !== pageUrl) ||
+      this.data.description?.trim() || imageUrl
+    );
+
+    // Private pages, metadata-free pages and failed requests still need a
+    // useful link, not a full-height empty preview. Keep the pending state
+    // compact too; CodeMirror remeasures when metadata replaces this widget.
+    if (!hasPreview) {
+      wrap.classList.add("cm-link-embed-fallback");
+      wrap.style.minHeight = "44px";
+      const link = document.createElement("a");
+      link.href = this.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = this.url;
+      link.style.cssText = "display:block; padding:10px 12px; color:var(--primary,#7c93f0); text-decoration:none; line-height:1.5;";
+      const label = document.createElement("span");
+      label.textContent = this.url;
+      label.style.cssText = "display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; white-space:normal;";
+      link.appendChild(label);
+      if (this.loading || !this.data) {
+        const status = document.createElement("span");
+        status.textContent = "リンク情報を取得中...";
+        status.style.cssText = "display:block; color:var(--muted-foreground,#888); font-size:11px;";
+        link.appendChild(status);
+        this.cleanup = observeNearViewport(wrap, () =>
+          requestOgpForView(this.view, this.url),
+        );
+      }
+      wrap.appendChild(link);
+      appendActionBar(wrap, this.url, this.view, "embed", this.controller);
       return wrap;
     }
 
+    wrap.style.height = `${LINK_EMBED_CARD_HEIGHT}px`;
     const hasOgp = this.data.success;
     const card = document.createElement("div");
     card.style.cssText =
-      "display: flex; gap: 10px; align-items: center; min-height: 56px; padding: 8px 12px;";
+      "display: flex; gap: 12px; align-items: center; height:100%; box-sizing:border-box; padding: 12px;";
 
-    const pageUrl = this.data.url || this.url;
     const faviconUrl = sanitizeMetadataImageUrl(this.data.favicon, pageUrl);
     if (faviconUrl) {
       const icon = document.createElement("img");
@@ -1028,7 +695,7 @@ class EmbedWidget extends WidgetType {
         const d = this.data.description;
         desc.textContent = d.length > 100 ? d.slice(0, 100) + "..." : d;
         desc.style.cssText =
-          "color: var(--muted-foreground, #888); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px;";
+          "color: var(--muted-foreground, #888); display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; margin-top:6px; line-height:1.4;";
         textWrap.appendChild(desc);
       }
       card.appendChild(textWrap);
@@ -1040,13 +707,12 @@ class EmbedWidget extends WidgetType {
       card.appendChild(urlEl);
     }
 
-    const imageUrl = sanitizeMetadataImageUrl(this.data.image, pageUrl);
     if (imageUrl) {
       const img = document.createElement("img");
       img.src = imageUrl;
       img.style.cssText =
-        "width: 60px; height: 40px; object-fit: cover; border-radius: 4px; flex-shrink: 0;";
-      img.onerror = () => (img.style.display = "none");
+        "width: 36%; max-width:160px; height:108px; object-fit:contain; border-radius: 4px; flex-shrink: 0;";
+      img.onerror = () => (img.style.visibility = "hidden");
       card.appendChild(img);
     }
     wrap.appendChild(card);
@@ -1132,7 +798,7 @@ function buildDecorations(
       const url = match[0];
       const from = line.from + match.index;
       const to = from + url.length;
-      const cached = ogpCache.get(url) ?? null;
+      const cached = cachedOgp(url);
       const loading = !cached && ogpInFlight.has(url);
       const mode = getDisplayMode(url, controller);
 

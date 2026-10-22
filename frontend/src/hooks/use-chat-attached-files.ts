@@ -38,16 +38,16 @@ export function useChatAttachedFiles({
   const attachedFiles = temporaryFilesBySession[temporaryFileSessionKey] ?? [];
 
   const setAttachedFiles = useCallback(
-    (next: File[] | ((prev: File[]) => File[])) => {
+    (next: File[] | ((prev: File[]) => File[]), sessionKey = temporaryFileSessionKey) => {
       setTemporaryFilesBySession((prev) => {
-        const current = prev[temporaryFileSessionKey] ?? [];
+        const current = prev[sessionKey] ?? [];
         const resolved = typeof next === "function" ? next(current) : next;
         const updated = { ...prev };
 
         if (resolved.length === 0) {
-          delete updated[temporaryFileSessionKey];
+          delete updated[sessionKey];
         } else {
-          updated[temporaryFileSessionKey] = resolved;
+          updated[sessionKey] = resolved;
         }
 
         return updated;
@@ -55,6 +55,17 @@ export function useChatAttachedFiles({
     },
     [temporaryFileSessionKey],
   );
+
+  const promoteAttachedFiles = useCallback((targetSessionKey: string, submittedFiles: File[]) => {
+    setTemporaryFilesBySession((previous) => {
+      const source = previous[temporaryFileSessionKey] ?? [];
+      if (source.length !== submittedFiles.length || source.some((file, index) => file !== submittedFiles[index]) ||
+          (previous[targetSessionKey]?.length ?? 0) > 0) return previous;
+      const next = { ...previous, [targetSessionKey]: source };
+      delete next[temporaryFileSessionKey];
+      return next;
+    });
+  }, [temporaryFileSessionKey]);
 
   const appendDroppedFiles = useCallback(
     async (dataTransfer: DataTransfer) => {
@@ -121,6 +132,7 @@ export function useChatAttachedFiles({
   return {
     attachedFiles,
     setAttachedFiles,
+    promoteAttachedFiles,
     handleChatFileDragOver,
     handleChatFileDrop,
   };

@@ -20,6 +20,7 @@ let catalogCache: CacheEntry<LlmModelCatalogResponse> | null = null;
 const skillCommandsCache = new Map<string, CacheEntry<SkillSlashCommand[]>>();
 const llmModeFlights = new Map<string, Promise<LlmModeResponse>>();
 const catalogFlights = new Map<string, Promise<LlmModelCatalogResponse>>();
+const catalogRefreshFlights = new Map<string, Promise<LlmModelCatalogResponse>>();
 const skillCommandFlights = new Map<string, Promise<SkillSlashCommand[]>>();
 let lastScope: string | null = null;
 let cacheGeneration = 0;
@@ -70,6 +71,8 @@ export async function getCachedLlmModelCatalog(
 ): Promise<LlmModelCatalogResponse> {
   const scope = currentScope(explicitScope);
   ensureScope(scope);
+  const refreshFlight = catalogRefreshFlights.get(scope);
+  if (refreshFlight) return refreshFlight;
   if (isFresh(catalogCache, scope)) return catalogCache.value;
   const existing = catalogFlights.get(scope);
   if (existing) return existing;
@@ -95,11 +98,37 @@ export async function getCachedLlmModelCatalog(
 /** 明示更新時だけ、このscopeのmodel catalog TTLを無効化して再取得する。 */
 export async function refreshLlmModelCatalog(
   explicitScope?: string,
+  options?: { provider?: string | null },
 ): Promise<LlmModelCatalogResponse> {
   const scope = currentScope(explicitScope);
   ensureScope(scope);
   if (catalogCache?.scope === scope) catalogCache = null;
-  return getCachedLlmModelCatalog(scope);
+  const existing = catalogRefreshFlights.get(scope);
+  if (existing) return existing;
+  // Invalidate an older normal read as well; its late response must not
+  // repopulate the cache after this explicit refresh has started.
+  cacheGeneration += 1;
+  catalogFlights.delete(scope);
+  const generation = cacheGeneration;
+  const flight = chatApi.getLlmModelCatalog({
+    refresh: true,
+    provider: options?.provider,
+  }).then((value) => {
+    if (lastScope === scope && cacheGeneration === generation) {
+      catalogCache = { scope, expiresAt: Date.now() + TTL_MS, value };
+    }
+    return value;
+  });
+  catalogRefreshFlights.set(scope, flight);
+  void flight.then(
+    () => {
+      if (catalogRefreshFlights.get(scope) === flight) catalogRefreshFlights.delete(scope);
+    },
+    () => {
+      if (catalogRefreshFlights.get(scope) === flight) catalogRefreshFlights.delete(scope);
+    },
+  );
+  return flight;
 }
 
 export async function getCachedSkillSlashCommands(
@@ -149,5 +178,6 @@ export function clearLlmMetaCache(): void {
   skillCommandsCache.clear();
   llmModeFlights.clear();
   catalogFlights.clear();
+  catalogRefreshFlights.clear();
   skillCommandFlights.clear();
 }

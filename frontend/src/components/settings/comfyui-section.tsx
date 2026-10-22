@@ -13,11 +13,11 @@ import { Label } from "@/components/ui/label";
 import { 
   Card, 
   CardContent, 
-  CardDescription, 
   CardFooter, 
   CardHeader, 
   CardTitle 
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Badge } from "@/components/ui/badge";
 import { 
   RefreshCcw, 
@@ -216,20 +216,26 @@ export function ComfyUISection() {
 
   return (
       <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="comfyui">
-      <CardHeader
-          className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
-        onClick={handleToggleExpanded}
-      >
+      <CardHeader className="flex flex-row items-center gap-2 border-b border-border dark:border-[#333335] p-0 !px-0">
+        <div
+          className="flex min-w-0 flex-1 cursor-pointer select-none px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          data-settings-target-activation="comfyui"
+          onClick={handleToggleExpanded}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              handleToggleExpanded();
+            }
+          }}
+        >
           <div className="flex items-center justify-between gap-3">
-            <div>
-              <CardTitle className="flex items-center gap-2 text-sm">
-                <Settings2 className="size-4" />
-                ComfyUI 連携設定
-              </CardTitle>
-              <CardDescription>
-                ローカル画像生成連携と画像生成ワークフローを管理します。
-              </CardDescription>
-            </div>
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Settings2 className="size-4" />
+              ComfyUI 連携設定
+            </CardTitle>
             <div className="flex shrink-0 items-center gap-2">
               {config?.enabled === false ? (
                 <Badge variant="secondary">OFF</Badge>
@@ -251,6 +257,10 @@ export function ComfyUISection() {
               {expanded ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
             </div>
           </div>
+        </div>
+        <HelpPopover label="ComfyUI 連携設定" className="mr-3">
+          ローカル画像生成連携と画像生成ワークフローを管理します。
+        </HelpPopover>
       </CardHeader>
       {expanded && (
         <CardContent className="space-y-4 px-3 py-3">
@@ -260,9 +270,11 @@ export function ComfyUISection() {
             <>
           <div className="flex items-center justify-between rounded-md border p-3">
             <div>
-              <p className="text-sm font-medium">ComfyUI連携</p>
-              <p className="text-xs text-muted-foreground">
-                OFFの間は設定画面でも生成処理でもComfyUIへ接続しません。
+              <p className="inline-flex items-center gap-1 text-sm font-medium">
+                ComfyUI連携
+                <HelpPopover label="ComfyUI連携">
+                  OFFの間は設定画面でも生成処理でもComfyUIへ接続しません。
+                </HelpPopover>
               </p>
             </div>
             <Checkbox
@@ -271,7 +283,12 @@ export function ComfyUISection() {
             />
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="comfyui-url">ComfyUI サーバー URL</Label>
+            <div className="inline-flex items-center gap-1">
+              <Label htmlFor="comfyui-url">ComfyUI サーバー URL</Label>
+              <HelpPopover label="ComfyUI サーバー URL">
+                ComfyUIを起動し、APIが有効な状態で待機させてください。
+              </HelpPopover>
+            </div>
             <div className="flex gap-2">
               <Input 
                 id="comfyui-url" 
@@ -281,19 +298,18 @@ export function ComfyUISection() {
               />
               <Button onClick={handleUpdateConfig}>保存</Button>
             </div>
-            <p className="text-xs text-muted-foreground">
-              ComfyUIを起動し、APIが有効な状態で待機させてください。
-            </p>
           </div>
           <div className="rounded-md border">
           <div className="flex items-center justify-between">
             <div>
               <p className="flex items-center gap-2 px-3 pt-3 text-sm font-medium">
                 <FileJson className="size-4" />
-                画像生成ワークフロー
-              </p>
-              <p className="px-3 pt-1 text-xs text-muted-foreground">
-                ComfyUI用JSONワークフローです。エージェントワークフローとは別物です。
+                <span className="inline-flex items-center gap-1">
+                  画像生成ワークフロー
+                  <HelpPopover label="画像生成ワークフロー">
+                    ComfyUI用JSONワークフローです。エージェントワークフローとは別物です。
+                  </HelpPopover>
+                </span>
               </p>
             </div>
             <div className="relative mr-3 mt-3">

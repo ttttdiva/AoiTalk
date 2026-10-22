@@ -13,8 +13,9 @@ export type LlmEngineState = {
 };
 
 export const llmEngineApi = {
-  async get(): Promise<LlmEngineState> {
-    return fetchApi<LlmEngineState>("/api/llm/engine");
+  async get(includeAvailable = false): Promise<LlmEngineState> {
+    const query = includeAvailable ? "?include_available=true" : "";
+    return fetchApi<LlmEngineState>(`/api/llm/engine${query}`);
   },
 
   async set(provider: string, model: string): Promise<LlmEngineState> {
@@ -22,6 +23,6 @@ export const llmEngineApi = {
       method: "POST",
       body: JSON.stringify({ provider, model }),
     });
-    return this.get();
+    return this.get(true);
   },
 };

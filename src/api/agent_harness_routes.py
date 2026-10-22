@@ -9,12 +9,15 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from ..agent_harness.config import (
     AgentHarnessConfigError,
     AgentHarnessSettings,
+    is_claude_runner,
+    migrate_legacy_claude_agent_harness_config,
+    persisted_agent_harness_runner,
     public_agent_harness_settings,
     strip_agent_harness_secret_keys,
     validate_agent_harness_update,
@@ -232,6 +235,19 @@ def create_agent_harness_router(
                     )
             orch = await get_orchestrator()
             state = await orch.snapshot_async() if orch.uses_common_runtime else orch.snapshot()
+            if not orch.settings.enabled:
+                # The durable coordinator may remain process-wide enabled for
+                # other Operations lanes, but this independent Agent Harness
+                # setting still owns the harness state shown by this endpoint.
+                state = {
+                    **state,
+                    "enabled": False,
+                    "effective_enabled": False,
+                    "effective_auto_start": False,
+                    "running": [],
+                    "retrying": [],
+                    "claimed": [],
+                }
             if not (
                 Features.autonomous_agent_runtime() or Features.code_agent()
             ):
@@ -252,7 +268,13 @@ def create_agent_harness_router(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.get("/config")
-    async def get_config(request: Request, _=Depends(require_auth_dependency)):
+    async def get_config(
+        request: Request,
+        runner: str | None = Query(default=None, max_length=32),
+        model: str | None = Query(default=None, max_length=256),
+        effort: str | None = Query(default=None, max_length=32),
+        _=Depends(require_auth_dependency),
+    ):
         """Return only independent autonomous-task settings (never Team routes)."""
         raw = config.get("agent_harness", {}) if hasattr(config, "get") else {}
         settings = public_agent_harness_settings(raw)
@@ -264,7 +286,25 @@ def create_agent_harness_router(
         if not runtime_allowed:
             settings["enabled"] = False
             settings["auto_start"] = False
-        return JSONResponse(content={"success": True, "independent": True, "settings": settings})
+        content: dict[str, Any] = {"success": True, "independent": True, "settings": settings}
+        status_runner = runner or settings.get("runner")
+        if is_claude_runner(status_runner):
+            # Version/capability compatibility for the selected Claude model.
+            try:
+                from ..llm.cli_backends.claude import detect_claude_code_status
+
+                effective = AgentHarnessSettings.from_config(
+                    config, root_dir=Path(__file__).resolve().parents[2]
+                )
+                content["claude_code"] = await asyncio.to_thread(
+                    detect_claude_code_status,
+                    effective.claude.bin_path,
+                    model=(model if model is not None else effective.claude.model),
+                    effort=(effort if effort is not None else effective.claude.reasoning_effort),
+                )
+            except Exception:
+                logger.debug("Claude Code status probe failed", exc_info=True)
+        return JSONResponse(content=content)
 
     @router.put("/config")
     async def update_config(request: Request, _=Depends(require_auth_dependency)):
@@ -273,17 +313,22 @@ def create_agent_harness_router(
             payload = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="JSON payload is required") from exc
-        try:
-            settings = validate_agent_harness_update(payload)
-        except AgentHarnessConfigError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         current = config.get("agent_harness", {}) if hasattr(config, "get") else {}
         if not isinstance(current, dict):
             current = {}
+        try:
+            settings = validate_agent_harness_update(
+                payload,
+                current_runner=persisted_agent_harness_runner(current),
+            )
+        except AgentHarnessConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Merge only the already-validated branches.  ``dict.update`` on an
         # arbitrary nested payload was the original RCE primitive (hooks,
         # custom_command, executable paths, and workspace roots all survived).
-        merged = strip_agent_harness_secret_keys(copy.deepcopy(current))
+        merged = strip_agent_harness_secret_keys(
+            migrate_legacy_claude_agent_harness_config(current)
+        )
         # A pre-existing hand-edited/legacy file may already contain these
         # deployment-owned branches.  Once an administrator uses the public
         # endpoint, remove them instead of carrying an unsafe value forward

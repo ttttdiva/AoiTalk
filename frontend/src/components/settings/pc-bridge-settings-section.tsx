@@ -8,11 +8,13 @@ import { Button } from "@/components/ui/button";
 import { AppSelect } from "@/components/ui/app-select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { withBasePath } from "@/lib/base-path";
+import { buildPcBridgeServerUrl } from "@/lib/websocket-url";
 import { SettingsDisclosure } from "./settings-disclosure";
 
 type Device = { id: string; name: string; online: boolean; edge_connected: boolean; capabilities: string[] };
 type State = { devices: Device[]; selected_device_id: string | null };
-const base = "/api/python-proxy/pc-bridge";
+const base = withBasePath("/api/python-proxy/pc-bridge");
 
 async function api(path: string, method = "GET", body?: unknown) {
   const response = await fetch(base + path, {
@@ -42,7 +44,8 @@ export function PcBridgeSettingsSection() {
     finally { setBusy(false); }
   }
   function saveConfig() {
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ server_url: window.location.origin, token }, null, 2)], { type: "application/json" }));
+    const serverUrl = buildPcBridgeServerUrl();
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ server_url: serverUrl, token, browser_backend: "agent_browser" }, null, 2)], { type: "application/json" }));
     const link = document.createElement("a"); link.href = url; link.download = "aoitalk-pc-connection.json"; link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
@@ -56,9 +59,20 @@ export function PcBridgeSettingsSection() {
     setScreen(screenRef.current);
   }
 
-  return <SettingsDisclosure title="PC接続" targetId="pc-bridge" icon={<Monitor className="size-4" />} summary={data?.devices.find(d => d.id === data.selected_device_id)?.name ?? "PC未選択"}>
+  return <SettingsDisclosure
+    title="PC接続"
+    targetId="pc-bridge"
+    icon={<Monitor className="size-4" />}
+    summary={data?.devices.find(d => d.id === data.selected_device_id)?.name ?? "PC未選択"}
+    help={(
+      <>
+        <p>操作するPCでポータブルBridgeを起動すると、そのPCのEdgeとWindowsをChatから操作できます。</p>
+        <p>このユーザーのChat操作先です。未接続でも別PCやサーバーPCへ自動で切り替わりません。</p>
+        <p>対応版Bridgeの「設定ファイル読込」で開き、「接続」を押してください。OperationsではProject・人格・アカウントを選び「専用ブラウザを開く」を押します。本人がログインして対象タブを選んでください。従来版は専用profileに対応していません。</p>
+      </>
+    )}
+  >
     <div className="max-w-2xl space-y-3">
-      <p className="text-sm">操作するPCでポータブルBridgeを起動すると、そのPCのEdgeとWindowsをChatから操作できます。</p>
       <a className="text-sm underline" href={`${base}/download`}>AoiTalk-PC-Bridge.exe を取得</a>
       {error && <p role="alert" className="text-sm text-destructive">PC一覧を取得できませんでした。</p>}
       <div className="space-y-1">
@@ -72,7 +86,6 @@ export function PcBridgeSettingsSection() {
           <option value="">PCを選択してください</option>
           {data?.devices.map(device => <option key={device.id} value={device.id}>{device.name} — {device.online ? "接続済み" : "未接続"}{device.online ? (device.edge_connected ? " / Edge接続済み" : " / Edge未接続") : ""}</option>)}
         </AppSelect>
-        <p className="text-xs text-muted-foreground">このユーザーのChat操作先です。未接続でも別PCやサーバーPCへ自動で切り替わりません。</p>
       </div>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void run(async () => { await mutate(); })}>接続を更新</Button>
@@ -91,7 +104,6 @@ export function PcBridgeSettingsSection() {
         <Label htmlFor="pc-bridge-token">接続コード（この画面でのみ表示）</Label>
         <Input id="pc-bridge-token" type="password" value={token} readOnly />
         <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => void run(async () => { await navigator.clipboard.writeText(token); setMessage("接続コードをコピーしました"); })}>コードをコピー</Button><Button size="sm" onClick={saveConfig}>Bridge設定ファイルを保存</Button></div>
-        <p className="text-xs text-muted-foreground">exeの「設定ファイル読込」で開き、「接続」を押してください。Edge操作はexeの「Edge拡張を準備」も実行します。</p>
       </div>}
       {message && <p role="status" className="text-sm">{message}</p>}
       {screen && <Image src={screen} unoptimized width={1600} height={1000} alt="選択したPCの画面" className="h-auto w-full rounded-md border" />}

@@ -354,7 +354,7 @@ export async function GET(
   const activityRows = await db
     .select()
     .from(timeEntries)
-    .where(eq(timeEntries.taskId, id))
+    .where(and(eq(timeEntries.taskId, id), isNull(timeEntries.deletedAt)))
     .orderBy(desc(timeEntries.startedAt));
 
   const result = serializeAutoCloseOnDue(
@@ -1801,6 +1801,7 @@ export async function PATCH(
       and(
         eq(timeEntries.taskId, id),
         eq(timeEntries.userId, user.id),
+        isNull(timeEntries.deletedAt),
         isNull(timeEntries.endedAt),
       ),
     )

@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   Download,
   Upload,
@@ -148,7 +149,17 @@ export function UserExportSection() {
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        data-settings-target-activation="user-export"
         onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
@@ -187,10 +198,10 @@ export function UserExportSection() {
 
           {/* インポート */}
           <div className="space-y-2">
-            <Label className="text-xs font-medium">インポート</Label>
-            <p className="text-xs text-muted-foreground">
-              JSONファイルからユーザーを一括作成します。既存ユーザーはスキップされます。
-            </p>
+            <div className="inline-flex items-center gap-1">
+              <Label className="text-xs font-medium">インポート</Label>
+              <HelpPopover label="ユーザーインポート">JSONファイルからユーザーを一括作成します。既存ユーザーはスキップされます。</HelpPopover>
+            </div>
             <div className="flex items-end gap-2">
               <div className="space-y-1">
                 <Label className="text-[10px] text-muted-foreground">

@@ -63,6 +63,7 @@ class MeetingProcessingWorker:
         self._poll_task = None
         self._tasks = set()
         self._claims = {}
+        self._lease_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self.is_running = False
         if self.storage is None:
             try:
@@ -114,6 +115,28 @@ class MeetingProcessingWorker:
         for claim in claims:
             try: await self._requeue_claim(claim)
             except Exception: log.warning("meeting worker requeue failed",exc_info=True)
+        await self._drain_lease_cleanup_tasks()
+
+    async def _drain_lease_cleanup_tasks(self) -> None:
+        """Wait for tracked runtime lease cleanup without blocking the loop."""
+
+        while True:
+            pending = tuple(
+                task for task in self._lease_cleanup_tasks if not task.done()
+            )
+            if not pending:
+                break
+            # Cancellation of stop() must not cancel the Future wrappers that
+            # are waiting for a sync thread. The tracked tasks remain owned by
+            # this worker and are drained by a later stop or by loop lifetime.
+            await asyncio.shield(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        drain = getattr(self.local_llm, "drain_runtime_consumer_lease_cleanup", None)
+        if callable(drain):
+            result = drain()
+            if inspect.isawaitable(result):
+                await result
     async def readiness_snapshot(self):
         async def ready(obj):
             if obj is None:return False
@@ -179,17 +202,105 @@ class MeetingProcessingWorker:
     def _assert_claim_active(claim: MeetingProcessingClaim) -> None:
         if claim.lease_lost.is_set():
             raise MeetingProcessingLeaseLost()
+
+    def _track_late_lease_cleanup(self, task: asyncio.Task[Any]) -> None:
+        self._lease_cleanup_tasks.add(task)
+        def finish(done: asyncio.Task[Any]) -> None:
+            self._lease_cleanup_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except Exception:
+                error = None
+            if error is not None:
+                log.warning("meeting runtime lease cleanup failed: %s", error)
+
+        task.add_done_callback(finish)
+
+    async def _release_runtime_lease(self, lease: Any) -> None:
+        if lease is None:
+            return
+        release_async = getattr(self.local_llm, "release_runtime_consumer_lease_async", None)
+        if callable(release_async):
+            await release_async(lease)
+            return
+        release = getattr(lease, "release", None)
+        if callable(release):
+            await asyncio.to_thread(release)
+
+    def _schedule_runtime_lease_cleanup(self, lease: Any) -> None:
+        if lease is None:
+            return
+        self._track_late_lease_cleanup(
+            asyncio.create_task(
+                self._release_runtime_lease(lease),
+                name="meeting-worker-runtime-lease-release",
+            )
+        )
+
+    async def _acquire_runtime_lease_nonblocking(self, acquire: Callable[[], Any]):
+        """Run legacy sync acquisition off-loop and settle a late result."""
+
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(acquire),
+            name="meeting-worker-runtime-lease",
+        )
+        try:
+            return await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            async def settle_late_acquire() -> None:
+                try:
+                    lease = await acquire_task
+                except Exception:
+                    return
+                if lease is not None:
+                    try:
+                        await self._release_runtime_lease(lease)
+                    except Exception:
+                        log.warning("late meeting runtime lease cleanup failed", exc_info=True)
+
+            self._track_late_lease_cleanup(
+                asyncio.create_task(
+                    settle_late_acquire(),
+                    name="meeting-worker-late-runtime-lease-cleanup",
+                )
+            )
+            raise
+
     async def _execute_claim(self,claim):
         stop=asyncio.Event(); heartbeat=asyncio.create_task(self._heartbeat(claim,stop))
-        try: await self._execute(claim)
+        runtime_lease = None
+        try:
+            acquire_async = getattr(self.local_llm, "acquire_runtime_consumer_lease_async", None)
+            if callable(acquire_async):
+                runtime_lease = await acquire_async()
+            else:
+                acquire = getattr(self.local_llm, "acquire_runtime_consumer_lease", None)
+                if callable(acquire):
+                    runtime_lease = await self._acquire_runtime_lease_nonblocking(acquire)
+            await self._execute(claim)
         except asyncio.CancelledError: raise
         except MeetingProcessingLeaseLost: pass
         except Exception as exc: await self._mark_failed(claim,exc)
         finally:
+            # Keep a managed local endpoint alive across both minutes and
+            # memo generation (including transcript reduction between them).
+            # The service-level wrappers protect individual calls; this job
+            # lease closes the gap between those calls while a global switch
+            # is waiting on active consumers.
+            # Stop lease heartbeats and close the claim boundary immediately;
+            # a slow release is tracked below and drained during worker.stop.
             stop.set(); heartbeat.cancel()
-            try: await heartbeat
-            except asyncio.CancelledError: pass
             self._claims.pop(claim.job_id,None)
+            try:
+                await asyncio.shield(heartbeat)
+            except BaseException:
+                pass
+            try:
+                self._schedule_runtime_lease_cleanup(runtime_lease)
+            except Exception:
+                log.warning("meeting runtime lease cleanup scheduling failed", exc_info=True)
     async def _load_job(self,job_id):
         session=await self._new_session()
         try:return await session.get(MeetingProcessingJob,job_id)
@@ -332,6 +443,8 @@ class MeetingProcessingWorker:
         # best effort: a filesystem failure must never turn a committed job
         # back into a failed one.
         await self._cleanup_staging(job)
+        from .media_index_worker import notify_media_source
+        notify_media_source(job.actor_user_id, "meeting_audio", job.id)
     def _audio_path(self,job):
         if self.storage is None:return Path(str(getattr(job,"audio_upload_id", "")))
         value=self.storage.resolve_upload(job.actor_user_id,job.audio_upload_id)

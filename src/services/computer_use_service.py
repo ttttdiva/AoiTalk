@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .pc_bridge_store import PcBridgeError
 from .candidate_decision_service import CandidateDecisionRouter, llm_choice_callback
 from .jev_decision_service import JevDecisionService
+from .decision_receipt_service import finalize_decision_receipt
 from .outbound_privacy_service import OutboundPrivacyGateway, current_effective_privacy_mode
 
 
@@ -37,6 +38,7 @@ class ComputerUseService:
             jev=JevDecisionService(OutboundPrivacyGateway(config), timeout_seconds=5, max_retries=0),
             jev_enabled=value.get('jev_enabled', True),
             local_only=current_effective_privacy_mode(config) == 'local_only',
+            default_decision_kind='computer_use',
         )
         self.trace = []
 
@@ -63,6 +65,7 @@ class ComputerUseService:
     async def run(self, *, goal='', action='observe', params=None, use_vision=False, max_steps=24):
         if not self.bridge.operation_lock.acquire(blocking=False):
             return {'success': False, 'reason': 'bridge_device_busy'}
+        receipt = None
         try:
             async with asyncio.timeout(600):
                 if not goal:
@@ -74,6 +77,7 @@ class ComputerUseService:
                         result['vision'] = await self.vision(outcome, 'Describe the visible screen.')
                     return {'success': True, 'status': 'observed' if action in ('observe', 'screenshot', 'windows') else 'performed', 'observation': result}
                 for number in range(1, max_steps + 1):
+                    receipt = None
                     from ..llm.generation_cancellation import raise_if_generation_interrupted
                     raise_if_generation_interrupted()
                     observed = await self.bridge.computer('observe')
@@ -105,28 +109,47 @@ class ComputerUseService:
                         return {'success': True, 'status': 'completed', 'summary': step.summary,
                                 'observation': state, 'trace': self.trace, 'fallback_reason': self.router.fallback_reason}
                     params = step.model_dump(exclude={'action', 'instruction', 'summary'}, exclude_none=True)
+                    if observed.get('observation_id'):
+                        params['observation_id'] = observed['observation_id']
                     if step.action in ('click', 'double_click', 'right_click', 'type') and step.instruction:
-                        controls = {key: item for key, item in observed.get('controls', {}).items() if item.get('enabled', True)}
+                        controls = {key: item for key, item in observed.get('controls', {}).items() if item.get('enabled', True) and item.get('actionable', True)}
                         if step.action == 'type':
-                            controls = {key: item for key, item in controls.items() if item.get('type') in ('Edit', 'Document')}
-                        ids = {f'e{i + 1}': key for i, key in enumerate(list(controls)[:190])}
+                            controls = {key: item for key, item in controls.items() if item.get('type') in ('Edit', 'Document') and not item.get('readonly', False)}
+                        ids = {f'e{i + 1}': key for i, key in enumerate(controls)}
                         if ids:
                             choice = await self.router.choose(
-                                {'windows': observed.get('windows', []), 'foreground_window_id': observed.get('foreground_window_id')},
+                                {'windows': observed.get('windows', []), 'foreground_window_id': observed.get('foreground_window_id'), 'coverage': observed.get('coverage', {})},
                                 f'Operation: {step.action}. Target: {step.instruction}',
-                                {key: controls[value] for key, value in ids.items()},
+                                {key: {k: v for k, v in controls[value].items() if k != 'value'} for key, value in ids.items()},
                             )
+                            receipt = getattr(choice, 'receipt', None)
+                            if choice.choice not in ids:
+                                finalize_decision_receipt(receipt, outcome='stale', validation_result='host_candidate_missing')
+                                receipt = None
+                                raise PcBridgeError('computer_candidate_stale')
+                            receipt = finalize_decision_receipt(receipt, host_action=step.action,
+                                host_candidate=choice.choice, outcome='dispatching', validation_result='host_candidate_valid')
                             params['target'] = ids[choice.choice]
                     if step.action == 'wait':
                         await asyncio.sleep(0.7)
                     else:
-                        await self.bridge.computer(step.action, **params)
+                        outcome = await self.bridge.computer(step.action, **params)
+                        receipt = finalize_decision_receipt(receipt,
+                            outcome='failed' if outcome.get('ok') is False or outcome.get('success') is False else 'performed',
+                            validation_result='bridge_returned')
                     self.trace.append({'step': number, 'action': step.action, 'instruction': step.instruction,
-                                       'text': step.text if step.action == 'type' else '', 'keys': step.keys})
+                                       'text_length': len(step.text) if step.action == 'type' else 0, 'keys': step.keys,
+                                       'decision_id': receipt.decision_id if receipt else None,
+                                       'receipt': receipt.to_dict() if receipt else None})
+                    receipt = None
                 return {'success': False, 'status': 'stopped', 'reason': 'computer_step_limit', 'trace': self.trace}
         except asyncio.CancelledError:
+            finalize_decision_receipt(receipt, outcome='unknown')
             raise
         except Exception as exc:
+            receipt = finalize_decision_receipt(receipt, outcome='unknown')
+            if receipt:
+                self.trace.append({'decision_id': receipt.decision_id, 'receipt': receipt.to_dict()})
             return {'success': False, 'status': 'failed', 'reason': str(exc)[:500], 'trace': self.trace}
         finally:
             self.bridge.operation_lock.release()

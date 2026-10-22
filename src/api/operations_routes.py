@@ -11,17 +11,28 @@ from __future__ import annotations
 import base64
 import binascii
 import inspect
+import hmac
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.exc import IntegrityError
 
 from ..services import operations_service as service
+from ..services.media_operations_package_service import build_action_package
 from ..services.operations_command_center import OperationsCommandCenterService
+from ..services.operations_execution_projection import read_execution
+from ..services.work_read_projection import WorkReadProjectionService
+from ..features import Features
+from .operations_execution_schemas import OperationsWorkExecutionResponse
+from .operations_command_center_schemas import OperationsCommandCenterResponse
+from .work_read_projection_schemas import WorkReadProjectionResponse
+from .media_operations_setup_routes import PlatformAccountDetailResponse
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +50,40 @@ class _OperationsResponseModel(BaseModel):
     """Permissive safe projection model for additive response metadata."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+class MediaActionPackageAsset(_OperationsModel):
+    ordinal: int
+    role: str
+    status: str
+    reference_type: str
+    reference_id: str | None = None
+    artifact_id: str | None = None
+    filename: str | None = None
+    archive_path: str | None = None
+    extension: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    reason: str | None = None
+
+
+class MediaActionPackageManifest(_OperationsModel):
+    schema_version: Literal["mediaops.action-package.v1"]
+    action: dict[str, Any]
+    source: dict[str, Any]
+    payload: dict[str, Any]
+    assets: list[MediaActionPackageAsset]
+    status: Literal["verified", "partial"]
+    reasons: list[dict[str, Any]]
+    receipt: dict[str, Any]
+    limits: dict[str, int]
+
+
+class MediaActionPackagePreview(_OperationsModel):
+    manifest: MediaActionPackageManifest
+    manifest_sha256: str
+    filename: str
 
 
 class ConnectionCreateRequest(_OperationsModel):
@@ -75,6 +120,11 @@ class OpportunityCreateRequest(_OperationsModel):
     project_id: str | None = None
     status: str = Field(default="open", min_length=1, max_length=32)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DevelopmentRequirementsResolveRequest(_OperationsModel):
+    resolved: bool
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class EvaluationCreateRequest(_OperationsModel):
@@ -150,7 +200,7 @@ class MediaActionCreateRequest(_OperationsModel):
     # ``operation_key`` is the descriptive alias used by MediaOps clients;
     # the service persists the canonical ``action_type`` value.
     operation_key: str | None = Field(default=None, max_length=64)
-    platform: Literal["x", "pixiv", "dlsite", "patreon", "youtube", "instagram"]
+    platform: Literal["x", "pixiv", "dlsite", "patreon", "youtube", "instagram", "fanza", "tiktok"]
     content_item_id: str
     content_variant_id: str
     content_variant_revision_id: str
@@ -264,6 +314,142 @@ class AttemptCompleteRequest(_OperationsModel):
     confirmation_level: str | None = Field(default=None, max_length=32)
     error_message: str | None = Field(default=None, max_length=4000)
     result_summary: str | None = Field(default=None, max_length=4000)
+
+
+class MediaBrowserPreparationRequest(_OperationsModel):
+    expected_version: int = Field(..., ge=1)
+    action_version: int = Field(..., ge=1)
+    payload_hash: str = Field(..., pattern=r"^[a-f0-9]{64}$")
+    device_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    tab_id: int = Field(..., ge=1)
+    idempotency_key: str = Field(..., min_length=1, max_length=255)
+
+
+class MediaBridgeConnectionPreviewRequest(_OperationsModel):
+    owner_user_id: UUID
+    project_id: UUID | None
+    persona_id: UUID
+    expected_account_revision_id: UUID
+    expected_account_revision_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    account_ref: str = Field(min_length=2, max_length=32)
+    device_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,120}$")
+    tab_id: int = Field(ge=1, strict=True)
+    browser_context_label: str = Field(min_length=1, max_length=80)
+    google_account_label: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class MediaBridgeBrowserContext(_OperationsModel):
+    context_id: UUID
+    context_epoch: UUID
+
+
+class MediaBridgeConnectionPreviewResponse(_OperationsModel):
+    mode: Literal["bridge_manual"]
+    owner_user_id: str
+    project_id: str | None
+    persona_id: str
+    persona_display_name: str
+    platform_account_id: str
+    platform_account_revision_id: str
+    platform_account_revision_hash: str
+    platform: Literal["x", "youtube"]
+    account_display_name: str
+    account_ref: str
+    device_id: str
+    tab_id: int
+    browser_context: MediaBridgeBrowserContext
+    browser_context_label: str
+    google_account_label: str | None
+    checked_at: str
+    expires_at: str
+    preview_token: str
+    official_api_verified: Literal[False]
+    publication_confirmed: Literal[False]
+
+
+class MediaBridgeConnectionSaveRequest(_OperationsModel):
+    preview_token: str = Field(min_length=1, max_length=8192)
+    confirmed: Literal[True]
+    idempotency_key: str = Field(min_length=1, max_length=220)
+
+    @model_validator(mode="before")
+    @classmethod
+    def explicit_boolean_confirmation(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("confirmed") is not True:
+            raise ValueError("confirmed must be the explicit boolean true")
+        return value
+
+
+class MediaBridgeConnectionReceipt(_OperationsModel):
+    binding_revision_id: str
+    account_revision_hash: str
+    connection_id: str
+    connection_version: int
+    owner_user_id: str
+    project_id: str | None
+    persona_id: str
+    platform_account_id: str
+    platform: Literal["x", "youtube"]
+    account_ref: str
+    device_id: str
+    tab_id: int
+    browser_context: MediaBridgeBrowserContext
+    browser_context_label: str
+    google_account_label: str | None
+    saved_at: str
+
+
+class MediaBridgeConnectionSaveResponse(_OperationsModel):
+    mode: Literal["bridge_manual"]
+    account: PlatformAccountDetailResponse
+    binding_receipt: MediaBridgeConnectionReceipt
+    readback_binding_matches: bool
+    official_api_verified: Literal[False]
+    publication_confirmed: Literal[False]
+
+
+class MediaBrowserPreparationInspectRequest(_OperationsModel):
+    preparation_id: UUID
+    expected_version: int = Field(..., ge=1)
+
+
+class MediaBrowserPreparationResponse(_OperationsResponseModel):
+    id: str
+    action_id: str
+    owner_user_id: str
+    project_id: str | None
+    action_version: int
+    action_state_version: int
+    payload_hash: str
+    platform: str
+    platform_account_id: str
+    platform_account_revision_id: str
+    device_id: str
+    tab_id: int
+    content_sha256: str
+    text_sha256: str | None
+    metadata_sha256: str | None
+    status: Literal["preparing", "awaiting_final_confirmation", "uncertain", "blocked"]
+    phase: str
+    version: int
+    lease_expires_at: str | None
+    error_code: str | None
+    publication_confirmed: Literal[False]
+    automatic_retry_allowed: Literal[False]
+    current_action_matches: bool
+    current_approval_valid: bool
+    created_at: str
+    finished_at: str | None
+
+
+class MediaBrowserPreparationEnvelope(_OperationsResponseModel):
+    preparation: MediaBrowserPreparationResponse | None
+    publication_confirmed: Literal[False]
+
+
+class ProviderRecoveryRequest(_OperationsModel):
+    expected_version: int = Field(..., ge=1)
+    resume: bool = False
 
 
 class ReconcileRequest(_OperationsModel):
@@ -384,6 +570,8 @@ class AttemptResponse(_OperationsResponseModel):
     capability_snapshot_hash: str | None = None
     execution_key: str | None = None
     provider_attempt_ref: str | None = None
+    provider_recovery_available: bool = False
+    provider_lease_expires_at: str | None = None
     evidence_artifact_ids: list[str] = Field(default_factory=list)
     result_summary: str | None = None
     error_message: str | None = None
@@ -692,8 +880,9 @@ def create_operations_router(
     """Build the authenticated Operations API router."""
 
     router = APIRouter(prefix="/api/operations", tags=["operations"])
-    operations = service.OperationsService()
+    operations = service.create_operations_service()
     command_center = OperationsCommandCenterService(action_registry=action_registry)
+    work_projection = WorkReadProjectionService()
 
     async def current_actor(request: Request) -> Any:
         user = await _actor(get_user_from_request, request)
@@ -706,8 +895,29 @@ def create_operations_router(
         return endpoint
 
     @router.get(
+        "/work-projection",
+        operation_id="operations_get_work_projection",
+        response_model=WorkReadProjectionResponse,
+    )
+    async def get_work_projection(
+        request: Request,
+        project_id: UUID | None = None,
+        space_id: UUID | None = None,
+        kind: Literal["task", "opportunity", "content_item"] | None = None,
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=2048),
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(
+            work_projection.snapshot, session, actor, project_id=project_id,
+            space_id=space_id, kind=kind, limit=limit, cursor=cursor,
+        ))
+
+    @router.get(
         "/command-center",
         operation_id="operations_get_command_center",
+        response_model=OperationsCommandCenterResponse,
     )
     @protected
     async def get_command_center(
@@ -720,6 +930,8 @@ def create_operations_router(
         from_: str | None = Query(default=None, alias="from"),
         to_: str | None = Query(default=None, alias="to"),
         limit: int = Query(default=100, ge=1, le=500),
+        work_cursor: str | None = Query(default=None, max_length=2048),
+        agents_cursor: str | None = Query(default=None, max_length=2048),
         _: Any = Depends(require_auth_dependency),
     ) -> Any:
         for value, label in (
@@ -747,8 +959,40 @@ def create_operations_router(
                 from_at=from_,
                 to_at=to_,
                 limit=limit,
+                work_cursor=work_cursor,
+                agents_cursor=agents_cursor,
             ),
         )
+
+    @router.get(
+        "/work/{work_id}/execution",
+        operation_id="operations_get_work_execution",
+        response_model=OperationsWorkExecutionResponse,
+    )
+    async def get_work_execution(
+        work_id: UUID,
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=100),
+        runs_cursor: str | None = Query(default=None, max_length=1024),
+        events_cursor: str | None = Query(default=None, max_length=1024),
+        tools_cursor: str | None = Query(default=None, max_length=1024),
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        if not (Features.virtual_company() and Features.autonomous_agent_runtime()):
+            raise HTTPException(status_code=404, detail="execution is unavailable")
+        actor = await current_actor(request)
+
+        async def read(session: Any) -> Any:
+            projects = await command_center.project_scope(session, actor)
+            payload = await _invoke(
+                read_execution, session, work_id, projects, limit=limit,
+                runs_cursor=runs_cursor, events_cursor=events_cursor, tools_cursor=tools_cursor,
+            )
+            if payload is None:
+                raise HTTPException(status_code=404, detail="execution is unavailable")
+            return payload
+
+        return await _with_session(get_db_manager, read)
 
     async def media_call(method_name: str, actor: Any, *args: Any, **kwargs: Any) -> Any:
         """Invoke one MediaOps action method through the shared DB boundary."""
@@ -769,10 +1013,16 @@ def create_operations_router(
     @protected
     async def media_adapter_status(
         request: Request,
+        platform_account_id: UUID | None = Query(default=None),
+        device_id: str | None = Query(default=None, min_length=1, max_length=120),
+        tab_id: int | None = Query(default=None, ge=1),
         _: Any = Depends(require_auth_dependency),
     ) -> Any:
         actor = await current_actor(request)
-        return await media_call("get_media_adapter_status", actor)
+        if platform_account_id is None and device_id is None and tab_id is None:
+            return await media_call("get_media_adapter_status", actor)
+        return await media_call("get_media_adapter_status", actor, platform_account_id=platform_account_id,
+            device_id=device_id, tab_id=tab_id)
 
     # Compatibility path for clients that group adapter readiness under
     # ``/adapters`` rather than the singular status resource.
@@ -785,10 +1035,16 @@ def create_operations_router(
     @protected
     async def media_adapters_status(
         request: Request,
+        platform_account_id: UUID | None = Query(default=None),
+        device_id: str | None = Query(default=None, min_length=1, max_length=120),
+        tab_id: int | None = Query(default=None, ge=1),
         _: Any = Depends(require_auth_dependency),
     ) -> Any:
         actor = await current_actor(request)
-        return await media_call("get_media_adapter_status", actor)
+        if platform_account_id is None and device_id is None and tab_id is None:
+            return await media_call("get_media_adapter_status", actor)
+        return await media_call("get_media_adapter_status", actor, platform_account_id=platform_account_id,
+            device_id=device_id, tab_id=tab_id)
 
     @router.get(
         "/media/actions",
@@ -940,6 +1196,52 @@ def create_operations_router(
             reason=payload.reason,
         )
 
+    @router.post("/media/platform-accounts/{account_id}/bridge-connection/preview",
+        response_model=MediaBridgeConnectionPreviewResponse, operation_id="media_operations_preview_bridge_connection")
+    async def preview_media_bridge_connection(account_id: UUID, payload: MediaBridgeConnectionPreviewRequest,
+        request: Request, response: Response, _: Any = Depends(require_auth_dependency)) -> Any:
+        response.headers["Cache-Control"] = "no-store"
+        actor = await current_actor(request)
+        return await media_call("preview_media_bridge_connection", actor, account_id, **payload.model_dump(mode="json"))
+
+    @router.post("/media/platform-accounts/{account_id}/bridge-connection",
+        response_model=MediaBridgeConnectionSaveResponse, operation_id="media_operations_save_bridge_connection")
+    async def save_media_bridge_connection(account_id: UUID, payload: MediaBridgeConnectionSaveRequest,
+        request: Request, response: Response, _: Any = Depends(require_auth_dependency)) -> Any:
+        response.headers["Cache-Control"] = "no-store"
+        actor = await current_actor(request)
+        return await media_call("save_media_bridge_connection", actor, account_id, **payload.model_dump())
+
+    @router.post(
+        "/media/actions/{action_id}/browser-preparation",
+        response_model=MediaBrowserPreparationResponse,
+        operation_id="media_operations_prepare_browser_action",
+    )
+    async def prepare_media_browser_action(action_id: UUID, payload: MediaBrowserPreparationRequest,
+        request: Request, _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await media_call("prepare_media_browser_action", actor, action_id, **payload.model_dump())
+
+    @router.get(
+        "/media/actions/{action_id}/browser-preparation",
+        response_model=MediaBrowserPreparationEnvelope,
+        operation_id="media_operations_get_browser_preparation",
+    )
+    async def get_media_browser_preparation(action_id: UUID, request: Request,
+        _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await media_call("get_media_browser_preparation", actor, action_id)
+
+    @router.post(
+        "/media/actions/{action_id}/browser-preparation/inspect",
+        response_model=MediaBrowserPreparationResponse,
+        operation_id="media_operations_inspect_browser_preparation",
+    )
+    async def inspect_media_browser_preparation(action_id: UUID, payload: MediaBrowserPreparationInspectRequest,
+        request: Request, _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await media_call("inspect_media_browser_preparation", actor, action_id, **payload.model_dump())
+
     @router.post(
         "/media/actions/{action_id}/attempts",
         response_model=AttemptResponse,
@@ -1014,6 +1316,19 @@ def create_operations_router(
             confirmation_level=payload.confirmation_level,
             error_message=payload.error_message,
         )
+
+    @router.post(
+        "/media/actions/{action_id}/provider-recovery", response_model=ActionResponse,
+        operation_id="media_operations_recover_provider_action",
+    )
+    @protected
+    async def recover_media_provider_action(
+        action_id: str, payload: ProviderRecoveryRequest, request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await media_call("recover_provider_action", actor, action_id,
+                                expected_version=payload.expected_version, resume=payload.resume)
 
     @router.post(
         "/media/actions/{action_id}/reconcile",
@@ -1225,6 +1540,45 @@ def create_operations_router(
             ),
         )
 
+    @router.get(
+        "/artifacts/{artifact_id}/content",
+        response_class=Response,
+        responses={200: {"content": {"application/octet-stream": {}}}},
+    )
+    @protected
+    async def get_artifact_content(
+        artifact_id: str,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        """Download an authorized artifact for human review.
+
+        Artifact bytes may come from an external client workspace, so only
+        images and text are rendered inline; everything else is an attachment
+        served with a sandbox CSP and nosniff.
+        """
+
+        actor = await current_actor(request)
+        artifact, data = await _with_session(
+            get_db_manager,
+            lambda session: _invoke(operations.get_artifact_content, session, actor, artifact_id),
+        )
+        mime = str(artifact.get("mime_type") or "application/octet-stream").lower()
+        inline_types = {"image/png": "image/png", "image/jpeg": "image/jpeg", "text/plain": "text/plain; charset=utf-8",
+                        "text/markdown": "text/plain; charset=utf-8", "application/json": "text/plain; charset=utf-8"}
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "_", str(artifact.get("filename") or "artifact"))[:120] or "artifact"
+        disposition = "inline" if mime in inline_types else "attachment"
+        return Response(
+            content=data,
+            media_type=inline_types.get(mime, "application/octet-stream"),
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{filename}"',
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self'",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
     @router.get("/opportunities", response_model=OpportunityListResponse)
     @protected
     async def list_opportunities(
@@ -1284,6 +1638,27 @@ def create_operations_router(
                 actor,
                 opportunity_id,
                 include_versions=include_versions,
+            ),
+        )
+
+    @router.post("/opportunities/{opportunity_id}/development-requirements", response_model=OpportunityResponse)
+    @protected
+    async def resolve_development_requirements(
+        opportunity_id: str,
+        payload: DevelopmentRequirementsResolveRequest,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(
+                operations.resolve_development_requirements,
+                session,
+                actor,
+                opportunity_id,
+                resolved=payload.resolved,
+                note=payload.note,
             ),
         )
 
@@ -1400,6 +1775,73 @@ def create_operations_router(
                 limit=limit,
                 offset=offset,
             ),
+        )
+
+    async def action_package(session: Any, actor: Any, action_id: str, version: int, digest: str) -> Any:
+        return await build_action_package(
+            session, actor, action_id,
+            expected_action_version=version, expected_payload_hash=digest, operations=operations,
+        )
+
+    @router.get(
+        "/actions/{action_id}/package",
+        response_model=MediaActionPackagePreview,
+        response_model_exclude_unset=True,
+        operation_id="operations_preview_media_action_package",
+    )
+    @protected
+    async def preview_media_action_package(
+        action_id: str,
+        request: Request,
+        response: Response,
+        expected_action_version: int = Query(..., ge=1),
+        expected_payload_hash: str = Query(..., pattern="^[0-9a-f]{64}$"),
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        manifest, _data = await _with_session(
+            get_db_manager,
+            lambda session: _invoke(action_package, session, actor, action_id, expected_action_version, expected_payload_hash),
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return {
+            "manifest": manifest,
+            "manifest_sha256": service.sha256_json(manifest),
+            "filename": f"mediaops-{UUID(action_id)}-v{expected_action_version}.zip",
+        }
+
+    @router.get(
+        "/actions/{action_id}/package/content",
+        response_class=Response,
+        responses={200: {"content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}}}},
+        operation_id="operations_download_media_action_package",
+    )
+    @protected
+    async def download_media_action_package(
+        action_id: str,
+        request: Request,
+        expected_action_version: int = Query(..., ge=1),
+        expected_payload_hash: str = Query(..., pattern="^[0-9a-f]{64}$"),
+        expected_manifest_sha256: str = Query(..., pattern="^[0-9a-f]{64}$"),
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        manifest, data = await _with_session(
+            get_db_manager,
+            lambda session: _invoke(action_package, session, actor, action_id, expected_action_version, expected_payload_hash),
+        )
+        if not hmac.compare_digest(service.sha256_json(manifest), expected_manifest_sha256):
+            raise HTTPException(status_code=409, detail="package contents changed; reload the package preview")
+        return Response(
+            content=data,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="mediaops-{UUID(action_id)}-v{expected_action_version}.zip"',
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+                "Cache-Control": "private, no-store",
+                "X-MediaOps-Manifest-SHA256": expected_manifest_sha256,
+            },
         )
 
     @router.get("/actions/{action_id}", response_model=ActionResponse)

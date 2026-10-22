@@ -126,6 +126,10 @@ const DDL: string[] = [
      project_id TEXT,
      title TEXT,
      is_group_chat INTEGER,
+     agent_id TEXT,
+     is_pinned INTEGER NOT NULL DEFAULT 0,
+     pinned_at TEXT,
+     pin_updated_at TEXT,
      session_metadata TEXT,
      created_at TEXT,
      updated_at TEXT,
@@ -133,6 +137,29 @@ const DDL: string[] = [
    );`,
   `CREATE INDEX IF NOT EXISTS idx_cs_project_id ON conversation_sessions(project_id);`,
   `CREATE INDEX IF NOT EXISTS idx_cs_updated_at ON conversation_sessions(updated_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_cs_pinned_activity ON conversation_sessions(is_pinned, updated_at);`,
+
+  `CREATE TABLE IF NOT EXISTS conversation_agents (
+     auth_scope TEXT NOT NULL,
+     server_fingerprint TEXT NOT NULL,
+     scope_key TEXT NOT NULL DEFAULT 'global',
+     session_id TEXT,
+     project_id TEXT,
+     id TEXT NOT NULL,
+     display_name TEXT NOT NULL,
+     state TEXT,
+     latest_revision_id TEXT,
+     character_id TEXT,
+     character_name TEXT,
+     utilization TEXT,
+     updated_at TEXT,
+     cached_at TEXT NOT NULL,
+     PRIMARY KEY (auth_scope, server_fingerprint, scope_key, id)
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_conversation_agents_scope
+     ON conversation_agents(auth_scope, server_fingerprint, scope_key);`,
+  `CREATE INDEX IF NOT EXISTS idx_conversation_agents_updated_at
+     ON conversation_agents(updated_at);`,
 
   `CREATE TABLE IF NOT EXISTS conversation_messages (
      id TEXT PRIMARY KEY,
@@ -210,319 +237,6 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_record_rows_project_id ON record_rows(project_id);`,
   `CREATE INDEX IF NOT EXISTS idx_record_rows_table_id ON record_rows(table_id);`,
   `CREATE INDEX IF NOT EXISTS idx_record_rows_updated_at ON record_rows(updated_at);`,
-
-
-
-  `CREATE TABLE IF NOT EXISTS scenarios (
-     id TEXT PRIMARY KEY,
-     title TEXT NOT NULL,
-     scenario_kind TEXT,
-     ruleset TEXT,
-     description TEXT,
-     genre TEXT,
-     perspective TEXT,
-     setting TEXT,
-     opening_text TEXT,
-     gm_instructions TEXT,
-     tags TEXT,
-     cover_image_path TEXT,
-     is_published INTEGER,
-     created_by TEXT,
-     voice_tone TEXT,
-     voice_tense_rules TEXT,
-     voice_vocabulary_register TEXT,
-     voice_banned_expressions TEXT,
-     voice_example_passages TEXT,
-     created_at TEXT,
-     updated_at TEXT,
-     deleted_at TEXT
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_scenarios_updated_at ON scenarios(updated_at);`,
-  `CREATE INDEX IF NOT EXISTS idx_scenarios_genre ON scenarios(genre);`,
-
-  `CREATE TABLE IF NOT EXISTS scenario_characters (
-     id TEXT PRIMARY KEY,
-     scenario_id TEXT NOT NULL,
-     character_id TEXT,
-     role TEXT,
-     name TEXT NOT NULL,
-     description TEXT,
-     personality_override TEXT,
-     appearance_tags_override TEXT,
-     sort_order INTEGER,
-     backstory TEXT,
-     psychology TEXT,
-     speech_patterns TEXT,
-     relationships TEXT,
-     character_arc TEXT,
-     importance INTEGER,
-     example_dialogues TEXT,
-     trpg_ruleset TEXT,
-     trpg_pc_state TEXT,
-     deleted_at TEXT
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_scenario_characters_scenario_id ON scenario_characters(scenario_id);`,
-
-  `CREATE TABLE IF NOT EXISTS scenario_scenes (
-     id TEXT PRIMARY KEY,
-     scenario_id TEXT NOT NULL,
-     episode_id TEXT,
-     title TEXT NOT NULL,
-     description TEXT,
-     scene_type TEXT,
-     gm_instructions TEXT,
-     image_prompt TEXT,
-     transitions TEXT,
-     sort_order INTEGER,
-     content TEXT,
-     content_versions TEXT,
-     word_count INTEGER,
-     status TEXT,
-     state_snapshot TEXT,
-     deleted_at TEXT
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_scenario_scenes_scenario_id ON scenario_scenes(scenario_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_scenario_scenes_episode_id ON scenario_scenes(episode_id);`,
-
-  `CREATE TABLE IF NOT EXISTS scenario_episodes (
-     id TEXT PRIMARY KEY,
-     scenario_id TEXT NOT NULL,
-     title TEXT NOT NULL,
-     synopsis_sentence TEXT,
-     synopsis_paragraph TEXT,
-     synopsis_full TEXT,
-     beat_sheet TEXT,
-     status TEXT,
-     sort_order INTEGER,
-     created_at TEXT,
-     updated_at TEXT,
-     deleted_at TEXT
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_scenario_episodes_scenario_id ON scenario_episodes(scenario_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_scenario_episodes_updated_at ON scenario_episodes(updated_at);`,
-
-  // ---------- Story Studio（canonical, auth-scoped cache） ----------
-  // Story is additive: legacy scenario tables above remain untouched.  The
-  // auth_scope prefix is part of every primary key so upgrading an existing
-  // install cannot expose one account's Story cache or drafts to another.
-  `CREATE TABLE IF NOT EXISTS story_works (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     user_id TEXT,
-     title TEXT NOT NULL,
-     synopsis TEXT,
-     plot TEXT,
-     style_guide TEXT,
-     kind TEXT NOT NULL DEFAULT 'novel',
-     status TEXT NOT NULL DEFAULT 'planning',
-     target_episode_chars INTEGER,
-     planned_episode_count INTEGER,
-     start_episode_id TEXT,
-     ui_state TEXT,
-     model_override TEXT,
-     image_settings TEXT,
-     resolved_model TEXT,
-     model_layer TEXT,
-     episode_count INTEGER,
-     char_count INTEGER,
-     created_at TEXT,
-     updated_at TEXT,
-     archived_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_works_scope_updated
-     ON story_works(auth_scope, updated_at);`,
-  `CREATE INDEX IF NOT EXISTS idx_story_works_scope_kind
-     ON story_works(auth_scope, kind);`,
-  `CREATE TABLE IF NOT EXISTS story_episodes (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     title TEXT NOT NULL,
-     plot TEXT,
-     summary TEXT,
-     summary_locked INTEGER,
-     premise_note TEXT,
-     status TEXT NOT NULL DEFAULT 'unwritten',
-     target_chars INTEGER,
-     char_count INTEGER,
-     body TEXT,
-     body_etag TEXT,
-     map_x REAL,
-     map_y REAL,
-     sort_hint REAL,
-     current_rev_no INTEGER,
-     created_at TEXT,
-     updated_at TEXT,
-     archived_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_episodes_scope_work
-     ON story_episodes(auth_scope, work_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_story_episodes_scope_work_sort
-     ON story_episodes(auth_scope, work_id, sort_hint);`,
-  `CREATE TABLE IF NOT EXISTS story_links (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     from_episode_id TEXT NOT NULL,
-     to_episode_id TEXT NOT NULL,
-     choice_label TEXT,
-     position REAL,
-     is_primary INTEGER,
-     created_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_links_scope_work
-     ON story_links(auth_scope, work_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_story_links_scope_from
-     ON story_links(auth_scope, from_episode_id);`,
-  `CREATE TABLE IF NOT EXISTS story_characters (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     user_id TEXT,
-     name TEXT NOT NULL,
-     aliases TEXT,
-     summary TEXT,
-     description TEXT,
-     notes TEXT,
-     ai_mode TEXT NOT NULL DEFAULT 'keyword',
-     keywords TEXT,
-     image_path TEXT,
-     created_at TEXT,
-     updated_at TEXT,
-     archived_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_characters_scope_name
-     ON story_characters(auth_scope, name);`,
-  `CREATE TABLE IF NOT EXISTS story_work_characters (
-     auth_scope TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     character_id TEXT NOT NULL,
-     role_note TEXT,
-     position REAL,
-     PRIMARY KEY (auth_scope, work_id, character_id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_work_characters_scope_work
-     ON story_work_characters(auth_scope, work_id);`,
-  `CREATE TABLE IF NOT EXISTS story_rulebooks (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     user_id TEXT,
-     name TEXT NOT NULL,
-     content TEXT,
-     created_at TEXT,
-     updated_at TEXT,
-     archived_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_rulebooks_scope_name
-     ON story_rulebooks(auth_scope, name);`,
-  `CREATE TABLE IF NOT EXISTS story_work_rulebooks (
-     auth_scope TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     rulebook_id TEXT NOT NULL,
-     enabled INTEGER,
-     position REAL,
-     PRIMARY KEY (auth_scope, work_id, rulebook_id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_work_rulebooks_scope_work
-     ON story_work_rulebooks(auth_scope, work_id);`,
-  `CREATE TABLE IF NOT EXISTS story_notes (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     title TEXT NOT NULL,
-     content TEXT,
-     ai_mode TEXT NOT NULL DEFAULT 'keyword',
-     keywords TEXT,
-     position REAL,
-     created_at TEXT,
-     updated_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_notes_scope_work
-     ON story_notes(auth_scope, work_id);`,
-  `CREATE TABLE IF NOT EXISTS story_episode_revisions (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     episode_id TEXT NOT NULL,
-     rev_no INTEGER NOT NULL,
-     title TEXT,
-     plot TEXT,
-     body TEXT,
-     message TEXT,
-     origin TEXT NOT NULL,
-     body_sha256 TEXT NOT NULL,
-     char_count INTEGER,
-     created_by TEXT NOT NULL,
-     created_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_revisions_scope_episode_rev
-     ON story_episode_revisions(auth_scope, episode_id, rev_no);`,
-  `CREATE TABLE IF NOT EXISTS story_generation_jobs (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     kind TEXT NOT NULL,
-     payload TEXT,
-     status TEXT NOT NULL DEFAULT 'queued',
-     progress TEXT,
-     result TEXT,
-     error TEXT,
-     created_at TEXT,
-     started_at TEXT,
-     finished_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_jobs_scope_work_status
-     ON story_generation_jobs(auth_scope, work_id, status);`,
-  `CREATE TABLE IF NOT EXISTS story_writing_sessions (
-     auth_scope TEXT NOT NULL,
-     id TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     episode_id TEXT,
-     conversation_session_id TEXT,
-     created_at TEXT,
-     updated_at TEXT,
-     PRIMARY KEY (auth_scope, id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_writing_sessions_scope_work
-     ON story_writing_sessions(auth_scope, work_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_story_writing_sessions_scope_conversation
-     ON story_writing_sessions(auth_scope, conversation_session_id);`,
-  `CREATE TABLE IF NOT EXISTS story_local_drafts (
-     auth_scope TEXT NOT NULL,
-     episode_id TEXT NOT NULL,
-     body TEXT NOT NULL,
-     expected_etag TEXT,
-     server_snapshot TEXT,
-     conflict_status TEXT NOT NULL DEFAULT 'draft',
-     created_at TEXT,
-     updated_at TEXT,
-     PRIMARY KEY (auth_scope, episode_id)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_local_drafts_scope_updated
-     ON story_local_drafts(auth_scope, updated_at);`,
-  `CREATE TABLE IF NOT EXISTS story_legacy_writing_drafts (
-     auth_scope TEXT NOT NULL,
-     legacy_key TEXT NOT NULL,
-     work_id TEXT NOT NULL,
-     target_episode_id TEXT,
-     target_scene_id TEXT,
-     prompt TEXT,
-     raw_payload TEXT NOT NULL,
-     status TEXT NOT NULL DEFAULT 'recovered',
-     created_at TEXT,
-     updated_at TEXT,
-     PRIMARY KEY (auth_scope, legacy_key)
-   );`,
-  `CREATE INDEX IF NOT EXISTS idx_story_legacy_writing_drafts_scope_work
-     ON story_legacy_writing_drafts(auth_scope, work_id);`,
-  `CREATE INDEX IF NOT EXISTS idx_story_legacy_writing_drafts_scope_updated
-     ON story_legacy_writing_drafts(auth_scope, updated_at);`,
 
   // ---------- Apps / Chat context (WS4, auth-scoped read cache) ----------
   // These tables are deliberately not part of the general Sync Engine and do
@@ -889,6 +603,44 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at);`,
   `CREATE INDEX IF NOT EXISTS idx_outbox_entity ON outbox(table_name, entity_id);`,
 
+  // ---------- outbox_resolution_records（明示的な解決のprivate journal） ----------
+  // The journal is independent from outbox so history remains readable after
+  // the selected operation is adopted and the queue becomes empty.  Snapshot
+  // JSON is private local storage; repositories expose only the finite view
+  // projection and never include credentials or raw errors in exports.
+  `CREATE TABLE IF NOT EXISTS outbox_resolution_records (
+     id TEXT PRIMARY KEY,
+     revision INTEGER NOT NULL DEFAULT 1,
+     auth_scope TEXT NOT NULL,
+     server_fingerprint TEXT NOT NULL,
+     credential_identity_revision TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     table_name TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     op_id TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     state TEXT NOT NULL,
+     operation_origin TEXT NOT NULL DEFAULT 'unrecorded',
+     target_namespace_json TEXT,
+     operation_snapshot_json TEXT NOT NULL,
+     local_snapshot_json TEXT NOT NULL,
+     related_snapshot_json TEXT NOT NULL DEFAULT '{}',
+     membership_snapshot_json TEXT NOT NULL DEFAULT '[]',
+     cache_snapshot_json TEXT NOT NULL DEFAULT '{}',
+     guard_snapshot_json TEXT NOT NULL DEFAULT '{}',
+     server_snapshot_json TEXT,
+     view_json TEXT NOT NULL,
+     draft_json TEXT,
+     export_snapshot_json TEXT,
+     updated_at INTEGER NOT NULL
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_resolution_auth_scope
+     ON outbox_resolution_records(auth_scope, created_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_resolution_operation
+     ON outbox_resolution_records(auth_scope, op_id, entity_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_resolution_state
+     ON outbox_resolution_records(auth_scope, state, updated_at);`,
+
   `CREATE TABLE IF NOT EXISTS sync_state (
      table_name TEXT PRIMARY KEY,
      last_pulled_at TEXT,
@@ -1052,6 +804,46 @@ const CLIP_INGEST_SERVER_FINGERPRINT_V01144_MARKER =
 const SCHEMA_MAINTENANCE_V01142_MARKER =
   "migration:schema_maintenance_v0.1.142";
 
+/** The Agent catalog gained an ACL query scope after the first cache shape. */
+function ensureConversationAgentsScopedSync(): void {
+  const db = getSqlite();
+  const columns = db.getAllSync("PRAGMA table_info(conversation_agents);") as Array<{ name?: string }>;
+  const hasLegacyTable = columns.some((column) => column.name === "auth_scope");
+  if (!hasLegacyTable || columns.some((column) => column.name === "scope_key")) return;
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS conversation_agents_scoped (
+      auth_scope TEXT NOT NULL,
+      server_fingerprint TEXT NOT NULL,
+      scope_key TEXT NOT NULL DEFAULT 'legacy',
+      session_id TEXT,
+      project_id TEXT,
+      id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      state TEXT,
+      latest_revision_id TEXT,
+      character_id TEXT,
+      character_name TEXT,
+      utilization TEXT,
+      updated_at TEXT,
+      cached_at TEXT NOT NULL,
+      PRIMARY KEY (auth_scope, server_fingerprint, scope_key, id)
+    );
+  `);
+  db.execSync(`
+    INSERT OR IGNORE INTO conversation_agents_scoped(
+      auth_scope, server_fingerprint, scope_key, id, display_name, state,
+      latest_revision_id, character_id, character_name, utilization,
+      updated_at, cached_at
+    )
+    SELECT auth_scope, server_fingerprint, 'legacy', id, display_name, state,
+      latest_revision_id, character_id, character_name, utilization,
+      updated_at, cached_at
+    FROM conversation_agents;
+  `);
+  db.execSync("DROP TABLE conversation_agents;");
+  db.execSync("ALTER TABLE conversation_agents_scoped RENAME TO conversation_agents;");
+}
+
 function ensureColumn(
   tableName: string,
   columnName: string,
@@ -1079,6 +871,48 @@ type AsyncSqliteExecutor = {
   getAllAsync: <T>(source: string) => Promise<T[]>;
 };
 
+async function ensureConversationAgentsScopedAsync(
+  tx: AsyncSqliteExecutor,
+): Promise<void> {
+  const columns = await tx.getAllAsync<{ name?: string }>(
+    "PRAGMA table_info(conversation_agents);",
+  );
+  const hasLegacyTable = columns.some((column) => column.name === "auth_scope");
+  if (!hasLegacyTable || columns.some((column) => column.name === "scope_key")) return;
+  await tx.execAsync(`
+    CREATE TABLE IF NOT EXISTS conversation_agents_scoped (
+      auth_scope TEXT NOT NULL,
+      server_fingerprint TEXT NOT NULL,
+      scope_key TEXT NOT NULL DEFAULT 'legacy',
+      session_id TEXT,
+      project_id TEXT,
+      id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      state TEXT,
+      latest_revision_id TEXT,
+      character_id TEXT,
+      character_name TEXT,
+      utilization TEXT,
+      updated_at TEXT,
+      cached_at TEXT NOT NULL,
+      PRIMARY KEY (auth_scope, server_fingerprint, scope_key, id)
+    );
+  `);
+  await tx.execAsync(`
+    INSERT OR IGNORE INTO conversation_agents_scoped(
+      auth_scope, server_fingerprint, scope_key, id, display_name, state,
+      latest_revision_id, character_id, character_name, utilization,
+      updated_at, cached_at
+    )
+    SELECT auth_scope, server_fingerprint, 'legacy', id, display_name, state,
+      latest_revision_id, character_id, character_name, utilization,
+      updated_at, cached_at
+    FROM conversation_agents;
+  `);
+  await tx.execAsync("DROP TABLE conversation_agents;");
+  await tx.execAsync("ALTER TABLE conversation_agents_scoped RENAME TO conversation_agents;");
+}
+
 const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
   // Unknown old remote rows are not assumed to be joined. The next project
   // list/sync fills this per-account projection without deleting user data.
@@ -1089,6 +923,10 @@ const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
   ["tasks", "parent_task_id", "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;"],
   ["tasks", "auto_close_on_due", "ALTER TABLE tasks ADD COLUMN auto_close_on_due INTEGER NOT NULL DEFAULT 0;"],
   ["projects", "is_completed", "ALTER TABLE projects ADD COLUMN is_completed INTEGER NOT NULL DEFAULT 0;"],
+  ["conversation_sessions", "is_pinned", "ALTER TABLE conversation_sessions ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;"],
+  ["conversation_sessions", "agent_id", "ALTER TABLE conversation_sessions ADD COLUMN agent_id TEXT;"],
+  ["conversation_sessions", "pinned_at", "ALTER TABLE conversation_sessions ADD COLUMN pinned_at TEXT;"],
+  ["conversation_sessions", "pin_updated_at", "ALTER TABLE conversation_sessions ADD COLUMN pin_updated_at TEXT;"],
   ["knowledge_nodes", "source", "ALTER TABLE knowledge_nodes ADD COLUMN source TEXT;"],
   ["knowledge_nodes", "access", "ALTER TABLE knowledge_nodes ADD COLUMN access TEXT;"],
   ["knowledge_nodes", "read_only", "ALTER TABLE knowledge_nodes ADD COLUMN read_only INTEGER;"],
@@ -1110,6 +948,8 @@ const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
   ["outbox", "auth_scope", "ALTER TABLE outbox ADD COLUMN auth_scope TEXT;"],
   ["outbox", "docs_scope_key", "ALTER TABLE outbox ADD COLUMN docs_scope_key TEXT;"],
   ["outbox", "blocked_reason", "ALTER TABLE outbox ADD COLUMN blocked_reason TEXT;"],
+  ["outbox_resolution_records", "operation_origin", "ALTER TABLE outbox_resolution_records ADD COLUMN operation_origin TEXT NOT NULL DEFAULT 'unrecorded';"],
+  ["outbox_resolution_records", "target_namespace_json", "ALTER TABLE outbox_resolution_records ADD COLUMN target_namespace_json TEXT;"],
   ["docs_sync_runs", "scope_key", "ALTER TABLE docs_sync_runs ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'personal';"],
   ["docs_sync_runs", "project_id", "ALTER TABLE docs_sync_runs ADD COLUMN project_id TEXT;"],
   ["docs_sync_runs", "scope_digest", "ALTER TABLE docs_sync_runs ADD COLUMN scope_digest TEXT;"],
@@ -1131,6 +971,11 @@ const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
 const INDEX_MIGRATIONS = [
   "CREATE INDEX IF NOT EXISTS idx_outbox_auth_scope ON outbox(auth_scope);",
   "CREATE INDEX IF NOT EXISTS idx_outbox_docs_scope ON outbox(auth_scope, docs_scope_key);",
+  // Ordered seeks for promotion snapshots, including legacy NULL auth rows.
+  "CREATE INDEX IF NOT EXISTS idx_outbox_docs_cursor ON outbox(docs_scope_key, op_id, auth_scope);",
+  // Protected-row conflict projection must not rescan an entire Docs scope.
+  "CREATE INDEX IF NOT EXISTS idx_outbox_docs_entity ON outbox(auth_scope, docs_scope_key, table_name, entity_id);",
+  "CREATE INDEX IF NOT EXISTS idx_cs_pinned_activity ON conversation_sessions(is_pinned, updated_at);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_runs_auth_scope ON docs_sync_runs(auth_scope, scope_key, scope_id, project_id, state);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_staging_auth_scope ON docs_sync_staging(auth_scope, scope_key, scope_id, project_id);",
   "CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_scope_status ON pending_clip_ingests(auth_scope, status);",
@@ -1149,6 +994,7 @@ function applySchemaBootstrapSync(): void {
   for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
     ensureColumn(tableName, columnName, ddl);
   }
+  ensureConversationAgentsScopedSync();
   for (const stmt of SCHEMA_INDEX_DDL) {
     db.execSync(stmt);
   }
@@ -1168,6 +1014,7 @@ async function applySchemaBootstrapAsync(
       await tx.execAsync(ddl);
     }
   }
+  await ensureConversationAgentsScopedAsync(tx);
   for (const stmt of SCHEMA_INDEX_DDL) {
     await tx.execAsync(stmt);
   }

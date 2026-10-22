@@ -66,6 +66,18 @@ export function useSubmissionTimeline(sessionId: string) {
 /** Distinguishes a retained failed bubble from a request rejected before acceptance. */
 export class RetainedSubmissionError extends Error {
   readonly retainedInTimeline = true;
+
+  static forFailure(message: string, failure: unknown): Error {
+    // An optimistic bubble is not durable when SQLite rejected the write.
+    // Preserve this failure so the composer keeps its draft and intent retry.
+    if (failure && typeof failure === "object" &&
+      "persistenceFailed" in failure && failure.persistenceFailed === true) {
+      return failure instanceof Error
+        ? failure
+        : Object.assign(new Error(message), { persistenceFailed: true });
+    }
+    return new RetainedSubmissionError(message);
+  }
 }
 
 /** Serialize handoffs, not UI acceptance. A new input cancels a Direct HTTP reply. */
@@ -74,9 +86,12 @@ export class ConversationSubmissionQueue {
   private direct: AbortController | null = null;
   private flights = new Map<string, Promise<void>>();
 
-  enqueue(id: string, deliver: (signal: AbortSignal) => Promise<void>): Promise<void> {
+  enqueue(id: string, deliver: (signal: AbortSignal) => Promise<void>, onEnqueue?: () => void): Promise<void> {
     const existing = this.flights.get(id);
     if (existing) return existing;
+    // A retained draft can retry after the same ID succeeded from the timeline.
+    // Only a new flight may replace its bubble or restart the waiting state.
+    onEnqueue?.();
     this.direct?.abort();
     const controller = new AbortController();
     this.direct = controller;

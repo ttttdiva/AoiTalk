@@ -30,8 +30,11 @@ import {
   Loader2,
   Search,
   Home,
+  NotebookPen,
   Settings,
 } from "lucide-react";
+import { OPEN_DAILY_CAPTURE_EVENT } from "@/lib/daily-capture";
+import { withBasePath } from "@/lib/base-path";
 import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { taskApi, type TimeEntry } from "@/lib/task-api";
@@ -60,6 +63,7 @@ import { NotificationBellPopover } from "@/components/layout/sidebar/notificatio
 import { useShellChrome } from "@/components/layout/shell-context";
 import { useRuntimeContext } from "@/contexts/runtime-context";
 import { ResourceColorDot } from "@/components/projects/resource-color-picker";
+import { AoiDotsToggleButton } from "@/components/aoidots/aoidots-panel";
 import {
   OPEN_HEADER_PROJECT_SELECTOR_EVENT,
   OPEN_HEADER_SPACE_SELECTOR_EVENT,
@@ -235,9 +239,8 @@ function getWorkspaceTitle(pathname: string | null): string {
   if (pathname.startsWith("/filer")) return "Files";
   if (pathname.startsWith("/reports")) return "レポート";
   if (pathname.startsWith("/operations")) return "Operations";
+  if (pathname.startsWith("/personal-ledger")) return "個人台帳";
   if (pathname.startsWith("/projects")) return "プロジェクト";
-  if (pathname.startsWith("/scenarios")) return "Story";
-  if (pathname.startsWith("/trpg")) return "TRPG";
   if (pathname.startsWith("/apps")) return "Apps";
   if (pathname.startsWith("/settings")) return "設定";
   return "Workspace";
@@ -453,7 +456,9 @@ export function AppHeader() {
 
   const isAdmin =
     authStatus?.authenticated === true && authStatus.user?.role === "admin";
-  const avatarUrl = authStatus?.user?.avatar_url || undefined;
+  const avatarUrl = authStatus?.user?.avatar_url
+    ? withBasePath(authStatus.user.avatar_url)
+    : undefined;
   const avatarFallback = (
     authStatus?.user?.display_name?.trim() ||
     authStatus?.user?.username?.trim() ||
@@ -535,7 +540,7 @@ export function AppHeader() {
   return (
     <div className="relative shrink-0" data-shell-region="global-context-shell">
       <header
-        className="ao-global-context flex min-h-14 h-14 items-center gap-2 border-b border-border bg-background px-2 sm:px-3 md:gap-3 md:px-4"
+        className="ao-global-context flex min-h-14 h-14 items-center gap-0.5 border-b border-border bg-background px-2 sm:gap-2 sm:px-3 md:gap-3 md:px-4"
         data-shell-region="global-context"
       >
           <SidebarTrigger
@@ -552,135 +557,142 @@ export function AppHeader() {
           />
         <Separator orientation="vertical" className="hidden h-5 md:block" />
 
-        <div className="min-w-0 flex-1" data-shell-region="workspace-title">
-          <div className="flex min-w-0 items-center gap-1.5 text-xs">
-            <span className="hidden shrink-0 font-semibold text-foreground sm:inline">
-              AoiTalk
-            </span>
-            <span className="hidden text-muted-foreground sm:inline">/</span>
-            <span className="truncate font-medium text-foreground">
-              {getWorkspaceTitle(pathname)}
-            </span>
+        {/* Stack the current workspace and Space inside one flexible mobile slot. */}
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5 md:contents" data-shell-region="workspace-context">
+          <div className="min-w-0 flex-1" data-shell-region="workspace-title">
+            <div className="flex min-w-0 items-center gap-1.5 text-xs">
+              <span className="hidden shrink-0 font-semibold text-foreground sm:inline">
+                AoiTalk
+              </span>
+              <span className="hidden text-muted-foreground sm:inline">/</span>
+              <span className="truncate font-medium text-foreground">
+                {getWorkspaceTitle(pathname)}
+              </span>
+            </div>
           </div>
-        </div>
-
-        <div
-          className="flex min-w-0 shrink-0 items-center gap-1.5"
-          data-shell-region="context-switchers"
-        >
-          {spaces.length > 0 && (
-            <div className="flex min-w-0 items-center gap-1">
-              <Layers
-                className="size-3.5 shrink-0 text-muted-foreground"
-                aria-hidden="true"
-                data-testid="header-space-icon"
-                style={selectedSpace?.color ? { color: selectedSpace.color } : undefined}
-              />
-              <AppSelect
-                aria-label="スペース選択"
-                value={selectedSpaceId ?? ""}
-                onChange={(event) => setSelectedSpaceId(event.target.value)}
-                open={spaceSelectorOpen}
-                onOpenChange={(open, details) =>
-                  handleSelectorOpenChange(
-                    spaceSelectorOpenRef,
-                    setSpaceSelectorOpen,
-                    spaceShortcutRestoreRef,
-                    open,
-                    details,
-                  )
-                }
-                onOpenChangeComplete={(open) =>
-                  handleSelectorOpenChangeComplete(
-                    spaceShortcutRestoreRef,
-                    open,
-                  )
-                }
-                triggerContent={
-                  <span className="truncate">
-                    {selectedSpace?.source === "remote" ? "[EP] " : ""}
-                    {selectedSpace?.name ?? ""}
-                  </span>
-                }
-                className={`${selectClassName} max-w-[7rem] md:max-w-[10rem]`}
-              >
-                {spaces.map((space) => (
-                  <option key={space.id} value={space.id}>
-                    <span className="inline-flex items-center gap-1.5">
-                      <ResourceColorDot color={space.color} />
-                      <span>
-                        {space.source === "remote" ? "[EP] " : ""}
-                        {space.name}
-                      </span>
+  
+          <div
+            className="flex w-full min-w-0 items-center gap-1.5 md:w-auto md:shrink-0"
+            data-shell-region="context-switchers"
+          >
+            {spaces.length > 0 && (
+              <div className="flex w-full min-w-0 items-center gap-1 md:w-auto">
+                <Layers
+                  className="hidden size-3.5 shrink-0 text-muted-foreground md:block"
+                  aria-hidden="true"
+                  data-testid="header-space-icon"
+                  style={selectedSpace?.color ? { color: selectedSpace.color } : undefined}
+                />
+                <AppSelect
+                  aria-label="スペース選択"
+                  aria-keyshortcuts="Alt+Shift+S"
+                  title="スペース選択を開く (Alt+Shift+S)"
+                  value={selectedSpaceId ?? ""}
+                  onChange={(event) => setSelectedSpaceId(event.target.value)}
+                  open={spaceSelectorOpen}
+                  onOpenChange={(open, details) =>
+                    handleSelectorOpenChange(
+                      spaceSelectorOpenRef,
+                      setSpaceSelectorOpen,
+                      spaceShortcutRestoreRef,
+                      open,
+                      details,
+                    )
+                  }
+                  onOpenChangeComplete={(open) =>
+                    handleSelectorOpenChangeComplete(
+                      spaceShortcutRestoreRef,
+                      open,
+                    )
+                  }
+                  triggerContent={
+                    <span className="truncate" data-shell-region="selected-space-name">
+                      {selectedSpace?.source === "remote" ? "[EP] " : ""}
+                      {selectedSpace?.name ?? ""}
                     </span>
-                  </option>
-                ))}
-              </AppSelect>
-            </div>
-          )}
-          {projects.length > 0 && (
-            <div className="hidden min-w-0 items-center gap-1 md:flex">
-              <FolderOpen
-                className="size-3.5 shrink-0 text-muted-foreground"
-                aria-hidden="true"
-                data-testid="header-project-icon"
-                style={
-                  selectedProject?.color
-                    ? { color: selectedProject.color }
-                    : undefined
-                }
-              />
-              <AppSelect
-                aria-label="プロジェクト選択"
-                value={selectedProjectId ?? ""}
-                onChange={(event) => setSelectedProjectId(event.target.value)}
-                open={projectSelectorOpen}
-                onOpenChange={(open, details) =>
-                  handleSelectorOpenChange(
-                    projectSelectorOpenRef,
-                    setProjectSelectorOpen,
-                    projectShortcutRestoreRef,
-                    open,
-                    details,
-                  )
-                }
-                onOpenChangeComplete={(open) =>
-                  handleSelectorOpenChangeComplete(
-                    projectShortcutRestoreRef,
-                    open,
-                  )
-                }
-                triggerContent={
-                  <span className="truncate">
-                    {selectedProject?.source === "remote" ? "[EP] " : ""}
-                    {selectedProject?.name ?? ""}
-                  </span>
-                }
-                className={`${selectClassName} max-w-[11rem]`}
-              >
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    <span className="inline-flex items-center gap-1.5">
-                      <ResourceColorDot color={project.color} />
-                      <span>
-                        {project.source === "remote" ? "[EP] " : ""}
-                        {project.name}
-                      </span>
-                    </span>
-                  </option>
-                ))}
-              </AppSelect>
-              {remoteErrors.length > 0 && (
-                <span
-                  className="max-w-28 truncate text-[10px] text-amber-600"
-                  title={remoteErrors.join("\n")}
-                  role="status"
+                  }
+                  className={`${selectClassName} w-full min-w-0 max-w-full gap-0.5 px-0.5 md:w-fit md:max-w-[10rem] md:gap-1.5 md:px-2`}
                 >
-                  Remote接続エラー
-                </span>
-              )}
-            </div>
-          )}
+                  {spaces.map((space) => (
+                    <option key={space.id} value={space.id}>
+                      <span className="inline-flex items-center gap-1.5">
+                        <ResourceColorDot color={space.color} />
+                        <span>
+                          {space.source === "remote" ? "[EP] " : ""}
+                          {space.name}
+                        </span>
+                      </span>
+                    </option>
+                  ))}
+                </AppSelect>
+              </div>
+            )}
+            {projects.length > 0 && (
+              <div className="hidden min-w-0 items-center gap-1 md:flex">
+                <FolderOpen
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                  aria-hidden="true"
+                  data-testid="header-project-icon"
+                  style={
+                    selectedProject?.color
+                      ? { color: selectedProject.color }
+                      : undefined
+                  }
+                />
+                <AppSelect
+                  aria-label="プロジェクト選択"
+                  aria-keyshortcuts="Alt+Shift+P"
+                  title="プロジェクト選択を開く (Alt+Shift+P)"
+                  value={selectedProjectId ?? ""}
+                  onChange={(event) => setSelectedProjectId(event.target.value)}
+                  open={projectSelectorOpen}
+                  onOpenChange={(open, details) =>
+                    handleSelectorOpenChange(
+                      projectSelectorOpenRef,
+                      setProjectSelectorOpen,
+                      projectShortcutRestoreRef,
+                      open,
+                      details,
+                    )
+                  }
+                  onOpenChangeComplete={(open) =>
+                    handleSelectorOpenChangeComplete(
+                      projectShortcutRestoreRef,
+                      open,
+                    )
+                  }
+                  triggerContent={
+                    <span className="truncate">
+                      {selectedProject?.source === "remote" ? "[EP] " : ""}
+                      {selectedProject?.name ?? ""}
+                    </span>
+                  }
+                  className={`${selectClassName} max-w-[11rem]`}
+                >
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      <span className="inline-flex items-center gap-1.5">
+                        <ResourceColorDot color={project.color} />
+                        <span>
+                          {project.source === "remote" ? "[EP] " : ""}
+                          {project.name}
+                        </span>
+                      </span>
+                    </option>
+                  ))}
+                </AppSelect>
+                {remoteErrors.length > 0 && (
+                  <span
+                    className="max-w-28 truncate text-[10px] text-amber-600"
+                    title={remoteErrors.join("\n")}
+                    role="status"
+                  >
+                    Remote接続エラー
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         <Button
@@ -701,12 +713,27 @@ export function AppHeader() {
           </kbd>
         </Button>
 
+        <AoiDotsToggleButton />
+
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          className="hidden size-8 shrink-0 md:inline-flex"
+          aria-label="今日のメモを開く"
+          aria-keyshortcuts="Control+Alt+D"
+          title="今日のメモ (Ctrl+Alt+D)"
+          onClick={() => window.dispatchEvent(new Event(OPEN_DAILY_CAPTURE_EVENT))}
+        >
+          <NotebookPen className="size-4" />
+        </Button>
+
         {activeEntry && (
           <div
             className="flex max-w-[7.5rem] shrink-0 items-center gap-0.5 rounded-md border border-input bg-card px-1 py-1 md:max-w-[13rem] md:gap-1 md:px-1.5"
             data-shell-region="timer"
           >
-            <Timer className="size-3.5 shrink-0 animate-pulse text-yellow-500" />
+            <Timer className="hidden size-3.5 shrink-0 animate-pulse text-yellow-500 sm:block" />
             <button
               type="button"
               className="flex min-w-0 items-center gap-1 rounded px-0.5 text-left hover:bg-accent/75 md:px-1"
@@ -795,6 +822,13 @@ export function AppHeader() {
             </Avatar>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              className="md:hidden"
+              onClick={() => window.dispatchEvent(new Event(OPEN_DAILY_CAPTURE_EVENT))}
+            >
+              <NotebookPen className="mr-2 size-4" />
+              今日のメモを開く
+            </DropdownMenuItem>
             <DropdownMenuItem
               className="md:hidden"
               onClick={() => window.dispatchEvent(new Event("global-open-home"))}

@@ -1,0 +1,80 @@
+{
+  "purpose": "Reviewed Windows distribution input; not product release clearance",
+  "package_scope": "Windows target graph, isolated onefile inventory, and reviewed notice/source bytes",
+  "registry_packages": 245,
+  "original_texts": 433,
+  "original_text_gaps": 0,
+  "file": "licenses/RUST-DEPENDENCIES-NOTICES.txt",
+  "bytes": 2241101,
+  "sha256": "ef228f39562540bc5ba40dfb99074f0c03d640ae2b4694a7c0a14b9fab52e18a",
+  "cargo_lock_sha256": "f1f1980cf6802f2fe1f6543645c91779f95531156690a452f0342da35e4aa92f",
+  "merged_license_only_corrections": [
+    "https://github.com/pdf-rs/fax/pull/12",
+    "https://github.com/lu-zero/simd_helpers/pull/1"
+  ],
+  "correction_note": "Later official license-only corrections, not original packaged files; original source blobs verified unchanged",
+  "assembly_checks": "All 427 original hashes, old424 byte preservation and deterministic regeneration passed",
+  "release_gate": "technical_distribution_input_complete",
+  "remaining_checks": [
+    {
+      "id": "crate_archive_integrity",
+      "status": "complete",
+      "detail": "245/245 registry crates in the recorded Windows target graph matched Cargo.lock notice checksums against the existing Cargo cache; no new archives downloaded."
+    },
+    {
+      "id": "mpl_source_availability",
+      "status": "complete",
+      "packages": [
+        "option-ext@0.2.0"
+      ],
+      "detail": "All 8 published option-ext 0.2.0 source archive files are included byte-for-byte with the pinned archive and recipient notice; Source Code Form availability for MPL 2.0 section 3.2 is recorded."
+    },
+    {
+      "id": "zune_license_alternative",
+      "status": "review_required",
+      "packages": [
+        "zune-core@0.4.12",
+        "zune-core@0.5.1",
+        "zune-inflate@0.2.54",
+        "zune-jpeg@0.4.21",
+        "zune-jpeg@0.5.12"
+      ],
+      "detail": "Zlib for all five versions proposed to parent; Cargo manifest/source headers permit it and no feature changes. Exact pinned Zlib texts supplied; choice not automatically confirmed."
+    },
+    {
+      "id": "combined_and_third_party_terms",
+      "status": "review_required",
+      "packages": [
+        "ring@0.17.14",
+        "unicode-ident@1.0.22",
+        "webpki-roots@0.26.11",
+        "webpki-roots@1.0.5",
+        "rav1e@0.8.1"
+      ],
+      "detail": "Combined Apache/ISC/Unicode/CDLA originals retained; exact rav1e AOM PATENTS supplied separately. Owner release review of conditions remains distinct."
+    },
+    {
+      "id": "product_components_and_packaging",
+      "status": "technical_corrected_notice_candidate_verified",
+      "detail": "CRLF-corrected candidate passed Python291 without --basetemp, offline frozen selftest/helper/profile-driver,49 native hashes and exact72-file export. Both helper/notice archive copies retain aggregate2241101 bytes/ef228f39; all427 internal original hashes and exr32/generic-array20/lebe26 CRLFs match. Helper83cacd41/build-manifest3a92c166 remain identical to the prior Rust snapshot30/Bridge60-tested bytes. Previous25fc4574 notice candidate normalized78 bytes and is ineligible for release. Parent review, Zune choice, Microsoft redistribution rights, paired runtime/helper distribution and actual GUI/Studio remain separate gates."
+    },
+    {
+      "id": "legal_release_clearance",
+      "status": "not_claimed"
+    },
+    {
+      "id": "microsoft_redistribution_authorization",
+      "status": "unconfirmed",
+      "packages": [
+        "mfc140u.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll"
+      ],
+      "detail": "Official14.51.36247.0 unchanged DLL originals and actual runtime terms supplied; applicable distributor Visual Studio/Build Tools license rights not inferred from installation."
+    }
+  ],
+  "original_texts_in_aggregate": 427,
+  "supplemental_original_texts": 6,
+  "supplemental_file": "licenses/supplemental/originals.json",
+  "supplemental_audit": "245 pinned crates,420 archive notice/copyright/patent files plus13 pinned upstream supplements. Original aggregate bytes retained."
+}

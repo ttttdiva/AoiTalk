@@ -26,6 +26,7 @@ import {
   formatRouteLabel,
   getModelEffortOptionsFromCatalog,
   hasExplicitSessionRoute,
+  normalizeAlwaysThinkingRoute,
   resolveDisplayedEffort,
   resolveEffortForModel,
   resolveGenerationReadyRoute,
@@ -55,6 +56,48 @@ function normalizedProviderId(value: unknown): string {
 
 function isStrictRuntimeProvider(value: unknown): boolean {
   return STRICT_RUNTIME_PROVIDERS.has(normalizedProviderId(value));
+}
+
+/**
+ * A new Chat may start before the defaults endpoint has produced its envelope.
+ * A strict local route can still be authoritative when the runtime has both a
+ * ready status and a served/catalog model proof. Keep this proof narrow so a
+ * stale display-only runtime value cannot bypass the normal handoff guard.
+ */
+function getReadyRuntimeRouteProof(
+  runtime: RuntimeContextValue,
+): { provider: string; model: string } | null {
+  if (runtime.llmStatus !== "ready") return null;
+  const route = runtime.effectiveLlm ?? runtime.currentLlm;
+  const provider = normalizedProviderId(route?.provider);
+  const model = route?.model?.trim() ?? "";
+  if (!provider || !model || !isStrictRuntimeProvider(provider)) return null;
+
+  if (
+    runtime.llmEngines.some(
+      (engine) =>
+        normalizedProviderId(engine.provider) === provider &&
+        engine.model.trim() === model &&
+        engine.available !== false &&
+        engine.disabled !== true &&
+        engine.unavailable !== true,
+    )
+  ) {
+    return { provider, model };
+  }
+
+  const catalogProvider = runtime.llmCatalog?.providers?.find(
+    (entry) => normalizedProviderId(entry.id) === provider,
+  );
+  if (!catalogProvider || catalogProvider.availability?.state === "error") {
+    return null;
+  }
+  const advertisedModels = Array.isArray(catalogProvider.chat_models)
+    ? catalogProvider.chat_models
+    : catalogProvider.available_models;
+  return advertisedModels?.some((entry) => entry.id === model)
+    ? { provider, model }
+    : null;
 }
 
 function uniqueModelOptions(
@@ -143,6 +186,8 @@ export const AGENT_TEAM_VALUE_FREE_TEAM = AGENT_TEAM_SELECTOR_FREE_TEAM;
 
 let displayedNewChatMainRoute: SessionMainRoute | null = null;
 let generationReadyNewChatMainRoute: SessionMainRoute | null = null;
+let newChatRouteSnapshotScopeKey: string | null = null;
+let newChatRouteSnapshotOwner: symbol | null = null;
 
 function toDisplayedMainRoute(
   route: ResolvedUnderlyingRoute,
@@ -166,7 +211,10 @@ function toGenerationMainRoute(route: ResolvedUnderlyingRoute): SessionMainRoute
 }
 
 /** このタブの新規チャットが表示している解決済み route。別タブの last-used では変わらない。 */
-export function getDisplayedNewChatMainRoute(): SessionMainRoute | null {
+export function getDisplayedNewChatMainRoute(scopeKey?: string): SessionMainRoute | null {
+  if (scopeKey !== undefined && newChatRouteSnapshotScopeKey !== scopeKey) {
+    return null;
+  }
   return displayedNewChatMainRoute;
 }
 
@@ -174,13 +222,18 @@ export function getDisplayedNewChatMainRoute(): SessionMainRoute | null {
  * 新規チャットの generation に渡してよい authoritative route。
  * runtime current の provisional 表示はここへ昇格させない。
  */
-export function getGenerationReadyNewChatMainRoute(): SessionMainRoute | null {
+export function getGenerationReadyNewChatMainRoute(scopeKey?: string): SessionMainRoute | null {
+  if (scopeKey !== undefined && newChatRouteSnapshotScopeKey !== scopeKey) {
+    return null;
+  }
   return generationReadyNewChatMainRoute;
 }
 
 export function resetDisplayedNewChatMainRoute(): void {
   displayedNewChatMainRoute = null;
   generationReadyNewChatMainRoute = null;
+  newChatRouteSnapshotScopeKey = null;
+  newChatRouteSnapshotOwner = null;
 }
 
 /**
@@ -193,6 +246,7 @@ export function useSyncDisplayedNewChatMainRoute(
   route: ResolvedUnderlyingRoute,
   effort?: string,
   generationReadyRoute: ResolvedUnderlyingRoute | null = route,
+  scopeKey?: string,
 ): void {
   // Route objects are derived during render; primitive fields intentionally
   // form the dependency key so a fresh object does not re-run this snapshot
@@ -202,8 +256,26 @@ export function useSyncDisplayedNewChatMainRoute(
   const generationProvider = generationReadyRoute?.provider ?? "";
   const generationModel = generationReadyRoute?.model ?? "";
   const generationEffort = generationReadyRoute?.effort ?? "";
+  const snapshotScopeKey = scopeKey ?? "__legacy__";
+  const snapshotOwnerRef = useRef<symbol | null>(null);
+  if (snapshotOwnerRef.current === null) {
+    snapshotOwnerRef.current = Symbol("new-chat-route-snapshot");
+  }
+  const snapshotOwner = snapshotOwnerRef.current;
   useLayoutEffect(() => {
-    if (sessionId) return;
+    if (sessionId) {
+      // Clear a committed new-chat snapshot as soon as this route scope moves
+      // to a session. Without this fence, a late old draft snapshot can be
+      // observed by another consumer during the session transition.
+      if (
+        newChatRouteSnapshotScopeKey !== null &&
+        newChatRouteSnapshotScopeKey !== snapshotScopeKey &&
+        newChatRouteSnapshotOwner === snapshotOwner
+      ) {
+        resetDisplayedNewChatMainRoute();
+      }
+      return;
+    }
     displayedNewChatMainRoute = toDisplayedMainRoute(
       { provider: routeProvider, model: routeModel, effort: effort ?? "" },
       effort,
@@ -215,6 +287,16 @@ export function useSyncDisplayedNewChatMainRoute(
           effort: generationEffort,
         })
       : null;
+    newChatRouteSnapshotScopeKey = snapshotScopeKey;
+    newChatRouteSnapshotOwner = snapshotOwner;
+    return () => {
+      if (
+        newChatRouteSnapshotScopeKey === snapshotScopeKey &&
+        newChatRouteSnapshotOwner === snapshotOwner
+      ) {
+        resetDisplayedNewChatMainRoute();
+      }
+    };
   }, [
     sessionId,
     routeProvider,
@@ -223,6 +305,8 @@ export function useSyncDisplayedNewChatMainRoute(
     generationProvider,
     generationModel,
     generationEffort,
+    snapshotScopeKey,
+    snapshotOwner,
   ]);
 }
 
@@ -340,6 +424,14 @@ export function useChatSessionRoute({
       : defaultSessionSettings()
     : pendingSettings;
   desiredSettingsRef.current = routeSettings;
+  const scopedSessionEffectiveMain =
+    sessionId && resolvedRouteScopeKey === routeScopeKey
+      ? sessionEffectiveMain
+      : null;
+  const scopedNewChatEffectiveMain =
+    !sessionId && resolvedRouteScopeKey === routeScopeKey
+      ? newChatEffectiveMain
+      : null;
 
   useEffect(() => {
     hydratePendingNewChatLlmSettings(userId);
@@ -437,16 +529,25 @@ export function useChatSessionRoute({
   const freeTeamActive = isFreeTeamActive(routeSettings);
   const agentTeamSelectionValue = resolveAgentTeamSelectorValue(routeSettings);
 
+  const runtimeRouteProof = !sessionId
+    ? getReadyRuntimeRouteProof(runtime)
+    : null;
   const routeContext = {
     sessionId,
     mainRoute: routeSettings.main_route,
-    newChatEffectiveMain,
-    sessionEffectiveMain,
-    runtimeProvider: runtime.currentLlm?.provider,
-    runtimeModel: runtime.currentLlm?.model,
+    newChatEffectiveMain: scopedNewChatEffectiveMain,
+    sessionEffectiveMain: scopedSessionEffectiveMain,
+    runtimeProvider:
+      runtimeRouteProof?.provider ?? runtime.currentLlm?.provider,
+    runtimeModel: runtimeRouteProof?.model ?? runtime.currentLlm?.model,
+    runtimeRouteReady: runtimeRouteProof !== null,
   };
   const displayedRoute = resolveUnderlyingRoute(routeContext);
-  const generationReadyRoute = resolveGenerationReadyRoute(routeContext);
+  const rawGenerationReadyRoute = resolveGenerationReadyRoute(routeContext);
+  const generationReadyRoute = normalizeAlwaysThinkingRoute(
+    runtime.llmCatalog,
+    rawGenerationReadyRoute,
+  );
   const authoritativeRouteProvider = generationReadyRoute?.provider ?? "";
   const underlyingProvider = displayedRoute.provider;
   const underlyingModel = displayedRoute.model;
@@ -454,10 +555,16 @@ export function useChatSessionRoute({
   const effectiveProvider = underlyingProvider;
   const effectiveModel = underlyingModel;
 
-  const effectiveEffort = resolveDisplayedEffort({
-    ...routeContext,
-    freeTeamActive,
-  });
+  const effectiveEffort = normalizeAlwaysThinkingRoute(
+    runtime.llmCatalog,
+    {
+      ...displayedRoute,
+      effort: resolveDisplayedEffort({
+        ...routeContext,
+        freeTeamActive,
+      }),
+    },
+  )?.effort ?? "";
 
   const catalogProviders = useMemo(() => {
     const persistedProviders = runtime.llmCatalog?.providers ?? [];
@@ -677,6 +784,7 @@ export function useChatSessionRoute({
     displayedRoute,
     effectiveEffort,
     generationReadyRoute,
+    routeScopeKey,
   );
 
   const effortOptions = useMemo(() => {
@@ -734,7 +842,7 @@ export function useChatSessionRoute({
 
   const hasSessionScopedRoute = sessionId
     ? hasExplicitSessionRoute(routeSettings.main_route) ||
-      Boolean(sessionEffectiveMain?.provider && sessionEffectiveMain?.model) ||
+      Boolean(scopedSessionEffectiveMain?.provider && scopedSessionEffectiveMain?.model) ||
       freeTeamActive
     : hasExplicitSessionRoute(routeSettings.main_route) || freeTeamActive;
 
@@ -852,8 +960,8 @@ export function useChatSessionRoute({
         const { provider } = resolveUnderlyingRoute({
           sessionId,
           mainRoute: current.main_route,
-          newChatEffectiveMain,
-          sessionEffectiveMain,
+          newChatEffectiveMain: scopedNewChatEffectiveMain,
+          sessionEffectiveMain: scopedSessionEffectiveMain,
           runtimeProvider: runtime.currentLlm?.provider,
           runtimeModel: runtime.currentLlm?.model,
         });
@@ -894,13 +1002,13 @@ export function useChatSessionRoute({
     },
     [
       applyDesiredSettings,
-      newChatEffectiveMain,
+      scopedNewChatEffectiveMain,
       runtime.currentLlm?.model,
       runtime.currentLlm?.provider,
       runtime.llmCatalog,
       runtime.llmEngines,
       catalogProviders,
-      sessionEffectiveMain,
+      scopedSessionEffectiveMain,
       sessionId,
     ],
   );
@@ -915,8 +1023,8 @@ export function useChatSessionRoute({
         const { provider, model } = resolveUnderlyingRoute({
           sessionId,
           mainRoute: current.main_route,
-          newChatEffectiveMain,
-          sessionEffectiveMain,
+          newChatEffectiveMain: scopedNewChatEffectiveMain,
+          sessionEffectiveMain: scopedSessionEffectiveMain,
           runtimeProvider: runtime.currentLlm?.provider,
           runtimeModel: runtime.currentLlm?.model,
         });
@@ -936,10 +1044,10 @@ export function useChatSessionRoute({
     },
     [
       applyDesiredSettings,
-      newChatEffectiveMain,
+      scopedNewChatEffectiveMain,
       runtime.currentLlm?.model,
       runtime.currentLlm?.provider,
-      sessionEffectiveMain,
+      scopedSessionEffectiveMain,
       sessionId,
     ],
   );
@@ -1049,8 +1157,8 @@ export function useChatSessionRoute({
     modelOptions,
     modelDiscoveryError,
     hasSessionScopedRoute,
-    sessionEffectiveMain,
-    newChatEffectiveMain,
+    sessionEffectiveMain: scopedSessionEffectiveMain,
+    newChatEffectiveMain: scopedNewChatEffectiveMain,
     generationReadyRoute,
     isLoading: settingsLoading,
     routeLoading: settingsLoading,

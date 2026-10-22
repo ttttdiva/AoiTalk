@@ -247,10 +247,6 @@ async function mockSidebarSearchApis(page: import("@playwright/test").Page) {
       await route.fulfill({ status: 503, json: { ok: false } });
       return;
     }
-    if (url.pathname === "/api/hydrus/settings") {
-      await route.fulfill({ json: { success: true, settings: {} } });
-      return;
-    }
     if (url.pathname === "/api/migemo") {
       await route.fulfill({ json: { terms: [] } });
       return;

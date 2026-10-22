@@ -33,6 +33,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 
 from .base import Base
+from ...utils.development_requirements import development_blocking_requirements
 
 
 def _uuid(value: Any) -> str | None:
@@ -480,6 +481,10 @@ def safe_opportunity_title(
     return title
 
 
+def _dict_or_none(value: Any) -> Dict[str, Any] | None:
+    return _safe_provenance(value) if isinstance(value, dict) else None
+
+
 def _safe_provenance(value: Any) -> Any:
     """Recursively remove protected bodies/secrets from public provenance."""
 
@@ -714,6 +719,30 @@ class EngagementOpportunity(_OperationModel, Base):
             "source_snapshot_hash": self.source_snapshot_hash,
             "source_untrusted": True,
             "status": self.status,
+            "workflow_stage": str((self.metadata_json or {}).get("workflow_stage") or "") or None,
+            "compensation_yen": (self.metadata_json or {}).get("compensation_yen"),
+            "compensation_type": (self.metadata_json or {}).get("compensation_type"),
+            "expected_profit": (self.metadata_json or {}).get("expected_profit"),
+            "expected_profit_per_hour": (self.metadata_json or {}).get("expected_profit_per_hour"),
+            "estimated_effort_hours": (self.metadata_json or {}).get("estimated_effort_hours"),
+            "expected_human_minutes": (self.metadata_json or {}).get("expected_human_minutes"),
+            "fit": (self.metadata_json or {}).get("fit"),
+            "confidence": (self.metadata_json or {}).get("confidence"),
+            "worker_kind": (self.metadata_json or {}).get("worker_kind"),
+            "assigned_agent_id": (self.metadata_json or {}).get("assigned_agent_id"),
+            "assigned_agent_name": (self.metadata_json or {}).get("assigned_agent_name"),
+            "specialist_assessment": _dict_or_none((self.metadata_json or {}).get("specialist_assessment")),
+            "development": _dict_or_none((self.metadata_json or {}).get("development")),
+            "development_blocking_requirements": development_blocking_requirements(self.metadata_json or {}),
+            "development_requirements_resolved": (self.metadata_json or {}).get("development_requirements_resolved"),
+            "development_requirements_revision": (self.metadata_json or {}).get("development_requirements_revision"),
+            "development_requirements_note": (self.metadata_json or {}).get("development_requirements_note"),
+            "review_artifact_version_ids": list((self.metadata_json or {}).get("review_artifact_version_ids") or [])[:20],
+            "card_summary_lines": list((self.metadata_json or {}).get("card_summary_lines") or [])[:3],
+            "screening_status": (self.metadata_json or {}).get("screening_status"),
+            "screening_reason": (self.metadata_json or {}).get("screening_reason"),
+            "external_action_id": (self.metadata_json or {}).get("external_action_id"),
+            "external_action_status": (self.metadata_json or {}).get("external_action_status"),
             "created_by": _uuid(self.created_by),
             "created_at": _dt(self.created_at),
             "updated_at": _dt(self.updated_at),
@@ -908,6 +937,8 @@ class ExternalAction(_OperationModel, Base):
         default="manual",
         server_default="manual",
     )
+    # A preparation is a draft stage, never a publication attempt or receipt.
+    browser_preparation_id = Column(UUID(as_uuid=True), nullable=True)
     capability_snapshot_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     capability_snapshot_hash = Column(String(64), nullable=True)
     adapter_key = Column(String(128), nullable=True)
@@ -945,7 +976,7 @@ class ExternalAction(_OperationModel, Base):
             "AND adapter_version IS NOT NULL AND length(trim(adapter_version)) > 0 "
             "AND credential_state_hash IS NOT NULL AND length(credential_state_hash) = 64 "
             "AND execution_key IS NOT NULL AND length(trim(execution_key)) > 0 "
-            "AND ((action_type NOT LIKE 'media.%' AND action_type <> 'engagement.submit_application' "
+            "AND ((action_type NOT LIKE 'media.%' "
             "AND registry_schema_version IS NOT NULL AND length(trim(registry_schema_version)) > 0) "
             "OR (capability_snapshot_id IS NOT NULL AND capability_snapshot_hash IS NOT NULL "
             "AND length(capability_snapshot_hash) = 64)))",
@@ -1109,6 +1140,10 @@ class ExternalActionAttempt(_OperationModel, Base):
     execution_key = Column(String(255), nullable=True)
     status = Column(String(16), nullable=False, default="running", server_default="running", index=True)
     provider_attempt_ref = Column(String(255), nullable=True)
+    # Provider upload session URLs can authorize access. Keep checkpoints
+    # encrypted with the existing vault key provider and omit them from DTOs.
+    provider_state_ciphertext = Column(Text, nullable=True)
+    provider_lease_expires_at = Column(DateTime, nullable=True)
     evidence_artifact_ids = Column(JSON, nullable=False, default=list, server_default="[]")
     result_summary = Column(Text, nullable=True)
     evidence_note = Column(Text, nullable=True)
@@ -1178,6 +1213,10 @@ class ExternalActionAttempt(_OperationModel, Base):
             "execution_key": self.execution_key,
             "status": self.status,
             "provider_attempt_ref": self.provider_attempt_ref,
+            "provider_recovery_available": (bool(self.provider_state_ciphertext) and self.status == "uncertain"
+                or self.status == "running" and self.provider_lease_expires_at is not None
+                and self.provider_lease_expires_at <= datetime.utcnow()),
+            "provider_lease_expires_at": _dt(self.provider_lease_expires_at),
             "evidence_artifact_ids": [_uuid(item) or str(item) for item in (self.evidence_artifact_ids or [])],
             "result_summary": self.result_summary,
             "evidence_note": self.evidence_note,

@@ -48,6 +48,17 @@ export function PetStateProvider({ children, userId, available }: { children: Re
   const refreshRef = useRef<() => void>(() => {});
   const channelRef = useRef<BroadcastChannel | null>(null);
   const enabled = available && !!userId;
+  // Capability/auth changes reset this scope's view state in place. A keyed
+  // remount here would also remount every app provider/page passed as
+  // children (duplicating their initial API reads when features load).
+  const scope = `${userId ?? "anonymous"}:${available}`;
+  const [stateScope, setStateScope] = useState(scope);
+  if (stateScope !== scope) {
+    setStateScope(scope);
+    setPet(null); setRegistered(null); setLegacyPet(null);
+    setReady(false); setConnected(false); setBusy(false);
+    setOperationError(null); setSyncError(null); setWarning(null); setNotice(null);
+  }
 
   const present = useCallback(() => {
     const current = registrationRef.current;
@@ -66,6 +77,10 @@ export function PetStateProvider({ children, userId, available }: { children: Re
     const current = () => epoch === epochRef.current && !session.signal.aborted;
     const cancelRead = () => { ++requestRef.current; read?.abort(); };
     cancelReadRef.current = cancelRead;
+    // Previous scope data must never be presented in the next scope.
+    registrationRef.current = null; imageRef.current = null;
+    preferencesRef.current = { ...DEFAULT_PREFERENCES };
+    connectedRef.current = false; busyRef.current = false;
     if (!enabled || !userId) return () => { session.abort(); ++epochRef.current; };
     connectedRef.current = false;
     busyRef.current = false;
@@ -228,6 +243,7 @@ export function PetStateProvider({ children, userId, available }: { children: Re
 export function PetProvider({ children, userId }: { children: ReactNode; userId: string | null }) {
   const runtime = useOptionalRuntimeContext();
   const available = runtime?.runtimeFeatures?.application_features?.entertainment === true;
-  // Capability/auth changes remount local view state and abort the previous scope.
-  return <PetStateProvider key={`${userId ?? "anonymous"}:${available}`} userId={userId} available={available}>{children}</PetStateProvider>;
+  // Capability/auth changes reset PetStateProvider's own scope and abort the
+  // previous one without remounting children (see PetStateProvider).
+  return <PetStateProvider userId={userId} available={available}>{children}</PetStateProvider>;
 }

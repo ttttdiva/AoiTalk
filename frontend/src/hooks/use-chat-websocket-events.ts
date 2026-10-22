@@ -16,6 +16,7 @@ import type {
 } from "@/lib/chat-api";
 import type { SubmittedSteeringInstruction } from "@/components/chat/chat-composer";
 import type { useWebSocket } from "@/hooks/use-websocket";
+import type { RefreshPersistedMessagesOptions } from "@/hooks/use-chat-persistence";
 import type { chatTimelineReducer } from "@/lib/chat-state";
 import {
   createLocalMessage,
@@ -66,6 +67,7 @@ type UseChatWebSocketEventsArgs = {
   dispatchChatTimeline: Dispatch<ChatTimelineAction>;
   refreshPersistedMessages: (
     sessionId: string,
+    options?: RefreshPersistedMessagesOptions,
   ) => Promise<ConversationMessage[] | null>;
   /** Bump only after refresh confirms the assistant row is persisted. */
   bumpSessionForAssistant: (sessionId: string, messageId: string) => void;
@@ -87,7 +89,7 @@ type UseChatWebSocketEventsArgs = {
   sendExternalModelPromptResponse?: (
     input: ExternalModelPromptResponseInput,
   ) => boolean | void;
-  setAskUserQuestionRequest?: (request: AskUserQuestionRequest | null) => void;
+  setAskUserQuestionRequest?: Dispatch<SetStateAction<AskUserQuestionRequest | null>>;
   setAskUserQuestionDraft?: (draft: string) => void;
   setAskUserQuestionChoices?: (choices: string[]) => void;
   setPlanApprovalRequest?: (request: PlanApprovalRequest | null) => void;
@@ -100,6 +102,7 @@ type UseChatWebSocketEventsArgs = {
 
   generationState: ChatGenerationState;
   dispatchGeneration: Dispatch<ChatGenerationEvent>;
+  onMemorySelectionEvent?: (message: Record<string, unknown>) => void;
 
   play: (item: { name: string; path: string; type: string }) => void;
   stopAudio: () => void;
@@ -143,6 +146,7 @@ export function useChatWebSocketEvents({
   setLiveToolResults,
   generationState,
   dispatchGeneration,
+  onMemorySelectionEvent,
   play,
   stopAudio,
   setVolume,
@@ -177,6 +181,7 @@ export function useChatWebSocketEvents({
       currentAgentRunId &&
       eventAgentRunId !== currentAgentRunId &&
       lastMessage.type !== "steering_update" &&
+      lastMessage.type !== "ask_user_question_closed" &&
       lastMessage.type !== "live_voice.event"
     ) {
       return;
@@ -206,6 +211,7 @@ export function useChatWebSocketEvents({
     })();
 
     const requiresGenerationCorrelation =
+      lastMessage.type === "memory_selection_progress" ||
       lastMessage.type === "tool_start" ||
       lastMessage.type === "tool_end" ||
       lastMessage.type === "status_update" ||
@@ -231,6 +237,11 @@ export function useChatWebSocketEvents({
     } else {
       if (processedLegacyMessageRef.current === lastMessage) return;
       processedLegacyMessageRef.current = lastMessage;
+    }
+
+    if (lastMessage.type === "memory_selection_progress") {
+      onMemorySelectionEvent?.(lastMessage);
+      return;
     }
 
     if (lastMessage.type === "llm_mode_change") {
@@ -380,6 +391,16 @@ export function useChatWebSocketEvents({
       return;
     }
 
+    if (lastMessage.type === "ask_user_question_closed") {
+      const data = lastMessage.data as Record<string, unknown> | undefined;
+      if (data && eventSessionId === activeSessionId && eventSessionId) {
+        setAskUserQuestionRequest?.((current) =>
+          current?.sessionId === eventSessionId && current.requestId === data.request_id &&
+          current.revision === Number(data.revision || 0) ? null : current);
+      }
+      return;
+    }
+
     if (lastMessage.type === "ask_user_question_request") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
       if (data && eventSessionId === activeSessionId && eventSessionId) {
@@ -429,7 +450,10 @@ export function useChatWebSocketEvents({
         eventSessionId === activeSessionId &&
         messageId
       ) {
-        void refreshPersistedMessages(activeSessionId);
+        void refreshPersistedMessages(activeSessionId, {
+          trigger: "websocket",
+          announcedMessageId: messageId,
+        });
       }
       return;
     }
@@ -446,7 +470,10 @@ export function useChatWebSocketEvents({
             selectGenerationAgentRunId(generationState, activeSessionId);
           const messageId = getWebSocketMessageId(lastMessage);
           if (!agentRunId && !messageId) {
-            void refreshPersistedMessages(activeSessionId);
+            void refreshPersistedMessages(activeSessionId, {
+              trigger: "websocket",
+              announcedMessageId: messageId,
+            });
             return;
           }
           const metadata: ConversationMessage["metadata"] = {
@@ -468,7 +495,10 @@ export function useChatWebSocketEvents({
             type: "append",
             message: messageId ? { ...liveAssistant, id: messageId } : liveAssistant,
           });
-          void refreshPersistedMessages(activeSessionId);
+          void refreshPersistedMessages(activeSessionId, {
+            trigger: "websocket",
+            announcedMessageId: messageId,
+          });
         }
       }
       // user型のnew_messageは保存済みIDを含まないため、応答側で履歴を再取得してtemp表示を置き換える
@@ -482,10 +512,13 @@ export function useChatWebSocketEvents({
           setSteeringInstructions([]);
         }
         void (async () => {
+          const announcedMessageId = getWebSocketMessageId(lastMessage);
           const persistedMessages =
-            await refreshPersistedMessages(activeSessionId);
+            await refreshPersistedMessages(activeSessionId, {
+              trigger: "websocket",
+              announcedMessageId: announcedMessageId,
+            });
           if (lastMessage.role === "assistant" && persistedMessages) {
-            const announcedMessageId = getWebSocketMessageId(lastMessage);
             const announcedRunId = getWebSocketMessageAgentRunId(lastMessage);
             const persistedAssistant = persistedMessages.find(
               (message) =>
@@ -505,16 +538,6 @@ export function useChatWebSocketEvents({
                 eventId,
               });
             }
-          }
-          if (
-            lastMessage.role === "assistant" &&
-            currentSession?.id === activeSessionId &&
-            persistedMessages
-          ) {
-            void maybeGenerateLoadedSessionTitle(
-              currentSession,
-              persistedMessages,
-            );
           }
         })();
       }
@@ -540,7 +563,10 @@ export function useChatWebSocketEvents({
         const messageId = getWebSocketMessageId(lastMessage);
         const imageAgentRunId = getWebSocketMessageAgentRunId(lastMessage);
         if (!messageId && !imageAgentRunId) {
-          void refreshPersistedMessages(activeSessionId);
+          void refreshPersistedMessages(activeSessionId, {
+            trigger: "websocket",
+            announcedMessageId: getWebSocketMessageId(lastMessage),
+          });
           return;
         }
         dispatchChatTimeline({
@@ -789,7 +815,10 @@ export function useChatWebSocketEvents({
             : "応答生成を停止できませんでした",
         );
         if (activeSessionId) {
-          void refreshPersistedMessages(activeSessionId);
+          void refreshPersistedMessages(activeSessionId, {
+            trigger: "websocket",
+            announcedMessageId: getWebSocketMessageId(lastMessage),
+          });
         }
         return;
       }
@@ -891,7 +920,10 @@ export function useChatWebSocketEvents({
         );
       }
       if (activeSessionId) {
-        void refreshPersistedMessages(activeSessionId);
+        void refreshPersistedMessages(activeSessionId, {
+          trigger: "websocket",
+          announcedMessageId: getWebSocketMessageId(lastMessage),
+        });
       }
       return;
     }
@@ -930,7 +962,10 @@ export function useChatWebSocketEvents({
           !streamEndMessageId &&
           !eventClientMessageId
         ) {
-          void refreshPersistedMessages(activeSessionId);
+          void refreshPersistedMessages(activeSessionId, {
+            trigger: "websocket",
+            announcedMessageId: terminalMessageId,
+          });
           if (streamingIntervalRef.current) {
             clearInterval(streamingIntervalRef.current);
             streamingIntervalRef.current = null;
@@ -965,7 +1000,10 @@ export function useChatWebSocketEvents({
       liveToolResultsRef.current = [];
       setLiveToolResults([]);
       if (activeSessionId) {
-        void refreshPersistedMessages(activeSessionId);
+        void refreshPersistedMessages(activeSessionId, {
+          trigger: "websocket",
+          announcedMessageId: terminalMessageId,
+        });
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -986,5 +1024,6 @@ export function useChatWebSocketEvents({
     processedLegacyMessageRef,
     generationState,
     dispatchGeneration,
+    onMemorySelectionEvent,
   ]);
 }

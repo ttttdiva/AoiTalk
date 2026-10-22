@@ -204,6 +204,55 @@ function composerPopups(page: Page) {
     .locator("div.absolute.bottom-full");
 }
 
+for (const width of [1280, 375]) {
+  test(`統合検索で以前のqueryへ戻しても旧引用URLを復活させない (${width}px)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 812 });
+    await openNewComposer(page);
+    const unit = '11111111-1111-4111-8111-111111111111';
+    let reads = 0;
+    await page.route('**/api/python-proxy/search/media**', async (route) => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON() as { plan: { instruction: string } };
+        await route.fulfill({ json: {
+          version: 1, results: [{ target_kind: 'media', locator: { kind: 'docs_attachment', id: unit },
+            unit_id: unit, source_kind: 'docs_attachment', source_id: unit, modality: 'image',
+            title: `結果: ${body.plan.instruction}`, text: '根拠の候補', score: 1,
+            page_number: 3, citation: { page_number: 3 }, matched_query_sources: [] }],
+          query_sources: [], lane_status: ['docs', 'knowledge', 'conversation', 'media'].map((target_kind) => ({
+            target_kind, status: 'complete', partitions: [], warnings: [] })), complete: true, warnings: [],
+        } });
+      } else {
+        reads += 1;
+        await route.fulfill({ json: { result: { unit_id: unit, source_kind: 'docs_attachment', source_id: unit,
+          title: '現在readerの資料', modality: 'image', text: '旧認可の引用',
+          original_url: `/api/search/media/${unit}/content#page=3`, page_number: 3 } } });
+      }
+    });
+    await page.keyboard.press('Control+f');
+    await page.getByRole('tab', { name: '添付・統合検索' }).click();
+    const query = page.getByPlaceholder('画像・音声・資料などを検索...');
+    await query.fill('first');
+    await expect(page.getByText('結果: first', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '資料を確認', exact: true }).click();
+    await expect(page.getByRole('link', { name: '原本を開く' })).toBeVisible();
+    await query.fill('second');
+    await expect(page.getByText('結果: second', { exact: true })).toBeVisible();
+    await query.fill('first');
+    await expect(page.getByText('結果: first', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: '原本を開く' })).toHaveCount(0);
+    await expect(page.getByText('旧認可の引用', { exact: true })).toHaveCount(0);
+    expect(reads).toBe(1);
+    const box = await page.getByRole('dialog').boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(width);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(812);
+    await page.getByRole('button', { name: '資料を確認', exact: true }).click();
+    await expect(page.getByRole('link', { name: '原本を開く' })).toBeVisible();
+    expect(reads).toBe(2);
+  });
+}
+
 test.afterEach(async ({ page }, testInfo) => {
   const evidence = evidenceByPage.get(page);
   if (!evidence) return;

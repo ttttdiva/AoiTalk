@@ -46,8 +46,18 @@ type SettingsScope = {
   scopeKey: string;
 };
 
+export type PendingNewChatLlmSettingsSnapshot = {
+  settings: SessionLlmSettings;
+  revision: number;
+};
+
+type ClearPendingOptions = {
+  bumpRevision?: boolean;
+};
+
 const pendingByScope = new Map<string, SessionLlmSettings>();
 const emptySnapshotsByScope = new Map<string, SessionLlmSettings>();
+const revisionsByScope = new Map<string, number>();
 const listeners = new Map<string, Set<() => void>>();
 const loadedScopes = new Set<string>();
 const draftLifecycleBindings = new Map<string, () => void>();
@@ -92,6 +102,16 @@ function getStorageKey(userId: string | null, key: string): string | null {
 
 function notify(scopeKey: string): void {
   listeners.get(scopeKey)?.forEach((listener) => listener());
+}
+
+function getRevision(scopeKey: string): number {
+  return revisionsByScope.get(scopeKey) ?? 0;
+}
+
+function bumpRevision(scopeKey: string): number {
+  const next = getRevision(scopeKey) + 1;
+  revisionsByScope.set(scopeKey, next);
+  return next;
 }
 
 function isAgentTeamSelection(
@@ -183,7 +203,9 @@ function bindDraftLifecycle(scope: SettingsScope): void {
     NEW_CHAT_COMPOSER_DRAFT_KEY,
     () => {
       if (!isNewChatDraftActive(scope.userId)) {
-        clearPendingNewChatLlmSettings(scope.userId);
+        clearPendingNewChatLlmSettings(scope.userId, undefined, {
+          bumpRevision: false,
+        });
       }
     },
     scope.userId,
@@ -377,6 +399,7 @@ function loadSettingsFromStorage(scope: SettingsScope): void {
     return;
   }
   pendingByScope.set(scope.scopeKey, settings);
+  bumpRevision(scope.scopeKey);
   notify(scope.scopeKey);
 }
 
@@ -384,9 +407,11 @@ export function hydratePendingNewChatLlmSettings(userId?: string | null): void {
   const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
   loadSettingsFromStorage(scope);
   if (scope.userId && !isNewChatDraftActive(scope.userId)) {
-    pendingByScope.delete(scope.scopeKey);
+    const hadPending = pendingByScope.delete(scope.scopeKey);
     removeStoredSettings(getStorageKey(scope.userId, scope.key));
-    notify(scope.scopeKey);
+    if (hadPending) {
+      notify(scope.scopeKey);
+    }
   }
 }
 
@@ -395,6 +420,19 @@ export function getPendingNewChatLlmSettings(
 ): SessionLlmSettings {
   const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
   return pendingByScope.get(scope.scopeKey) ?? getEmptySnapshot(scope.scopeKey);
+}
+
+export function getPendingNewChatLlmSettingsSnapshot(
+  userId?: string | null,
+): PendingNewChatLlmSettingsSnapshot {
+  const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
+  loadSettingsFromStorage(scope);
+  return {
+    settings: cloneSettings(
+      pendingByScope.get(scope.scopeKey) ?? getEmptySnapshot(scope.scopeKey),
+    ),
+    revision: getRevision(scope.scopeKey),
+  };
 }
 
 export function getPendingNewChatLlmSettingsServerSnapshot(): SessionLlmSettings {
@@ -424,6 +462,7 @@ export function setPendingNewChatLlmSettings(
   loadSettingsFromStorage(scope);
   const next = cloneSettings(settings);
   pendingByScope.set(scope.scopeKey, next);
+  bumpRevision(scope.scopeKey);
   notify(scope.scopeKey);
   writeSettingsNow(scope, next);
 }
@@ -441,15 +480,28 @@ export function updatePendingNewChatLlmSettings(
   const current = getPendingNewChatLlmSettings(userId);
   const next = mergeSettings(current, patch);
   pendingByScope.set(scope.scopeKey, next);
+  bumpRevision(scope.scopeKey);
   notify(scope.scopeKey);
   writeSettingsNow(scope, next);
 }
 
-export function clearPendingNewChatLlmSettings(userId?: string | null): void {
+export function clearPendingNewChatLlmSettings(
+  userId?: string | null,
+  expectedRevision?: number,
+  options?: ClearPendingOptions,
+): boolean {
   const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
+  if (
+    expectedRevision !== undefined &&
+    getRevision(scope.scopeKey) !== expectedRevision
+  ) {
+    return false;
+  }
   pendingByScope.delete(scope.scopeKey);
   removeStoredSettings(getStorageKey(scope.userId, scope.key));
+  if (options?.bumpRevision !== false) bumpRevision(scope.scopeKey);
   notify(scope.scopeKey);
+  return true;
 }
 
 export function hasPendingNewChatRoute(userId?: string | null): boolean {
@@ -461,11 +513,13 @@ export async function applyPendingNewChatLlmSettingsToSession(
   sessionId: string,
   userId?: string | null,
   generationReadyMain?: SessionLlmSettings["main_route"] | null,
+  capturedSnapshot?: PendingNewChatLlmSettingsSnapshot,
 ): Promise<SessionLlmSettingsResponse | null> {
   if (!sessionId) return null;
   const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
   loadSettingsFromStorage(scope);
-  const pending =
+  const currentRevision = getRevision(scope.scopeKey);
+  const pending = capturedSnapshot?.settings ??
     pendingByScope.get(scope.scopeKey) ?? getEmptySnapshot(scope.scopeKey);
   const merged = cloneSettings(pending);
   // Callers must pass the generation-ready route, never the runtime-only
@@ -481,7 +535,11 @@ export async function applyPendingNewChatLlmSettingsToSession(
     snapshotForSessionSave(merged, generationReadyMain),
   );
   const verified = assertPendingHandoffApplied(merged, saved);
-  clearPendingNewChatLlmSettings(userId);
+  clearPendingNewChatLlmSettings(
+    userId,
+    capturedSnapshot?.revision ?? currentRevision,
+    { bumpRevision: false },
+  );
   return verified;
 }
 
@@ -490,6 +548,7 @@ export function resetNewChatLlmSettingsStore(): void {
   draftLifecycleBindings.clear();
   pendingByScope.clear();
   loadedScopes.clear();
+  revisionsByScope.clear();
   listeners.forEach((scopeListeners) =>
     scopeListeners.forEach((listener) => listener()),
   );

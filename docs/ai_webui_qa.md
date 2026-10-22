@@ -1,6 +1,6 @@
 # AI WebUI QA
 
-WebUIの完成判定では、コードレビューやtypecheck / buildだけでなく、ユーザーが実際に操作した結果を確認する。共通の作業・CI・完了状態は [AGENTS.md](../AGENTS.md) を参照する。
+WebUIの完成判定では、コードレビューやtypecheck / buildだけでなく、ユーザーが実際に操作した結果を確認する。共通の作業・CI・完了状態は AGENTS.md を参照する。
 
 ## 対象
 
@@ -36,4 +36,4 @@ FAIL時は再現手順、期待結果、実際の結果、関連するConsole / 
 | FAIL | 不具合を修正して再QAする。未解決なら `INCOMPLETE` |
 | 必要なブラウザ・認証・起動環境がなく未実施 | `INCOMPLETE_WEBUI_UNVERIFIED`。静的検証やbuild成功を実UIのPASSに置き換えない |
 
-実装・ターゲット検証・実UI QA・commit / push・CIは別の結果として報告する。実UI未検証を理由に変更をpushせず黙って終了するのではなく、pushの結果と残る検証を明記する。
+実装・ローカルのターゲット検証・実UI QA・commit / pushは別の結果として報告する。CI結果の取得・完了待機は不要で、参照する場合だけ既知の結果を補足する。実UI未検証を理由に変更をpushせず黙って終了するのではなく、pushの結果と残る検証を明記する。

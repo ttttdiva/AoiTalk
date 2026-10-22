@@ -39,7 +39,7 @@ FEATURE_DEFINITIONS: Dict[str, RuntimeFeatureDefinition] = {
     "web_ui": RuntimeFeatureDefinition(
         "web_ui",
         "WebUI",
-        "Web interface, BFF, and TRPG screens. This is always enabled.",
+        "Web interface and BFF. This is always enabled.",
     ),
     "local_mic": RuntimeFeatureDefinition(
         "local_mic",

@@ -530,7 +530,7 @@ export function HeartbeatsSection() {
   return (
     <>
       <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
-        <CardHeader className="cursor-pointer select-none" onClick={handleToggle}>
+        <CardHeader className="cursor-pointer select-none" role="button" tabIndex={0} aria-expanded={expanded} data-settings-target-activation="heartbeats" onClick={handleToggle} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); handleToggle(); } }}>
           <CardTitle className="flex items-center justify-between gap-3 text-sm">
             <span className="flex min-w-0 items-center gap-2">
               <Activity className="size-4" />

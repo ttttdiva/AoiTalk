@@ -11,6 +11,7 @@ import ipaddress
 import inspect
 import os
 import re
+from typing import Mapping
 from urllib.parse import urlsplit
 from sqlalchemy import select
 
@@ -98,6 +99,107 @@ def _normalize_cors_origin(value: Any) -> str | None:
     return f"{scheme}://{authority}"
 
 
+def _register_verification_provenance_middleware(
+    app: FastAPI,
+    server: "WebChatServer",
+) -> None:
+    """Install the production verification provenance request boundary."""
+    from ..services.verification_provenance import (
+        VerificationProvenanceError,
+        VerificationProvenanceService,
+    )
+    from ..verification.context import (
+        context_from_run,
+        reset_current_verification_context,
+        set_current_verification_context,
+        verify_verification_headers,
+    )
+
+    @app.middleware("http")
+    async def _verification_provenance_middleware(request: Request, call_next):
+        try:
+            context = verify_verification_headers(request.headers)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {
+                    "detail": "Invalid verification provenance headers",
+                    "code": "verification_headers_invalid",
+                },
+                status_code=400,
+            )
+        if context is None:
+            return await call_next(request)
+
+        manager = server._db_manager
+        if manager is None or not callable(getattr(manager, "get_session", None)):
+            return JSONResponse(
+                {
+                    "detail": "Verification provenance is unavailable",
+                    "code": "verification_unavailable",
+                },
+                status_code=503,
+            )
+
+        session = None
+        token = None
+        try:
+            session = await manager.get_session()
+            run = await VerificationProvenanceService().start_run(
+                session,
+                run_id=context.run_id,
+                source=context.source,
+                harness=context.harness,
+                commit=True,
+            )
+            # A completed run cannot be reused to create new domain rows.
+            # Cleanup/preview retries are read/maintenance operations and
+            # are allowed through without rebinding a write context.
+            if run.status != "running":
+                path = request.url.path.rstrip("/")
+                if path != "/api/admin/verification-data" and not path.startswith(
+                    "/api/admin/verification-data/"
+                ):
+                    return JSONResponse(
+                        {
+                            "detail": "Verification run is no longer active",
+                            "code": "verification_run_closed",
+                        },
+                        status_code=409,
+                    )
+                return await call_next(request)
+
+            # Bind the durable row's canonical attribution/timestamp,
+            # rather than reusing mutable header text for entity markers.
+            token = set_current_verification_context(context_from_run(run))
+            return await call_next(request)
+        except VerificationProvenanceError:
+            if session is not None and callable(getattr(session, "rollback", None)):
+                await session.rollback()
+            return JSONResponse(
+                {
+                    "detail": "Verification provenance is unavailable",
+                    "code": "verification_unavailable",
+                },
+                status_code=503,
+            )
+        except Exception:
+            if session is not None and callable(getattr(session, "rollback", None)):
+                await session.rollback()
+            logger.exception("Failed to establish verification provenance context")
+            return JSONResponse(
+                {
+                    "detail": "Verification provenance is unavailable",
+                    "code": "verification_unavailable",
+                },
+                status_code=503,
+            )
+        finally:
+            if token is not None:
+                reset_current_verification_context(token)
+            if session is not None and callable(getattr(session, "close", None)):
+                await session.close()
+
+
 class WebChatServer(
     AuthMixin,
     ChatMessageMixin,
@@ -122,6 +224,11 @@ class WebChatServer(
         self._heartbeat_execution_dispatcher = None
         self._agent_work_coordinator = None
         self._agent_work_coordinator_started = False
+        # Optional CLI development session facade.  The route is registered
+        # even when this service is disabled; startup attaches it to the one
+        # shared AgentWork coordinator only after the coordinator exists.
+        self._cli_development_session_service = None
+        self._cli_development_session_work_coordinator = None
         self._task_notification_worker = None
         try:
             from ..heartbeat.runner import get_heartbeat_runner
@@ -177,6 +284,8 @@ class WebChatServer(
         self._mage_vl_preload_task: asyncio.Task[Any] | None = None
         self._register_mage_vl_lifecycle()
         self._register_docs_index_lifecycle()
+        self._register_media_index_lifecycle()
+        self._register_files_index_lifecycle()
         self._conversation_dispatch_tasks: set[Any] = set()
         self._conversation_dispatch_recovery_task: Any | None = None
         self._conversation_dispatch_shutting_down = False
@@ -352,85 +461,7 @@ class WebChatServer(
         # header set is rejected here; ordinary requests remain completely
         # unaffected.  The middleware deliberately does not trust request
         # bodies or query parameters for provenance.
-        from ..services.verification_provenance import (
-            VerificationProvenanceError,
-            VerificationProvenanceService,
-        )
-        from ..verification.context import (
-            context_from_run,
-            reset_current_verification_context,
-            set_current_verification_context,
-            verify_verification_headers,
-        )
-
-        @self.app.middleware("http")
-        async def _verification_provenance_middleware(request: Request, call_next):
-            try:
-                context = verify_verification_headers(request.headers)
-            except (TypeError, ValueError) as exc:
-                return JSONResponse(
-                    {"detail": "Invalid verification provenance headers", "code": "verification_headers_invalid"},
-                    status_code=400,
-                )
-            if context is None:
-                return await call_next(request)
-
-            manager = self._db_manager
-            if manager is None or not callable(getattr(manager, "get_session", None)):
-                return JSONResponse(
-                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
-                    status_code=503,
-                )
-
-            session = None
-            token = None
-            try:
-                session = await manager.get_session()
-                run = await VerificationProvenanceService().start_run(
-                    session,
-                    run_id=context.run_id,
-                    source=context.source,
-                    harness=context.harness,
-                    commit=True,
-                )
-                # A completed run cannot be reused to create new domain rows.
-                # Cleanup/preview retries are read/maintenance operations and
-                # are allowed through without rebinding a write context.
-                if run.status != "running":
-                    path = request.url.path.rstrip("/")
-                    if path != "/api/admin/verification-data" and not path.startswith(
-                        "/api/admin/verification-data/"
-                    ):
-                        return JSONResponse(
-                            {"detail": "Verification run is no longer active", "code": "verification_run_closed"},
-                            status_code=409,
-                        )
-                    return await call_next(request)
-
-                # Bind the durable row's canonical attribution/timestamp,
-                # rather than reusing mutable header text for entity markers.
-                token = set_current_verification_context(context_from_run(run))
-                return await call_next(request)
-            except VerificationProvenanceError:
-                if session is not None and callable(getattr(session, "rollback", None)):
-                    await session.rollback()
-                return JSONResponse(
-                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
-                    status_code=503,
-                )
-            except Exception:
-                if session is not None and callable(getattr(session, "rollback", None)):
-                    await session.rollback()
-                logger.exception("Failed to establish verification provenance context")
-                return JSONResponse(
-                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
-                    status_code=503,
-                )
-            finally:
-                if token is not None:
-                    reset_current_verification_context(token)
-                if session is not None and callable(getattr(session, "close", None)):
-                    await session.close()
+        _register_verification_provenance_middleware(self.app, self)
 
         # Auth settings (depends on _db_manager for DB auth)
         (
@@ -450,8 +481,14 @@ class WebChatServer(
         self.cookie_name = os.getenv(
             "AOITALK_FASTAPI_SESSION_COOKIE", "aoitalk_fastapi_session"
         )
-        self.legacy_cookie_name = "aoitalk_session"
-        self.next_cookie_name = "aoitalk_session"
+        self.next_cookie_name = (
+            os.getenv("AOITALK_SESSION_COOKIE_NAME", "aoitalk_session").strip()
+            or "aoitalk_session"
+        )
+        # Keep the old FastAPI fallback aligned with the configured Next.js
+        # cookie.  In particular, the disposable QA frontend must not accept
+        # the production aoitalk_session cookie shared by the same browser.
+        self.legacy_cookie_name = self.next_cookie_name
 
         # Connection manager
         self.manager = ConnectionManager()
@@ -460,10 +497,6 @@ class WebChatServer(
 
         # Install the durable Heartbeat execution callback before lifespan start.
         self._configure_heartbeat_execution()
-
-        from .trpg_play_connection_manager import TrpgPlayConnectionManager
-
-        self.trpg_play_manager = TrpgPlayConnectionManager()
 
         # Register BGM change callback
         if set_bgm_callback:
@@ -495,6 +528,7 @@ class WebChatServer(
         self.on_user_input = None
         self.on_clear_chat = None  # Callback for clear chat events
         self.on_llm_client_change = None
+        self.on_session_llm_route_change = None
         self.main_event_loop = None
 
         # Voice status
@@ -642,6 +676,8 @@ class WebChatServer(
         if CONVERSATION_ROUTES_AVAILABLE and create_conversation_router:
             self._register_conversation_routes()
 
+        self._register_chat_intent_routes()
+
         # Register group chat routes if available
         if GROUP_CHAT_ROUTES_AVAILABLE and create_group_chat_router:
             self._register_group_chat_routes()
@@ -752,6 +788,9 @@ class WebChatServer(
         if HEARTBEAT_ROUTES_AVAILABLE and create_heartbeat_router:
             self._register_heartbeat_routes()
 
+        self._register_local_agent_task_routes()
+        self._register_cli_development_session_routes()
+
         # Register agent harness status routes if available
         if AGENT_HARNESS_ROUTES_AVAILABLE and create_agent_harness_router:
             self._register_agent_harness_routes()
@@ -759,25 +798,9 @@ class WebChatServer(
         if APPS_ROUTES_AVAILABLE and create_apps_router:
             self._register_apps_routes()
 
-        # Register hydrus browser routes if available
-        if HYDRUS_ROUTES_AVAILABLE and create_hydrus_router:
-            self._register_hydrus_routes()
-
         # Register ECC feature routes if available
         if ECC_ROUTES_AVAILABLE and create_ecc_router:
             self._register_ecc_routes()
-
-        # Register Scenario Studio canonical routes.
-        if STORY_ROUTES_AVAILABLE and create_story_router:
-            self._register_story_routes()
-        if STORY_LEGACY_COMPAT_AVAILABLE and create_story_legacy_compat_router:
-            self._register_story_legacy_compat_routes()
-
-        # Register read-only TRPG asset reference routes; play execution was retired.
-        if TRPG_REFERENCE_ROUTES_AVAILABLE and create_trpg_reference_router:
-            self._register_trpg_reference_routes()
-        if TRPG_PLAY_ROUTES_AVAILABLE and create_trpg_play_router:
-            self._register_trpg_play_routes()
 
         # Register comfyui routes if available
         if COMFYUI_ROUTES_AVAILABLE and create_comfyui_router:
@@ -1063,6 +1086,30 @@ class WebChatServer(
         self._docs_index_worker = DocsIndexWorker(session_factory)
         self._register_lifecycle_pair(self._docs_index_worker.start, self._docs_index_worker.stop)
 
+    def _register_media_index_lifecycle(self) -> None:
+        from ..services.media_index_worker import MediaIndexWorker
+        from ..memory.database import get_db_session
+
+        async def session_factory():
+            manager = getattr(self, "_db_manager", None)
+            return await manager.get_session() if manager is not None else await get_db_session()
+
+        self._media_index_worker = MediaIndexWorker(session_factory)
+        self._register_lifecycle_pair(self._media_index_worker.start, self._media_index_worker.stop)
+
+    def _register_files_index_lifecycle(self) -> None:
+        """Scan User/Project Files into the workspace_file media index inventory."""
+        from ..services.workspace_file_index import WorkspaceFileIndexService
+        from ..memory.database import get_db_session
+
+        async def session_factory():
+            manager = getattr(self, "_db_manager", None)
+            return await manager.get_session() if manager is not None else await get_db_session()
+
+        self._files_index_service = WorkspaceFileIndexService(
+            session_factory, workspace_root=self._resolve_workspace_root())
+        self._register_lifecycle_pair(self._files_index_service.start, self._files_index_service.stop)
+
     def _register_project_overview_lifecycle(self) -> None:
         """Register the durable Project Overview refresh worker."""
 
@@ -1347,6 +1394,7 @@ class WebChatServer(
                     self._agent_work_coordinator = AgentWorkCoordinator(
                         self._db_manager,
                         config=self.config,
+                        max_concurrency=None,
                         task_executor=getattr(self, "_agent_task_executor", None),
                         execution_actor=ActorPrincipal.service("aoitalk.system"),
                         enabled=True,
@@ -1388,8 +1436,37 @@ class WebChatServer(
                             "Code-agent adapter eager registration failed",
                             exc_info=True,
                         )
+                # Gateway delegation joins this exact coordinator before stale
+                # recovery; it never starts a second worker or inference loop.
+                from ..services.local_agent_tasks import get_local_agent_task_manager, local_agent_tasks_enabled
+                from ..services.local_agent_task_adapter import bind_local_agent_task_coordinator
+
+                if local_agent_tasks_enabled(self.config):
+                    bind_local_agent_task_coordinator(
+                        get_local_agent_task_manager(self.config),
+                        self._agent_work_coordinator,
+                    )
+                # Generic API Agent tasks own an evidence-based restart hook.
+                # Without eager binding the generic fallback dead-letters an
+                # interrupted max_attempts=1 task before the first request
+                # lazily creates the service.
+                if self._db_manager is not None:
+                    from .agent_task_routes import bind_agent_task_service
+
+                    agent_task_service = bind_agent_task_service(
+                        self._db_manager, self.config, self._agent_work_coordinator
+                    )
+                # The CLI development session facade uses the same durable
+                # coordinator and must be attached before stale recovery or
+                # the poller can observe its WorkSource.
+                await self._attach_cli_development_session_service()
                 with _startup_timer.phase("startup.web.lifespan.agent_work_recovery"):
                     await self._agent_work_coordinator.recover_stale()
+                    if self._db_manager is not None:
+                        try:
+                            await agent_task_service.migrate_workspace_fence_keys()
+                        except Exception:
+                            logger.warning("API Agent task fence migration skipped", exc_info=True)
                     if Features.virtual_company() and Features.voice_input():
                         # Only expired phone sessions beyond their absolute
                         # lifetime are classified; another worker's live call
@@ -1400,28 +1477,6 @@ class WebChatServer(
                 logger.warning("Common AgentWork coordinator startup skipped: %s", exc)
                 if Features.is_enterprise() or os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {"1", "true", "yes", "on"}:
                     raise RuntimeError("Common AgentWork coordinator failed to start") from exc
-        pending_background_tasks = list(self._startup_background_tasks)
-        with _startup_timer.phase("startup.web.lifespan.background_schedule"):
-            for task_factory in pending_background_tasks:
-                try:
-                    startup_coro = task_factory()
-                    if not inspect.isawaitable(startup_coro):
-                        raise TypeError(
-                            f"startup hook {task_factory!r} did not return an awaitable"
-                        )
-                    task_name = str(
-                        getattr(task_factory, "__name__", "startup") or "startup"
-                    )
-                    task = self._spawn_lifespan_task(
-                        startup_coro,
-                        name=f"aoitalk-web-startup:{task_name}",
-                        startup_factory=task_factory,
-                    )
-                    if task_factory is self._mage_vl_preload_factory:
-                        self._mage_vl_preload_task = task
-                except Exception as exc:
-                    logger.error(f"Failed to schedule startup background task: {exc}")
-
         # AgentRun provider tasks and human-interaction Futures are process
         # local; they cannot be resumed safely after a restart.  Reconcile any
         # stale running run before dispatch recovery so its terminal audit is
@@ -1447,31 +1502,6 @@ class WebChatServer(
             # is down; enterprise/database-required startup will fail later at
             # its existing bootstrap gate.
             logger.warning("AgentRun startup reconciliation skipped: %s", exc)
-
-        # Story Studio jobs must not remain ``running`` after a process restart.
-        # Mark them interrupted before normal request handling resumes so the UI
-        # can offer the documented resume action without touching any GET route.
-        if not Features.is_enterprise():
-            try:
-                from ..services.story_studio import StoryJobRunner
-
-                if self._db_manager is not None:
-                    session = await self._db_manager.get_session()
-                    try:
-                        with _startup_timer.phase(
-                            "startup.web.lifespan.story_recovery"
-                        ):
-                            interrupted = await StoryJobRunner(session).mark_interrupted()
-                            await session.commit()
-                        if interrupted:
-                            logger.info(
-                                "Story Studio の中断ジョブを %s 件復旧しました",
-                                interrupted,
-                            )
-                    finally:
-                        await session.close()
-            except Exception as exc:
-                logger.warning("Story Studio の中断ジョブ復旧をスキップしました: %s", exc)
 
         # 料金カタログをDBへ同期する（idempotent upsert）。
         # ファイル同期はDBのみで完結するので同期実行し、外部APIを叩く
@@ -1629,6 +1659,32 @@ class WebChatServer(
             except Exception as exc:
                 logger.error(f"Task startup sync failed: {exc}")
 
+        # Keep optional workers from opening a burst of new PostgreSQL
+        # connections while the required recovery and bootstrap steps are
+        # still waiting for their own connection.  On Windows that burst can
+        # stall the AgentRun reconciliation until FastAPI's readiness timeout.
+        pending_background_tasks = list(self._startup_background_tasks)
+        with _startup_timer.phase("startup.web.lifespan.background_schedule"):
+            for task_factory in pending_background_tasks:
+                try:
+                    startup_coro = task_factory()
+                    if not inspect.isawaitable(startup_coro):
+                        raise TypeError(
+                            f"startup hook {task_factory!r} did not return an awaitable"
+                        )
+                    task_name = str(
+                        getattr(task_factory, "__name__", "startup") or "startup"
+                    )
+                    task = self._spawn_lifespan_task(
+                        startup_coro,
+                        name=f"aoitalk-web-startup:{task_name}",
+                        startup_factory=task_factory,
+                    )
+                    if task_factory is self._mage_vl_preload_factory:
+                        self._mage_vl_preload_task = task
+                except Exception as exc:
+                    logger.error(f"Failed to schedule startup background task: {exc}")
+
         # All startup hooks (including Agent Harness adapter binding) have now
         # had a scheduling turn.  Start the one common coordinator last so no
         # work can be claimed before its adapters are registered.
@@ -1682,7 +1738,7 @@ class WebChatServer(
             from ..services.media_operations_content_service import MediaOperationsContentService
             from ..services.media_operations_metrics_service import MediaOperationsMetricsService
             from ..services.media_operations_learning_service import MediaOperationsLearningService
-            from ..services.operations_service import OperationsService
+            from ..services.operations_service import create_operations_service
 
             resolver = AgentAuthorityResolver(self._db_manager, config=self.config)
             async def media_actor_resolver(work_item: Any = None, *, session: Any = None, **_: Any) -> Any:
@@ -1732,7 +1788,7 @@ class WebChatServer(
                 coordinator,
                 research_service=kwargs["research_service"],
                 generation_service=kwargs["generation_service"],
-                operations_service=OperationsService(),
+                operations_service=create_operations_service(),
                 metrics_service=kwargs["metrics_service"],
                 learning_service=kwargs["learning_service"],
                 authority_resolver=resolver.resolve,
@@ -1746,6 +1802,9 @@ class WebChatServer(
     def _setup_routes(self):
         """Setup API routes (ドメイン別の registrar モジュールへ委譲)"""
         register_system_routes(self.app, self)
+        from .routes.embedding_runtime_routes import register_embedding_runtime_routes
+
+        register_embedding_runtime_routes(self.app, self)
         register_config_routes(self.app, self)
         from .routes.pc_bridge_routes import register_pc_bridge_routes
         register_pc_bridge_routes(self.app, self)
@@ -1758,13 +1817,46 @@ class WebChatServer(
         if not Features.is_enterprise():
             register_mobile_command_routes(self.app, self)
         register_conversation_dispatch_routes(self.app, self)
+        from .media_search_routes import create_media_search_router
+        self.app.include_router(create_media_search_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+            workspace_root=self._resolve_workspace_root(),
+            queue_provider=lambda: self._media_index_worker.queue,
+        ))
+        from .files_index_routes import create_files_index_router
+        self.app.include_router(create_files_index_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+            queue_provider=lambda: self._media_index_worker.queue,
+        ))
         register_agent_run_routes(self.app, self)
         if AGENT_WORK_ROUTES_AVAILABLE and create_agent_work_router:
             self._register_agent_work_routes()
+        self._register_agent_task_routes()
         if AGENT_IDENTITY_ROUTES_AVAILABLE and create_agent_identity_router:
             self._register_agent_identity_routes()
+        from .agent_dialogue_routes import create_agent_dialogue_router
+        from ..services.agent_dialogue_service import get_agent_dialogue_dispatch_bridge
+        dialogue_dispatch_bridge = get_agent_dialogue_dispatch_bridge(self._db_manager, config=self.config)
+        self._agent_dialogue_dispatch_bridge = dialogue_dispatch_bridge
+        self.app.include_router(create_agent_dialogue_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+            get_dispatch_bridge=lambda: dialogue_dispatch_bridge,
+            config=self.config,
+        ))
         register_live_voice_routes(self.app, self)
         register_voice_session_routes(self.app, self)
+        from .routes.mobile_voice_routes import register_mobile_voice_routes
+
+        register_mobile_voice_routes(self.app, self)
+        from .routes.tts_provider_routes import register_tts_provider_routes
+
+        register_tts_provider_routes(self.app, self)
         from .ai_employee_registration import register_ai_employee_routes
 
         register_ai_employee_routes(self, cookie_auth_dependency(self._enforce_cookie_auth))
@@ -1773,6 +1865,12 @@ class WebChatServer(
         register_document_storage_routes(self.app, self)
         register_auth_routes(self.app, self)
         register_api_token_routes(self.app, self)
+        from .routes.personal_ledger_routes import register_personal_ledger_routes
+
+        register_personal_ledger_routes(self.app, self)
+        from .routes.personal_draft_routes import register_personal_draft_routes
+
+        register_personal_draft_routes(self.app, self)
         register_capabilities_routes(self.app, self)
         if not Features.is_enterprise():
             register_remote_server_routes(self.app, self)
@@ -1781,8 +1879,6 @@ class WebChatServer(
         register_verification_data_routes(self.app, self)
         register_feedback_routes(self.app, self)
         register_websocket_routes(self.app, self)
-        if TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE and register_trpg_play_websocket_routes:
-            register_trpg_play_websocket_routes(self.app, self)
 
     def _register_agent_identity_routes(self):
         """Register the additive WS01 Agent identity/authority API."""
@@ -1812,6 +1908,32 @@ class WebChatServer(
         )
         self.app.include_router(router)
         logger.info("Common AgentWork routes registered")
+
+    def _register_agent_task_routes(self):
+        """Register authenticated invocation routes for generic API Agents."""
+
+        from .agent_task_routes import create_agent_task_router
+
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        self.app.include_router(
+            create_agent_task_router(
+                get_db_manager=lambda: self._db_manager,
+                get_coordinator=lambda: self._agent_work_coordinator,
+                get_user_from_request=self._get_user_info_from_request,
+                require_auth_dependency=require_auth,
+                config=self.config,
+            )
+        )
+        from .agent_task_listing_routes import create_agent_task_listing_router
+
+        self.app.include_router(
+            create_agent_task_listing_router(
+                get_db_manager=lambda: self._db_manager,
+                get_user_from_request=self._get_user_info_from_request,
+                require_auth_dependency=require_auth,
+            )
+        )
+        logger.info("Generic Agent task routes registered")
 
     def _agent_work_poll_interval_seconds(self) -> float:
         """Return a bounded coordinator poll interval from app config."""
@@ -2231,9 +2353,33 @@ class WebChatServer(
             require_auth=require_auth,
             get_current_user=self._get_user_info_from_request,
             get_llm_for_title_generation=generate_title_via_llm,
+            get_title_config=lambda: self.config,
         )
         self.app.include_router(router)
+        if CONVERSATION_ROUTES_AVAILABLE and create_conversation_agent_router:
+            self.app.include_router(
+                create_conversation_agent_router(
+                    require_auth=require_auth,
+                    get_current_user=self._get_user_info_from_request,
+                    config=self.config,
+                )
+            )
         logger.info("Conversation routes registered")
+
+    def _register_chat_intent_routes(self):
+        """Register optional, non-persistent pre-send intent suggestions."""
+        from .chat_intent_routes import create_chat_intent_router
+        from ..services.chat_intent_service import CHAT_INTENT_TIMEOUT_SECONDS
+        from ..services.jev_decision_service import JevClientPool
+
+        client_pool = JevClientPool(timeout_seconds=CHAT_INTENT_TIMEOUT_SECONDS)
+        self._register_lifecycle_pair(client_pool.start, client_pool.aclose)
+        self.app.include_router(create_chat_intent_router(
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+            get_current_user=self._get_user_info_from_request,
+            config=self.config,
+            client_pool=client_pool,
+        ))
 
     def _register_group_chat_routes(self):
         """Register Group Chat API routes"""
@@ -2429,6 +2575,14 @@ class WebChatServer(
                 self._docs_clip_ingest_worker = worker
                 self._register_lifecycle_pair(worker.start, worker.stop)
 
+        from ..services.daily_capture_worker import DailyCaptureWorker
+        daily_worker = DailyCaptureWorker(
+            get_db_manager=lambda: self._db_manager,
+            plan_llm_factory=docs_ingest_plan_llm_session,
+        )
+        self._daily_capture_worker = daily_worker
+        self._register_lifecycle_pair(daily_worker.start, daily_worker.stop)
+
         logger.info("Docs routes registered")
 
     def _register_x_cookie_routes(self):
@@ -2459,6 +2613,147 @@ class WebChatServer(
         router = create_heartbeat_router(require_admin=require_admin)
         self.app.include_router(router)
         logger.info("Heartbeat routes registered")
+
+    def _register_local_agent_task_routes(self):
+        """Register admin-only local-LLM task delegation (Home MCP Gateway)."""
+        from .local_agent_task_routes import create_local_agent_task_router
+        from ..services.local_agent_tasks import (
+            get_local_agent_task_manager,
+            local_agent_tasks_enabled,
+        )
+        from ..services.codex_task_preflight import CodexManagedConfigPreflight
+
+        config = self.config if hasattr(self, "config") else {}
+        manager = None
+        if local_agent_tasks_enabled(config):
+            try:
+                # The callback only reads managed requirements from an
+                # already-running official daemon.  It never starts a daemon
+                # or edits the user's Codex configuration/authentication.
+                manager = get_local_agent_task_manager(
+                    config,
+                    codex_preflight=CodexManagedConfigPreflight(),
+                )
+            except Exception as exc:
+                logger.warning("Local agent task manager unavailable: %s", type(exc).__name__)
+
+        async def require_admin(request: Request) -> None:
+            self._enforce_cookie_auth(request)
+            if not await self._is_admin_user(request):
+                raise HTTPException(
+                    status_code=403, detail="Administrator privileges required"
+                )
+
+        self.app.include_router(create_local_agent_task_router(
+            require_admin=require_admin,
+            get_manager=lambda: manager,
+            get_user_id=self._get_user_info_from_request,
+        ))
+        if manager is not None:
+            async def _start_local_agent_tasks() -> None:
+                manager.start()
+
+            async def _stop_local_agent_tasks() -> None:
+                manager.stop()
+
+            self._register_lifecycle_pair(_start_local_agent_tasks, _stop_local_agent_tasks)
+        logger.info("Local agent task routes registered (enabled=%s)", manager is not None)
+
+    def _register_cli_development_session_routes(self) -> None:
+        """Register the authenticated CLI development session facade.
+
+        The optional service is deliberately resolved lazily.  A disabled or
+        rolling deployment still exposes the status route, while create/send
+        endpoints fail closed until startup has attached the service to the
+        shared AgentWork coordinator.
+        """
+
+        try:
+            from .cli_development_session_routes import (
+                create_cli_development_session_router,
+            )
+        except Exception as exc:
+            logger.warning(
+                "CLI development session routes unavailable: %s",
+                type(exc).__name__,
+            )
+            return
+
+        async def require_admin(request: Request) -> None:
+            self._enforce_cookie_auth(request)
+            if not await self._is_admin_user(request):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required",
+                )
+
+        self.app.include_router(
+            create_cli_development_session_router(
+                require_admin=require_admin,
+                get_user_from_request=self._get_user_info_from_request,
+                get_service=lambda: self._cli_development_session_service,
+                get_config=lambda: self.config,
+            )
+        )
+        logger.info("CLI development session routes registered")
+
+    def _build_cli_development_session_service(self) -> Any | None:
+        """Construct the optional session service at the composition root."""
+
+        if self._cli_development_session_service is not None:
+            return self._cli_development_session_service
+        enabled = False
+        try:
+            raw = self.config.get("cli_development_sessions.enabled", False)
+            if isinstance(self.config, Mapping) and raw is False:
+                section = self.config.get("cli_development_sessions", {})
+                raw = section.get("enabled", False) if isinstance(section, Mapping) else False
+            enabled = raw is True or str(raw).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        except Exception:
+            enabled = False
+        if not enabled:
+            return None
+        try:
+            from ..services.cli_development_sessions import CLIDevelopmentSessionService
+        except Exception as exc:
+            logger.warning(
+                "CLI development session service import skipped: %s",
+                type(exc).__name__,
+            )
+            return None
+        try:
+            instance = CLIDevelopmentSessionService(
+                self._db_manager,
+                config=self.config,
+                coordinator=self._agent_work_coordinator,
+            )
+            self._cli_development_session_service = instance
+            return instance
+        except Exception as exc:
+            logger.warning(
+                "CLI development session service construction skipped: %s",
+                type(exc).__name__,
+            )
+            return None
+
+    async def _attach_cli_development_session_service(self) -> None:
+        """Attach the session source/adapter to the shared coordinator once."""
+
+        coordinator = self._agent_work_coordinator
+        if coordinator is None:
+            return
+        service = self._build_cli_development_session_service()
+        if service is None:
+            return
+        if self._cli_development_session_work_coordinator is coordinator:
+            return
+        service.bind_coordinator(coordinator)
+        self._cli_development_session_work_coordinator = coordinator
 
     def _register_agent_harness_routes(self):
         """Register agent harness observability and manual tick routes"""
@@ -2494,6 +2789,92 @@ class WebChatServer(
             logger.warning("Apps routes not available")
             return
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        # App Action runs are persisted and dispatched by the execution
+        # service.  Keep the owner/device-bound PC transport behind this
+        # server seam so routes never construct AppActionRun rows directly.
+        execution_service = getattr(self, "_app_action_execution_service", None)
+        if execution_service is None:
+            try:
+                from ..services.app_action_runtime_service import (
+                    build_app_action_execution_service,
+                )
+                transport_config = (
+                    self.config
+                    if isinstance(self.config, dict)
+                    else getattr(self.config, "config", {})
+                )
+                execution_service = build_app_action_execution_service(
+                    self._db_manager,
+                    config=transport_config,
+                    workspace_root=self._resolve_workspace_root(),
+                )
+            except Exception:
+                logger.exception("App Action execution service initialization failed")
+                execution_service = None
+        self._app_action_execution_service = execution_service
+
+        if execution_service is not None:
+            # RunService commits its dispatch fence before invoking transport.
+            # A preflight callback can therefore fail closed on a stale
+            # Gateway/PC registration without ever sending a start request.
+            if getattr(execution_service, "preflight", None) is None:
+                transport = getattr(execution_service, "transport", None)
+
+                async def _app_action_preflight(run):
+                    checker = getattr(execution_service, "preflight_run", None)
+                    if callable(checker):
+                        return await checker(run)
+                    availability = getattr(transport, "availability", None)
+                    if not callable(availability):
+                        return {"allowed": False, "error_code": "app_action_preflight_unavailable"}
+                    try:
+                        result = await availability(
+                            owner_user_id=str(getattr(run, "owner_user_id", None) or getattr(run, "started_by", "")),
+                            device_id=str(getattr(run, "device_id", "")),
+                            machine_id=str(getattr(run, "machine_id", "")),
+                            execution_target_id=str(getattr(run, "execution_target_id", "")),
+                            execution_target_kind=str(getattr(run, "execution_target_kind", "")),
+                            execution_mode=str(getattr(run, "execution_mode", "finite")),
+                            saved_action_id=getattr(run, "saved_action_id", None),
+                            sha256=getattr(run, "target_sha256", None),
+                            contract_hash=getattr(run, "target_contract_hash", None),
+                            mode=str(getattr(run, "execution_mode", "finite")),
+                            input_sha256=getattr(run, "input_hash", None),
+                        )
+                    except Exception:
+                        return {"allowed": False, "error_code": "app_action_preflight_unavailable"}
+                    if isinstance(result, dict):
+                        return {
+                            **result,
+                            "allowed": bool(result.get("online", result.get("available", False))),
+                            "error_code": (
+                                None
+                                if result.get("online", result.get("available", False))
+                                else "app_action_target_unavailable"
+                            ),
+                        }
+                    return {"allowed": bool(result), "error_code": None if result else "app_action_target_unavailable"}
+
+                execution_service.preflight = _app_action_preflight
+
+            recover = getattr(execution_service, "recover_pending_runs", None)
+            if callable(recover):
+                async def _recover_app_action_runs() -> None:
+                    try:
+                        await recover()
+                    except Exception:
+                        # Recovery is status-only and must not prevent the API
+                        # from starting.  The run remains observable as
+                        # unknown/blocked for a later explicit reconcile.
+                        logger.exception("App Action run recovery failed")
+
+                async def _stop_app_action_recovery() -> None:
+                    return None
+
+                self._register_lifecycle_pair(
+                    _recover_app_action_runs,
+                    _stop_app_action_recovery,
+                )
         router = create_apps_router(
             get_db_manager=lambda: self._db_manager,
             get_user_from_request=self._get_user_info_from_request,
@@ -2501,29 +2882,10 @@ class WebChatServer(
             get_llm_client=lambda: getattr(self, "_llm_client", None),
             workspace_root=self._resolve_workspace_root(),
             get_app_config=lambda: getattr(self, "config", {}) or {},
+            execution_service=execution_service,
         )
         self.app.include_router(router)
         logger.info("Persistent Apps routes registered")
-
-    def _register_hydrus_routes(self):
-        """Register Hydrus Browser API routes"""
-        if not HYDRUS_ROUTES_AVAILABLE:
-            logger.warning("Hydrus browser routes not available")
-            return
-
-        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
-
-        router = create_hydrus_router(
-            require_auth=require_auth,
-            get_current_user=self._get_user_info_from_request,
-        )
-        self.app.include_router(router)
-        compat_router = create_hydrus_compat_router(
-            require_auth=require_auth,
-            get_current_user=self._get_user_info_from_request,
-        )
-        self.app.include_router(compat_router)
-        logger.info("Hydrus browser routes registered")
 
     def _register_ecc_routes(self):
         """Register ECC feature routes (agents, automations, usage, workflows, etc.)"""
@@ -2534,56 +2896,6 @@ class WebChatServer(
         router = create_ecc_router(self)
         self.app.include_router(router)
         logger.info("ECC feature routes registered (49 endpoints)")
-
-    def _register_story_routes(self):
-        """Register Scenario Studio canonical story routes."""
-        if not STORY_ROUTES_AVAILABLE:
-            logger.warning("Scenario Studio routes not available")
-            return
-
-        router = create_story_router(self)
-        self.app.include_router(router)
-        logger.info("Scenario Studio routes registered")
-
-        if STORY_ASSIST_ROUTES_AVAILABLE and create_story_assist_router:
-            assist_router = create_story_assist_router(self)
-            self.app.include_router(assist_router)
-            logger.info("Scenario Studio assist routes registered")
-
-    def _register_story_legacy_compat_routes(self):
-        """Register read-only mobile/legacy story projections.
-
-        mobile が実際に叩く GET /api/scenarios/{id} と /api/scenarios/{id}/canon
-        を提供する（scenario_routes.py 削除後の 404 を塞ぐ）。書き込み系は無い。
-        """
-        if not STORY_LEGACY_COMPAT_AVAILABLE:
-            return
-        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
-        router = create_story_legacy_compat_router(
-            get_db_manager=lambda: self._db_manager,
-            get_user_from_request=self._get_user_info_from_request,
-            require_auth_dependency=require_auth,
-        )
-        self.app.include_router(router)
-        logger.info(
-            "Story legacy compatibility routes registered "
-            "(GET /api/scenarios/{id}, /api/scenarios/{id}/canon)"
-        )
-
-    def _register_trpg_reference_routes(self):
-        """Register read-only TRPG rules and reference asset routes."""
-        if not TRPG_REFERENCE_ROUTES_AVAILABLE or not create_trpg_reference_router:
-            return
-        self.app.include_router(create_trpg_reference_router())
-        logger.info("TRPG reference asset routes registered")
-
-    def _register_trpg_play_routes(self):
-        """Register TRPG Play execution routes."""
-        if not TRPG_PLAY_ROUTES_AVAILABLE or not create_trpg_play_router:
-            return
-        router = create_trpg_play_router(self)
-        self.app.include_router(router)
-        logger.info("TRPG Play routes registered")
 
     def _register_generated_media_routes(self):
         """Register durable generated media delivery routes."""

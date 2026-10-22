@@ -61,9 +61,18 @@ class StorageContextType(str, Enum):
 
 
 def get_base_storage_dir() -> Path:
-    """Get the base storage directory (user_files)"""
+    """Resolve the base storage directory without creating it."""
     files_dir = os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
     path = _assert_storage_path_has_no_links(files_dir)
+    root = path.resolve()
+    if root.exists() and not root.is_dir():
+        raise NotADirectoryError(f"workspace root is not a directory: {root}")
+    return root
+
+
+def ensure_base_storage_dir() -> Path:
+    """Resolve and create the base storage directory for an explicit write."""
+    path = get_base_storage_dir()
     path.mkdir(parents=True, exist_ok=True)
     _assert_storage_path_has_no_links(path)
     return path.resolve()
@@ -79,7 +88,7 @@ def ensure_user_storage(user_id: UUID) -> Path:
     Returns:
         Path to user's storage directory
     """
-    base = get_base_storage_dir()
+    base = ensure_base_storage_dir()
     user_dir = base / "_users" / f"user_{user_id}"
     _assert_storage_path_has_no_links(user_dir)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -97,7 +106,7 @@ def ensure_project_storage(project_id: UUID) -> Path:
     Returns:
         Path to project's storage directory
     """
-    base = get_base_storage_dir()
+    base = ensure_base_storage_dir()
     project_dir = base / "_projects" / f"project_{project_id}"
     _assert_storage_path_has_no_links(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -122,7 +131,7 @@ def get_context_root(
     *,
     app_id: Optional[UUID] = None,
     release_id: Optional[UUID] = None,
-    create: bool = True,
+    create: bool = False,
 ) -> Tuple[Path, bool]:
     """
     Get the root directory for a storage context.
@@ -140,6 +149,8 @@ def get_context_root(
     base = get_base_storage_dir()
     
     if context_type == StorageContextType.LEGACY:
+        if create:
+            base = ensure_base_storage_dir()
         return base, True
     
     elif context_type == StorageContextType.PERSONAL:
@@ -165,27 +176,42 @@ def get_context_root(
         return project_dir, True
 
     elif context_type == StorageContextType.APP:
-        from ...services.app_storage import ensure_app_workspace
+        from ...services.app_storage import ensure_app_workspace, get_app_workspace_path
 
         app_uuid = app_id or context_id
         if not app_uuid:
             return base, False
-        return ensure_app_workspace(app_uuid), True
+        root = (
+            ensure_app_workspace(app_uuid, workspace_root=base)
+            if create
+            else get_app_workspace_path(app_uuid, workspace_root=base)
+        )
+        return root, True
 
     elif context_type == StorageContextType.APP_INSTANCE:
-        from ...services.app_storage import ensure_app_instance
+        from ...services.app_storage import ensure_app_instance, get_app_instance_path
 
         if not context_id or not app_id:
             return base, False
-        return ensure_app_instance(context_id, app_id), True
+        root = (
+            ensure_app_instance(context_id, app_id, workspace_root=base)
+            if create
+            else get_app_instance_path(context_id, app_id, workspace_root=base)
+        )
+        return root, True
 
     elif context_type == StorageContextType.APP_ARTIFACT:
-        from ...services.app_storage import ensure_app_artifact
+        from ...services.app_storage import ensure_app_artifact, get_app_artifact_path
 
         artifact_app_id = app_id or context_id
         if not artifact_app_id or not release_id:
             return base, False
-        return ensure_app_artifact(artifact_app_id, release_id), True
+        root = (
+            ensure_app_artifact(artifact_app_id, release_id, workspace_root=base)
+            if create
+            else get_app_artifact_path(artifact_app_id, release_id, workspace_root=base)
+        )
+        return root, True
     
     return base, False
 

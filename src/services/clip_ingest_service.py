@@ -6563,6 +6563,8 @@ class ClipIngestService:
             await self.session.flush()
             for payload, row in zip(new_result_items, rows):
                 payload["attachment_id"] = str(row.id) if getattr(row, "id", None) else None
+                from .media_index_worker import queue_media_after_commit
+                queue_media_after_commit(self.session, user_id, "docs_attachment", row.id)
             self._promoted_paths.extend(promoted_paths)
             # Legacy synchronous requests clean staging after the flush.  A
             # durable worker must retain both payload and sidecar until its

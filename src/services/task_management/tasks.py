@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
-from datetime import datetime, timedelta
-from typing import Any, Iterable, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable, Optional, Sequence
 from uuid import UUID, uuid4
 
 import httpx
@@ -44,7 +45,9 @@ from ...memory.models import (
     KnowledgeSupertag,
 )
 from ...memory.project_repository import ProjectRepository
-from ...task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
+from ...task_time import (
+    DEFAULT_TASK_TIMEZONE, normalize_task_timezone, timer_db_datetime, timer_now_db,
+)
 from ..docs_acl import can_write_node
 from ..managed_docs_policy import policy_for_node
 from ..project_color_service import extract_project_color
@@ -912,61 +915,257 @@ class TaskCrudMixin:
             return []
 
         bounded_limit = max(1, min(int(limit or 25), 50))
-        stmt = (
-            select(Task)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.title,
-                    Task.status,
-                    Task.project_id,
-                    Task.parent_task_id,
-                    Task.updated_at,
-                    Task.description,
+        normalized_status = normalize_task_status(status) if status else None
+
+        async def refresh_projects() -> list[UUID]:
+            """Re-resolve the exact operational scope before point cleanup."""
+
+            current = await self._get_participating_project_ids(session, user_id)
+            if project_id is not None:
+                await self.require_project_permission(
+                    session, project_id=project_id, user_id=user_id, permission="read"
+                )
+                return [project_id] if project_id in current else []
+            if space_id is not None:
+                return await self._filter_project_ids_by_space(
+                    session, project_ids=current, space_id=space_id
+                )
+            return current
+
+        semantic_ids: list[str] = []
+        semantic_hashes: dict[str, str] = {}
+        semantic_enabled = False
+        task_index_service = None
+        if search:
+            from ...rag.task_index import (
+                TaskIndexError,
+                get_task_index_service,
+                task_content_hash,
+                task_semantic_search_enabled,
+            )
+
+            semantic_enabled = task_semantic_search_enabled()
+            if semantic_enabled:
+                task_index_service = get_task_index_service()
+                scope_attempts = 2
+                for scope_attempt in range(scope_attempts):
+                    current_scope = list(participating_project_ids)
+                    try:
+                        semantic_hits = await task_index_service.search_task_hits(
+                            session,
+                            current_scope,
+                            search=search,
+                            status=normalized_status,
+                            assignee_id=assignee_id,
+                            limit=bounded_limit,
+                            refresh_project_ids=refresh_projects,
+                        )
+                        semantic_ids = [hit.task_id for hit in semantic_hits]
+                        semantic_hashes = {
+                            hit.task_id: hit.content_hash for hit in semantic_hits
+                        }
+                    except TaskIndexError as exc:
+                        # An unavailable/incomplete semantic lane must never become
+                        # a successful empty duplicate search.
+                        raise TaskManagementError(
+                            "Taskの意味検索を完了できません",
+                            status_code=503,
+                            detail={"code": exc.code},
+                        ) from exc
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        raise TaskManagementError(
+                            "Taskの意味検索を完了できません",
+                            status_code=503,
+                            detail={"code": "task_semantic_failed"},
+                        ) from exc
+
+                    refreshed_scope = await refresh_projects()
+                    if not refreshed_scope:
+                        return []
+                    if set(refreshed_scope) == set(current_scope):
+                        participating_project_ids = refreshed_scope
+                        break
+                    participating_project_ids = refreshed_scope
+                    if scope_attempt + 1 >= scope_attempts:
+                        raise TaskManagementError(
+                            "Taskの権限範囲が検索中に変化しました",
+                            status_code=503,
+                            detail={"code": "task_scope_changed"},
+                        )
+            else:
+                refreshed_scope = await refresh_projects()
+                if not refreshed_scope:
+                    return []
+                participating_project_ids = refreshed_scope
+
+        def candidate_statement(*, ids: Sequence[str] | None = None, lexical: bool):
+            statement = (
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.title,
+                        Task.status,
+                        Task.project_id,
+                        Task.parent_task_id,
+                        Task.updated_at,
+                        Task.description,
+                    )
+                )
+                .where(
+                    Task.project_id.in_(participating_project_ids),
+                    Task.archived_at.is_(None),
+                    Task.deleted_at.is_(None),
                 )
             )
-            .where(
-                Task.project_id.in_(participating_project_ids),
-                Task.archived_at.is_(None),
-                Task.deleted_at.is_(None),
+            if ids is not None:
+                statement = statement.where(Task.id.in_([UUID(value) for value in ids]))
+            if normalized_status:
+                statement = statement.where(Task.status == normalized_status)
+            if lexical and search:
+                like_term = f"%{search.strip()}%"
+                predicates = [
+                    Task.title.ilike(like_term),
+                    Task.description.ilike(like_term),
+                ]
+                try:
+                    exact_id = UUID(search.strip())
+                except (TypeError, ValueError, AttributeError):
+                    exact_id = None
+                if exact_id is not None:
+                    predicates.append(Task.id == exact_id)
+                statement = statement.where(or_(*predicates))
+            if assignee_id:
+                statement = statement.join(TaskAssignee).where(
+                    TaskAssignee.user_id == assignee_id
+                )
+            if lexical:
+                statement = statement.order_by(
+                    Task.updated_at.desc(),
+                    Task.sort_order.asc().nulls_last(),
+                    Task.id.asc(),
+                ).limit(bounded_limit)
+            return statement.execution_options(populate_existing=True)
+
+        lexical_result = await session.execute(candidate_statement(lexical=True))
+        lexical_tasks = list(lexical_result.scalars().unique().all())
+        semantic_tasks: list[Any] = []
+        if semantic_ids:
+            semantic_result = await session.execute(
+                candidate_statement(ids=semantic_ids, lexical=False)
             )
-            .order_by(
-                Task.updated_at.desc(),
-                Task.sort_order.asc().nulls_last(),
-                Task.id.asc(),
-            )
-            .limit(bounded_limit)
+            by_id = {
+                str(task.id): task for task in semantic_result.scalars().unique().all()
+            }
+            semantic_tasks = [
+                task for task_id in semantic_ids if (task := by_id.get(task_id))
+            ]
+
+        def exact_task(task: Any) -> bool:
+            query = str(search or "").strip().casefold()
+            if not query:
+                return False
+            task_id = str(task.id)
+            return query in {
+                task_id.casefold(),
+                task_id.replace("-", "").casefold(),
+            } or str(task.title or "").strip().casefold() == query
+
+        ordered_tasks: list[Any] = []
+        seen: set[str] = set()
+        lexical_ids = {str(task.id) for task in lexical_tasks}
+        ordered_sources = (
+            [*[task for task in lexical_tasks if exact_task(task)], *semantic_tasks, *lexical_tasks]
+            if semantic_ids
+            else lexical_tasks
         )
+        for task in ordered_sources:
+            task_id = str(task.id)
+            if task_id not in seen:
+                seen.add(task_id)
+                ordered_tasks.append(task)
 
-        if status:
-            stmt = stmt.where(Task.status == normalize_task_status(status))
-        if search:
-            like_term = f"%{search.strip()}%"
-            stmt = stmt.where(
-                or_(Task.title.ilike(like_term), Task.description.ilike(like_term))
+        def lexical_matches(task: Any) -> bool:
+            query = str(search or "").strip().casefold()
+            if not query:
+                return True
+            task_id = str(task.id)
+            return (
+                query in str(task.title or "").casefold()
+                or query in str(task.description or "").casefold()
+                or query in {task_id.casefold(), task_id.replace("-", "").casefold()}
             )
-        if assignee_id:
-            stmt = stmt.join(TaskAssignee).where(TaskAssignee.user_id == assignee_id)
 
-        result = await session.execute(stmt)
-        candidates: list[dict[str, Any]] = []
-        for task in result.scalars().unique().all():
-            candidates.append(
-                {
-                    "id": str(task.id),
-                    "title": task.title,
-                    "status": task.status,
-                    "project_id": str(task.project_id),
-                    "parent_task_id": (
-                        str(task.parent_task_id) if task.parent_task_id else None
-                    ),
-                    "updated_at": (
-                        task.updated_at.isoformat() if task.updated_at else None
-                    ),
-                    "snippet": self._task_candidate_snippet(task.description),
-                }
+        # Rehydrate the complete union under the scope immediately before
+        # serialization.  A revoke during semantic encoding must not allow a
+        # lexical exact hit to leak through the old project list.
+        final_scope = await refresh_projects()
+        if not final_scope:
+            return []
+        if set(final_scope) != set(participating_project_ids):
+            raise TaskManagementError(
+                "Taskの権限範囲が検索中に変化しました",
+                status_code=503,
+                detail={"code": "task_scope_changed"},
             )
-        return candidates
+        participating_project_ids = final_scope
+        ordered_ids = [str(task.id) for task in ordered_tasks]
+        if ordered_ids:
+            final_result = await session.execute(
+                candidate_statement(ids=ordered_ids, lexical=False)
+            )
+            final_by_id = {
+                str(task.id): task for task in final_result.scalars().unique().all()
+            }
+            fresh_tasks: list[Any] = []
+            for task_id in ordered_ids:
+                task = final_by_id.get(task_id)
+                if task is None:
+                    continue
+                if task_id in semantic_hashes:
+                    # The vector was ranked using the query-time body.  If the
+                    # row changed before final hydration, keep it only when
+                    # the current text still independently satisfies lexical
+                    # matching; otherwise drop the stale semantic candidate.
+                    current_hash = task_content_hash(task.title, task.description)
+                    if current_hash != semantic_hashes[task_id]:
+                        if task_id not in lexical_ids or not lexical_matches(task):
+                            continue
+                if task_id in lexical_ids and not lexical_matches(task):
+                    continue
+                fresh_tasks.append(task)
+            # Apply the public limit after stale semantic/lexical candidates
+            # have been removed, so an old vector cannot crowd out a valid
+            # lexical sibling from the union.
+            ordered_tasks = fresh_tasks[:bounded_limit]
+        last_scope = await refresh_projects()
+        if not last_scope:
+            return []
+        if set(last_scope) != set(participating_project_ids):
+            raise TaskManagementError(
+                "Taskの権限範囲が検索中に変化しました",
+                status_code=503,
+                detail={"code": "task_scope_changed"},
+            )
+
+        return [
+            {
+                "id": str(task.id),
+                "title": task.title,
+                "status": task.status,
+                "project_id": str(task.project_id),
+                "parent_task_id": (
+                    str(task.parent_task_id) if task.parent_task_id else None
+                ),
+                "updated_at": (
+                    task.updated_at.isoformat() if task.updated_at else None
+                ),
+                "snippet": self._task_candidate_snippet(task.description),
+            }
+            for task in ordered_tasks
+        ]
 
     async def delete_task(
         self,
@@ -1058,6 +1257,7 @@ class TaskCrudMixin:
                 deleted_at=deleted_at,
                 deletion_batch_id=deletion_batch_id,
                 updated_at=deleted_at,
+                ended_at=func.coalesce(TimeEntry.ended_at, timer_now_db()),
             )
         )
 
@@ -1179,6 +1379,30 @@ class TaskCrudMixin:
             raise TaskManagementError(
                 "Deletion batch does not match task", status_code=409
             )
+
+        # Old versions tombstoned active entries without ending them. Restore
+        # these as stopped at their recorded deletion instant, never as a new
+        # active timer. The mutation clock is UTC; timer columns are local.
+        unfinished_result = await session.execute(
+            select(TimeEntry).where(
+                TimeEntry.task_id.in_(task_ids),
+                TimeEntry.deletion_batch_id == batch_id,
+                TimeEntry.deleted_at == deleted_at,
+                TimeEntry.ended_at.is_(None),
+            ).with_for_update()
+        )
+        unfinished_entries = list(unfinished_result.scalars().all())
+        stopped_at = timer_db_datetime(deleted_at.replace(tzinfo=timezone.utc))
+        for entry in unfinished_entries:
+            if stopped_at < entry.started_at:
+                raise TaskManagementError(
+                    "Deleted timer ends before its start; correct its timestamps before restoring",
+                    status_code=409,
+                    detail={"code": "time_entry_restore_invalid_interval"},
+                )
+        for entry in unfinished_entries:
+            entry.ended_at = stopped_at
+        await session.flush()
 
         restored_at = current_time
         await session.execute(
@@ -2097,10 +2321,22 @@ class TaskCrudMixin:
                 task=task,
                 user_id=user_id,
             )
+        # ``Task.updated_at`` is the lower-bound marker used by task sync.  A
+        # relationship/child-row mutation does not invoke SQLAlchemy's
+        # ``onupdate`` hook on the parent Task, so explicitly advance the
+        # aggregate marker for every real update request.  Repeated close
+        # requests remain idempotent and must not manufacture a new delta.
+        if updates and not is_idempotent_close_replay:
+            task.updated_at = datetime.utcnow()
         if commit:
             _assert_generation_mutation_allowed()
             await session.commit()
-        task = await self._load_task(session, task.id)
+        else:
+            # DatabaseManager sessions disable autoflush.  Flush the outer
+            # transaction before the response refresh so commit=False callers
+            # still receive pending relationship rows and the new sync marker.
+            await session.flush()
+        task = await self._load_task(session, task.id, populate_existing=True)
         payload = task.to_dict()
         if commit:
             await self._broadcast("task_updated", payload)

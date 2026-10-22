@@ -90,6 +90,7 @@ def compute_scope_fingerprint(scope: Any) -> str:
         "workspace_access_level": str(
             getattr(scope, "workspace_access_level", "write") or "write"
         ),
+        "backend_kind": str(getattr(scope, "backend_kind", "wsl_bwrap") or "wsl_bwrap"),
         "read_roots": _paths("read_roots"),
         "write_roots": _paths("write_roots"),
         "delete_roots": _paths("delete_roots"),
@@ -171,7 +172,14 @@ class BackgroundJob:
     """バックグラウンド実行中の 1 ジョブ"""
 
     _OWNER_FIELDS: ClassVar[frozenset[str]] = frozenset(
-        {"owner_run_id", "repository_identity", "scope_fingerprint"}
+        {
+            "owner_run_id",
+            "repository_identity",
+            "scope_fingerprint",
+            "backend_kind",
+            "filesystem_isolation",
+            "timeout_seconds",
+        }
     )
 
     job_id: str
@@ -191,6 +199,10 @@ class BackgroundJob:
     owner_run_id: Optional[str] = None
     repository_identity: Optional[str] = None
     scope_fingerprint: Optional[str] = None
+    backend_kind: Optional[str] = None
+    filesystem_isolation: Optional[bool] = None
+    timeout_seconds: Optional[float] = None
+    timed_out: bool = False
     # A staged WSL backend may reject the post-process diff even when the
     # shell itself exits successfully.  Keep that durable outcome attached to
     # the job so callers can observe fail-closed publication semantics.
@@ -207,14 +219,33 @@ class BackgroundJob:
         if owner_run_id is None:
             repository_identity = None
             scope_fingerprint = None
+            backend_kind = None
+            filesystem_isolation = None
         elif not repository_identity or not scope_fingerprint:
             raise ValueError(
                 "scoped background jobs require owner_run_id, repository_identity, "
                 "and scope_fingerprint"
             )
+        else:
+            backend_kind = str(self.backend_kind or "wsl_bwrap")
+            if backend_kind not in {"wsl_bwrap", "native_windows"}:
+                raise ValueError("scoped background jobs require a trusted backend_kind")
+            expected_isolation = backend_kind == "wsl_bwrap"
+            if (
+                self.filesystem_isolation is not None
+                and bool(self.filesystem_isolation) != expected_isolation
+            ):
+                raise ValueError("filesystem_isolation must match the selected backend")
+            filesystem_isolation = expected_isolation
+        timeout_seconds = self.timeout_seconds
+        if timeout_seconds is not None and float(timeout_seconds) <= 0:
+            raise ValueError("background timeout_seconds must be positive")
         object.__setattr__(self, "owner_run_id", owner_run_id)
         object.__setattr__(self, "repository_identity", repository_identity)
         object.__setattr__(self, "scope_fingerprint", scope_fingerprint)
+        object.__setattr__(self, "backend_kind", backend_kind)
+        object.__setattr__(self, "filesystem_isolation", filesystem_isolation)
+        object.__setattr__(self, "timeout_seconds", float(timeout_seconds) if timeout_seconds is not None else None)
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Keep owner identity immutable while allowing lifecycle updates."""
@@ -238,6 +269,10 @@ class BackgroundJob:
             "owner_run_id": self.owner_run_id,
             "repository_identity": self.repository_identity,
             "scope_fingerprint": self.scope_fingerprint,
+            "backend_kind": self.backend_kind,
+            "filesystem_isolation": self.filesystem_isolation,
+            "timeout_seconds": self.timeout_seconds,
+            "timed_out": self.timed_out,
             "finalization_error": self.finalization_error,
             "finalization_published": self.finalization_published,
         }
@@ -351,6 +386,14 @@ class BackgroundJobRegistry:
         """プロセスの終了状態をジョブへ反映する"""
         if job.status != "running":
             return
+        if (
+            job.timeout_seconds is not None
+            and (datetime.now() - job.started_at).total_seconds() >= job.timeout_seconds
+            and job.process.poll() is None
+        ):
+            job.timed_out = True
+            self._stop_job(job, refresh=False)
+            return
         code = job.process.poll()
         if code is not None:
             job.exit_code = code
@@ -431,70 +474,88 @@ class BackgroundJobRegistry:
         """
         try:
             from ...security.agent_run_scope import RunScopeViolation, get_current_run_scope
+            from ...security.harness_execution_scope import resolve_command_backend_kind
         except ImportError:  # pragma: no cover - defensive for stripped builds
             RunScopeViolation = None  # type: ignore[assignment]
             get_current_run_scope = lambda: None  # type: ignore[assignment]
+            resolve_command_backend_kind = lambda **_kwargs: None  # type: ignore[assignment]
 
         scope = get_current_run_scope()
+        upper = None
+        try:
+            from ...security.harness_execution_scope import get_current_harness_execution_scope
+
+            upper = get_current_harness_execution_scope()
+        except ImportError:  # pragma: no cover - defensive stripped builds
+            pass
         scoped_buffer_bytes = self.buffer_bytes
         scoped_owner_metadata: tuple[str, str, str] | None = None
+        backend_kind = None
+        timeout_seconds = None
         if scope is not None:
             # Validate and capture the complete owner tuple before spawning.
             # In particular, an empty/malformed run_id must fail closed rather
             # than being normalised into the legacy ``owner_run_id=None`` path.
             scoped_owner_metadata = self._scope_metadata(scope)
             try:
-                from ...security.harness_execution_scope import (
-                    get_current_harness_execution_scope,
+                backend_kind = resolve_command_backend_kind(
+                    run_scope=scope,
+                    harness_scope=upper,
                 )
-
-                upper = get_current_harness_execution_scope()
                 limits = getattr(upper, "resource_limits", None)
                 scoped_buffer_bytes = min(
                     self.buffer_bytes,
                     max(1, int(getattr(limits, "max_output_bytes", self.buffer_bytes))),
                 )
+                raw_timeout = getattr(limits, "max_background_seconds", None)
+                timeout_seconds = max(0.1, float(raw_timeout)) if raw_timeout is not None else None
             except (ImportError, TypeError, ValueError):
-                # A lower scope without a valid upper capability is rejected
-                # by the backend.  Keep the legacy finite cap until then.
-                scoped_buffer_bytes = self.buffer_bytes
+                raise BackgroundJobError("scoped command backend selection failed") from None
         scoped_backend = None
         if scope is not None:
             try:
                 cwd = str(scope.assert_command_cwd_allowed(cwd))
             except RunScopeViolation as exc:
                 raise BackgroundJobError(str(exc)) from exc
-            try:
-                from ...security.wsl_bwrap_backend import (
-                    WslBwrapError,
-                    get_wsl_bwrap_backend,
+            if backend_kind == "native_windows":
+                if os.name != "nt":
+                    raise BackgroundJobError("native_windows background execution requires Windows")
+                try:
+                    shell_name = resolve_shell_name(shell)
+                    argv = build_shell_command(command, shell)
+                except ValueError as exc:
+                    raise BackgroundJobError(str(exc)) from exc
+            elif backend_kind == "wsl_bwrap":
+                try:
+                    from ...security.wsl_bwrap_backend import (
+                        WslBwrapError,
+                        get_wsl_bwrap_backend,
+                    )
+                except ImportError as exc:  # pragma: no cover - stripped builds
+                    raise BackgroundJobError(
+                        f"file-scoped WSL2/bubblewrap backend is unavailable: {exc}"
+                    ) from exc
+                backend = get_wsl_bwrap_backend()
+                try:
+                    if not getattr(backend, "file_scoped", False):
+                        raise BackgroundJobError(
+                            "configured backend is not file-scoped"
+                        )
+                    if not backend.is_available():
+                        raise BackgroundJobError(
+                            "file-scoped WSL2/bubblewrap backend is unavailable; "
+                            "run-scoped background shell execution was denied"
+                        )
+                except WslBwrapError as exc:
+                    raise BackgroundJobError(str(exc)) from exc
+                scoped_backend = (scope, backend)
+                shell_name = (
+                    "bash" if shell is None or str(shell).strip().lower() == "auto"
+                    else str(shell).strip().lower()
                 )
-            except ImportError as exc:  # pragma: no cover - stripped builds
-                raise BackgroundJobError(
-                    f"file-scoped WSL2/bubblewrap backend is unavailable: {exc}"
-                ) from exc
-            backend = get_wsl_bwrap_backend()
-            try:
-                if not getattr(backend, "file_scoped", False):
-                    raise BackgroundJobError(
-                        "configured command backend is not file-scoped"
-                    )
-                if not backend.is_available():
-                    raise BackgroundJobError(
-                        "file-scoped WSL2/bubblewrap backend is unavailable; "
-                        "run-scoped background shell execution was denied"
-                    )
-            except WslBwrapError as exc:
-                raise BackgroundJobError(str(exc)) from exc
-            scoped_backend = (scope, backend)
-            # ``WslBwrapBackend`` always launches POSIX ``/bin/sh``.  Keep a
-            # stable label in summaries without resolving a host shell that
-            # is intentionally unavailable inside the namespace.
-            shell_name = (
-                "bash" if shell is None or str(shell).strip().lower() == "auto"
-                else str(shell).strip().lower()
-            )
-            argv = None
+                argv = None
+            else:
+                raise BackgroundJobError("run-scoped background command backend is unavailable")
         else:
             try:
                 shell_name = resolve_shell_name(shell)
@@ -518,6 +579,8 @@ class BackgroundJobRegistry:
 
         # 停止時にプロセスツリーごと確実に殺せるよう、独立したグループで起動する
         popen_kwargs: Dict[str, Any] = build_process_group_kwargs()
+        if backend_kind == "native_windows" and os.name == "nt":
+            popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         try:
             if scoped_backend is not None:
@@ -566,8 +629,11 @@ class BackgroundJobRegistry:
                     "owner_run_id": scoped_owner_metadata[0],
                     "repository_identity": scoped_owner_metadata[1],
                     "scope_fingerprint": scoped_owner_metadata[2],
+                    "backend_kind": backend_kind,
+                    "filesystem_isolation": backend_kind == "wsl_bwrap",
+                    "timeout_seconds": timeout_seconds,
                 }
-                if scoped_backend is not None and scoped_owner_metadata is not None
+                if scope is not None and scoped_owner_metadata is not None
                 else {}
             ),
         )
@@ -608,6 +674,8 @@ class BackgroundJobRegistry:
         header = [f"Status: {job.status}"]
         if job.exit_code is not None:
             header.append(f"Exit code: {job.exit_code}")
+        if job.timed_out:
+            header.append("Timed out: true")
         if stdout_trimmed.truncated or stderr_trimmed.truncated:
             header.append(
                 "Total output lines: "
@@ -625,6 +693,7 @@ class BackgroundJobRegistry:
             "command": job.command,
             "status": job.status,
             "exit_code": job.exit_code,
+            "timed_out": job.timed_out,
             "output": "\n".join(header) + "\n" + body,
             "stdout": stdout_trimmed.text,
             "stderr": stderr_trimmed.text,
@@ -634,6 +703,8 @@ class BackgroundJobRegistry:
             "started_at": job.started_at.isoformat(),
             "finalization_error": job.finalization_error,
             "finalization_published": job.finalization_published,
+            "backend_kind": job.backend_kind,
+            "filesystem_isolation": job.filesystem_isolation,
         }
 
     def write_stdin(
@@ -661,16 +732,18 @@ class BackgroundJobRegistry:
 
         return {"job_id": job.job_id, "written_chars": len(payload)}
 
-    def _stop_job(self, job: BackgroundJob) -> Dict[str, Any]:
+    def _stop_job(self, job: BackgroundJob, *, refresh: bool = True) -> Dict[str, Any]:
         """Stop one job without doing an ownership lookup."""
 
-        self._refresh(job)
+        if refresh:
+            self._refresh(job)
         if job.status != "running":
             return {
                 "job_id": job.job_id,
                 "status": job.status,
                 "exit_code": job.exit_code,
                 "message": "ジョブは既に終了しています。",
+                "timed_out": job.timed_out,
             }
 
         termination_error: Exception | None = None
@@ -755,6 +828,7 @@ class BackgroundJobRegistry:
             "message": "ジョブを停止しました。",
             "finalization_error": job.finalization_error,
             "finalization_published": job.finalization_published,
+            "timed_out": job.timed_out,
         }
 
     def stop(
@@ -930,6 +1004,8 @@ class BackgroundJobRegistry:
                     "owner_run_id": job.owner_run_id,
                     "repository_identity": job.repository_identity,
                     "scope_fingerprint": job.scope_fingerprint,
+                    "backend_kind": job.backend_kind,
+                    "filesystem_isolation": job.filesystem_isolation,
                 }
             )
             results.append(result)

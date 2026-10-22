@@ -1,5 +1,7 @@
 "use client";
 
+import { useConfirm } from "@/hooks/use-confirm";
+
 /* eslint-disable @next/next/no-img-element */
 
 import { useRef, useEffect, useState, useCallback } from "react";
@@ -69,6 +71,11 @@ interface DocumentEditorProps {
   linkDisplayModes?: LinkDisplayModeMap | null;
   /** Called when a user toggles a link preview's display mode. */
   onLinkDisplayModeChange?: LinkDisplayModeChangeHandler;
+  /**
+   * Reports unsaved/failed-save state so a host (Files Esc×2) can avoid
+   * discarding edits.  Called with a clean state on unmount.
+   */
+  onEditStateChange?: (state: { dirty: boolean; saveFailed: boolean }) => void;
 }
 
 const documentEditorTheme = EditorView.theme({
@@ -236,15 +243,31 @@ export function DocumentEditor({
   readOnly = false,
   linkDisplayModes,
   onLinkDisplayModeChange,
+  onEditStateChange,
 }: DocumentEditorProps) {
   const { editorLinkDefaultDisplayMode } = useUserSettings();
   const { resolvedTheme } = useTheme();
   const editorRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const linkEmbedCompartmentRef = useRef(new Compartment());
   const themeCompartmentRef = useRef(new Compartment());
   const [isDirty, setIsDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const onEditStateChangeRef = useRef(onEditStateChange);
+  useEffect(() => {
+    onEditStateChangeRef.current = onEditStateChange;
+  }, [onEditStateChange]);
+  useEffect(() => {
+    onEditStateChangeRef.current?.({ dirty: isDirty, saveFailed });
+  }, [isDirty, saveFailed]);
+  useEffect(
+    () => () => {
+      onEditStateChangeRef.current?.({ dirty: false, saveFailed: false });
+    },
+    [],
+  );
   const [cursorInfo, setCursorInfo] = useState({ line: 1, col: 1 });
   const [previewMode, setPreviewMode] = useState(false);
   const [previewContent, setPreviewContent] = useState(initialContent);
@@ -253,6 +276,7 @@ export function DocumentEditor({
   const fileIdentityRef = useRef(0);
   const extensionRef = useRef(extension);
   const readOnlyRef = useRef(readOnly);
+  const confirmOverwrite = useConfirm();
   const markdownImagePreviewEnabledRef = useRef(
     isMarkdownImageExtension(extension),
   );
@@ -301,7 +325,7 @@ export function DocumentEditor({
 
       let batchResult: ExplorerUploadBatchResult;
       try {
-        batchResult = await explorerUpload(directory, imageFiles);
+        batchResult = await explorerUpload(directory, imageFiles, { confirmOverwrite });
       } catch (error) {
         // explorerUpload rejects only after all files have been attempted.  A
         // batch may still contain successful uploads, which must remain
@@ -360,8 +384,55 @@ export function DocumentEditor({
 
       return references.length > 0 ? references.join("\n") : null;
     },
+    [confirmOverwrite],
+  );
+
+  // Disabling the Save button or hiding the editor drops focus to <body>,
+  // where the Files double-Escape boundary no longer sees the key.  Hand the
+  // focus back to the editor (or this pane while the preview hides it).
+  const restoreFocusFrameRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (restoreFocusFrameRef.current !== null) {
+        window.cancelAnimationFrame(restoreFocusFrameRef.current);
+        restoreFocusFrameRef.current = null;
+      }
+    },
     [],
   );
+  const restoreFocusIfLost = useCallback(() => {
+    if (restoreFocusFrameRef.current !== null) {
+      window.cancelAnimationFrame(restoreFocusFrameRef.current);
+    }
+    restoreFocusFrameRef.current = window.requestAnimationFrame(() => {
+      restoreFocusFrameRef.current = null;
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
+      const view = viewRef.current;
+      if (view && !editorRef.current?.hidden) {
+        view.focus();
+        return;
+      }
+      rootRef.current?.focus({ preventScroll: true });
+    });
+  }, []);
+
+  const previousPreviewModeRef = useRef(previewMode);
+  useEffect(() => {
+    if (previousPreviewModeRef.current === previewMode) return;
+    previousPreviewModeRef.current = previewMode;
+    // Chromium moves focus out of a node hidden by `hidden` only at its next
+    // style update (after any rAF check), so hand the focus over before that.
+    if (
+      previewMode &&
+      isMarkdown &&
+      editorRef.current?.contains(document.activeElement)
+    ) {
+      rootRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    restoreFocusIfLost();
+  }, [isMarkdown, previewMode, restoreFocusIfLost]);
 
   // Toggle markdown preview with Ctrl+Shift+V
   const togglePreview = useCallback(() => {
@@ -377,6 +448,8 @@ export function DocumentEditor({
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target instanceof Element ? e.target : document.activeElement;
+      if (target?.closest("[data-daily-capture]")) return;
       if (e.ctrlKey && e.shiftKey && e.key === "V") {
         e.preventDefault();
         togglePreview();
@@ -396,20 +469,24 @@ export function DocumentEditor({
       } else {
         const result = await explorerSave(filePathRef.current, content);
         if (!result.success) {
+          setSaveFailed(true);
           toast.error(result.message || "ファイルの保存に失敗しました");
           return;
         }
       }
       setIsDirty(false);
+      setSaveFailed(false);
       contentRef.current = content;
     } catch (error) {
+      setSaveFailed(true);
       toast.error(
         error instanceof Error ? error.message : "ファイルの保存に失敗しました",
       );
     } finally {
       setSaving(false);
+      restoreFocusIfLost();
     }
-  }, [onSave]);
+  }, [onSave, restoreFocusIfLost]);
 
   const handleAskAI = useCallback(() => {
     if (!viewRef.current || !onAskAI) return;
@@ -552,6 +629,7 @@ export function DocumentEditor({
       });
       contentRef.current = initialContent;
       setIsDirty(false);
+      setSaveFailed(false);
       setPreviewContent(initialContent);
     }
   }, [initialContent]);
@@ -575,7 +653,12 @@ export function DocumentEditor({
                   : extension.replace(".", "").toUpperCase() || "Text";
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+    <div
+      ref={rootRef}
+      tabIndex={-1}
+      data-document-editor=""
+      className="flex h-full min-h-0 flex-col bg-background text-foreground outline-none"
+    >
       {/* Toolbar */}
       <div className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
         <div className="flex min-w-0 items-center gap-2 text-[13px]">
@@ -658,7 +741,12 @@ export function DocumentEditor({
       </div>
 
       {/* Editor / Preview */}
-      {previewMode && isMarkdown ? (
+      <div
+        ref={editorRef}
+        hidden={previewMode && isMarkdown}
+        className="min-h-0 flex-1 overflow-hidden bg-background"
+      />
+      {previewMode && isMarkdown && (
         <div className="min-h-0 flex-1 overflow-auto bg-background p-6">
           <div className="max-w-none text-sm leading-relaxed">
             <ReactMarkdown
@@ -780,8 +868,6 @@ export function DocumentEditor({
             </ReactMarkdown>
           </div>
         </div>
-      ) : (
-        <div ref={editorRef} className="min-h-0 flex-1 overflow-hidden bg-background" />
       )}
 
       {/* Status Bar */}

@@ -14,7 +14,12 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
-from .base import CLIBackendBase, CLIEventCallback, CLISessionCapabilities
+from .base import (
+    CLIBackendBase,
+    CLIEventCallback,
+    CLIInvocationOptions,
+    CLISessionCapabilities,
+)
 from ..turn_stream_events import emit_assistant_text
 
 _AUTH_MARKERS = (
@@ -43,10 +48,6 @@ _FINAL_TYPES = {
     "assistant_response",
     "assistant",
     "completion",
-    "completed",
-    "message",
-    "text",
-    "content",
 }
 
 
@@ -79,6 +80,8 @@ class GrokCLIBackend(CLIBackendBase):
     """Grok Build CLI backend for AoiTalk's normal CLI client."""
 
     scoped_execution_delegate = True
+    provider_state_env_name = "GROK_HOME"
+    provider_state_root_supported = True
 
     _native_sessions_available: Optional[bool] = None
 
@@ -133,6 +136,20 @@ class GrokCLIBackend(CLIBackendBase):
                             return str(value).strip()
         return super().extract_native_session_id(raw_output)
 
+    def validate_invocation_options(self, options: CLIInvocationOptions) -> None:
+        super().validate_invocation_options(options)
+        if options.effective_effort:
+            raise ValueError("Grok Build CLI does not support per-invocation effort")
+        if options.sandbox is not None:
+            raise ValueError("Grok Build CLI does not expose a per-invocation sandbox flag")
+        if options.effective_approval_policy not in {
+            "native_default",
+            "standard",
+        }:
+            raise ValueError(
+                f"Grok Build CLI does not support approval policy: {options.effective_approval_policy}"
+            )
+
     def execute_prompt(self, *args: Any, **kwargs: Any):
         self._reset_stream_state()
         return super().execute_prompt(*args, **kwargs)
@@ -150,10 +167,20 @@ class GrokCLIBackend(CLIBackendBase):
         )
         self._stream_round += 1
 
+    @staticmethod
+    def _extract_applied_launch_fields(
+        cmd: List[str],
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        approval, permission, sandbox = CLIBackendBase._extract_applied_launch_fields(cmd)
+        if "--always-approve" in cmd:
+            return "never", "auto", sandbox
+        return approval, permission, sandbox
+
     def get_cli_command(self, prompt: str) -> List[str]:
         bin_path = os.getenv("GROK_BIN", "grok")
         cmd = [
             bin_path,
+            "--always-approve",
             "--no-auto-update",
             "--output-format",
             "streaming-json",
@@ -164,9 +191,16 @@ class GrokCLIBackend(CLIBackendBase):
             cmd.extend(["--resume", session_id])
         elif action == "start" and session_id:
             cmd.extend(["--session-id", session_id])
-        model = self._model or os.getenv("GROK_MODEL")
+        options = self.get_invocation_options()
+        model = (
+            str(options.model or "").strip()
+            if options is not None
+            else self._model or os.getenv("GROK_MODEL")
+        )
         if model:
             cmd.extend(["--model", model])
+        # --always-approve is backend-owned; never pass a conflicting
+        # permission mode from an invocation or resumed session.
         if prompt:
             cmd.extend(["-p", prompt])
         return cmd
@@ -320,6 +354,36 @@ class GrokCLIBackend(CLIBackendBase):
             return f"Grok Build CLI の実行に失敗しました: {message[:2000]}"
         return None
 
+    def validate_success_output(self, raw_output: str, stderr: str) -> Optional[str]:
+        """Treat structured streaming error/result-failed events as failures."""
+
+        if self.get_invocation_options() is None:
+            return None
+        events = list(self._events(str(raw_output or "")))
+        for event in events:
+            payload = _event_payload(event)
+            event_type = self._event_type(event, payload).lower()
+            status_value = event.get("status") or payload.get("status")
+            result_payload = payload.get("result")
+            if isinstance(result_payload, dict):
+                status_value = status_value or result_payload.get("status")
+            status = str(status_value or "").lower()
+            if event_type in {"error", "failed", "failure", "turn_failed", "result_failed"} or status in {
+                "error",
+                "failed",
+                "failure",
+                "canceled",
+                "cancelled",
+            }:
+                self._set_cli_diagnostic(
+                    status="failed",
+                    state="failed",
+                    error_code="grok_stream_error",
+                )
+                detail = self._event_text(event, payload) or "Grok Build CLI reported a failed result"
+                return f"Grok Build CLI reported a failed result: {detail[:1000]}"
+        return None
+
     @classmethod
     def _parse_event(cls, line: str) -> Optional[dict[str, Any]]:
         try:
@@ -353,7 +417,16 @@ class GrokCLIBackend(CLIBackendBase):
     @staticmethod
     def _event_text(event: dict[str, Any], payload: dict[str, Any]) -> str:
         for source in (event, payload):
-            for key in ("text", "delta", "content", "output", "message", "result", "error"):
+            for key in (
+                "text",
+                "delta",
+                "content",
+                "output",
+                "message",
+                "response",
+                "result",
+                "error",
+            ):
                 text = _text_value(source.get(key))
                 if text:
                     return text
@@ -368,6 +441,7 @@ class GrokCLIBackend(CLIBackendBase):
         if any(key in event or key in payload for key in ("delta", "chunk")):
             return True
         return event_type.endswith("_chunk") or event_type in {
+            "text",
             "content_block_delta",
             "agent_message_chunk",
             "text_delta",

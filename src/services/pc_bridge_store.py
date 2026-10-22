@@ -34,7 +34,57 @@ def token_parts(token: str) -> tuple[str, str, str]:
         raise PcBridgeError('bridge_invalid_token') from None
 
 
+async def browser_profile_catalog(session, user_id: str) -> list[dict[str, str]]:
+    """Local setup candidates only; the ordinary preview revalidates every pin.
+
+    Reuse the same human/Project ACL, current Persona/account revision and
+    provider-binding exclusions as manual Bridge connection, without secrets.
+    """
+    from sqlalchemy import select
+    from ..memory.models import User, PlatformAccount, PlatformAccountRevision, Project
+    from .operations_service import OperationsService, OperationsError
+    from .media_bridge_connection import MediaBridgeConnectionService
+    owner = UUID(user_id)
+    user = await session.get(User, owner)
+    if user is None or not user.is_active:
+        raise PcBridgeError('bridge_owner_unavailable')
+    actor = {'id': owner, 'role': user.role, 'actor_type': 'human'}
+    operations = OperationsService()
+    connection = MediaBridgeConnectionService(operations)
+    accounts = (await session.scalars(select(PlatformAccount).where(
+        PlatformAccount.owner_user_id == owner, PlatformAccount.platform.in_(['x', 'youtube']),
+        PlatformAccount.account_type == 'profile').order_by(PlatformAccount.id).limit(256))).all()
+    result = []
+    def label(value):
+        return ''.join(char for char in str(value or '') if ord(char) >= 32)[:200]
+    for account in accounts:
+        revision = await session.scalar(select(PlatformAccountRevision).where(
+            PlatformAccountRevision.platform_account_id == account.id).order_by(PlatformAccountRevision.version.desc()).limit(1))
+        if revision is None or account.persona_id is None:
+            continue
+        expected = {'owner_user_id': user_id, 'project_id': str(account.project_id) if account.project_id else None,
+            'persona_id': str(account.persona_id), 'expected_account_revision_id': str(revision.id),
+            'expected_account_revision_hash': revision.content_hash}
+        try:
+            _, _, _, _, snapshot = await connection._target(session, actor, account.id, expected)
+        except OperationsError:
+            continue
+        project = await session.get(Project, account.project_id) if account.project_id else None
+        result.append({'platform_account_id': str(account.id), 'service': account.platform,
+            'display_name': label(revision.display_name), 'persona_name': label(snapshot['persona_display_name']),
+            'project_name': label(project.name) if project else 'Personal'})
+    return result
+
+
 class PcBridgeStore:
+    async def browser_profiles(self, user_id: str) -> list[dict[str, str]]:
+        from ..memory.database import get_database_manager
+        session = await get_database_manager().get_session()
+        try:
+            return await browser_profile_catalog(session, user_id)
+        finally:
+            await session.close()
+
     async def read(self, user_id: str) -> dict[str, Any]:
         from sqlalchemy import select
         from ..memory.database import get_database_manager
@@ -75,7 +125,11 @@ class PcBridgeStore:
         finally:
             await session.close()
 
-    async def register(self, user_id: str, name: str) -> dict[str, Any]:
+    async def register(self, user_id: str, name: str, machine_id: str | None = None) -> dict[str, Any]:
+        if machine_id is not None:
+            from pc_bridge.action_protocol import MACHINE_PATTERN
+            if not isinstance(machine_id, str) or not MACHINE_PATTERN.fullmatch(machine_id):
+                raise PcBridgeError('bridge_machine_id_invalid')
         device = str(uuid4())
         secret = secrets.token_urlsafe(32)
         def change(value):
@@ -85,8 +139,27 @@ class PcBridgeStore:
                 'token_hash': hashlib.sha256(secret.encode()).hexdigest(),
                 'created_at': datetime.now(timezone.utc).isoformat(),
             }
+            if machine_id is not None:
+                devices[device]['machine_id'] = machine_id
         await self.update(user_id, change)
-        return {'id': device, 'name': name, 'token': f'{user_id}.{device}.{secret}'}
+        result = {'id': device, 'name': name, 'token': f'{user_id}.{device}.{secret}'}
+        if machine_id is not None:
+            result['machine_id'] = machine_id
+        return result
+
+    async def set_machine_id(self, user_id: str, device_id: str, machine_id: str):
+        from pc_bridge.action_protocol import MACHINE_PATTERN
+        if not isinstance(machine_id, str) or not MACHINE_PATTERN.fullmatch(machine_id):
+            raise PcBridgeError('bridge_machine_id_invalid')
+        def change(value):
+            device = value.get('devices', {}).get(device_id)
+            if device is None:
+                raise PcBridgeError('bridge_device_not_found')
+            current = device.get('machine_id')
+            if current is not None and current != machine_id:
+                raise PcBridgeError('bridge_machine_id_mismatch')
+            device['machine_id'] = machine_id
+        await self.update(user_id, change)
 
     async def authenticate(self, token: str) -> tuple[str, dict[str, Any]]:
         owner, device, secret = token_parts(token)

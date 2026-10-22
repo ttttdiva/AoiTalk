@@ -1,0 +1,98 @@
+{
+  "schema": 1,
+  "product": "AoiTalk-PC-Bridge",
+  "required_files": [
+    {
+      "path": "application/LICENSE.txt",
+      "sha256": "302635c64ff7a5bf5ab44db693fd6dbe9dab4df7315a9511b81347df444e46df"
+    },
+    {
+      "path": "helper/NOTICE-bridge-modifications.txt",
+      "sha256": "342e3ff77eec4b87d0972e4729b278101da3e9f16d4b2174d31909c86c97b015"
+    },
+    {
+      "path": "helper/licenses/RUST-DEPENDENCIES-NOTICES.txt",
+      "sha256": "ef228f39562540bc5ba40dfb99074f0c03d640ae2b4694a7c0a14b9fab52e18a"
+    },
+    {
+      "path": "helper/licenses/supplemental/rand-0.8.5-COPYRIGHT.txt",
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+    },
+    {
+      "path": "helper/licenses/supplemental/rand_chacha-0.3.1-COPYRIGHT.txt",
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+    },
+    {
+      "path": "helper/licenses/supplemental/rand_core-0.6.4-COPYRIGHT.txt",
+      "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5"
+    },
+    {
+      "path": "helper/licenses/supplemental/rav1e-0.8.1-PATENTS.txt",
+      "sha256": "7b14a70c194b19dbd0625e7eac839a63200f67484521ce5e8d8244b127e8907a"
+    },
+    {
+      "path": "helper/licenses/supplemental/tiff-0.10.3-tests-COPYRIGHT.txt",
+      "sha256": "c341a79df284be8a0321dabda4aa1aeea053b55b4e0db827940c221fcaf29b7b"
+    },
+    {
+      "path": "helper/licenses/supplemental/utf8_iter-1.0.4-COPYRIGHT.txt",
+      "sha256": "c30152c94a6d75e021adbc52b3a52470366a46edb917e17deae3259251af244c"
+    },
+    {
+      "path": "official-originals/microsoft-vcredist-14.51.36247.0/Visual-C-V14-License-Redistributable_and_Runtime_ENU.docx",
+      "sha256": "08651651a7602fc7c0e2763de0fde1ff9f868df2780597cd1775ee9d6441c783"
+    },
+    {
+      "path": "official-originals/microsoft-vcredist-14.51.36247.0/Visual-C-V14-License-Redistributable_and_Runtime_ENU.txt",
+      "sha256": "a70fd83440606365b11c7cfd25200acc7283421b4969ee165fc7e5d5ba089b7f"
+    }
+  ],
+  "zune_packages": [
+    "zune-core@0.4.12",
+    "zune-core@0.5.1",
+    "zune-inflate@0.2.54",
+    "zune-jpeg@0.4.21",
+    "zune-jpeg@0.5.12"
+  ],
+  "zune_available_choices": {
+    "zune-core@0.4.12": [
+      "Zlib"
+    ],
+    "zune-core@0.5.1": [
+      "Zlib"
+    ],
+    "zune-inflate@0.2.54": [
+      "Zlib"
+    ],
+    "zune-jpeg@0.4.21": [
+      "Zlib"
+    ],
+    "zune-jpeg@0.5.12": [
+      "Zlib"
+    ]
+  },
+  "zune_proposal": {
+    "status": "proposed_to_parent_not_release_approval",
+    "recommended_choice": "Zlib",
+    "feature_changes": false,
+    "detail": "All five pinned crates declare MIT OR Apache-2.0 OR Zlib. Complete pinned Zlib texts supplied for old archives missing original files; all existing alternatives retained in aggregate."
+  },
+  "microsoft_dlls": [
+    "mfc140u.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll"
+  ],
+  "microsoft_runtime_version": "14.51.36247.0",
+  "microsoft_license_sources": [
+    "https://learn.microsoft.com/en-us/visualstudio/releases/2026/redistribution",
+    "https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files?view=msvc-170"
+  ],
+  "microsoft_authorization": "not_confirmed; installed toolchain and official unchanged DLL hashes are not acceptance or redistribution-license proof",
+  "combined_conditions": {
+    "ring0.17.14": "Apache-2.0 AND ISC plus BoringSSL/once_cell nested notices retained",
+    "unicode-ident1.0.22": "(MIT OR Apache-2.0) AND Unicode-3.0 retained; host/proc-macro inventory conservatively included",
+    "webpki-roots0.26.11/1.0.5": "CDLA-Permissive-2.0 text provided alongside root data",
+    "rav1e0.8.1": "BSD-2-Clause plus original AOM Patent License1.0 reproduced; availability and defensive-termination conditions remain owner review, not general patent clearance"
+  },
+  "distribution_state": "notice assembly and rights decisions are separate; no new terms accepted"
+}

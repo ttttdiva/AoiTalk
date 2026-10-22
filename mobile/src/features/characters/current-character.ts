@@ -1,4 +1,4 @@
-import type { ManagedCharacter } from "../../types/api";
+import type { ConversationAgent, ManagedCharacter } from "../../types/api";
 import { characterApi } from "../../lib/character-api";
 import {
   getCurrentCharacterSlug,
@@ -110,13 +110,23 @@ export async function getLocalCurrentCharacterSlug(): Promise<string> {
 
 export async function createCurrentCharacterSession(
   projectId?: string | null,
-  options?: { localFirst?: boolean },
+  options?: { localFirst?: boolean; userId?: string | null; agent?: ConversationAgent | null },
 ) {
   if (options?.localFirst) {
     const characterSlug = await getLocalCurrentCharacterSlug();
-    return conversationsRepo.createLocalSession(characterSlug, projectId);
+    return conversationsRepo.createLocalSession(
+      characterSlug,
+      projectId,
+      options.userId,
+      options.agent,
+    );
   }
 
   const characterSlug = await getResolvedCurrentCharacterSlug();
-  return conversationsRepo.createSession(characterSlug, projectId);
+  return conversationsRepo.createSession(
+    characterSlug,
+    projectId,
+    options?.userId,
+    options?.agent,
+  );
 }

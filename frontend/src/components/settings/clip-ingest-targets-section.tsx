@@ -14,6 +14,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   Select,
   SelectContent,
@@ -198,25 +199,31 @@ export function ClipIngestTargetsSection() {
   };
 
   return (
-    <Card>
-      <CardHeader
-        role="button"
-        tabIndex={0}
-        aria-expanded={sectionOpen}
-        onClick={() => setSectionOpen((v) => !v)}
-        onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSectionOpen((v) => !v); } }}
-        className="flex-row items-center justify-between gap-3 cursor-pointer"
-      >
-        <div className="flex min-w-0 items-start gap-2">
-          <ChevronRight className={cn("mt-1 size-4 shrink-0 text-muted-foreground transition-transform", sectionOpen && "rotate-90")} />
-          <div className="min-w-0">
-            <CardTitle className="flex items-center gap-2 text-base">クリップ取り込み先{!loading && targets.length ? <Badge variant="secondary">{targets.length}件</Badge> : null}</CardTitle>
-            <p className="mt-1 text-xs text-muted-foreground">クリップを自動分類して保存するDocsノードを設定します。</p>
-          </div>
+    <Card size="sm" className="py-0">
+      <CardHeader className="flex min-h-10 flex-row items-center justify-between gap-2 p-0 !px-0">
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={sectionOpen}
+          data-settings-target-activation="clip-ingest"
+          onClick={() => setSectionOpen((v) => !v)}
+          onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSectionOpen((v) => !v); } }}
+          className="flex min-h-10 min-w-0 flex-1 cursor-pointer items-center gap-2 px-3 py-2"
+        >
+          <ChevronRight className={cn("size-4 shrink-0 text-muted-foreground transition-transform", sectionOpen && "rotate-90")} />
+          <CardTitle className="flex items-center gap-2 text-sm leading-5">
+            クリップ取り込み先
+            {!loading && targets.length ? <Badge variant="secondary">{targets.length}件</Badge> : null}
+          </CardTitle>
         </div>
-        <Button variant="outline" size="sm" onClick={(event) => { event.stopPropagation(); setSectionOpen(true); setPickerOpen(true); }} disabled={loading}>
-          <Plus className="size-4" />追加
-        </Button>
+        <div className="flex h-10 shrink-0 items-center gap-2 pr-3">
+          <HelpPopover label="クリップ取り込み先">
+            クリップを自動分類して保存するDocsノードを設定します。
+          </HelpPopover>
+          <Button variant="outline" size="sm" className="h-7" onClick={(event) => { event.stopPropagation(); setSectionOpen(true); setPickerOpen(true); }} disabled={loading}>
+            <Plus className="size-3.5" />追加
+          </Button>
+        </div>
       </CardHeader>
       {sectionOpen ? (
       <CardContent className="space-y-3">
@@ -294,9 +301,13 @@ export function ClipIngestTargetsSection() {
             {isOpen ? (
               <div className="space-y-1.5 border-t bg-muted/10 px-3 py-2">
                 <div className="space-y-1.5">
-                  <Label htmlFor={`clip-hint-${target.node_id}`}>保存先判定用の説明</Label>
+                  <div className="inline-flex items-center gap-1">
+                    <Label htmlFor={`clip-hint-${target.node_id}`}>保存先判定用の説明</Label>
+                    <HelpPopover label="保存先判定用の説明">
+                      この説明は保存先の判定にだけ使用されます。保存される見出しやノード階層の生成規則は変更しません。
+                    </HelpPopover>
+                  </div>
                   <Textarea id={`clip-hint-${target.node_id}`} value={target.routing_hint} onChange={(event) => updateTarget(target.node_id, { routing_hint: event.target.value })} placeholder="この保存先に適した話題や情報を説明してください" rows={2} />
-                  <p className="text-xs text-muted-foreground">この説明は保存先の判定にだけ使用されます。保存される見出しやノード階層の生成規則は変更しません。</p>
                 </div>
               </div>
             ) : null}

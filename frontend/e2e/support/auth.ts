@@ -1,9 +1,17 @@
-import type { Page } from "@playwright/test";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { SignJWT } from "jose";
 import { createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import postgres from "postgres";
+import { SESSION_COOKIE_NAME } from "../../src/lib/session-cookie";
+import {
+  assertVerifiedStorageFingerprint,
+  assertVerificationStorageTarget,
+  resolveVerificationStorageTarget,
+  storageFingerprint,
+  type VerificationStorageTarget,
+} from "../../src/lib/verification-storage";
 
 const DEFAULT_E2E_USER_ID = "00000000-0000-4000-8000-000000000001";
 const E2E_USERNAME = "__playwright_e2e__";
@@ -29,12 +37,6 @@ const SECRET = new TextEncoder().encode(
 export const E2E_USER_ID = process.env.E2E_USER_ID || DEFAULT_E2E_USER_ID;
 
 const E2E_VERIFICATION_SOURCE = "frontend/e2e/support/auth.ts::ensureE2EUser";
-const EPHEMERAL_DATABASE_PREFIXES = [
-  "aoitalk_canonical_",
-  "aoitalk_e2e_",
-  "aoitalk_test_",
-  "aoitalk_gc_",
-];
 const POSTGRES_SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export type VerificationRun = {
@@ -114,50 +116,76 @@ export async function installVerificationRun(
 /**
  * Refuse opt-in specs that write entities without a disposable storage
  * boundary.  A signed run protects supported server-owned artifacts, but
- * Story/TRPG rows currently have no generic cleanup adapter; those specs must
- * therefore run only against the canonical runner's fresh database (or an
- * explicitly non-public schema).
+ * some legacy-ingested rows currently have no generic cleanup adapter; those
+ * specs must therefore run only against the canonical runner's fresh
+ * database (or an explicitly non-public schema).
  */
 export function assertVerificationStorageIsolated(
   options: {
     requireEphemeralDatabase?: boolean;
   } = {},
-): void {
-  const schema = process.env.POSTGRES_SCHEMA?.trim();
-  const schemaIsolated = Boolean(schema && schema.toLowerCase() !== "public");
-  if (schemaIsolated && !options.requireEphemeralDatabase) return;
-  const configured = process.env.DATABASE_URL || readEnvValue("DATABASE_URL");
-  const database = configured
-    ? (() => {
-        try {
-          const parsed = new URL(configured);
-          return decodeURIComponent(parsed.pathname.replace(/^\//, ""));
-        } catch {
-          return "";
-        }
-      })()
-    : process.env.POSTGRES_DB || readEnvValue("POSTGRES_DB") || "";
-  const normalized = String(database).trim().toLowerCase();
-  if (
-    (options.requireEphemeralDatabase && schemaIsolated) ||
-    !EPHEMERAL_DATABASE_PREFIXES.some((prefix) => normalized.startsWith(prefix))
-  ) {
+): VerificationStorageTarget {
+  const target = resolveVerificationStorageTarget({
+    DATABASE_URL: process.env.DATABASE_URL || readEnvValue("DATABASE_URL"),
+    POSTGRES_DB: process.env.POSTGRES_DB || readEnvValue("POSTGRES_DB"),
+    POSTGRES_SCHEMA:
+      process.env.POSTGRES_SCHEMA || readEnvValue("POSTGRES_SCHEMA"),
+  });
+  assertVerificationStorageTarget(target, options);
+  return target;
+}
+
+/**
+ * Verify the database actually used by both Next.js and FastAPI before a live
+ * spec can authenticate or create any fixture data.  The endpoint returns no
+ * database name, schema, or secret; it only returns ``verified`` after both
+ * server processes compare their read-only connection identity to this run's
+ * expected fingerprint.
+ */
+export async function assertLiveVerificationStorageIsolated(
+  request: APIRequestContext,
+  options: {
+    requireEphemeralDatabase?: boolean;
+  } = {},
+): Promise<void> {
+  const target = assertVerificationStorageIsolated(options);
+  const fingerprint = storageFingerprint(target);
+  const response = await request.get("/api/verification/storage", {
+    headers: {
+      "X-AoiTalk-Storage-Fingerprint": fingerprint,
+    },
+    failOnStatusCode: false,
+  });
+  if (!response.ok()) {
     throw new Error(
-      options.requireEphemeralDatabase
-        ? "verification spec requires an ephemeral PostgreSQL database (Story/TRPG rows have no generic cleanup); refusing normal or persistent-schema writes"
-        : "verification spec requires an ephemeral PostgreSQL database or non-public POSTGRES_SCHEMA; refusing normal runtime writes",
+      "live verification storage probe was unavailable or did not match the isolated target",
     );
   }
+  const body = await response.json().catch(() => null);
+  assertVerifiedStorageFingerprint(fingerprint, body);
 }
 
 export type VerificationCleanupOptions = {
   /**
    * Permit a run with no ledger selector only when an outer harness has
-   * guaranteed ephemeral storage (for example Story/TRPG rows that predate
-   * generic verification cleanup). Endpoint/HTTP failures remain fatal.
+   * guaranteed ephemeral storage (for example legacy-ingested rows that
+   * predate generic verification cleanup). Endpoint/HTTP failures remain
+   * fatal.
    */
   allowMissingSelector?: boolean;
 };
+
+export function assertVerificationCleanupCompleted(body: unknown): void {
+  const cleanupStatus =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as { status?: unknown }).status
+      : undefined;
+  if (cleanupStatus !== "completed" && cleanupStatus !== "idempotent") {
+    throw new Error(
+      "verification cleanup did not complete; refusing to leave a live run uncleaned",
+    );
+  }
+}
 
 /**
  * Delete one explicitly attributable verification run through the admin
@@ -266,6 +294,12 @@ export async function cleanupVerificationRun(
       `verification cleanup endpoint is unavailable (POST ${path}); refusing to leave a live run uncleaned`,
     );
   }
+  if (response.status() === 404) {
+    return { status: response.status(), body };
+  }
+  // HTTP 2xx/207 is not sufficient: a filesystem or post-commit failure
+  // means the run is still dirty and must fail the live verification.
+  assertVerificationCleanupCompleted(body);
   return { status: response.status(), body };
 }
 
@@ -414,7 +448,7 @@ export async function addAuthCookie(page: Page, userId = E2E_USER_ID) {
   const port = process.env.PLAYWRIGHT_PORT ?? "3002";
   await page.context().addCookies([
     {
-      name: "aoitalk_session",
+      name: SESSION_COOKIE_NAME,
       value: await createSessionToken(resolveTestUserId(userId)),
       url: `http://${host}:${port}`,
     },
@@ -424,7 +458,13 @@ export async function addAuthCookie(page: Page, userId = E2E_USER_ID) {
 export async function mockAuthenticatedApis(page: Page) {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
+    url.pathname = url.pathname.slice(url.pathname.indexOf("/api/"));
     const method = route.request().method();
+
+    if (url.pathname === "/api/python-proxy/operations/media/brand-portfolio") {
+      await route.fulfill({ json: { owner_user_id: E2E_USER_ID, status: "not_configured", brands: [], source: { sha256: "8f3cade315b6866743748e0ff8e2567759793685b89a2cf7b5e1300e0ca30edd" } } });
+      return;
+    }
 
     if (url.pathname === "/api/auth/status") {
       await route.fulfill({
@@ -628,7 +668,7 @@ export async function mockAuthenticatedApis(page: Page) {
     }
 
     if (url.pathname === "/api/python-proxy/settings") {
-      await route.fulfill({ json: {} });
+      await route.fulfill({ json: { settings: {} } });
       return;
     }
 
@@ -638,11 +678,6 @@ export async function mockAuthenticatedApis(page: Page) {
       await route.fulfill({
         json: { success: true, queued: false, session_id: "session-e2e" },
       });
-      return;
-    }
-
-    if (url.pathname.includes("/scenarios/logs/by-conversation/")) {
-      await route.fulfill({ json: null });
       return;
     }
 

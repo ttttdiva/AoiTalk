@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   BookOpen,
   Check,
@@ -345,7 +346,10 @@ function DailyIntakeSection({
       <div className="flex items-center justify-between border-b px-3 py-2">
         <div className="flex items-center gap-2 text-sm font-medium">
           <Sparkles className="size-4 text-primary" />
-          日次インテーク
+          <span className="inline-flex items-center gap-1">
+            日次インテーク
+            <HelpPopover label="日次インテーク">内容を整理するため、入力した作業記録から不明点を確認し、案件情報への反映案を作成します。</HelpPopover>
+          </span>
         </div>
         {phase !== "input" ? (
           <Badge variant="secondary">
@@ -955,9 +959,9 @@ export function ProjectInformationPanel({
             <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(32rem,1.1fr)]">
               <section className="mx-auto w-full max-w-4xl min-w-0 rounded-md border border-border bg-card" data-testid="project-qa-section">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
-                  <div>
+                  <div className="inline-flex items-center gap-1">
                     <div className="text-sm font-medium">Q&amp;A（承認済み）</div>
-                    <p className="mt-0.5 text-xs text-muted-foreground">Projectで再利用する質問と回答だけを表示しています。</p>
+                    <HelpPopover label="Q&A（承認済み）">Projectで再利用する質問と回答だけを表示しています。</HelpPopover>
                   </div>
                   <Badge variant="secondary">{acceptedEntries.length}</Badge>
                 </div>

@@ -60,6 +60,7 @@ from .routes.tasks import (
     register_occurrence_time_routes,
     register_space_routes,
     register_tag_reorder_routes,
+    register_task_proposal_routes,
     register_task_routes,
 )
 from .routes.tasks._shared import (  # noqa: F401  (既存 import 面を維持)
@@ -562,6 +563,7 @@ def create_task_router(
 
     register_space_routes(router, ctx)
     register_task_routes(router, ctx)
+    register_task_proposal_routes(router, ctx)
     register_attachment_routes(router, ctx)
     register_occurrence_time_routes(router, ctx)
     register_notification_routes(router, ctx)

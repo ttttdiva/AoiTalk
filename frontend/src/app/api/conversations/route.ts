@@ -20,6 +20,11 @@ import { cleanupExpiredDeletedConversationsIfDue } from "@/lib/server/conversati
 import { fetchPythonApi, type InternalPythonUser } from "@/lib/server/python-api-proxy";
 import { jsonWithConditional } from "@/lib/server/http-cache";
 import { getReadableProjectIds } from "@/lib/server/task-route-utils";
+import {
+  ConversationHistoryStatusBridgeError,
+  fetchConversationHistoryStatuses,
+  isConversationHistoryStatusBridgeError,
+} from "@/lib/server/conversation-history-status";
 
 class CharacterResolutionError extends Error {
   constructor(
@@ -37,13 +42,6 @@ async function resolveCharacterSlug(
 ): Promise<string | null> {
   const normalized = requestedName.trim();
   if (!normalized) return null;
-  if (
-    normalized.startsWith("scenario_roleplay:") ||
-    normalized.startsWith("scenario_") ||
-    normalized.startsWith("trpg_room_")
-  ) {
-    return normalized;
-  }
 
   let response: Response;
   try {
@@ -115,14 +113,21 @@ function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
     context: "context",
     currentSummary: "current_summary",
     isActive: "is_active",
+    isPinned: "is_pinned",
+    pinnedAt: "pinned_at",
+    pinUpdatedAt: "pin_updated_at",
     deletedAt: "deleted_at",
     projectId: "project_id",
     appId: "app_id",
     appTargetId: "app_target_id",
+    agentId: "agent_id",
+    agentBindingUpdatedAt: "agent_binding_updated_at",
     developmentStatus: "development_status",
     lastReadAt: "last_read_at",
     isGroupChat: "is_group_chat",
     groupCharacterNames: "group_character_names",
+    historyStatus: "history_status",
+    historyCompletedAt: "history_completed_at",
   };
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
@@ -132,15 +137,6 @@ function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
         : v;
   }
   return out;
-}
-
-function isStoryWorkflowSession(row: Record<string, unknown>): boolean {
-  const characterName = String(row.characterName ?? "");
-  const title = String(row.title ?? "");
-  return (
-    characterName.startsWith("story_") ||
-    title.startsWith("[執筆]")
-  );
 }
 
 export async function GET(request: NextRequest) {
@@ -238,6 +234,7 @@ export async function GET(request: NextRequest) {
     .where(and(...conditions))
     .groupBy(conversationSessions.id)
     .orderBy(
+      desc(conversationSessions.isPinned),
       // last_activity is the durable activity boundary. Deriving this from
       // message.created_at makes the list response disagree with resume (and
       // causes a click-only session replacement to reorder the sidebar).
@@ -247,11 +244,7 @@ export async function GET(request: NextRequest) {
     );
 
   const result = rows
-    .filter(
-      (r) =>
-        Number(r.actualMessageCount ?? 0) > 0 &&
-        !isStoryWorkflowSession(r.session as unknown as Record<string, unknown>),
-    )
+    .filter((r) => Number(r.actualMessageCount ?? 0) > 0)
     .map((r) => {
       const session = sessionToSnake({
         ...(r.session as unknown as Record<string, unknown>),
@@ -260,31 +253,63 @@ export async function GET(request: NextRequest) {
         // not when the session is opened or its title/read state is changed.
         lastActivity: r.session.lastActivity ?? r.session.sessionStart,
       });
-      const lastActivity = session.last_activity;
-      const lastReadAt = session.last_read_at;
-      const activityMs =
-        lastActivity instanceof Date
-          ? lastActivity.getTime()
-          : typeof lastActivity === "string"
-            ? Date.parse(lastActivity)
-            : Number.NaN;
-      const readMs =
-        lastReadAt instanceof Date
-          ? lastReadAt.getTime()
-          : typeof lastReadAt === "string"
-            ? Date.parse(lastReadAt)
-            : Number.NaN;
-      const isUnread =
-        session.app_id != null &&
-        session.development_status === "waiting_for_user" &&
-        Number.isFinite(activityMs) &&
-        (!lastReadAt || !Number.isFinite(readMs) || activityMs > readMs);
-      return { ...session, is_unread: isUnread };
+      return session;
     });
 
+  let statusProjections: Awaited<
+    ReturnType<typeof fetchConversationHistoryStatuses>
+  >;
+  try {
+    statusProjections = await fetchConversationHistoryStatuses(
+      result
+        .map((session) => (session as { id?: unknown }).id)
+        .filter((sessionId): sessionId is string => typeof sessionId === "string"),
+      user,
+    );
+  } catch (error) {
+    if (isConversationHistoryStatusBridgeError(error)) {
+      return NextResponse.json(
+        { detail: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+
+  let projectedResult: typeof result;
+  try {
+    projectedResult = result.map((session) => {
+      const sessionId = (session as { id?: unknown }).id;
+      const projection = statusProjections.get(String(sessionId));
+      if (!projection) {
+        throw new ConversationHistoryStatusBridgeError(
+          502,
+          "history_status_missing_projection",
+          "会話履歴の状態投影が一部欠落しています",
+        );
+      }
+      return {
+        ...session,
+        history_status: projection.history_status,
+        history_completed_at: projection.history_completed_at,
+        // Keep the legacy field as a compatibility alias for the shared
+        // assistant-completion/read-fence projection across normal and App chat.
+        is_unread: projection.history_status === "ready",
+      };
+    });
+  } catch (error) {
+    if (isConversationHistoryStatusBridgeError(error)) {
+      return NextResponse.json(
+        { detail: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+
   return jsonWithConditional(request, {
-    conversations: result,
-    total: result.length,
+    conversations: projectedResult,
+    total: projectedResult.length,
   });
 }
 
@@ -304,6 +329,27 @@ export async function POST(request: NextRequest) {
     typeof body?.app_target_id === "string" && body.app_target_id.trim()
       ? body.app_target_id.trim()
       : null;
+  const requestedAgentId =
+    typeof body?.agent_id === "string" && body.agent_id.trim()
+      ? body.agent_id.trim()
+      : null;
+  const clientSessionId =
+    typeof body?.client_session_id === "string" && body.client_session_id.trim()
+      ? body.client_session_id.trim()
+      : null;
+  if (
+    body?.agent_id !== undefined &&
+    body?.agent_id !== null &&
+    (typeof body.agent_id !== "string" || !body.agent_id.trim())
+  ) {
+    return NextResponse.json({ detail: "agent_idの形式が不正です" }, { status: 400 });
+  }
+  if (
+    clientSessionId &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(clientSessionId)
+  ) {
+    return NextResponse.json({ detail: "client_session_idの形式が不正です" }, { status: 400 });
+  }
   const initialMessage =
     body?.initial_message && typeof body.initial_message === "object"
       ? body.initial_message
@@ -358,14 +404,17 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // App開発チャットは、App/Target権限の検証と進行状態の初期化を
+  // App開発チャットとAgent-bound Chatは、scope/identityの検証を
   // Python側の正規作成経路に委譲する。通常チャットのBFF直書き経路とは
-  // 分けることで、権限検証を迂回して他ユーザーのAppを紐付けられないようにする。
-  if (appId || appTargetId) {
+  // 分けることで、クライアントがAgentやAppの所有権検証を迂回できないようにする。
+  if (clientSessionId || appId || appTargetId || requestedAgentId) {
     let response: Response;
     try {
-      response = await fetchPythonApi("/api/conversations", {
-        method: "POST",
+      const canonicalPath = clientSessionId
+        ? `/api/conversations/client/${encodeURIComponent(clientSessionId)}`
+        : "/api/conversations";
+      response = await fetchPythonApi(canonicalPath, {
+        method: clientSessionId ? "PUT" : "POST",
         user,
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -373,6 +422,10 @@ export async function POST(request: NextRequest) {
           project_id: requestedProjectId,
           app_id: appId,
           app_target_id: appTargetId,
+          ...(requestedAgentId ? { agent_id: requestedAgentId } : {}),
+          ...(clientSessionId && initialMessage
+            ? { initial_message: initialMessage }
+            : {}),
         }),
       });
     } catch (error) {
@@ -387,7 +440,7 @@ export async function POST(request: NextRequest) {
       );
     }
     const responseBody = await response.text();
-    if (!response.ok || !initialContent.trim()) {
+    if (!response.ok || !initialContent.trim() || clientSessionId) {
       return new NextResponse(responseBody, {
         status: response.status,
         headers: {

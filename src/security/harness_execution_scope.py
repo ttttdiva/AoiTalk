@@ -31,6 +31,7 @@ from .agent_run_scope import AgentRunScope, ScopeDecision
 
 PathLike = str | os.PathLike[str]
 AccessKind = Literal["read", "write", "delete", "mutation"]
+CommandBackendKind = Literal["wsl_bwrap", "native_windows"]
 
 
 class HarnessExecutionScopeError(ValueError):
@@ -43,6 +44,41 @@ class HarnessExecutionScopeConfigurationError(HarnessExecutionScopeError):
 
 class HarnessExecutionScopeViolation(PermissionError, HarnessExecutionScopeError):
     """Raised when a path/operation is outside a harness scope."""
+
+
+def resolve_command_backend_kind(
+    *,
+    run_scope: AgentRunScope | None = None,
+    harness_scope: "HarnessExecutionScope | None" = None,
+) -> str | None:
+    """Resolve the server-issued command backend shared by scoped OS tools."""
+
+    if run_scope is None:
+        from .agent_run_scope import get_current_run_scope
+
+        run_scope = get_current_run_scope()
+    if harness_scope is None:
+        harness_scope = get_current_harness_execution_scope()
+    selected = []
+    for scope in (run_scope, harness_scope):
+        if scope is None:
+            continue
+        kind = str(getattr(scope, "backend_kind", "wsl_bwrap") or "wsl_bwrap")
+        if kind not in {"wsl_bwrap", "native_windows"}:
+            raise HarnessExecutionScopeConfigurationError(
+                f"unsupported command backend kind: {kind!r}"
+            )
+        selected.append(kind)
+    if len(set(selected)) > 1:
+        raise HarnessExecutionScopeConfigurationError(
+            "HarnessExecutionScope and AgentRunScope select different command backends"
+        )
+    backend_kind = selected[0] if selected else None
+    if backend_kind == "native_windows" and os.name != "nt":
+        raise HarnessExecutionScopeConfigurationError(
+            "native_windows command backend is available only on Windows"
+        )
+    return backend_kind
 
 
 # Compatibility aliases used by integrations that call this an execution
@@ -372,6 +408,7 @@ class HarnessExecutionScope:
     run_id: str
     audit_id: str
     root_identity: str
+    backend_kind: CommandBackendKind = "wsl_bwrap"
     _authority_token: object = field(default=None, repr=False, compare=False)
     _capability_fingerprint: str = field(default="", init=False, repr=False, compare=False)
 
@@ -385,6 +422,10 @@ class HarnessExecutionScope:
         run_id = _clean_identifier(self.run_id, label="run_id", required=True)
         audit_id = _clean_identifier(self.audit_id, label="audit_id", required=True)
         root_identity = _clean_identifier(self.root_identity, label="root_identity", required=True)
+        if self.backend_kind not in {"wsl_bwrap", "native_windows"}:
+            raise HarnessExecutionScopeConfigurationError(
+                f"unsupported command backend kind: {self.backend_kind!r}"
+            )
         if not isinstance(self.resource_limits, ResourceLimits):
             raise HarnessExecutionScopeConfigurationError("resource_limits must be ResourceLimits")
         try:
@@ -414,6 +455,7 @@ class HarnessExecutionScope:
         object.__setattr__(self, "run_id", str(run_id))
         object.__setattr__(self, "audit_id", str(audit_id))
         object.__setattr__(self, "root_identity", str(root_identity))
+        object.__setattr__(self, "backend_kind", str(self.backend_kind))
         object.__setattr__(self, "network_capability", network)
         object.__setattr__(self, "project_ids", _normalise_id_tuple(self.project_ids, label="project_ids"))
         object.__setattr__(self, "app_ids", _normalise_id_tuple(self.app_ids, label="app_ids"))
@@ -513,6 +555,14 @@ class HarnessExecutionScope:
         return self._capability_fingerprint
 
     @property
+    def file_scoped(self) -> bool:
+        return self.backend_kind == "wsl_bwrap"
+
+    @property
+    def filesystem_isolation(self) -> bool:
+        return self.file_scoped
+
+    @property
     def fingerprint(self) -> str:
         return self.capability_fingerprint
 
@@ -572,6 +622,7 @@ class HarnessExecutionScope:
             "secret_capability_ids": sorted(self.secret_capability_ids, key=str.casefold),
             "resource_limits": self.resource_limits.to_dict(),
             "root_identity": self.root_identity,
+            "backend_kind": self.backend_kind,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "surrogatepass")
         return hashlib.sha256(encoded).hexdigest()
@@ -691,6 +742,7 @@ class HarnessExecutionScope:
             delete_roots=delete_roots,
             command_roots=command_roots,
             scratch_roots=scratch,
+            backend_kind=self.backend_kind,
         )
 
     as_agent_run_scope = to_agent_run_scope
@@ -721,6 +773,8 @@ class HarnessExecutionScope:
             "run_id": self.run_id,
             "audit_id": self.audit_id,
             "root_identity": self.root_identity,
+            "backend_kind": self.backend_kind,
+            "filesystem_isolation": self.filesystem_isolation,
             "capability_fingerprint": self.capability_fingerprint,
         }
 
@@ -790,12 +844,13 @@ ExecutionResourceLimits = ResourceLimits
 
 
 __all__ = [
-    "AccessKind", "ExecutionResourceLimits", "ExecutionScope",
+    "AccessKind", "CommandBackendKind", "ExecutionResourceLimits", "ExecutionScope",
     "ExecutionScopeConfigurationError", "ExecutionScopeError", "ExecutionScopeViolation",
     "ExternalReadGrant", "ExternalReadOnlyGrant", "HarnessExecutionScope",
     "HarnessExecutionScopeConfigurationError", "HarnessExecutionScopeError",
     "HarnessExecutionScopeViolation", "NetworkCapability", "NetworkCapabilityValue",
     "ResourceLimits", "scope_from_untrusted", "get_current_harness_execution_scope",
+    "resolve_command_backend_kind",
     "require_current_harness_execution_scope", "bind_harness_execution_scope",
     "reset_harness_execution_scope", "harness_execution_scope_context",
 ]

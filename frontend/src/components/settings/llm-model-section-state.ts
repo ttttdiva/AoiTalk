@@ -6,6 +6,7 @@ import { useConfirm } from "@/hooks/use-confirm";
 import {
   filterAvailableProviders,
   isProviderAvailable,
+  resolveEffectiveModelId,
   resolveEffectiveProviderId,
 } from "@/lib/llm-provider-visibility";
 import {
@@ -22,13 +23,14 @@ import {
   type LlamaCppSettingsDraft,
   type LlamaCppModelRootState,
   type LlamaCppRuntimeProfile,
-  type LocalRuntimeStatus, type LocalRuntimeTask,
+  type LocalRuntimeStatus, type LocalRuntimeTask, type StrataSetupRequest,
   llamaCppDraftFromSettings, llamaCppPayloadFromDraft, llamaCppBaseUrlFromPayload,
   llamaCppRuntimeProfileForModel, managedLocalRuntimeForSelection,
   cloudAdvisorProviderOptions,
 } from "./llm-model-section-types";
 
 const UNSUPPORTED_CLIP_INGEST_PROVIDERS = new Set(["claude", "grok"]);
+const LOCAL_RUNTIME_STARTUP_POLL_MS = 5000;
 
 export type RoutingSaveScope =
   | "all"
@@ -38,6 +40,28 @@ export type RoutingSaveScope =
   | "clip_ingest"
   | "project_automation"
   | "agent";
+
+export function activeLocalRuntimeTaskFromStatus(
+  status: LocalRuntimeStatus | null,
+): LocalRuntimeTask | null {
+  return status?.task_id && !status.done
+    ? status as LocalRuntimeTask
+    : null;
+}
+
+export function canCancelLocalRuntimeTask(
+  task: LocalRuntimeTask | null,
+  targetModel: string,
+): boolean {
+  return Boolean(
+    task
+      && !task.done
+      && task.runtime === "strata"
+      && task.task_id
+      && (!task.model || task.model === targetModel.trim())
+      && task.actions?.cancel !== false,
+  );
+}
 
 function settingsReasoningEffortOptions(
   provider: LlmProviderCatalog | null | undefined,
@@ -83,6 +107,8 @@ export function useLlmModelSection() {
   const [provider, setProvider] = useState("gemini");
   const [model, setModel] = useState("");
   const [customModel, setCustomModel] = useState("");
+  // 「カスタム」を明示選択したprovider。選択状態の変更・保存成功・provider変更で解除する。
+  const [customPickedProvider, setCustomPickedProvider] = useState<string | null>(null);
   const [providerDrafts, setProviderDrafts] = useState<Record<string, ProviderDraft>>({});
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -94,6 +120,7 @@ export function useLlmModelSection() {
   const [localRuntimePreparing, setLocalRuntimePreparing] = useState(false);
   const localRuntimePollSeqRef = useRef(0);
   const localRuntimePrepareRef = useRef<number | null>(null);
+  const localRuntimeStartupPollInFlightRef = useRef(false);
   const localRuntimeActivationRef = useRef<string | null>(null);
   const [pulling, setPulling] = useState(false);
   const [pullInput, setPullInput] = useState("gpt-oss:20b");
@@ -319,9 +346,17 @@ export function useLlmModelSection() {
         const currentProvider = data.providers.find(
           (item) => item.id === preferredProvider,
         );
-        const selection = providerSelection(currentProvider);
+        const deploymentModel = resolveEffectiveModelId(data.deployment);
+        const preferredModel =
+          effectiveProvider === preferredProvider && deploymentModel
+            ? deploymentModel
+            : data.current?.provider === preferredProvider
+              ? data.current.model
+              : undefined;
+        const selection = providerSelection(currentProvider, preferredModel);
         setModel(selection.model);
         setCustomModel(selection.customModel);
+        setCustomPickedProvider(null);
       }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "モデル一覧を取得できませんでした");
@@ -354,6 +389,7 @@ export function useLlmModelSection() {
     setProvider(fallback);
     setModel(selection.model);
     setCustomModel(selection.customModel);
+    setCustomPickedProvider(null);
   }, [catalog, provider, providerOptions]);
 
   useEffect(() => {
@@ -453,6 +489,7 @@ export function useLlmModelSection() {
 
   useEffect(() => {
     const sequence = ++localRuntimePollSeqRef.current;
+    const isCurrentSequence = () => localRuntimePollSeqRef.current === sequence;
     localRuntimePrepareRef.current = null;
     localRuntimeActivationRef.current = null;
     setLocalRuntimeTask(null);
@@ -466,33 +503,155 @@ export function useLlmModelSection() {
     }
 
     setLocalRuntimeLoading(true);
-    const params = new URLSearchParams({ model: selectedModelId.trim() });
-    void pyFetch<LocalRuntimeStatus>(`/llm/local-runtime/status?${params.toString()}`)
-      .then((status) => {
-        if (localRuntimePollSeqRef.current !== sequence) return;
+    const targetModel = selectedModelId.trim();
+    const params = new URLSearchParams({ model: targetModel });
+    const statusPath = `/llm/local-runtime/status?${params.toString()}`;
+    const matchesSelection = (status: LocalRuntimeStatus) =>
+      status.model.trim() === targetModel
+      && String(status.runtime ?? "").trim().toLowerCase() === selectedManagedRuntime;
+
+    void (async () => {
+      try {
+        const status = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (!isCurrentSequence()) return;
+        const activeTask = activeLocalRuntimeTaskFromStatus(status);
+        if (activeTask && !matchesSelection(activeTask)) {
+          throw new Error("選択したモデルとローカルruntime準備タスクが一致しません");
+        }
         setLocalRuntimeStatus(status);
-      })
-      .catch((error) => {
-        if (localRuntimePollSeqRef.current !== sequence) return;
+        setLocalRuntimeTask(activeTask);
+        setLocalRuntimePreparing(Boolean(activeTask));
+        setLocalRuntimeLoading(false);
+        const taskId = activeTask?.task_id;
+        if (!activeTask || !taskId) return;
+
+        // A task restored from status has no prepare callback waiting for it.
+        // Adopt only its polling ownership; never submit setup again on reload.
+        localRuntimePrepareRef.current = sequence;
+        let nextTask = activeTask;
+        while (!nextTask.done) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+          if (!isCurrentSequence()) return;
+          const next = await pyFetch<LocalRuntimeTask>(
+            `/llm/local-runtime/tasks/${encodeURIComponent(taskId)}`,
+          );
+          if (!isCurrentSequence()) return;
+          if (next.task_id !== activeTask.task_id || !matchesSelection(next)) {
+            throw new Error("選択したモデルとローカルruntime準備タスクが一致しません");
+          }
+          nextTask = next;
+          setLocalRuntimeTask(nextTask);
+          setLocalRuntimeStatus(nextTask);
+        }
+
+        if (nextTask.error || nextTask.status === "failed") {
+          throw new Error(nextTask.reason || nextTask.error || "ローカルruntimeの準備に失敗しました");
+        }
+        const refreshedStatus = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (isCurrentSequence() && matchesSelection(refreshedStatus)) {
+          setLocalRuntimeStatus(refreshedStatus);
+        }
+      } catch (error) {
+        if (!isCurrentSequence()) return;
         const message = error instanceof Error
           ? error.message
           : "ローカルruntimeの状態を取得できませんでした";
-        setLocalRuntimeStatus(null);
         setEngineChangeError(message);
         toast.error(message);
-      })
-      .finally(() => {
-        if (localRuntimePollSeqRef.current === sequence) {
+      } finally {
+        if (isCurrentSequence()) {
           setLocalRuntimeLoading(false);
+          setLocalRuntimePreparing(false);
         }
-      });
+        if (localRuntimePrepareRef.current === sequence) {
+          localRuntimePrepareRef.current = null;
+        }
+      }
+    })();
 
     return () => {
-      if (localRuntimePollSeqRef.current === sequence) {
-        localRuntimePollSeqRef.current += 1;
-      }
+      // A prepare request may have taken ownership since this effect ran.
+      // Changing selection or unmounting must invalidate that owner as well.
+      localRuntimePollSeqRef.current += 1;
+      localRuntimePrepareRef.current = null;
     };
   }, [selectedManagedRuntime, selectedModelId]);
+
+  const localRuntimeStatusModel = localRuntimeStatus?.model?.trim() ?? "";
+  const localRuntimeStatusRuntime = String(localRuntimeStatus?.runtime ?? "").trim().toLowerCase();
+  const hasLocalRuntimeStartupProgress = localRuntimeStatus?.server?.startup_progress != null;
+
+  useEffect(() => {
+    const targetModel = selectedModelId.trim();
+    const shouldPoll = Boolean(
+      expanded
+      && (selectedManagedRuntime === "strata" || selectedManagedRuntime === "llama_cpp")
+      && targetModel
+      && localRuntimeStatusModel === targetModel
+      && localRuntimeStatusRuntime === selectedManagedRuntime
+      && localRuntimeStatus?.server?.ready === false
+      && localRuntimeStatus?.status !== "failed"
+      && localRuntimeStatus?.server?.status !== "failed"
+      && (hasLocalRuntimeStartupProgress
+        || (selectedManagedRuntime === "llama_cpp"
+          && ["waiting", "loading"].includes(localRuntimeStatus?.server?.status ?? "")))
+      && !localRuntimePreparing
+      && localRuntimePrepareRef.current === null,
+    );
+    if (!shouldPoll) return;
+
+    const sequence = localRuntimePollSeqRef.current;
+    const statusPath = `/llm/local-runtime/status?${new URLSearchParams({ model: targetModel }).toString()}`;
+    let active = true;
+    let timer: number | null = null;
+    const isCurrentSequence = () => localRuntimePollSeqRef.current === sequence;
+    const schedule = () => {
+      if (!active || !isCurrentSequence() || localRuntimePrepareRef.current !== null) return;
+      timer = window.setTimeout(() => void poll(), LOCAL_RUNTIME_STARTUP_POLL_MS);
+    };
+    const poll = async () => {
+      if (!active || !isCurrentSequence() || localRuntimePrepareRef.current !== null) return;
+      if (localRuntimeStartupPollInFlightRef.current) {
+        schedule();
+        return;
+      }
+      localRuntimeStartupPollInFlightRef.current = true;
+      try {
+        const next = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (!active || !isCurrentSequence() || localRuntimePrepareRef.current !== null) return;
+        if (
+          next.model.trim() !== targetModel
+          || String(next.runtime ?? "").trim().toLowerCase() !== selectedManagedRuntime
+        ) {
+          active = false;
+          return;
+        }
+        setLocalRuntimeStatus(next);
+      } catch {
+        // Keep the last known state and retry while the startup projection remains active.
+      } finally {
+        localRuntimeStartupPollInFlightRef.current = false;
+        schedule();
+      }
+    };
+
+    schedule();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [
+    expanded,
+    hasLocalRuntimeStartupProgress,
+    localRuntimePreparing,
+    localRuntimeStatus?.server?.ready,
+    localRuntimeStatus?.server?.status,
+    localRuntimeStatus?.status,
+    localRuntimeStatusModel,
+    localRuntimeStatusRuntime,
+    selectedManagedRuntime,
+    selectedModelId,
+  ]);
 
   useEffect(() => {
     if (!task || task.done) return;
@@ -522,9 +681,17 @@ export function useLlmModelSection() {
     nextProvider: string,
     nextModel: string,
     settings?: ProviderSettingsDraft,
+    refreshRuntime = false,
   ) => {
     const trimmedModel = nextModel.trim();
     if (!nextProvider || !trimmedModel) return;
+    const activeLocalTask = localRuntimeTask && !localRuntimeTask.done;
+    if ((localRuntimePreparing || activeLocalTask) && !refreshRuntime) {
+      const message = "ローカルruntime準備中はモデル設定を保存できません。完了またはキャンセルしてください";
+      setEngineChangeError(message);
+      toast.error(message);
+      return;
+    }
     setSaving(true);
     setEngineChangeError(null);
     try {
@@ -542,6 +709,7 @@ export function useLlmModelSection() {
           payload.llama_cpp = settings.llama_cpp;
         }
       }
+      if (refreshRuntime) payload.refresh_runtime = true;
       const data = await pyFetch<LlmEngineResponse>("/llm/engine", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -549,6 +717,7 @@ export function useLlmModelSection() {
       setProvider(data.provider);
       setModel(data.model);
       setCustomModel("");
+      setCustomPickedProvider(null);
       setProviderDrafts((current) => ({
         ...current,
         [data.provider]: { model: data.model, customModel: "" },
@@ -613,7 +782,7 @@ export function useLlmModelSection() {
     } finally {
       setSaving(false);
     }
-  }, []);
+  }, [localRuntimePreparing, localRuntimeTask]);
 
   useEffect(() => {
     const targetModel = selectedModelId.trim();
@@ -623,7 +792,7 @@ export function useLlmModelSection() {
       : "";
     const statusMatchesSelection = Boolean(
       targetKey
-        && localRuntimeStatus?.prepared
+        && (localRuntimeStatus?.prepared || (statusRuntime === "strata" && localRuntimeStatus?.status === "external" && localRuntimeStatus?.server?.ready))
         && localRuntimeStatus.model.trim() === targetModel
         && statusRuntime === selectedManagedRuntime,
     );
@@ -671,7 +840,7 @@ export function useLlmModelSection() {
     selectedProvider,
   ]);
 
-  const startLocalRuntimePrepare = useCallback(async () => {
+  const startLocalRuntimePrepare = useCallback(async (strataRequest?: StrataSetupRequest) => {
     const targetModel = selectedModelId.trim();
     const runtime = selectedManagedRuntime;
     if (
@@ -679,10 +848,11 @@ export function useLlmModelSection() {
       || !runtime
       || saving
       || localRuntimePrepareRef.current !== null
+      || (localRuntimeTask && !localRuntimeTask.done)
     ) return;
 
     if (
-      localRuntimeStatus?.prepared
+      !strataRequest && localRuntimeStatus?.prepared
       && localRuntimeStatus.model.trim() === targetModel
       && String(localRuntimeStatus.runtime ?? "").trim().toLowerCase() === runtime
     ) {
@@ -712,6 +882,47 @@ export function useLlmModelSection() {
         status = await pyFetch<LocalRuntimeStatus>(statusPath);
         if (!isCurrentSequence()) return;
         setLocalRuntimeStatus(status);
+      }
+
+      if (runtime === "strata" && strataRequest) {
+        let nextTask = await pyFetch<LocalRuntimeTask>("/llm/local-runtime/prepare", {
+          method: "POST",
+          body: JSON.stringify({ model: targetModel, runtime, ...strataRequest }),
+        });
+        if (!isCurrentSequence()) return;
+        setLocalRuntimeTask(nextTask);
+        while (!nextTask.done) {
+          if (!nextTask.task_id) throw new Error("Strata setup task IDがありません");
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+          if (!isCurrentSequence()) return;
+          nextTask = await pyFetch<LocalRuntimeTask>(`/llm/local-runtime/tasks/${encodeURIComponent(nextTask.task_id)}`);
+          if (!isCurrentSequence()) return;
+          setLocalRuntimeTask(nextTask);
+        }
+        if (nextTask.error || nextTask.status === "failed") {
+          throw new Error(nextTask.reason || nextTask.error || "Strata setupに失敗しました");
+        }
+        status = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (isCurrentSequence()) setLocalRuntimeStatus(status);
+        if (nextTask.status === "cancelled") return;
+        if (
+          isCurrentSequence()
+          && runtime === "strata"
+          && current?.provider === "openai_compatible_local"
+          && current.model === targetModel
+        ) {
+          // The prepare/configure API persists the endpoint while the active
+          // OpenAI client keeps its constructor URL. Re-apply the same model
+          // through the transactional engine route so the client, owned
+          // process and lease boundary follow the new Strata settings.
+          await saveModelSelection(
+            "openai_compatible_local",
+            targetModel,
+            undefined,
+            true,
+          );
+        }
+        return;
       }
 
       if (!status.prepared) {
@@ -769,10 +980,50 @@ export function useLlmModelSection() {
     }
   }, [
     localRuntimeStatus,
+    localRuntimeTask,
+    current,
     saving,
+    saveModelSelection,
     selectedManagedRuntime,
     selectedModelId,
   ]);
+
+  const cancelLocalRuntimePrepare = useCallback(async () => {
+    const activeTask = localRuntimeTask && !localRuntimeTask.done
+      ? localRuntimeTask
+      : activeLocalRuntimeTaskFromStatus(localRuntimeStatus);
+    const targetModel = selectedModelId.trim();
+    const taskId = activeTask?.task_id;
+    if (!taskId || !canCancelLocalRuntimeTask(activeTask, targetModel)) return;
+    const sequence = localRuntimePollSeqRef.current;
+    try {
+      const cancelled = await pyFetch<LocalRuntimeTask>(
+        `/llm/local-runtime/tasks/${encodeURIComponent(taskId)}/cancel`,
+        { method: "POST" },
+      );
+      if (
+        localRuntimePollSeqRef.current !== sequence
+        || cancelled.model !== targetModel
+        || cancelled.runtime !== "strata"
+        || cancelled.task_id !== taskId
+      ) return;
+      setLocalRuntimeTask(cancelled);
+      setLocalRuntimeStatus(cancelled);
+      if (cancelled.status === "cancelled") {
+        // A task GET already in flight must not restore an older running state.
+        localRuntimePollSeqRef.current += 1;
+        localRuntimePrepareRef.current = null;
+        setLocalRuntimePreparing(false);
+      }
+    } catch (error) {
+      if (localRuntimePollSeqRef.current !== sequence) return;
+      const message = error instanceof Error
+        ? error.message
+        : "ローカルruntime準備をキャンセルできませんでした";
+      setEngineChangeError(message);
+      toast.error(message);
+    }
+  }, [localRuntimeStatus, localRuntimeTask, selectedModelId]);
 
   const handleProviderChange = useCallback(
     (nextProvider: string) => {
@@ -802,6 +1053,7 @@ export function useLlmModelSection() {
       if (nextEffort) setReasoningEffort(nextEffort);
       setModel(selection.model);
       setCustomModel(selection.customModel);
+      setCustomPickedProvider(null);
       if (managedLocalRuntimeForSelection(next, nextOption, nextModelId)) {
         setEngineChangeError(null);
         return;
@@ -815,6 +1067,7 @@ export function useLlmModelSection() {
     (nextModel: string) => {
       setModel(nextModel);
       setCustomModel("");
+      setCustomPickedProvider(null);
       setProviderDrafts((current) => ({
         ...current,
         [provider]: { model: nextModel, customModel: "" },
@@ -845,6 +1098,7 @@ export function useLlmModelSection() {
   const handleCustomModelChange = useCallback(
     (nextModel: string) => {
       setCustomModel(nextModel);
+      setCustomPickedProvider(provider);
       setProviderDrafts((current) => ({
         ...current,
         [provider]: { model, customModel: nextModel },
@@ -1089,7 +1343,7 @@ export function useLlmModelSection() {
         projectAutomationRoute?.provider || "",
       );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Agent Team設定を取得できませんでした");
+      toast.error(error instanceof Error ? error.message : "Execution Team設定を取得できませんでした");
     }
   }, [providerOptions]);
 
@@ -1311,7 +1565,7 @@ export function useLlmModelSection() {
       }
       toast.success("モデル・メディア設定を保存しました");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Agent Team設定を保存できませんでした");
+      toast.error(error instanceof Error ? error.message : "Execution Team設定を保存できませんでした");
     } finally {
       setSavingRouting(false);
     }
@@ -1327,11 +1581,12 @@ export function useLlmModelSection() {
 
   return {
     expanded, setExpanded, catalog, setCatalog, provider, setProvider, model, setModel,
-    customModel, setCustomModel, providerDrafts, setProviderDrafts, loading, setLoading,
+    customModel, setCustomModel, customPickedProvider, setCustomPickedProvider, providerDrafts, setProviderDrafts, loading, setLoading,
     refreshing, setRefreshing, saving, setSaving, pulling, setPulling, pullInput, setPullInput,
     engineChangeError,
     localRuntimeStatus, localRuntimeTask, localRuntimeLoading, localRuntimePreparing,
     startLocalRuntimePrepare,
+    cancelLocalRuntimePrepare,
     task, setTask, deletingModel, setDeletingModel, modelSearch, setModelSearch, modelPage, setModelPage,
     baseUrl, setBaseUrl, apiKey, setApiKey, reasoningEffort, setReasoningEffort,
     llamaCppDraft, setLlamaCppDraft, llamaCppError,

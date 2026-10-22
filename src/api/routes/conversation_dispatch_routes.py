@@ -24,7 +24,9 @@ from ...services.agent_run_service import (
     DispatchConflictError,
     conversation_dispatch_fingerprint,
 )
+from ...services.agent_root_lifecycle import AgentRootLifecycleError
 from ...services.mention_resolver import normalize_mentions
+from ...services.chat_execution_adapter import resolve_canonical_session_agent_id
 from ..router_helpers import cookie_auth_dependency
 from .payloads import (
     ConversationDispatchRequest,
@@ -37,6 +39,47 @@ if TYPE_CHECKING:
     from ..server import WebChatServer
 
 logger = logging.getLogger(__name__)
+
+
+def _admission_http_exception(error: BaseException) -> HTTPException | None:
+    """Map trusted interactive admission codes to safe REST responses."""
+
+    code = str(getattr(error, "code", "") or "").strip().casefold()
+    if not code:
+        text = str(error or "").strip().casefold()
+        code = text if len(text) <= 96 else ""
+    if not code:
+        return None
+    if any(
+        marker in code
+        for marker in (
+            "authorization",
+            "forbidden",
+            "permission",
+            "acl",
+            "human_project",
+        )
+    ):
+        status = 403
+    elif any(marker in code for marker in ("not_found", "session_unavailable", "agent_missing")):
+        status = 404
+    elif any(
+        marker in code
+        for marker in (
+            "busy",
+            "capacity",
+            "conflict",
+            "binding_changed",
+            "revision_mismatch",
+            "state",
+            "admission",
+            "run_work",
+        )
+    ):
+        status = 409
+    else:
+        return None
+    return HTTPException(status_code=status, detail=code)
 
 
 def _parse_builtin_masking_command(message: Any):
@@ -415,6 +458,125 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             is_admin=bool(user_info and user_info.get("role") == "admin"),
         ):
             raise HTTPException(status_code=403, detail="Access denied")
+
+        # Resolve the durable private-root pointer before the generic Project
+        # attachment helper runs.  A client-supplied project on the canonical
+        # AoiDots session must fail closed; the optional context hint remains
+        # advisory child-work scope and never becomes root session state.
+        root_session_is_canonical = False
+        canonical_conversation = await ConversationRepository().get_session_by_id(
+            session_id,
+            with_messages=False,
+        )
+        if canonical_conversation is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(canonical_conversation, "id", None) in (None, ""):
+            # Lightweight compatibility repositories may expose only the
+            # Project/App projection.  They cannot identify a private root;
+            # the durable AgentRun path still performs its normal checks.
+            root_metadata = None
+        else:
+            try:
+                from ...memory.database import get_database_manager
+                from ...services.agent_root_lifecycle import find_private_agent_root
+
+                root_db_session = await get_database_manager().get_session()
+                try:
+                    root_metadata = await find_private_agent_root(
+                        root_db_session,
+                        canonical_conversation,
+                        owner_user_id=user_id,
+                        lock=True,
+                    )
+                finally:
+                    await root_db_session.close()
+                root_session_is_canonical = root_metadata is not None
+            except AgentRootLifecycleError as exc:
+                raise HTTPException(
+                    status_code=int(getattr(exc, "status_code", 409) or 409),
+                    detail=str(getattr(exc, "code", None) or exc),
+                ) from exc
+            except RuntimeError as exc:
+                if "Database is not initialized" not in str(exc):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Private Agent root protection is unavailable",
+                    ) from exc
+
+        context_project_hint_id = None
+        raw_context_project_hint_id = getattr(
+            payload, "context_project_hint_id", None
+        )
+        if raw_context_project_hint_id not in (None, ""):
+            from uuid import UUID
+
+            try:
+                context_project_hint_id = str(UUID(str(raw_context_project_hint_id)))
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid context project hint",
+                ) from None
+            checker = getattr(server, "_assert_project_read_access_for_turn", None)
+            if not callable(checker):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Project access checker is unavailable",
+                )
+            try:
+                await checker(
+                    UUID(context_project_hint_id),
+                    user_id=user_id,
+                    user_role=(user_info or {}).get("role"),
+                )
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail="Access denied") from exc
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Context project hint access check failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Project access check is unavailable",
+                ) from exc
+            if _payload_field_was_provided(payload, "project_id") and payload.project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="context_project_hint_id requires project_id to be omitted",
+                )
+        if root_session_is_canonical and payload.project_id:
+            raise HTTPException(
+                status_code=409,
+                detail="private_agent_root_projectless",
+            )
+
+        # The optional expected binding is a concurrency guard for offline
+        # senders.  It never selects an Agent; the canonical session row does.
+        expected_agent_provided = _payload_field_was_provided(
+            payload, "expected_agent_id"
+        )
+        expected_agent_id = None
+        if expected_agent_provided and payload.expected_agent_id is not None:
+            expected_agent_id = str(payload.expected_agent_id).strip()
+            if not expected_agent_id:
+                raise HTTPException(status_code=400, detail="Invalid expected Agent binding")
+        if expected_agent_provided:
+            try:
+                canonical_agent_id = await resolve_canonical_session_agent_id(
+                    session_id=session_id,
+                    config=getattr(server, "config", None),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve expected Chat Agent binding: %s",
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Conversation Agent binding is unavailable",
+                ) from exc
+            if expected_agent_id != canonical_agent_id:
+                raise HTTPException(status_code=409, detail="Conversation Agent binding changed")
         command_capabilities = await inherit_command_capabilities_from_edit_source(
             session_id=session_id,
             edit_message_id=payload.edit_message_id,
@@ -510,7 +672,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             and not help_requested
         ):
             raise HTTPException(status_code=400, detail="message is required")
-        if help_requested:
+        if help_requested or context_project_hint_id is not None or root_session_is_canonical:
             # Help must not resolve, attach, or mutate a selected Project.
             effective_attached_project_id = None
         else:
@@ -529,11 +691,14 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
-        conversation = await ConversationRepository().get_session_by_id(
-            session_id, with_messages=False
-        )
+        conversation = canonical_conversation
         if conversation is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        if context_project_hint_id is not None and conversation.project_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="AoiDots root session must remain projectless",
+            )
         generation_status = server.get_conversation_generation_status(session_id)
         if generation_status.get("running") and generation_status.get("status") == "cancellation_pending":
             raise HTTPException(
@@ -550,6 +715,8 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
         effective_project_id = (
             None
             if help_requested
+            or context_project_hint_id is not None
+            or root_session_is_canonical
             else effective_attached_project_id
             or (str(conversation.project_id) if conversation.project_id else None)
         )
@@ -619,19 +786,31 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             finally:
                 await db_session.close()
             if app_scope_provided:
+                try:
+                    await ConversationRepository().update_session(
+                        session_id,
+                        touch_activity=False,
+                        app_id=app_uuid,
+                        app_target_id=target_uuid,
+                    )
+                except AgentRootLifecycleError as exc:
+                    raise HTTPException(
+                        status_code=int(getattr(exc, "status_code", 409) or 409),
+                        detail=str(getattr(exc, "code", None) or exc),
+                    ) from exc
+        elif app_scope_provided and not help_requested:
+            try:
                 await ConversationRepository().update_session(
                     session_id,
                     touch_activity=False,
-                    app_id=app_uuid,
-                    app_target_id=target_uuid,
+                    app_id=None,
+                    app_target_id=None,
                 )
-        elif app_scope_provided and not help_requested:
-            await ConversationRepository().update_session(
-                session_id,
-                touch_activity=False,
-                app_id=None,
-                app_target_id=None,
-            )
+            except AgentRootLifecycleError as exc:
+                raise HTTPException(
+                    status_code=int(getattr(exc, "status_code", 409) or 409),
+                    detail=str(getattr(exc, "code", None) or exc),
+                ) from exc
         include_project_context = effective_include_project_context(
             message=message,
             requested=payload.include_project_context,
@@ -640,6 +819,8 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             project_selected=bool(effective_project_id),
         )
         if help_requested:
+            include_project_context = False
+        if context_project_hint_id is not None:
             include_project_context = False
 
         if masking_command is not None:
@@ -755,6 +936,10 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             return JSONResponse(response_payload, status_code=200)
 
         response_model = sanitize_response_model_selection(payload.response_model)
+        # The durable run service pins the canonical session Agent inside its
+        # transaction.  Agent execution reconstruction ignores this legacy
+        # response-model preference once the persisted typed run is present.
+        response_model_for_turn = response_model
         run_metadata = {
             "client_message_id": payload.client_message_id,
             "generation_profile": generation_profile,
@@ -767,16 +952,19 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             "tools_required": payload.tools_required,
             "cloud_advisor_explicit": bool(payload.cloud_advisor_explicit),
             "edit_message_id": payload.edit_message_id,
-            "response_model": response_model,
+            "response_model": response_model_for_turn,
             "attachment_count": len(payload.attachments or []),
             "dispatch_source": "conversation_dispatch",
             "app_id": effective_app_id,
             "app_target_id": effective_app_target_id,
             "mention_count": len(mentions),
+            "context_project_hint_id": context_project_hint_id,
         }
         if workflow_route is not None:
             run_metadata["workflow"] = workflow_route.metadata
-        agent_run_service = AgentRunService()
+        agent_run_service = AgentRunService(
+            config=getattr(server, "config", None),
+        )
         sender_display_name = str(
             (user_info or {}).get("display_name")
             or (user_info or {}).get("username")
@@ -788,8 +976,13 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
         # from silently changing the next execution mode.
         message_metadata: Dict[str, Any] = {
             "generation_profile": generation_profile,
+            "context_project_hint_id": context_project_hint_id,
         }
-        if payload.client_message_id:
+        atomic_dispatch = (
+            bool(payload.client_message_id)
+            or callable(getattr(agent_run_service, "create_server_dispatch_turn", None))
+        )
+        if atomic_dispatch:
             message_metadata["client_message_id"] = payload.client_message_id
         if payload.attachments:
             message_metadata["attachments"] = sanitize_chat_attachments(
@@ -895,7 +1088,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     detail="Invalid persisted user message",
                 ) from e
 
-        if payload.client_message_id:
+        if atomic_dispatch:
             durable_payload = {
                 "message": message,
                 "session_id": session_id,
@@ -906,13 +1099,14 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 ),
                 "_sender_display_name": sender_display_name,
                 "project_id": effective_project_id,
+                "context_project_hint_id": context_project_hint_id,
                 "app_id": effective_app_id,
                 "app_target_id": effective_app_target_id,
                 "generation_profile": generation_profile,
                 "planning_policy": planning_policy,
                 "include_project_context": include_project_context,
                 "edit_message_id": payload.edit_message_id,
-                "response_model": response_model,
+                "response_model": response_model_for_turn,
                 "client_message_id": payload.client_message_id,
                 "command_capabilities": list(command_capabilities),
                 "tools_required": payload.tools_required,
@@ -921,11 +1115,16 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 "attachments": payload.attachments or [],
                 "attachment_context": payload.attachment_context,
                 "mentions": mentions,
+                "expected_agent_id": (
+                    expected_agent_id if expected_agent_provided else "__omitted__"
+                ),
+                "expected_agent_provided": expected_agent_provided,
             }
             request_fingerprint = conversation_dispatch_fingerprint(
                 {
                     "message": message,
                     "project_id": effective_project_id,
+                    "context_project_hint_id": context_project_hint_id,
                     "app_id": effective_app_id,
                     "app_target_id": effective_app_target_id,
                     "generation_profile": generation_profile,
@@ -933,6 +1132,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "include_project_context": include_project_context,
                     "edit_message_id": payload.edit_message_id,
                     "response_model": response_model,
+                    "response_model_for_turn": response_model_for_turn,
                     "command_capabilities": list(command_capabilities),
                     "tools_required": payload.tools_required,
                     "cloud_advisor_explicit": bool(payload.cloud_advisor_explicit),
@@ -945,41 +1145,57 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "attachments": payload.attachments or [],
                     "attachment_context": payload.attachment_context,
                     "mentions": mention_fingerprint,
+                    "expected_agent_id": (
+                        expected_agent_id if expected_agent_provided else "__omitted__"
+                    ),
                 }
             )
             try:
-                agent_run, persisted_user_message_id, _created = (
-                    await agent_run_service.create_or_get_dispatch_turn(
-                        session_id=session_id,
-                        client_message_id=payload.client_message_id,
-                        content=message,
-                        message_metadata=message_metadata,
-                        sender_type="user",
-                        sender_id=user_id,
-                        sender_display_name=sender_display_name,
-                        edit_message_id=payload.edit_message_id,
-                        outbox_payload=durable_payload,
-                        request_fingerprint=request_fingerprint,
-                        persisted_user_message_id=(
+                dispatch_kwargs = {
+                    "session_id": session_id,
+                    "content": message,
+                    "message_metadata": message_metadata,
+                    "sender_type": "user",
+                    "sender_id": user_id,
+                    "sender_display_name": sender_display_name,
+                    "edit_message_id": payload.edit_message_id,
+                    "outbox_payload": durable_payload,
+                    "request_fingerprint": request_fingerprint,
+                    "persisted_user_message_id": (
                             payload.persisted_user_message_id
                             if skip_user_persistence
                             else None
-                        ),
-                        user_id=user_id,
-                        project_id=effective_project_id,
-                        app_id=effective_app_id,
-                        app_target_id=effective_app_target_id,
-                        objective=message,
-                        generation_profile=generation_profile,
-                        metadata=run_metadata,
+                    ),
+                    "user_id": user_id,
+                    "project_id": effective_project_id,
+                    "context_project_hint_id": context_project_hint_id,
+                    "app_id": effective_app_id,
+                    "app_target_id": effective_app_target_id,
+                    "objective": message,
+                    "generation_profile": generation_profile,
+                    "metadata": run_metadata,
+                    "expected_agent_id": expected_agent_id,
+                    "expected_agent_provided": expected_agent_provided,
+                }
+                if payload.client_message_id:
+                    dispatch_result = await agent_run_service.create_or_get_dispatch_turn(
+                        client_message_id=payload.client_message_id,
+                        **dispatch_kwargs,
                     )
-                )
+                else:
+                    dispatch_result = await agent_run_service.create_server_dispatch_turn(
+                        **dispatch_kwargs,
+                    )
+                agent_run, persisted_user_message_id, _created = dispatch_result
             except DispatchConflictError as e:
                 raise HTTPException(
                     status_code=409,
                     detail=str(e),
                 ) from e
             except Exception as e:
+                admission_error = _admission_http_exception(e)
+                if admission_error is not None:
+                    raise admission_error from e
                 logger.exception("Failed to persist atomic conversation dispatch")
                 raise HTTPException(
                     status_code=500,
@@ -1095,6 +1311,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 session_id=session_id,
                 user_id=user_id,
                 project_id=effective_project_id,
+                context_project_hint_id=context_project_hint_id,
                 app_id=effective_app_id,
                 app_target_id=effective_app_target_id,
                 trigger_message_id=persisted_user_message_id,
@@ -1102,8 +1319,13 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                 run_type="chat_turn",
                 generation_profile=generation_profile,
                 metadata=run_metadata,
+                expected_agent_id=expected_agent_id,
+                expected_agent_provided=expected_agent_provided,
             )
         except Exception as e:
+            admission_error = _admission_http_exception(e)
+            if admission_error is not None:
+                raise admission_error from e
             logger.exception("Failed to create agent run for dispatch")
             raise HTTPException(
                 status_code=500,
@@ -1156,7 +1378,7 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             "planning_policy": planning_policy,
             "include_project_context": include_project_context,
             "edit_message_id": payload.edit_message_id,
-            "response_model": response_model,
+            "response_model": response_model_for_turn,
             "client_message_id": payload.client_message_id,
             "command_capabilities": list(command_capabilities),
             "tools_required": payload.tools_required,
@@ -1167,6 +1389,10 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             "attachments": payload.attachments or [],
             "attachment_context": payload.attachment_context,
             "mentions": mentions,
+            "expected_agent_id": (
+                expected_agent_id if expected_agent_provided else "__omitted__"
+            ),
+            "expected_agent_provided": expected_agent_provided,
             "_response_started_at_monotonic": time.monotonic(),
         }
 
@@ -1278,7 +1504,30 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             is_admin=bool(user_info and user_info.get("role") == "admin"),
         ):
             raise HTTPException(status_code=403, detail="Access denied")
+        dialogue_control_receipts = []
+        try:
+            from ...services.agent_run_service import AgentRunService
+
+            dialogue_control_receipts = (
+                await AgentRunService(
+                    config=getattr(server, "config", None),
+                )._apply_agent_dialogue_control_for_session(
+                    session_id=session_id,
+                    owner_user_id=user_id,
+                    action="stop",
+                )
+            )
+        except Exception:
+            # Legacy/ordinary Chat stop remains available while an additive
+            # dialogue ledger is absent or unavailable.  The hook only targets
+            # direct worker sessions and never cancels a root consultation.
+            logger.debug("AgentDialogue stop hook unavailable", exc_info=True)
         result = await server._handle_stop_generation({"session_id": session_id})
+        if dialogue_control_receipts:
+            result = {
+                **result,
+                "agent_dialogue_control": dialogue_control_receipts,
+            }
         return JSONResponse(
             {
                 "success": not bool(result.get("persistence_failed")),

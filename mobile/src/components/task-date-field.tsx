@@ -11,11 +11,20 @@
  *   自動保存の未保存判定（署名比較）を崩さない。
  */
 import React, { useMemo, useState } from "react";
-import { StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import {
+  ScrollView,
+  StyleSheet,
+  useWindowDimensions,
+  View,
+  type StyleProp,
+  type ViewStyle,
+} from "react-native";
 import {
   Button,
   Dialog,
+  Icon,
   IconButton,
+  Switch,
   Portal,
   Text,
   TouchableRipple,
@@ -28,6 +37,11 @@ type TaskDateFieldProps = {
   onChange: (value: string) => void;
   allDay: boolean;
   style?: StyleProp<ViewStyle>;
+  compact?: boolean;
+  onAllDayChange?: (value: boolean) => void;
+  onOpenRecurrence?: () => void;
+  recurrenceLabel?: string;
+  recurrenceDisabled?: boolean;
 };
 
 function pad(value: number): string {
@@ -68,8 +82,15 @@ export function TaskDateField({
   onChange,
   allDay,
   style,
+  compact = false,
+  onAllDayChange,
+  onOpenRecurrence,
+  recurrenceLabel = "なし",
+  recurrenceDisabled = false,
 }: TaskDateFieldProps) {
   const [visible, setVisible] = useState(false);
+  const [localAllDay, setLocalAllDay] = useState(allDay);
+  const { height } = useWindowDimensions();
   const [localDate, setLocalDate] = useState("");
   const [localHour, setLocalHour] = useState(9);
   const [localMinute, setLocalMinute] = useState(0);
@@ -79,6 +100,7 @@ export function TaskDateField({
   const open = () => {
     const parsed = parseValue(value);
     setLocalDate(parsed.date);
+    setLocalAllDay(allDay);
     setLocalHour(parsed.hour);
     setLocalMinute(parsed.minute);
     setVisible(true);
@@ -87,9 +109,10 @@ export function TaskDateField({
   const close = () => setVisible(false);
 
   const commit = () => {
+    if (localAllDay !== allDay) onAllDayChange?.(localAllDay);
     if (!localDate) {
       onChange("");
-    } else if (allDay) {
+    } else if (localAllDay) {
       onChange(localDate);
     } else {
       onChange(`${localDate}T${pad(localHour)}:${pad(localMinute)}`);
@@ -115,112 +138,165 @@ export function TaskDateField({
 
   return (
     <View style={style}>
-      <TouchableRipple onPress={open} style={styles.field} borderless>
-        <View>
-          <Text style={styles.fieldLabel}>{label}</Text>
-          <View style={styles.fieldValueRow}>
+      <TouchableRipple
+        onPress={open}
+        style={[styles.field, compact && styles.compactField]}
+        borderless
+        accessibilityRole="button"
+        accessibilityLabel={`${label}: ${display || "未設定"}`}
+      >
+        {compact ? (
+          <View style={styles.compactRow}>
+            <Icon source="calendar-blank-outline" size={16} color="#9399b2" />
+            <Text style={styles.fieldLabel}>{label}</Text>
             <Text
-              style={[
-                styles.fieldValue,
-                !value && styles.fieldPlaceholder,
-              ]}
+              style={[styles.compactValue, !value && styles.fieldPlaceholder]}
               numberOfLines={1}
             >
               {display || "未設定"}
             </Text>
-            {value ? (
-              <IconButton
-                icon="close"
-                size={16}
-                onPress={() => onChange("")}
-                style={styles.trailingButton}
-                iconColor="#9399b2"
-              />
-            ) : (
-              <IconButton
-                icon="calendar-blank-outline"
-                size={16}
-                disabled
-                style={styles.trailingButton}
-                iconColor="#585b70"
-              />
-            )}
           </View>
-        </View>
+        ) : (
+          <View>
+            <Text style={styles.fieldLabel}>{label}</Text>
+            <View style={styles.fieldValueRow}>
+              <Text
+                style={[styles.fieldValue, !value && styles.fieldPlaceholder]}
+                numberOfLines={1}
+              >
+                {display || "未設定"}
+              </Text>
+              {value ? (
+                <IconButton
+                  icon="close"
+                  size={16}
+                  accessibilityLabel={`${label}をクリア`}
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    onChange("");
+                  }}
+                  style={styles.trailingButton}
+                  iconColor="#9399b2"
+                />
+              ) : (
+                <IconButton
+                  icon="calendar-blank-outline"
+                  size={16}
+                  disabled
+                  style={styles.trailingButton}
+                  iconColor="#585b70"
+                />
+              )}
+            </View>
+          </View>
+        )}
       </TouchableRipple>
 
       <Portal>
         <Dialog visible={visible} onDismiss={close} style={styles.dialog}>
           <Dialog.Title style={styles.dialogTitle}>{label}</Dialog.Title>
-          <Dialog.Content>
-            <Calendar
-              current={localDate || undefined}
-              markedDates={
-                localDate ? { [localDate]: { selected: true } } : {}
-              }
-              onDayPress={(day: { dateString: string }) =>
-                setLocalDate(day.dateString)
-              }
-              firstDay={0}
-              enableSwipeMonths
-              theme={{
-                calendarBackground: "#1e1e2e",
-                monthTextColor: "#cdd6f4",
-                textMonthFontWeight: "bold",
-                textMonthFontSize: 16,
-                arrowColor: "#7c3aed",
-                todayTextColor: "#7c3aed",
-                todayBackgroundColor: "transparent",
-                dayTextColor: "#cdd6f4",
-                textDisabledColor: "#585b70",
-                selectedDayBackgroundColor: "#4c1d95",
-                selectedDayTextColor: "#cdd6f4",
-                textDayFontSize: 14,
-                textDayHeaderFontSize: 12,
-                textSectionTitleColor: "#a6adc8",
-              }}
-            />
-            {!allDay ? (
-              <View style={styles.timeRow}>
-                <Text style={styles.timeLabel}>時刻</Text>
-                <View style={styles.stepper}>
-                  <IconButton
-                    icon="chevron-down"
-                    size={18}
-                    iconColor="#89b4fa"
-                    onPress={() => adjustHour(-1)}
-                    style={styles.stepButton}
-                  />
-                  <Text style={styles.timeValue}>{pad(localHour)}</Text>
-                  <IconButton
-                    icon="chevron-up"
-                    size={18}
-                    iconColor="#89b4fa"
-                    onPress={() => adjustHour(1)}
-                    style={styles.stepButton}
+          <Dialog.ScrollArea style={{ maxHeight: height * 0.65 }}>
+            <ScrollView
+              contentContainerStyle={styles.dialogScroll}
+              keyboardShouldPersistTaps="handled"
+            >
+              {onAllDayChange ? (
+                <View style={styles.scheduleRow}>
+                  <Text style={styles.timeLabel}>終日</Text>
+                  <Switch
+                    accessibilityLabel="終日"
+                    value={localAllDay}
+                    onValueChange={setLocalAllDay}
                   />
                 </View>
-                <Text style={styles.timeColon}>:</Text>
-                <View style={styles.stepper}>
-                  <IconButton
-                    icon="chevron-down"
-                    size={18}
-                    iconColor="#89b4fa"
-                    onPress={() => adjustMinute(-5)}
-                    style={styles.stepButton}
-                  />
-                  <Text style={styles.timeValue}>{pad(localMinute)}</Text>
-                  <IconButton
-                    icon="chevron-up"
-                    size={18}
-                    iconColor="#89b4fa"
-                    onPress={() => adjustMinute(5)}
-                    style={styles.stepButton}
-                  />
+              ) : null}
+              <Calendar
+                current={localDate || undefined}
+                markedDates={
+                  localDate ? { [localDate]: { selected: true } } : {}
+                }
+                onDayPress={(day: { dateString: string }) =>
+                  setLocalDate(day.dateString)
+                }
+                firstDay={0}
+                enableSwipeMonths
+                theme={{
+                  calendarBackground: "#1e1e2e",
+                  monthTextColor: "#cdd6f4",
+                  textMonthFontWeight: "bold",
+                  textMonthFontSize: 16,
+                  arrowColor: "#7c3aed",
+                  todayTextColor: "#7c3aed",
+                  todayBackgroundColor: "transparent",
+                  dayTextColor: "#cdd6f4",
+                  textDisabledColor: "#585b70",
+                  selectedDayBackgroundColor: "#4c1d95",
+                  selectedDayTextColor: "#cdd6f4",
+                  textDayFontSize: 14,
+                  textDayHeaderFontSize: 12,
+                  textSectionTitleColor: "#a6adc8",
+                }}
+              />
+              {!localAllDay ? (
+                <View style={styles.timeRow}>
+                  <Text style={styles.timeLabel}>時刻</Text>
+                  <View style={styles.stepper}>
+                    <IconButton
+                      icon="chevron-down"
+                      size={18}
+                      iconColor="#89b4fa"
+                      onPress={() => adjustHour(-1)}
+                      style={styles.stepButton}
+                    />
+                    <Text style={styles.timeValue}>{pad(localHour)}</Text>
+                    <IconButton
+                      icon="chevron-up"
+                      size={18}
+                      iconColor="#89b4fa"
+                      onPress={() => adjustHour(1)}
+                      style={styles.stepButton}
+                    />
+                  </View>
+                  <Text style={styles.timeColon}>:</Text>
+                  <View style={styles.stepper}>
+                    <IconButton
+                      icon="chevron-down"
+                      size={18}
+                      iconColor="#89b4fa"
+                      onPress={() => adjustMinute(-5)}
+                      style={styles.stepButton}
+                    />
+                    <Text style={styles.timeValue}>{pad(localMinute)}</Text>
+                    <IconButton
+                      icon="chevron-up"
+                      size={18}
+                      iconColor="#89b4fa"
+                      onPress={() => adjustMinute(5)}
+                      style={styles.stepButton}
+                    />
+                  </View>
                 </View>
-              </View>
-            ) : null}
-          </Dialog.Content>
+              ) : null}
+              {onOpenRecurrence ? (
+                <TouchableRipple
+                  accessibilityRole="button"
+                  accessibilityLabel={`繰り返し: ${recurrenceLabel}`}
+                  disabled={recurrenceDisabled}
+                  onPress={() => {
+                    commit();
+                    onOpenRecurrence();
+                  }}
+                >
+                  <View style={styles.scheduleRow}>
+                    <Icon source="repeat" size={18} color="#a6adc8" />
+                    <Text style={styles.scheduleTitle}>繰り返し</Text>
+                    <Text style={styles.timeLabel}>{recurrenceLabel}</Text>
+                    <Icon source="chevron-right" size={18} color="#9399b2" />
+                  </View>
+                </TouchableRipple>
+              ) : null}
+            </ScrollView>
+          </Dialog.ScrollArea>
           <Dialog.Actions>
             <Button onPress={clear} textColor="#f38ba8">
               クリア
@@ -239,6 +315,23 @@ export function TaskDateField({
 }
 
 const styles = StyleSheet.create({
+  compactField: {
+    minHeight: 44,
+    paddingVertical: 0,
+    borderWidth: 0,
+    borderRadius: 8,
+  },
+  compactRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  compactValue: { flex: 1, minWidth: 0, color: "#cdd6f4", fontSize: 13 },
+  dialogScroll: { paddingHorizontal: 16 },
+  scheduleRow: {
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  scheduleTitle: { flex: 1, color: "#cdd6f4", fontSize: 14 },
   field: {
     borderWidth: 1,
     borderColor: "#313244",
@@ -256,7 +349,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   fieldValue: { color: "#cdd6f4", fontSize: 15, flex: 1 },
-  fieldPlaceholder: { color: "#585b70" },
+  fieldPlaceholder: { color: "#9399b2" },
   trailingButton: { margin: 0, marginRight: -6 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },

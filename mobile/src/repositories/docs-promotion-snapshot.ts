@@ -1,6 +1,9 @@
 import type { DocsSqliteAsyncTransaction } from "../db/docs-sync-async";
+import { compareDocsVersions } from "./docs-create-ack";
 
 export const DOCS_PROMOTION_SNAPSHOT_PAGE_SIZE = 256;
+/** Bound pure-JS work without paying one timer turn for every SQLite page. */
+export const DOCS_PROMOTION_CPU_YIELD_INTERVAL = 4_096;
 
 type DocsAuthoritativeLike = Record<string, { ids?: string[] }>;
 
@@ -14,6 +17,9 @@ export type DocsPromotionDirtyRows = {
 export type DocsPromotionMembershipSnapshot = {
   refs: Map<string, number>;
   scoped: Map<string, Set<string>>;
+  readonlyNodes: Set<string>;
+  /** Existing scoped rows whose stored ACL projection needs refreshing. */
+  needsUpsert: Map<string, Set<string>>;
 };
 
 export type DocsPromotionQuarantineMembershipSnapshot = {
@@ -36,11 +42,18 @@ export type DocsPromotionQuarantineOutboxSnapshot = {
 
 type MembershipScanRow = {
   scope_key: string;
+  scope_id: string | null;
+  project_id: string | null;
   table_name: string;
   entity_key: string;
   state: string;
   access: string | null;
   read_only: unknown;
+};
+
+type DocsPromotionTargetScope = {
+  workspace_id?: string;
+  project_id?: string | null;
 };
 
 function sqliteBoolean(value: unknown): boolean {
@@ -67,14 +80,17 @@ function isPromiseLike(value: unknown): value is PromiseLike<void> {
 export async function forEachDocsPromotionChunk<T>(
   items: Iterable<T>,
   handler: (item: T) => void | Promise<void>,
+  assertActive: () => void = () => undefined,
 ): Promise<void> {
   let processed = 0;
+  assertActive();
   for (const item of items) {
     const pending = handler(item);
     if (isPromiseLike(pending)) await pending;
     processed += 1;
-    if (processed % DOCS_PROMOTION_SNAPSHOT_PAGE_SIZE === 0) {
+    if (processed % DOCS_PROMOTION_CPU_YIELD_INTERVAL === 0) {
       await yieldDocsPromotionCpu();
+      assertActive();
     }
   }
 }
@@ -88,19 +104,22 @@ export async function forEachDocsPromotionChunk<T>(
 export async function buildDocsAuthoritativeSets(
   authoritative: DocsAuthoritativeLike,
   tableNames: readonly string[],
+  assertActive: () => void = () => undefined,
 ): Promise<Map<string, Set<string>>> {
   const result = new Map<string, Set<string>>();
   for (const table of tableNames) {
+    assertActive();
     const ids = authoritative[table]?.ids;
     if (ids == null) continue;
     const set = new Set<string>();
     for (let index = 0; index < ids.length; index += 1) {
       set.add(ids[index]);
       if (
-        (index + 1) % DOCS_PROMOTION_SNAPSHOT_PAGE_SIZE === 0 &&
+        (index + 1) % DOCS_PROMOTION_CPU_YIELD_INTERVAL === 0 &&
         index + 1 < ids.length
       ) {
         await yieldDocsPromotionCpu();
+        assertActive();
       }
     }
     result.set(table, set);
@@ -137,7 +156,7 @@ async function scanMembershipRowsTx(
     (cursor) =>
       cursor == null
         ? tx.getAllAsync<MembershipScanRow>(
-            `SELECT scope_key, table_name, entity_key, state, access, read_only
+            `SELECT scope_key, scope_id, project_id, table_name, entity_key, state, access, read_only
                FROM docs_scope_membership
               WHERE auth_scope = ?
               ORDER BY scope_key ASC, table_name ASC, entity_key ASC
@@ -145,7 +164,7 @@ async function scanMembershipRowsTx(
             authScope,
           )
         : tx.getAllAsync<MembershipScanRow>(
-            `SELECT scope_key, table_name, entity_key, state, access, read_only
+            `SELECT scope_key, scope_id, project_id, table_name, entity_key, state, access, read_only
                FROM docs_scope_membership
               WHERE auth_scope = ?
                 AND (scope_key, table_name, entity_key) > (?, ?, ?)
@@ -166,19 +185,75 @@ export async function loadDocsMembershipSnapshotTx(
   tx: DocsSqliteAsyncTransaction,
   authScope: string,
   scopeKey: string,
+  scopeMeta?: {
+    workspace_id?: string;
+    project_id?: string | null;
+    access?: string;
+    read_only?: boolean;
+  },
+  assertActive: () => void = () => undefined,
+  targetScope?: DocsPromotionTargetScope,
 ): Promise<DocsPromotionMembershipSnapshot> {
   const refs = new Map<string, number>();
   const scoped = new Map<string, Set<string>>();
+  const readonlyNodes = new Set<string>();
+  const needsUpsert = new Map<string, Set<string>>();
+  const markNeedsUpsert = (table: string, key: string): void => {
+    const rows = needsUpsert.get(table) ?? new Set<string>();
+    rows.add(key);
+    needsUpsert.set(table, rows);
+  };
+  const membershipNeedsRefresh = (
+    row: MembershipScanRow,
+    desiredState: string,
+  ): boolean => {
+    // The membership identity is scoped by scope_key, but the UPSERT also
+    // refreshes the target scope metadata.  Prefer the target identity passed
+    // independently from the ACL projection; the scopeMeta fallback keeps
+    // older compatibility callers working when they provide both together.
+    const targetScopeId = targetScope
+      ? targetScope.workspace_id
+      : scopeMeta?.workspace_id;
+    const targetProjectId = targetScope
+      ? targetScope.project_id ?? null
+      : scopeMeta?.project_id ?? null;
+    const metadataNeedsRefresh = Boolean(targetScopeId)
+      && (row.scope_id !== targetScopeId
+        || (row.project_id ?? null) !== targetProjectId);
+    const desiredAccess = desiredState === "readonly" ? "read" : scopeMeta?.access ?? null;
+    const desiredReadOnly = desiredState === "readonly"
+      ? 1
+      : scopeMeta?.read_only == null ? null : scopeMeta.read_only ? 1 : 0;
+    const currentReadOnly = row.read_only == null ? null : sqliteBoolean(row.read_only) ? 1 : 0;
+    return metadataNeedsRefresh
+      || row.state !== desiredState
+      || row.access !== desiredAccess
+      || currentReadOnly !== desiredReadOnly;
+  };
+  assertActive();
   await scanMembershipRowsTx(tx, authScope, (row) => {
     if (row.state === "deleted") return;
     const refKey = `${row.table_name}:${row.entity_key}`;
     refs.set(refKey, (refs.get(refKey) ?? 0) + 1);
+    // Shared live-row deletion needs account-wide refs; ACL projection is
+    // owned by the requested scope and must not inherit a sibling's state.
     if (row.scope_key !== scopeKey) return;
+    if (row.table_name === "knowledge_nodes" && (
+      row.state !== "active" || sqliteBoolean(row.read_only) || row.access === "read"
+    )) {
+      readonlyNodes.add(row.entity_key);
+    }
+    const desiredState = row.table_name === "knowledge_nodes" && readonlyNodes.has(row.entity_key)
+      ? "readonly"
+      : "active";
+    if (membershipNeedsRefresh(row, desiredState)) {
+      markNeedsUpsert(row.table_name, row.entity_key);
+    }
     const bucket = scoped.get(row.table_name) ?? new Set<string>();
     bucket.add(row.entity_key);
     scoped.set(row.table_name, bucket);
   });
-  return { refs, scoped };
+  return { refs, scoped, readonlyNodes, needsUpsert };
 }
 
 export async function loadDocsQuarantineMembershipSnapshotTx(
@@ -256,6 +331,59 @@ export async function loadDocsScopedOutboxProtectionTx(
     },
   );
   return protection;
+}
+
+/** An authoritative pull cannot tombstone an unsent create in this writable scope. */
+export async function loadDocsPendingNodeCreatesTx(
+  tx: DocsSqliteAsyncTransaction,
+  authScope: string,
+  scopeKey: string,
+  workspaceId: string,
+  projectId: string | null,
+  snapshotServerTime?: string | null,
+): Promise<Set<string>> {
+  const ids = new Set<string>();
+  type Row = { op_id: string; entity_id: string };
+  await forEachSnapshotPage<Row>(
+    (cursor) => tx.getAllAsync<Row>(
+      `SELECT o.op_id, o.entity_id FROM outbox o
+         JOIN knowledge_nodes n ON n.id = o.entity_id
+         JOIN docs_scope_membership m ON m.auth_scope = o.auth_scope
+          AND m.scope_key = o.docs_scope_key AND m.table_name = o.table_name
+          AND m.entity_key = o.entity_id
+        WHERE o.auth_scope = ? AND o.docs_scope_key = ?
+          AND o.table_name = 'knowledge_nodes' AND o.action = 'create'
+          AND n.workspace_id = ? AND n.project_id IS ?
+          AND n.read_only = 0 AND n.access IN ('owner', 'write')
+          AND m.state = 'active' AND m.read_only = 0 AND m.access IN ('owner', 'write')
+          ${cursor ? "AND o.op_id > ?" : ""}
+        ORDER BY o.op_id ASC LIMIT ${DOCS_PROMOTION_SNAPSHOT_PAGE_SIZE}`,
+      authScope, scopeKey, workspaceId, projectId,
+      ...(cursor ? [cursor.op_id] : []),
+    ),
+    (row) => row.op_id,
+    (row) => { ids.add(row.entity_id); },
+  );
+  if (Number.isFinite(Date.parse(snapshotServerTime ?? ""))) {
+    await forEachSnapshotPage<{ id: string; created_at: string }>(
+      (cursor) => tx.getAllAsync<{ id: string; created_at: string }>(
+        `SELECT n.id, n.created_at FROM knowledge_nodes n JOIN docs_scope_membership m ON m.entity_key = n.id
+          WHERE m.auth_scope = ? AND m.scope_key = ? AND m.table_name = 'knowledge_nodes'
+            AND m.state = 'active' AND m.read_only = 0 AND m.access IN ('owner', 'write')
+            AND n.workspace_id = ? AND n.project_id IS ?
+            AND n.created_by = ? AND n.server_updated_at IS NOT NULL
+            AND julianday(n.created_at) >= julianday(?)
+            AND n.read_only = 0 AND n.access IN ('owner', 'write')
+            ${cursor ? "AND n.id > ?" : ""}
+          ORDER BY n.id ASC LIMIT ${DOCS_PROMOTION_SNAPSHOT_PAGE_SIZE}`,
+        authScope, scopeKey, workspaceId, projectId, authScope.slice("auth:".length), snapshotServerTime!,
+        ...(cursor ? [cursor.id] : []),
+      ),
+      (row) => row.id,
+      (row) => { if (compareDocsVersions(row.created_at, snapshotServerTime!) === 1) ids.add(row.id); },
+    );
+  }
+  return ids;
 }
 
 export async function loadDocsQuarantineOutboxSnapshotTx(

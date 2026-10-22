@@ -5,6 +5,13 @@ import { CalendarDays, MessageSquare, Search, UserRound } from "lucide-react";
 import type { ConversationSearchResult } from "@/lib/chat-api";
 import { chatApi } from "@/lib/chat-api";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { MediaSearchPanel } from "@/components/chat/media-search-panel";
+import {
+  filterChatSearchResults,
+  readChatHistoryStatusFilter,
+  type ChatHistoryStatusFilter,
+} from "@/lib/chat-session-view";
 import {
   Command,
   CommandDialog,
@@ -19,6 +26,9 @@ type ConversationSearchDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   projectId?: string | null;
+  spaceId?: string | null;
+  sessionId?: string | null;
+  messageId?: string | null;
   onSelectResult: (result: ConversationSearchResult) => void;
 };
 
@@ -40,16 +50,30 @@ function formatResultDate(value?: string | null) {
   }).format(date);
 }
 
-export function ConversationSearchDialog({
+export function ConversationSearchDialog(props: ConversationSearchDialogProps) {
+  // Unmount also clears in-flight state when another caller closes the dialog.
+  return props.open ? <ConversationSearchDialogContent {...props} /> : null;
+}
+
+function ConversationSearchDialogContent({
   open,
   onOpenChange,
   projectId,
+  spaceId,
+  sessionId,
+  messageId,
   onSelectResult,
 }: ConversationSearchDialogProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<ConversationSearchResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [projectOnly, setProjectOnly] = useState(false);
+  const [historyStatus, setHistoryStatus] =
+    useState<ChatHistoryStatusFilter>(
+      () => readChatHistoryStatusFilter() ?? "all",
+    );
+  const [tab, setTab] = useState("conversation");
+  const [resultsKey, setResultsKey] = useState("");
   const requestIdRef = useRef(0);
 
   const handleOpenChange = useCallback(
@@ -59,6 +83,9 @@ export function ConversationSearchDialog({
         setQuery("");
         setResults([]);
         setIsLoading(false);
+        setTab("conversation");
+      } else {
+        setHistoryStatus(readChatHistoryStatusFilter() ?? "all");
       }
       onOpenChange(nextOpen);
     },
@@ -66,7 +93,7 @@ export function ConversationSearchDialog({
   );
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || tab !== "conversation") return;
     const trimmed = query.trim();
     const requestId = ++requestIdRef.current;
 
@@ -80,7 +107,12 @@ export function ConversationSearchDialog({
         .searchConversations(trimmed, projectOnly ? projectId : null)
         .then((data) => {
           if (requestIdRef.current !== requestId) return;
-          setResults(data.results);
+          setResults(filterChatSearchResults(data.results, historyStatus));
+          setResultsKey(JSON.stringify([
+            trimmed,
+            projectOnly ? projectId : null,
+            historyStatus,
+          ]));
         })
         .catch(() => {
           if (requestIdRef.current !== requestId) return;
@@ -93,30 +125,41 @@ export function ConversationSearchDialog({
         });
     }, 180);
 
-    return () => window.clearTimeout(timer);
-  }, [open, projectId, projectOnly, query]);
+    return () => { window.clearTimeout(timer); requestIdRef.current += 1; };
+  }, [historyStatus, open, projectId, projectOnly, query, tab]);
 
   const emptyLabel = useMemo(() => {
     if (!query.trim()) return "検索語を入力してください";
     if (isLoading) return "検索中...";
     return "見つかりません";
   }, [isLoading, query]);
-  const visibleResults = query.trim() ? results : [];
+  const visibleResults = query.trim() && resultsKey === JSON.stringify([
+    query.trim(),
+    projectOnly ? projectId : null,
+    historyStatus,
+  ]) ? results : [];
 
   return (
     <CommandDialog
       open={open}
       onOpenChange={handleOpenChange}
-      title="会話履歴検索"
-      description="会話履歴を検索します"
+      title="会話・資料検索"
+      description="会話履歴と添付を手がかりにDocs・Knowledge・会話・資料を検索します"
       size="2xl"
+      className="top-[10dvh] max-h-[80dvh]"
     >
       <Command shouldFilter={false}>
+        <Tabs className="min-h-0" value={tab} onValueChange={(value) => setTab(String(value))}>
+          <TabsList className="mx-2 mt-2" aria-label="検索対象">
+            <TabsTrigger value="conversation">会話</TabsTrigger>
+            <TabsTrigger value="media">添付・統合検索</TabsTrigger>
+          </TabsList>
         <CommandInput
-          placeholder="会話履歴を検索..."
+          placeholder={tab === "conversation" ? "会話履歴を検索..." : "画像・音声・資料などを検索..."}
           value={query}
           onValueChange={setQuery}
         />
+        <TabsContent value="conversation">
         {projectId && (
           <div className="flex items-center gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
             <Checkbox
@@ -181,6 +224,11 @@ export function ConversationSearchDialog({
             </CommandGroup>
           )}
         </CommandList>
+        </TabsContent>
+        <TabsContent value="media">
+          {open && tab === "media" && <MediaSearchPanel open={open} query={query} projectId={projectId} spaceId={spaceId} sessionId={sessionId} messageId={messageId} />}
+        </TabsContent>
+        </Tabs>
       </Command>
     </CommandDialog>
   );

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
@@ -18,6 +18,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   MenuMnemonicButton,
   MenuMnemonicSurface,
@@ -85,7 +86,7 @@ export function TrashMainView({
         ゴミ箱
         <span className="text-xs font-normal text-muted-foreground">{archivedNodes.length} 件</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
+      <div className="min-h-0 flex-1 overflow-auto px-6 py-5" data-docs-history-main-scroll="main">
         {archivedNodes.length === 0 ? (
           <div className="rounded-md border border-dashed border-border p-8 text-center text-sm text-muted-foreground">ゴミ箱は空です</div>
         ) : (
@@ -120,17 +121,45 @@ export function TrashMainView({
   );
 }
 
+const SEARCH_NODE_TAG_PAGE_SIZE = 40;
+
 export function SearchNodesMainView({
   tags,
   searchNodes,
   onCreateSearchNode,
   onOpenNode,
+  tagFilter: controlledTagFilter,
+  onTagFilterChange,
+  visibleTagCount: controlledVisibleTagCount,
+  onLoadMoreTags,
 }: {
   tags: DocsSupertag[];
   searchNodes: DocsNode[];
   onCreateSearchNode: (tag: DocsSupertag) => void;
   onOpenNode: (nodeId: string) => void;
+  tagFilter?: string;
+  onTagFilterChange?: (value: string) => void;
+  visibleTagCount?: number;
+  onLoadMoreTags?: () => void;
 }) {
+  const [localTagFilter, setLocalTagFilter] = useState("");
+  const [localVisibleTagCount, setLocalVisibleTagCount] = useState(SEARCH_NODE_TAG_PAGE_SIZE);
+  const tagFilter = controlledTagFilter ?? localTagFilter;
+  const visibleTagCount = controlledVisibleTagCount ?? localVisibleTagCount;
+  const updateTagFilter = (value: string) => {
+    if (onTagFilterChange) onTagFilterChange(value);
+    else {
+      setLocalTagFilter(value);
+      setLocalVisibleTagCount(SEARCH_NODE_TAG_PAGE_SIZE);
+    }
+  };
+  const loadMoreTags = () => {
+    if (onLoadMoreTags) onLoadMoreTags();
+    else setLocalVisibleTagCount((count) => count + SEARCH_NODE_TAG_PAGE_SIZE);
+  };
+  const normalizedTagFilter = tagFilter.trim().toLowerCase();
+  const filteredTags = tags.filter((tag) => tag.name.toLowerCase().includes(normalizedTagFilter));
+  const visibleTags = filteredTags.slice(0, visibleTagCount);
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background">
       <div className="flex h-14 items-center justify-between border-b border-border px-6">
@@ -141,7 +170,7 @@ export function SearchNodesMainView({
         </div>
         <span className="rounded border border-primary/30 bg-primary/5 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-primary">Live query</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
+      <div className="min-h-0 flex-1 overflow-auto px-6 py-5" data-docs-history-main-scroll="main">
         <div className="mx-auto w-full max-w-4xl space-y-5">
           <div className="space-y-2">
             <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -149,14 +178,40 @@ export function SearchNodesMainView({
               <span>タグから検索ノードを作成</span>
               <span className="h-px flex-1 bg-border" />
             </div>
+            <div className="flex items-center gap-2">
+              <Input
+                placeholder="タグ名で検索"
+                aria-label="検索ノード用のタグを検索"
+                value={tagFilter}
+                onChange={(event) => updateTagFilter(event.target.value)}
+              />
+              {tagFilter ? (
+                <Button type="button" variant="ghost" aria-label="タグ検索をクリア" onClick={() => updateTagFilter("")}>
+                  クリア
+                </Button>
+              ) : null}
+            </div>
+            <div aria-live="polite" className="text-xs text-muted-foreground">
+              {visibleTags.length} / {filteredTags.length} 件
+            </div>
+            {filteredTags.length === 0 ? (
+              <div role="status" className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+                {tags.length === 0 ? "タグはまだありません" : "一致するタグはありません"}
+              </div>
+            ) : null}
             <div className="grid gap-2 sm:grid-cols-2">
-              {tags.slice(0, 40).map((tag) => (
+              {visibleTags.map((tag) => (
                 <button key={tag.id} type="button" onClick={() => onCreateSearchNode(tag)} className="flex w-full items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-left text-sm transition-colors hover:border-primary/50 hover:bg-muted/50">
                   <ListFilter className="size-4 shrink-0 text-muted-foreground" />
                   <span className="truncate">List of <span className="text-primary">#{tag.name}</span></span>
                 </button>
               ))}
             </div>
+            {visibleTags.length < filteredTags.length ? (
+              <Button type="button" variant="outline" size="sm" onClick={loadMoreTags}>
+                タグをさらに表示
+              </Button>
+            ) : null}
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -278,9 +333,9 @@ export function DocsSidebarNode({
         >
           {node.node_type === "search" ? (
             <ListFilter className="size-3.5 shrink-0 text-primary" />
-          ) : (
+          ) : depth > 0 ? (
             <Hash className="size-3.5 shrink-0 text-muted-foreground" />
-          )}
+          ) : null}
           <span className="truncate">{nodeText(node)}</span>
           {node.node_type === "search" ? (
             <span className="shrink-0 rounded border border-primary/40 bg-primary/5 px-1.5 py-0.5 text-[10px] font-medium text-primary">

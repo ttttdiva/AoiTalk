@@ -7,6 +7,7 @@ import inspect
 
 from ..server_shared import *  # noqa: F401,F403
 from ...features import Features
+from ..public_base_path import public_cookie_path
 
 
 class AuthMixin:
@@ -1321,6 +1322,7 @@ class AuthMixin:
             samesite="lax",
             secure=secure,
             max_age=self.session_ttl_seconds,
+            path=public_cookie_path(),
         )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> bool:

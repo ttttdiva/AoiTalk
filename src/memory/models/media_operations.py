@@ -33,6 +33,8 @@ class MediaPlatform(str, Enum):
     PATREON = "patreon"
     YOUTUBE = "youtube"
     INSTAGRAM = "instagram"
+    FANZA = "fanza"
+    TIKTOK = "tiktok"
 
 
 MEDIA_PLATFORM_VALUES = tuple(platform.value for platform in MediaPlatform)
@@ -44,6 +46,8 @@ _PLATFORM_COLUMNS: tuple[tuple[MediaPlatform, str], ...] = (
     (MediaPlatform.PATREON, "platform_patreon"),
     (MediaPlatform.YOUTUBE, "platform_youtube"),
     (MediaPlatform.INSTAGRAM, "platform_instagram"),
+    (MediaPlatform.FANZA, "platform_fanza"),
+    (MediaPlatform.TIKTOK, "platform_tiktok"),
 )
 
 
@@ -198,6 +202,8 @@ class PersonaRevision(Base):
     platform_patreon = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     platform_youtube = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     platform_instagram = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    platform_fanza = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    platform_tiktok = Column(Boolean, nullable=False, default=False, server_default=text("false"))
 
     content_pillars_json = Column(
         "content_pillars",
@@ -354,7 +360,7 @@ class PersonaResource(Base):
         ),
         CheckConstraint(
             "platform IS NULL OR platform IN "
-            "('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')",
+            "('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')",
             name="ck_media_persona_resources_platform",
         ),
         CheckConstraint(

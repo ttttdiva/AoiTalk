@@ -12,6 +12,7 @@ import json
 import re
 import time
 from datetime import datetime
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from ...llm.agentic_completion import (
@@ -21,6 +22,7 @@ from ...llm.agentic_completion import (
     requested_deterministic_task_mutation_tools,
     response_looks_like_unfinished_work,
 )
+from ...llm.generation_error import GenerationFailure
 from ...llm.context_snapshot import sanitize_context_snapshot
 from ...llm.tool_policy import (
     DOCS_MUTATION_TOOL_NAMES,
@@ -30,6 +32,7 @@ from ...llm.tool_policy import (
 )
 from ...services.agent_run_service import (
     AgentRunService,
+    PreproviderFailureProof,
     sanitize_assistant_display_text,
     sanitize_durable_error_text,
     sanitize_stream_display_payload,
@@ -392,7 +395,7 @@ def _client_tool_calls(client) -> list[Any]:
 async def _peek_client_agent_run_state(
     client,
     run_id: str | None,
-) -> tuple[list[Any], dict[str, int] | None, str] | None:
+) -> tuple[list[Any], dict[str, Any] | None, str] | None:
     """Peek at provider run state so DB failures remain retryable."""
 
     if _is_isolated_controller_turn():
@@ -418,8 +421,21 @@ async def _peek_client_agent_run_state(
     raw_usage = state.get("usage")
     if not isinstance(raw_usage, dict):
         return tool_calls, None, str(state.get("failure") or "")
-    usage: dict[str, int] = {}
-    for key in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+    dialogue_usage = getattr(client, "_agent_dialogue_usage", None)
+    if isinstance(dialogue_usage, dict):
+        # A native completed-state snapshot may have been published before a
+        # nested specialist finished.  The shared dialogue ledger is the
+        # current canonical cumulative receipt for this parent turn.
+        raw_usage = {**raw_usage, **dialogue_usage}
+    usage: dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "total_tokens",
+        "cost_micros",
+    ):
         value = raw_usage.get(key)
         if value is None:
             continue
@@ -427,10 +443,25 @@ async def _peek_client_agent_run_state(
             usage[key] = max(0, int(value))
         except (TypeError, ValueError):
             continue
+    if isinstance(raw_usage.get("output_includes_reasoning"), bool):
+        usage["output_includes_reasoning"] = raw_usage[
+            "output_includes_reasoning"
+        ]
+    if raw_usage.get("total_tokens_source") in {"reported", "derived"}:
+        usage["total_tokens_source"] = raw_usage["total_tokens_source"]
     if usage:
+        reasoning_is_separate = not bool(
+            usage.get("output_includes_reasoning", False)
+        )
         usage.setdefault(
             "total_tokens",
-            usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + (
+                usage.get("reasoning_tokens", 0)
+                if reasoning_is_separate
+                else 0
+            ),
         )
     return tool_calls, usage or None, str(state.get("failure") or "")
 
@@ -478,6 +509,62 @@ def _client_tool_loop_failed(client) -> bool:
         getattr(client, "_last_turn_tool_loop_failed", False)
         or _client_tool_rounds_exhausted(client)
     )
+
+
+def _client_generation_failure(client) -> GenerationFailure | None:
+    """Read a provider-owned failure marker without inferring from reply text."""
+
+    if _is_isolated_controller_turn() or client is None:
+        return None
+    for attribute in (
+        "generation_failure",
+        "last_generation_failure",
+        "_last_generation_failure",
+        "_generation_failure",
+    ):
+        marker = getattr(client, attribute, None)
+        if isinstance(marker, GenerationFailure):
+            return marker
+    getter = getattr(client, "get_generation_failure", None)
+    if callable(getter):
+        try:
+            marker = getter()
+        except Exception:
+            return None
+        if isinstance(marker, GenerationFailure):
+            return marker
+    return None
+
+
+def _safe_preprovider_failure_proof(
+    value: Any,
+    *,
+    run_id: str,
+) -> dict[str, Any] | None:
+    """Keep only the server-owned proof for a zero-sender local failure."""
+
+    if not isinstance(value, PreproviderFailureProof):
+        return None
+    if value.run_id != str(run_id):
+        return None
+    if value.provider_started is not False or value.sender_attempts != 0:
+        return None
+    proof_id = value.proof_id
+    if not re.fullmatch(r"[0-9a-f]{32}", proof_id):
+        return None
+    request_type = value.request_type
+    if request_type not in {"chat", "stream", "retry", "tool"}:
+        return None
+    if value.safe_error_code != "agent_dialogue_provider_not_started":
+        return None
+    return {
+        "run_id": str(run_id),
+        "proof_id": proof_id,
+        "provider_started": False,
+        "sender_attempts": 0,
+        "request_type": request_type,
+        "safe_error_code": "agent_dialogue_provider_not_started",
+    }
 
 
 def _client_context_snapshot(client) -> dict[str, Any] | None:
@@ -534,7 +621,7 @@ def _client_context_manifest_ref(client) -> dict[str, Any] | None:
         }
     except Exception:
         return None
-def _client_agent_run_usage(client) -> dict[str, int] | None:
+def _client_agent_run_usage(client) -> dict[str, Any] | None:
     """Return the client-side confirmed usage accumulated for this AgentRun."""
     if _is_isolated_controller_turn():
         return None
@@ -545,16 +632,20 @@ def _client_agent_run_usage(client) -> dict[str, int] | None:
         metadata = getter() or {}
         if not isinstance(metadata, dict):
             return None
-        raw_usage = metadata.get("agent_run_usage")
+        raw_usage = getattr(client, "_agent_dialogue_usage", None)
+        if not isinstance(raw_usage, dict):
+            raw_usage = metadata.get("agent_run_usage")
         if not isinstance(raw_usage, dict):
             return None
 
-        usage: dict[str, int] = {}
+        usage: dict[str, Any] = {}
         for key in (
             "input_tokens",
             "output_tokens",
+            "reasoning_tokens",
             "cached_tokens",
             "total_tokens",
+            "cost_micros",
         ):
             value = raw_usage.get(key)
             if value is None:
@@ -563,11 +654,28 @@ def _client_agent_run_usage(client) -> dict[str, int] | None:
                 usage[key] = max(0, int(value))
             except (TypeError, ValueError):
                 continue
+        if isinstance(raw_usage.get("output_includes_reasoning"), bool):
+            usage["output_includes_reasoning"] = raw_usage[
+                "output_includes_reasoning"
+            ]
+        if raw_usage.get("total_tokens_source") in {"reported", "derived"}:
+            usage["total_tokens_source"] = raw_usage["total_tokens_source"]
         if not usage:
             return None
+        if raw_usage.get("usage_state") in {"known", "unknown"}:
+            usage["usage_state"] = raw_usage["usage_state"]
+        reasoning_is_separate = not bool(
+            usage.get("output_includes_reasoning", False)
+        )
         usage.setdefault(
             "total_tokens",
-            usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + (
+                usage.get("reasoning_tokens", 0)
+                if reasoning_is_separate
+                else 0
+            ),
         )
         return usage
     except Exception:
@@ -635,6 +743,17 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     if error is not None:
         error = str(error)
 
+    blocked_reason = value(
+        "blocked_reason",
+        "blocking_reason",
+        "policy_reason",
+        default=None,
+    )
+    if blocked_reason is None and isinstance(result_object, dict):
+        blocked_reason = result_object.get("blocked_reason")
+    if blocked_reason is not None:
+        blocked_reason = str(blocked_reason)
+
     explicit_success = value("successful", "success", default=None)
     if isinstance(result_object, dict):
         if explicit_success is None:
@@ -666,6 +785,21 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         # Never let a contradictory provider marker (successful=True plus an
         # error/failure field) become authoritative completion evidence.
         successful = False
+    explicit_failure = (
+        isinstance(explicit_success, bool)
+        and explicit_success is False
+    ) or (
+        explicit_success is not None
+        and str(explicit_success).strip().casefold()
+        in {"0", "false", "no", "failed", "failure", "error"}
+    )
+    if explicit_failure and not error and str(result).strip():
+        # An explicit provider failure is authoritative even when the legacy
+        # producer omitted its separate error field. Preserve the bounded
+        # result text as diagnostic evidence; do not use this for records that
+        # lack an explicit status marker, so legacy successful prose keeps its
+        # historical compatibility behavior.
+        error = str(result)
     if isinstance(result_object, dict):
         result_success = result_object.get("success")
         if result_success is not None and str(result_success).strip().casefold() not in {
@@ -691,8 +825,21 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         metadata = {}
     else:
         metadata = dict(metadata)
+    # Execution provenance is framework-owned and must survive the
+    # compatibility record projection. Keep it in bounded metadata so the
+    # durable AgentRun row can distinguish an actual provider execution from
+    # a synthetic/not-executed model transcript result.
+    for provenance_key in ("executed", "synthetic"):
+        provenance_value = value(provenance_key, default=None)
+        if isinstance(provenance_value, bool):
+            metadata.setdefault(provenance_key, provenance_value)
+    intent_digest = value("arguments_digest", default=None)
+    if isinstance(intent_digest, str) and intent_digest.strip():
+        metadata.setdefault("arguments_digest", intent_digest.strip())
     if error:
         metadata.setdefault("error", error)
+    if blocked_reason:
+        metadata.setdefault("blocked_reason", blocked_reason)
 
     safe_payload = sanitize_tool_audit_payload(
         {
@@ -701,6 +848,7 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
             "result": result,
             "successful": bool(successful),
             "error": error,
+            "blocked_reason": blocked_reason,
             "tool_call_id": normalized_tool_call_id,
         }
     )
@@ -725,6 +873,7 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         "result": safe_result,
         "successful": bool(successful),
         "error": safe_payload.get("error"),
+        "blocked_reason": safe_payload.get("blocked_reason"),
         "metadata": sanitize_tool_audit_payload(metadata),
         "tool_call_id": str(safe_payload.get("tool_call_id") or normalized_tool_call_id or "") or None,
         "already_recorded": bool(
@@ -1380,7 +1529,22 @@ class AgentRunEventEmitter:
         # emitter so terminal completion does not issue a second mutation.
         self._already_recorded_tool_ids: set[str] = set()
         self._already_recorded_tool_signatures: set[str] = set()
-        self._event_tool_call_ids_by_signature: dict[str, str] = {}
+        # A signature can identify one legacy event only while it is unique.
+        # Once two explicit IDs share the same tool/arguments, None marks
+        # the signature ambiguous and prevents a later ID-less record from
+        # being incorrectly assigned to whichever ID arrived last.
+        self._event_tool_call_ids_by_signature: dict[str, str | None] = {}
+        # Set when the assistant reply of this turn could not be stored.  A
+        # generated-but-unsaved reply is a failed turn, never a success.
+        self.assistant_persistence_failure: str | None = None
+
+    def record_assistant_persistence_failure(self, detail: str) -> None:
+        """Mark this turn failed because its assistant reply was not saved."""
+
+        self.assistant_persistence_failure = (
+            sanitize_durable_error_text(str(detail or "unknown"))
+            or "unknown"
+        )
 
     @staticmethod
     def _model_context(client) -> dict[str, Any]:
@@ -1400,6 +1564,17 @@ class AgentRunEventEmitter:
             or getattr(client, "model_name", None)
             or getattr(client, "model", None)
         )
+        # Chat Agent turns carry an immutable route projection on their
+        # request-scoped client.  Prefer it for run start metadata so the
+        # durable audit cannot report the process-wide Character/Main route.
+        agent_route = getattr(client, "_agent_route", None)
+        if isinstance(agent_route, dict):
+            provider = agent_route.get("provider") or provider
+            model = agent_route.get("model") or model
+            route_source = (
+                str(agent_route.get("route_source") or "agent_revision").strip()
+                or "agent_revision"
+            )
         if str(model or "").strip().lower() == "default":
             model = None
         # The generation client already records the additive effective-route
@@ -1485,8 +1660,17 @@ class AgentRunEventEmitter:
                     payload.setdefault("operation_id", correlation)
                     payload.setdefault("tool_call_id", correlation)
                     tool_result.setdefault("tool_call_id", correlation)
+                if "success" not in tool_result and isinstance(
+                    payload.get("success"), bool
+                ):
+                    tool_result["success"] = payload["success"]
                 if "success" not in tool_result and "error" in tool_result:
                     tool_result["success"] = not bool(tool_result.get("error"))
+                if (
+                    "blocked_reason" not in tool_result
+                    and payload.get("blocked_reason")
+                ):
+                    tool_result["blocked_reason"] = payload["blocked_reason"]
                 if payload.get("error") and not tool_result.get("error"):
                     tool_result["error"] = payload.get("error")
                 payload["tool_result"] = tool_result
@@ -1523,6 +1707,11 @@ class AgentRunEventEmitter:
         status: str | None = None,
         message_text: str | None = None,
     ) -> None:
+        if event_type == "stream.memory_selection_progress":
+            # Shared AgentRun audit/timelines cannot disclose the sender's
+            # private memory counts or Jev state. The owner-only inspector
+            # persists the bounded observation on the assistant row instead.
+            return
         if not self._agent_run_service:
             return
         payload = self._event_payload(event_type, data or {})
@@ -1537,14 +1726,24 @@ class AgentRunEventEmitter:
                 ).strip()
                 signature = _agent_run_tool_operation_signature(payload)
                 if operation_id:
-                    self._event_tool_call_ids_by_signature[signature] = operation_id
+                    if signature not in self._event_tool_call_ids_by_signature:
+                        self._event_tool_call_ids_by_signature[signature] = operation_id
+                    elif (
+                        self._event_tool_call_ids_by_signature[signature]
+                        and self._event_tool_call_ids_by_signature[signature]
+                        != operation_id
+                    ):
+                        self._event_tool_call_ids_by_signature[signature] = None
                 already_recorded = bool(
                     payload.get("tool_result_already_recorded")
                 )
                 if already_recorded:
                     if operation_id:
                         self._already_recorded_tool_ids.add(operation_id)
-                    self._already_recorded_tool_signatures.add(signature)
+                    else:
+                        # Signature fallback is safe only for legacy events
+                        # that carried no explicit identity at all.
+                        self._already_recorded_tool_signatures.add(signature)
         try:
             safe_message_text = (
                 sanitize_assistant_display_text(message_text)
@@ -1581,6 +1780,7 @@ class AgentRunEventEmitter:
                 continue
             signature = _agent_run_tool_operation_signature(payload)
             event_tool_call_id = self._event_tool_call_ids_by_signature.get(signature)
+            source_tool_call_id = str(payload.get("tool_call_id") or "").strip()
             if not payload["tool_call_id"] and event_tool_call_id:
                 payload["tool_call_id"] = event_tool_call_id
             tool_call_id = _agent_run_tool_call_id(
@@ -1590,7 +1790,10 @@ class AgentRunEventEmitter:
             )
             if payload["already_recorded"] or (
                 tool_call_id in self._already_recorded_tool_ids
-                or signature in self._already_recorded_tool_signatures
+                or (
+                    not source_tool_call_id
+                    and signature in self._already_recorded_tool_signatures
+                )
             ):
                 continue
             persisted_tool_call = await self._agent_run_service.record_tool_call(
@@ -1704,6 +1907,7 @@ class AgentRunEventEmitter:
             successful_mutation_tool_count = _successful_mutation_tool_call_count(
                 tool_calls
             )
+            client_failure = _client_generation_failure(client)
             mutation_evidence = (
                 authoritative_mutation_completion_evidence(
                     tool_calls,
@@ -1726,20 +1930,38 @@ class AgentRunEventEmitter:
             completion_metadata = {"usage": usage} if usage else None
             if usage:
                 result_payload["usage"] = usage
+            if client_failure is not None:
+                result_payload["generation_failure"] = {
+                    "kind": str(client_failure.kind or "unknown")[:64],
+                    "technical_detail": sanitize_durable_error_text(
+                        client_failure.technical_detail
+                    ),
+                }
             if mutation_evidence is not None:
                 # Keep the provider-side finalization failure observable while
                 # allowing the already-proven mutation to complete the run.
                 # Tool-level failed records are persisted above and remain
                 # available to the audit/UI timeline.
                 result_payload["authoritative_mutation"] = mutation_evidence
-                if run_state is not None and run_state[2]:
-                    result_payload["provider_finalization_failure"] = (
-                        sanitize_durable_error_text(run_state[2])
+                provider_failure_detail = (
+                    run_state[2]
+                    if run_state is not None and run_state[2]
+                    else (
+                        client_failure.technical_detail
+                        if client_failure is not None
+                        else ""
                     )
-            failure_message = (
-                run_state[2]
-                if run_state is not None and run_state[2]
-                else _agent_run_completion_failure_message(
+                )
+                if provider_failure_detail:
+                    result_payload["provider_finalization_failure"] = (
+                        sanitize_durable_error_text(provider_failure_detail)
+                    )
+            if run_state is not None and run_state[2]:
+                failure_message = run_state[2]
+            elif client_failure is not None:
+                failure_message = client_failure.technical_detail
+            else:
+                failure_message = _agent_run_completion_failure_message(
                     user_input=self._user_input,
                     reply=reply,
                     search_tool_result_count=len(self._search_tool_results),
@@ -1748,9 +1970,18 @@ class AgentRunEventEmitter:
                     tool_rounds_exhausted=_client_tool_rounds_exhausted(client),
                     tool_loop_failed=_client_tool_loop_failed(client),
                 )
-            )
             if mutation_evidence is not None:
                 failure_message = None
+            if self.assistant_persistence_failure:
+                # The reply exists only in the stream; the conversation lost
+                # it.  Record the run as failed with the durable reason.
+                result_payload["assistant_persistence_failure"] = (
+                    self.assistant_persistence_failure
+                )
+                failure_message = (
+                    "Assistant reply persistence failed: "
+                    f"{self.assistant_persistence_failure}"
+                )
             if failure_message:
                 failure_kwargs = {"result": result_payload}
                 if completion_metadata:
@@ -1790,6 +2021,7 @@ class AgentRunEventEmitter:
         client=None,
         *,
         status: str = "failed",
+        provider_failure_proof: Mapping[str, Any] | None = None,
     ) -> None:
         if self.finished:
             return
@@ -1811,6 +2043,18 @@ class AgentRunEventEmitter:
                 search_tool_results=[],
                 tool_calls=tool_calls,
             )
+            safe_preprovider_proof = _safe_preprovider_failure_proof(
+                provider_failure_proof,
+                run_id=self._agent_run_id,
+            )
+            if safe_preprovider_proof is not None:
+                result.update(
+                    {
+                        "safe_error_code": "agent_dialogue_provider_not_started",
+                        "provider_started": False,
+                        "preprovider_proof": safe_preprovider_proof,
+                    }
+                )
             context_snapshot = _client_context_snapshot(client)
             if context_snapshot:
                 result["context_snapshot"] = context_snapshot
@@ -1822,16 +2066,40 @@ class AgentRunEventEmitter:
                 if run_state is not None
                 else _client_agent_run_usage(client)
             )
-            failure_metadata = {"usage": usage} if usage else None
+            failure_metadata = {"usage": usage} if usage else {}
+            if safe_preprovider_proof is not None:
+                failure_metadata.update(
+                    {
+                        "safe_error_code": "agent_dialogue_provider_not_started",
+                        "provider_started": False,
+                        "preprovider_proof": safe_preprovider_proof,
+                    }
+                )
+            if not failure_metadata:
+                failure_metadata = None
             if usage:
                 result["usage"] = usage
             failure_kwargs = {"result": result}
             if failure_metadata:
                 failure_kwargs["metadata"] = failure_metadata
-            safe_status = status if status in {"failed", "cancelled"} else "failed"
+            if safe_preprovider_proof is not None:
+                failure_kwargs["preprovider_proof"] = provider_failure_proof
+            safe_status = (
+                status
+                if status in {"failed", "cancelled", "awaiting_approval"}
+                else "failed"
+            )
             terminal_result = await self._agent_run_service.fail_run(
                 self._agent_run_id,
-                (run_state[2] if run_state is not None and run_state[2] else error_text),
+                (
+                    error_text
+                    if safe_preprovider_proof is not None
+                    else (
+                        run_state[2]
+                        if run_state is not None and run_state[2]
+                        else error_text
+                    )
+                ),
                 status=safe_status,
                 **failure_kwargs,
             )

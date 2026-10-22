@@ -197,6 +197,27 @@ class DlsiteContentPayload(_ContentCommandModel):
     thumbnail_assets: list[OpaqueRef] = Field(default_factory=list, max_length=20)
 
 
+class FanzaContentPayload(DlsiteContentPayload):
+    type: Literal["fanza_release"]
+    storefront: Literal["doujin", "commercial"]
+    seller_ref: OpaqueRef
+    ai_usage: Literal["none", "partial", "generated", "unknown"]
+    ai_generated: bool
+    submission_state: Literal["draft", "ready_for_review"]
+
+
+class TikTokContentPayload(_ContentCommandModel):
+    type: Literal["tiktok_video"]
+    caption: str = Field(max_length=2200)
+    media_asset: list[OpaqueRef] = Field(min_length=1, max_length=1)
+    # No privacy default: the operator must explicitly choose for this content.
+    privacy: Literal["SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE"]
+    music_rights: Literal["owned", "licensed", "no_music", "review_required"]
+    ai_disclosure: bool
+    cover: list[OpaqueRef] = Field(default_factory=list, max_length=1)
+    scheduled_at: str | None = Field(default=None, max_length=64)
+
+
 class PatreonContentPayload(_ContentCommandModel):
     type: Literal["patreon_post"]
     audience: Literal["public", "paid", "tier"]
@@ -252,6 +273,8 @@ PlatformPayload = Annotated[
     | XThreadContentPayload
     | PixivContentPayload
     | DlsiteContentPayload
+    | FanzaContentPayload
+    | TikTokContentPayload
     | PatreonContentPayload
     | YouTubeContentPayload
     | InstagramContentPayload,
@@ -263,6 +286,8 @@ _PAYLOAD_PLATFORM = {
     "x_thread": "x",
     "pixiv_work": "pixiv",
     "dlsite_release": "dlsite",
+    "fanza_release": "fanza",
+    "tiktok_video": "tiktok",
     "patreon_post": "patreon",
     "youtube_video": "youtube",
     "youtube_short": "youtube",
@@ -577,7 +602,7 @@ def _payload_data(payload: ContentVariantCreateFields) -> dict[str, Any]:
     if isinstance(data.get("payload"), dict):
         data["payload"] = strip_nulls(data["payload"])
         if (
-            data["payload"].get("type") != "instagram_reel"
+            data["payload"].get("type") not in {"instagram_reel", "tiktok_video"}
             and "cover" in data["payload"]
         ):
             data["payload"].pop("cover", None)
@@ -863,6 +888,10 @@ def create_media_operations_content_router(
         actor = await current_actor(request)
         return await call("get_readiness", actor, variant_id)
 
+    from .media_asset_routes import create_media_asset_router
+    router.include_router(create_media_asset_router(
+        get_db_manager, get_user_from_request, require_auth_dependency,
+    ))
     return router
 
 

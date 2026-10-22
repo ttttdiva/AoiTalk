@@ -60,7 +60,7 @@ OBSOLETE_AGENT_TOGGLE_KEYS = {
 
 # Legacy memory settings for the removed SentenceTransformer embedding path.
 # Semantic conversation search is owned by CrossSessionMemoryService/src.rag
-# (BGE-M3 + Qdrant), so these keys have no runtime consumer and must not be
+# (EmbeddingGemma 2 + Qdrant), so these keys have no runtime consumer and must not be
 # retained in the persisted application configuration.
 OBSOLETE_MEMORY_CONFIG_KEYS = {
     "embedding_model",
@@ -168,6 +168,12 @@ def _prune_obsolete_app_config(value: Dict[str, Any]) -> Dict[str, Any]:
     """Drop stale config branches that no longer have a runtime owner."""
     cleaned = copy.deepcopy(value)
     cleaned.pop("model_sharing", None)
+    # 廃止したOpenCode IP Rotator providerの設定。Main選択が残る場合は
+    # 既定値へ戻し、他providerの設定には触れない。
+    cleaned.pop("opencode_ip_rotator", None)
+    if str(cleaned.get("llm_provider") or "").strip() == "opencode-ip-rotator":
+        cleaned.pop("llm_provider", None)
+        cleaned.pop("llm_model", None)
 
     agent_team = cleaned.get("agent_team")
     if isinstance(agent_team, dict):
@@ -968,6 +974,7 @@ def update_app_config_keys_sync(
                         session.rollback()
                         return False
 
+                before_patch = copy.deepcopy(config)
                 for key, parts, value in parsed_changes:
                     current: Dict[str, Any] = config
                     for part in parts[:-1]:
@@ -987,6 +994,9 @@ def update_app_config_keys_sync(
                             REVIEW_MAX_ROUNDS_USER_PROVENANCE
                         )
                         config["app_config_schema_version"] = APP_CONFIG_SCHEMA_VERSION
+
+                from .services.openai_confirmation_service import invalidate_config_patch
+                invalidate_config_patch(before_patch, config)
 
                 # A patch is an explicit operator action, but the retired
                 # compact model is no longer accepted even when supplied by a
@@ -1014,4 +1024,3 @@ def update_app_config_keys_sync(
             type(exc).__name__,
         )
         return False
-

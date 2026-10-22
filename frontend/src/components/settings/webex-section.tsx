@@ -251,7 +251,17 @@ export function WebexSection() {
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="webex">
       <CardHeader
         className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        data-settings-target-activation="webex"
         onClick={() => setExpanded((value) => !value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((value) => !value);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">

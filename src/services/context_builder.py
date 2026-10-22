@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import time
@@ -18,7 +20,7 @@ from .scoped_memory_service import ScopedMemoryService
 from .project_context import (
     ProjectContextResolver,
     format_minimal_project_context_for_chat_prompt,
-    format_project_context_for_chat_prompt,
+    format_project_details_for_chat_prompt,
 )
 from .docs_acl import can_read_node, docs_readable_node_predicate
 from .docs_workspace import get_project_docs_library
@@ -85,6 +87,66 @@ def _coerce_uuid(value: Optional[str]) -> Optional[uuid.UUID]:
         return uuid.UUID(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _agent_memory_scope_allowed(
+    row: Any,
+    *,
+    project_id: Optional[str],
+    task_id: Optional[str],
+    session_id: Optional[str],
+) -> bool:
+    """Defense-in-depth projection for a server-scoped Agent memory list.
+
+    ``ScopedMemoryService`` applies this boundary in SQL before lexical,
+    embedding, or relevance selection.  The ContextBuilder check protects
+    compatibility/fake services and prevents a returned legacy row from being
+    rendered if an adapter ignored the optional retrieval filter.
+    """
+
+    if not isinstance(row, dict):
+        return False
+    scope_type = str(row.get("scope_type") or "").strip().casefold()
+    if scope_type not in {"project", "task", "session"}:
+        return False
+
+    def same(left: Any, right: Any) -> bool:
+        if left in (None, "") or right in (None, ""):
+            return False
+        left_uuid = _coerce_uuid(str(left))
+        right_uuid = _coerce_uuid(str(right))
+        if left_uuid is not None and right_uuid is not None:
+            return left_uuid == right_uuid
+        return str(left).strip().casefold() == str(right).strip().casefold()
+
+    if scope_type == "project":
+        canonical = project_id
+        return bool(
+            canonical
+            and same(row.get("scope_id"), canonical)
+            and same(row.get("project_id"), canonical)
+        )
+    if scope_type == "task":
+        canonical = task_id
+        return bool(
+            canonical
+            and same(row.get("scope_id"), canonical)
+            and same(row.get("task_id"), canonical)
+            and (
+                not row.get("project_id")
+                or same(row.get("project_id"), project_id)
+            )
+        )
+    canonical = session_id
+    return bool(
+        canonical
+        and same(row.get("scope_id"), canonical)
+        and same(row.get("session_id"), canonical)
+        and (
+            not row.get("project_id")
+            or same(row.get("project_id"), project_id)
+        )
+    )
 
 
 def _clip_text(text: str, max_chars: int) -> str:
@@ -461,10 +523,71 @@ def _record_context_manifest_observation(
         debug[key] = value
 
 
+def _project_stable_context_revision(
+    *,
+    project_context: Optional[dict[str, Any]],
+    project_knowledge_index: Optional[dict[str, Any]],
+    accessible_knowledge_index: Optional[dict[str, Any]],
+    project_information_block: str,
+) -> str:
+    """Return a content-free digest used to invalidate Project prompt caches."""
+
+    if not project_context or not project_context.get("id"):
+        return ""
+
+    def revision_rows(index: Any, groups: tuple[str, ...]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        if not isinstance(index, dict):
+            return rows
+        for group in groups:
+            values = index.get(group)
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "group": group,
+                        "id": str(item.get("id") or item.get("node_id") or ""),
+                        "relation": str(item.get("relation") or item.get("relation_type") or ""),
+                        "updated_at": str(item.get("updated_at") or ""),
+                    }
+                )
+        return sorted(rows, key=lambda row: (row["group"], row["id"], row["relation"]))
+
+    payload = {
+        "schema": "project-cag-v1",
+        "project_id": str(project_context.get("id") or ""),
+        # ProjectRepository bumps Project.updated_at for ACL grant/revoke/update,
+        # so this one revision covers both metadata and authorization changes.
+        "project_revision": str(project_context.get("_project_revision") or ""),
+        "project_knowledge": revision_rows(
+            project_knowledge_index, ("canonical_nodes", "related_nodes")
+        ),
+        "accessible_knowledge": revision_rows(
+            accessible_knowledge_index, ("project", "personal")
+        ),
+        # Project Information is only selected for relevant turns.  Its exact
+        # body digest makes a same-title edit invalidate the provider prefix.
+        "project_information_digest": hashlib.sha256(
+            str(project_information_block or "").encode("utf-8")
+        ).hexdigest()[:24],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class ContextBundle:
     memory_context_block: str = ""
+    # The minimal Project identity is deliberately stable across turns so
+    # provider prompt/KV caches can reuse it safely. Query-sensitive details
+    # live in ``project_details_block`` and remain turn-local.
     project_context_block: str = ""
+    project_details_block: str = ""
     project_information_block: str = ""
     project_knowledge_index: Optional[Dict[str, Any]] = None
     accessible_knowledge_index: Optional[Dict[str, Any]] = None
@@ -501,6 +624,7 @@ class ContextBundle:
         )
         blocks = [
             ("project_context", "Project context", "ContextBundle.project_context_block", self.project_context_block, 100),
+            ("project_details", "Project details", "ContextBundle.project_details_block", self.project_details_block, 99),
             ("session_summary", "Session summary", "ContextBundle.session_context_block", self.session_context_block, 95),
             ("context_memory", "Context memory", "ContextBundle.memory_context_block", self.memory_context_block, 90),
             # Live authoritative work state outranks advisory memory under a
@@ -637,6 +761,59 @@ class ContextBundle:
     def render_for_prompt(self, max_chars: Optional[int] = None) -> str:
         return self.render_with_trace(max_chars)[0]
 
+    def render_partitioned_with_trace(
+        self, max_chars: Optional[int] = None
+    ) -> tuple[str, str, list[dict[str, Any]]]:
+        """Render one shared-budget bundle as stable Project and dynamic parts.
+
+        The budget decision is made exactly once by ``render_with_trace``.  We
+        then preserve the chosen block order inside each partition so splitting
+        the provider prompt never increases the amount of context selected.
+        """
+
+        _output, trace = self.render_with_trace(max_chars)
+        stable_categories = {
+            "project_context",
+            "project_knowledge_index",
+            "accessible_knowledge_index",
+            "project_information",
+        }
+        stable: list[str] = []
+        dynamic: list[str] = []
+        stable_cursor = 0
+        dynamic_cursor = 0
+        for item in trace:
+            if item.get("status") != "active":
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            is_stable = str(item.get("category") or "") in stable_categories
+            target = stable if is_stable else dynamic
+            cursor = stable_cursor if is_stable else dynamic_cursor
+            if target:
+                cursor += 2
+            item["prompt_partition"] = "stable_project" if is_stable else "dynamic_turn"
+            item["partition_offset_start"] = cursor
+            item["partition_offset_end"] = cursor + len(text)
+            target.append(text)
+            cursor += len(text)
+            if is_stable:
+                stable_cursor = cursor
+            else:
+                dynamic_cursor = cursor
+        return "\n\n".join(stable), "\n\n".join(dynamic), trace
+
+    def render_partitioned_for_prompt(
+        self, max_chars: Optional[int] = None
+    ) -> tuple[str, str]:
+        stable, dynamic, _trace = self.render_partitioned_with_trace(max_chars)
+        return stable, dynamic
+
+    @property
+    def project_cache_revision(self) -> str:
+        return str(self.debug.get("project_stable_context_revision") or "")
+
 
 class ContextBuilder:
     """Collect existing and scoped context into one prompt block."""
@@ -649,7 +826,10 @@ class ContextBuilder:
         work_intelligence_compiler: Optional[Any] = None,
         manifest_config: Any = None,
     ):
-        self.context_memory_service = context_memory_service or ScopedMemoryService()
+        self.config = manifest_config
+        self.context_memory_service = context_memory_service or ScopedMemoryService(
+            config=manifest_config
+        )
         self.project_context_resolver = project_context_resolver or ProjectContextResolver()
         # Import lazily so callers that only need legacy ContextBundle
         # rendering do not pay for the optional projection's model imports.
@@ -717,6 +897,59 @@ class ContextBuilder:
             except Exception:
                 self._context_manifest_observation_enabled = False
 
+    async def _agent_project_context_allowed(self, project_id: Optional[str]) -> bool:
+        """Revalidate Agent project authority before implicit context reads."""
+
+        turn = get_turn_context()
+        binding = getattr(turn, "agent_execution_binding", None)
+        if binding is None:
+            return True
+        if not project_id:
+            return False
+        agent_id = str(
+            getattr(turn, "agent_id", None)
+            or getattr(binding, "agent_id", "")
+            or ""
+        ).strip()
+        revision_id = str(
+            getattr(turn, "agent_revision_id", None)
+            or getattr(binding, "agent_revision_id", "")
+            or ""
+        ).strip()
+        user_id = str(getattr(turn, "user_id", None) or "").strip()
+        if not agent_id or not revision_id or not user_id:
+            return False
+        ceiling = {
+            str(item).strip()
+            for item in (getattr(binding, "capability_ceiling", ()) or ())
+            if str(item).strip()
+        }
+        if "project_read" not in ceiling:
+            return False
+        try:
+            from .agent_authority import AgentAuthorityResolver
+
+            decision = await AgentAuthorityResolver(
+                config=self.config,
+            ).resolve(
+                agent_id=agent_id,
+                revision_id=revision_id,
+                project_id=project_id,
+                required_capability="project_read",
+            )
+            return bool(
+                decision.allowed
+                and str(decision.agent_id or agent_id) == agent_id
+                and str(decision.agent_revision_id or revision_id) == revision_id
+                and str(decision.project_id or project_id) == str(project_id)
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ContextBuilder] Agent project context authority unavailable: %s",
+                type(exc).__name__,
+            )
+            return False
+
     async def build_context(
         self,
         *,
@@ -731,6 +964,7 @@ class ContextBuilder:
         include_project_information: Optional[bool] = None,
         include_task_context: Optional[bool] = None,
         project_context_mode: str = "auto",
+        memory_selection_callback: Any = None,
     ) -> ContextBundle:
         # Provider bridges historically omitted ``task_id`` because ordinary
         # chat turns do not have one.  A request that entered through a
@@ -753,6 +987,9 @@ class ContextBuilder:
         }
         bundle = ContextBundle(max_chars=max_chars, debug=debug)
         debug["work_intelligence_gate"] = self._work_intelligence_gate
+        turn_context = get_turn_context()
+        agent_turn = getattr(turn_context, "agent_execution_binding", None) is not None
+        debug["agent_turn"] = agent_turn
 
         # Project Steward and actorless Heartbeat execution supply their
         # complete bounded input explicitly. Do not re-introduce user/global
@@ -773,6 +1010,7 @@ class ContextBuilder:
         ) -> None:
             error_keys = {
                 "project_context": "project_context",
+                "project_details": "project_context",
                 "project_knowledge_index": "project_knowledge",
                 "accessible_knowledge_index": "accessible_knowledge",
                 "project_information": "project_information",
@@ -852,9 +1090,23 @@ class ContextBuilder:
                 project_id = task_project_id
                 debug["project_id"] = project_id
 
-        resolved_project_context = project_context if include_project_context else None
+        agent_project_context_allowed = True
+        if agent_turn:
+            agent_project_context_allowed = await self._agent_project_context_allowed(
+                project_id
+            )
+            debug["agent_project_context_authorized"] = agent_project_context_allowed
+            if not agent_project_context_allowed:
+                debug["agent_project_context_suppressed"] = "authority_unavailable_or_denied"
+        allow_project_layers = bool(
+            include_project_context
+            and (not agent_turn or agent_project_context_allowed)
+        )
+        resolved_project_context = (
+            project_context if allow_project_layers else None
+        )
         project_context_started = time.perf_counter()
-        if include_project_context:
+        if allow_project_layers:
             if resolved_project_context is None and (project_id or session_id):
                 try:
                     resolved_project_context = await self.project_context_resolver.resolve_context(
@@ -867,15 +1119,19 @@ class ContextBuilder:
                     debug["errors"]["project_context"] = str(exc)
 
             if resolved_project_context:
-                if resolved_project_context_mode == "minimal":
-                    bundle.project_context_block = (
-                        format_minimal_project_context_for_chat_prompt(
+                # Keep a query-invariant Project identity in the stable cache
+                # prefix.  Rich App/description/table material is useful only
+                # on detail-oriented turns and therefore stays dynamic.
+                bundle.project_context_block = (
+                    format_minimal_project_context_for_chat_prompt(
+                        resolved_project_context
+                    )
+                )
+                if resolved_project_context_mode == "full":
+                    bundle.project_details_block = (
+                        format_project_details_for_chat_prompt(
                             resolved_project_context
                         )
-                    )
-                else:
-                    bundle.project_context_block = format_project_context_for_chat_prompt(
-                        resolved_project_context
                     )
                 if not project_id and resolved_project_context.get("id"):
                     project_id = str(resolved_project_context["id"])
@@ -902,8 +1158,18 @@ class ContextBuilder:
                 else "project_context_disabled_or_unavailable"
             ),
         )
+        record_layer(
+            "project_details",
+            project_context_started,
+            bundle.project_details_block,
+            (
+                "current_message_requires_project_details"
+                if bundle.project_details_block
+                else "deferred_until_relevant_turn"
+            ),
+        )
 
-        if include_project_context and project_id:
+        if allow_project_layers and project_id:
             project_knowledge_started = time.perf_counter()
             try:
                 from .project_knowledge_service import resolve_project_knowledge
@@ -938,16 +1204,26 @@ class ContextBuilder:
                 float(ACCESSIBLE_KNOWLEDGE_TIMEOUT_SECONDS),
             )
             try:
-                bundle.accessible_knowledge_index = (
-                    await asyncio.wait_for(
-                        self._build_accessible_knowledge_index(
-                            project_id=project_id,
-                            user_id=user_id,
-                            max_nodes=24,
-                        ),
-                        timeout=accessible_knowledge_timeout,
+                if agent_turn:
+                    # This index includes Personal Docs by design. Keep it
+                    # out of implicit Agent context; explicit server-resolved
+                    # references and bounded Agent activity remain separate
+                    # entrances with their own ACL checks.
+                    bundle.accessible_knowledge_index = None
+                    debug["accessible_knowledge_selection"] = (
+                        "agent_personal_docs_suppressed"
                     )
-                )
+                else:
+                    bundle.accessible_knowledge_index = (
+                        await asyncio.wait_for(
+                            self._build_accessible_knowledge_index(
+                                project_id=project_id,
+                                user_id=user_id,
+                                max_nodes=24,
+                            ),
+                            timeout=accessible_knowledge_timeout,
+                        )
+                    )
                 _record_context_manifest_observation(
                     debug,
                     "accessible_knowledge_manifest_provenance",
@@ -1007,7 +1283,9 @@ class ContextBuilder:
             )
 
         task_context_started = time.perf_counter()
-        if include_task_context:
+        if include_task_context and (
+            not agent_turn or agent_project_context_allowed
+        ):
             try:
                 bundle.task_context_block = await self._build_task_context_block(
                     project_id=project_id if include_project_context else None,
@@ -1041,32 +1319,69 @@ class ContextBuilder:
         )
 
         context_memory_started = time.perf_counter()
-        try:
-            memories, retrieval_trace = (
-                await self.context_memory_service.retrieve_for_context(
-                    actor_id=user_id,
-                    project_id=project_id if include_project_context else None,
-                    task_id=task_id if include_project_context else None,
-                    session_id=session_id,
-                    query=message,
-                    limit=8,
-                    max_chars=5000,
+        agent_memory_scope = None
+        if agent_turn and allow_project_layers:
+            # Agent memory is shared only through canonical Project/Task/current
+            # ConversationSession rows.  The human remains the authenticated
+            # actor for ACL checks; this metadata narrows retrieval before any
+            # lexical, embedding, or optional relevance-provider work.
+            agent_memory_scope = {
+                "allowed_scope_types": ("project", "task", "session"),
+                "project_id": project_id,
+                "task_id": task_id,
+                "session_id": session_id,
+            }
+            debug["context_memory_selection"] = "agent_shared_scope_memory"
+        elif agent_turn:
+            # Personal/global memory and project memory without a live
+            # Project-read authority remain suppressed on Agent turns.
+            debug["context_memory_selection"] = "agent_implicit_memory_suppressed"
+        if not agent_turn or agent_memory_scope is not None:
+            try:
+                memories, retrieval_trace = (
+                    await self.context_memory_service.retrieve_for_context(
+                        actor_id=user_id,
+                        project_id=project_id if include_project_context else None,
+                        task_id=task_id if include_project_context else None,
+                        session_id=session_id,
+                        query=message,
+                        limit=8,
+                        max_chars=5000,
+                        **(
+                            {"retrieval_scope": agent_memory_scope}
+                            if agent_memory_scope is not None
+                            else {}
+                        ),
+                        **({"progress_callback": memory_selection_callback} if memory_selection_callback else {}),
+                    )
                 )
-            )
-            debug["context_memory_retrieval_trace"] = retrieval_trace
-            bundle.memory_context_block = (
-                self.context_memory_service.render_memories_for_prompt(memories)
-            )
-            debug["context_memory_count"] = len(memories)
-            _record_context_manifest_observation(
-                debug,
-                "context_memory_manifest_lineage",
-                lambda: _context_manifest_memory_lineage(memories),
-                enabled=self._context_manifest_observation_enabled,
-            )
-        except Exception as exc:
-            logger.warning("[ContextBuilder] context memories failed: %s", exc)
-            debug["errors"]["context_memories"] = str(exc)
+                if agent_turn:
+                    memories = [
+                        item
+                        for item in memories
+                        if _agent_memory_scope_allowed(
+                            item,
+                            project_id=project_id,
+                            task_id=task_id,
+                            session_id=session_id,
+                        )
+                    ]
+                debug["context_memory_retrieval_trace"] = retrieval_trace
+                bundle.memory_context_block = (
+                    self.context_memory_service.render_memories_for_prompt(memories)
+                )
+                debug["context_memory_count"] = len(memories)
+                _record_context_manifest_observation(
+                    debug,
+                    "context_memory_manifest_lineage",
+                    lambda: _context_manifest_memory_lineage(memories),
+                    enabled=self._context_manifest_observation_enabled,
+                )
+            except Exception as exc:
+                logger.warning("[ContextBuilder] context memories failed: %s", exc)
+                debug["errors"]["context_memories"] = str(exc)
+                if memory_selection_callback:
+                    await memory_selection_callback({"stage": "context_budget", "status": "failed", "engine": "host"})
         record_layer(
             "context_memory",
             context_memory_started,
@@ -1080,7 +1395,7 @@ class ContextBuilder:
         # advisory input so authoritative Task/Docs state wins conflicts.
         work_intelligence_started = time.perf_counter()
         wi_enabled = self._work_intelligence_gate is not False
-        if wi_enabled and include_project_context and project_id and self.work_intelligence_compiler is not None:
+        if wi_enabled and allow_project_layers and project_id and self.work_intelligence_compiler is not None:
             try:
                 compiler = self.work_intelligence_compiler
                 compile_method = getattr(compiler, "compile", None)
@@ -1152,6 +1467,17 @@ class ContextBuilder:
             bundle.work_intelligence_block,
             debug.get("work_intelligence_selection", "selected_live_work_projection"),
         )
+
+        if include_project_context and project_id and resolved_project_context:
+            debug["project_stable_context_revision"] = (
+                _project_stable_context_revision(
+                    project_context=resolved_project_context,
+                    project_knowledge_index=bundle.project_knowledge_index,
+                    accessible_knowledge_index=bundle.accessible_knowledge_index,
+                    project_information_block=bundle.project_information_block,
+                )
+            )
+            debug["project_cag_schema"] = "project-cag-v1"
 
         return bundle
 
@@ -1233,6 +1559,7 @@ class ContextBuilder:
                     KnowledgeNode.title,
                     KnowledgeNode.project_id,
                     KnowledgeNode.archived_at,
+                    KnowledgeNode.updated_at,
                 )
                 .where(KnowledgeNode.id.in_(ordered_ids))
                 .where(KnowledgeNode.archived_at.is_(None))
@@ -1242,16 +1569,19 @@ class ContextBuilder:
 
         # Reorder by the scope resolver's deterministic ID order rather than
         # relying on database IN-list ordering.
-        by_id: dict[uuid.UUID, tuple[str, Optional[uuid.UUID]]] = {}
+        by_id: dict[uuid.UUID, tuple[str, Optional[uuid.UUID], str]] = {}
         for row in rows:
-            try:
-                node_id, title, node_project_id, archived_at = row
-            except (TypeError, ValueError):
+            values = list(row) if isinstance(row, (tuple, list)) else None
+            if values is not None and len(values) in {4, 5}:
+                node_id, title, node_project_id, archived_at = values[:4]
+                updated_at = values[4] if len(values) == 5 else None
+            else:
                 mapping = getattr(row, "_mapping", {})
                 node_id = mapping.get("id")
                 title = mapping.get("title")
                 node_project_id = mapping.get("project_id")
                 archived_at = mapping.get("archived_at")
+                updated_at = mapping.get("updated_at")
             node_uuid = _coerce_uuid(node_id)
             if node_uuid is None or archived_at is not None:
                 continue
@@ -1260,7 +1590,7 @@ class ContextBuilder:
                 " ".join(str(title or "(untitled)").split()),
                 180,
             )
-            by_id[node_uuid] = (safe_title, node_project_uuid)
+            by_id[node_uuid] = (safe_title, node_project_uuid, _iso(updated_at))
 
         canonical_set = set(canonical_ids)
         project_entries: list[dict[str, str]] = []
@@ -1269,23 +1599,23 @@ class ContextBuilder:
             row = by_id.get(node_uuid)
             if row is None:
                 continue
-            title, node_project_uuid = row
+            title, node_project_uuid, updated_at = row
             if node_uuid not in canonical_set and node_project_uuid is None:
-                personal_entries.append(
-                    {"id": str(node_uuid), "title": title}
-                )
+                entry = {"id": str(node_uuid), "title": title}
+                if updated_at:
+                    entry["updated_at"] = updated_at
+                personal_entries.append(entry)
             else:
-                project_entries.append(
-                    {
-                        "id": str(node_uuid),
-                        "title": title,
-                        "relation": (
-                            "canonical"
-                            if node_uuid in canonical_set
-                            else "related"
-                        ),
-                    }
-                )
+                entry = {
+                    "id": str(node_uuid),
+                    "title": title,
+                    "relation": (
+                        "canonical" if node_uuid in canonical_set else "related"
+                    ),
+                }
+                if updated_at:
+                    entry["updated_at"] = updated_at
+                project_entries.append(entry)
 
         if not project_entries and not personal_entries:
             return None

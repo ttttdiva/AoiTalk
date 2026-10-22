@@ -49,7 +49,6 @@ from ..services.turn_context import (
 )
 from ..tools.registry import ToolRegistry, get_registry
 from ..tools.adapters import OpenAIAPIAdapter
-from ..services.story_chat_context import run_story_chat_context_sync
 from .generation_policy import (
     DEFAULT_GENERATION_POLICY,
     get_client_generation_policy,
@@ -69,6 +68,8 @@ from .agent_runtime import (
     OpenAIToolCallRecord,
     build_tool_hint_context_sync,
     compose_tool_hint_user_message,
+    dialogue_provider_wire_max_output_tokens,
+    dialogue_provider_usage_with_rate_card,
     guard_tool_execution_claims,
     run_openai_tool_call_loop,
 )
@@ -86,12 +87,12 @@ from .turn_stream_events import (
 from .context_snapshot import (
     capture_context_manifest_before_context_clear,
     context_manifest_metadata,
-    context_bundle_components,
+    context_bundle_partition_components,
     openai_compatible_request_components,
     reconcile_snapshot,
     sanitized_snapshot_series,
     snapshot,
-    without_text_from_last_role,
+    without_text,
 )
 from ..services.outbound_privacy_service import (
     EgressDescriptor,
@@ -101,14 +102,17 @@ from ..services.outbound_privacy_service import (
 from .tool_exposure import filtered_registry_for_client
 from .tool_policy import (
     project_progress_review_active,
+    get_current_user_input,
     reset_current_user_input,
     set_current_user_input,
 )
 from .provider_capabilities import ProviderCapabilities
 from .conversation_context import (
     build_prompt_messages,
+    canonical_model_transcript_for_history,
     normalize_usage,
     persist_usage_sync,
+    project_prompt_cache_key,
     stable_cache_key,
 )
 from .openai_compatible_local_profiles import openai_compatible_server_profile
@@ -131,6 +135,9 @@ _HELP_STREAM_PROVIDER_STATE_FIELDS = (
     "_last_tool_loop_messages",
     "_last_context_snapshots",
     "_current_context_bundle",
+    "_current_prompt_stable_context",
+    "_current_prompt_dynamic_context",
+    "_current_project_cache_revision",
     "_current_dynamic_context",
     "_current_dynamic_context_metadata",
     "_last_privacy_payload",
@@ -676,7 +683,6 @@ class SGLangClient:
         if (
             not self._lightweight_ephemeral_client
             and config
-            and config.get("use_tools", True)
             and config.get("runtime.target_enable_tools", True) is not False
         ):
             self._tool_registry = build_runtime_tool_registry_for_client(
@@ -737,6 +743,9 @@ class SGLangClient:
         # is deliberately cleared at both turn boundaries so a reused client
         # (or a provider switch) cannot leak a previous project's context.
         self._current_context_bundle: Optional[ContextBundle] = None
+        self._current_prompt_stable_context: list[tuple[str, str]] = []
+        self._current_prompt_dynamic_context: list[tuple[str, str]] = []
+        self._current_project_cache_revision: str = ""
         self._current_dynamic_context: list[tuple[str, str]] = []
         self._current_dynamic_context_metadata: dict[str, dict[str, Any]] = {}
 
@@ -929,6 +938,28 @@ class SGLangClient:
         # Merge them before the gateway so a review cannot approve one object
         # while the sender silently appends another.
         request_payload.update(transport_kwargs)
+        budget_user_input = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(request_payload.get("messages") or [])
+                if isinstance(message, dict)
+                and str(message.get("role") or "") == "user"
+            ),
+            "",
+        )
+        payload_cap = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=budget_user_input,
+            requested=int(request_payload.get("max_tokens") or 0),
+            payload=request_payload,
+        )
+        if payload_cap is not None:
+            if payload_cap <= 0:
+                raise ValueError("AgentDialogue provider budget is exhausted")
+            request_payload["max_tokens"] = min(
+                int(request_payload.get("max_tokens") or payload_cap),
+                payload_cap,
+            )
         if suppress_automatic_context is None:
             suppress_automatic_context = bool(
                 getattr(get_turn_context(), "suppress_automatic_context", False)
@@ -949,7 +980,10 @@ class SGLangClient:
             if not isinstance(final_payload, dict):
                 raise PrivacyError("SGLang outbound payload is malformed")
             self._last_privacy_payload = dict(final_payload)
-            return self.client.chat.completions.create(**final_payload)
+            from .generation_budget import record_bounded_model_request
+            budget = record_bounded_model_request(final_payload)
+            client = self.client.with_options(max_retries=0) if budget else self.client
+            return client.chat.completions.create(**final_payload)
 
         response = gateway.execute_sync(
             request_payload,
@@ -997,14 +1031,18 @@ class SGLangClient:
             if context_bundle is not None
             else self._context_bundle_for_turn()
         )
-        rendered_bundle, bundle_parts = context_bundle_components(bundle)
+        stable_bundle, dynamic_bundle, bundle_parts = (
+            context_bundle_partition_components(bundle)
+        )
         observed_messages = list(api_kwargs.get("messages") or [])
-        if rendered_bundle:
-            observed_messages = without_text_from_last_role(
-                observed_messages,
-                f"[Current ContextBundle]\n{rendered_bundle.strip()}",
-                role="user",
-            )
+        for label, value in (
+            ("Stable Project Context", stable_bundle),
+            ("Current ContextBundle", dynamic_bundle),
+        ):
+            if value:
+                observed_messages = without_text(
+                    observed_messages, f"[{label}]\n{value.strip()}"
+                )
         dynamic_context = [
             item
             for item in (getattr(self, "_current_dynamic_context", []) or [])
@@ -1111,7 +1149,16 @@ class SGLangClient:
         ledger: UnifiedTurnLedger,
     ) -> dict[str, Any]:
         captured_usage = self._capture_usage(response)
-        ledger.record_usage(captured_usage)
+        budget = getattr(self, "_agent_dialogue_budget", None)
+        if isinstance(budget, dict) and budget.get("max_cost_micros") is not None:
+            captured_usage = dialogue_provider_usage_with_rate_card(
+                captured_usage,
+                budget.get("server_rate_card"),
+            ) or captured_usage
+        ledger.record_usage(
+            captured_usage,
+            usage_key=ledger.next_provider_usage_key("provider"),
+        )
         if not bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             self._last_usage_run_id = str(ledger.run_id or "").strip() or None
         return captured_usage
@@ -1149,11 +1196,14 @@ class SGLangClient:
             self._last_model_transcript = []
             return
         source_messages = self._last_tool_loop_messages or messages
-        self._last_model_transcript = [
-            dict(message)
-            for message in source_messages
-            if message.get("role") in {"user", "assistant", "tool"}
-        ]
+        self._last_model_transcript = canonical_model_transcript_for_history(
+            [
+                dict(message)
+                for message in source_messages
+                if message.get("role") in {"user", "assistant", "tool"}
+            ],
+            current_user_input=get_current_user_input(),
+        )
         if response_text:
             self._last_model_transcript.append({"role": "assistant", "content": response_text})
         self.history_manager.set_model_messages(self._last_model_transcript)
@@ -1162,6 +1212,7 @@ class SGLangClient:
         self,
         user_input: str,
         *,
+        stable_context: Optional[list[tuple[str, str]]] = None,
         dynamic_context: Optional[list[tuple[str, str]]] = None,
     ) -> List[Dict[str, Any]]:
         """Build messages list for API call
@@ -1192,6 +1243,9 @@ class SGLangClient:
                 history[-(context_window * 2):],
                 summary=("" if suppress_automatic_context else self.history_manager.summary),
                 current_user_input=user_input,
+                stable_context=(
+                    [] if suppress_automatic_context else stable_context or []
+                ),
                 dynamic_context=(
                     [] if suppress_automatic_context else dynamic_context or []
                 ),
@@ -1206,17 +1260,6 @@ class SGLangClient:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()
-
-    def _get_story_chat_context_sync(self):
-        """Resolve the trusted StoryWritingSession for this conversation."""
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return None
-        if not self.current_session_id:
-            return None
-        return run_story_chat_context_sync(
-            self._run_async_sync,
-            str(self.current_session_id),
-        )
 
     def _consume_steering_callback(
         self,
@@ -1540,6 +1583,9 @@ class SGLangClient:
             messages = [system_message, user_message]
         self._last_context_snapshots = []
         self._current_context_bundle = None
+        self._current_prompt_stable_context = []
+        self._current_prompt_dynamic_context = []
+        self._current_project_cache_revision = ""
         self._current_dynamic_context = []
         self._current_dynamic_context_metadata = {}
         response = self._create_observed_completion(
@@ -1569,6 +1615,8 @@ class SGLangClient:
 
         def create_extraction() -> Any:
             started_at = time.monotonic()
+            config = getattr(self, "config", None)
+            output_limit = config.get("runtime.target_max_output_tokens", 1200) if config else 1200
             response = self._create_observed_completion(
                 {
                     "model": self.model_name,
@@ -1577,7 +1625,7 @@ class SGLangClient:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 1200,
+                    "max_tokens": min(1200, max(1, int(output_limit or 1200))),
                 },
                 request_kind=request_type,
                 observe=False,
@@ -1695,6 +1743,9 @@ class SGLangClient:
         try:
             self._last_context_snapshots = []
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
             self._current_dynamic_context = []
             self._current_dynamic_context_metadata = {}
             stream = self._create_observed_completion(
@@ -1760,6 +1811,15 @@ class SGLangClient:
         Returns:
             Generated response text or generator
         """
+        projected_max_tokens = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=user_input,
+            requested=max_tokens,
+        )
+        if projected_max_tokens is not None:
+            if projected_max_tokens <= 0:
+                raise ValueError("AgentDialogue provider budget is exhausted")
+            max_tokens = projected_max_tokens
         isolated_provider_state = (
             _snapshot_help_stream_provider_state(self)
             if bool(getattr(get_turn_context(), "suppress_automatic_context", False))
@@ -1822,6 +1882,9 @@ class SGLangClient:
             self._last_context_snapshots = []
             # Never retain a prior turn's ContextBundle on a reused client.
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
             self._current_dynamic_context = []
             self._current_dynamic_context_metadata = {}
             if suppress_automatic_context:
@@ -1868,21 +1931,24 @@ class SGLangClient:
             tool_hint_duration_ms = (
                 time.perf_counter() - tool_hint_started
             ) * 1000
+            stable_context: list[tuple[str, str]] = []
             dynamic_context: list[tuple[str, str]] = []
-            rendered_bundle = (
-                self._current_context_bundle.render_for_prompt()
+            stable_block, dynamic_block = (
+                self._current_context_bundle.render_partitioned_for_prompt()
                 if self._current_context_bundle
-                else ""
+                else ("", "")
             )
-            if rendered_bundle:
-                dynamic_context.append(
-                    (
-                        "Current ContextBundle",
-                        rendered_bundle,
-                    )
-                )
+            if stable_block:
+                stable_context.append(("Stable Project Context", stable_block))
+            if dynamic_block:
+                dynamic_context.append(("Current ContextBundle", dynamic_block))
             if tool_hint_context:
                 dynamic_context.append(("Current tool hints", tool_hint_context))
+            self._current_prompt_stable_context = list(stable_context)
+            self._current_prompt_dynamic_context = list(dynamic_context)
+            self._current_project_cache_revision = str(
+                getattr(self._current_context_bundle, "project_cache_revision", "") or ""
+            )
             self._current_dynamic_context = list(dynamic_context)
             self._current_dynamic_context_metadata = {
                 "Current ContextBundle": {"duration_ms": context_bundle_duration_ms},
@@ -1894,6 +1960,7 @@ class SGLangClient:
             # Build messages
             messages = self._build_messages(
                 user_input,
+                stable_context=stable_context,
                 dynamic_context=dynamic_context,
             )
             if image_data and messages:
@@ -1925,15 +1992,19 @@ class SGLangClient:
             if suppress_automatic_context:
                 self._cache_key = None
             else:
-                self._cache_key = stable_cache_key(
+                self._cache_key = project_prompt_cache_key(
                     user_id=self.session_user_id,
                     session_id=self.current_session_id,
-                    project_id=self.current_project_id,
+                    project_id=(
+                        self.current_project_id or get_turn_context().project_id
+                    ),
                     character=self.character_name,
                     model=self.model_name,
                     system_prompt=self.system_prompt,
                     tool_schemas=api_tools or [],
                     provider="sglang",
+                    stable_context=getattr(self, "_current_prompt_stable_context", []),
+                    context_revision=getattr(self, "_current_project_cache_revision", ""),
                     branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
                     summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
                     server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
@@ -2040,15 +2111,19 @@ class SGLangClient:
                 if suppress_automatic_context:
                     self._cache_key = None
                 else:
-                    self._cache_key = stable_cache_key(
+                    self._cache_key = project_prompt_cache_key(
                         user_id=self.session_user_id,
                         session_id=self.current_session_id,
-                        project_id=self.current_project_id,
+                        project_id=(
+                            self.current_project_id or get_turn_context().project_id
+                        ),
                         character=self.character_name,
                         model=self.model_name,
                         system_prompt=self.system_prompt,
                         tool_schemas=api_tools or [],
                         provider="sglang",
+                        stable_context=getattr(self, "_current_prompt_stable_context", []),
+                        context_revision=getattr(self, "_current_project_cache_revision", ""),
                         branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
                         summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
                         server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
@@ -2184,6 +2259,9 @@ class SGLangClient:
                         capture_context_manifest_before_context_clear(self)
                 finally:
                     self._current_context_bundle = None
+                    self._current_prompt_stable_context = []
+                    self._current_prompt_dynamic_context = []
+                    self._current_project_cache_revision = ""
                     self._current_dynamic_context = []
                     self._current_dynamic_context_metadata = {}
                 if suppress_automatic_context:
@@ -2265,6 +2343,9 @@ class SGLangClient:
                     self._last_model_transcript = preserved_model_transcript
             finally:
                 self._current_context_bundle = None
+                self._current_prompt_stable_context = []
+                self._current_prompt_dynamic_context = []
+                self._current_project_cache_revision = ""
                 self._current_dynamic_context = []
                 self._current_dynamic_context_metadata = {}
                 if hasattr(self, "_aoitalk_help_gateway_restore"):
@@ -2319,6 +2400,9 @@ class SGLangClient:
             capture_context_manifest_before_context_clear(self)
         finally:
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
             self._current_dynamic_context = []
             self._current_dynamic_context_metadata = {}
             if hasattr(self, "_aoitalk_help_gateway_restore"):
@@ -2626,6 +2710,9 @@ class SGLangClient:
                 return_result=True,
                 config=self.config,
                 user_input=user_input,
+                budget_client=self,
+                turn_ledger=ledger,
+                record_provider_usage=False,
                 event_callback=event_callback,
                 restore_tool_arguments=self._privacy_gateway.restore_tool_arguments,
             )
@@ -2821,7 +2908,10 @@ class SGLangClient:
                 if captured_usage:
                     stream_usage = captured_usage
 
-            ledger.record_usage(stream_usage)
+            ledger.record_usage(
+                stream_usage,
+                usage_key=ledger.next_provider_usage_key("provider"),
+            )
             stream_usage_recorded = True
             if not suppress_automatic_context:
                 self._last_usage_run_id = str(ledger.run_id or "").strip() or None
@@ -2849,7 +2939,10 @@ class SGLangClient:
         except Exception as e:
             ledger.failure = f"{type(e).__name__}: {e}"
             if not stream_usage_recorded:
-                ledger.record_usage(stream_usage)
+                ledger.record_usage(
+                    stream_usage,
+                    usage_key=ledger.next_provider_usage_key("provider"),
+                )
             if not suppress_automatic_context:
                 self._last_usage_run_id = str(ledger.run_id or "").strip() or None
             logger.error(f"[SGLangClient] ストリーミングエラー: {e}")
@@ -2913,7 +3006,10 @@ class SGLangClient:
         call_kwargs = {
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            # ResponseHandler supplies a stream callback for the live SGLang
+            # path. Preserve that streaming contract while keeping direct
+            # callback-free calls on the historical non-stream path.
+            "stream": stream_callback is not None,
             "image_data": image_data,
             "stream_callback": stream_callback,
             "steering_callback": steering_callback,
@@ -2933,11 +3029,19 @@ class SGLangClient:
                 }
         except (TypeError, ValueError):
             pass
-        return await asyncio.to_thread(
-            self.generate_response,
-            user_input,
-            **call_kwargs,
-        )
+        def _invoke_generation() -> Any:
+            result = self.generate_response(user_input, **call_kwargs)
+            if not call_kwargs.get("stream") or result is None:
+                return result
+            if isinstance(result, str) or not hasattr(result, "__iter__"):
+                return result
+            chunks: list[str] = []
+            for chunk in result:
+                if chunk:
+                    chunks.append(str(chunk))
+            return "".join(chunks)
+
+        return await asyncio.to_thread(_invoke_generation)
 
     def clear_history(self):
         """Clear conversation history"""

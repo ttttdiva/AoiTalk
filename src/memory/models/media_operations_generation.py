@@ -178,16 +178,16 @@ class GenerationWorkspace(Base):
             "owner_user_id",
             "external_workspace_id",
             unique=True,
-            postgresql_where=text("project_id IS NULL"),
-            sqlite_where=text("project_id IS NULL"),
+            postgresql_where=text("project_id IS NULL AND status <> 'unavailable'"),
+            sqlite_where=text("project_id IS NULL AND status <> 'unavailable'"),
         ),
         Index(
             "uq_media_generation_workspaces_project_identity",
             "project_id",
             "external_workspace_id",
             unique=True,
-            postgresql_where=text("project_id IS NOT NULL"),
-            sqlite_where=text("project_id IS NOT NULL"),
+            postgresql_where=text("project_id IS NOT NULL AND status <> 'unavailable'"),
+            sqlite_where=text("project_id IS NOT NULL AND status <> 'unavailable'"),
         ),
         Index(
             "uq_media_generation_workspaces_personal_idempotency",
@@ -888,7 +888,7 @@ class GenerationRunObservation(Base):
 
 
 class GenerationOutput(Base):
-    """Immutable opaque output reference returned by a Generation run."""
+    """Immutable output identity; imports bind bytes without a fabricated run."""
 
     __tablename__ = "media_generation_outputs"
 
@@ -896,7 +896,7 @@ class GenerationOutput(Base):
     generation_run_id = Column(
         UUID(as_uuid=True),
         ForeignKey("media_generation_runs.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     owner_user_id = Column(
@@ -913,6 +913,11 @@ class GenerationOutput(Base):
     )
     external_asset_id = Column(String(164), nullable=False)
     external_output_version = Column(String(165), nullable=False)
+    # Persist outside the deletable byte ledger, so a missing registered
+    # binding can never be mistaken for an external/public output.
+    byte_binding_state = Column(
+        String(16), nullable=False, default="external", server_default="external"
+    )
     sha256 = Column(String(64), nullable=False, index=True)
     mime_type = Column(String(255), nullable=False)
     width = Column(Integer, nullable=True)
@@ -922,6 +927,10 @@ class GenerationOutput(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
     __table_args__ = (
+        CheckConstraint(
+            "byte_binding_state IN ('external', 'managed')",
+            name="ck_media_generation_outputs_byte_binding_state",
+        ),
         CheckConstraint(
             "external_asset_id LIKE 'ast_%'",
             name="ck_media_generation_outputs_asset_ref",

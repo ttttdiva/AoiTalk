@@ -24,13 +24,6 @@ import {
 } from "@/lib/explorer-api";
 import { listRemoteWorkspaceFiles } from "@/lib/remote-servers";
 import { useProject } from "@/contexts/project-context";
-import { hfExplorerList } from "@/lib/hf/explorer-loader";
-import { HF_PREFIX, isHfPath, parseHfPath } from "@/lib/hf/virtual-path";
-import {
-  fetchCreatorMapping,
-  creatorMatchesQuery,
-  type CreatorMapping,
-} from "@/lib/hf/creator-mapping";
 import { buildExplorerRangeSelection } from "@/lib/explorer-selection";
 import {
   isRemoteFilerPath,
@@ -40,10 +33,8 @@ import {
 import {
   clearFilerUndoHistory,
   registerExplorerDeleteViewHandlers,
-  registerHydrusViewHandlers,
   type ExplorerDeleteViewOperation,
 } from "@/lib/explorer/filer-operations";
-import { parseHydrusFileId } from "@/lib/hydrus/virtual-path";
 import {
   DEFAULT_SORT_DIR,
   DEFAULT_SORT_KEY,
@@ -61,7 +52,7 @@ import {
 } from "@/components/explorer/files-sidebar-store";
 
 export type ViewMode = "grid" | "list";
-export type FilerTab = "workspace" | "user" | "hf" | "hydrus";
+export type FilerTab = "workspace" | "user";
 
 /**
  * In-memory view snapshot associated with a directory navigation history
@@ -102,8 +93,6 @@ export type ExplorerBookmarkCollections = {
 export const FILER_TAB_LABELS: Record<FilerTab, string> = {
   workspace: "Project Files",
   user: "User Files",
-  hf: "HF",
-  hydrus: "Hydrus",
 };
 
 interface ClipboardState {
@@ -170,9 +159,6 @@ interface ExplorerContextType {
 
   isAbsoluteFilerPath: boolean;
   isRemoteWorkspace: boolean;
-  isHfMode: boolean;
-  isHydrusMode: boolean;
-  /** Authenticated principal used to namespace HF/Hydrus browser state. */
   userId: string | null;
 
   /** タブ / パス種別ごとの破壊的操作の可否（削除・リネーム・移動・作成） */
@@ -182,11 +168,6 @@ interface ExplorerContextType {
   editingFile: { path: string; name: string; extension: string } | null;
   openEditor: (file: { path: string; name: string; type?: string }) => void;
   closeEditor: () => void;
-
-  // HF creator_mapping.json 検索（60_huggingface-sync 互換のタグ/作者フィルタ）
-  hfCreatorMapping: CreatorMapping | null;
-  hfSearchQuery: string;
-  setHfSearchQuery: (q: string) => void;
 }
 
 const ExplorerContext = createContext<ExplorerContextType | null>(null);
@@ -241,12 +222,7 @@ function writeLocalStorage(key: string, value: string): void {
 }
 
 function isFilerTab(value: string | null): value is FilerTab {
-  return (
-    value === "workspace" ||
-    value === "user" ||
-    value === "hf" ||
-    value === "hydrus"
-  );
+  return value === "workspace" || value === "user";
 }
 
 function lastPathStorageKey(tab: FilerTab, ownerId?: string | null): string {
@@ -269,7 +245,6 @@ function writeLastPath(
   path: string,
   ownerId?: string | null,
 ): void {
-  if (tab === "hydrus") return;
   writeLocalStorage(lastPathStorageKey(tab, ownerId), path);
 }
 
@@ -395,16 +370,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   // Principal that produced browseDataState.  Rendering is gated below so a
   // logout/login switch cannot flash the previous user's directory.
   const [dataPrincipalId, setDataPrincipalId] = useState<string | null>(null);
-  const [hfCreatorMapping, setHfCreatorMapping] =
-    useState<CreatorMapping | null>(null);
-  const [hfSearchQuery, setHfSearchQuery] = useState<string>("");
-  // Hydrus は検索結果のページキャッシュを持ち refresh で削除が反映されないため、
-  // 削除済み file_id を表示側で保持して一覧から除外する。
-  const [hydrusHiddenFileIds, setHydrusHiddenFileIds] = useState<Set<number>>(
-    () => new Set(),
-  );
-  // 通常の Files 削除中に一覧から先行して隠す tombstone。Hydrus/HF は
-  // 専用の表示キャッシュを持つため、この state を適用しない。
+  // 通常の Files 削除中に一覧から先行して隠す tombstone。
   const pendingDeletedPathsRef = useRef<Set<string>>(new Set());
   const committedDeletedPathsRef = useRef<Set<string>>(new Set());
   // Multiple delete operations may overlap on the same path.  Keep every
@@ -454,8 +420,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [storageCtxList, setStorageCtxList] = useState<StorageContext[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
   const [isAbsoluteFilerPath, setIsAbsoluteFilerPath] = useState(false);
-  const [isHfMode, setIsHfMode] = useState(false);
-  const [isHydrusMode, setIsHydrusMode] = useState(false);
   const [filerTab, setFilerTabState] = useState<FilerTab>("workspace");
   const activeFilerTabRef = useRef<FilerTab>("workspace");
   const historyBackRef = useRef<ExplorerHistoryEntry[]>([]);
@@ -466,9 +430,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const logicalNavigationCursorRef = useRef<LogicalNavigationCursor | null>(null);
   const [userId, setUserId] = useState<string | null>(() =>
     sessionUserId === undefined ? null : sessionUserId,
-  );
-  const [hfOwnedAccountIds, setHfOwnedAccountIds] = useState<Set<string>>(
-    () => new Set(),
   );
   const previousUserIdRef = useRef<string | null>(null);
   const activeFetchRef = useRef<ActiveDirectoryFetch | null>(null);
@@ -513,39 +474,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     writeLocalStorage(EXPLORER_SORT_DIR_STORAGE_KEY, dir);
   }, []);
 
-  // HF 検索クエリで絞り込んだ browseData（HFモード時のみフィルタ）。
-  // Hydrus モードでは削除済み file_id を除外する。通常の Files では
   // 削除中 tombstone を適用し、API refresh 完了を待たずに表示を確定する。
   const browseData = useMemo<ExplorerListResponse | null>(() => {
     if (!browseDataState || dataPrincipalId !== userId) return null;
-    if (isHydrusMode) {
-      if (hydrusHiddenFileIds.size === 0) return browseDataState;
-      const files = browseDataState.files.filter((file) => {
-        const fileId = parseHydrusFileId(file.path);
-        return fileId === null || !hydrusHiddenFileIds.has(fileId);
-      });
-      return {
-        ...browseDataState,
-        files,
-        total_items: browseDataState.directories.length + files.length,
-      };
-    }
-    if (isHfMode) {
-      const q = hfSearchQuery.trim().toLowerCase();
-      if (!q) return browseDataState;
-      const filteredDirs = browseDataState.directories.filter((d) =>
-        creatorMatchesQuery(hfCreatorMapping, d.name, q),
-      );
-      const filteredFiles = browseDataState.files.filter((f) =>
-        f.name.toLowerCase().includes(q),
-      );
-      return {
-        ...browseDataState,
-        directories: filteredDirs,
-        files: filteredFiles,
-        total_items: filteredDirs.length + filteredFiles.length,
-      };
-    }
     if (pendingDeletedPaths.size === 0 && committedDeletedPaths.size === 0) {
       return browseDataState;
     }
@@ -569,12 +500,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     browseDataState,
     dataPrincipalId,
     userId,
-    isHfMode,
-    isHydrusMode,
-    hydrusHiddenFileIds,
     pendingDeletedPaths,
-    hfSearchQuery,
-    hfCreatorMapping,
     committedDeletedPaths,
   ]);
 
@@ -617,25 +543,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   );
 
   const setBrowseData = setBrowseDataForPrincipal;
-
-  // Hydrus 削除/復元の表示反映。filer-operations から呼ばれる。
-  const pruneHydrusFiles = useCallback((fileIds: number[]) => {
-    if (fileIds.length === 0) return;
-    setHydrusHiddenFileIds((prev) => {
-      const next = new Set(prev);
-      for (const id of fileIds) next.add(id);
-      return next;
-    });
-  }, []);
-
-  const restoreHydrusFiles = useCallback((fileIds: number[]) => {
-    if (fileIds.length === 0) return;
-    setHydrusHiddenFileIds((prev) => {
-      const next = new Set(prev);
-      for (const id of fileIds) next.delete(id);
-      return next;
-    });
-  }, []);
 
   const invalidateExplorerDeleteScope = useCallback(
     (clearState = true) => {
@@ -784,25 +691,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const registrationGeneration = deleteScopeGenerationRef.current;
-    const unregister = registerHydrusViewHandlers({
-      prune: (fileIds) => {
-        if (registrationGeneration !== deleteScopeGenerationRef.current) return;
-        pruneHydrusFiles(fileIds);
-      },
-      restore: (fileIds) => {
-        if (registrationGeneration !== deleteScopeGenerationRef.current) return;
-        restoreHydrusFiles(fileIds);
-      },
-    });
-    return unregister;
-  }, [
-    deleteScopeVersion,
-    pruneHydrusFiles,
-    restoreHydrusFiles,
-  ]);
-
-  useEffect(() => {
-    const registrationGeneration = deleteScopeGenerationRef.current;
     const handlers = {
       hide: (paths: string[]) =>
         hideExplorerDeletePaths(paths, registrationGeneration),
@@ -884,8 +772,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
-  // A logout/login switch must not leave the previous user's in-memory HF or
-  // Hydrus data visible while the new principal is loading. Persistent state is
+  // A logout/login switch must not leave the previous user's in-memory data
+  // visible while the new principal is loading. Persistent state is
   // namespaced by user id; in-memory state is cleared immediately here.
   useEffect(() => {
     const previous = previousUserIdRef.current;
@@ -894,7 +782,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       // A principal switch is also a navigation identity change.  Rename
       // refresh callbacks may outlive the session transition; advancing the
       // epoch makes their captured refresh epoch stale before they can
-      // restore a path/selection from the previous user or HF account.
+      // restore a path/selection from the previous user.
       const nextNavigationEpoch = navigationEpochRef.current + 1;
       navigationEpochRef.current = nextNavigationEpoch;
       setNavigationEpoch(nextNavigationEpoch);
@@ -904,59 +792,17 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       setLoading(false);
       setCurrentPath("");
       currentPathRef.current = "";
-      setHydrusHiddenFileIds(new Set());
       invalidateExplorerDeleteScope();
       setSelectedItems(new Set());
       selectedItemsRef.current = new Set();
       setFocusedItemPath(null);
       focusedItemPathRef.current = null;
-      setHfCreatorMapping(null);
-      setHfSearchQuery("");
       clearNavigationHistory();
       clearFilerUndoHistory();
       loadedRepoKeyRef.current = null;
-      setHfOwnedAccountIds(new Set());
     }
     previousUserIdRef.current = userId;
   }, [clearNavigationHistory, invalidateExplorerDeleteScope, userId]);
-
-  // Account ownership is resolved from the authenticated user's DB-backed
-  // account list; the opaque account id is never trusted from the URL alone.
-  useEffect(() => {
-    let cancelled = false;
-    if (!userId) {
-      setHfOwnedAccountIds(new Set());
-      return () => {
-        cancelled = true;
-      };
-    }
-    const refreshAccounts = () => {
-      void fetch("/api/huggingface/accounts", { credentials: "include" })
-        .then(async (response) => {
-          if (!response.ok) return [];
-          const body = (await response.json().catch(() => ({}))) as {
-            accounts?: Array<{ id?: unknown }>;
-          };
-          return Array.isArray(body.accounts)
-            ? body.accounts.flatMap((account) =>
-                typeof account.id === "string" ? [account.id] : [],
-              )
-            : [];
-        })
-        .then((ids) => {
-          if (!cancelled) setHfOwnedAccountIds(new Set(ids));
-        })
-        .catch(() => {
-          if (!cancelled) setHfOwnedAccountIds(new Set());
-        });
-    };
-    refreshAccounts();
-    window.addEventListener("aoitalk:hf-accounts-changed", refreshAccounts);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("aoitalk:hf-accounts-changed", refreshAccounts);
-    };
-  }, [userId]);
 
   // 現在位置が絶対パスでも失わない、タブ固有のホーム遷移先。
   const homeRootPath = useMemo(() => {
@@ -1046,9 +892,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         if (!uid) return null;
         return readLastPath(tab, uid) ?? userRoot(uid);
       }
-      if (tab === "hf") {
-        return readLastPath(tab, uid) ?? HF_PREFIX;
-      }
       return null;
     },
     [selectedProject, selectedProjectId, userId],
@@ -1057,10 +900,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const rememberCurrentPath = useCallback(
     (path: string, principalId: string | null = userId) => {
       if (!path || isAbsolutePath(path)) return;
-      if (isHfPath(path)) {
-        writeLastPath("hf", path, principalId);
-        return;
-      }
       // Derive the workspace owner from the path itself.  A shared bookmark
       // may temporarily open an admin-only Project while the canonical
       // ProjectContext selection remains on a participating Project; using
@@ -1103,7 +942,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     return next;
   }, []);
 
-  // ディレクトリ読み込み（explorer API or filer path API or HF API を自動判定）
+  // ディレクトリ読み込み（explorer API or filer path API を自動判定）
   const fetchDirectory = useCallback(
     async (
       path: string,
@@ -1203,53 +1042,11 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           setLoading(true);
           setError(null);
 
-          const useHf = isHfPath(targetPath);
-          const useAbsoluteFilerPath = !useHf && isAbsolutePath(targetPath);
+          const useAbsoluteFilerPath = isAbsolutePath(targetPath);
 
           try {
             let successfulData: ExplorerListResponse | null = null;
-            if (useHf) {
-              const data = await hfExplorerList(targetPath);
-              if (
-                requestGeneration !== principalGenerationRef.current ||
-                requestNavigationEpoch !== navigationEpochRef.current
-              ) continue;
-              setIsAbsoluteFilerPath(false);
-              setIsHfMode(true);
-              setIsHydrusMode(false);
-              setBrowseDataForPrincipal(data, targetPrincipalId);
-              setCurrentPath(data.current_path);
-              currentPathRef.current = data.current_path;
-              rememberCurrentPath(data.current_path, targetPrincipalId);
-              successfulData = data;
-
-              // creator_mapping.json はリポごとに一度だけロード（内部キャッシュも併用）
-              const parsed = parseHfPath(data.current_path);
-              if (parsed?.kind === "repo" && parsed.repoId && parsed.repoType) {
-                const key = `${parsed.accountId ?? ""}|${parsed.repoType}|${parsed.repoId}`;
-                if (loadedRepoKeyRef.current !== key) {
-                  loadedRepoKeyRef.current = key;
-                  setHfCreatorMapping(null);
-                  setHfSearchQuery("");
-                  fetchCreatorMapping({
-                    accountId: parsed.accountId,
-                    repoType: parsed.repoType,
-                    repoId: parsed.repoId,
-                  }).then((m) => {
-                    if (
-                      requestGeneration === principalGenerationRef.current &&
-                      loadedRepoKeyRef.current === key
-                    ) {
-                      setHfCreatorMapping(m);
-                    }
-                  });
-                }
-              } else {
-                loadedRepoKeyRef.current = null;
-                setHfCreatorMapping(null);
-                setHfSearchQuery("");
-              }
-            } else if (
+            if (
               targetPath.startsWith("remote://") &&
               selectedProject?.source === "remote" &&
               selectedProject.remote_server_id &&
@@ -1310,8 +1107,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 total_items: remoteData.total_items ?? 0,
               };
               setIsAbsoluteFilerPath(true);
-              setIsHfMode(false);
-              setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
@@ -1324,8 +1119,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 requestNavigationEpoch !== navigationEpochRef.current
               ) continue;
               setIsAbsoluteFilerPath(true);
-              setIsHfMode(false);
-              setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
@@ -1345,8 +1138,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 requestNavigationEpoch !== navigationEpochRef.current
               ) continue;
               setIsAbsoluteFilerPath(false);
-              setIsHfMode(false);
-              setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
@@ -1810,7 +1601,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     ? ([BOOKMARKS_SWR_KEY, bookmarkPrincipalIdentity, "personal:", null] as const)
     : null;
   // Only the active local Project Space has a shared collection in this
-  // provider. Remote, User, HF, and Hydrus tabs intentionally expose null.
+  // provider. Remote and User tabs intentionally expose null.
   const sharedBookmarksSWRKey =
     bookmarkPrincipalReady && bookmarkScope.scope === "shared"
       ? ([
@@ -1943,33 +1734,14 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   // タブ / パス種別ごとの操作可否。削除・リネーム・移動の判定はここに一元化する。
   const capabilities = useMemo(
-    () => {
-      const parsedHf = isHfMode ? parseHfPath(currentPath) : null;
-      const hfOwnAccount = Boolean(
-        parsedHf?.kind === "repo" &&
-          parsedHf.accountId &&
-          hfOwnedAccountIds.has(parsedHf.accountId),
-      );
-      return resolveFilerCapabilities({
+    () =>
+      resolveFilerCapabilities({
         filerTab,
         isAbsoluteFilerPath,
         isRemoteWorkspace,
-        isHfMode,
-        isHydrusMode,
         isAdmin,
-        hfOwnAccount,
-      });
-    },
-    [
-      filerTab,
-      currentPath,
-      isAbsoluteFilerPath,
-      isRemoteWorkspace,
-      isHfMode,
-      isHydrusMode,
-      isAdmin,
-      hfOwnedAccountIds,
-    ],
+      }),
+    [filerTab, isAbsoluteFilerPath, isRemoteWorkspace, isAdmin],
   );
 
   // タブ切り替え
@@ -1977,7 +1749,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     (tab: FilerTab) => {
       // タブをまたいだ Undo は復元先が食い違うためスタックを全消去する
       clearFilerUndoHistory();
-      setHydrusHiddenFileIds(new Set());
       invalidateExplorerDeleteScope();
       clearNavigationHistory();
       activeFilerTabRef.current = tab;
@@ -1986,35 +1757,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       writeLocalStorage(FILER_TAB_STORAGE_KEY, tab);
       const navigationEpoch = bumpNavigationEpoch();
       const restorePath = initialPathForTab(tab);
-      if (tab === "workspace" && restorePath) {
-        setIsHfMode(false);
-        setIsHydrusMode(false);
+      if (restorePath) {
         fetchDirectory(restorePath, userId, navigationEpoch);
-      } else if (tab === "user" && restorePath) {
-        setIsHfMode(false);
-        setIsHydrusMode(false);
-        fetchDirectory(restorePath, userId, navigationEpoch);
-      } else if (tab === "hf") {
-        setIsHfMode(true);
-        setIsHydrusMode(false);
-        fetchDirectory(restorePath ?? HF_PREFIX, userId, navigationEpoch);
-      } else if (tab === "hydrus") {
-        setIsHfMode(false);
-        setIsHydrusMode(true);
-        // Hydrus は ExplorerListResponse にマップしにくいので、
-        // browseData を空にして専用検索UI（filer/page.tsx 側）から駆動する
-        setBrowseDataForPrincipal({
-          success: true,
-          current_path: "Hydrus",
-          parent_path: null,
-          can_go_up: false,
-          directories: [],
-          files: [],
-          total_items: 0,
-        });
-        setCurrentPath("Hydrus");
-        currentPathRef.current = "Hydrus";
-        setLoading(false);
       }
     },
     [
@@ -2023,7 +1767,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       fetchDirectory,
       initialPathForTab,
       invalidateExplorerDeleteScope,
-      setBrowseDataForPrincipal,
       userId,
     ],
   );
@@ -2166,25 +1909,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
             workspaceRoot(selectedProjectId),
           uid,
         );
-        initDoneRef.current = true;
-      } else if (tab === "hf") {
-        setIsHfMode(true);
-        await fetchDirectory(readLastPath("hf", uid) ?? HF_PREFIX, uid);
-        initDoneRef.current = true;
-      } else if (tab === "hydrus") {
-        setIsHydrusMode(true);
-        setBrowseDataForPrincipal({
-          success: true,
-          current_path: "Hydrus",
-          parent_path: null,
-          can_go_up: false,
-          directories: [],
-          files: [],
-          total_items: 0,
-        }, uid);
-        setCurrentPath("Hydrus");
-        currentPathRef.current = "Hydrus";
-        setLoading(false);
         initDoneRef.current = true;
       }
       // workspace tab で selectedProjectId がまだnullの場合は
@@ -2372,11 +2096,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     ],
   );
 
-  const sidebarScopeRoot = filerTab === "hf"
-    ? HF_PREFIX
-    : filerTab === "hydrus"
-      ? "Hydrus"
-      : homeRootPath;
+  const sidebarScopeRoot = homeRootPath;
   const sidebarScopeKey = `${filerTab}:${bookmarkScope.scope}:${bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : ""}:${userId ?? ""}`;
   useEffect(() => {
     const owner = filesSidebarOwnerRef.current;
@@ -2479,16 +2199,11 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         isAdmin,
         isAbsoluteFilerPath,
         isRemoteWorkspace,
-        isHfMode,
-        isHydrusMode,
         userId,
         capabilities,
         editingFile,
         openEditor,
         closeEditor,
-        hfCreatorMapping,
-        hfSearchQuery,
-        setHfSearchQuery,
       }}
     >
       {children}

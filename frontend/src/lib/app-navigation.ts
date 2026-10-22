@@ -3,24 +3,15 @@ import {
   Boxes,
   Calendar,
   CheckSquare,
-  Film,
   FileText,
   Folder,
   FolderOpen,
   MessageSquare,
   Settings,
-  Swords,
   Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { DOCS_NAV_LABEL, DOCS_ROUTE } from "@/lib/docs-model";
-
-export type AppNavigationVisibilityKey = "scenarios" | "trpg";
-
-export type AppNavigationVisibility = Record<
-  AppNavigationVisibilityKey,
-  boolean
->;
 
 export type AppViewTab = {
   id: string;
@@ -29,7 +20,6 @@ export type AppViewTab = {
   icon: LucideIcon;
   shortcut: string;
   available: boolean;
-  visibilityKey?: AppNavigationVisibilityKey;
 };
 
 export const APP_VIEW_TABS = [
@@ -100,24 +90,6 @@ export const APP_VIEW_TABS = [
     available: true,
   },
   {
-    id: "scenarios",
-    title: "シナリオ",
-    href: "/scenarios",
-    icon: Film,
-    shortcut: "8",
-    available: true,
-    visibilityKey: "scenarios",
-  },
-  {
-    id: "trpg",
-    title: "TRPG",
-    href: "/trpg",
-    icon: Swords,
-    shortcut: "9",
-    available: true,
-    visibilityKey: "trpg",
-  },
-  {
     id: "apps",
     title: "Apps",
     href: "/apps",
@@ -138,14 +110,6 @@ export const APP_VIEW_TABS = [
   },
 ] as const satisfies readonly AppViewTab[];
 
-export const OPTIONAL_APP_VIEW_TABS = APP_VIEW_TABS.filter(
-  (
-    tab,
-  ): tab is (typeof APP_VIEW_TABS)[number] & {
-    visibilityKey: AppNavigationVisibilityKey;
-  } => "visibilityKey" in tab,
-);
-
 export function assertValidAppViewTabRegistry(tabs: readonly AppViewTab[]) {
   for (const property of ["id", "href", "shortcut"] as const) {
     const values = new Set<string>();
@@ -161,14 +125,8 @@ export function assertValidAppViewTabRegistry(tabs: readonly AppViewTab[]) {
   }
 }
 
-export function getVisibleAppViewTabs(
-  visibility: AppNavigationVisibility,
-): readonly AppViewTab[] {
-  return APP_VIEW_TABS.filter(
-    (tab) =>
-      tab.available &&
-      (!("visibilityKey" in tab) || visibility[tab.visibilityKey]),
-  );
+export function getVisibleAppViewTabs(): readonly AppViewTab[] {
+  return APP_VIEW_TABS.filter((tab) => tab.available);
 }
 
 if (process.env.NODE_ENV !== "production") {

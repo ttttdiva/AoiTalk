@@ -30,6 +30,10 @@ import { SearchNodeResults } from "./docs-search-panels";
 export function SupertagPage({
   apiFetch,
   tag,
+  activeViewId: controlledActiveViewId,
+  onActiveViewChange,
+  tagFilter: controlledTagFilter,
+  onTagFilterChange,
   tags,
   views,
   nodes,
@@ -52,6 +56,10 @@ export function SupertagPage({
 }: {
   apiFetch: DocsApiFetch;
   tag: DocsSupertag | null;
+  activeViewId?: string | null;
+  onActiveViewChange?: (viewId: string | null) => void;
+  tagFilter?: string;
+  onTagFilterChange?: (value: string) => void;
   tags: DocsSupertag[];
   views: DocsSavedView[];
   nodes: DocsNode[];
@@ -94,7 +102,18 @@ export function SupertagPage({
       }))
     : [];
   const viewList = savedViews.length > 0 ? savedViews : defaultViews;
-  const [activeViewId, setActiveViewId] = useState<string | null>(null);
+  const [localActiveViewId, setLocalActiveViewId] = useState<string | null>(null);
+  const [localTagFilter, setLocalTagFilter] = useState("");
+  const activeViewId = controlledActiveViewId === undefined ? localActiveViewId : controlledActiveViewId;
+  const tagFilter = controlledTagFilter ?? localTagFilter;
+  const changeActiveView = (viewId: string | null) => {
+    if (onActiveViewChange) onActiveViewChange(viewId);
+    else setLocalActiveViewId(viewId);
+  };
+  const changeTagFilter = (value: string) => {
+    if (onTagFilterChange) onTagFilterChange(value);
+    else setLocalTagFilter(value);
+  };
   const [showAddView, setShowAddView] = useState(false);
   const [newViewName, setNewViewName] = useState("");
   const [newViewLayout, setNewViewLayout] = useState<SearchView>("list");
@@ -119,11 +138,12 @@ export function SupertagPage({
   };
 
   useEffect(() => {
-    setActiveViewId(null);
     setShowAddView(false);
   }, [tag?.id]);
 
   if (!tag) {
+    const normalizedTagFilter = tagFilter.trim().toLowerCase();
+    const filteredTags = tags.filter((item) => item.name.toLowerCase().includes(normalizedTagFilter));
     const submitTable = async () => {
       const name = newTableName.trim();
       if (readOnly || !name || creatingTable) return;
@@ -139,7 +159,7 @@ export function SupertagPage({
       }
     };
     return (
-      <section className="min-w-0 flex-1 overflow-auto px-6 py-8">
+      <section className="min-w-0 flex-1 overflow-auto px-6 py-8" data-docs-history-main-scroll="main">
         <div className="mx-auto w-full max-w-3xl">
           <div className="mb-4 flex items-center justify-between gap-3">
             <h1 className="text-2xl font-semibold">Supertags</h1>
@@ -167,9 +187,27 @@ export function SupertagPage({
               </Button>
             </div>
           ) : null}
-          <Input className="mb-6 h-9" placeholder="Filter tags" />
+          <div className="mb-6 flex items-center gap-2">
+            <Input
+              className="h-9"
+              placeholder="Filter tags"
+              aria-label="タグを検索"
+              value={tagFilter}
+              onChange={(event) => changeTagFilter(event.target.value)}
+            />
+            {tagFilter ? (
+              <Button type="button" variant="ghost" aria-label="タグ検索をクリア" onClick={() => changeTagFilter("")}>
+                クリア
+              </Button>
+            ) : null}
+          </div>
+          {filteredTags.length === 0 ? (
+            <div role="status" className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+              {tags.length === 0 ? "タグはまだありません" : "一致するタグはありません"}
+            </div>
+          ) : null}
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {tags.map((item) => (
+            {filteredTags.map((item) => (
               <button
                 key={item.id}
                 type="button"
@@ -217,14 +255,14 @@ export function SupertagPage({
   };
   const persistActiveViewLayout = (view: SearchView) => {
     if (readOnly) {
-      setActiveViewId(viewList.find((item) => item.layout === view)?.id ?? activeView?.id ?? null);
+      changeActiveView(viewList.find((item) => item.layout === view)?.id ?? activeView?.id ?? null);
       return;
     }
     if (activeViewIsSaved && activeView) {
       void onUpdateView(activeView.id, { layout: view });
       return;
     }
-    setActiveViewId(viewList.find((item) => item.layout === view)?.id ?? activeView?.id ?? null);
+    changeActiveView(viewList.find((item) => item.layout === view)?.id ?? activeView?.id ?? null);
   };
   const beginAddView = () => {
     setNewViewName(`${tag.name} custom view`);
@@ -252,7 +290,7 @@ export function SupertagPage({
       return;
     }
     void onCreateView(tag, { name, layout: newViewLayout, config_json: configJson }).then((view) => {
-      setActiveViewId(view.id);
+      changeActiveView(view.id);
       setShowAddView(false);
     });
   };
@@ -280,7 +318,7 @@ export function SupertagPage({
   };
 
   return (
-    <section className="min-w-0 flex-1 overflow-auto px-6 py-5">
+    <section className="min-w-0 flex-1 overflow-auto px-6 py-5" data-docs-history-main-scroll="main">
       <div className="mx-auto w-full max-w-5xl">
         <div className="mb-3 flex items-center justify-between gap-3">
           <div className="min-w-0">
@@ -305,7 +343,7 @@ export function SupertagPage({
         </div>
         <div className="mb-5 flex flex-wrap gap-1 border-b pb-2">
           {viewList.map((view) => (
-            <button key={view.id} type="button" className={cn("rounded px-2 py-1 text-xs hover:bg-accent", activeView?.id === view.id && "bg-accent")} onClick={() => setActiveViewId(view.id)}>
+            <button key={view.id} type="button" className={cn("rounded px-2 py-1 text-xs hover:bg-accent", activeView?.id === view.id && "bg-accent")} onClick={() => changeActiveView(view.id)}>
               {view.name}
             </button>
           ))}

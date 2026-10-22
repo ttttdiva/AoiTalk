@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, ChevronRight, Loader2, Users } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ChevronRight, ExternalLink, Loader2, Users } from "lucide-react";
 import {
   chatApi,
   type AgentRun,
@@ -292,6 +292,28 @@ function RunView({
         <MetaRow label="run ID" value={run.id} />
         <MetaRow label="親 run" value={run.parent_run_id ?? null} />
       </div>
+      {(run.agent_id || run.work_item_id) && (
+        <div className="flex flex-wrap gap-2 text-[11px]">
+          {run.agent_id && (
+            <a
+              href={`/operations?tab=agents&agent=${encodeURIComponent(run.agent_id)}&panel=activity`}
+              className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-1 text-primary underline-offset-2 hover:underline"
+            >
+              <ExternalLink className="size-3" />
+              Operations Agentを開く
+            </a>
+          )}
+          {run.work_item_id && (
+            <a
+              href={`/operations?tab=work&work_id=${encodeURIComponent(run.work_item_id)}`}
+              className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-1 text-primary underline-offset-2 hover:underline"
+            >
+              <ExternalLink className="size-3" />
+              WorkItemを開く
+            </a>
+          )}
+        </div>
+      )}
       {run.error && (
         <div className="flex items-start gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />

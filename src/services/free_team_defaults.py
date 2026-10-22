@@ -76,8 +76,8 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
         },
     },
     "quota_pools": {
-        "openai-sol-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 1_000_000, "safety_margin_ratio": 0.01, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
-        "openai-luna-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 10_000_000, "safety_margin_ratio": 0.01, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
+        "openai-sol-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 1_000_000, "safety_margin_units": 30_000, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
+        "openai-luna-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 10_000_000, "safety_margin_units": 30_000, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
         "gemini-free-rpm": {"credential_profile_id": "gemini-free", "metric_type": "rpm", "limit": 0, "reset_policy": {"kind": "minute"}},
         "gemini-free-tpm": {"credential_profile_id": "gemini-free", "metric_type": "tpm", "limit": 0, "reset_policy": {"kind": "minute"}},
         "gemini-free-rpd": {"credential_profile_id": "gemini-free", "metric_type": "rpd", "limit": 0, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
@@ -90,7 +90,7 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
     },
     "candidates": {
         "openai-luna": {"credential_profile_id": "openai-complimentary", "provider": "openai", "model": "gpt-5.6-luna", "effort": "max", "priority": 10, "quota_pool_ids": ["openai-luna-daily"], "capabilities": ["text", "structured_output", "coding", "long_context"], "quality_class": "heavy", "max_input_tokens": 196000, "max_output_tokens": 4096, "tool_call_policy": {"complimentary_tool_calls_allowed": False}},
-        "openai-sol": {"credential_profile_id": "openai-complimentary", "provider": "openai", "model": "gpt-5.6-sol", "effort": "medium", "priority": 11, "quota_pool_ids": ["openai-sol-daily"], "capabilities": ["text", "structured_output", "coding", "long_context"], "quality_class": "heavy", "max_input_tokens": 196000, "max_output_tokens": 4096, "tool_call_policy": {"complimentary_tool_calls_allowed": False}},
+        "openai-sol": {"credential_profile_id": "openai-complimentary", "provider": "openai", "model": "gpt-5.6-sol", "effort": "high", "priority": 11, "quota_pool_ids": ["openai-sol-daily"], "capabilities": ["text", "structured_output", "coding", "long_context"], "quality_class": "heavy", "max_input_tokens": 196000, "max_output_tokens": 4096, "tool_call_policy": {"complimentary_tool_calls_allowed": False}},
         "gemini-free-flash": {"credential_profile_id": "gemini-free", "provider": "gemini", "model": "gemini-2.5-flash", "priority": 20, "quota_pool_ids": ["gemini-free-rpm", "gemini-free-tpm", "gemini-free-rpd"], "capabilities": ["text", "tools", "vision", "structured_output", "coding", "long_context"], "quality_class": "standard", "max_input_tokens": 100000, "max_output_tokens": 4096},
         "gemini-free-lite": {"credential_profile_id": "gemini-free", "provider": "gemini", "model": "gemini-2.5-flash-lite", "priority": 21, "quota_pool_ids": ["gemini-free-rpm", "gemini-free-tpm", "gemini-free-rpd"], "capabilities": ["text", "tools", "structured_output", "long_context"], "quality_class": "light", "max_input_tokens": 100000, "max_output_tokens": 4096},
         "openrouter-free-router": {"credential_profile_id": "openrouter-free", "provider": "openrouter", "model": "openrouter/free", "priority": 30, "quota_pool_ids": ["openrouter-free-rpm", "openrouter-free-rpd"], "capabilities": ["text", "tools", "coding"], "quality_class": "standard", "max_input_tokens": 32000, "max_output_tokens": 2048, "provider_options": {"max_price": 0, "allow_fallbacks": False, "require_free": True}},

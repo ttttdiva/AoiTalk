@@ -89,7 +89,7 @@ test("Chat settings keyboard outer/inner transitions keep Portal focus determini
   const provider = page.getByRole("combobox", { name: "Provider" });
   const model = page.getByRole("combobox", { name: "Model" });
   const effort = page.getByRole("combobox", { name: "推論・LLMモード" });
-  const agentTeam = page.getByRole("combobox", { name: "Agent Team" });
+  const agentTeam = page.getByRole("combobox", { name: "Execution Team" });
   const executionProfile = page.getByRole("combobox", { name: "Execution Profile" });
   const character = page.getByRole("combobox", { name: "キャラクター" });
   await expect(provider).toBeVisible();
@@ -202,7 +202,7 @@ test("Chat settings keeps Melody reasoning unsupported and skips its status row"
 
   const provider = page.getByRole("combobox", { name: "Provider" });
   const model = page.getByRole("combobox", { name: "Model" });
-  const agentTeam = page.getByRole("combobox", { name: "Agent Team" });
+  const agentTeam = page.getByRole("combobox", { name: "Execution Team" });
   await expect(provider).toBeVisible();
   await expect(provider).toBeFocused();
   await expect(page.getByTestId("chat-effort-unsupported")).toHaveText(

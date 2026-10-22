@@ -21,7 +21,7 @@ from uuid import UUID
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .field_crypto import FieldCryptoError, get_data_key
+from .field_crypto import FieldCryptoError, _probe_key_usable, _readonly_data_key_access, get_data_key
 
 
 MEDIA_CREDENTIAL_ENCRYPTION_PREFIX = "enc:v1:"
@@ -128,6 +128,21 @@ def _key_for_id(key_id: str) -> bytes:
     return key
 
 
+def probe_media_credential_key_readonly() -> bool:
+    """Probe the active vault key using existing providers without key creation.
+
+    Provider precedence/key-id selection match credential encryption. The
+    local fallback uses read-existing mode; configured commands are the same
+    bounded keyring/KMS readers. Only a bool or a sanitized error escapes.
+    """
+
+    try:
+        with _readonly_data_key_access():
+            return _probe_key_usable(_key_for_id(_key_id()))
+    except Exception:
+        raise MediaCredentialKeyUnavailable("media credential key is unavailable") from None
+
+
 def _encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -194,6 +209,13 @@ def encrypt_media_credential(
     )
 
 
+def encrypt_media_credential_readonly(payload: Any, *, credential_id: UUID | str,
+    platform_account_id: UUID | str) -> EncryptedMediaCredential:
+    """Encrypt checkpoint metadata using an existing key, never initialize one."""
+    with _readonly_data_key_access():
+        return encrypt_media_credential(payload, credential_id=credential_id, platform_account_id=platform_account_id)
+
+
 def decrypt_media_credential(
     ciphertext: str,
     *,
@@ -252,4 +274,6 @@ __all__ = [
     "decrypt_media_credential",
     "decrypt_media_credential_safe",
     "encrypt_media_credential",
+    "encrypt_media_credential_readonly",
+    "probe_media_credential_key_readonly",
 ]

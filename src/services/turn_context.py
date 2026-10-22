@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Iterator, Mapping
@@ -38,6 +40,118 @@ class ResourceReference:
         identifier = str(self.id or "").strip()
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "id", identifier)
+
+
+@dataclass(frozen=True)
+class AgentDialogueContinuationTarget:
+    """Server-authored immutable target for one Human-answer continuation."""
+
+    dialogue_id: str
+    input_id: str
+    input_revision: int
+    control_revision: int
+    source_run_id: str
+    source_work_item_id: str
+    source_message_id: str
+    source_session_id: str
+    source_agent_id: str
+    source_agent_revision_id: str
+    answer_message_id: str
+    root_session_id: str
+    root_agent_id: str
+    root_agent_revision_id: str
+    root_run_id: str
+    root_work_item_id: str
+    target_digest: str
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "AgentDialogueContinuationTarget | None":
+        if not isinstance(value, Mapping):
+            return None
+        if value.get("target_kind") != "human_answer_continuation":
+            return None
+        required = (
+            "dialogue_id",
+            "input_id",
+            "source_run_id",
+            "source_work_item_id",
+            "source_message_id",
+            "source_session_id",
+            "source_agent_id",
+            "source_agent_revision_id",
+            "answer_message_id",
+            "root_session_id",
+            "root_agent_id",
+            "root_agent_revision_id",
+            "root_run_id",
+            "root_work_item_id",
+            "target_digest",
+        )
+        if any(not str(value.get(key) or "").strip() for key in required):
+            return None
+        try:
+            input_revision = int(value.get("input_revision"))
+            control_revision = int(value.get("control_revision"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if input_revision < 1 or control_revision < 0:
+            return None
+        digest_material = {
+            str(key): value[key]
+            for key in value
+            if str(key) != "target_digest"
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                digest_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(value.get("target_digest") or "").casefold() != expected_digest:
+            return None
+        return cls(
+            dialogue_id=str(value["dialogue_id"]).strip(),
+            input_id=str(value["input_id"]).strip(),
+            input_revision=input_revision,
+            control_revision=control_revision,
+            source_run_id=str(value["source_run_id"]).strip(),
+            source_work_item_id=str(value["source_work_item_id"]).strip(),
+            source_message_id=str(value["source_message_id"]).strip(),
+            source_session_id=str(value["source_session_id"]).strip(),
+            source_agent_id=str(value["source_agent_id"]).strip(),
+            source_agent_revision_id=str(value["source_agent_revision_id"]).strip(),
+            answer_message_id=str(value["answer_message_id"]).strip(),
+            root_session_id=str(value["root_session_id"]).strip(),
+            root_agent_id=str(value["root_agent_id"]).strip(),
+            root_agent_revision_id=str(value["root_agent_revision_id"]).strip(),
+            root_run_id=str(value["root_run_id"]).strip(),
+            root_work_item_id=str(value["root_work_item_id"]).strip(),
+            target_digest=str(value["target_digest"]).strip().casefold(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_kind": "human_answer_continuation",
+            "dialogue_id": self.dialogue_id,
+            "input_id": self.input_id,
+            "input_revision": self.input_revision,
+            "control_revision": self.control_revision,
+            "source_run_id": self.source_run_id,
+            "source_work_item_id": self.source_work_item_id,
+            "source_message_id": self.source_message_id,
+            "source_session_id": self.source_session_id,
+            "source_agent_id": self.source_agent_id,
+            "source_agent_revision_id": self.source_agent_revision_id,
+            "answer_message_id": self.answer_message_id,
+            "root_session_id": self.root_session_id,
+            "root_agent_id": self.root_agent_id,
+            "root_agent_revision_id": self.root_agent_revision_id,
+            "root_run_id": self.root_run_id,
+            "root_work_item_id": self.root_work_item_id,
+            "target_digest": self.target_digest,
+        }
 
 
 @dataclass(frozen=True)
@@ -84,6 +198,29 @@ class TurnContext:
     # model tool argument never become escalation authority.
     cloud_advisor_origin: Any | None = None
     cloud_advisor_assessment: Any | None = None
+
+    # A trusted Operations Agent execution binding.  This is populated only
+    # after the server has resolved the canonical ConversationSession Agent
+    # and pinned its exact AgentRevision.  Character/Persona state deliberately
+    # remains separate from this identity.
+    agent_id: str | None = None
+    agent_revision_id: str | None = None
+    agent_execution_binding: Any | None = None
+    agent_role: str | None = None
+    agent_execution_config: Any | None = None
+
+    # A durable AgentDialogue turn is still an ordinary Chat turn.  These
+    # fields are server-derived references used to keep the worker's input,
+    # control revision, and human anchor separate from provider prose.
+    agent_dialogue_id: str | None = None
+    agent_dialogue_role: str | None = None
+    agent_dialogue_input_id: str | None = None
+    agent_dialogue_control_revision: int | None = None
+    agent_dialogue_human_anchor: str | None = None
+    agent_dialogue_continuation_target: AgentDialogueContinuationTarget | None = None
+    agent_dialogue_typed_resume_answer: str | None = None
+    agent_dialogue_typed_resume_answer_id: str | None = None
+    context_project_hint_id: str | None = None
 
 
 _current_turn_context: ContextVar[TurnContext] = ContextVar(
@@ -137,6 +274,20 @@ def set_turn_context(
     strict_project_scope: bool = False,
     cloud_advisor_origin: Any | None = None,
     cloud_advisor_assessment: Any | None = None,
+    agent_id: str | None = None,
+    agent_revision_id: str | None = None,
+    agent_execution_binding: Any | None = None,
+    agent_role: str | None = None,
+    agent_execution_config: Any | None = None,
+    agent_dialogue_id: str | None = None,
+    agent_dialogue_role: str | None = None,
+    agent_dialogue_input_id: str | None = None,
+    agent_dialogue_control_revision: int | None = None,
+    agent_dialogue_human_anchor: str | None = None,
+    agent_dialogue_continuation_target: AgentDialogueContinuationTarget | None = None,
+    agent_dialogue_typed_resume_answer: str | None = None,
+    agent_dialogue_typed_resume_answer_id: str | None = None,
+    context_project_hint_id: str | None = None,
 ) -> Token:
     normalized_reference_ids = tuple(
         dict.fromkeys(
@@ -246,12 +397,89 @@ def set_turn_context(
             strict_project_scope=bool(strict_project_scope),
             cloud_advisor_origin=normalized_cloud_origin,
             cloud_advisor_assessment=normalized_cloud_assessment,
+            agent_id=str(agent_id).strip() if agent_id else None,
+            agent_revision_id=(
+                str(agent_revision_id).strip() if agent_revision_id else None
+            ),
+            agent_execution_binding=agent_execution_binding,
+            agent_role=str(agent_role).strip() if agent_role else None,
+            agent_execution_config=agent_execution_config,
+            agent_dialogue_id=(
+                str(agent_dialogue_id).strip() if agent_dialogue_id else None
+            ),
+            agent_dialogue_role=(
+                str(agent_dialogue_role).strip().casefold()
+                if agent_dialogue_role
+                else None
+            ),
+            agent_dialogue_input_id=(
+                str(agent_dialogue_input_id).strip() if agent_dialogue_input_id else None
+            ),
+            agent_dialogue_control_revision=(
+                max(0, int(agent_dialogue_control_revision))
+                if agent_dialogue_control_revision is not None
+                else None
+            ),
+            agent_dialogue_human_anchor=(
+                str(agent_dialogue_human_anchor).strip()[:131_072]
+                if agent_dialogue_human_anchor
+                else None
+            ),
+            agent_dialogue_continuation_target=(
+                agent_dialogue_continuation_target
+                if isinstance(
+                    agent_dialogue_continuation_target,
+                    AgentDialogueContinuationTarget,
+                )
+                else None
+            ),
+            agent_dialogue_typed_resume_answer=(
+                str(agent_dialogue_typed_resume_answer)
+                if agent_dialogue_typed_resume_answer is not None
+                else None
+            ),
+            agent_dialogue_typed_resume_answer_id=(
+                str(agent_dialogue_typed_resume_answer_id).strip()
+                if agent_dialogue_typed_resume_answer_id
+                else None
+            ),
+            context_project_hint_id=(
+                str(context_project_hint_id).strip() if context_project_hint_id else None
+            ),
         )
     )
 
 
 def get_turn_context() -> TurnContext:
     return _current_turn_context.get()
+
+
+def is_agent_dialogue_worker(context: TurnContext | None = None) -> bool:
+    """Return whether the current turn is a server-bound dialogue worker.
+
+    The explicit role is preferred.  The immutable binding projection is a
+    compatibility fallback for adapters that have not yet copied the fields
+    onto ``TurnContext``; arbitrary provider/model text is never inspected.
+    """
+
+    current = context or get_turn_context()
+    role = str(current.agent_dialogue_role or "").strip().casefold()
+    if role:
+        return role == "worker"
+    binding = current.agent_execution_binding
+    if isinstance(binding, Mapping):
+        role = str(
+            binding.get("agent_dialogue_role")
+            or binding.get("dialogue_role")
+            or binding.get("role")
+            or ""
+        ).strip().casefold()
+        return role == "worker"
+    for name in ("agent_dialogue_role", "dialogue_role"):
+        role = str(getattr(binding, name, "") or "").strip().casefold()
+        if role:
+            return role == "worker"
+    return False
 
 
 def override_turn_context(**changes: Any) -> Token:

@@ -38,6 +38,8 @@ class ContentVariantPlatform(str, Enum):
     PATREON = "patreon"
     YOUTUBE = "youtube"
     INSTAGRAM = "instagram"
+    FANZA = "fanza"
+    TIKTOK = "tiktok"
 
 
 CONTENT_VARIANT_PLATFORM_VALUES = tuple(
@@ -114,7 +116,7 @@ class ContentVariant(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "platform IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')",
+            "platform IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')",
             name="ck_media_content_variants_platform",
         ),
         CheckConstraint(
@@ -268,7 +270,7 @@ class ContentVariantRevision(Base):
             name="ck_media_content_variant_revisions_version",
         ),
         CheckConstraint(
-            "platform IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')",
+            "platform IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')",
             name="ck_media_content_variant_revisions_platform",
         ),
         CheckConstraint(

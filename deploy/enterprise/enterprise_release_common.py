@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import platform
 import re
 import stat
+import shutil
+import subprocess
 import tempfile
 import zipfile
 
@@ -158,6 +162,43 @@ def write_zip(root: Path, destination: Path) -> None:
         os.fsync(stream.fileno())
 
 
+def _publish_windows_drive_from_wsl(source: Path, destination: Path) -> bool:
+    """Use Windows' no-replace directory move where DrvFs lacks renameat2 flags."""
+    if platform.system() != "Linux" or "microsoft" not in platform.release().casefold():
+        return False
+    converter, powershell = shutil.which("wslpath"), shutil.which("powershell.exe")
+    if not converter or not powershell:
+        return False
+    paths = []
+    for path in (source, destination):
+        converted = subprocess.run(
+            [converter, "-w", str(path)], capture_output=True, text=True,
+            encoding="utf-8", errors="strict", check=False, timeout=30,
+        )
+        value = converted.stdout.removesuffix("\n").removesuffix("\r")
+        windows = PureWindowsPath(value)
+        if (converted.returncode or not re.fullmatch(r"[A-Za-z]:", windows.drive)
+                or not windows.is_absolute() or any(c in value for c in "\0\r\n")
+                or any(part.endswith((" ", ".")) or ":" in part for part in windows.parts[1:])):
+            return False
+        paths.append(value)
+    if PureWindowsPath(paths[0]).drive.casefold() != PureWindowsPath(paths[1]).drive.casefold():
+        return False
+    # Literal quoting keeps spaces, Unicode, apostrophes and shell metacharacters
+    # in paths as data. Do not alter PowerShell's execution policy or WSL settings.
+    literals = ["'" + value.replace("'", "''") + "'" for value in paths]
+    command = "$ErrorActionPreference = 'Stop'; [System.IO.Directory]::Move(" + ", ".join(literals) + ")"
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True, check=False, timeout=30,
+    )
+    if result.returncode:
+        if destination.exists():
+            raise FileExistsError(errno.EEXIST, "release destination already exists", str(destination))
+        raise OSError(errno.EIO, "Windows no-replace directory publication failed", str(destination))
+    return True
+
+
 def publish_directory(source: Path, destination: Path) -> None:
     """Atomic no-replace publish; an output race must never erase an old tree."""
     no_links(source)
@@ -173,5 +214,30 @@ def publish_directory(source: Path, destination: Path) -> None:
         rename.restype = ctypes.c_int
         if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1):
             error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), str(destination))
+            unsupported = {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}
+            if error not in unsupported or not _publish_windows_drive_from_wsl(source, destination):
+                raise OSError(error, os.strerror(error), str(destination))
     fsync_directory(destination.parent)
+
+
+def preflight_publication(parent: Path) -> None:
+    """Check the output filesystem before any large acquisition or packaging."""
+    parent = no_links(parent)
+    with tempfile.TemporaryDirectory(prefix=".enterprise-publish-probe-", dir=parent) as raw:
+        root = Path(raw)
+        source, target = root / "source", root / "target"
+        source.mkdir()
+        (source / "marker").write_bytes(b"publication-probe")
+        publish_directory(source, target)
+        if source.exists() or (target / "marker").read_bytes() != b"publication-probe":
+            raise ContractError("directory publication did not preserve the source")
+        source.mkdir()
+        (source / "new").write_bytes(b"must-not-replace")
+        try:
+            publish_directory(source, target)
+        except FileExistsError:
+            pass
+        else:
+            raise ContractError("directory publication did not refuse an existing target")
+        if (target / "marker").read_bytes() != b"publication-probe" or not (source / "new").is_file():
+            raise ContractError("directory publication changed an existing target")

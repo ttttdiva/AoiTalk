@@ -83,11 +83,6 @@ class CrawlerStatusChecker:
             return self._is_process_running("main.py", DISCORD_CRAWLER_PATH)
         elif crawler_name == "EventMonitor":
             return self._is_process_running("main.py", EVENT_MONITOR_PATH)
-        elif crawler_name == "HydrusClient":
-            # Hydrus credentials are user-scoped and must never be read from
-            # process-wide HYDRUS_* environment variables.  The per-user
-            # /api/hydrus/health route performs the authenticated check.
-            return False
         elif crawler_name == "VideoCrawler":
             # HuggingFace Space health check
             if not VIDEO_CRAWLER_RUNTIME_URL:
@@ -171,25 +166,6 @@ class CrawlerStatusChecker:
             logger.error(f"Failed to get VideoCrawler status: {e}")
         
         return result
-
-    async def get_hydrus_client_detailed_status(self) -> Dict[str, Any]:
-        """Get detailed HydrusClient status including API availability"""
-        result = {
-            "status": "unknown",
-            "details": {},
-            "error": None,
-            "can_restart": False,
-            "is_alive": False
-        }
-        
-        # Credentials are deliberately not available to this legacy crawler
-        # status endpoint.  Use the authenticated per-user Hydrus route for a
-        # connection check instead of falling back to global environment state.
-        result["status"] = "not_configured"
-        result["error"] = "ユーザーごとのHydrus設定画面から接続確認してください"
-        return result
-
-    
 
     def _get_next_run(self, jobs: list) -> Optional[str]:
         """Extract next run time from jobs list"""
@@ -432,47 +408,6 @@ class CrawlerStatusChecker:
         
         return result
     
-    async def launch_hydrus_client(self) -> Dict[str, Any]:
-        """Launch HydrusClient (only if not already running)"""
-        result = {
-            "success": False,
-            "message": "",
-            "error": None
-        }
-        
-        try:
-            # Check if already running
-            if psutil:
-                for proc in psutil.process_iter(['name', 'exe']):
-                    try:
-                        if proc.info['name'] and 'hydrus' in proc.info['name'].lower():
-                            result["success"] = False
-                            result["message"] = "HydrusClient is already running"
-                            return result
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            
-            # Launch HydrusClient
-            hydrus_exe = Path(r"C:\Hydrus Network\hydrus_client.exe")
-            if not hydrus_exe.exists():
-                raise FileNotFoundError(f"HydrusClient not found: {hydrus_exe}")
-            
-            logger.info("Launching HydrusClient...")
-            subprocess.Popen(
-                [str(hydrus_exe)],
-                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
-            )
-            
-            result["success"] = True
-            result["message"] = "HydrusClient launched successfully"
-            
-        except Exception as e:
-            result["error"] = str(e)
-            result["message"] = f"Failed to launch HydrusClient: {e}"
-            logger.error(f"Failed to launch HydrusClient: {e}")
-        
-        return result
-    
     async def stop_discord_crawler(self) -> Dict[str, Any]:
         """Stop DiscordCrawler if running"""
         result = {
@@ -561,42 +496,3 @@ class CrawlerStatusChecker:
         
         return result
     
-    async def stop_hydrus_client(self) -> Dict[str, Any]:
-        """Stop HydrusClient if running"""
-        result = {
-            "success": False,
-            "message": "",
-            "error": None
-        }
-        
-        try:
-            # Check if running
-            found = False
-            if psutil:
-                for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                    try:
-                        if proc.info['name'] and 'hydrus' in proc.info['name'].lower():
-                            found = True
-                            logger.info(f"Stopping HydrusClient (PID: {proc.info['pid']})...")
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=5)
-                            except psutil.TimeoutExpired:
-                                proc.kill()
-                            logger.info(f"Stopped HydrusClient process (PID: {proc.info['pid']})")
-                            result["success"] = True
-                            result["message"] = "HydrusClient stopped successfully"
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            
-            if not found:
-                result["success"] = False
-                result["message"] = "HydrusClient is not running"
-                
-        except Exception as e:
-            result["error"] = str(e)
-            result["message"] = f"Failed to stop HydrusClient: {e}"
-            logger.error(f"Failed to stop HydrusClient: {e}")
-        
-        return result

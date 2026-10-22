@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Loader2, Send, Sparkles, X } from "lucide-react";
+import { Check, Loader2, Send, Sparkles, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,12 +27,14 @@ type Props = {
   notificationId: string | null;
   target: KnowledgeCaptureNotificationTarget | null;
   candidate: KnowledgeCaptureCandidate | null;
+  readOnly?: boolean;
+  canPublish?: boolean;
   onOpenChange(open: boolean): void;
   onDidOpen(notificationId: string): void;
   onResolved(): void;
 };
 
-type PendingAction = "answer" | "review" | "dismiss" | null;
+type PendingAction = "answer" | "review" | "dismiss" | "publish" | null;
 
 function candidateUrl(target: KnowledgeCaptureNotificationTarget): string {
   return `/api/projects/${encodeURIComponent(target.projectId)}/knowledge-capture/candidates/${encodeURIComponent(target.candidateId)}`;
@@ -47,9 +49,11 @@ function answerUrl(
 
 function reviewUrl(
   target: KnowledgeCaptureNotificationTarget,
-  questionId: string,
+  questionId?: string,
 ): string {
-  return `${candidateUrl(target)}/questions/${encodeURIComponent(questionId)}/review`;
+  return questionId
+    ? `${candidateUrl(target)}/questions/${encodeURIComponent(questionId)}/review`
+    : `${candidateUrl(target)}/review`;
 }
 
 function dismissUrl(target: KnowledgeCaptureNotificationTarget): string {
@@ -62,6 +66,11 @@ function statusLabel(status: string): string {
       return "回答待ち";
     case "draft_ready":
       return "Docs候補";
+    case "published":
+      return "保存済み";
+    case "dismissed":
+    case "discarded":
+      return "見送り済み";
     default:
       return status;
   }
@@ -138,11 +147,23 @@ function normalizeReviewResponse(
   };
 }
 
-export function KnowledgeCaptureReviewDialog({
+export function KnowledgeCaptureReviewDialog(props: Props) {
+  const { candidate, target, open } = props;
+  return (
+    <KnowledgeCaptureReviewSession
+      key={`${target?.projectId}:${target?.candidateId}:${candidate?.id}:${candidate?.version}:${open}`}
+      {...props}
+    />
+  );
+}
+
+function KnowledgeCaptureReviewSession({
   open,
   notificationId,
   target,
   candidate,
+  readOnly = false,
+  canPublish,
   onOpenChange,
   onDidOpen,
   onResolved,
@@ -156,14 +177,12 @@ export function KnowledgeCaptureReviewDialog({
     useState<KnowledgeCaptureReviewResponse | null>(null);
   const [thread, setThread] = useState<KnowledgeCaptureReviewExchange[]>([]);
   const didOpenKeyRef = useRef<string | null>(null);
+  const [publishPermission, setPublishPermission] = useState<"checking" | "allowed" | "denied" | "unavailable">("checking");
+  const mayPublish = canPublish ?? publishPermission === "allowed";
+  const requestEpochRef = useRef(0);
+  const pendingRef = useRef(false);
 
-  useEffect(() => {
-    setCurrentCandidate(candidate);
-    setComposer("");
-    setError(null);
-    setReviewResponse(null);
-    setThread([]);
-  }, [candidate]);
+  useEffect(() => () => { requestEpochRef.current += 1; }, []);
 
   useEffect(() => {
     if (!open) {
@@ -177,8 +196,55 @@ export function KnowledgeCaptureReviewDialog({
     onDidOpen(notificationId);
   }, [candidate, notificationId, onDidOpen, open]);
 
-  const reloadCandidate = async (): Promise<KnowledgeCaptureCandidate> => {
-    if (!target) throw new Error("ナレッジ候補を再読み込みできませんでした。");
+  useEffect(() => {
+    if (!open || readOnly || canPublish !== undefined || !target || currentCandidate?.status !== "draft_ready") return;
+    let active = true;
+    const controller = new AbortController();
+    // This existing read-only endpoint requires the same manage_settings
+    // permission as publication. Unknown permissions never enable adoption.
+    void fetch(`/api/projects/${encodeURIComponent(target.projectId)}/knowledge-capture/settings`, {
+      credentials: "include", cache: "no-store", signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) {
+        if (active) setPublishPermission(response.status === 403 ? "denied" : "unavailable");
+        return;
+      }
+      const body: unknown = await response.json();
+      const matchesProject = !!body && typeof body === "object" &&
+        "project_id" in body && typeof body.project_id === "string" &&
+        body.project_id.toLowerCase() === target.projectId.toLowerCase();
+      if (active) setPublishPermission(matchesProject ? "allowed" : "unavailable");
+    }).catch(() => { if (active) setPublishPermission("unavailable"); });
+    return () => { active = false; controller.abort(); };
+  }, [canPublish, currentCandidate?.status, open, readOnly, target]);
+
+  const isCurrentRequest = (epoch: number) => requestEpochRef.current === epoch;
+
+  const beginAction = (action: Exclude<PendingAction, null>): number | null => {
+    if (
+      readOnly || !open || !target || !currentCandidate || pendingRef.current ||
+      currentCandidate.id !== target.candidateId ||
+      currentCandidate.projectId?.toLowerCase() !== target.projectId.toLowerCase()
+    ) return null;
+    pendingRef.current = true;
+    setPendingAction(action);
+    setError(null);
+    return requestEpochRef.current;
+  };
+
+  const endAction = (epoch: number) => {
+    if (!isCurrentRequest(epoch)) return;
+    pendingRef.current = false;
+    setPendingAction(null);
+  };
+
+  const validCandidate = (next: KnowledgeCaptureCandidate | null) => Boolean(
+    next && target && next.id === target.candidateId &&
+    next.projectId?.toLowerCase() === target.projectId.toLowerCase() && next.version > 0,
+  );
+
+  const reloadCandidate = async (epoch: number) => {
+    if (!target) return;
     const response = await fetch(candidateUrl(target), {
       credentials: "include",
       cache: "no-store",
@@ -186,98 +252,90 @@ export function KnowledgeCaptureReviewDialog({
     if (!response.ok) {
       throw await responseError(response, "ナレッジ候補を再読み込みできませんでした。");
     }
-    const next = normalizeKnowledgeCaptureCandidateDetail(
-      await response.json(),
-    );
-    if (
-      !next ||
-      next.id !== target.candidateId ||
-      next.projectId?.toLowerCase() !== target.projectId.toLowerCase() ||
-      next.version <= 0
-    ) {
-      throw new Error("ナレッジ候補の詳細が不正です。");
-    }
+    const next = normalizeKnowledgeCaptureCandidateDetail(await response.json());
+    if (!isCurrentRequest(epoch)) return;
+    if (!validCandidate(next)) throw new Error("ナレッジ候補の詳細が不正です。");
     setCurrentCandidate(next);
     setComposer("");
     setReviewResponse(null);
     setThread([]);
-    return next;
+    setError("別の操作で更新されました。最新状態を読み込みました。内容を確認してから操作してください。");
   };
 
-  const finishResolved = (next: KnowledgeCaptureCandidate | null) => {
-    if (next) setCurrentCandidate(next);
-    onResolved();
-    onOpenChange(false);
+  const mutateCandidate = async (
+    action: "answer" | "dismiss" | "publish",
+    url: string,
+    payload: Record<string, unknown>,
+    fallback: string,
+  ) => {
+    const epoch = beginAction(action);
+    if (epoch === null || !currentCandidate) return;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_candidate_version: currentCandidate.version,
+          ...payload,
+        }),
+      });
+      if (!isCurrentRequest(epoch)) return;
+      if (response.status === 409) {
+        await reloadCandidate(epoch);
+        return;
+      }
+      if (!response.ok) {
+        if (action === "publish" && response.status === 403) {
+          throw new Error("Docsへの採用・保存にはプロジェクトの管理権限が必要です。管理者に確認してください。");
+        }
+        throw await responseError(response, fallback);
+      }
+      const next = normalizeKnowledgeCaptureCandidateDetail(await response.json());
+      if (!isCurrentRequest(epoch)) return;
+      if (
+        !validCandidate(next) || !next || next.version <= currentCandidate.version ||
+        (action === "publish" && next.status !== "published") ||
+        (action === "dismiss" && next.status !== "dismissed" && next.status !== "discarded")
+      ) throw new Error("操作後の候補データが不正です。最新状態を開き直してください。");
+      setCurrentCandidate(next);
+      onResolved();
+      onOpenChange(false);
+    } catch (cause) {
+      if (isCurrentRequest(epoch)) setError(cause instanceof Error ? cause.message : fallback);
+    } finally {
+      endAction(epoch);
+    }
   };
 
   const answer = async (optionId?: string, text?: string) => {
-    if (!target || !currentCandidate?.question || pendingAction) return;
+    if (!target || currentCandidate?.status !== "needs_user" || !currentCandidate.question) return;
     const question = currentCandidate.question;
     if (optionId && !question.options.some((option) => option.id === optionId)) {
       setError("選択肢を確認できませんでした。");
       return;
     }
     const answerText = text?.trim() || "";
-    if (!optionId && !answerText) return;
-    if (!optionId && !question.allowFreeText) {
-      setError("この質問は自由入力に対応していません。");
-      return;
-    }
-
-    setPendingAction("answer");
-    setError(null);
-    try {
-      const response = await fetch(answerUrl(target, question.id), {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          expected_candidate_version: currentCandidate.version,
-          ...(optionId ? { option_id: optionId } : {}),
-          ...(answerText ? { text: answerText.slice(0, 4000) } : {}),
-        }),
-      });
-      if (response.status === 409) {
-        await reloadCandidate();
-        setError("別の操作で更新されました。最新状態を読み込みました。");
-        return;
-      }
-      if (!response.ok) {
-        throw await responseError(response, "回答を保存できませんでした。");
-      }
-      const next = normalizeKnowledgeCaptureCandidateDetail(
-        await response.json(),
-      );
-      if (
-        !next ||
-        next.id !== target.candidateId ||
-        next.projectId?.toLowerCase() !== target.projectId.toLowerCase() ||
-        next.version <= 0
-      ) {
-        throw new Error("回答後の候補データが不正です。");
-      }
-      finishResolved(next);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "回答を保存できませんでした。");
-    } finally {
-      setPendingAction(null);
-    }
+    if (!optionId && (!answerText || !question.allowFreeText)) return;
+    await mutateCandidate("answer", answerUrl(target, question.id), {
+      ...(optionId ? { option_id: optionId } : {}),
+      ...(answerText ? { text: answerText.slice(0, 2000) } : {}),
+    }, "回答を保存できませんでした。");
   };
 
   const askAi = async () => {
-    if (!target || !currentCandidate?.question || pendingAction) return;
+    if (!target || !currentCandidate ||
+      !(currentCandidate.status === "draft_ready" ||
+        (currentCandidate.status === "needs_user" && currentCandidate.question))) return;
     const text = composer.trim();
     if (!text) return;
-    const question = currentCandidate.question;
-    const userExchange: KnowledgeCaptureReviewExchange = {
-      role: "user",
-      text: text.slice(0, 2000),
-    };
+    const epoch = beginAction("review");
+    if (epoch === null) return;
+    const userExchange: KnowledgeCaptureReviewExchange = { role: "user", text: text.slice(0, 2000) };
     const nextThread = [...thread, userExchange].slice(-8);
-    setPendingAction("review");
-    setError(null);
     try {
-      const response = await fetch(reviewUrl(target, question.id), {
+      const response = await fetch(reviewUrl(target,
+        currentCandidate.status === "needs_user" ? currentCandidate.question?.id : undefined), {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -287,84 +345,42 @@ export function KnowledgeCaptureReviewDialog({
           thread: nextThread,
         }),
       });
-      if (!response.ok) {
-        if (response.status === 409) {
-          await reloadCandidate();
-          setError("別の操作で更新されました。最新状態を読み込みました。");
-          return;
-        }
-        throw await responseError(response, "AIへの聞き返しに失敗しました。");
+      if (!isCurrentRequest(epoch)) return;
+      if (response.status === 409) {
+        await reloadCandidate(epoch);
+        return;
       }
-      const parsed = normalizeReviewResponse(
-        await response.json(),
-        currentCandidate.version,
-      );
+      if (!response.ok) throw await responseError(response, "AIへの聞き返しに失敗しました。");
+      const parsed = normalizeReviewResponse(await response.json(), currentCandidate.version);
+      if (!isCurrentRequest(epoch)) return;
       if (!parsed) throw new Error("AIの回答形式を確認できませんでした。");
       setReviewResponse(parsed);
-      const assistantExchange: KnowledgeCaptureReviewExchange = {
-        role: "assistant",
-        text: parsed.reply,
-      };
-      setThread(
-        [...nextThread, assistantExchange].slice(-8),
-      );
+      setThread([...nextThread, { role: "assistant" as const, text: parsed.reply }].slice(-8));
       setComposer("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "AIへの聞き返しに失敗しました。");
+      if (isCurrentRequest(epoch)) setError(cause instanceof Error ? cause.message : "AIへの聞き返しに失敗しました。");
     } finally {
-      setPendingAction(null);
+      endAction(epoch);
     }
   };
 
   const dismiss = async () => {
-    if (!target || !currentCandidate || pendingAction) return;
-    setPendingAction("dismiss");
-    setError(null);
-    try {
-      const response = await fetch(dismissUrl(target), {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          expected_candidate_version: currentCandidate.version,
-        }),
-      });
-      if (response.status === 409) {
-        await reloadCandidate();
-        setError("別の操作で更新されました。最新状態を読み込みました。");
-        return;
-      }
-      if (!response.ok) {
-        throw await responseError(response, "候補を保存しない設定にできませんでした。");
-      }
-      const next = normalizeKnowledgeCaptureCandidateDetail(
-        await response.json(),
-      );
-      if (
-        !next ||
-        next.id !== target.candidateId ||
-        next.projectId?.toLowerCase() !== target.projectId.toLowerCase() ||
-        next.version <= 0
-      ) {
-        throw new Error("保存しない操作後の候補データが不正です。");
-      }
-      finishResolved(next);
-    } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "候補を保存しない設定にできませんでした.",
-      );
-    } finally {
-      setPendingAction(null);
-    }
+    if (!target || !currentCandidate || !["needs_user", "draft_ready"].includes(currentCandidate.status)) return;
+    await mutateCandidate("dismiss", dismissUrl(target), {}, "候補を保存しない設定にできませんでした。");
+  };
+
+  const publish = async () => {
+    if (!mayPublish || !target || currentCandidate?.status !== "draft_ready" || !currentCandidate.draft) return;
+    await mutateCandidate("publish", `${candidateUrl(target)}/publish`, {}, "Docsへ保存できませんでした。");
   };
 
   const context = currentCandidate?.reviewContext;
-  const question = currentCandidate?.question;
-  const canAskAi = Boolean(question && composer.trim() && !pendingAction);
+  const question = currentCandidate?.status === "needs_user" ? currentCandidate.question : null;
+  const isDraft = currentCandidate?.status === "draft_ready";
+  const canReview = Boolean(question || isDraft);
+  const canAskAi = Boolean(!readOnly && canReview && composer.trim() && !pendingAction);
   const canAnswerWithText = Boolean(
-    question?.allowFreeText && composer.trim() && !pendingAction,
+    !readOnly && question?.allowFreeText && composer.trim() && !pendingAction,
   );
 
   return (
@@ -382,7 +398,7 @@ export function KnowledgeCaptureReviewDialog({
             )}
           </div>
           <DialogDescription>
-            自動整理だけでは確定できない情報を確認して、保存方法を選んでください。
+            内容と根拠を確認し、採用するか見送るかを選んでください。迷う点はAIに質問できます。
           </DialogDescription>
         </DialogHeader>
 
@@ -463,7 +479,10 @@ export function KnowledgeCaptureReviewDialog({
             <section className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
               <h3 className="text-sm font-semibold">なぜ確認が必要？</h3>
               <p className="whitespace-pre-wrap break-words text-sm">
-                {context?.reviewReason || "人間にしか判断できない情報が残っています。"}
+                {context?.reviewReason || (isDraft
+                  ? "下書きができました。内容を確認して、採用する場合は「採用してDocsへ保存」を押してください。"
+                  : question ? "下の質問への回答を確認してから、候補を再整理します。"
+                  : "候補の状態が変わっています。最新の状態を確認してください。") }
               </p>
             </section>
 
@@ -486,7 +505,7 @@ export function KnowledgeCaptureReviewDialog({
                           variant="outline"
                           size="sm"
                           onClick={() => void answer(option.id)}
-                          disabled={pendingAction !== null}
+                          disabled={readOnly || pendingAction !== null}
                           data-testid={`knowledge-capture-quick-option-${option.id}`}
                         >
                           {pendingAction === "answer" ? (
@@ -498,26 +517,47 @@ export function KnowledgeCaptureReviewDialog({
                     </div>
                   </fieldset>
                 ) : null}
-                {question.allowFreeText ? (
-                  <label className="block text-sm">
-                    <span className="text-xs text-muted-foreground">自由入力</span>
-                    <Textarea
-                      value={composer}
-                      onChange={(event) => setComposer(event.target.value)}
-                      placeholder="確認したい内容を入力"
-                      className="mt-1 min-h-24"
-                      maxLength={2000}
-                      disabled={pendingAction !== null}
-                      data-testid="knowledge-capture-review-composer"
-                    />
-                  </label>
+              </section>
+            ) : null}
+
+            {currentCandidate.draft ? (
+              <section className="space-y-3 rounded-md border p-3" data-testid="knowledge-capture-draft-preview">
+                <h3 className="text-sm font-semibold">候補の下書き</h3>
+                <p className="break-words text-sm font-medium">{currentCandidate.draft.title || "タイトル未設定"}</p>
+                {currentCandidate.draft.sections.map((section, index) => (
+                  <article key={`${section.key || section.title}-${index}`} className="space-y-1 border-t pt-3">
+                    {section.title ? <h4 className="text-sm font-medium">{section.title}</h4> : null}
+                    <p className="whitespace-pre-wrap break-words text-sm">{section.body}</p>
+                  </article>
+                ))}
+                {currentCandidate.draft.evidenceSummary ? (
+                  <p className="whitespace-pre-wrap break-words border-t pt-3 text-xs text-muted-foreground">
+                    根拠の要約: {currentCandidate.draft.evidenceSummary}
+                  </p>
+                ) : null}
+                {!currentCandidate.draft.sections.length ? (
+                  <p className="text-sm text-muted-foreground">下書きの本文を確認できません。採用前にAIへの確認や再読み込みを行ってください。</p>
                 ) : null}
               </section>
-            ) : currentCandidate.draft ? (
-              <section className="space-y-2 rounded-md border p-3">
-                <h3 className="text-sm font-semibold">候補の下書き</h3>
-                <p className="break-words text-sm">{currentCandidate.draft.title || "タイトル未設定"}</p>
-              </section>
+            ) : null}
+
+            {canReview ? (
+              <label className="block text-sm">
+                <span className="font-medium">{isDraft ? "AIへの質問・補足" : "回答・AIへの質問"}</span>
+                <Textarea
+                  value={composer}
+                  onChange={(event) => setComposer(event.target.value)}
+                  placeholder={isDraft ? "例: 何が再利用できますか？ この補足を踏まえて採用すべきか教えて" : "確認したい内容を入力"}
+                  className="mt-1 min-h-24"
+                  maxLength={2000}
+                  disabled={readOnly || pendingAction !== null}
+                  data-testid="knowledge-capture-review-composer"
+                />
+                <span className="mt-1 block text-xs text-muted-foreground">
+                  AIへの質問・補足だけでは、下書きの内容や採用状態は変わりません。
+                  {question && !question.allowFreeText ? " 回答は上の選択肢から選んでください。" : ""}
+                </span>
+              </label>
             ) : null}
 
             {thread.length > 0 ? (
@@ -570,8 +610,17 @@ export function KnowledgeCaptureReviewDialog({
               </section>
             ) : null}
 
-            <DialogFooter className="-mx-0 -mb-0 rounded-none border-t-0 bg-transparent p-0 pt-2">
-              {question ? (
+            {readOnly ? <p className="text-xs text-muted-foreground">閲覧のみの権限です。採用・回答・見送りは権限を持つメンバーに依頼してください。</p> : isDraft && !mayPublish ? <p className="text-xs text-muted-foreground">{canPublish === undefined && publishPermission === "checking" ? "採用に必要な管理権限を確認しています。" : canPublish === undefined && publishPermission === "unavailable" ? "採用権限を確認できませんでした。いったん閉じて開き直してください。" : "Docsへの採用・保存にはプロジェクトの管理権限が必要です。"}</p> : null}
+            <DialogFooter className="sticky bottom-0 -mx-0 -mb-0 z-10 flex-wrap rounded-none border-t bg-card p-0 py-3">
+              {isDraft ? (
+                <Button type="button" onClick={() => void publish()}
+                  disabled={readOnly || !mayPublish || pendingAction !== null || !currentCandidate.draft?.sections.some((section) => section.body.trim())}
+                  data-testid="knowledge-capture-publish-button">
+                  {pendingAction === "publish" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Check className="mr-2 size-4" />}
+                  採用してDocsへ保存
+                </Button>
+              ) : null}
+              {question?.allowFreeText ? (
                 <>
                   <Button
                     type="button"
@@ -586,6 +635,10 @@ export function KnowledgeCaptureReviewDialog({
                     )}
                     回答として送る
                   </Button>
+                </>
+              ) : null}
+              {canReview ? (
+                <>
                   <Button
                     type="button"
                     variant="outline"
@@ -602,11 +655,11 @@ export function KnowledgeCaptureReviewDialog({
                   </Button>
                 </>
               ) : null}
-              <Button
+              {canReview ? <Button
                 type="button"
                 variant="ghost"
                 onClick={() => void dismiss()}
-                disabled={pendingAction !== null}
+                disabled={readOnly || pendingAction !== null}
                 data-testid="knowledge-capture-dismiss-button"
               >
                 {pendingAction === "dismiss" ? (
@@ -615,7 +668,7 @@ export function KnowledgeCaptureReviewDialog({
                   <X className="mr-2 size-4" />
                 )}
                 今回は保存しない
-              </Button>
+              </Button> : null}
             </DialogFooter>
           </div>
         ) : null}

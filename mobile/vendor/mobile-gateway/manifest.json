@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "owner": "85_CaddyGateway/packages/mobile-gateway",
+  "sourceRevision": "8e5a394b0b55f8b0cc721fa2ffb8be0b515acb88",
+  "sourceState": "committed",
+  "uncommittedSource": false,
+  "files": {
+    "index.mjs": {
+      "bytes": 78570,
+      "sha256": "697f333f10a756075b2371e8a3b01987e9ec2871045e7f9e6078b0eb675bfdb5"
+    },
+    "index.d.ts": {
+      "bytes": 5157,
+      "sha256": "1d39c6005d8c70335d3bb2e25d94e31c930519cd18de37874db1df0c309ce0c8"
+    },
+    "package.json": {
+      "bytes": 274,
+      "sha256": "9fd56c56e7c4b6ff49c45714be90b477aaf3619aecd9cb673e0b0ef42d4cbf8f"
+    }
+  }
+}

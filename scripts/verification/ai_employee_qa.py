@@ -1,4 +1,4 @@
-"""Isolated, authenticated AI employee QA runtime (never a production launcher).
+"""Isolated, authenticated Agent QA runtime (never a production launcher).
 
 Run with the repository venv Python. Commands:
   prepare [--node PATH] [--postgres-bin PATH]
@@ -40,12 +40,12 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from uuid import UUID, uuid4
 
 
 REPO = Path(__file__).resolve().parents[2]
+QA_SESSION_COOKIE_NAME = "aoitalk_qa_session"
 SCRIPT = Path(__file__).resolve()
 PREFIX = "aoitalk_test_employee_"
 IDENTIFIER = re.compile(r"aoitalk_test_employee_[0-9a-f]{32}\Z")
@@ -58,6 +58,26 @@ def check_identity(value: str) -> str:
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
         raise ValueError("Refusing a database outside the exact QA UUID namespace")
     return value
+
+
+def qa_run_path(name: str, repository: Path = REPO) -> Path:
+    """Resolve an owned QA run directory inside this checkout's scratch area."""
+    safe_name = check_identity(name)
+    repo_root = Path(repository).resolve()
+    parent = (repo_root / ".local" / "qa-runs").resolve()
+    if not parent.is_relative_to(repo_root):
+        raise ValueError("QA output directory must stay inside the repository")
+    return parent / safe_name
+
+
+def qa_artifact_path(name: str, repository: Path = REPO) -> Path:
+    """Resolve the retained evidence bundle for a completed QA run."""
+    safe_name = check_identity(name)
+    repo_root = Path(repository).resolve()
+    parent = (repo_root / "artifacts" / "qa-runs").resolve()
+    if not parent.is_relative_to(repo_root):
+        raise ValueError("QA evidence directory must stay inside the repository")
+    return parent / safe_name
 
 
 def read_qa_credentials() -> tuple[str, str]:
@@ -178,6 +198,7 @@ def child_environment(manifest: dict, private: dict) -> dict[str, str]:
         "AOITALK_WORKSPACES_DIR": str(root / "workspaces"), "AOITALK_DATA_DIR": str(root / "data"),
         "AOITALK_FIELD_CRYPTO_ALLOW_ENV_KEY": "true", "AOITALK_FIELD_CRYPTO_KEY_B64": private["field_key"],
         "AOITALK_WEB_AUTH_SECRET": private["web_secret"], "NEXTAUTH_SECRET": private["next_secret"],
+        "AOITALK_SESSION_COOKIE_NAME": QA_SESSION_COOKIE_NAME,
         "AUTH_SECRET": private["next_secret"], "AOITALK_JWT_SECRET": private["jwt_secret"],
         "INTERNAL_API_KEY": private["internal_key"],
         "PYTHON_API_URL": f"http://127.0.0.1:{manifest['backend_port']}",
@@ -241,13 +262,8 @@ def prepare(args) -> Path:
     pg_bin = Path(args.postgres_bin)
     run_id = uuid4()
     name = check_identity(PREFIX + run_id.hex)
-    temporary_parent = Path(tempfile.gettempdir()).resolve()
-    # Next's Windows webpack loaders use relative paths to node_modules. A
-    # cross-drive junction produces invalid './D:/...' module requests. Keep
-    # this owned output beside the repo when TEMP lives on another drive.
-    if os.name == "nt" and temporary_parent.drive.lower() != REPO.drive.lower():
-        temporary_parent = REPO.parent
-    root = temporary_parent / name
+    root = qa_run_path(name)
+    root.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir(mode=0o700)
     settings = local_settings()
     dedicated_cluster = not settings["admin_password"]
@@ -425,25 +441,25 @@ async def seed(manifest: dict) -> None:
     async with manager.SessionLocal() as session:
         session.add(User(id=user_id, username=username, password_hash=UserRepository.hash_password(password),
             role="admin", auth_source="local", is_active=True, is_password_reset_required=False,
-            display_name="AI Employee QA administrator (test)", session_version=1,
+            display_name="Agent QA administrator (test)", session_version=1,
             user_settings={"verification_provenance": marker}))
         await session.flush()
-        session.add(Space(id=space_id, owner_id=user_id, name="AI Employee QA Space (test)", slug="employee-qa"))
+        session.add(Space(id=space_id, owner_id=user_id, name="Agent QA Space (test)", slug="employee-qa"))
         await session.flush()
         session.add(Project(id=project_id, owner_id=user_id, space_id=space_id,
-            name="AI Employee QA Project (test)", slug="employee-qa", project_metadata={"verification_provenance": marker}))
+            name="Agent QA Project (test)", slug="employee-qa", project_metadata={"verification_provenance": marker}))
         await session.flush()
         session.add(ProjectMember(project_id=project_id, user_id=user_id, role="owner"))
         await session.commit()
-    organization = await OrganizationService(manager).bootstrap({"display_name": "AI Employee QA (test)",
+    organization = await OrganizationService(manager).bootstrap({"display_name": "Agent QA (test)",
         "autonomy_level": "bounded", "policy": {"allow_agent_runtime": True, "allow_external_actions": True,
         "require_human_approval": False, "max_concurrent_runs": 2}})
     from src.memory.conversation_repository import ConversationRepository
     conversation_repository = ConversationRepository()
     conversation = await conversation_repository.create_session(user_id=str(user_id),
-        character_name="project_manager", title="AI Employee QA reports (test)", project_id=str(project_id))
+        character_name="project_manager", title="Agent QA reports (test)", project_id=str(project_id))
     await conversation_repository.ensure_participant(str(conversation.id), "user", str(user_id),
-        display_name="AI Employee QA administrator (test)", role="owner")
+        display_name="Agent QA administrator (test)", role="owner")
     from sqlalchemy import text
     with manager.sync_engine.connect() as connection:
         head = connection.execute(text("SELECT version_num FROM alembic_version")).scalars().all()
@@ -590,12 +606,12 @@ def check(manifest: dict) -> None:
         evidence["checks"].append("anonymous_employee_api_denied")
         bad = client.post("/api/auth/login", headers={"Origin": manifest["frontend_url"]},
             json={"username": username, "password": "incorrect-" + secrets.token_urlsafe(20), "credential_source": "local"})
-        if bad.status_code != 401 or client.cookies.get("aoitalk_session"):
+        if bad.status_code != 401 or client.cookies.get(QA_SESSION_COOKIE_NAME):
             raise RuntimeError("Incorrect password did not fail closed")
         evidence["checks"].append("wrong_password_denied_without_session")
         response = client.post("/api/auth/login", headers={"Origin": manifest["frontend_url"]},
             json={"username": username, "password": password, "credential_source": "local"})
-        if response.status_code != 200 or not client.cookies.get("aoitalk_session"):
+        if response.status_code != 200 or not client.cookies.get(QA_SESSION_COOKIE_NAME):
             raise RuntimeError(f"Real Next -> FastAPI password login failed: {response.status_code}")
         if str(response.json().get("user", {}).get("id")) != manifest["fixtures"]["user_id"]:
             raise RuntimeError("Password login resolved a user outside the QA fixture")
@@ -818,7 +834,7 @@ def stop(manifest: dict, *, drop_database=False) -> None:
         write_json(root / "manifest.json", manifest)
 
 
-def cleanup(manifest: dict) -> None:
+def cleanup(manifest: dict) -> Path | None:
     root = Path(manifest["output_dir"]).resolve()
     already_dropped = manifest["status"] == "database_dropped"
     if not already_dropped:
@@ -840,7 +856,105 @@ def cleanup(manifest: dict) -> None:
         "already_dropped": already_dropped, "private_files_removed": removed,
         "safe_artifacts_retained": True,
         "completed_at_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}
+
+    # New runs keep their active database/frontend snapshot in .local. Once
+    # stopped, retain only review evidence under artifacts and remove the
+    # task scratch directory. Historical runs outside .local keep their old
+    # cleanup behavior so existing manifest references remain usable.
+    expected_scratch_parent = (REPO / ".local" / "qa-runs").resolve()
+    if root.parent == expected_scratch_parent and root.name == check_identity(manifest["database"]):
+        artifact_root = qa_artifact_path(root.name)
+        if _is_link_or_reparse(artifact_root):
+            raise RuntimeError("Refusing a linked QA artifact directory")
+        resolved_artifact_root = artifact_root.resolve()
+        if not resolved_artifact_root.is_relative_to(REPO.resolve()):
+            raise RuntimeError("QA artifact directory escaped the repository")
+
+        if artifact_root.exists():
+            archived_manifest_path = artifact_root / "manifest.json"
+            if archived_manifest_path.is_file() and not _is_link_or_reparse(archived_manifest_path):
+                archived = load_manifest(archived_manifest_path)
+                if (
+                    archived["run_id"] != manifest["run_id"]
+                    or archived["database"] != manifest["database"]
+                    or Path(archived["output_dir"]).resolve() != artifact_root.resolve()
+                ):
+                    raise RuntimeError("Existing QA artifact belongs to another run")
+                owner_marker = artifact_root / ".archive-owner.json"
+                if owner_marker.exists():
+                    if _is_link_or_reparse(owner_marker):
+                        raise RuntimeError("QA archive owner marker cannot be a link")
+                    owner_marker.unlink()
+                shutil.rmtree(root)
+                return archived_manifest_path
+
+            owner_marker = artifact_root / ".archive-owner.json"
+            marker_matches_run = False
+            if owner_marker.is_file() and not _is_link_or_reparse(owner_marker):
+                try:
+                    marker = json.loads(owner_marker.read_text(encoding="utf-8"))
+                    marker_matches_run = (
+                        isinstance(marker, dict)
+                        and marker.get("run_id") == manifest["run_id"]
+                        and marker.get("database") == manifest["database"]
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    marker_matches_run = False
+            if marker_matches_run:
+                shutil.rmtree(artifact_root)
+            elif not any(artifact_root.iterdir()):
+                artifact_root.rmdir()
+            else:
+                raise RuntimeError("Incomplete QA artifact has no matching run marker")
+
+        artifact_root.mkdir(parents=True, exist_ok=False)
+        try:
+            write_json(
+                artifact_root / ".archive-owner.json",
+                {"run_id": manifest["run_id"], "database": manifest["database"]},
+            )
+            manifest["output_dir"] = str(artifact_root)
+            for path in root.iterdir():
+                if path.name == "manifest.json":
+                    continue
+                if path.is_file() and (
+                    path.suffix.casefold() == ".log"
+                    or path.name.endswith("-evidence.json")
+                    or path.name in {"browser-journey.json", "journey-evidence.json"}
+                ):
+                    shutil.copy2(path, artifact_root / path.name)
+                elif path.is_dir() and path.name == "screenshots":
+                    shutil.copytree(path, artifact_root / path.name)
+                elif path.is_dir() and path.name == "frontend":
+                    shutil.copytree(
+                        path,
+                        artifact_root / path.name,
+                        ignore=shutil.ignore_patterns(
+                            "node_modules", ".next*", ".env*", "playwright-report*",
+                            "test-results*", "*.tsbuildinfo", ".git",
+                        ),
+                    )
+            write_json(artifact_root / "manifest.json", manifest)
+            (artifact_root / ".archive-owner.json").unlink(missing_ok=True)
+        except Exception:
+            raise
+        shutil.rmtree(root)
+        return artifact_root / "manifest.json"
+
     write_json(root / "manifest.json", manifest)
+    return root / "manifest.json"
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            return bool(is_junction())
+        except OSError:
+            return True
+    return False
 
 
 def main() -> int:
@@ -870,10 +984,12 @@ def main() -> int:
     elif args.command == "stop":
         stop(manifest, drop_database=args.drop_database)
     else:
-        {"start": start, "upgrade": upgrade, "refresh-frontend": refresh_frontend, "check": check,
+        manifest_path = {"start": start, "upgrade": upgrade, "refresh-frontend": refresh_frontend, "check": check,
          "browser": browser, "verify-journey": verify_journey, "concurrency": concurrency,
          "migration-test": migration_test, "recovery-check": recovery_check, "ui-smoke": ui_smoke,
          "history-smoke": lambda value: ui_smoke(value, history=True), "phone-smoke": phone_smoke, "cleanup": cleanup}[args.command](manifest)
+        if isinstance(manifest_path, Path):
+            args.manifest = manifest_path
     print(json.dumps({"manifest": str(args.manifest), "command": args.command, "result": "complete"}))
     return 0
 

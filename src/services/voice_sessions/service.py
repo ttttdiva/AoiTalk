@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from fastapi import HTTPException
@@ -131,12 +132,6 @@ class VoiceSessionService:
                 legacy_instructions=legacy_instructions,
                 allow_legacy_overrides=allow_legacy_overrides,
             )
-            if policy.mode == VoiceSessionMode.PIPELINE:
-                raise LiveVoiceError(
-                    "Pipeline voice is not started through voice-sessions yet",
-                    status_code=400,
-                )
-
             resolved_voice = (
                 str(policy.native_voice or legacy_voice or DEFAULT_REALTIME_VOICE).strip()
                 or DEFAULT_REALTIME_VOICE
@@ -225,7 +220,67 @@ class VoiceSessionService:
         *,
         sdp: str,
     ) -> Mapping[str, Any]:
+        session = await self._live.get_session(voice_session_id, actor)
+        if self._session_mode(session) == VoiceSessionMode.PIPELINE:
+            raise LiveVoiceError("Pipeline voice does not use WebRTC", status_code=409)
         return await self._live.connect_unified_call(voice_session_id, actor, sdp=sdp)
+
+    def _mobile_voice(self) -> Any:
+        if self._server is None:
+            raise LiveVoiceError("Voice pipeline server context is unavailable", status_code=503)
+        runtime = getattr(self._server, "_mobile_voice_service", None)
+        if runtime is None:
+            from ..mobile_voice_service import MobileVoiceService
+
+            runtime = MobileVoiceService(self._server)
+            self._server._mobile_voice_service = runtime
+            hooks = getattr(self._server, "_shutdown_background_tasks", None)
+            if isinstance(hooks, list):
+                hooks.append(runtime.close)
+        return runtime
+
+    async def transcribe_pipeline(
+        self,
+        voice_session_id: str,
+        actor: LiveVoiceActor,
+        *,
+        audio_base64: str,
+        mime_type: str,
+    ) -> dict[str, Any]:
+        session = await self._live._active_session(voice_session_id, actor)
+        if self._session_mode(session) != VoiceSessionMode.PIPELINE:
+            raise LiveVoiceError("Voice session is not a pipeline session", status_code=409)
+        try:
+            text = await self._mobile_voice().transcribe(audio_base64, mime_type)
+        except Exception as exc:
+            from ..mobile_voice_service import MobileVoiceError
+
+            if isinstance(exc, MobileVoiceError):
+                raise LiveVoiceError(str(exc), status_code=exc.status_code) from exc
+            raise
+        session.last_activity_at = datetime.now(timezone.utc)
+        return {"text": text}
+
+    async def synthesize_pipeline(
+        self,
+        voice_session_id: str,
+        actor: LiveVoiceActor,
+        *,
+        text: str,
+    ) -> bytes:
+        session = await self._live._active_session(voice_session_id, actor)
+        if self._session_mode(session) != VoiceSessionMode.PIPELINE:
+            raise LiveVoiceError("Voice session is not a pipeline session", status_code=409)
+        try:
+            audio = await self._mobile_voice().synthesize(text, session.character_name)
+        except Exception as exc:
+            from ..mobile_voice_service import MobileVoiceError
+
+            if isinstance(exc, MobileVoiceError):
+                raise LiveVoiceError(str(exc), status_code=exc.status_code) from exc
+            raise
+        session.last_activity_at = datetime.now(timezone.utc)
+        return audio
 
     async def interrupt(
         self,
@@ -236,11 +291,14 @@ class VoiceSessionService:
         partial_unknown: bool = False,
     ) -> dict[str, Any]:
         session = await self._live._active_session(voice_session_id, actor)
-        interrupt_result = await self._live.interrupt_voice_session(
-            session,
-            spoken_prefix=spoken_prefix,
-            partial_unknown=partial_unknown,
-        )
+        if self._session_mode(session) == VoiceSessionMode.PIPELINE:
+            interrupt_result = {"interrupted": True, "transport": "browser"}
+        else:
+            interrupt_result = await self._live.interrupt_voice_session(
+                session,
+                spoken_prefix=spoken_prefix,
+                partial_unknown=partial_unknown,
+            )
         return {
             "success": True,
             "voice_session_id": session.id,

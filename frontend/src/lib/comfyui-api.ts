@@ -1,3 +1,4 @@
+import { withBasePath } from "@/lib/base-path";
 // ComfyUI Management API Client
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -44,7 +45,7 @@ async function fetchWithTimeout<T>(
 
     if (res.status === 401) {
       if (typeof window !== "undefined") {
-        window.location.href = "/login";
+        window.location.href = withBasePath("/login");
       }
       throw new Error("認証が必要です");
     }

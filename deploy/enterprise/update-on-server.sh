@@ -68,9 +68,9 @@ assert_secure_ancestors() {
             mode="$(stat -c '%a' -- "$current" 2>/dev/null || true)"
             [[ "$owner" == 0 ]] || die "path ancestor must be root-owned: $current"
             mode_num=$((8#$mode))
-            # /tmp is an explicitly supported sticky system scratch parent for
-            # tests; all production install ancestors must be non-writable.
-            if [[ "$current" == "/tmp" && $((mode_num & 01000)) -ne 0 ]]; then
+            # Only the two root-owned system scratch parents may be sticky.
+            # /var/tmp holds authenticated disk-backed bootstrap snapshots.
+            if [[ ( "$current" == "/tmp" || "$current" == "/var/tmp" ) && $((mode_num & 01000)) -ne 0 ]]; then
                 :
             else
                 (( (mode_num & 0022) == 0 )) || die "path ancestor is group/world writable: $current"

@@ -15,6 +15,8 @@ type ChatSessionContextValue = {
   sessions: ConversationSession[];
   sessionsError: string | null;
   fetchSessions: () => Promise<void>;
+  /** Mark a session read while preserving the assistant-completion fence. */
+  markSessionRead: (sessionId: string) => Promise<void>;
   addSession: (session: ConversationSession) => void;
   /** Register a route-created session and optionally mark its empty state idle. */
   registerSession: (
@@ -38,6 +40,60 @@ type ChatSessionContextValue = {
 
 /** 会話履歴はProviderを正本にして全Workspace/Quick Panelから共有する。 */
 const SESSIONS_REFRESH_INTERVAL_MS = 15000;
+// The history lifecycle is projected by the server from completion/read
+// fences.  Optimistic read handling may update these fields for immediate UI
+// feedback, but a later list response must be allowed to restore a newer
+// completion (for example, a reply that arrived after the session was opened).
+const SERVER_OWNED_HISTORY_FIELDS = new Set([
+  "history_status",
+  "history_completed_at",
+  // This legacy field is projected from the same completion/read fence.
+  "is_unread",
+]);
+
+type ReadCompletionFence = {
+  completionAt: string | null;
+  readAt: string;
+  token: number;
+};
+
+function isHistoryCompletionAtOrBefore(
+  completionAt: string | null | undefined,
+  readFenceAt: string,
+): boolean {
+  if (typeof completionAt !== "string" || completionAt.length === 0) {
+    return false;
+  }
+  const completionMs = Date.parse(completionAt);
+  const readFenceMs = Date.parse(readFenceAt);
+  if (Number.isFinite(completionMs) && Number.isFinite(readFenceMs)) {
+    return completionMs <= readFenceMs;
+  }
+  // Generated server values are Z-suffixed UTC. Keep exact equality as a
+  // defensive fallback if a malformed value reaches the client.
+  return completionAt === readFenceAt;
+}
+
+function isHistoryCompletionStrictlyOlder(
+  completionAt: string | null | undefined,
+  currentCompletionAt: string | null | undefined,
+): boolean {
+  if (
+    typeof completionAt !== "string" ||
+    typeof currentCompletionAt !== "string" ||
+    completionAt.length === 0 ||
+    currentCompletionAt.length === 0
+  ) {
+    return false;
+  }
+  const completionMs = Date.parse(completionAt);
+  const currentCompletionMs = Date.parse(currentCompletionAt);
+  return (
+    Number.isFinite(completionMs) &&
+    Number.isFinite(currentCompletionMs) &&
+    completionMs < currentCompletionMs
+  );
+}
 
 const ChatSessionContext = createContext<ChatSessionContextValue | null>(null);
 
@@ -50,6 +106,10 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   const optimisticSessionIdsRef = useRef<Set<string>>(new Set());
   const generationReadySessionIdsRef = useRef<Set<string>>(new Set());
   const removedSessionIdsRef = useRef<Set<string>>(new Set());
+  const readCompletionFencesRef = useRef<Map<string, ReadCompletionFence>>(
+    new Map(),
+  );
+  const readFenceTokenRef = useRef(0);
   const sessionMutationVersionRef = useRef<
     Map<string, Map<string, number>>
   >(new Map());
@@ -57,6 +117,8 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   // 同時に走る fetchSessions() を1リクエストへ束ねる。各画面のQuick Panelや
   // route遷移直後の再試行が重なっても、GET /api/conversationsは1本にする。
   const inFlightFetchRef = useRef<Promise<void> | null>(null);
+  const sessionsRef = useRef<ConversationSession[]>([]);
+  sessionsRef.current = sessions;
 
   const markSessionMutation = useCallback((id: string, fields: string[]) => {
     if (fields.length === 0) return;
@@ -99,6 +161,40 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
             )[field];
           }
         }
+        const remoteCompletionIsOlder = isHistoryCompletionStrictlyOlder(
+          session.history_completed_at,
+          previousSession.history_completed_at,
+        );
+        if (remoteCompletionIsOlder) {
+          // A GET started before a newer completion can arrive after the
+          // newer response. Never let that stale projection replace the
+          // already observed server-owned history fields.
+          merged.history_status = previousSession.history_status;
+          merged.history_completed_at = previousSession.history_completed_at;
+          merged.is_unread = previousSession.is_unread;
+        } else {
+          const readFence = readCompletionFencesRef.current.get(session.id);
+          if (
+            readFence &&
+            session.history_status === "ready" &&
+            ((readFence.completionAt &&
+              isHistoryCompletionAtOrBefore(
+                session.history_completed_at,
+                readFence.completionAt,
+              )) ||
+              (!readFence.completionAt &&
+                isHistoryCompletionAtOrBefore(
+                  session.history_completed_at,
+                  readFence.readAt,
+                )))
+          ) {
+            // A list response can have started before the read API request and
+            // arrive afterwards. Keep that same completion read, while allowing
+            // a later completion to remain server-owned and ready.
+            merged.history_status = "idle";
+            merged.is_unread = false;
+          }
+        }
         return [merged];
       });
       const preservedSessions = previous.filter((session) => {
@@ -119,7 +215,9 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
         optimisticSessionIdsRef.current.delete(session.id);
       }
 
-      return [...preservedSessions, ...mergedFetched];
+      const next = [...preservedSessions, ...mergedFetched];
+      sessionsRef.current = next;
+      return next;
     },
     [],
   );
@@ -187,6 +285,12 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
     markSessionMutation(session.id, ["*"]);
     removedSessionIdsRef.current.delete(session.id);
     optimisticSessionIdsRef.current.add(session.id);
+    // Keep the read fence capture synchronous when a newly created session is
+    // opened before React commits the queued state update.
+    sessionsRef.current = [
+      session,
+      ...sessionsRef.current.filter((item) => item.id !== session.id),
+    ];
     setSessions((prev) => [
       session,
       ...prev.filter((item) => item.id !== session.id),
@@ -234,6 +338,7 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   const removeSession = useCallback((id: string) => {
     markSessionMutation(id, ["*"]);
     generationReadySessionIdsRef.current.delete(id);
+    readCompletionFencesRef.current.delete(id);
     removedSessionIdsRef.current.add(id);
     optimisticSessionIdsRef.current.delete(id);
     setSessions((prev) => prev.filter((s) => s.id !== id));
@@ -257,11 +362,82 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
           return changedFields.length > 0 ? updated : session;
         });
         if (changedFields.length === 0) return prev;
-        markSessionMutation(id, changedFields);
+        markSessionMutation(
+          id,
+          changedFields.filter((field) => !SERVER_OWNED_HISTORY_FIELDS.has(field)),
+        );
         return next;
       });
     },
     [markSessionMutation],
+  );
+
+  const markSessionRead = useCallback(
+    async (sessionId: string): Promise<void> => {
+      // Keep a client-side request-entry fence as a fallback for a deep link
+      // whose list response has not populated the context yet. Once a server
+      // completion is known, completion ordering takes precedence over client
+      // clock ordering so a newer response cannot be suppressed by skew.
+      const readAt = new Date().toISOString();
+      const readToken = readFenceTokenRef.current + 1;
+      readFenceTokenRef.current = readToken;
+      const rememberReadCompletion = (
+        completionAt: unknown,
+        updateRequestMetadata = true,
+      ) => {
+        const previousFence = readCompletionFencesRef.current.get(sessionId);
+        let nextCompletionAt = previousFence?.completionAt ?? null;
+        if (typeof completionAt === "string" && completionAt.length > 0) {
+          if (
+            !nextCompletionAt ||
+            !isHistoryCompletionAtOrBefore(completionAt, nextCompletionAt)
+          ) {
+            nextCompletionAt = completionAt;
+          }
+        }
+        readCompletionFencesRef.current.set(sessionId, {
+          completionAt: nextCompletionAt,
+          readAt: updateRequestMetadata ? readAt : previousFence?.readAt ?? readAt,
+          token: updateRequestMetadata
+            ? readToken
+            : previousFence?.token ?? readToken,
+        });
+      };
+      const currentSession = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      rememberReadCompletion(currentSession?.history_completed_at);
+
+      updateSession(sessionId, (session) => {
+        // The updater is also the source of truth when React has batched a
+        // preceding add/list update and the render ref still points at the
+        // older snapshot.
+        rememberReadCompletion(session.history_completed_at, false);
+        return {
+          ...session,
+          is_unread: false,
+          ...(session.history_status === "ready"
+            ? { history_status: "idle" as const }
+            : {}),
+        };
+      });
+
+      try {
+        await chatApi.markSessionRead(sessionId);
+        await fetchSessions();
+      } catch {
+        // A failed read must not permanently suppress the server's ready
+        // projection. A newer read may already own the same session fence, so
+        // only revoke this operation's token and then reconcile from server.
+        if (
+          readCompletionFencesRef.current.get(sessionId)?.token === readToken
+        ) {
+          readCompletionFencesRef.current.delete(sessionId);
+          await fetchSessions();
+        }
+      }
+    },
+    [fetchSessions, updateSession],
   );
 
   const updateSessionTitle = useCallback(
@@ -288,6 +464,7 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
         sessions,
         sessionsError,
         fetchSessions,
+        markSessionRead,
         addSession,
         registerSession,
         consumeGenerationReadySession,

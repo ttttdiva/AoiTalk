@@ -149,11 +149,21 @@ class AppSourceUpdateService:
     """Stage, preview and atomically apply App source updates.
 
     The source location is deliberately not persisted. Only a short-lived
-    candidate under ``workspaces/cache`` is retained between preview/apply.
+    candidate under the runtime ``cache`` root is retained between preview/apply.
     """
 
-    def __init__(self, *, workspace_root: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: str | os.PathLike[str] | None = None,
+        cache_root: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.workspace_root = workspace_root
+        self.cache_root = (
+            Path(cache_root).expanduser().resolve()
+            if cache_root is not None
+            else Path(__file__).resolve().parents[2] / "cache"
+        )
 
     def _staging_root(self, app_id: str, import_id: str) -> Path:
         try:
@@ -161,10 +171,18 @@ class AppSourceUpdateService:
             import_uuid = UUID(str(import_id))
         except (TypeError, ValueError, AttributeError) as exc:
             raise AppSourceUpdateError("AppまたはimportのIDが不正です") from exc
+        staging_root = self.cache_root / "app_source_updates"
+        return (staging_root / str(app_uuid) / str(import_uuid)).resolve()
+
+    def _legacy_staging_root(self, app_id: str, import_id: str) -> Path:
+        """Resolve the pre-cache-root location for unexpired previews only."""
+        try:
+            app_uuid = UUID(str(app_id))
+            import_uuid = UUID(str(import_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AppSourceUpdateError("AppまたはimportのIDが不正です") from exc
         root = get_workspaces_root(self.workspace_root) / "cache" / "app_source_updates"
-        path = (root / str(app_uuid) / str(import_uuid)).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
+        return (root / str(app_uuid) / str(import_uuid)).resolve()
 
     def _workspace_files(self, workspace: Path) -> dict[str, Path]:
         result: dict[str, Path] = {}
@@ -332,6 +350,7 @@ class AppSourceUpdateService:
     ) -> dict[str, object]:
         import_id = str(uuid.uuid4())
         staging = self._staging_root(app_id, import_id)
+        staging.parent.mkdir(parents=True, exist_ok=True)
         staging.mkdir(parents=True, exist_ok=False)
         try:
             workspace = get_app_workspace_path(app_id, workspace_root=self.workspace_root)
@@ -412,7 +431,12 @@ class AppSourceUpdateService:
         staging = self._staging_root(app_id, import_id)
         metadata_path = staging / "metadata.json"
         if not metadata_path.is_file():
-            raise AppSourceUpdateError("差分プレビューが見つからないか期限切れです", status_code=404)
+            legacy_staging = self._legacy_staging_root(app_id, import_id)
+            legacy_metadata = legacy_staging / "metadata.json"
+            if legacy_staging == staging or not legacy_metadata.is_file():
+                raise AppSourceUpdateError("差分プレビューが見つからないか期限切れです", status_code=404)
+            staging = legacy_staging
+            metadata_path = legacy_metadata
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if not isinstance(metadata, dict):

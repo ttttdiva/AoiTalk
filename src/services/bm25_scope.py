@@ -243,6 +243,18 @@ _CACHE_FORMAT = 2
 _ManifestFingerprint = tuple[int, int, str, int, int, int, str]
 
 
+class Bm25ScopeUnbound(PermissionError):
+    """The requested scope has no server-bound identity in this run.
+
+    ``safe_code`` is a fixed, secret-free reason that callers may surface; the
+    message text is never exposed.
+    """
+
+    def __init__(self, message: str, safe_code: str) -> None:
+        super().__init__(message)
+        self.safe_code = safe_code
+
+
 def _lock_for(key: str) -> threading.RLock:
     with _CACHE_GUARD:
         lock = _CACHE_LOCKS.get(key)
@@ -1167,13 +1179,13 @@ class Bm25ScopeService:
             elif path:
                 requested = "external"
             else:
-                raise PermissionError("scope/pathを明示してください（cwdをBM25対象にはしません）")
+                raise Bm25ScopeUnbound("scope/pathを明示してください（cwdをBM25対象にはしません）", "bm25_scope_unbound")
         if requested not in {"project_files", "user_files", "external", "app"}:
             raise ValueError(f"未対応のBM25 scopeです: {requested}")
 
         if requested == "project_files":
             if not project_id:
-                raise PermissionError("project_idが必要です")
+                raise Bm25ScopeUnbound("project_idが必要です", "bm25_project_unbound")
             target = self.workspace_root / "_projects" / f"project_{project_id}"
             root = _safe_path(target, self.workspace_root)
             relative = path or ""
@@ -1192,7 +1204,7 @@ class Bm25ScopeService:
 
         if requested == "user_files":
             if not user_id:
-                raise PermissionError("user_idが必要です")
+                raise Bm25ScopeUnbound("user_idが必要です", "bm25_user_unbound")
             target = self.workspace_root / "_users" / f"user_{user_id}"
             root = _safe_path(target, self.workspace_root)
             if Path(path).is_absolute() or "\x00" in path:

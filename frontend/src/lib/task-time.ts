@@ -19,6 +19,21 @@ export function getElapsedTimerSeconds(
   return Math.max(0, Math.floor((nowMs - startedMs) / 1000));
 }
 
+/** 完了済みの合計に、現在計測中の経過秒だけを加える。 */
+export function getTrackedTimerSeconds(
+  completedSeconds: number | null | undefined,
+  startedAt?: string | null,
+  nowMs = Date.now(),
+): number {
+  const completed =
+    typeof completedSeconds === "number" && Number.isFinite(completedSeconds)
+      ? Math.max(0, Math.floor(completedSeconds))
+      : 0;
+  const elapsed = getElapsedTimerSeconds(startedAt, nowMs);
+  const total = completed + (Number.isFinite(elapsed) ? elapsed : 0);
+  return Number.isFinite(total) ? total : completed;
+}
+
 export function parseTaskTimerDate(
   value: string | null | undefined,
 ): Date | null {

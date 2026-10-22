@@ -566,6 +566,11 @@ def build_approval_signature(tool_name: str, tool_args: Optional[Dict[str, Any]]
     if tool_name in COMMAND_TOOLS:
         return f"program:{_command_program_name(args.get('command', ''))}"
     if tool_name in (FILE_WRITE_TOOLS | FILE_DELETE_TOOLS):
+        if tool_name == "upload_workspace_file":
+            path = str(args.get("path") or "")
+            filename = str(args.get("filename") or "")
+            overwrite = args.get("overwrite", False) is True
+            return f"upload:{path}/{filename}:overwrite:{overwrite}"
         for key in _PATH_ARG_KEYS:
             value = args.get(key)
             if value:
@@ -1429,7 +1434,8 @@ class ExternalLLMPermissionManager:
                 f"ワークスペースフォルダ作成: {args.get('path', '')}/{args.get('name', '')}"
             ),
             "upload_workspace_file": lambda args: (
-                f"ワークスペースファイル保存: {args.get('path', '')}/{args.get('filename', '')}"
+                f"ワークスペースファイル{'上書き' if args.get('overwrite', False) is True else ''}保存: "
+                f"{args.get('path', '')}/{args.get('filename', '')}"
             ),
             "delete_workspace_item": lambda args: f"ワークスペース項目削除: {args.get('path', '')}",
             "move_workspace_item": lambda args: (

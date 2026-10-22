@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from collections.abc import Mapping
+import inspect
+from collections.abc import Iterable, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Optional
+from ..utils.config_values import strict_config_bool as _policy_config_bool
 
 from .generation_policy import GenerationProfile, get_current_generation_policy
 from .planning_policy import (
@@ -23,6 +27,22 @@ _current_user_input: ContextVar[Optional[str]] = ContextVar(
 )
 _current_agent_team_role: ContextVar[Optional[str]] = ContextVar(
     "tool_policy_current_agent_team_role",
+    default=None,
+)
+_current_agent_tool_scope: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "tool_policy_current_agent_tool_scope",
+    default=None,
+)
+_current_agent_dialogue_authority: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "tool_policy_current_agent_dialogue_authority",
+    default=None,
+)
+_current_agent_workspace_scope: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "tool_policy_current_agent_workspace_scope",
+    default=None,
+)
+_current_shared_resource_scope: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "tool_policy_current_shared_resource_scope",
     default=None,
 )
 
@@ -241,6 +261,8 @@ SEARCH_TOOL_NAMES: set[str] = {
     "knowledge_query",
     "knowledge_read",
     "knowledge_status",
+    "media_search",
+    "media_read",
     "search_past_chats",
 }
 
@@ -294,6 +316,16 @@ FILESYSTEM_TOOL_NAMES: set[str] = (
 
 
 def set_current_user_input(user_input: Optional[str]) -> Token:
+    # AgentDialogue worker prompts can contain a curated source-Agent request.
+    # It is input data, never a permission grant.  When the server has pinned
+    # the canonical human anchor for this turn, keep command-capability and
+    # mutation lexical checks on that anchor instead of trusting the source
+    # Agent prose.
+    authority = _current_agent_dialogue_authority.get()
+    if isinstance(authority, dict) and authority.get("role") in {"worker", "root"}:
+        anchor = authority.get("human_anchor")
+        if isinstance(anchor, str) and anchor.strip():
+            user_input = anchor
     return _current_user_input.set(user_input)
 
 
@@ -303,6 +335,152 @@ def reset_current_user_input(token: Token) -> None:
 
 def get_current_user_input() -> Optional[str]:
     return _current_user_input.get()
+
+
+def set_current_agent_dialogue_authority(
+    *,
+    human_anchor: str | None,
+    role: str = "worker",
+    agent_id: str | None = None,
+    control_revision: int | None = None,
+) -> Token:
+    """Pin tool-policy input to the canonical human anchor for a dialogue.
+
+    The source Agent's instruction is intentionally absent from this scope.
+    Concrete capability and Human ACL checks still run through the ordinary
+    Agent authority guard on every tool call.
+    """
+
+    return _current_agent_dialogue_authority.set(
+        {
+            "role": str(role or "").strip().casefold(),
+            "human_anchor": str(human_anchor or "").strip()[:131_072] or None,
+            "agent_id": str(agent_id or "").strip() or None,
+            "control_revision": (
+                max(0, int(control_revision))
+                if control_revision is not None
+                else None
+            ),
+        }
+    )
+
+
+def reset_current_agent_dialogue_authority(token: Token) -> None:
+    _current_agent_dialogue_authority.reset(token)
+
+
+def get_current_agent_dialogue_authority() -> dict[str, Any] | None:
+    value = _current_agent_dialogue_authority.get()
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_current_agent_workspace_scope(
+    *,
+    session_id: str | None,
+    agent_id: str | None,
+    run_id: str | None,
+    resource_key: str | None,
+    readonly: bool,
+    native_allowed: bool,
+    task_mode: str | None = None,
+    edit_scope: "FixedEditScope | None" = None,
+) -> Token:
+    """Bind the server-issued workspace/resource fence for one Agent turn.
+
+    ``task_mode`` is the structured API Agent task mode (``mutate`` or
+    ``read_only``).  When present it is the mutation authority for workspace
+    file tools; free-form Constraints prose only narrows the editable files.
+    ``edit_scope`` is the frozen admission-time file scope of an API task; when
+    bound it replaces any prose re-parse for the whole run.
+    """
+
+    normalized_task_mode = str(task_mode or "").strip()
+    return _current_agent_workspace_scope.set(
+        {
+            "session_id": str(session_id or "").strip() or None,
+            "agent_id": str(agent_id or "").strip() or None,
+            "run_id": str(run_id or "").strip() or None,
+            "resource_key": str(resource_key or "").strip() or None,
+            "readonly": bool(readonly),
+            "native_allowed": bool(native_allowed),
+            "task_mode": (
+                normalized_task_mode
+                if normalized_task_mode in {"mutate", "read_only"}
+                else None
+            ),
+            "edit_scope": edit_scope if isinstance(edit_scope, FixedEditScope) else None,
+            "policy_denial": None,
+        }
+    )
+
+
+def current_structured_task_mode() -> str | None:
+    """Return the structured API Agent task mode bound to this turn, if any."""
+
+    value = _current_agent_workspace_scope.get()
+    if not isinstance(value, dict):
+        return None
+    mode = value.get("task_mode")
+    return mode if mode in {"mutate", "read_only"} else None
+
+
+def record_structured_task_policy_denial(reason: str) -> None:
+    """Remember the first tool-policy denial of a structured Agent task."""
+
+    value = _current_agent_workspace_scope.get()
+    if isinstance(value, dict) and value.get("task_mode") and not value.get("policy_denial"):
+        value["policy_denial"] = str(reason or "tool policy blocked")[:300]
+
+
+def structured_task_policy_denial() -> str | None:
+    """Return the recorded structured-task tool-policy denial, if any."""
+
+    value = _current_agent_workspace_scope.get()
+    if not isinstance(value, dict):
+        return None
+    denial = value.get("policy_denial")
+    return str(denial) if denial else None
+
+
+def reset_current_agent_workspace_scope(token: Token) -> None:
+    _current_agent_workspace_scope.reset(token)
+
+
+def get_current_agent_workspace_scope() -> dict[str, Any] | None:
+    value = _current_agent_workspace_scope.get()
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_current_shared_resource_scope(
+    *,
+    session_id: str | None,
+    user_id: str | None,
+    project_id: str | None,
+    run_id: str | None,
+    resource_key: str,
+    permitted_write: bool,
+) -> Token:
+    """Bind the canonical Human Project writer resource lease."""
+
+    return _current_shared_resource_scope.set(
+        {
+            "session_id": str(session_id or "").strip() or None,
+            "user_id": str(user_id or "").strip() or None,
+            "project_id": str(project_id or "").strip() or None,
+            "run_id": str(run_id or "").strip() or None,
+            "resource_key": str(resource_key or "").strip(),
+            "permitted_write": bool(permitted_write),
+        }
+    )
+
+
+def reset_current_shared_resource_scope(token: Token) -> None:
+    _current_shared_resource_scope.reset(token)
+
+
+def get_current_shared_resource_scope() -> dict[str, Any] | None:
+    value = _current_shared_resource_scope.get()
+    return dict(value) if isinstance(value, dict) else None
 
 
 def set_current_agent_team_role(role: Optional[str]) -> Token:
@@ -317,6 +495,291 @@ def reset_current_agent_team_role(token: Token) -> None:
 
 def get_current_agent_team_role() -> Optional[str]:
     return _current_agent_team_role.get()
+
+
+def set_current_agent_tool_scope(
+    capabilities: Any,
+    *,
+    allowed_subagent_ids: Any = None,
+    revalidate: Any = None,
+) -> Token:
+    """Bind the trusted AgentRevision capability ceiling for one turn.
+
+    This scope is installed only by the server-side Chat Agent adapter.  The
+    list is an intersection ceiling; human/project ACLs remain owned by the
+    concrete tool services and are evaluated on every invocation.
+    """
+
+    if isinstance(capabilities, str):
+        raw_capabilities = re.split(r"[, \t\r\n]+", capabilities)
+    elif isinstance(capabilities, (list, tuple, set, frozenset)):
+        raw_capabilities = list(capabilities)
+    else:
+        raw_capabilities = []
+    normalized = frozenset(
+        str(item).strip().lower()
+        for item in raw_capabilities
+        if str(item).strip()
+    )
+    if isinstance(allowed_subagent_ids, str):
+        raw_subagents = re.split(r"[, \t\r\n]+", allowed_subagent_ids)
+    elif isinstance(allowed_subagent_ids, (list, tuple, set, frozenset)):
+        raw_subagents = list(allowed_subagent_ids)
+    else:
+        raw_subagents = []
+    return _current_agent_tool_scope.set(
+        {
+            "capabilities": normalized,
+            "allowed_subagent_ids": frozenset(
+                str(item).strip().lower()
+                for item in raw_subagents
+                if str(item).strip()
+            ),
+            "revalidate": revalidate if callable(revalidate) else None,
+        }
+    )
+
+
+def reset_current_agent_tool_scope(token: Token) -> None:
+    _current_agent_tool_scope.reset(token)
+
+
+def get_current_agent_tool_scope() -> dict[str, Any] | None:
+    return _current_agent_tool_scope.get()
+
+
+_AGENT_TOOL_CAPABILITY_FAMILIES: dict[str, frozenset[str]] = {
+    "workspace_read": frozenset(
+        {
+            "read_file", "search_files", "list_directory", "get_repo_map",
+            "get_repo_tree", "repo_map", "bm25_search", "search_workspace",
+        }
+    ),
+    "workspace_write": frozenset(
+        {
+            "write_file", "create_file", "edit_file", "delete_file",
+            "execute_command", "shell_command", "run_command",
+        }
+    ),
+    "repo_map": frozenset({"get_repo_map", "repo_map"}),
+    # Background jobs launched by ``execute_command`` are read, listed and
+    # stopped through the same capability (the registry itself filters by the
+    # job's owner/scope); stdin injection is deliberately not included.
+    "command_execute": frozenset(
+        {
+            "execute_command", "shell_command", "run_command",
+            "read_command_output", "list_commands", "stop_command",
+        }
+    ),
+    "docs_read": DOCS_READ_TOOL_NAMES,
+    "docs_write": DOCS_MUTATION_TOOL_NAMES,
+    "project_read": frozenset(
+        set(PROJECT_MANAGEMENT_READ_TOOL_NAMES)
+        | {"memory_search", "memory_get", "memory_explain"}
+    ),
+    "project_write": frozenset(
+        set(PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES)
+        | {
+            "memory_upsert",
+            "memory_update",
+            "memory_forget",
+            "memory_move_scope",
+            "memory_promote_to_project_information",
+        }
+    ),
+    "web_read": frozenset({"web_search", "search_web", "x_search", "grok_x_search", "deep_research"}),
+    "media": frozenset(MEDIA_OPERATIONS_READ_TOOL_NAMES | MEDIA_OPERATIONS_MUTATION_TOOL_NAMES | {"media_assistant", "generate_image"}),
+    "spotify": frozenset({"spotify_assistant", "search_spotify_music", "play_spotify_track", "play_song_now"}),
+    "aoi_tools": frozenset(
+        {
+            "calculate",
+            "get_current_time",
+            "get_weather",
+            "get_weather_info",
+            "agent_activity",
+            # AgentDialogue tools are registered with the existing
+            # ``aoi_tools`` owner. Keep their names here as well so the
+            # provider/fake-registry lane, which may not carry a
+            # ToolDefinition, resolves the same capability family.
+            "list_agent_workers",
+            "delegate_agent_work",
+            "get_agent_work_status",
+            "send_agent_work_message",
+            "answer_agent_work_question",
+            "escalate_agent_work_question",
+            "stop_agent_work",
+            "resume_agent_work",
+            "ask_user_question",
+        }
+    ),
+    "browser_qa": frozenset({"browser_agent", "browser_agent_dedicated", "computer_observe", "computer_use"}),
+    "external_action_propose": frozenset({"propose_external_action", "execute_external_action"}),
+    "telephony_control": frozenset({"telephony_control", "place_call", "transfer_call"}),
+}
+
+
+def agent_capability_ids_for_tool(
+    tool_name: str,
+    tool_definition: Any = None,
+) -> frozenset[str]:
+    """Return canonical Agent capability IDs for one concrete tool.
+
+    An empty result is intentionally ambiguous only for legacy callers; the
+    central Agent guard treats it as unknown and fails closed whenever an
+    Agent execution scope is active.
+    """
+
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    matches = {
+        capability
+        for capability, tools in _AGENT_TOOL_CAPABILITY_FAMILIES.items()
+        if normalized_tool in tools or normalized_tool == capability
+    }
+    owner = str(getattr(tool_definition, "owner", "") or "").strip().lower()
+    if owner and owner in _AGENT_TOOL_CAPABILITY_FAMILIES:
+        matches.add(owner)
+    return frozenset(matches)
+
+
+# 構造化API Agentタスクはproject未束縛で動く。BM25のproject/user scopeは
+# タスクworkspaceを検索できないため、モデルには公開せず search_files を使わせる。
+_STRUCTURED_TASK_UNBOUND_HIDDEN_TOOLS: frozenset[str] = frozenset({"bm25_search"})
+
+
+def structured_task_hides_tool(tool_name: str) -> bool:
+    """Whether a structured API Agent task hides this tool from the model.
+
+    Prompt guidance uses this together with the schema filter so a hidden tool
+    is neither offered as a definition nor named in routing text.
+    """
+
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    return (
+        current_structured_task_mode() is not None
+        and normalized_tool in _STRUCTURED_TASK_UNBOUND_HIDDEN_TOOLS
+    )
+
+
+def agent_tool_scope_permits_exposure(
+    tool_name: str,
+    tool_definition: Any = None,
+) -> bool | None:
+    """Return whether the active AgentRevision ceiling can ever allow a tool.
+
+    ``None`` means no Agent scope is bound.  This is the static part of
+    ``_agent_tool_scope_decision`` (capability ceiling, read-only workspace and
+    native execution), used only to narrow provider schemas.  Execution still
+    runs the full decision, including dynamic revalidation.
+    """
+
+    scope = get_current_agent_tool_scope()
+    if not isinstance(scope, dict):
+        return None
+    capabilities = scope.get("capabilities")
+    if not isinstance(capabilities, (set, frozenset, tuple, list)):
+        return False
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    workspace = get_current_agent_workspace_scope()
+    if (
+        current_structured_task_mode() is not None
+        and normalized_tool in _STRUCTURED_TASK_UNBOUND_HIDDEN_TOOLS
+    ):
+        return False
+    if isinstance(workspace, dict):
+        if bool(workspace.get("readonly")) and normalized_tool in FILESYSTEM_MUTATION_TOOL_NAMES:
+            return False
+        if (
+            normalized_tool in {"execute_command", "computer_use", "browser_agent", "browser_agent_dedicated"}
+            and not bool(workspace.get("native_allowed"))
+        ):
+            return False
+    if normalized_tool == "agent_team_delegate":
+        return bool(scope.get("allowed_subagent_ids"))
+    allowed = {str(item).strip().lower() for item in capabilities if str(item).strip()}
+    # Mirror the execution guard: every authority family of the tool (for
+    # example ``get_repo_map`` is both workspace_read and repo_map) must be
+    # inside the ceiling, otherwise the model is shown a tool it cannot call.
+    required = agent_capability_ids_for_tool(normalized_tool, tool_definition)
+    return bool(required) and required <= allowed
+
+
+def _agent_tool_scope_decision(
+    tool_name: str,
+    *,
+    tool_args: Mapping[str, Any] | None,
+    tool_definition: Any,
+) -> ToolPolicyDecision | None:
+    scope = get_current_agent_tool_scope()
+    if not isinstance(scope, dict):
+        return None
+    capabilities = scope.get("capabilities")
+    if not isinstance(capabilities, (set, frozenset, tuple, list)):
+        return ToolPolicyDecision(False, "Agent capability scope is invalid")
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    workspace = get_current_agent_workspace_scope()
+    if (
+        current_structured_task_mode() is not None
+        and normalized_tool in _STRUCTURED_TASK_UNBOUND_HIDDEN_TOOLS
+    ):
+        return ToolPolicyDecision(
+            False,
+            "bm25_search is unavailable for project-unbound Agent tasks; use search_files",
+        )
+    if isinstance(workspace, dict):
+        if bool(workspace.get("readonly")) and normalized_tool in FILESYSTEM_MUTATION_TOOL_NAMES:
+            return ToolPolicyDecision(
+                False,
+                "Agent workspace is read-only for this turn",
+            )
+        if (
+            normalized_tool in {"execute_command", "computer_use", "browser_agent", "browser_agent_dedicated"}
+            and not bool(workspace.get("native_allowed"))
+        ):
+            return ToolPolicyDecision(
+                False,
+                "native execution is not authorized for this Agent workspace",
+            )
+    if normalized_tool == "agent_team_delegate":
+        requested = str((tool_args or {}).get("subagent") or "").strip().lower()
+        allowed_subagents = scope.get("allowed_subagent_ids") or frozenset()
+        if requested and requested not in allowed_subagents:
+            return ToolPolicyDecision(False, "AgentRevision does not allow this Subagent")
+        if not requested:
+            return ToolPolicyDecision(False, "Subagent identity is required")
+    allowed = {str(item).strip().lower() for item in capabilities if str(item).strip()}
+    # A selected Agent with an empty revision ceiling is explicitly read-only
+    # at the tool layer; ordinary text generation remains available.
+    required = agent_capability_ids_for_tool(normalized_tool, tool_definition)
+    matches = required if required <= allowed else set()
+    # Delegation is a control operation whose required capabilities are the
+    # requested child intersection, checked by AgentAuthorityResolver below;
+    # it must not require an invented capability ID or the child's first
+    # concrete tool capability at this static policy layer.
+    if not matches and normalized_tool != "agent_team_delegate":
+        return ToolPolicyDecision(False, "Tool is outside the AgentRevision capability ceiling")
+    checker = scope.get("revalidate")
+    if callable(checker):
+        try:
+            verdict = checker(normalized_tool, dict(tool_args or {}), tool_definition)
+        except Exception:
+            return ToolPolicyDecision(False, "Agent authority could not be revalidated")
+        if inspect.isawaitable(verdict):
+            # Sync policy callers must never treat a coroutine object as a
+            # truthy allow. The unified async lane awaits the central guard
+            # before entering this policy.
+            close = getattr(verdict, "close", None)
+            if callable(close):
+                close()
+            return ToolPolicyDecision(False, "Agent authority checker requires async runtime")
+        if verdict is False:
+            return ToolPolicyDecision(False, "Agent authority was revoked")
+        if isinstance(verdict, ToolPolicyDecision) and not verdict.allowed:
+            return verdict
+        if verdict is not True and not (
+            isinstance(verdict, ToolPolicyDecision) and verdict.allowed
+        ):
+            return ToolPolicyDecision(False, "Agent authority was not explicitly allowed")
+    return None
 
 
 def sanitize_command_capabilities(value: Any) -> tuple[str, ...]:
@@ -748,10 +1211,17 @@ _MUTATION_FORBIDDEN_PATTERNS = (
     ),
     re.compile(r"(?:確認|閲覧|参照|表示|一覧|読み取り)(?:だけ|のみ)"),
     re.compile(
-        r"(?:作成|追加|登録|更新|変更|修正|削除|消去|割り当て|"
+        # ``追加`` is a mutation action when it names the requested
+        # operation (``追加は禁止``).  It is also commonly an attributive
+        # modifier for a later, non-mutating continuation constraint such as
+        # ``追加の委譲は不要`` or ``追加ツールは不要``.  Do not let that
+        # modifier turn a required current delegation into a global
+        # no-mutation request.  Other action tokens, including a later
+        # ``追加`` after a separator, remain covered by the same pattern.
+        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール))追加|登録|更新|変更|修正|削除|消去|割り当て|"
         r"スケジュール|書き込み)"
         r"(?:[／/・、,\s]*"
-        r"(?:作成|追加|登録|更新|変更|修正|削除|消去|割り当て|"
+        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール))追加|登録|更新|変更|修正|削除|消去|割り当て|"
         r"スケジュール|書き込み))*"
         r"[^。\n]{0,12}(?:禁止|しないで|しない|不要|不可)"
     ),
@@ -783,6 +1253,650 @@ def mutation_execution_forbidden(text: str | None) -> bool:
         pattern.search(policy_text) is not None
         for pattern in _MUTATION_FORBIDDEN_PATTERNS
     )
+
+
+# Workspace file tools whose target is a single ``path`` argument.  Under a
+# structured ``mode=mutate`` API Agent task these are authorised by the task
+# mode and narrowed by path-scoped Constraints instead of the lexical
+# whole-request gate above.
+STRUCTURED_TASK_FILE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "create_file",
+        "write_file",
+        "edit_file",
+        "append_to_file",
+        "insert_to_file",
+        "delete_file",
+        "undo_edit",
+    }
+)
+# ``Inspect only relevant sections`` / ``Read only the relevant parts`` narrows
+# how much is read; it is not the read-only declaration ``inspect only.``.  The
+# qualifier is removed before the whole-task scan, so a restrictive clause in the
+# same sentence ("... and do not modify any files") is still enforced.
+_TASK_INSPECTION_QUALIFIER_RE = re.compile(
+    r"\b(?:inspect|read|view|check|list|show|count)\s+only\s+"
+    r"(?:(?:the|those|these|a|an)\s+)?"
+    r"(?:(?:relevant|necessary|needed|required|specific|targeted|matching|affected|"
+    r"minimal|small|focused|changed|failing)\b"
+    r"|\w+\s+(?:sections?|parts?|lines?|portions?|ranges?|excerpts?|snippets?|slices?|hunks?)\b)",
+    re.IGNORECASE,
+)
+# ``既存3文書とFINDINGS.mdのみ編集``: a count of unnamed documents beside a named
+# file.  The unnamed targets are never guessed; edits stay limited to the files
+# that are named and the denial tells the author to list every target.
+_TASK_UNENUMERATED_TARGET_RE = re.compile(
+    r"(?:既存の?)?\d+\s*(?:個|件|つ|本)?の?(?:文書|ファイル|ドキュメント|資料)(?:と|や|および|及び)"
+    r"|\b\d+\s+(?:existing\s+|other\s+)?(?:documents?|files?|docs)\s+(?:and|plus)\b",
+    re.IGNORECASE,
+)
+_TASK_UNENUMERATED_PREFIX_RE = re.compile(
+    r"^.*?(?:" + _TASK_UNENUMERATED_TARGET_RE.pattern + r")(?P<path>[A-Za-z0-9_.~].*)$",
+    re.IGNORECASE,
+)
+_TASK_SENTENCE_SPLIT_RE = re.compile(r"[\n。;；]+|(?<=[!?])\s+|(?<=\.)\s+")
+_TASK_CLAUSE_SPLIT_RE = re.compile(
+    r"[、，,]+|\s+(?:but|while|whereas|however|and)\s+|ただし|しかし",
+    re.IGNORECASE,
+)
+_TASK_PATH_EXT = r"\.[A-Za-z][A-Za-z0-9]{0,9}"
+# Quoted targets may contain spaces; unquoted ones may contain non-ASCII
+# (e.g. Japanese) characters but no whitespace or prose punctuation.
+_TASK_QUOTED_PATH_RE = re.compile(
+    r"[\"'`“「『]([^\"'`”」』\n]*?" + _TASK_PATH_EXT + r")(?=[\"'`”」』])"
+)
+_TASK_PATH_NAME = r"[^\s/\\:：*?\"<>|「」『』“”‘’()（）、，。;；,`'\[\]{}]"
+_TASK_PATH_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_./\\:-])"
+    r"((?:[A-Za-z]:)?[/\\]{0,2}(?:" + _TASK_PATH_NAME + r"+[/\\])*"
+    + _TASK_PATH_NAME + r"+?" + _TASK_PATH_EXT + r")"
+    r"(?![A-Za-z0-9_/\\])"
+)
+# A carve-out (other/remaining/except ...) means another target is editable.
+_TASK_SCOPE_EXCLUSION_RE = re.compile(
+    r"他の|他ファイル|ほかの|残り|以外|その他|対象外"
+    r"|\b(?:other|others|remaining|rest|except|besides|otherwise|unrelated)\b",
+    re.IGNORECASE,
+)
+_TASK_FILE_NOUN_RE = re.compile(r"ファイル|\bfiles?\b|\bpaths?\b", re.IGNORECASE)
+# Unambiguous whole-task declarations are honoured even when a file is named.
+_TASK_WHOLE_READ_ONLY_RE = re.compile(
+    r"\bread[\s_-]*only\s+(?:task|request|mode|job|run|session|review|analysis|investigation)\b"
+    r"|\b(?:task|request|job|run|work)\s+is\s+read[\s_-]*only\b"
+    r"|\b(?:do\s+not|don['’]?t|dont|never)\s+(?:modify|change|edit|write|touch|update)\s+"
+    r"(?:any|anything|all)\b"
+    r"|\bno\s+(?:file\s+)?(?:changes|edits|modifications|writes)\s+(?:at\s+all|whatsoever)\b"
+    r"|読み取り専用(?:の|で)?(?:タスク|作業|モード|依頼|調査|対応|実行)"
+    r"|(?:タスク|作業|依頼)(?:全体)?(?:は|を)?(?:読み取り専用|読み取りのみ)"
+    r"|(?:一切|何も)(?:の)?(?:ファイルを?)?(?:変更|編集|修正|書き込み|作成)",
+    re.IGNORECASE,
+)
+# A named target (file, credential/TTL/DB area, commands, file count) scopes a
+# restriction to that target instead of the whole task.
+_TASK_SCOPE_TARGET_RE = re.compile(
+    r"\d+\s*(?:個の)?(?:ファイル|files?)"
+    r"|TTL|認証|資格情報|秘密|シークレット|\.env|DB|データベース|コマンド|設定|スキーマ|マイグレーション"
+    r"|\b(?:auth\w*|credentials?|secrets?|tokens?|database|db|commands?|config\w*|schema|migrations?|"
+    r"git|tests?|lockfiles?|dependenc\w+)\b"
+    # A qualified code object ("do not change calendar code") names a part of
+    # the repository; bare "code"/"all code" stays an unscoped declaration.
+    r"|\b(?!(?:the|any|all|this|that|these|those|my|your|our|its|source|of|existing|change|modify|edit|update|write|touch|create|delete|alter|add|remove)\b)"
+    r"[A-Za-z][\w-]*\s+(?:source\s+)?(?:code|codebase|modules?)\b",
+    re.IGNORECASE,
+)
+_TASK_READ_ONLY_TARGET_RE = re.compile(
+    r"読取|読み取り|参照|閲覧|確認のみ|確認だけ|変更禁止|編集禁止|変更しない|編集しない"
+    r"|\bread[\s_-]*only\b|\b(?:do\s+not|don['’]?t|dont|never)\s+(?:edit|modify|change|touch|write)\b"
+    r"|\b(?:unchanged|untouched)\b",
+    re.IGNORECASE,
+)
+_TASK_EDIT_VERB_RE = re.compile(
+    # ``移植``/``保存`` name the destination file of a port or save.
+    r"編集|修正|変更|追記|書き換え|更新|置換|直す|直して|作成|移植|保存|書き込"
+    r"|\b(?:edit|modify|update|change|fix|patch|rewrite|replace|append|create|write)\b",
+    re.IGNORECASE,
+)
+_TASK_ONLY_RE = re.compile(r"だけ|のみ|\bonly\b", re.IGNORECASE)
+# Japanese prose is a legal filename character, so ``変更はdocs/a.md`` is one
+# token.  A particle or copula with no slash before an ASCII path is prose,
+# not a directory name.  ``data/はdocs/a.md`` keeps its slash and is unchanged.
+_TASK_PATH_PROSE_PREFIX_RE = re.compile(
+    r"^(?P<prose>[^/\\]+?(?:から|まで|[はのをにもでへや]))"
+    r"(?P<path>(?:[A-Za-z]:[/\\]|[A-Za-z0-9_.~-][^/\\]*[/\\]).*)$"
+)
+# ``変更はREADME.md`` / ``変更は資料/a.md``: a task-scope lead word and particle
+# name the target, so what follows is the path even without a slash or when it
+# starts with a non-ASCII folder name.  Other prose before a bare name is kept,
+# because ``設定のconfig.md`` may itself be a file name.
+_TASK_PATH_LEAD_PROSE_RE = re.compile(
+    r"^(?:(?:編集|変更|修正|更新|追記|作成|書き換え|置換|参照|閲覧|読み取り|読取)(?:対象)?(?:ファイル)?"
+    r"|対象(?:ファイル)?)"
+    r"(?:するの|する|先|箇所)?(?:は|を|が|も)(?P<path>[^/\\].*)$"
+)
+# ``docs/a.mdとdocs/b.md``: a Japanese conjunction directly after a file
+# extension separates two targets that the token pattern reads as one.
+_TASK_PATH_CONJUNCTION_RE = re.compile(
+    r"(" + _TASK_PATH_EXT + r")(?:および|及び|または|又は|と|や)(?=\S)"
+)
+
+
+def _split_joined_task_paths(value: str) -> list[str]:
+    return _TASK_PATH_CONJUNCTION_RE.sub("\\1\n", value).split("\n")
+
+
+def _strip_leading_task_prose(value: str) -> str:
+    """Return the path when Japanese prose is glued to its front."""
+
+    counted = _TASK_UNENUMERATED_PREFIX_RE.match(value)
+    if counted is not None:
+        return counted.group("path")
+    lead = _TASK_PATH_LEAD_PROSE_RE.match(value)
+    if lead is not None:
+        return lead.group("path")
+    match = _TASK_PATH_PROSE_PREFIX_RE.match(value)
+    if match is None:
+        return value
+    return match.group("path")
+
+
+def _task_path_tokens(text: str) -> set[str]:
+    text = str(text or "")
+    raw = [match.group(1) for match in _TASK_QUOTED_PATH_RE.finditer(text)]
+    unquoted = _TASK_QUOTED_PATH_RE.sub(" ", text)
+    raw.extend(match.group(1) for match in _TASK_PATH_TOKEN_RE.finditer(unquoted))
+    tokens: set[str] = set()
+    for joined in raw:
+        for value in _split_joined_task_paths(joined):
+            path = _normalise_task_path(_strip_leading_task_prose(_normalise_task_path(value)))
+            if path:
+                tokens.add(path)
+    return tokens
+
+
+def _normalise_task_path(value: Any) -> str:
+    path = str(value or "").strip().strip("`'\"").replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.rstrip("/")
+
+
+def _task_path_key(path: str, run_scope: Any) -> str:
+    """Comparable location of a task/tool path inside the task workspace.
+
+    Relative paths (including a bare file name) are resolved against the
+    bound AgentRunScope root exactly like the file tools resolve them, so a
+    named target means one file in the specified workspace.  Without a bound
+    scope only the lexical form is comparable.
+    """
+
+    if run_scope is not None:
+        try:
+            path = str(run_scope.resolve(path)).replace("\\", "/")
+        except (OSError, ValueError, TypeError):
+            return ""
+    return path.casefold()
+
+
+def _task_path_matches(
+    path: str,
+    token: str,
+    run_scope: Any,
+    *,
+    protected: bool = False,
+    exact: bool = False,
+) -> bool:
+    """Whether a tool target is the file a task path names.
+
+    Both sides are resolved inside the task workspace and compared exactly, so
+    a folder-qualified token never matches another folder or a location that
+    merely shares its suffix.  A bare file name names that file wherever it
+    sits inside the task workspace; a protected bare name protects every
+    same-named file.
+    """
+
+    path_key = _task_path_key(path, run_scope)
+    if not path_key:
+        return False
+    if path_key == _task_path_key(token, run_scope):
+        return True
+    # An explicit ``edit_targets`` token names exactly one workspace file: a
+    # same-named file in another folder never matches it.
+    if exact:
+        return False
+    if "/" in token or path_key.rsplit("/", 1)[-1] != token.casefold():
+        return False
+    if protected or run_scope is None:
+        return protected
+    root_key = _task_path_key(".", run_scope)
+    return bool(root_key) and path_key.startswith(root_key.rstrip("/") + "/")
+
+
+@dataclass(frozen=True)
+class StructuredTaskMutationScope:
+    """File-mutation scope derived from a structured ``mode=mutate`` task."""
+
+    whole_task_forbidden: bool
+    restricted: bool
+    protected_paths: frozenset[str]
+    editable_paths: frozenset[str]
+    # True only when the task limits edits to ``editable_paths``: an explicit
+    # "only Y" or a carve-out ("the other files are read-only").  Protecting a
+    # file ("X は変更しない") alone leaves every other file editable, and a
+    # restriction that names no file (TTL/DB/auth/設定) never limits edits.
+    editable_limited: bool = False
+    # An edit clause refers to unnamed targets ("既存3文書と X.md のみ編集").
+    # They are not guessed; the author must enumerate every target file.
+    unenumerated_targets: bool = False
+    # Prose declared that the other files are read-only (a carve-out).
+    carve_out: bool = False
+
+
+def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationScope:
+    """Classify read-only/no-mutation prose of a structured mutate task.
+
+    A structured API Agent task carries ``mode`` as authority.  Constraint
+    prose that names files ("the remaining 3 files are read-only", "X は変更
+    しないこと") narrows the editable targets rather than turning the whole
+    task read-only.  A restriction that names no file ("TTL/auth/DB changes
+    are forbidden", "設定ファイルは変更しないこと") is only an instruction to
+    the model: it neither widens nor narrows the scope.  A genuine whole-task declaration
+    ("read-only task", "do not modify any files", or an unscoped "read-only")
+    still forbids every file mutation.
+    """
+
+    policy_text = _extract_effective_user_request(str(text or ""))
+    whole = False
+    carve_out = False
+    protected: set[str] = set()
+    edit_tokens: set[str] = set()
+    only_edit_tokens: set[str] = set()
+    unenumerated = False
+    for sentence in _TASK_SENTENCE_SPLIT_RE.split(policy_text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        scan = _TASK_INSPECTION_QUALIFIER_RE.sub(" ", sentence)
+        forbidden = any(
+            pattern.search(scan) is not None
+            for pattern in _MUTATION_FORBIDDEN_PATTERNS
+        )
+        if forbidden:
+            if _TASK_SCOPE_EXCLUSION_RE.search(sentence):
+                carve_out = carve_out or bool(
+                    _task_path_tokens(sentence) or _TASK_FILE_NOUN_RE.search(sentence)
+                )
+            elif _TASK_WHOLE_READ_ONLY_RE.search(sentence):
+                whole = True
+            elif _task_path_tokens(sentence):
+                # The named files are protected by the clause scan below.
+                pass
+            elif _TASK_SCOPE_TARGET_RE.search(sentence):
+                # A restriction that names no file ("設定ファイルは変更しない
+                # こと", "TTL/認証/DB禁止") stays an instruction to the model in
+                # the prompt.  It neither widens nor narrows the file scope.
+                pass
+            else:
+                whole = True
+        elif (
+            _TASK_WHOLE_READ_ONLY_RE.search(sentence)
+            and not _TASK_SCOPE_EXCLUSION_RE.search(sentence)
+        ):
+            # An explicit whole-task declaration ("これは読み取り専用のタスク
+            # です") needs no separate mutation-forbidden verb.
+            whole = True
+        sentence_read_only = forbidden or _TASK_READ_ONLY_TARGET_RE.search(sentence) is not None
+        if (
+            sentence_read_only
+            and _TASK_SCOPE_EXCLUSION_RE.search(sentence)
+            and (_task_path_tokens(sentence) or _TASK_FILE_NOUN_RE.search(sentence))
+        ):
+            # Coordination prose ("other implementers handle X, keep those
+            # modules untouched") names no files and must not limit edits.
+            carve_out = True
+        for clause in _TASK_CLAUSE_SPLIT_RE.split(sentence):
+            tokens = _task_path_tokens(clause)
+            if not tokens:
+                continue
+            if (
+                _TASK_READ_ONLY_TARGET_RE.search(clause)
+                or any(pattern.search(clause) for pattern in _MUTATION_FORBIDDEN_PATTERNS)
+                # "a.md, b.md and c.md are read-only": list items share the
+                # sentence's read-only marker unless they name an edit.
+                or (sentence_read_only and not _TASK_EDIT_VERB_RE.search(clause))
+            ):
+                protected.update(tokens)
+            elif _TASK_EDIT_VERB_RE.search(clause):
+                edit_tokens.update(tokens)
+                if _TASK_ONLY_RE.search(clause):
+                    only_edit_tokens.update(tokens)
+                    if _TASK_UNENUMERATED_TARGET_RE.search(clause):
+                        unenumerated = True
+    editable = (only_edit_tokens or edit_tokens) - protected
+    # Edits are limited to the named targets only when the task says so; a
+    # protection-only constraint ("src_a.py は変更しないこと") denies just the
+    # protected files and leaves the rest of the mutate task editable.
+    editable_limited = bool(only_edit_tokens or (carve_out and editable))
+    return StructuredTaskMutationScope(
+        whole_task_forbidden=whole,
+        restricted=bool(protected) or editable_limited,
+        protected_paths=frozenset(protected),
+        editable_paths=frozenset(editable),
+        editable_limited=editable_limited,
+        unenumerated_targets=unenumerated and editable_limited,
+        carve_out=carve_out,
+    )
+
+
+def structured_task_whole_mutation_forbidden(text: str | None) -> bool:
+    """Return whether task prose declares the entire task read-only."""
+
+    return structured_task_mutation_scope(text).whole_task_forbidden
+
+
+_FIXED_EDIT_SCOPE_VERSION = 1
+_FIXED_EDIT_SCOPE_KEYS = frozenset(
+    {"v", "whole", "limited", "editable", "protected", "unenumerated", "explicit", "sha"}
+)
+_FIXED_EDIT_SCOPE_MAX_PATHS = 64
+_FIXED_EDIT_SCOPE_MAX_CHARS = 260
+
+
+class StructuredEditScopeError(ValueError):
+    """The structured task's edit scope is inconsistent or malformed."""
+
+
+def _lexical_task_path_matches(path: str, token: str, *, exact: bool = False) -> bool:
+    """Workspace-relative comparison without a bound run scope (admission time).
+
+    Mirrors ``_task_path_matches``: an exact path or, for a prose-inferred bare
+    name, that name wherever it sits in the workspace.  ``exact`` (explicit
+    ``edit_targets``) accepts the identical relative path only.  Comparison is
+    case-insensitive on every platform, like the runtime comparison.
+    """
+
+    path_key = _normalise_task_path(path).casefold()
+    token_key = _normalise_task_path(token).casefold()
+    if not path_key or not token_key:
+        return False
+    if path_key == token_key:
+        return True
+    return not exact and "/" not in token_key and path_key.rsplit("/", 1)[-1] == token_key
+
+
+def _scope_path_is_clean(path: str, *, relative_only: bool) -> bool:
+    """A normalised token; explicit targets must also be safe workspace-relative files."""
+
+    if not path or path != _normalise_task_path(path) or any(ord(char) < 32 for char in path):
+        return False
+    if not relative_only:
+        return True
+    parts = path.split("/")
+    return not (
+        path.startswith("/")
+        or "\\" in path
+        or re.match(r"^[A-Za-z]:", path)
+        or any(part in ("", ".", "..") or ":" in part or part != part.rstrip(". ") for part in parts)
+    )
+
+
+@dataclass(frozen=True)
+class FixedEditScope:
+    """Immutable file-mutation scope of one structured API Agent task.
+
+    Computed once at admission from the caller's original goal/constraints/
+    criteria (plus the optional explicit ``edit_targets``) and persisted.  The
+    runtime binds this value instead of re-reading prose, so framework
+    guidance, corrective notes and restart notes can never change authority.
+    It governs file-tool targets only; it is not an OS sandbox and does not
+    diff what an allowed command writes.
+    """
+
+    whole: bool
+    limited: bool
+    editable: tuple[str, ...]
+    protected: tuple[str, ...]
+    unenumerated: bool = False
+    explicit: bool = False
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "v": _FIXED_EDIT_SCOPE_VERSION,
+            "whole": self.whole,
+            "limited": self.limited,
+            "editable": list(self.editable),
+            "protected": list(self.protected),
+            "unenumerated": self.unenumerated,
+            "explicit": self.explicit,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        canonical = json.dumps(self._body(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def to_payload(self) -> dict[str, Any]:
+        return {**self._body(), "sha": self.fingerprint}
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "FixedEditScope":
+        """Strictly rebuild a persisted scope; anything off raises (fail closed)."""
+
+        if not isinstance(payload, Mapping) or set(payload) != _FIXED_EDIT_SCOPE_KEYS:
+            raise StructuredEditScopeError("edit scope metadata is malformed")
+        version = payload.get("v")
+        if type(version) is not int or version != _FIXED_EDIT_SCOPE_VERSION:
+            raise StructuredEditScopeError("edit scope version is unsupported")
+        flags: dict[str, bool] = {}
+        for name in ("whole", "limited", "unenumerated", "explicit"):
+            if not isinstance(payload.get(name), bool):
+                raise StructuredEditScopeError("edit scope metadata is malformed")
+            flags[name] = payload[name]
+        lists: dict[str, tuple[str, ...]] = {}
+        for name in ("editable", "protected"):
+            raw = payload.get(name)
+            if (
+                not isinstance(raw, list)
+                or len(raw) > _FIXED_EDIT_SCOPE_MAX_PATHS
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or len(item) > _FIXED_EDIT_SCOPE_MAX_CHARS
+                    for item in raw
+                )
+            ):
+                raise StructuredEditScopeError("edit scope metadata is malformed")
+            lists[name] = tuple(raw)
+        scope = cls(
+            whole=flags["whole"],
+            limited=flags["limited"],
+            editable=lists["editable"],
+            protected=lists["protected"],
+            unenumerated=flags["unenumerated"],
+            explicit=flags["explicit"],
+        )
+        scope._validate_invariants()
+        if payload.get("sha") != scope.fingerprint:
+            raise StructuredEditScopeError("edit scope fingerprint does not match")
+        return scope
+
+    def _validate_invariants(self) -> None:
+        """Reject a self-consistent but impossible scope (a forged or corrupt row)."""
+
+        for name, items in (("editable", self.editable), ("protected", self.protected)):
+            if list(items) != sorted(set(items)):
+                raise StructuredEditScopeError(f"edit scope {name} list is not canonical")
+            for item in items:
+                if not _scope_path_is_clean(item, relative_only=self.explicit and name == "editable"):
+                    raise StructuredEditScopeError(f"edit scope {name} path is invalid")
+        if self.explicit and not self.limited:
+            raise StructuredEditScopeError("an explicit edit scope is always limited")
+        if self.unenumerated and (self.explicit or not self.limited):
+            raise StructuredEditScopeError("edit scope unenumerated flag is inconsistent")
+        if self.editable and not self.limited and self.explicit:
+            raise StructuredEditScopeError("edit scope limited flag is inconsistent")
+
+    def as_mutation_scope(self) -> StructuredTaskMutationScope:
+        return StructuredTaskMutationScope(
+            whole_task_forbidden=self.whole,
+            restricted=bool(self.protected) or self.limited,
+            protected_paths=frozenset(self.protected),
+            editable_paths=frozenset(self.editable),
+            editable_limited=self.limited,
+            unenumerated_targets=self.unenumerated,
+        )
+
+
+def _freeze_scope(
+    parsed: StructuredTaskMutationScope,
+    *,
+    editable: Iterable[str],
+    limited: bool,
+    explicit: bool,
+) -> FixedEditScope:
+    editable_paths = tuple(sorted(set(editable)))
+    protected = tuple(sorted(parsed.protected_paths))
+    if len(editable_paths) > _FIXED_EDIT_SCOPE_MAX_PATHS or len(protected) > _FIXED_EDIT_SCOPE_MAX_PATHS:
+        raise StructuredEditScopeError("the task names too many files to bind an edit scope")
+    if any(len(item) > _FIXED_EDIT_SCOPE_MAX_CHARS for item in (*editable_paths, *protected)):
+        raise StructuredEditScopeError("the task names a path that is too long")
+    return FixedEditScope(
+        whole=parsed.whole_task_forbidden,
+        limited=bool(limited),
+        editable=editable_paths,
+        protected=protected,
+        unenumerated=parsed.unenumerated_targets and not explicit,
+        explicit=explicit,
+    )
+
+
+def fixed_edit_scope_from_prose(text: str | None) -> FixedEditScope:
+    """Freeze the prose-derived scope (legacy tasks without explicit targets)."""
+
+    parsed = structured_task_mutation_scope(text)
+    return _freeze_scope(
+        parsed,
+        editable=parsed.editable_paths,
+        limited=parsed.editable_limited,
+        explicit=False,
+    )
+
+
+def build_fixed_edit_scope(
+    text: str | None,
+    *,
+    edit_targets: Sequence[str] | None,
+    required_outputs: Sequence[str] = (),
+) -> FixedEditScope:
+    """Admission-time scope from the ORIGINAL caller text and explicit targets.
+
+    ``edit_targets=None`` keeps the prose-derived scope.  A list (even an empty
+    one) replaces only the prose-inferred positive editable list: protected
+    files and carve-outs in the prose still apply, and ``required_outputs`` is
+    never authority, only checked against the final scope.
+    """
+
+    parsed = structured_task_mutation_scope(text)
+    if parsed.whole_task_forbidden:
+        raise StructuredEditScopeError("mode=mutate conflicts with a whole-task read-only instruction")
+    if edit_targets is None:
+        scope = _freeze_scope(
+            parsed,
+            editable=parsed.editable_paths,
+            limited=parsed.editable_limited,
+            explicit=False,
+        )
+    else:
+        targets = tuple(edit_targets)
+        for target in targets:
+            if any(_lexical_task_path_matches(target, token) for token in parsed.protected_paths):
+                raise StructuredEditScopeError("edit_targets names a file the task marks read-only")
+            if (
+                parsed.carve_out
+                and parsed.editable_paths
+                and not any(_lexical_task_path_matches(target, token) for token in parsed.editable_paths)
+            ):
+                raise StructuredEditScopeError(
+                    "edit_targets conflicts with the task's explicit restriction of editable files"
+                )
+        scope = _freeze_scope(parsed, editable=targets, limited=True, explicit=True)
+    for output in required_outputs:
+        if any(_lexical_task_path_matches(output, token) for token in scope.protected):
+            raise StructuredEditScopeError("required_outputs names a file the task marks read-only")
+        if scope.limited and not any(
+            _lexical_task_path_matches(output, token, exact=scope.explicit) for token in scope.editable
+        ):
+            raise StructuredEditScopeError(
+                "required_outputs must be inside the editable file scope; "
+                "name it in edit_targets (required_outputs never grants write access)"
+            )
+    return scope
+
+
+def current_structured_edit_scope() -> FixedEditScope | None:
+    """The fixed edit scope bound to this structured task turn, if any."""
+
+    value = _current_agent_workspace_scope.get()
+    scope = value.get("edit_scope") if isinstance(value, dict) else None
+    return scope if isinstance(scope, FixedEditScope) else None
+
+
+def _structured_mutate_task_decision(
+    text: str,
+    tool_name: str,
+    tool_args: Mapping[str, Any] | None,
+) -> ToolPolicyDecision:
+    # An admitted API task enforces its frozen scope.  Turn text may be
+    # framework guidance or a corrective note, so prose is re-read only for
+    # legacy callers that never bound a scope.
+    fixed = current_structured_edit_scope()
+    scope = fixed.as_mutation_scope() if fixed is not None else structured_task_mutation_scope(text)
+    if scope.whole_task_forbidden:
+        return ToolPolicyDecision(
+            False,
+            "the user explicitly requested read-only or no-mutation handling",
+        )
+    if tool_name not in STRUCTURED_TASK_FILE_EDIT_TOOL_NAMES:
+        # Command execution is authorised only by allow_commands, which the
+        # workspace native fence has already enforced; other mutation tools
+        # by the Agent tool scope (required_capabilities).  The file-target
+        # scope is not a command filesystem sandbox.
+        return ToolPolicyDecision(True, "structured mutate task authorises this tool")
+    if not scope.restricted:
+        return ToolPolicyDecision(True, "structured mutate task authorises workspace edits")
+    args = tool_args or {}
+    path = _normalise_task_path(args.get("path") or args.get("file_path") or "")
+    if not path:
+        return ToolPolicyDecision(
+            False,
+            "the structured task restricts editable files and this edit has no target path",
+        )
+    from ..security.agent_run_scope import get_current_run_scope
+
+    run_scope = get_current_run_scope()
+    if any(
+        _task_path_matches(path, token, run_scope, protected=True)
+        for token in scope.protected_paths
+    ):
+        return ToolPolicyDecision(
+            False,
+            "the structured task marks this file read-only",
+        )
+    if not scope.editable_limited:
+        return ToolPolicyDecision(True, "structured mutate task authorises unprotected files")
+    exact = fixed is not None and fixed.explicit
+    if not any(_task_path_matches(path, token, run_scope, exact=exact) for token in scope.editable_paths):
+        if scope.unenumerated_targets:
+            return ToolPolicyDecision(
+                False,
+                "the structured task limits edits to named files but also refers to "
+                "unnamed targets (e.g. a count of documents); list every target file "
+                "explicitly, because unnamed targets are not inferred",
+            )
+        return ToolPolicyDecision(
+            False,
+            "the structured task restricts edits to its named target file",
+        )
+    return ToolPolicyDecision(True, "structured mutate task authorises its target file")
 
 
 def project_management_required_mutation_tools(text: str) -> set[str]:
@@ -1179,7 +2293,9 @@ def is_memory_search_enabled(config: Any) -> bool:
     memory = config.get("memory", {}) if hasattr(config, "get") else {}
     if not isinstance(memory, dict):
         return False
-    return bool(memory.get("enabled", True) and memory.get("enable_search", True))
+    return _policy_config_bool(memory.get("enabled", True), default=True) and _policy_config_bool(
+        memory.get("enable_search", True), default=True
+    )
 
 
 def is_knowledge_search_enabled(config: Any) -> bool:
@@ -1188,7 +2304,7 @@ def is_knowledge_search_enabled(config: Any) -> bool:
     search = config.get("search", {}) if hasattr(config, "get") else {}
     if not isinstance(search, dict):
         return False
-    return bool(search.get("knowledge_enabled", False))
+    return _policy_config_bool(search.get("knowledge_enabled", False), default=False)
 
 
 def _policy_config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -1222,22 +2338,6 @@ def _policy_config_get(config: Any, key: str, default: Any = None) -> Any:
             current = current[part]
         return current
     return default
-
-
-def _policy_config_bool(value: Any, *, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in {0, 1}:
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-        if normalized in {"false", "0", "no", "off", ""}:
-            return False
-    return False
 
 
 def _tool_metadata_value(tool_definition: Any, key: str, default: Any = None) -> Any:
@@ -1446,6 +2546,38 @@ def _runtime_capability_for_tool(
     name = str(tool_name or "").strip()
     owner = str(_tool_metadata_value(tool_definition, "owner", "") or "").strip().casefold()
 
+    if not _policy_config_bool(_policy_config_get(config, "use_tools", True), default=True):
+        return "tools are disabled in configuration"
+    if not _policy_config_bool(_policy_config_get(config, "runtime.target_enable_tools", True), default=True):
+        return "tools are disabled for this runtime target"
+    # MCP transport availability and search capability are independent gates.
+    # Check the transport before a search marker can replace its owner.
+    if owner.startswith("mcp:") or name in {"use_mcp_tool", "call_mcp_tool"}:
+        if not _policy_config_bool(_policy_config_get(config, "mcp_enabled", True), default=True):
+            return "MCP integration is disabled in configuration"
+    if name == "consult_cloud_advisor" or owner == "cloud_advisor":
+        mode = str(_policy_config_get(config, "cloud_advisor.mode", "disabled") or "disabled").strip().casefold()
+        if mode not in {"manual", "automatic"}:
+            return "Cloud Advisor is disabled in configuration"
+    if name.startswith("memory_"):
+        if not _policy_config_bool(_policy_config_get(config, "memory.enabled", True), default=True):
+            return "memory capability is disabled in configuration"
+        if name == "memory_search" and not is_memory_search_enabled(config):
+            return "memory search is disabled in configuration"
+    if name in {"list_chat_sessions", "search_past_chats", "read_chat_session"}:
+        discovery_enabled = is_memory_search_enabled(config) and _policy_config_bool(
+            _policy_config_get(config, "agents.search.enabled", True), default=True
+        )
+        availability = _tool_metadata_value(tool_definition, "availability", {}) or {}
+        explicit_reader = name == "read_chat_session" and isinstance(availability, Mapping) and availability.get("explicit_chat_reference") is True
+        if not discovery_enabled and not explicit_reader:
+            return "past chat discovery is disabled in configuration"
+    if name == "grok_x_search" and not _policy_config_bool(
+        _policy_config_get(config, "search.x_enabled", _policy_config_get(config, "search.grok_x_enabled", False)),
+        default=False,
+    ):
+        return "Grok X search is disabled in configuration"
+
     # An explicit search marker is authoritative even when a provider set a
     # generic owner such as ``mcp:<server>``.  This is the metadata path for
     # custom MCP names; absent a marker, existing owner/name handling below is
@@ -1457,7 +2589,7 @@ def _runtime_capability_for_tool(
     # optional groups when a legacy definition omitted ``owner``.  This is a
     # capability gate, not a mutation classification; custom names remain
     # governed by their explicit metadata.
-    if not owner:
+    if owner in {"", "core", "utility", "sessions", "workspace"}:
         if name.startswith("ws_"):
             owner = "workspace"
         elif name in {
@@ -1496,6 +2628,9 @@ def _runtime_capability_for_tool(
             "knowledge_query",
             "knowledge_read",
             "knowledge_status",
+            "media_search",
+            "media_read",
+            "chat_search_sources",
             "webex_list_selected_spaces",
             "webex_search_messages",
             "webex_get_thread",
@@ -1508,6 +2643,14 @@ def _runtime_capability_for_tool(
             # Custom/MCP names are never classified by a substring heuristic;
             # an explicit capability marker is required for this branch.
             owner = "search"
+        elif name in FILESYSTEM_READ_TOOL_NAMES | FILESYSTEM_MUTATION_TOOL_NAMES:
+            owner = "filesystem"
+        elif name in DOCS_READ_TOOL_NAMES | DOCS_MUTATION_TOOL_NAMES:
+            owner = "docs"
+        elif name in PROJECT_MANAGEMENT_READ_TOOL_NAMES | PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES:
+            owner = "project_management"
+        elif name == "invoke_skill":
+            owner = "skills"
         elif name.startswith("managed_") or name in {
             "list_managed_tools",
             "create_managed_tool",
@@ -1550,11 +2693,14 @@ def _runtime_capability_for_tool(
         }:
             owner = "apps"
 
-    if name in {"browser_agent", "computer_use"} or owner in {"browser_agent", "computer_use"}:
+    if name in {"browser_agent", "browser_agent_dedicated", "computer_observe", "computer_use", "run_skill"} or owner in {"browser_agent", "computer_use"}:
         from ..services.browser_agent_models import BrowserAgentSettings
         try:
-            if not BrowserAgentSettings.from_config(config).enabled:
+            browser_settings = BrowserAgentSettings.from_config(config)
+            if not browser_settings.enabled:
                 return "Browser Agent is disabled"
+            if name == "browser_agent_dedicated" and not browser_settings.dedicated_enabled:
+                return "Dedicated browser is disabled"
         except ValueError:
             return "Browser Agent configuration is invalid"
 
@@ -1566,6 +2712,11 @@ def _runtime_capability_for_tool(
         _policy_config_get(config, "integrations.spotify.enabled", False), default=False
     ):
         return "Spotify integration is disabled in configuration"
+    if owner in {"spotify", "media"}:
+        from ..features import Features
+
+        if not Features.entertainment():
+            return "entertainment capability is disabled by the feature profile"
     if owner == "search" and not _policy_config_bool(
         _policy_config_get(config, "agents.search.enabled", True), default=True
     ):
@@ -1598,7 +2749,7 @@ def _runtime_capability_for_tool(
         default=True,
     ):
         return "project-management direct tools are disabled in configuration"
-    if owner in {"skills", "skill"} and not _policy_config_bool(
+    if (name in {"manage_skill", "run_skill"} or owner in {"skills", "skill"}) and not _policy_config_bool(
         _policy_config_get(config, "skills.enabled", True), default=True
     ):
         return "skills capability is disabled in configuration"
@@ -1622,6 +2773,25 @@ def _runtime_capability_for_tool(
     return None
 
 
+def agent_team_subagent_capability_reason(config: Any, subagent: Mapping[str, Any]) -> str | None:
+    """Apply application feature dependencies before advertising/delegating a role."""
+    required_tools = {
+        "workspace_read": "read_file", "workspace_write": "create_file",
+        "repo_map": "get_repo_map", "command_execute": "execute_command",
+        "docs_read": "docs_read", "docs_write": "docs_update_node",
+        "project_read": "get_project_progress", "project_write": "create_task",
+        "web_read": "web_search", "media": "media_assistant",
+        "spotify": "search_spotify_music",
+    }
+    for capability in subagent.get("capability_ids") or ():
+        tool_name = required_tools.get(str(capability))
+        if tool_name:
+            reason = _runtime_capability_for_tool(tool_name, config=config)
+            if reason:
+                return reason
+    return None
+
+
 def check_tool_call_allowed(
     tool_name: str,
     *,
@@ -1642,12 +2812,33 @@ def check_tool_call_allowed(
     ``ToolDefinition`` so review/planning/no-mutation gates can use its
     side-effect metadata even when a custom tool has an unfamiliar name.
     """
-    text = _combined_text(user_input, tool_args)
+    dialogue_authority = get_current_agent_dialogue_authority()
+    if (
+        isinstance(dialogue_authority, dict)
+        and dialogue_authority.get("role") == "worker"
+        and isinstance(dialogue_authority.get("human_anchor"), str)
+        and dialogue_authority.get("human_anchor").strip()
+    ):
+        # Keep tool arguments available for concrete resource validation while
+        # preventing source-Agent prose from becoming a command capability or
+        # a read-only/mutation override.
+        text = _combined_text(dialogue_authority["human_anchor"], tool_args)
+    else:
+        text = _combined_text(user_input, tool_args)
     # Help is a hard provider boundary, not merely a prompt hint.  The normal
     # server path emits a trusted command preamble; the lexical fallback is
     # limited to the leading user token and protects direct/test callers that
     # invoke policy before the preamble has been rendered.
-    trusted_input = str(user_input or get_current_user_input() or "")
+    trusted_input = str(
+        (
+            dialogue_authority.get("human_anchor")
+            if isinstance(dialogue_authority, dict)
+            else None
+        )
+        or user_input
+        or get_current_user_input()
+        or ""
+    )
     trusted_help = "aoitalk_help" in command_capabilities_from_text(trusted_input)
     first_line = trusted_input.lstrip().splitlines()[0].strip().casefold() if trusted_input.lstrip() else ""
     if trusted_help or (first_line.split(None, 1)[0] if first_line else "") == "/help":
@@ -1673,11 +2864,28 @@ def check_tool_call_allowed(
     )
     if capability is not None:
         return ToolPolicyDecision(False, capability)
+    agent_scope_decision = _agent_tool_scope_decision(
+        tool_name,
+        tool_args=tool_args,
+        tool_definition=metadata,
+    )
+    if agent_scope_decision is not None:
+        return agent_scope_decision
     mutation = tool_definition_is_mutating(
         tool_name,
         text,
         tool_definition=metadata,
     )
+    shared_resource = get_current_shared_resource_scope()
+    if (
+        mutation
+        and isinstance(shared_resource, dict)
+        and not bool(shared_resource.get("permitted_write"))
+    ):
+        return ToolPolicyDecision(
+            False,
+            "the Human Project resource lease does not permit writes",
+        )
 
     planning_state = get_current_planning_run_state()
     if is_planning_cancelled_terminal():
@@ -1741,7 +2949,27 @@ def check_tool_call_allowed(
             "review mode does not allow mutation-capable tool calls",
         )
 
-    if (
+    task_mode = current_structured_task_mode()
+    normalized_tool_name = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    if mutation and task_mode == "read_only":
+        return ToolPolicyDecision(
+            False,
+            "the structured Agent task mode is read_only",
+        )
+    if mutation and task_mode == "mutate":
+        # The structured task mode (with the Agent tool scope and the
+        # allow_commands fence) is the authority for mutation tools.  Prose
+        # that names files narrows the editable files; prose that names no
+        # file ("設定ファイルは変更しないこと") is a model instruction and never
+        # a lexical no-mutation gate here.
+        structured_decision = _structured_mutate_task_decision(
+            text,
+            normalized_tool_name,
+            tool_args,
+        )
+        if not structured_decision.allowed:
+            return structured_decision
+    elif (
         mutation_execution_forbidden(text)
         and mutation
     ):
@@ -1777,6 +3005,17 @@ def check_tool_call_allowed(
 
 
 def format_blocked_tool_result(tool_name: str, decision: ToolPolicyDecision) -> str:
+    if tool_name == "computer_use" and decision.reason in {
+        "the user explicitly requested read-only or no-mutation handling",
+        "review mode does not allow mutation-capable tool calls",
+        "planning phase is read-only until the plan is approved",
+    }:
+        return (
+            f"Tool policy blocked `{tool_name}`: {decision.reason}. "
+            "Do not retry `computer_use`. If `computer_observe` is exposed, use it "
+            "for a single observe, screenshot, or windows read on the requested PC. "
+            "It cannot focus windows or perform actions. Respect its capability and device checks."
+        )
     return (
         f"Tool policy blocked `{tool_name}`: {decision.reason}. "
         f"Do not call `{tool_name}` again for this user request. "
@@ -1812,6 +3051,7 @@ def _docs_agent_delegation_available(config: Any) -> bool:
 
         return bool(
             agent_team_v3_delegation_enabled(config)
+            and _runtime_capability_for_tool("docs_read", config=config) is None
             and any(
                 item.get("subagent_id") == "docs_operator"
                 and item.get("enabled", True)
@@ -2042,6 +3282,11 @@ def _looks_like_utility_request(text: str) -> bool:
         "\u6c17\u6e29",
         "\u8a08\u7b97",
         "\u96fb\u5353",
+        "get_current_time",
+        "get current time",
+        "get_weather_info",
+        "get weather info",
+        "get_weather",
         "what time",
         "current time",
         "current date",

@@ -36,6 +36,9 @@ export type ConversationMessageDisplayRevision = {
   error: unknown;
   agentRunId: unknown;
   toolResults: unknown;
+  senderType: ConversationMessage["sender_type"];
+  senderId: string | null;
+  senderDisplayName: string | null;
 };
 
 /**
@@ -60,6 +63,9 @@ export function conversationMessageDisplayRevision(
     error: message.metadata?.error,
     agentRunId: message.metadata?.agent_run_id,
     toolResults: message.metadata?.tool_results,
+    senderType: message.sender_type,
+    senderId: message.sender_id ?? null,
+    senderDisplayName: message.sender_display_name ?? null,
   };
 }
 
@@ -84,6 +90,9 @@ export function sameConversationMessageDisplayRevision(
     left.error === right.error &&
     left.agentRunId === right.agentRunId &&
     left.toolResults === right.toolResults
+    && left.senderType === right.senderType
+    && left.senderId === right.senderId
+    && left.senderDisplayName === right.senderDisplayName
   );
 }
 

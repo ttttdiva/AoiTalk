@@ -8,7 +8,8 @@ import React, {
   useRef,
   useMemo,
 } from "react";
-import { Upload } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import {
   buildDraftTask,
@@ -21,6 +22,7 @@ import {
   type EditorImageInsertHandler,
 } from "@/components/editor/task-description-editor";
 import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -29,6 +31,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogDescription,
+  DialogClose,
 } from "@/components/ui/dialog";
 import {
   taskApi,
@@ -62,6 +65,7 @@ import { TaskDetailTriageCard } from "@/components/tasks/task-detail/task-detail
 import { TaskDetailPropertyGrid } from "@/components/tasks/task-detail/task-detail-property-grid";
 import { TaskDetailComments } from "@/components/tasks/task-detail/task-detail-comments";
 import { TaskDependencySection } from "@/components/tasks/task-detail/task-dependency-section";
+import { TaskProposalList } from "@/components/tasks/task-proposal-card";
 import { useTaskTagManagement } from "@/components/tasks/hooks/use-task-tag-management";
 import { useTaskRecurrence } from "@/components/tasks/hooks/use-task-recurrence";
 import { useTaskPersistence } from "@/components/tasks/hooks/use-task-persistence";
@@ -70,6 +74,8 @@ import { useTaskDeletion } from "@/components/tasks/hooks/use-task-deletion";
 import { useTaskDocsNode } from "@/components/tasks/hooks/use-task-docs-node";
 import { useTaskDraftForm } from "@/components/tasks/hooks/use-task-draft-form";
 import { useTaskTimer } from "@/components/tasks/hooks/use-task-timer";
+import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
+import type { TaskProposal } from "@/lib/task-proposals-api";
 import { isImageFile } from "@/lib/editor-image-files";
 import {
   deriveTaskTriageView,
@@ -182,6 +188,7 @@ export function TaskDetailModal({
     () => taskBrowseScopeToQuery(browseScope),
     [browseScope],
   );
+  const router = useRouter();
   const { allProjects, spaces } = useProject();
   const [createdTaskId, setCreatedTaskId] = useState<string | null>(null);
   const [task, setTask] = useState<Task | null>(null);
@@ -190,9 +197,12 @@ export function TaskDetailModal({
     start_at: string | null;
     end_at: string | null;
   } | null>(null);
-  const [occurrenceStatusOverride, setOccurrenceStatusOverride] = useState<
-    string | null
-  >(null);
+  const [, setOccurrenceStatusOverrideState] = useState<string | null>(null);
+  const occurrenceStatusOverrideRef = useRef<string | null>(null);
+  const setOccurrenceStatusOverride = useCallback((status: string | null) => {
+    occurrenceStatusOverrideRef.current = status;
+    setOccurrenceStatusOverrideState(status);
+  }, []);
   const [pendingRecurringDateChange, setPendingRecurringDateChange] =
     useState<PendingRecurringDateChange | null>(null);
   const [inferredOccurrenceContext, setInferredOccurrenceContext] =
@@ -269,6 +279,20 @@ export function TaskDetailModal({
     window.setTimeout(() => titleInputRef.current?.focus(), 0);
   }, [readOnly]);
   const effectiveTaskId = taskId ?? createdTaskId;
+  const proposalTaskIds = useMemo(
+    () => (effectiveTaskId ? [effectiveTaskId] : []),
+    [effectiveTaskId],
+  );
+  const proposalState = useTaskProposals({
+    taskIds: proposalTaskIds,
+    enabled: open && Boolean(task) && Boolean(effectiveTaskId),
+  });
+  const handleProposalConfirm = useCallback(
+    (proposal: TaskProposal) => {
+      router.push(`/chat?s=${encodeURIComponent(proposal.session_id)}`);
+    },
+    [router],
+  );
   const activeOccurrenceContext =
     occurrenceContext ?? inferredOccurrenceContext;
   const activeOccurrenceIdentity = activeOccurrenceContext?.start_at
@@ -291,6 +315,7 @@ export function TaskDetailModal({
     occurrenceContext?.end_at,
     occurrenceContext?.original_start_at,
     occurrenceContext?.status,
+    setOccurrenceStatusOverride,
   ]);
 
   // スラッシュコマンド候補（/m: プロジェクト, /t: タグ, /status: ステータス, /priority: 優先度）
@@ -308,6 +333,17 @@ export function TaskDetailModal({
   }, [allProjects, slashSelectedTagIds, tags]);
 
   const currentProjectId = task?.project_id || draftTask?.project_id || null;
+  const currentProject = useMemo(
+    () => allProjects.find((project) => project.id === task?.project_id) ?? null,
+    [allProjects, task?.project_id],
+  );
+  const proposalDecisionDisabled =
+    readOnly ||
+    !task ||
+    task.source === "remote" ||
+    !currentProject ||
+    currentProject.source === "remote" ||
+    currentProject.can_write === false;
   const currentSpaceId = useMemo(
     () =>
       allProjects.find((project) => project.id === currentProjectId)
@@ -373,6 +409,7 @@ export function TaskDetailModal({
     task,
     draftTask,
     activeOccurrenceContext,
+    statusOccurrenceContext: occurrenceContext ?? null,
     editTitle,
     draftTagIds,
     setTask,
@@ -757,7 +794,13 @@ export function TaskDetailModal({
   // タスク取得
   const fetchTask = useCallback(
     async (options: FetchTaskOptions = {}) => {
-      if (!effectiveTaskId) return;
+      // Late handlers from a previous detail must not invalidate the current
+      // request generation or turn its loading indicator on.
+      if (
+        !effectiveTaskId ||
+        !openRef.current ||
+        attachmentTaskIdRef.current !== effectiveTaskId
+      ) return;
       const requestedTaskId = effectiveTaskId;
       const requestGeneration = taskFetchGenerationRef.current + 1;
       taskFetchGenerationRef.current = requestGeneration;
@@ -801,7 +844,9 @@ export function TaskDetailModal({
           setInferredOccurrenceContext(occurrenceForView);
         }
         const occurrenceStatus =
-          occurrenceStatusOverride ?? occurrenceForView?.status ?? null;
+          occurrenceStatusOverrideRef.current ??
+          occurrenceContext?.status ??
+          null;
         setTask(occurrenceStatus ? { ...t, status: occurrenceStatus } : t);
         // 詳細の単体GETで得た正本を、呼び出し側の一覧キャッシュにも同期できるようにする。
         // occurrence表示用の上書きではなくDB上のタスク本体を渡す。
@@ -920,7 +965,7 @@ export function TaskDetailModal({
       browseScope,
       browseQuery,
       effectiveTaskId,
-      occurrenceStatusOverride,
+      occurrenceContext,
       onTaskLoaded,
     ],
   );
@@ -1006,6 +1051,42 @@ export function TaskDetailModal({
     browseScope: browseQuery,
   });
 
+  const timerOccurrenceId = activeOccurrenceContext?.occurrence_id;
+  const timerOccurrenceStartAt = activeOccurrenceContext?.start_at;
+  const timerOccurrenceEndAt = activeOccurrenceContext?.end_at;
+  const timerOccurrenceOriginalStartAt =
+    activeOccurrenceContext?.original_start_at;
+  const timerOccurrenceAllDay = activeOccurrenceContext?.all_day;
+  const timerOccurrence = useMemo(
+    () =>
+      timerOccurrenceStartAt
+        ? {
+            id: timerOccurrenceId,
+            startAt: timerOccurrenceStartAt,
+            endAt: timerOccurrenceEndAt,
+            originalStartAt: timerOccurrenceOriginalStartAt,
+            allDay: timerOccurrenceAllDay ?? undefined,
+          }
+        : null,
+    [
+      timerOccurrenceId,
+      timerOccurrenceStartAt,
+      timerOccurrenceEndAt,
+      timerOccurrenceOriginalStartAt,
+      timerOccurrenceAllDay,
+    ],
+  );
+  const handleTimerStatusApplied = useCallback(() => {
+    if (!timerOccurrenceStartAt) return;
+    occurrenceStatusOverrideRef.current = "in_progress";
+    setOccurrenceStatusOverrideState("in_progress");
+  }, [timerOccurrenceStartAt]);
+  const handleTimerStatusFailed = useCallback(() => {
+    // 発生回の保存に失敗したら、仮の進行中上書きを破棄してサーバー値を表示する。
+    occurrenceStatusOverrideRef.current = null;
+    setOccurrenceStatusOverrideState(null);
+  }, []);
+
   const { elapsedSeconds, timerLoading, handleTimer } = useTaskTimer({
     task,
     effectiveTaskId,
@@ -1013,6 +1094,9 @@ export function TaskDetailModal({
     fetchTask,
     onTaskUpdated,
     setTask,
+    occurrence: timerOccurrence,
+    onTimerStatusApplied: handleTimerStatusApplied,
+    onTimerStatusFailed: handleTimerStatusFailed,
   });
 
   const { openingChat, triagingAgent, handleOpenInChat, handleRunAgentTriage } =
@@ -1330,10 +1414,10 @@ export function TaskDetailModal({
       <Dialog open={open} onOpenChange={handleReadOnlyAwareDialogOpenChange}>
         <DialogContent
           className={cn(
-            "sm:max-w-6xl max-h-[85vh] overflow-y-auto rounded border-border bg-background p-0",
+            "sm:max-w-6xl flex max-h-[85vh] min-w-0 flex-col overflow-hidden rounded border-border bg-background p-0",
             fileDragActive && "ring-2 ring-primary",
           )}
-          showCloseButton={true}
+          showCloseButton={false}
           onDragEnterCapture={handleEditorImageDragCapture}
           onDragOverCapture={handleEditorImageDragCapture}
           onDragLeaveCapture={handleEditorImageDragCapture}
@@ -1360,7 +1444,7 @@ export function TaskDetailModal({
               タスクが見つかりません
             </div>
           ) : (
-            <div className="flex min-h-0 flex-col space-y-6 p-4">
+            <div className="flex min-h-0 min-w-0 flex-col space-y-6 overflow-y-auto p-4">
               {/* タイトル */}
               <TaskDetailHeader
                 task={task}
@@ -1397,6 +1481,15 @@ export function TaskDetailModal({
                   triageQuestions={triageQuestions}
                 />
               ) : null}
+
+              <TaskProposalList
+                state={proposalState}
+                getDecisionState={proposalState.getDecisionState}
+                onDecision={proposalState.decide}
+                onConfirm={handleProposalConfirm}
+                onRefresh={proposalState.refresh}
+                decisionDisabled={() => proposalDecisionDisabled}
+              />
 
               <TaskDetailPropertyGrid
                 task={task}
@@ -1598,6 +1691,18 @@ export function TaskDetailModal({
               </div>
             </div>
           ) : null}
+          <DialogClose
+            render={
+              <Button
+                variant="ghost"
+                className="absolute right-2 top-2 z-10"
+                size="icon-sm"
+              />
+            }
+          >
+            <X />
+            <span className="sr-only">Close</span>
+          </DialogClose>
         </DialogContent>
       </Dialog>
       <RecurringDeleteDialog

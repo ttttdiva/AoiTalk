@@ -65,6 +65,7 @@ export default function TasksPage() {
   const searchParams = useSearchParams();
   const appFilterId = searchParams.get("app_id") || "";
   const appFilterProjectId = searchParams.get("project_id") || "";
+  const routeBrowseProjectId = searchParams.get("browse_project_id") || "";
   const projectContext = useProject();
   const {
     projects,
@@ -98,13 +99,23 @@ export default function TasksPage() {
     () => participatingProjects ?? projects ?? [],
     [participatingProjects, projects],
   );
-  const [browseScope, setBrowseScope] = useState<TaskBrowseScope | null>(null);
+  const [browseScope, setBrowseScope] = useState<TaskBrowseScope | null>(() =>
+    routeBrowseProjectId ? { kind: "project", id: routeBrowseProjectId } : null,
+  );
+  const previousRouteBrowseIdRef = useRef(routeBrowseProjectId);
+  useEffect(() => {
+    if (previousRouteBrowseIdRef.current === routeBrowseProjectId) return;
+    previousRouteBrowseIdRef.current = routeBrowseProjectId;
+    // URL navigation restores an explicit view; the server still authorizes it.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setBrowseScope(routeBrowseProjectId ? { kind: "project", id: routeBrowseProjectId } : null);
+  }, [routeBrowseProjectId]);
 
   useEffect(() => {
-    if (appFilterProjectId && appFilterProjectId !== selectedProjectId) {
+    if (!routeBrowseProjectId && appFilterProjectId && appFilterProjectId !== selectedProjectId) {
       setSelectedProjectId(appFilterProjectId);
     }
-  }, [appFilterProjectId, selectedProjectId, setSelectedProjectId]);
+  }, [appFilterProjectId, routeBrowseProjectId, selectedProjectId, setSelectedProjectId]);
 
   const taskData = useTasksData(
     selectedProjectId,
@@ -410,6 +421,7 @@ export default function TasksPage() {
   const interactionReadOnly = remoteReadOnly || browseReadOnly;
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const selectedTaskIdRef = useRef<string | null>(null);
+  const pendingRouteDetailTaskIdRef = useRef<string | null>(null);
   const [loadedDetailTask, setLoadedDetailTask] = useState<Task | null>(null);
   const [selectedOccurrenceContext, setSelectedOccurrenceContext] =
     useState<RecurringOccurrenceContext | null>(null);
@@ -518,33 +530,50 @@ export default function TasksPage() {
       />
     ),
   });
+  const consumeDetailRouteIntent = useCallback((taskId: string) => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("detail") !== taskId) return;
+    url.searchParams.delete("detail");
+    url.searchParams.delete("new");
+    window.history.replaceState({}, "", url.pathname + url.search);
+  }, []);
   const closeTaskDetail = useCallback(() => {
+    const pendingTaskId = pendingRouteDetailTaskIdRef.current;
+    pendingRouteDetailTaskIdRef.current = null;
     selectedTaskIdRef.current = null;
     setSelectedTaskId(null);
     setLoadedDetailTask(null);
     setSelectedOccurrenceContext(null);
     setDraftTask(null);
-  }, []);
+    if (pendingTaskId) consumeDetailRouteIntent(pendingTaskId);
+  }, [consumeDetailRouteIntent]);
   useEffect(() => {
     const checkParams = (event?: Event) => {
+      // ProjectContext restores the selected Space/Project asynchronously.
+      // Keep a cold URL's intent until that scope is stable; consuming it on
+      // the first shell render loses the detail when the shell remounts.
+      if (!initialLoadComplete) return;
       const eventTaskId =
         event instanceof CustomEvent && typeof event.detail?.taskId === "string"
           ? event.detail.taskId
           : null;
       const params = new URLSearchParams(window.location.search);
-      const detailId = eventTaskId ?? params.get("detail");
+      const urlDetailId = params.get("detail");
+      const detailId = eventTaskId ?? urlDetailId;
       const isNew = params.get("new");
-      if (detailId) openTaskById(detailId, null);
+      if (detailId && selectedTaskIdRef.current !== detailId) {
+        pendingRouteDetailTaskIdRef.current =
+          urlDetailId === detailId ? detailId : null;
+        openTaskById(detailId, null);
+      }
       if (isNew && selectedProjectId && !interactionReadOnly) {
         startDraft({
           project_id: selectedProjectId,
           title: "",
           notifications_enabled: taskNotificationsDefaultEnabled,
         });
-      }
-      if (detailId || isNew) {
         const url = new URL(window.location.href);
-        url.searchParams.delete("detail");
         url.searchParams.delete("new");
         window.history.replaceState({}, "", url.pathname + url.search);
       }
@@ -554,6 +583,7 @@ export default function TasksPage() {
     return () => window.removeEventListener("task-detail-open", checkParams);
   }, [
     openTaskById,
+    initialLoadComplete,
     interactionReadOnly,
     selectedProjectId,
     startDraft,
@@ -637,13 +667,17 @@ export default function TasksPage() {
   );
   const handleDetailTaskLoaded = useCallback((loaded: Task) => {
     if (selectedTaskIdRef.current !== loaded.id) return;
+    if (pendingRouteDetailTaskIdRef.current === loaded.id) {
+      pendingRouteDetailTaskIdRef.current = null;
+      consumeDetailRouteIntent(loaded.id);
+    }
     setLoadedDetailTask(loaded);
     if (browseScopeRef.current) return;
     const currentTaskData = taskDataRef.current;
     if (currentTaskData.tasks.some((task) => task.id === loaded.id)) {
       currentTaskData.applyTaskPatchLocally(loaded.id, loaded);
     }
-  }, []);
+  }, [consumeDetailRouteIntent]);
   const selectedTask = selectedTaskId
     ? loadedDetailTask?.id === selectedTaskId
       ? loadedDetailTask

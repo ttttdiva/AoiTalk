@@ -21,6 +21,7 @@ class IrodoriTTSEngine:
 
     DEFAULT_CHECKPOINT = IRODORI_TTS_CHECKPOINT
     DEFAULT_CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
+    DEFAULT_NUM_STEPS = 40
 
     def __init__(
         self,
@@ -109,6 +110,33 @@ class IrodoriTTSEngine:
         if device == "cpu" and precision == "bf16":
             return "fp32"
         return precision
+
+    @staticmethod
+    def _is_meanflow_runtime(runtime: Any) -> bool:
+        flow = getattr(getattr(runtime, "model_cfg", None), "flow_parameterization", None)
+        return str(flow or "").strip().lower() == "meanflow"
+
+    def _resolve_sampling_num_steps(self, runtime: Any, kwargs: dict[str, Any]) -> int | None:
+        """Leave MeanFlow NFE unset when the caller still uses the RF default.
+
+        Vendored ``InferenceRuntime`` uses 4 steps when ``num_steps`` is None and
+        ``flow_parameterization`` is ``meanflow``. AoiTalk's historical default
+        is 40 (Rectified Flow / Small). Treat unset and that default as "use
+        the runtime MeanFlow default"; any other explicit value is forwarded.
+        """
+
+        if "num_steps" in kwargs:
+            raw = kwargs.get("num_steps")
+            requested = None if raw is None else int(raw)
+        else:
+            requested = int(self.num_steps)
+        if self._is_meanflow_runtime(runtime) and (
+            requested is None or requested == self.DEFAULT_NUM_STEPS
+        ):
+            return None
+        if requested is None:
+            return int(self.num_steps)
+        return requested
 
     async def initialize(self) -> bool:
         """Prepare imports and directories without loading model weights."""
@@ -340,7 +368,7 @@ class IrodoriTTSEngine:
                     ref_latent=resolved_ref_latent,
                     ref_latents=resolved_ref_latents,
                     no_ref=should_use_no_ref,
-                    num_steps=int(kwargs.get("num_steps", self.num_steps)),
+                    num_steps=self._resolve_sampling_num_steps(runtime, kwargs),
                     t_schedule_mode=str(
                         kwargs.get("t_schedule_mode", self.t_schedule_mode)
                     ),

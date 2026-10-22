@@ -1,8 +1,11 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import { useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { APP_ALT_SHORTCUTS } from "@/lib/app-navigation";
+import { isDailyCaptureShortcut, OPEN_DAILY_CAPTURE_EVENT } from "@/lib/daily-capture";
 import { OPEN_DOCS_CLIP_INGEST_EVENT } from "@/lib/clip-ingest-shortcut";
 import {
   OPEN_HEADER_PROJECT_SELECTOR_EVENT,
@@ -28,6 +31,17 @@ export function KeyboardShortcuts() {
     }
 
     function handleKeydown(e: KeyboardEvent) {
+      const target = e.target instanceof Element ? e.target : document.activeElement;
+      const dailyCaptureTarget = target?.closest("[data-daily-capture]");
+      if (isDailyCaptureShortcut(e) && (!target?.closest("[role=dialog], [role=alertdialog]") || dailyCaptureTarget)) {
+        e.preventDefault();
+        window.dispatchEvent(new Event(OPEN_DAILY_CAPTURE_EVENT));
+        return;
+      }
+
+      // A modal capture owns input; app navigation must not discard its draft.
+      if (dailyCaptureTarget) return;
+
       // Ctrl+Alt+I: どの画面からでもDocsのクリップ取り込みを開く
       if (
         e.ctrlKey
@@ -42,39 +56,35 @@ export function KeyboardShortcuts() {
         return;
       }
 
-      // Ctrl+Alt+S: グローバルヘッダーのスペース選択を開く
+      // Alt+Shift+S/P: グローバルヘッダーの選択を開く。
+      // composerのCtrl+Shift+PやIME変換キー入力とは競合させない。
       if (
-        e.ctrlKey
-        && e.altKey
-        && !e.shiftKey
-        && !e.metaKey
-        && !e.repeat
-        && e.key.toLowerCase() === "s"
+        e.altKey &&
+        e.shiftKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.repeat &&
+        !e.isComposing &&
+        e.keyCode !== 229
       ) {
-        e.preventDefault();
-        window.dispatchEvent(new Event(OPEN_HEADER_SPACE_SELECTOR_EVENT));
-        return;
-      }
-
-      // Ctrl+Alt+P: グローバルヘッダーのプロジェクト選択を開く
-      if (
-        e.ctrlKey
-        && e.altKey
-        && !e.shiftKey
-        && !e.metaKey
-        && !e.repeat
-        && e.key.toLowerCase() === "p"
-      ) {
-        e.preventDefault();
-        window.dispatchEvent(new Event(OPEN_HEADER_PROJECT_SELECTOR_EVENT));
-        return;
+        const key = e.key.toLowerCase();
+        if (key === "s") {
+          e.preventDefault();
+          window.dispatchEvent(new Event(OPEN_HEADER_SPACE_SELECTOR_EVENT));
+          return;
+        }
+        if (key === "p") {
+          e.preventDefault();
+          window.dispatchEvent(new Event(OPEN_HEADER_PROJECT_SELECTOR_EVENT));
+          return;
+        }
       }
 
       // Ctrl+Shift+O: 新規チャット開始
       if (e.ctrlKey && e.shiftKey && (e.key === "o" || e.key === "O")) {
         e.preventDefault();
         localStorage.removeItem("aoitalk_last_session_id");
-        window.location.href = "/chat";
+        window.location.href = withBasePath("/chat");
         return;
       }
 
@@ -122,7 +132,6 @@ export function KeyboardShortcuts() {
       // Alt+キー: 既存ショートカット（入力欄フォーカス中でも発火）
       if (e.altKey) {
         // Alt+P（修飾キーなし）: グローバルメモ帳を開閉
-        // Alt+Shift+P はチャットの Project context 代替キーに譲る。
         if (
           !e.ctrlKey &&
           !e.metaKey &&
@@ -144,7 +153,7 @@ export function KeyboardShortcuts() {
         // Alt+数字: ページ遷移
         if (APP_ALT_SHORTCUTS[e.key]) {
           e.preventDefault();
-          window.location.href = APP_ALT_SHORTCUTS[e.key];
+          window.location.href = withBasePath(APP_ALT_SHORTCUTS[e.key]);
         }
         return;
       }
@@ -174,12 +183,12 @@ export function KeyboardShortcuts() {
         case "l":
         case "L":
           e.preventDefault();
-          window.location.href = "/tasks";
+          window.location.href = withBasePath("/tasks");
           break;
         case "c":
         case "C":
           e.preventDefault();
-          window.location.href = "/calendar";
+          window.location.href = withBasePath("/calendar");
           break;
         case "p":
         case "P":

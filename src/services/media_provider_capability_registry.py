@@ -4,8 +4,9 @@ The registry is deliberately a *declaration*, not a credential or provider
 health check.  It records what the dated official-source matrix says about a
 provider and the safe fallback available to a human operator.  Runtime
 credential/account observations remain authoritative in
-``PlatformAccountRevision`` and ``MediaPlatformCredential``; an observation
-never upgrades an ``unverified`` operation to an executable operation.
+``PlatformAccountRevision`` and ``MediaPlatformCredential``; only operations
+with a reviewed adapter contract can become executable, and only when a
+verified runtime observation satisfies that contract.
 
 No provider payload, token, cookie, request header or response body is accepted
 by this module.  The only runtime input accepted by the effective-status
@@ -34,7 +35,7 @@ class CapabilityStatus(str, Enum):
 ProviderCapabilityStatus = CapabilityStatus
 
 
-CAPABILITY_REGISTRY_VERSION = "2026-09-01"
+CAPABILITY_REGISTRY_VERSION = "2026-10-05"
 CAPABILITY_MATRIX_SOURCE = "docs/media_platform_capability_matrix.md"
 
 CAPABILITY_OPERATIONS: tuple[str, ...] = (
@@ -55,7 +56,7 @@ CAPABILITY_OPERATIONS: tuple[str, ...] = (
 )
 
 _OPERATION_SET = frozenset(CAPABILITY_OPERATIONS)
-_PROVIDERS = ("x", "pixiv", "patreon", "youtube", "instagram", "dlsite")
+_PROVIDERS = ("x", "pixiv", "patreon", "youtube", "instagram", "dlsite", "fanza", "tiktok")
 _PROVIDER_SET = frozenset(_PROVIDERS)
 
 
@@ -197,6 +198,8 @@ def _policy(
     operations: Mapping[str, CapabilityStatus],
     *,
     source_urls: tuple[str, ...],
+    adapter_version: str = "1",
+    registry_version: str = "2026-09-23",
 ) -> ProviderCapabilityPolicy:
     return ProviderCapabilityPolicy(
         platform=platform,
@@ -205,41 +208,42 @@ def _policy(
         adapter_ref=f"media-provider/{platform}/capability-policy",
         adapter_key=f"media-provider/{platform}",
         sources=(_MATRIX, *source_urls),
+        adapter_version=adapter_version,
+        registry_version=registry_version,
     )
 
 
-# The matrix is dated design evidence.  A bounded identity probe exists for
-# X/YouTube/Patreon, but those providers still have no live sandbox evidence;
-# identity therefore remains ``unverified`` in the static registry.  No
-# operation is declared executable until a provider-specific adapter contract
-# and postcondition are reviewed.  Pixiv and DLsite explicitly stay on the
-# human/manual path because a public creator API was not confirmed.
+# The matrix is dated design evidence. X and YouTube have reviewed official
+# write adapters, explicit receipt/postcondition contracts and bounded OAuth
+# scope checks. Runtime execution still requires a verified credential and an
+# immutable capability snapshot. Other providers remain manual/unverified.
 _REGISTRY: Mapping[str, ProviderCapabilityPolicy] = MappingProxyType(
     {
         "x": _policy(
             "x",
             "X",
             _operations(
-                identity=CapabilityStatus.UNVERIFIED,
-                oauth=CapabilityStatus.UNVERIFIED,
-                token=CapabilityStatus.UNVERIFIED,
+                identity=CapabilityStatus.AUTOMATABLE,
+                oauth=CapabilityStatus.AUTOMATABLE,
+                token=CapabilityStatus.AUTOMATABLE,
                 cookie=CapabilityStatus.MANUAL,
-                text=CapabilityStatus.UNVERIFIED,
-                image=CapabilityStatus.UNVERIFIED,
-                video=CapabilityStatus.UNVERIFIED,
+                text=CapabilityStatus.AUTOMATABLE,
+                image=CapabilityStatus.AUTOMATABLE,
+                video=CapabilityStatus.AUTOMATABLE,
                 schedule=CapabilityStatus.MANUAL,
                 edit=CapabilityStatus.UNVERIFIED,
                 delete=CapabilityStatus.UNVERIFIED,
                 analytics=CapabilityStatus.UNVERIFIED,
                 revenue=CapabilityStatus.UNSUPPORTED,
-                refresh=CapabilityStatus.UNVERIFIED,
-                revoke=CapabilityStatus.UNVERIFIED,
+                refresh=CapabilityStatus.AUTOMATABLE,
+                revoke=CapabilityStatus.AUTOMATABLE,
             ),
             source_urls=(
                 "https://docs.x.com/x-api/posts/manage-tweets/introduction",
                 "https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code",
-                "https://docs.x.com/x-api/fundamentals/metrics",
+                "https://docs.x.com/x-api/media/upload-media",
             ),
+            adapter_version="3",
         ),
         "pixiv": _policy(
             "pixiv",
@@ -295,26 +299,28 @@ _REGISTRY: Mapping[str, ProviderCapabilityPolicy] = MappingProxyType(
             "youtube",
             "YouTube",
             _operations(
-                identity=CapabilityStatus.UNVERIFIED,
-                oauth=CapabilityStatus.UNVERIFIED,
-                token=CapabilityStatus.UNVERIFIED,
+                identity=CapabilityStatus.AUTOMATABLE,
+                oauth=CapabilityStatus.AUTOMATABLE,
+                token=CapabilityStatus.AUTOMATABLE,
                 cookie=CapabilityStatus.UNSUPPORTED,
-                text=CapabilityStatus.UNVERIFIED,
-                image=CapabilityStatus.UNVERIFIED,
-                video=CapabilityStatus.UNVERIFIED,
-                schedule=CapabilityStatus.UNVERIFIED,
+                text=CapabilityStatus.UNSUPPORTED,
+                image=CapabilityStatus.AUTOMATABLE,
+                video=CapabilityStatus.AUTOMATABLE,
+                schedule=CapabilityStatus.AUTOMATABLE,
                 edit=CapabilityStatus.UNVERIFIED,
                 delete=CapabilityStatus.UNVERIFIED,
                 analytics=CapabilityStatus.UNVERIFIED,
                 revenue=CapabilityStatus.MANUAL,
-                refresh=CapabilityStatus.UNVERIFIED,
-                revoke=CapabilityStatus.UNVERIFIED,
+                refresh=CapabilityStatus.AUTOMATABLE,
+                revoke=CapabilityStatus.AUTOMATABLE,
             ),
             source_urls=(
                 "https://developers.google.com/youtube/v3/docs/videos",
                 "https://developers.google.com/youtube/v3/docs/videos/insert",
-                "https://developers.google.com/youtube/analytics/metrics",
+                "https://developers.google.com/youtube/v3/docs/thumbnails/set",
+                "https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol",
             ),
+            adapter_version="3",
         ),
         "instagram": _policy(
             "instagram",
@@ -339,6 +345,24 @@ _REGISTRY: Mapping[str, ProviderCapabilityPolicy] = MappingProxyType(
                 "https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api",
                 "https://www.postman.com/meta/instagram/folder/u4g5a2a/instagram-api-with-facebook-login",
             ),
+        ),
+        "fanza": _policy(
+            "fanza", "FANZA",
+            _operations(identity=CapabilityStatus.MANUAL, text=CapabilityStatus.MANUAL,
+                        image=CapabilityStatus.MANUAL, video=CapabilityStatus.MANUAL,
+                        analytics=CapabilityStatus.UNVERIFIED, revenue=CapabilityStatus.UNVERIFIED),
+            source_urls=("https://www.dmm.co.jp/dc/doujin/", "https://support.dmm.co.jp/doujin/article/48426"),
+            registry_version=CAPABILITY_REGISTRY_VERSION,
+        ),
+        "tiktok": _policy(
+            "tiktok", "TikTok",
+            _operations(identity=CapabilityStatus.UNVERIFIED, oauth=CapabilityStatus.UNVERIFIED,
+                        token=CapabilityStatus.UNVERIFIED, video=CapabilityStatus.MANUAL,
+                        image=CapabilityStatus.UNVERIFIED, analytics=CapabilityStatus.UNVERIFIED,
+                        revenue=CapabilityStatus.UNVERIFIED),
+            source_urls=("https://developers.tiktok.com/docs/en/content-sharing-guidelines",
+                         "https://developers.tiktok.com/docs/en/content-posting-api-get-started"),
+            registry_version=CAPABILITY_REGISTRY_VERSION,
         ),
         "dlsite": _policy(
             "dlsite",
@@ -407,9 +431,11 @@ def _observation_value(observation: Mapping[str, Any] | None, key: str) -> str |
 def _observed_capability_key(operation: str) -> str | None:
     if operation == "identity":
         return "identity"
-    if operation in {"analytics"}:
+    if operation == "analytics":
         return "analytics"
-    if operation in {"text", "image", "video", "publish"}:
+    if operation == "text":
+        return "publish"
+    if operation in {"image", "video", "schedule"}:
         return "media"
     return None
 
@@ -470,9 +496,8 @@ def bound_credential_capabilities(
             continue
         if rendered != "available":
             continue
-        # Identity evidence is useful to the vault even while the provider's
-        # operation remains unverified.  It never makes a write operation
-        # executable.  Other capabilities require a future explicit
+        # Identity evidence is useful to the vault even while a provider
+        # operation remains unverified. Other capabilities require an explicit
         # automatable policy entry and a verified credential.
         if key == "identity" and static in {
             CapabilityStatus.AUTOMATABLE,
@@ -493,10 +518,8 @@ def effective_operation_status(
     """Combine static policy with a redacted runtime observation.
 
     Static ``manual``, ``unsupported`` and ``unavailable`` statuses are never
-    upgraded.  ``unverified`` is also never upgraded: a provider-specific
-    adapter contract and safe postcondition are required before changing code.
-    The checked-in six-provider registry has no automatable operation yet;
-    future entries must still require a verified vault observation.
+    upgraded. ``automatable`` entries still require a verified vault
+    observation; static policy alone cannot authorize a remote write.
     """
 
     policy = get_provider_capability(platform)
@@ -514,8 +537,11 @@ def effective_operation_status(
         return static
     if not isinstance(observation, Mapping):
         return CapabilityStatus.UNVERIFIED
-    key = _observed_capability_key(_operation(operation) or "")
+    operation_key = _operation(operation)
+    key = _observed_capability_key(operation_key or "")
     if key is None:
+        if operation_key in {"oauth", "token", "refresh", "revoke"} and credential_status == "verified":
+            return CapabilityStatus.AUTOMATABLE
         return CapabilityStatus.UNVERIFIED
     capability = _observation_value(observation, key)
     if capability == "unsupported":

@@ -35,11 +35,11 @@ class Features:
         "entertainment": True,     # Spotify/YouTube/ニコニコ等
         "code_agent": False,       # コード保守エージェント（企業用）
         "remote_server_view": True,  # 外部AoiTalkサーバー接続・閲覧（個人版で有効）
-        # WS01 identity foundation remains inert until a later workstream
-        # explicitly enables the corresponding runtime/company/media gate.
-        "autonomous_agent_runtime": False,
-        "virtual_company": False,
-        "media_operations_autonomy": False,
+        # Personal is an active Agent/media automation product. The common
+        # durable coordinator remains the mandatory dependency for autonomy.
+        "autonomous_agent_runtime": True,
+        "virtual_company": True,
+        "media_operations_autonomy": True,
     }
 
     # Enterprise profile - minimal features for code maintenance

@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import { Suspense, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
@@ -82,7 +84,7 @@ function ChangePasswordForm() {
     try {
       await changePassword(password);
       // APIがSet-Cookieで再発行したJWTを使って通常画面を再取得する。
-      window.location.assign(destination);
+      window.location.assign(withBasePath(destination));
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "パスワードの更新に失敗しました",

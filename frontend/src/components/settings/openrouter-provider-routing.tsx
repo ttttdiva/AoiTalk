@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { pyFetch } from "./llm-model-section-types";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 export type OpenRouterProviderRoutingMode = "auto" | "order" | "only";
 
@@ -15,8 +16,15 @@ export type OpenRouterProviderRouting = {
   only?: string[];
   order?: string[];
   allow_fallbacks?: boolean;
+  require_parameters?: boolean;
   zdr?: boolean;
 };
+
+const DECART_FIXED_PROFILE_MODEL = "deepseek/deepseek-v4.1-flash-1017";
+
+function supportsDecartFixedProfile(model: string): boolean {
+  return model === DECART_FIXED_PROFILE_MODEL;
+}
 
 export type OpenRouterProviderCandidate = {
   slug: string;
@@ -37,7 +45,13 @@ export function providerRoutingState(policy: OpenRouterProviderRouting | undefin
     mode: (only.length ? "only" : order.length ? "order" : "auto") as OpenRouterProviderRoutingMode,
     selected: only.length ? only : order,
     allowFallbacks: normalized.allow_fallbacks ?? true,
+    requireParameters: normalized.require_parameters === true,
     zdr: normalized.zdr === true,
+    decartFixedProfile:
+      only.length === 1 && only[0] === "decart"
+      && order.length === 1 && order[0] === "decart"
+      && normalized.allow_fallbacks === false
+      && normalized.require_parameters === true,
   };
 }
 
@@ -46,13 +60,26 @@ export function buildProviderRoutingPayload(
   selected: string[],
   allowFallbacks: boolean,
   zdr: boolean,
+  requireParameters = false,
+  decartFixedProfile = false,
 ): OpenRouterProviderRouting {
+  if (decartFixedProfile) {
+    return {
+      only: ["decart"],
+      order: ["decart"],
+      allow_fallbacks: false,
+      require_parameters: true,
+      ...(zdr ? { zdr: true } : {}),
+    };
+  }
+
   const unique = selected.filter((slug, index) => slug && selected.indexOf(slug) === index);
   const payload: OpenRouterProviderRouting = {};
   if (mode === "only" && unique.length) payload.only = unique;
   if (mode === "order" && unique.length) payload.order = unique;
   if (mode !== "auto") payload.allow_fallbacks = allowFallbacks;
   else if (!allowFallbacks) payload.allow_fallbacks = false;
+  if (requireParameters) payload.require_parameters = true;
   if (zdr) payload.zdr = true;
   return payload;
 }
@@ -69,7 +96,9 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
   const [mode, setMode] = useState<OpenRouterProviderRoutingMode>("auto");
   const [selected, setSelected] = useState<string[]>([]);
   const [allowFallbacks, setAllowFallbacks] = useState(true);
+  const [requireParameters, setRequireParameters] = useState(false);
   const [zdr, setZdr] = useState(false);
+  const [decartFixedProfile, setDecartFixedProfile] = useState(false);
   const [candidates, setCandidates] = useState<OpenRouterProviderCandidate[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -89,11 +118,20 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
         const savedCandidates = state.selected
           .filter((slug) => !known.has(slug))
           .map((slug) => ({ slug, label: slug }));
-        setCandidates([...savedCandidates, ...apiCandidates]);
+        const candidatesWithDecart = supportsDecartFixedProfile(model) && !known.has("decart")
+          ? [...apiCandidates, { slug: "decart", label: "Decart" }]
+          : apiCandidates;
+        const candidatesBySlug = new Map<string, OpenRouterProviderCandidate>();
+        for (const candidate of [...savedCandidates, ...candidatesWithDecart]) {
+          candidatesBySlug.set(candidate.slug, candidate);
+        }
+        setCandidates([...candidatesBySlug.values()]);
         setMode(state.mode);
         setSelected(state.selected);
         setAllowFallbacks(state.allowFallbacks);
+        setRequireParameters(state.requireParameters);
         setZdr(state.zdr);
+        setDecartFixedProfile(state.decartFixedProfile);
       })
       .catch((error) => {
         if (!active) return;
@@ -101,7 +139,9 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
         setMode("auto");
         setSelected([]);
         setAllowFallbacks(true);
+        setRequireParameters(false);
         setZdr(false);
+        setDecartFixedProfile(false);
         toast.error(error instanceof Error ? error.message : "OpenRouter provider候補を取得できませんでした");
       })
       .finally(() => {
@@ -131,7 +171,14 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
     }
     setSaving(true);
     try {
-      const provider = buildProviderRoutingPayload(mode, selected, allowFallbacks, zdr);
+      const provider = buildProviderRoutingPayload(
+        mode,
+        selected,
+        allowFallbacks,
+        zdr,
+        requireParameters,
+        decartFixedProfile && supportsDecartFixedProfile(model),
+      );
       await pyFetch("/llm/openrouter/provider-routing", {
         method: "PATCH",
         body: JSON.stringify({ model, provider }),
@@ -149,11 +196,18 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
   return (
     <div className="space-y-3 rounded-md border p-3">
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-xs font-medium">OpenRouter上流プロバイダー</div>
-          <p className="text-[10px] text-muted-foreground">
-            {model} の設定。未設定ならOpenRouterの自動ルーティングを使用します。
-          </p>
+        <div className="min-w-0 flex-1">
+          <div className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1 text-xs font-medium">
+            <span className="shrink-0">OpenRouter上流プロバイダー</span>
+            <span
+              className="min-w-0 max-w-[18rem] truncate"
+              title={model}
+              aria-label={model}
+            >
+              {model}
+            </span>
+            <HelpPopover label="OpenRouter上流プロバイダー">設定はOpenRouterへ希望するルーティングを伝えるものです。実際に処理したproviderを保証しません。未設定ならOpenRouterの自動ルーティングを使用します。</HelpPopover>
+          </div>
         </div>
         {loading && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
       </div>
@@ -162,7 +216,10 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
         <Label className="text-xs">ルーティング</Label>
         <AppSelect
           value={mode}
-          onChange={(event) => setMode(event.target.value as OpenRouterProviderRoutingMode)}
+          onChange={(event) => {
+            setMode(event.target.value as OpenRouterProviderRoutingMode);
+            setDecartFixedProfile(false);
+          }}
           disabled={loading || saving}
           className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
         >
@@ -172,9 +229,30 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
         </AppSelect>
       </div>
 
+      {supportsDecartFixedProfile(model) && (
+        <div className="space-y-1">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setMode("only");
+              setSelected(["decart"]);
+              setAllowFallbacks(false);
+              setRequireParameters(true);
+              setDecartFixedProfile(true);
+            }}
+            disabled={loading || saving}
+          >
+            Decart固定プロファイルを適用
+          </Button>
+        </div>
+      )}
+
       <div className="space-y-2">
-        <div className="text-[10px] text-muted-foreground">
-          OpenRouter endpoint APIから取得したslug（表示名ではなくslugを保存）
+        <div className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+          <span>OpenRouter上流プロバイダー候補</span>
+          <HelpPopover label="OpenRouter上流プロバイダー候補">OpenRouter endpoint APIから取得したslugを使います。保存する値は表示名ではなくslugです。</HelpPopover>
         </div>
         {candidates.length ? (
           <div className="grid gap-1 md:grid-cols-2">
@@ -182,7 +260,10 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
               <Label key={candidate.slug} className="flex items-center gap-2 rounded border px-2 py-1.5 text-xs">
                 <Checkbox
                   checked={selected.includes(candidate.slug)}
-                  onCheckedChange={(checked) => toggleProvider(candidate.slug, checked === true)}
+                  onCheckedChange={(checked) => {
+                    setDecartFixedProfile(false);
+                    toggleProvider(candidate.slug, checked === true);
+                  }}
                   disabled={mode === "auto" || loading || saving}
                   aria-label={`${candidate.label} (${candidate.slug})`}
                 />
@@ -236,10 +317,24 @@ export function OpenRouterProviderRouting({ model }: { model: string }) {
         <Label className="flex items-center gap-2">
           <Checkbox
             checked={allowFallbacks}
-            onCheckedChange={(checked) => setAllowFallbacks(checked === true)}
+            onCheckedChange={(checked) => {
+              setAllowFallbacks(checked === true);
+              setDecartFixedProfile(false);
+            }}
             disabled={loading || saving}
           />
           フォールバックを許可
+        </Label>
+        <Label className="flex items-center gap-2">
+          <Checkbox
+            checked={requireParameters}
+            onCheckedChange={(checked) => {
+              setRequireParameters(checked === true);
+              setDecartFixedProfile(false);
+            }}
+            disabled={loading || saving}
+          />
+          対応パラメーター必須
         </Label>
         <Label className="flex items-center gap-2">
           <Checkbox

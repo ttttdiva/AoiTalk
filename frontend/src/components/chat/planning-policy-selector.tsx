@@ -72,13 +72,13 @@ export function PlanningPolicySelector({
           <Button
             type="button"
             variant="ghost"
-            size="sm"
-            className="h-8 gap-1 px-2 text-xs"
+            size="icon"
+            className="shrink-0"
             title={`計画ポリシー: ${current.label}`}
+            aria-label={`計画ポリシー: ${current.label}`}
           >
-            <CurrentIcon className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">{current.label}</span>
-            <ChevronUp className="h-3 w-3 opacity-60" />
+            <CurrentIcon className="size-4" />
+            <ChevronUp className="ml-0.5 size-3 text-muted-foreground" />
           </Button>
         }
       />

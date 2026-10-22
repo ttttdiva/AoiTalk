@@ -17,13 +17,13 @@ import math
 import os
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from inspect import isawaitable
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from ..memory.models import (
@@ -92,6 +92,7 @@ from ..security.media_credential_crypto import (
     decrypt_media_credential,
     media_credential_ciphertext_key_id,
 )
+from .operations_text import EVALUATION_COLLECTION_MAX_BYTES, OPERATIONS_TEXT_BYTE_LIMITS
 from .project_context import has_project_read_access
 from .project_permissions import (
     has_effective_project_permission,
@@ -160,10 +161,8 @@ MEDIA_ACTION_TYPES = frozenset(
 )
 MEDIA_PLATFORM_VALUES = tuple(str(item) for item in CONTENT_VARIANT_PLATFORM_VALUES)
 
-# There are intentionally no provider adapters in this slice.  Keeping the
-# status explicit prevents a future caller from mistaking a recorded manual
-# attempt for a network publication.  The shape is stable for UI/readiness
-# consumers and covers every WS5 platform.
+# Manual fallback metadata remains separate from installed official adapters.
+# A recorded manual attempt does not establish a provider publication receipt.
 MEDIA_ADAPTER_STATUS: dict[str, dict[str, Any]] = {
     platform: {
         "platform": platform,
@@ -753,7 +752,7 @@ def _normalize_media_platform(value: Any) -> str:
     rendered = str(getattr(value, "value", value) or "").strip().lower()
     if rendered not in MEDIA_PLATFORM_VALUES:
         raise OperationsValidationError(
-            "platform must be one of x, pixiv, dlsite, patreon, youtube, instagram"
+            "platform must be one of x, pixiv, dlsite, patreon, youtube, instagram, fanza, tiktok"
         )
     return rendered
 
@@ -799,22 +798,8 @@ def _normalize_provider_adapter_value(
 def _media_provider_operation(action_type: Any, payload: Mapping[str, Any] | None) -> str:
     """Map one typed MediaOps action to the closed registry operation set."""
 
-    action_key = str(action_type or "").strip().lower()
-    if action_key == "media.release_product":
-        return "revenue"
-    if action_key == "media.delete_content":
-        return "delete"
-    if action_key == "media.update_content":
-        return "edit"
-    raw_type = payload.get("type") if isinstance(payload, Mapping) else None
-    rendered = str(raw_type or "").strip().lower()
-    if "video" in rendered or "reel" in rendered:
-        return "video"
-    if "image" in rendered or "carousel" in rendered or "work" in rendered:
-        return "image"
-    # Text-only posts/threads and unknown typed payloads fail closed through
-    # the registry's status lookup rather than guessing a provider operation.
-    return "text"
+    from .media_publication_contract import publication_operation
+    return publication_operation(str(action_type or "").strip().lower(), payload)
 
 
 class OperationsService:
@@ -1087,6 +1072,17 @@ class OperationsService:
             raise OperationsNotFoundError(f"{label} not found")
         return value
 
+    async def _lock_media_account_actions(self, session: Any, account_id: UUID) -> list[Any]:
+        """Media writers lock Action(s), then Account, Persona and Connection.
+
+        Binding changes touch multiple Actions; deterministic UUID order avoids
+        cycles with another binding writer. This must run before Account locks.
+        """
+        return await self._scalars(session, select(ExternalAction)
+            .where(ExternalAction.platform_account_id == account_id)
+            .order_by(ExternalAction.id).with_for_update()
+            .execution_options(populate_existing=True))
+
     async def _check_expected_version(self, entity: Any, expected_version: int | None) -> None:
         if expected_version is None:
             raise OperationsValidationError("expected_version is required")
@@ -1156,6 +1152,8 @@ class OperationsService:
                 "media credential references are owned by the credential vault"
             )
         _reject_protected_input_keys(metadata or {}, field="connection metadata")
+        if "binding_mode" in (metadata or {}):
+            raise OperationsValidationError("managed connection mode cannot be supplied")
         connection = ExternalConnection(
             owner_user_id=actor_id,
             project_id=project_uuid,
@@ -1246,6 +1244,9 @@ class OperationsService:
             raise OperationsValidationError("actor and connection_id are required")
         connection = await self._get_or_404(session, ExternalConnection, connection_id, "connection_id", for_update=True)
         await self._assert_entity_access(session, actor, connection, permission="write")
+        from .media_bridge_connection import manual_bridge
+        if manual_bridge(connection) or "binding_mode" in (metadata or {}):
+            raise OperationsAuthorizationError("Bridge connections must be changed through the human Bridge binding flow")
         if _is_media_vault_reference(connection.credential_ref):
             raise OperationsAuthorizationError(
                 "vault-owned credential connections must be changed through the credential vault"
@@ -1302,7 +1303,10 @@ class OperationsService:
         sha256: str | None = None,
         size_bytes: int | None = None,
         storage_ref: str | None = None,
+        _defer_commit: bool = False,
+        _snapshot: Any | None = None,
     ) -> dict[str, Any]:
+        """Register bytes; product binding may own the final database commit."""
         session = self._resolve_session(session)
         if actor is None:
             raise OperationsValidationError("actor is required")
@@ -1317,14 +1321,21 @@ class OperationsService:
                 data = content
             else:
                 raise OperationsValidationError("content must be bytes")
-        if data is None:
+        if data is None and _snapshot is None:
             raise OperationsValidationError(
                 "artifact content is required; unverified references cannot be registered"
             )
-        if len(data) > 25 * 1024 * 1024:
+        if data is not None and len(data) > 25 * 1024 * 1024:
             raise OperationsValidationError("artifact content exceeds 25 MiB")
-        computed_hash = sha256_bytes(data)
-        computed_size = len(data)
+        if _snapshot is not None:
+            from .artifact_snapshot_storage import ArtifactSnapshot, MAX_SNAPSHOT_BYTES
+            if (data is not None or not isinstance(_snapshot, ArtifactSnapshot)
+                    or not 0 < _snapshot.size_bytes <= MAX_SNAPSHOT_BYTES):
+                raise OperationsValidationError("invalid internal artifact snapshot")
+            computed_hash, computed_size = _snapshot.sha256, _snapshot.size_bytes
+        else:
+            computed_hash = sha256_bytes(data)
+            computed_size = len(data)
         if sha256 is not None and str(sha256).strip().lower() != computed_hash:
             raise OperationsValidationError("sha256 does not match content")
         if size_bytes is not None and int(size_bytes) != computed_size:
@@ -1339,6 +1350,10 @@ class OperationsService:
         else:
             raise OperationsValidationError("provenance must be an object")
         _reject_protected_input_keys(provenance_input, field="artifact provenance")
+        if "artifact_stream_v1" in provenance_input:
+            raise OperationsValidationError("artifact stream integrity is server managed")
+        if _snapshot is not None:
+            provenance_input["artifact_stream_v1"] = _snapshot.integrity
         # URL-like provenance is validated before JSON conversion, size
         # accounting, filesystem writes, or database mutation.
         try:
@@ -1379,7 +1394,7 @@ class OperationsService:
         )
         if existing is not None:
             return existing.to_safe_dict()
-        generated_storage_ref = _persist_artifact_bytes(data, sha_value)
+        generated_storage_ref = f"operations_artifacts/{sha_value}" if _snapshot is not None else _persist_artifact_bytes(data, sha_value)
         artifact = ArtifactVersion(
             owner_user_id=actor_id,
             project_id=project_uuid,
@@ -1418,8 +1433,45 @@ class OperationsService:
             project_id=project_uuid,
             payload={"sha256": sha_value, "size_bytes": size_value, "mime_type": mime},
         )
-        await self._flush_commit(session)
+        if _defer_commit:
+            # Internal composition only: the product binder atomically commits
+            # ArtifactVersion, artifact.created, and its explicit source binding.
+            await self._flush_only(session)
+        else:
+            await self._flush_commit(session)
         return artifact.to_safe_dict()
+
+    async def get_artifact_content(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        artifact_id: UUID | str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
+        """Return an authorized artifact projection and its verified bytes."""
+
+        session = self._resolve_session(session)
+        if actor is None or artifact_id is None:
+            raise OperationsValidationError("actor and artifact_id are required")
+        artifact = await self._get_or_404(session, ArtifactVersion, artifact_id, "artifact_id")
+        await self._assert_entity_access(session, actor, artifact, permission="read")
+        storage_ref = str(artifact.storage_ref or "")
+        prefix = "operations_artifacts/"
+        digest = storage_ref[len(prefix):] if storage_ref.startswith(prefix) else ""
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or digest != artifact.sha256:
+            raise OperationsNotFoundError("artifact content is not available")
+        expected_size = int(artifact.size_bytes or 0)
+        if expected_size < 0 or expected_size > 25 * 1024 * 1024:
+            raise OperationsConflictError("artifact content exceeds its size limit")
+        try:
+            # Bound the read even if the stored file was replaced with larger
+            # bytes. One extra byte detects growth without loading the file.
+            with (_artifact_storage_root() / digest).open("rb") as stream:
+                data = stream.read(expected_size + 1)
+        except OSError:
+            raise OperationsNotFoundError("artifact content is not available") from None
+        if sha256_bytes(data) != artifact.sha256 or len(data) != int(artifact.size_bytes or 0):
+            raise OperationsConflictError("artifact content does not match its hash")
+        return artifact.to_safe_dict(), data
 
     # Common names used by integrations/tests.
     upload_artifact = create_artifact
@@ -1579,9 +1631,76 @@ class OperationsService:
                 .order_by(ApplicationDraft.version.desc())
                 .limit(25),
             )
+            actions = await self._scalars(
+                session,
+                select(ExternalAction)
+                .where(ExternalAction.opportunity_id == opportunity.id)
+                .order_by(ExternalAction.created_at.desc())
+                .limit(25),
+            )
             payload["evaluations"] = [item.to_safe_dict() for item in evaluations]
             payload["drafts"] = [item.to_safe_dict() for item in drafts]
+            payload["actions"] = [item.to_safe_dict() for item in actions]
         return payload
+
+    async def resolve_development_requirements(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        opportunity_id: UUID | str | None = None,
+        *,
+        resolved: bool,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record the human gate for customer-development prerequisites."""
+
+        session = self._resolve_session(session)
+        if actor is None or opportunity_id is None:
+            raise OperationsValidationError("actor and opportunity_id are required")
+        opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
+        await self._assert_entity_access(session, actor, opportunity, permission="write")
+        metadata = dict(opportunity.metadata_json or {})
+        kind = str(metadata.get("worker_kind") or "").strip().lower().replace("-", "_")
+        if kind == "code":
+            kind = "app_development"
+        if kind not in {"web_development", "app_development"}:
+            raise OperationsValidationError("development requirements apply only to Web/App opportunities")
+        previous_value = metadata.get("development_requirements_resolved")
+        previous_resolved = previous_value if isinstance(previous_value, bool) else None
+        revision_was_present = "development_requirements_revision" in metadata
+        try:
+            decision_revision = max(0, int(metadata.get("development_requirements_revision") or 0))
+        except (TypeError, ValueError):
+            decision_revision = 0
+        if previous_resolved is True and not revision_was_present:
+            decision_revision = 1
+        decision_changed = previous_resolved is not None and previous_resolved != bool(resolved)
+        first_resolution = bool(resolved) and previous_resolved is not True
+        if first_resolution:
+            decision_revision += 1
+        elif decision_changed and not resolved:
+            # A human can explicitly revoke a previous resolution, but this
+            # must never create a new runnable attempt by itself.  The next
+            # true decision advances the revision and unlocks one new source
+            # revision.
+            decision_revision = max(1, decision_revision)
+        metadata["development_requirements_resolved"] = bool(resolved)
+        metadata["development_requirements_revision"] = decision_revision
+        metadata["development_requirements_note"] = str(note or "").strip()[:2000] or None
+        if decision_changed or previous_resolved is None:
+            metadata["development_requirements_resolved_at"] = datetime.utcnow().isoformat() if resolved else None
+        development = metadata.get("development")
+        if isinstance(development, dict) and isinstance(development.get("requirements"), dict):
+            development = dict(development)
+            requirements = dict(development["requirements"])
+            requirements["status"] = "resolved" if resolved else "awaiting_client_input"
+            development["requirements"] = requirements
+            if resolved and development.get("status") == "blocked":
+                development["blocking_reason"] = None
+            metadata["development"] = development
+        opportunity.metadata_json = metadata
+        await self._flush_commit(session)
+        return opportunity.to_safe_dict()
 
     async def create_evaluation(
         self,
@@ -1628,7 +1747,7 @@ class OperationsService:
             (missing_requirements or [], "evaluation missing_requirements"),
             (evidence_refs or [], "evaluation evidence_refs"),
         ):
-            if len(canonical_json(value).encode("utf-8")) > 16_000:
+            if len(canonical_json(value).encode("utf-8")) > EVALUATION_COLLECTION_MAX_BYTES:
                 raise OperationsValidationError(f"{field_name} exceeds 16000 bytes")
         evaluation = OpportunityEvaluation(
             opportunity_id=opportunity.id,
@@ -1638,10 +1757,10 @@ class OperationsService:
             estimated_effort_hours=float(estimated_effort_hours) if estimated_effort_hours is not None else None,
             estimated_cost=float(estimated_cost) if estimated_cost is not None else None,
             estimated_revenue=float(estimated_revenue) if estimated_revenue is not None else None,
-            fit=_text(fit, "fit", max_bytes=32),
+            fit=_text(fit, "fit", max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["fit"]),
             risks=_json_safe(list(risks or [])),
             missing_requirements=_json_safe(list(missing_requirements or [])),
-            summary=_text(summary, "summary", max_bytes=32_000),
+            summary=_text(summary, "summary", max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["summary"]),
             evidence_refs=_json_safe(list(evidence_refs or [])),
             created_by=_actor_id(actor),
         )
@@ -1680,7 +1799,7 @@ class OperationsService:
             raise OperationsValidationError("actor and opportunity_id are required")
         opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
         await self._assert_entity_access(session, actor, opportunity, permission="write")
-        message_value = _text(message, "message", required=True, max_bytes=64_000)
+        message_value = _text(message, "message", required=True, max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["message"])
         if offered_price is not None and (
             not isinstance(offered_price, (int, float)) or not math.isfinite(float(offered_price))
         ):
@@ -1700,8 +1819,8 @@ class OperationsService:
         canonical_payload = {
             "message": message_value,
             "offered_price": float(offered_price) if offered_price is not None else None,
-            "currency": _text(currency, "currency", max_bytes=16),
-            "delivery_estimate": _text(delivery_estimate, "delivery_estimate", max_bytes=255),
+            "currency": _text(currency, "currency", max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["currency"]),
+            "delivery_estimate": _text(delivery_estimate, "delivery_estimate", max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["delivery_estimate"]),
             "artifact_version_ids": [str(item.id) for item in artifacts],
         }
         draft = ApplicationDraft(
@@ -1843,13 +1962,43 @@ class OperationsService:
         account = binding.get("account")
         account_revision = binding.get("account_revision")
         credential = binding.get("credential")
+        from .media_bridge_connection import manual_bridge
+        if manual_bridge(binding.get("connection")):
+            raise OperationsInvalidTransitionError("Bridge browser identity does not authorize official API publication")
         if account is None or account_revision is None or credential is None:
             raise OperationsInvalidTransitionError(
                 "provider execution requires a pinned account, account revision, and verified credential"
             )
 
+        from .media_publication_contract import official_write_blockers
+        blockers = official_write_blockers(str(binding["platform"]), payload)
+        if blockers:
+            raise OperationsInvalidTransitionError("provider publication is blocked: " + ", ".join(blockers))
+        # Resolve only an entirely omitted tuple, from a human-established
+        # snapshot. Supplied stale/partial authority is never silently rebound.
+        if all(value is None for value in (capability_snapshot_id, capability_snapshot_hash,
+                adapter_key, adapter_version, credential_state_hash)):
+            from .media_provider_readiness_service import MediaProviderReadinessService
+            authority = await MediaProviderReadinessService().resolve_execution_binding(
+                session, actor, account.id, operation=_media_provider_operation(action_type, payload))
+            if authority is None:
+                raise OperationsInvalidTransitionError("a current human-established provider capability snapshot is required")
+            capability_snapshot_id = authority["capability_snapshot_id"]
+            capability_snapshot_hash = authority["capability_snapshot_hash"]
+            adapter_key = authority["adapter_key"]
+            adapter_version = authority["adapter_version"]
+            credential_state_hash = authority["credential_state_hash"]
+        elif credential_state_hash is None and all(value is not None for value in (
+                capability_snapshot_id, capability_snapshot_hash, adapter_key, adapter_version)):
+            # The wire DTO may pin the public snapshot without a credential
+            # digest. Complete only that server-owned field from the freshly
+            # verified binding; all supplied snapshot/route pins are still
+            # compared against that credential and account below.
+            credential_state_hash = binding.get("credential_state_hash")
+
         snapshot_uuid = _as_uuid(capability_snapshot_id, "capability_snapshot_id")
-        assert snapshot_uuid is not None
+        if snapshot_uuid is None:
+            raise OperationsValidationError("capability_snapshot_id is required for a supplied authority tuple")
         snapshot_hash = _normalize_media_hash(
             capability_snapshot_hash,
             "capability_snapshot_hash",
@@ -2224,6 +2373,16 @@ class OperationsService:
                 raise OperationsValidationError("PlatformAccountRevision does not belong to PlatformAccount")
             if getattr(revision, "platform_account_revision_id", None) != getattr(account_revision, "id", None):
                 raise OperationsValidationError("PlatformAccountRevision does not match ContentVariantRevision")
+            from .media_bridge_connection import manual_bridge
+            if manual_bridge(connection):
+                latest_id = await session.scalar(select(PlatformAccountRevision.id).where(PlatformAccountRevision.platform_account_id == account.id)
+                    .order_by(PlatformAccountRevision.version.desc()).limit(1))
+                if (connection.credential_ref is not None or connection.auth_status != "unknown"
+                        or connection.metadata_json.get("persona_id") != str(account.persona_id)
+                        or connection.metadata_json.get("platform_account_id") != str(account.id)
+                        or connection.metadata_json.get("binding_revision_id") != str(account_revision.id)
+                        or latest_id != account_revision.id):
+                    raise OperationsConflictError("Bridge manual binding revision changed")
         elif getattr(revision, "platform_account_revision_id", None) is not None:
             raise OperationsValidationError("platform_account_revision_id is required by ContentVariantRevision")
 
@@ -2289,6 +2448,12 @@ class OperationsService:
             raise OperationsInvalidTransitionError(
                 "MediaOps publication requires a pinned PlatformAccountRevision"
             )
+        persona_revision = binding.get("persona_revision")
+        if persona_revision is None:
+            persona_revision = await self._get_or_404(session, PersonaRevision, revision.persona_revision_id, "persona_revision_id")
+        if (binding["account"].persona_id is None
+                or binding["account"].persona_id != persona_revision.persona_id):
+            raise OperationsInvalidTransitionError("persona_account_binding_missing_or_mismatch")
         # A proposal must target the variant's current (highest) immutable
         # revision.  Revisions are append-only and assessments never transfer.
         latest_version = await self._scalar(
@@ -2317,7 +2482,11 @@ class OperationsService:
 
         qa = await latest(QAAssessment)
         rights = await latest(RightsAssessment)
-        blockers: list[str] = []
+        from .media_platform_readiness import platform_payload_blockers
+        from .media_output_integrity import generation_output_blockers
+
+        blockers: list[str] = platform_payload_blockers(revision.payload_json)
+        blockers.extend(await generation_output_blockers(session, revision))
         if qa is None:
             blockers.append("qa_missing")
         elif getattr(qa, "content_variant_id", None) != getattr(variant, "id", None):
@@ -2366,6 +2535,25 @@ class OperationsService:
                 raise OperationsValidationError("payload.type is required")
             return _json_safe(data)
 
+    async def _assert_reviewed_media_payload(
+        self, binding: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> None:
+        """The write body must be the exact revision covered by QA/Rights.
+
+        Recomputing an action hash only proves internal consistency; it does
+        not authorize a different caption, visibility, thumbnail or asset.
+        Every proposal/revision and approval/attempt uses this same boundary.
+        """
+        reviewed = getattr(binding["revision"], "payload_json", None)
+        from .media_operations_content_service import canonical_publication_payload
+        if (not isinstance(reviewed, Mapping)
+                or canonical_json(canonical_publication_payload(payload, binding["platform"]))
+                != canonical_json(canonical_publication_payload(reviewed, binding["platform"]))):
+            raise OperationsConflictError(
+                "MediaOps publication payload differs from the reviewed ContentVariantRevision; "
+                "create a new content revision and obtain fresh QA/Rights clearance"
+            )
+
     def _media_action_payload(
         self,
         binding: Mapping[str, Any],
@@ -2385,6 +2573,10 @@ class OperationsService:
         credential_state_hash: str | None = None,
         execution_key: str | None = None,
     ) -> dict[str, Any]:
+        if execution_mode == "provider" and schedule:
+            raise OperationsValidationError(
+                "provider schedule metadata must be empty; use the reviewed payload.scheduled_at"
+            )
         item = binding["item"]
         variant = binding["variant"]
         revision = binding["revision"]
@@ -2498,6 +2690,19 @@ class OperationsService:
         key = _text(idempotency_key, "idempotency_key", required=True, max_bytes=255)
         platform_value = _normalize_media_platform(platform)
         artifact_values = _hash_list(artifact_hashes)
+        execution_mode_value = _normalize_media_execution_mode(execution_mode)
+        if execution_mode_value == "manual" and platform_account_id is not None:
+            from .media_bridge_connection import manual_bridge
+            candidate = await self._get_or_404(session, PlatformAccount, platform_account_id, "platform_account_id")
+            await self._assert_entity_access(session, actor, candidate, permission="write")
+            current_connection = await session.get(ExternalConnection, candidate.connection_id) if candidate.connection_id else None
+            if manual_bridge(current_connection):
+                # A new Action has no Action row yet. Fence its INSERT with the
+                # Account lock so binding invalidation cannot miss a phantom
+                # proposal using the previous revision. Existing Action writes
+                # continue to lock Action first, then Account.
+                await session.refresh(candidate, with_for_update=True)
+                await session.refresh(current_connection)
         binding = await self._load_media_binding(
             session,
             actor,
@@ -2521,7 +2726,7 @@ class OperationsService:
         )
         await self._assert_media_publication_readiness(session, actor, binding)
         normalized_payload = await self._normalize_media_typed_payload(payload, platform_value)
-        execution_mode_value = _normalize_media_execution_mode(execution_mode)
+        await self._assert_reviewed_media_payload(binding, normalized_payload)
         if execution_mode_value == "provider":
             provider_authority = await self._assert_media_provider_readiness(
                 session,
@@ -2825,6 +3030,7 @@ class OperationsService:
             raw.get("payload"),
             binding["platform"],
         )
+        await self._assert_reviewed_media_payload(binding, normalized_payload)
         qa_value = _normalized_media_mapping(raw.get("qa"), "qa", default={"status": "unknown"})
         rights_value = _normalized_media_mapping(raw.get("rights"), "rights", default={"status": "unknown"})
         schedule_value = _normalized_media_mapping(raw.get("schedule"), "schedule")
@@ -3020,6 +3226,7 @@ class OperationsService:
         await self._assert_media_publication_readiness(session, actor, binding)
         artifact_values = _hash_list(artifact_hashes if artifact_hashes is not None else action.artifact_hashes)
         normalized_payload = await self._normalize_media_typed_payload(payload, binding["platform"])
+        await self._assert_reviewed_media_payload(binding, normalized_payload)
         provider_authority = None
         if prior_execution_mode == "provider":
             provider_authority = await self._assert_media_provider_readiness(
@@ -3257,19 +3464,27 @@ class OperationsService:
         self,
         session: Any | None = None,
         actor: Any | None = None,
+        *,
+        platform_account_id: UUID | str | None = None,
+        device_id: str | None = None,
+        tab_id: int | None = None,
     ) -> dict[str, Any]:
-        """Return deterministic manual-only status for all six platforms."""
+        """既存adapter契約と本人が明示した対象の読み取り専用準備可否を返す。"""
 
         if actor is None:
             raise OperationsValidationError("actor is required")
+        readiness = None
+        if platform_account_id is not None:
+            from .media_browser_preparation import MediaBrowserPreparationService
+            readiness = await MediaBrowserPreparationService(self).readiness(
+                session, actor, platform_account_id=platform_account_id, device_id=device_id, tab_id=tab_id)
         platforms: dict[str, dict[str, Any]] = {}
         for key, value in MEDIA_ADAPTER_STATUS.items():
             item = dict(value)
             policy = get_provider_capability(key) if callable(get_provider_capability) else None
             if policy is not None:
-                # Keep provider network execution disabled until a concrete
-                # adapter contract/private target is verified.  The registry
-                # projection is metadata-only and never exposes credentials.
+                # Installed route metadata grants no per-account authority and
+                # never exposes credentials. Readiness owns that binding.
                 item["registry_version"] = getattr(policy, "registry_version", None)
                 item["adapter_key"] = getattr(policy, "adapter_key", None) or getattr(
                     policy,
@@ -3280,11 +3495,20 @@ class OperationsService:
                     operation: getattr(policy.status_for(operation), "value", str(policy.status_for(operation)))
                     for operation in ("text", "image", "video", "schedule", "edit", "delete", "revenue")
                 }
-                item["provider_execution"] = "unverified"
+                installed = self.provider_adapter is not None and key in {"x", "youtube"}
+                item["provider_execution"] = "account_readiness_required" if installed else "unavailable"
+                item["provider_calls"] = installed
+                item["adapter_version"] = getattr(policy, "adapter_version", None)
+                item["provider_route"] = "official_api" if installed else None
+                item["status"] = "provider_available" if installed else "manual"
+                item["mode"] = "provider" if installed else "manual"
+                item["manual_fallback_available"] = True
+                from .media_publication_contract import browser_publication_status
+                item["browser_publication"] = browser_publication_status(key, readiness)
             platforms[key] = item
         return {
             "schema_version": "media-operations-adapter-status-v1",
-            "provider_calls": False,
+            "provider_calls": any(item.get("provider_calls") for item in platforms.values()),
             "platforms": platforms,
         }
 
@@ -3853,6 +4077,7 @@ class OperationsService:
         if exact_artifacts != list(action.artifact_hashes or []):
             raise OperationsConflictError("artifact_hashes do not match current proposal")
         if decision == "approved":
+            await self._assert_no_unknown_media_provider_replay(session, action)
             if action.status not in {"proposed", "rejected", "failed"}:
                 raise OperationsInvalidTransitionError("action cannot be approved in its current state")
             next_status = "approved"
@@ -3873,6 +4098,19 @@ class OperationsService:
         session.add(approval)
         action.status = next_status
         action.version = int(action.version or 1) + 1
+        if action.action_type == "engagement.submit_application" and action.opportunity_id is not None:
+            opportunity = await session.get(EngagementOpportunity, action.opportunity_id)
+            if opportunity is not None:
+                metadata = dict(opportunity.metadata_json or {})
+                metadata["external_action_id"] = str(action.id)
+                metadata["external_action_status"] = next_status
+                if decision == "approved":
+                    metadata["screening_status"] = "application_approved"
+                    metadata["screening_reason"] = "実応募を承認済み。CrowdWorks担当が応募送信を実行します"
+                else:
+                    metadata["screening_status"] = "rejected"
+                    metadata["screening_reason"] = "今回は見送り"
+                opportunity.metadata_json = metadata
         await self._flush_only(session)
         await self._event(
             session,
@@ -3949,21 +4187,23 @@ class OperationsService:
     reject = reject_action
 
     async def _current_valid_approval(self, session: Any, action: ExternalAction) -> ExternalActionApproval | None:
-        return await self._scalar(
+        decision = await self._scalar(
             session,
             select(ExternalActionApproval)
             .where(
                 ExternalActionApproval.action_id == action.id,
                 ExternalActionApproval.action_version == int(action.action_version or 1),
-                ExternalActionApproval.decision == "approved",
                 ExternalActionApproval.payload_hash == action.payload_hash,
             )
-            .order_by(ExternalActionApproval.created_at.desc())
+            .order_by(ExternalActionApproval.created_at.desc(),
+                (ExternalActionApproval.decision != "approved").desc(), ExternalActionApproval.id.desc())
             .limit(1),
         )
+        return decision if decision is not None and decision.decision == "approved" else None
 
     async def _invoke_provider_adapter(
         self,
+        session: Any,
         action: ExternalAction,
         attempt: ExternalActionAttempt,
     ) -> Any:
@@ -3981,6 +4221,10 @@ class OperationsService:
             raise OperationsInvalidTransitionError(
                 "provider adapter execution is unavailable"
             )
+        internal = getattr(adapter, "execute_internal", None)
+        if callable(internal):
+            value = internal(session=session, action=action, attempt=attempt)
+            return await value if isawaitable(value) else value
         method = getattr(adapter, "execute", None) or getattr(adapter, "submit", None)
         if not callable(method):
             raise OperationsInvalidTransitionError(
@@ -4053,15 +4297,22 @@ class OperationsService:
         attempt: ExternalActionAttempt,
         *,
         note: str,
+        expected_version: int | None = None,
     ) -> None:
         """Persist an ambiguous provider outcome without retrying it."""
 
+        expected = expected_version if expected_version is not None else int(action.version or 1)
+        claimed = await self._execute(session, update(ExternalAction).where(
+            ExternalAction.id == action.id, ExternalAction.version == expected,
+            ExternalAction.status == "attempting",
+        ).values(status="uncertain", version=ExternalAction.version + 1).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            return
+        await session.refresh(action)
         attempt.status = "uncertain"
         attempt.error_message = "provider execution outcome is ambiguous"
         attempt.evidence_note = _text(note, "evidence_note", max_bytes=8_000)
         attempt.finished_at = attempt.finished_at or datetime.utcnow()
-        action.status = "uncertain"
-        action.version = int(action.version or 1) + 1
         await self._flush_only(session)
         await self._event(
             session,
@@ -4079,6 +4330,86 @@ class OperationsService:
             },
         )
         await self._flush_commit(session)
+
+    async def _lock_media_publication_budget(self, session, actor, action):
+        if action.action_type not in ("media.publish_content", "media.release_product"):
+            return None
+        from .media_publication_budget import lock_publication_program
+        from ..memory.models.media_operations_research import EditorialProgram, EditorialProgramRevision
+        item = await self._get_or_404(session, ContentItem, action.content_item_id, "content_item_id")
+        program = await self._get_or_404(session, EditorialProgram, item.editorial_program_id, "editorial_program_id")
+        await self._assert_entity_access(session, actor, program, permission="write")
+        if program.owner_user_id != action.owner_user_id or program.project_id != action.project_id:
+            raise OperationsConflictError("publication program scope does not match action")
+        await lock_publication_program(session, program.id)
+        revision = await self._scalar(session, select(EditorialProgramRevision).where(
+            EditorialProgramRevision.editorial_program_id == program.id,
+        ).order_by(EditorialProgramRevision.version.desc()).limit(1))
+        if revision is None:
+            raise OperationsConflictError("publication program revision is unavailable")
+        limit = revision.max_publications
+        if limit is not None and (type(limit) is not int or not 0 <= limit <= 10000):
+            raise OperationsConflictError("publication program ceiling is invalid")
+        return program.id, revision.id, limit
+
+    async def _claim_media_publication(self, session, action, budget):
+        from .media_publication_budget import occupied_action, publication_usage, publication_units
+        program_id, _, limit = budget
+        if limit is not None:
+            held = await self._scalar(session, select(ExternalAction.id).where(
+                ExternalAction.id == action.id, occupied_action(),
+            ))
+            if held is not None:
+                raise OperationsConflictError("publication intent is unresolved; reconcile before retry")
+            if await publication_usage(session, program_id) + publication_units(action.payload_json) > limit:
+                raise OperationsConflictError("publication_count_limit_reached")
+        # PostgreSQL row locks and SQLite writer admission share this CAS. A
+        # second caller that read approved before waiting cannot create a job.
+        claimed = await self._execute(session, update(ExternalAction).where(
+            ExternalAction.id == action.id, ExternalAction.version == action.version,
+            ExternalAction.status == "approved",
+        ).values(status="attempting", version=ExternalAction.version + 1)
+          .execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            raise OperationsConflictError("publication action changed before admission")
+        await session.refresh(action)
+
+    async def _media_not_submitted_evidence(self, session, actor, action, *,
+                                            provider_receipt_ref, remote_resource_id,
+                                            remote_status, provider_observed_at,
+                                            evidence_note):
+        if action.action_type not in ("media.publish_content", "media.release_product"):
+            return None
+        if remote_status != "not_submitted":
+            return None
+        observed = _parse_datetime(provider_observed_at)
+        lookup = _text(provider_receipt_ref or remote_resource_id, "provider_lookup_ref", max_bytes=255)
+        if not observed or not lookup or not evidence_note:
+            raise OperationsValidationError("not_submitted requires lookup reference, observation time and evidence note")
+        return {"provider_lookup_ref": lookup, "remote_status": "not_submitted",
+                "observed_at": observed.isoformat(), "evidence_note": evidence_note}
+
+    async def _record_media_not_submitted(self, session, actor, action, attempt, evidence):
+        from .media_publication_budget import NOT_SUBMITTED_EVENT
+        await self._event(session, actor=actor, entity_type="action", entity_id=action.id,
+                          event_type=NOT_SUBMITTED_EVENT, owner_user_id=action.owner_user_id,
+                          project_id=action.project_id,
+                          payload={**evidence, "attempt_key": attempt.id.hex,
+                                   "attempt_id": str(attempt.id), "action_version": attempt.action_version})
+
+    async def _assert_no_unknown_media_provider_replay(self, session, action):
+        if action.action_type not in MEDIA_ACTION_TYPES or action.execution_mode != "provider":
+            return
+        # Append-only uncertainty/reconciliation events survive a historical
+        # manual failed transition. Quota settings must not permit replay.
+        unknown = await self._scalar(session, select(OperationEvent.id).where(
+            OperationEvent.entity_type == "action", OperationEvent.entity_id == action.id,
+            OperationEvent.event_type.in_(("action.attempt.uncertain", "action.reconciled.failed")),
+        ).limit(1))
+        if unknown is not None:
+            raise OperationsInvalidTransitionError(
+                "provider outcome has been uncertain; reconcile with positive receipt evidence; an unknown publication cannot be approved or replayed"
+            )
 
     async def create_attempt(
         self,
@@ -4104,6 +4435,11 @@ class OperationsService:
         )
         action = await self._get_or_404(session, ExternalAction, action_id, "action_id", for_update=True)
         await self._assert_entity_access(session, actor, action, permission="write")
+        if getattr(action, "browser_preparation_id", None) is not None:
+            raise OperationsInvalidTransitionError("browser preparation cannot become a publication attempt; final confirmation remains manual")
+        publication_budget = await self._lock_media_publication_budget(session, actor, action)
+        if publication_budget is not None:
+            await session.refresh(action)
         if getattr(action, "legacy_evidence_incomplete", False):
             raise OperationsConflictError("legacy_provider_evidence_incomplete")
         await self._check_expected_version(action, expected_version)
@@ -4112,6 +4448,7 @@ class OperationsService:
         action_mode = _normalize_media_execution_mode(
             getattr(action, "execution_mode", None) or raw_payload.get("execution_mode", "manual")
         )
+        await self._assert_no_unknown_media_provider_replay(session, action)
         if requested_mode != action_mode or executor_value != action_mode:
             raise OperationsConflictError(
                 "attempt execution mode does not match the approved action"
@@ -4177,11 +4514,15 @@ class OperationsService:
             capability_snapshot_id=(getattr(action, "capability_snapshot_id", None) if action_mode == "provider" else None),
             capability_snapshot_hash=(getattr(action, "capability_snapshot_hash", None) if action_mode == "provider" else None),
             credential_state_hash=(getattr(action, "credential_state_hash", None) if action_mode == "provider" else None),
+            provider_lease_expires_at=(datetime.utcnow() + timedelta(minutes=15) if action_mode == "provider" else None),
             created_by=_actor_id(actor),
         )
+        if publication_budget is not None:
+            await self._claim_media_publication(session, action, publication_budget)
         session.add(attempt)
-        action.status = "attempting"
-        action.version = int(action.version or 1) + 1
+        if publication_budget is None:
+            action.status = "attempting"
+            action.version = int(action.version or 1) + 1
         await self._flush_only(session)
         await self._event(
             session,
@@ -4193,8 +4534,20 @@ class OperationsService:
             project_id=action.project_id,
             payload={"attempt_id": str(attempt.id), "action_version": attempt.action_version, "version": action.version},
         )
+        if publication_budget is not None:
+            from .media_publication_budget import RESERVATION_EVENT, publication_units
+            await self._event(session, actor=actor, entity_type="action", entity_id=action.id,
+                              event_type=RESERVATION_EVENT, owner_user_id=action.owner_user_id,
+                              project_id=action.project_id,
+                              payload={"attempt_key": attempt.id.hex, "attempt_id": str(attempt.id),
+                                       "action_version": attempt.action_version,
+                                       "program_id": str(publication_budget[0]),
+                                       "program_revision_id": str(publication_budget[1]),
+                                       "max_publications": publication_budget[2],
+                                       "units": publication_units(action.payload_json)})
         await self._flush_commit(session)
         if action_mode == "provider":
+            provider_fence_version = int(action.version or 1)
             # Re-read every immutable authority binding after the durable
             # attempt intent is committed and immediately before invoking the
             # adapter.  Approval/capability/credential changes in the small
@@ -4249,6 +4602,7 @@ class OperationsService:
                     actor,
                     action,
                     attempt,
+                    expected_version=provider_fence_version,
                     note="provider authority changed before adapter invocation",
                 )
                 provider_preflight_ok = False
@@ -4264,7 +4618,7 @@ class OperationsService:
                 return refreshed_attempt.to_safe_dict()
             try:
                 provider_result = self._provider_result_projection(
-                    await self._invoke_provider_adapter(action, attempt)
+                    await self._invoke_provider_adapter(session, action, attempt)
                 )
             except OperationsInvalidTransitionError:
                 # The adapter disappeared or was removed from the registry
@@ -4275,6 +4629,7 @@ class OperationsService:
                     actor,
                     action,
                     attempt,
+                    expected_version=provider_fence_version,
                     note="provider adapter is unavailable after intent commit",
                 )
             except Exception:
@@ -4286,6 +4641,7 @@ class OperationsService:
                     actor,
                     action,
                     attempt,
+                    expected_version=provider_fence_version,
                     note="provider adapter outcome could not be confirmed",
                 )
             else:
@@ -4297,6 +4653,7 @@ class OperationsService:
                         actor,
                         action,
                         attempt,
+                        expected_version=provider_fence_version,
                         note=str(provider_result.get("evidence_note") or provider_result.get("result_summary") or "provider outcome is ambiguous"),
                     )
                 elif provider_result["status"] == "succeeded" and not _has_provider_success_evidence(
@@ -4316,6 +4673,7 @@ class OperationsService:
                         actor,
                         action,
                         attempt,
+                        expected_version=provider_fence_version,
                         note="provider success lacked a receipt or bounded remote postcondition",
                     )
                 else:
@@ -4355,6 +4713,7 @@ class OperationsService:
                             actor,
                             action,
                             attempt,
+                            expected_version=provider_fence_version,
                             note="provider result could not be confirmed",
                         )
             refreshed_attempt = await self._get_or_404(
@@ -4367,6 +4726,119 @@ class OperationsService:
         return attempt.to_safe_dict()
 
     start_attempt = create_attempt
+
+    async def prepare_media_browser_action(self, session, actor, action_id, **kwargs):
+        from .media_browser_preparation import MediaBrowserPreparationService
+        return await MediaBrowserPreparationService(self).prepare(session, actor, action_id, **kwargs)
+
+    async def preview_media_bridge_connection(self, session, actor, account_id, **kwargs):
+        from .media_bridge_connection import MediaBridgeConnectionService
+        return await MediaBridgeConnectionService(self).preview(session, actor, account_id, **kwargs)
+
+    async def save_media_bridge_connection(self, session, actor, account_id, **kwargs):
+        from .media_bridge_connection import MediaBridgeConnectionService
+        return await MediaBridgeConnectionService(self).save(session, actor, account_id, **kwargs)
+
+    async def get_media_browser_preparation(self, session, actor, action_id):
+        from .media_browser_preparation import MediaBrowserPreparationService
+        return await MediaBrowserPreparationService(self).get(session, actor, action_id)
+
+    async def inspect_media_browser_preparation(self, session, actor, action_id, **kwargs):
+        from .media_browser_preparation import MediaBrowserPreparationService
+        return await MediaBrowserPreparationService(self).inspect(session, actor, action_id, **kwargs)
+
+    async def recover_provider_action(
+        self, session: Any | None = None, actor: Any | None = None,
+        action_id: UUID | str | None = None, *, expected_version: int | None,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        """Observe/resume the exact fenced attempt; never mint a new intent.
+
+        The compare-and-swap admission commits before provider I/O. Recovery
+        remains uncertain on missing receipts, expired sessions or revocation.
+        Only the trusted adapter may complete a recovered provider receipt.
+        """
+        session = self._resolve_session(session)
+        if actor is None or action_id is None or type(resume) is not bool:
+            raise OperationsValidationError("actor, action_id and boolean resume are required")
+        await self._assert_human(actor)
+        action = await self._get_or_404(session, ExternalAction, action_id, "action_id", for_update=True)
+        await self._assert_entity_access(session, actor, action, permission="write")
+        await self._check_expected_version(action, expected_version)
+        if action.action_type not in MEDIA_ACTION_TYPES or action.execution_mode != "provider" or action.status not in {"uncertain", "attempting"}:
+            raise OperationsInvalidTransitionError("only unresolved media provider actions can be recovered")
+        if getattr(action, "legacy_evidence_incomplete", False):
+            raise OperationsConflictError("legacy_provider_evidence_incomplete")
+        await self._assert_media_action_integrity(session, actor, action, require_readiness=resume)
+        attempt = await self._scalar(session, select(ExternalActionAttempt).where(
+            ExternalActionAttempt.action_id == action.id, ExternalActionAttempt.status.in_(["uncertain", "running"]),
+        ).order_by(ExternalActionAttempt.started_at.desc()).limit(1).with_for_update())
+        if attempt is None:
+            raise OperationsInvalidTransitionError("provider attempt is unavailable")
+        if action.status == "attempting" and (attempt.status != "running"
+            or attempt.provider_lease_expires_at is None or attempt.provider_lease_expires_at > datetime.utcnow()):
+            raise OperationsInvalidTransitionError("provider execution lease is still active")
+        if (attempt.owner_user_id != action.owner_user_id or attempt.action_version != action.action_version
+            or attempt.executor_type != "provider" or attempt.execution_mode != "provider"
+            or attempt.provider_key != action.platform or attempt.provider_adapter_key != action.adapter_key
+            or attempt.provider_adapter_version != action.adapter_version
+            or attempt.credential_state_hash != action.credential_state_hash
+            or attempt.execution_key != action.execution_key
+            or attempt.capability_snapshot_id != action.capability_snapshot_id
+            or attempt.capability_snapshot_hash != action.capability_snapshot_hash
+            or getattr(attempt, "legacy_evidence_incomplete", False)):
+            raise OperationsConflictError("provider attempt authority changed before recovery")
+        if resume:
+            approval = await self._current_valid_approval(session, action)
+            if approval is None or canonicalize_payload(approval.artifact_hashes or []) != canonicalize_payload(action.artifact_hashes or []):
+                raise OperationsInvalidTransitionError("exact human approval is required to resume provider writes")
+        method = getattr(self.provider_adapter, "recover_internal", None)
+        if not callable(method):
+            raise OperationsInvalidTransitionError("provider recovery adapter is unavailable")
+        claimed = await self._execute(session, update(ExternalAction).where(
+            ExternalAction.id == action.id, ExternalAction.version == action.version,
+            ExternalAction.status == action.status,
+        ).values(status="attempting", version=ExternalAction.version + 1).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            raise OperationsConflictError("publication action changed before recovery admission")
+        await session.refresh(action)
+        attempt.status = "running"
+        attempt.finished_at = None
+        attempt.provider_lease_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        await self._event(session, actor=actor, entity_type="action", entity_id=action.id,
+            event_type="action.provider.recovery.started", owner_user_id=action.owner_user_id,
+            project_id=action.project_id, payload={"attempt_id": str(attempt.id), "resume": resume})
+        await self._flush_commit(session)
+        recovery_fence_version = int(action.version)
+        if not getattr(attempt, "provider_state_ciphertext", None):
+            await self._mark_provider_attempt_uncertain(session, actor, action, attempt,
+                expected_version=recovery_fence_version,
+                note="expired execution recovered without a checkpoint; manual reconciliation is required")
+            return await self.get_action(session, actor, action.id)
+        try:
+            # Revalidate after the durable fence, immediately before I/O.
+            await self._assert_media_action_integrity(session, actor, action, require_readiness=resume)
+            value = method(session=session, action=action, attempt=attempt, resume=resume)
+            result = self._provider_result_projection(await value if isawaitable(value) else value)
+            if result["status"] == "succeeded":
+                await self.complete_attempt(session, actor, action.id, attempt.id,
+                    status="succeeded", expected_version=int(action.version),
+                    evidence_artifact_ids=result.get("evidence_artifact_ids", []),
+                    provider_receipt_ref=result.get("provider_receipt_ref"),
+                    remote_resource_id=result.get("remote_resource_id"), remote_url=result.get("remote_url"),
+                    remote_status=result.get("remote_status"), provider_observed_at=result.get("provider_observed_at"),
+                    evidence_note=result.get("evidence_note"), result_summary=result.get("result_summary"),
+                    confirmation_level="provider_confirmed",
+                    _provider_confirmation_token=_PROVIDER_ADAPTER_CONFIRMATION_TOKEN)
+            else:
+                await self._mark_provider_attempt_uncertain(session, actor, action, attempt,
+                    expected_version=recovery_fence_version,
+                    note="provider recovery remains unresolved: " + str(result.get("remote_status") or "receipt_unknown"))
+        except Exception:
+            await self._mark_provider_attempt_uncertain(session, actor, action, attempt,
+                expected_version=recovery_fence_version,
+                note="provider recovery could not be confirmed")
+        return await self.get_action(session, actor, action.id)
 
     async def _validate_evidence_artifacts(
         self,
@@ -4405,6 +4877,7 @@ class OperationsService:
             raise OperationsValidationError("actor, action_id and attempt_id are required")
         await self._assert_human(actor)
         action = await self._get_or_404(session, ExternalAction, action_id, "action_id", for_update=True)
+        await session.refresh(action)
         await self._assert_entity_access(session, actor, action, permission="write")
         if getattr(action, "legacy_evidence_incomplete", False):
             raise OperationsConflictError("legacy_provider_evidence_incomplete")
@@ -4424,6 +4897,8 @@ class OperationsService:
             )
         )
         if action_mode == "provider":
+            if _provider_confirmation_token is not _PROVIDER_ADAPTER_CONFIRMATION_TOKEN:
+                raise OperationsInvalidTransitionError("provider attempts can only be completed by the trusted adapter")
             if attempt.executor_type != "provider" or getattr(attempt, "execution_mode", None) != "provider":
                 raise OperationsConflictError("provider attempt execution metadata is stale")
             if (
@@ -4520,6 +4995,17 @@ class OperationsService:
                 raise OperationsInvalidTransitionError(
                     "manual completion may only use human_confirmed"
                 )
+        negative_evidence = None
+        if normalized_status == "failed":
+            negative_evidence = await self._media_not_submitted_evidence(
+                session, actor, action, provider_receipt_ref=provider_receipt_ref,
+                remote_resource_id=remote_resource_id, remote_status=remote_status,
+                provider_observed_at=provider_observed_at, evidence_note=evidence_note_value)
+            budget = await self._lock_media_publication_budget(session, actor, action)
+            if budget is not None and budget[2] is not None and negative_evidence is None:
+                # Failure alone cannot establish that a remote write did not
+                # happen. Keep the durable slot and use the existing reconcile UI.
+                normalized_status = "uncertain"
         now = datetime.utcnow()
         attempt.status = normalized_status
         attempt.evidence_artifact_ids = [str(item) for item in evidence_ids]
@@ -4580,6 +5066,8 @@ class OperationsService:
                     "confirmation_level": receipt.confirmation_level,
                 },
             )
+        if negative_evidence is not None:
+            await self._record_media_not_submitted(session, actor, action, attempt, negative_evidence)
         await self._flush_commit(session)
         return await self.get_action(session, actor, action.id)
 
@@ -4613,7 +5101,11 @@ class OperationsService:
         await self._assert_entity_access(session, actor, action, permission="write")
         await self._check_expected_version(action, expected_version)
         await self._assert_media_action_integrity(session, actor, action)
-        if action.status != "uncertain":
+        publication_budget = await self._lock_media_publication_budget(session, actor, action)
+        historical_publication_failure = (
+            action.status == "failed" and publication_budget is not None and publication_budget[2] is not None
+        )
+        if action.status != "uncertain" and not historical_publication_failure:
             raise OperationsInvalidTransitionError("only uncertain actions can be reconciled")
         if getattr(action, "legacy_evidence_incomplete", False):
             raise OperationsConflictError("legacy_provider_evidence_incomplete")
@@ -4638,7 +5130,7 @@ class OperationsService:
             .where(ExternalActionAttempt.action_id == action.id)
             .order_by(ExternalActionAttempt.started_at.desc()),
         )
-        unresolved = next((item for item in attempts if item.status == "uncertain"), None)
+        unresolved = next((item for item in attempts if item.status == "uncertain" or (historical_publication_failure and item.status == "failed")), None)
         if unresolved is None:
             raise OperationsInvalidTransitionError("no uncertain attempt is available for reconcile")
         if getattr(unresolved, "legacy_evidence_incomplete", False):
@@ -4651,6 +5143,13 @@ class OperationsService:
                 else "manual"
             )
         )
+        if action_mode == "provider" and action.action_type in MEDIA_ACTION_TYPES and normalized == "failed":
+            # Neither absence of a receipt nor an operator's note can prove a
+            # create request did not take effect. Current X/YouTube contracts
+            # provide no authoritative negative lookup for an unknown create.
+            raise OperationsInvalidTransitionError(
+                "unknown provider publication cannot be reconciled as failed; use receipt recovery or positive remote evidence"
+            )
         generic_service_attempt = (
             getattr(action, "action_policy_revision_id", None) is not None
             and getattr(action, "registry_schema_version", None) is not None
@@ -4744,6 +5243,16 @@ class OperationsService:
                 "remote_status": "not_submitted", "observed_at": _parse_datetime(provider_observed_at).isoformat(),
                 "evidence_note": evidence_note_value,
             })
+        negative_evidence = None
+        if normalized == "failed" and publication_budget is not None:
+            negative_evidence = await self._media_not_submitted_evidence(
+                session, actor, action, provider_receipt_ref=provider_receipt_ref,
+                remote_resource_id=remote_resource_id, remote_status=remote_status,
+                provider_observed_at=provider_observed_at, evidence_note=evidence_note_value)
+            if publication_budget[2] is not None and (
+                str(outcome or "").strip().lower() != "not_submitted" or negative_evidence is None
+            ):
+                raise OperationsInvalidTransitionError("publication failure reconciliation requires confirmed not_submitted lookup evidence")
         unresolved.status = normalized
         if evidence_ids:
             unresolved.evidence_artifact_ids = [str(item) for item in evidence_ids]
@@ -4810,6 +5319,8 @@ class OperationsService:
                     "reconciled": True,
                 },
             )
+        if negative_evidence is not None:
+            await self._record_media_not_submitted(session, actor, action, unresolved, negative_evidence)
         await self._flush_commit(session)
         return await self.get_action(session, actor, action.id)
 
@@ -4854,6 +5365,26 @@ class OperationsService:
         return result
 
 
+def create_operations_service(
+    session: Any | None = None,
+    *,
+    provider_adapter: Any | None = None,
+) -> OperationsService:
+    """Build the production service with reviewed provider adapters enabled.
+
+    Bare ``OperationsService()`` remains fail-closed for unit tests and callers
+    that intentionally need a provider-neutral/manual kernel.  Production
+    composition roots use this factory so X/YouTube provider execution is
+    available only through the audited ExternalAction boundary.
+    """
+
+    if provider_adapter is None:
+        from .media_provider_execution import MediaProviderExecutionRouter
+
+        provider_adapter = MediaProviderExecutionRouter()
+    return OperationsService(session=session, provider_adapter=provider_adapter)
+
+
 # Public exception aliases used by routers/integrations.
 OperationsServiceError = OperationsError
 AuthorizationError = OperationsAuthorizationError
@@ -4863,6 +5394,7 @@ StaleVersionError = OperationsStaleVersionError
 
 __all__ = [
     "OperationsService",
+    "create_operations_service",
     "OperationsError",
     "OperationsServiceError",
     "OperationsNotFoundError",

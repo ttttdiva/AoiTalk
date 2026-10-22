@@ -29,9 +29,10 @@ AGENT_HARNESS_UPDATE_KEYS = frozenset(
         "tracker",
         "codex",
         "claude",
-        # These aliases are emitted by the current settings UI.  They are
-        # normalized into ``codex`` below and are not persisted as executable
-        # top-level options.
+        # Legacy flat aliases.  ``runner`` is stored at ``codex.runner`` (the
+        # runner selector read by ``build_runner``); ``model``/``effort`` are
+        # routed to the branch of the selected runner (``codex`` or
+        # ``claude``) and are never persisted as top-level options.
         "runner",
         "model",
         "effort",
@@ -43,10 +44,23 @@ AGENT_HARNESS_TRACKER_UPDATE_KEYS = frozenset(
 AGENT_HARNESS_CODEX_UPDATE_KEYS = frozenset(
     {"model", "reasoning_effort", "approval_policy", "exec_sandbox", "runner", "stall_timeout_ms"}
 )
-AGENT_HARNESS_CLAUDE_UPDATE_KEYS = frozenset({"model", "reasoning_effort"})
+AGENT_HARNESS_CLAUDE_UPDATE_KEYS = frozenset({"model", "reasoning_effort", "permission_mode"})
 AGENT_HARNESS_SAFE_RUNNERS = frozenset(
     {"codex_exec", "codex_cli", "claude_code", "claude_cli", "custom_command"}
 )
+AGENT_HARNESS_CLAUDE_RUNNERS = frozenset({"claude_code", "claude_cli"})
+# Only these aliases are unambiguously Claude-owned in the pre-branch config.
+# A generic value such as ``high`` is not enough evidence to reinterpret a
+# Codex branch as Claude; effort is migrated only together with one of these
+# recognized Claude model values.
+LEGACY_CLAUDE_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku", "fable"})
+# Legacy Claude permission modes remain accepted in saved settings, but
+# the runner always passes --dangerously-skip-permissions. These values
+# no longer control the CLI, and AoiTalk scope enforcement stays separate.
+AGENT_HARNESS_SAFE_CLAUDE_PERMISSION_MODES = frozenset(
+    {"default", "acceptEdits", "plan", "dontAsk"}
+)
+AGENT_HARNESS_DEFAULT_CLAUDE_PERMISSION_MODE = "acceptEdits"
 AGENT_HARNESS_SAFE_SANDBOXES = frozenset({"read-only", "workspace-write"})
 AGENT_HARNESS_SAFE_EXECUTION_BACKENDS = frozenset({"wsl_bwrap", "wsl2_bwrap"})
 AGENT_HARNESS_SAFE_APPROVAL_POLICIES = frozenset(
@@ -118,7 +132,30 @@ def _validate_harness_int(
     return value
 
 
-def validate_agent_harness_update(payload: Any) -> dict[str, Any]:
+def _normalize_runner_value(value: Any, *, field_name: str) -> str:
+    runner = _validate_harness_text(value, field_name=field_name, max_length=32).lower().replace("-", "_")
+    if runner not in AGENT_HARNESS_SAFE_RUNNERS:
+        raise AgentHarnessConfigError("Unsupported Agent Harness runner")
+    return runner
+
+
+def _optional_harness_text(value: Any, *, field_name: str, max_length: int) -> str | None:
+    """``None``/empty string clears the value; anything else is validated."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _validate_harness_text(value, field_name=field_name, max_length=max_length)
+
+
+def is_claude_runner(runner: Any) -> bool:
+    return str(runner or "").strip().lower().replace("-", "_") in AGENT_HARNESS_CLAUDE_RUNNERS
+
+
+def validate_agent_harness_update(
+    payload: Any,
+    *,
+    current_runner: str | None = None,
+) -> dict[str, Any]:
     """Validate and canonicalize the public Agent Harness settings contract.
 
     The function is shared by the API layer and tests.  It deliberately does
@@ -229,10 +266,9 @@ def validate_agent_harness_update(payload: Any) -> dict[str, Any]:
         normalized_codex: dict[str, Any] = {}
         for key in ("model", "reasoning_effort"):
             if key in codex:
-                value = codex[key]
-                if value is not None:
-                    value = _validate_harness_text(value, field_name=f"codex.{key}", max_length=256)
-                normalized_codex[key] = value
+                normalized_codex[key] = _optional_harness_text(
+                    codex[key], field_name=f"codex.{key}", max_length=256
+                )
         if "approval_policy" in codex:
             approval = _validate_harness_text(codex["approval_policy"], field_name="codex.approval_policy", max_length=32).lower()
             if approval not in AGENT_HARNESS_SAFE_APPROVAL_POLICIES:
@@ -244,10 +280,9 @@ def validate_agent_harness_update(payload: Any) -> dict[str, Any]:
                 raise AgentHarnessConfigError("Unsupported codex sandbox")
             normalized_codex["exec_sandbox"] = sandbox
         if "runner" in codex:
-            runner = _validate_harness_text(codex["runner"], field_name="codex.runner", max_length=32).lower().replace("-", "_")
-            if runner not in AGENT_HARNESS_SAFE_RUNNERS:
-                raise AgentHarnessConfigError("Unsupported Agent Harness runner")
-            normalized_codex["runner"] = runner
+            normalized_codex["runner"] = _normalize_runner_value(
+                codex["runner"], field_name="codex.runner"
+            )
         if "stall_timeout_ms" in codex:
             normalized_codex["stall_timeout_ms"] = _validate_harness_int(
                 codex["stall_timeout_ms"], field_name="codex.stall_timeout_ms", minimum=0, maximum=86_400_000
@@ -266,26 +301,109 @@ def validate_agent_harness_update(payload: Any) -> dict[str, Any]:
         normalized_claude: dict[str, Any] = {}
         for key in ("model", "reasoning_effort"):
             if key in claude:
-                value = claude[key]
-                if value is not None:
-                    value = _validate_harness_text(value, field_name=f"claude.{key}", max_length=256)
-                normalized_claude[key] = value
+                normalized_claude[key] = _optional_harness_text(
+                    claude[key], field_name=f"claude.{key}", max_length=256
+                )
+        if "permission_mode" in claude:
+            mode = _optional_harness_text(
+                claude["permission_mode"], field_name="claude.permission_mode", max_length=32
+            )
+            if mode is not None and mode not in AGENT_HARNESS_SAFE_CLAUDE_PERMISSION_MODES:
+                raise AgentHarnessConfigError("Unsupported claude permission mode")
+            normalized_claude["permission_mode"] = mode
         result["claude"] = normalized_claude
 
-    # Current UI aliases are intentionally converted to the same safe codex
-    # branch used by the explicit schema.  No executable/path field is exposed.
-    aliases = {key: raw[key] for key in ("runner", "model", "effort") if key in raw}
-    if aliases:
-        codex_result = result.setdefault("codex", {})
-        if "runner" in aliases:
-            runner = _validate_harness_text(aliases["runner"], field_name="runner", max_length=32).lower().replace("-", "_")
-            if runner not in AGENT_HARNESS_SAFE_RUNNERS:
-                raise AgentHarnessConfigError("Unsupported Agent Harness runner")
-            codex_result["runner"] = runner
-        if "model" in aliases:
-            codex_result["model"] = _validate_harness_text(aliases["model"], field_name="model", max_length=256) if aliases["model"] else None
-        if "effort" in aliases:
-            codex_result["reasoning_effort"] = _validate_harness_text(aliases["effort"], field_name="effort", max_length=32) if aliases["effort"] else None
+    # Flat aliases.  The runner selector keeps its canonical location
+    # (``codex.runner``); model/effort go to the selected runner's own branch
+    # so choosing Claude Code never overwrites the Codex model (and vice
+    # versa).  Explicit branch values win over aliases.
+    if "runner" in raw:
+        runner = _normalize_runner_value(raw["runner"], field_name="runner")
+        codex_branch = result.setdefault("codex", {})
+        if "runner" in codex_branch and codex_branch["runner"] != runner:
+            raise AgentHarnessConfigError("Conflicting Agent Harness runner values")
+        codex_branch["runner"] = runner
+    if "model" in raw or "effort" in raw:
+        effective_runner = (
+            (result.get("codex") or {}).get("runner")
+            or current_runner
+            or "codex_exec"
+        )
+        target = "claude" if is_claude_runner(effective_runner) else "codex"
+        branch = result.setdefault(target, {})
+        if "model" in raw and "model" not in branch:
+            branch["model"] = _optional_harness_text(raw["model"], field_name="model", max_length=256)
+        if "effort" in raw and "reasoning_effort" not in branch:
+            branch["reasoning_effort"] = _optional_harness_text(
+                raw["effort"], field_name="effort", max_length=32
+            )
+    return result
+
+
+def persisted_agent_harness_runner(raw: Any) -> str:
+    """Return the runner selected by a persisted ``agent_harness`` mapping."""
+
+    if not isinstance(raw, dict):
+        return "codex_exec"
+    codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
+    claude = raw.get("claude") if isinstance(raw.get("claude"), dict) else {}
+    runner = raw.get("runner") or codex.get("runner")
+    if not runner and claude and not codex:
+        runner = "claude_code"
+    return _normalize_runner(str(runner or "codex_exec"))
+
+
+def _is_legacy_claude_model(value: Any) -> bool:
+    model = _safe_model_value(value)
+    if not model:
+        return False
+    base = model.split("[", 1)[0].strip().lower()
+    return base in LEGACY_CLAUDE_MODEL_ALIASES or base.startswith("claude-")
+
+
+def legacy_claude_agent_harness_settings(raw: Any) -> dict[str, str]:
+    """Project pre-branch Claude settings without guessing new Codex data."""
+
+    if not isinstance(raw, dict):
+        return {}
+    if not is_claude_runner(persisted_agent_harness_runner(raw)):
+        return {}
+    codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
+    claude = raw.get("claude") if isinstance(raw.get("claude"), dict) else {}
+    result: dict[str, str] = {}
+    legacy_model = _safe_model_value(raw.get("model")) or _safe_model_value(codex.get("model"))
+    if not _is_legacy_claude_model(legacy_model):
+        return result
+    if not _safe_model_value(claude.get("model")) and legacy_model:
+        result["model"] = legacy_model
+    legacy_effort = _safe_model_value(raw.get("effort")) or _safe_model_value(codex.get("reasoning_effort"))
+    if not _safe_model_value(claude.get("reasoning_effort")) and legacy_effort:
+        result["reasoning_effort"] = legacy_effort
+    return result
+
+
+def migrate_legacy_claude_agent_harness_config(raw: Any) -> dict[str, Any]:
+    """Canonicalize legacy Claude-in-Codex settings on the next admin save."""
+
+    if not isinstance(raw, dict):
+        return {}
+    result = copy.deepcopy(raw)
+    legacy = legacy_claude_agent_harness_settings(result)
+    if not legacy:
+        return result
+    claude = result.setdefault("claude", {})
+    if not isinstance(claude, dict):
+        claude = {}
+        result["claude"] = claude
+    claude.update({key: value for key, value in legacy.items() if not claude.get(key)})
+    # Remove only the ambiguous legacy aliases. A later Codex value is then
+    # written independently by the runner-specific branch.
+    result.pop("model", None)
+    result.pop("effort", None)
+    codex = result.get("codex")
+    if isinstance(codex, dict):
+        codex.pop("model", None)
+        codex.pop("reasoning_effort", None)
     return result
 
 
@@ -316,14 +434,26 @@ def public_agent_harness_settings(raw: Any) -> dict[str, Any]:
         }
     codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
     claude = raw.get("claude") if isinstance(raw.get("claude"), dict) else {}
-    if codex:
-        result["runner"] = str(codex.get("runner") or "codex_exec")
-        result["model"] = str(codex.get("model") or "")
-        result["effort"] = str(codex.get("reasoning_effort") or "")
-    elif claude:
-        result["runner"] = "claude_code"
-        result["model"] = str(claude.get("model") or "")
-        result["effort"] = str(claude.get("reasoning_effort") or "")
+    runner = persisted_agent_harness_runner(raw)
+    legacy = legacy_claude_agent_harness_settings(raw)
+    codex_view = {
+        "model": str(codex.get("model") or ""),
+        "reasoning_effort": str(codex.get("reasoning_effort") or ""),
+    }
+    claude_view = {
+        "model": str(claude.get("model") or legacy.get("model") or ""),
+        "reasoning_effort": str(claude.get("reasoning_effort") or legacy.get("reasoning_effort") or ""),
+        "permission_mode": str(
+            claude.get("permission_mode") or AGENT_HARNESS_DEFAULT_CLAUDE_PERMISSION_MODE
+        ),
+    }
+    active = claude_view if is_claude_runner(runner) else codex_view
+    result["runner"] = runner
+    result["codex"] = codex_view
+    result["claude"] = claude_view
+    # Flat aliases always describe the selected runner's own branch.
+    result["model"] = active["model"]
+    result["effort"] = active["reasoning_effort"]
     return result
 
 
@@ -598,6 +728,10 @@ class HarnessClaudeSettings:
     bin_path: str = "claude"
     model: str | None = None
     reasoning_effort: str | None = None
+    permission_mode: str = AGENT_HARNESS_DEFAULT_CLAUDE_PERMISSION_MODE
+    # Deployment-owned permission rules passed to ``--allowedTools`` (for
+    # example ``Bash(npm test)``).  Not part of the HTTP update contract.
+    allowed_tools: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -678,6 +812,8 @@ class AgentHarnessSettings:
         }
 
         raw_runner = raw.get("runner") or codex_raw.get("runner") or "codex_exec"
+        normalized_runner = _normalize_runner(str(raw_runner))
+        legacy_claude = legacy_claude_agent_harness_settings(raw)
         raw_model = raw.get("model") or codex_raw.get("model")
         raw_effort = raw.get("effort") or codex_raw.get("reasoning_effort")
         approval_policy = codex_raw.get("approval_policy", "never")
@@ -686,7 +822,6 @@ class AgentHarnessSettings:
         exec_sandbox = str(codex_raw.get("exec_sandbox") or "workspace-write").strip().lower()
         if exec_sandbox not in AGENT_HARNESS_SAFE_SANDBOXES:
             exec_sandbox = "workspace-write"
-        normalized_runner = _normalize_runner(str(raw_runner))
         # ``custom_command`` is retained for trusted, existing deployments,
         # but malformed shell syntax is disabled before a runner is built.
         custom_command = _safe_custom_command(custom_command_raw.get("command"))
@@ -756,11 +891,19 @@ class AgentHarnessSettings:
             codex=HarnessCodexSettings(
                 bin_path=_safe_cli_bin(codex_raw.get("bin_path"), default="codex", env_name="CODEX_BIN"),
                 model=(
-                    _safe_model_value(raw_model)
+                    (
+                        None
+                        if legacy_claude.get("model")
+                        else _safe_model_value(raw_model)
+                    )
                     or _safe_model_value(codex_cli_raw.get("model"))
                 ),
                 reasoning_effort=(
-                    _safe_model_value(raw_effort)
+                    (
+                        None
+                        if legacy_claude.get("reasoning_effort")
+                        else _safe_model_value(raw_effort)
+                    )
                     or _safe_model_value(codex_cli_raw.get("reasoning_effort"))
                 ),
                 approval_policy=approval_policy,
@@ -772,18 +915,42 @@ class AgentHarnessSettings:
                 bin_path=_safe_cli_bin(claude_raw.get("bin_path"), default="claude", env_name="CLAUDE_BIN"),
                 model=(
                     _safe_model_value(claude_raw.get("model"))
+                    or legacy_claude.get("model")
                     or _safe_model_value(claude_cli_raw.get("model"))
                 ),
                 reasoning_effort=(
                     _safe_model_value(claude_raw.get("reasoning_effort"))
+                    or legacy_claude.get("reasoning_effort")
                     or _safe_model_value(claude_cli_raw.get("reasoning_effort"))
                 ),
+                permission_mode=_safe_claude_permission_mode(claude_raw.get("permission_mode")),
+                allowed_tools=_safe_claude_allowed_tools(claude_raw.get("allowed_tools")),
             ),
             custom_command=HarnessCustomCommandSettings(
                 command=custom_command,
                 args=custom_args,
             ),
         )
+
+
+def _safe_claude_permission_mode(value: Any) -> str:
+    if isinstance(value, str) and value.strip() in AGENT_HARNESS_SAFE_CLAUDE_PERMISSION_MODES:
+        return value.strip()
+    return AGENT_HARNESS_DEFAULT_CLAUDE_PERMISSION_MODE
+
+
+def _safe_claude_allowed_tools(value: Any) -> list[str]:
+    items = _as_str_list(value, [])
+    if len(items) > 32:
+        return []
+    return [
+        item
+        for item in items
+        if len(item) <= 256
+        and not item.startswith("-")
+        and not any(ord(char) < 32 for char in item)
+        and not _HARNESS_SHELL_META.search(item)
+    ]
 
 
 def _is_positive_int(value: Any) -> bool:

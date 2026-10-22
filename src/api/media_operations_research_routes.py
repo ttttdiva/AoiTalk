@@ -68,7 +68,7 @@ class ResearchRoutineRevisionCreateRequest(
         min_length=1,
         max_length=20,
     )
-    target_platforms: list[MediaPlatform] | None = Field(default=None, max_length=6)
+    target_platforms: list[MediaPlatform] | None = Field(default=None, max_length=8)
     cadence: Literal["manual", "hourly", "daily", "weekly", "monthly"] | None = None
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     schedule: dict[str, Any] | None = None
@@ -101,7 +101,7 @@ class ResearchRoutineCreateRequest(
         min_length=1,
         max_length=20,
     )
-    target_platforms: list[MediaPlatform] | None = Field(default=None, max_length=6)
+    target_platforms: list[MediaPlatform] | None = Field(default=None, max_length=8)
     cadence: Literal["manual", "hourly", "daily", "weekly", "monthly"] | None = None
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
     schedule: dict[str, Any] | None = None
@@ -369,7 +369,7 @@ class EditorialProgramRevisionCreateRequest(
     )
     content_type: str = Field(default="article", min_length=1, max_length=64)
     cadence: Literal["manual", "hourly", "daily", "weekly", "monthly"] = "manual"
-    target_platforms: list[MediaPlatform] = Field(default_factory=list, max_length=6)
+    target_platforms: list[MediaPlatform] = Field(default_factory=list, max_length=8)
     target_account_refs: list[str] = Field(default_factory=list, max_length=32)
     content_pillar: str | None = Field(default=None, max_length=200)
     required_resources: list[str] = Field(default_factory=list, max_length=32)
@@ -377,6 +377,7 @@ class EditorialProgramRevisionCreateRequest(
     default_qa_policy_ref: str | None = Field(default=None, max_length=164)
     experiment_ref: str | None = Field(default=None, max_length=164)
     draft_generation_policy: str = Field(default="human_review", min_length=1, max_length=64)
+    max_publications: int | None = Field(default=None, ge=0, le=10000, strict=True)
 
 
 class EditorialProgramCreateRequest(
@@ -393,7 +394,7 @@ class EditorialProgramCreateRequest(
     )
     content_type: str = Field(default="article", min_length=1, max_length=64)
     cadence: Literal["manual", "hourly", "daily", "weekly", "monthly"] = "manual"
-    target_platforms: list[MediaPlatform] = Field(default_factory=list, max_length=6)
+    target_platforms: list[MediaPlatform] = Field(default_factory=list, max_length=8)
     target_account_refs: list[str] = Field(default_factory=list, max_length=32)
     content_pillar: str | None = Field(default=None, max_length=200)
     required_resources: list[str] = Field(default_factory=list, max_length=32)
@@ -401,6 +402,7 @@ class EditorialProgramCreateRequest(
     default_qa_policy_ref: str | None = Field(default=None, max_length=164)
     experiment_ref: str | None = Field(default=None, max_length=164)
     draft_generation_policy: str = Field(default="human_review", min_length=1, max_length=64)
+    max_publications: int | None = Field(default=None, ge=0, le=10000, strict=True)
     state: Literal["draft", "active", "paused", "archived"] = "draft"
     enabled: bool = False
 
@@ -425,6 +427,7 @@ class EditorialProgramRevisionResponse(
     default_qa_policy_ref: str | None
     experiment_ref: str | None
     draft_generation_policy: str
+    max_publications: int | None = None
     content_hash: str
     created_by: str | None
     created_at: str
@@ -467,6 +470,7 @@ class ContentItemCreateRequest(
     _ResearchCommandModel
 ):
     editorial_program_id: str
+    input_kind: Literal["research", "user_authored"] = "research"
     title: str = Field(
         min_length=1,
         max_length=500,
@@ -498,6 +502,7 @@ class ContentItemSummaryResponse(
     project_id: str | None
     title: str
     brief: str
+    input_kind: Literal["research", "user_authored"]
     version: int
     status: Literal["draft", "ready", "in_progress", "published", "archived"]
     persona_revision_id: str | None
@@ -1276,6 +1281,8 @@ def create_media_operations_research_router(
     ) -> Any:
         actor = await current_actor(request)
         data = payload.model_dump(mode="json")
+        if "max_publications" not in payload.model_fields_set:
+            data.pop("max_publications", None)
         expected_version = data.pop("expected_version")
 
         return await _with_session(

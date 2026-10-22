@@ -15,6 +15,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -387,10 +388,11 @@ export function ProjectKnowledgeCapturePanel({
     >
       <CardHeader className="border-b border-border">
         <div className="flex items-center justify-between gap-3">
-          <CardTitle className="flex items-center gap-2 text-base font-semibold">
+          <CardTitle className="inline-flex items-center gap-2 text-base font-semibold">
             <BookOpen className="size-4" />
             解決ナレッジ候補
             <Badge variant="secondary">{total}</Badge>
+            <HelpPopover label="解決ナレッジ候補">解決した作業を、あとから再利用できるProject Docsとして確認・保存します。</HelpPopover>
           </CardTitle>
           <Button
             type="button"
@@ -404,9 +406,6 @@ export function ProjectKnowledgeCapturePanel({
             更新
           </Button>
         </div>
-        <p className="text-sm text-muted-foreground">
-          解決した作業を、あとから再利用できるProject Docsとして確認・保存します。
-        </p>
       </CardHeader>
       <CardContent className="space-y-4 pt-5">
         {error ? (

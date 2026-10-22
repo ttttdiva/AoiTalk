@@ -108,13 +108,13 @@ matrix).
 
 ## Boundary with existing ACLs and side effects
 
-The AI employee platform adds `external_action_propose` and `telephony_control`
+The Agent platform adds `external_action_propose` and `telephony_control`
 as narrow, opt-in capability declarations. These require both company/runtime
 features and explicit Organization runtime/external-action permission. Provider
 execution separately validates exact human approval or the active immutable
 action policy. Bounded policy execution never sets the legacy
 `external_action_approved` flag or manufactures an approval row. See
-[AI employee platform](ai_employee_platform.md).
+[Agent platform](ai_employee_platform.md).
 
 * Existing human Project/Task/Docs/Files ACL services remain authoritative for
   human users.

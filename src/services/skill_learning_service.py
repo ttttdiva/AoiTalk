@@ -36,6 +36,8 @@ from ..security.skill_content_privacy import (
 from .scoped_memory_service import classify_sensitivity
 from .skill_target_io import (
     SkillTargetTransitionPending,
+    SkillTargetIOError,
+    assert_skill_aliases_available,
     async_skill_target_lock,
     atomic_remove,
     atomic_replace_text,
@@ -43,6 +45,7 @@ from .skill_target_io import (
     read_skill_transition_journal,
     read_stable_skill_text,
     read_target_hash,
+    skill_namespace_lock_key,
     write_skill_transition_journal,
 )
 
@@ -1773,6 +1776,10 @@ class SkillLearningService:
     def _write_target(self, proposal: SkillProposal) -> SkillTargetSnapshot:
         """Publish proposal content; caller must hold the per-target lock."""
         path, canonical_path, text, payload = self._proposal_target_material(proposal)
+        try:
+            assert_skill_aliases_available(path, text)
+        except SkillTargetIOError as exc:
+            raise SkillLearningConflict("Skill canonical name or alias publication conflicts") from exc
         atomic_replace_text(path, text)
         sha256 = _digest_text(text)
         return SkillTargetSnapshot(
@@ -1908,6 +1915,10 @@ class SkillLearningService:
             path=path,
             text=text,
         )
+        try:
+            assert_skill_aliases_available(path, text)
+        except SkillTargetIOError as exc:
+            raise SkillLearningConflict("restored Skill canonical name or alias publication conflicts") from exc
         atomic_replace_text(path, text)
         sha256 = _digest_text(text)
         return SkillTargetSnapshot(
@@ -2174,6 +2185,7 @@ class SkillLearningService:
         proposal_id: str,
         *,
         actor_id: str,
+        expected_content_digest: str | None = None,
     ) -> dict[str, Any]:
         async with self._session() as session:
             proposal = await self._load_proposal(
@@ -2188,6 +2200,13 @@ class SkillLearningService:
                 write=True,
             )
             _assert_proposal_content_private(proposal)
+            if expected_content_digest is not None:
+                observed_content_digest = _digest_text(json.dumps(
+                    proposal.proposed_content, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ))
+                if observed_content_digest != expected_content_digest:
+                    raise SkillLearningConflict("approved Skill proposal content changed")
             target_scope = str(proposal.target_scope)
             target_name = str(proposal.target_name)
             target_project_id = (
@@ -2200,7 +2219,7 @@ class SkillLearningService:
                 project_id=target_project_id,
             )
 
-            async with async_skill_target_lock(path):
+            async with async_skill_target_lock(skill_namespace_lock_key(path)), async_skill_target_lock(path):
                 journal = read_skill_transition_journal(path)
                 if journal is not None:
                     recovered = self._recover_transition_locked(
@@ -2508,7 +2527,7 @@ class SkillLearningService:
                 project_id=target_project_id,
             )
 
-            async with async_skill_target_lock(path):
+            async with async_skill_target_lock(skill_namespace_lock_key(path)), async_skill_target_lock(path):
                 journal = read_skill_transition_journal(path)
                 if journal is not None:
                     recovered = self._recover_transition_locked(

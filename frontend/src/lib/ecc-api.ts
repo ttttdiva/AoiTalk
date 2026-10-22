@@ -1,3 +1,7 @@
+import { withBasePath } from "@/lib/base-path";
+import type { components } from "@/lib/api-types.gen";
+
+export type TokenUsageDetail = components["schemas"]["TokenUsageDetail"];
 // ECC (Extended Claude Capabilities) API クライアント
 // ブラウザから直接呼ぶ用（"use client"コンポーネントから使用）
 // 全て /api/python-proxy/api/ 経由（Python バックエンド）
@@ -249,7 +253,7 @@ async function fetchWithTimeout<T>(
     });
     if (res.status === 401) {
       if (typeof window !== "undefined") {
-        window.location.href = "/login";
+        window.location.href = withBasePath("/login");
       }
       throw new Error("認証が必要です");
     }
@@ -322,6 +326,10 @@ function usageParams(
 }
 
 export const usageApi = {
+  getRecordDetail: (usageId: string, runId: string) => {
+    const query = new URLSearchParams({ run_id: runId });
+    return get<TokenUsageDetail>(`/usage/records/${encodeURIComponent(usageId)}?${query}`);
+  },
   getDashboard: async (includeFreeIncentive?: boolean) => {
     const params = usageParams({}, includeFreeIncentive);
     const query = params.toString();
@@ -642,6 +650,7 @@ function memoryQuery(options: ScopedMemoryListOptions = {}): string {
 }
 
 export const memoryApi = {
+  get: (id: string) => get<{ success: boolean; memory: ScopedMemory }>(`/memories/${encodeURIComponent(id)}`),
   list: (options?: ScopedMemoryListOptions) =>
     get<{ success: boolean; memories: ScopedMemory[] }>(
       `/memories${memoryQuery(options)}`,

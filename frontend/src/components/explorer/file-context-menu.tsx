@@ -21,8 +21,6 @@ import {
   useFilerUndoState,
 } from "@/hooks/use-filer-operations";
 import { toFilerDeleteTarget } from "@/lib/explorer/filer-operations";
-import { isHfPath } from "@/lib/hf/virtual-path";
-import { isHydrusPath } from "@/lib/hydrus/virtual-path";
 import { isRecordTableFile } from "@/lib/record-tables-api";
 import {
   FolderOpen,
@@ -38,10 +36,12 @@ import {
   RefreshCw,
   Image as ImageIcon,
   ImageOff,
+  BookmarkPlus,
   Undo2,
   Redo2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { requestFilesBookmark } from "@/lib/files-sidebar-events";
 
 // 画像ファイル拡張子（フォルダサムネに設定可能）
 const IMAGE_EXTS = new Set([
@@ -157,8 +157,18 @@ export function FileContextMenu({
         paths: clipboard.paths,
         destDir: currentPath,
         operation: clipboard.operation === "cut" ? "move" : "copy",
-        onTransferred: () => {
-          if (clipboard.operation === "cut") setClipboard(null);
+        onTransferred: (transferredPaths) => {
+          if (clipboard.operation === "cut") {
+            const transferred = new Set(transferredPaths);
+            const remainingPaths = clipboard.paths.filter(
+              (path) => !transferred.has(path),
+            );
+            setClipboard(
+              remainingPaths.length > 0
+                ? { ...clipboard, paths: remainingPaths }
+                : null,
+            );
+          }
         },
       });
       onClose();
@@ -237,6 +247,8 @@ export function FileContextMenu({
     return createPortal(
       <MenuMnemonicSurface
         ref={menuRef}
+        // Portaled to <body>, but part of the Files keyboard workspace.
+        data-workspace="files"
         className="fixed z-50 min-w-48 rounded-md border border-border bg-popover p-1 shadow-lg"
         style={menuStyle}
         onContextMenu={(e) => e.preventDefault()}
@@ -283,9 +295,8 @@ export function FileContextMenu({
   const normalizedExt = itemExt.startsWith(".") ? itemExt : `.${itemExt}`;
   const isImageFile = !isDirectory && IMAGE_EXTS.has(normalizedExt);
 
-  // HF / Hydrus 仮想パスはフォルダサムネイル設定の対象外（.folder-thumb 書き込み不可）
-  const isVirtualPath =
-    isHfPath(item.path) || isHydrusPath(item.path) || isRecordTable;
+  // レコードテーブルはフォルダサムネイル設定の対象外（.folder-thumb 書き込み不可）
+  const isVirtualPath = isRecordTable;
   const canSetFolderThumb =
     isImageFile && !isVirtualPath && !isRemoteWorkspace && !!currentPath;
   const canClearFolderThumb =
@@ -320,6 +331,11 @@ export function FileContextMenu({
     } else if (onOpen) {
       onOpen(item);
     }
+    onClose();
+  };
+
+  const handleAddToFavorites = () => {
+    requestFilesBookmark(item.path, item.name);
     onClose();
   };
 
@@ -364,8 +380,18 @@ export function FileContextMenu({
       paths: clipboard.paths,
       destDir: dest,
       operation: clipboard.operation === "cut" ? "move" : "copy",
-      onTransferred: () => {
-        if (clipboard.operation === "cut") setClipboard(null);
+      onTransferred: (transferredPaths) => {
+        if (clipboard.operation === "cut") {
+          const transferred = new Set(transferredPaths);
+          const remainingPaths = clipboard.paths.filter(
+            (path) => !transferred.has(path),
+          );
+          setClipboard(
+            remainingPaths.length > 0
+              ? { ...clipboard, paths: remainingPaths }
+              : null,
+          );
+        }
       },
     });
     onClose();
@@ -396,6 +422,14 @@ export function FileContextMenu({
     // 開く: フォルダは常に、ファイルはonOpenがある場合
     ...(isDirectory || (onOpen && (isTextFile || isRecordTable))
       ? [{ icon: FolderOpen, label: "開く", mnemonic: "O", action: handleOpen }]
+      : []),
+    ...(!isRemoteWorkspace
+      ? [{
+          icon: BookmarkPlus,
+          label: "お気に入りに登録",
+          mnemonic: "F",
+          action: handleAddToFavorites,
+        }]
       : []),
     // ダウンロード: 実体パスのファイル / フォルダ
     ...(!isRecordTable && !isVirtualPath
@@ -430,7 +464,7 @@ export function FileContextMenu({
           },
         ]
       : []),
-    // リネーム: HF / Hydrus / 絶対パスでは不可（従来は空振りするメニューが出ていた）
+    // リネーム: 絶対パスでは不可（従来は空振りするメニューが出ていた）
     ...(capabilities.canRename
       ? [
           {
@@ -496,6 +530,8 @@ export function FileContextMenu({
   return createPortal(
     <MenuMnemonicSurface
       ref={menuRef}
+      // Portaled to <body>, but part of the Files keyboard workspace.
+      data-workspace="files"
       className="fixed z-50 min-w-40 rounded-md border border-border bg-popover p-1 shadow-lg"
       style={menuStyle}
       onContextMenu={(e) => e.preventDefault()}

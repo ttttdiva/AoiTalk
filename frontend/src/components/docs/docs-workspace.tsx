@@ -18,6 +18,7 @@ import {
   type DragEvent as ReactDragEvent,
 } from "react";
 import { usePathname } from "next/navigation";
+import { readDocsLastLocation, writeDocsLastLocation, type DocsLastLocation } from "./docs-last-location";
 import {
   createPortal,
   flushSync,
@@ -47,6 +48,7 @@ import {
 import {
   Button,
 } from "@/components/ui/button";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   Skeleton,
 } from "@/components/ui/skeleton";
@@ -287,6 +289,31 @@ function validDocsNodes(nodes: DocsNode[]): DocsNode[] {
 }
 
 type DocsLoadStatus = "success" | "superseded" | "failed";
+type DocsNavigationHistoryEntry = {
+  focusNodeId: string | null;
+  selectedNodeId: string | null;
+  selectedNodeIds: string[];
+  selectionAnchorNodeId: string | null;
+  mainView: "trash" | "search" | null;
+  tagPageId: string | null;
+  splitNodeId: string | null;
+  collapsedNodeIds: string[];
+  sidebarCollapsedNodeIds: string[];
+  rightPanel: "related" | "tags";
+  propertiesOpen: boolean;
+  propertiesTagId: string | null;
+  searchNodeTagFilter: string;
+  searchNodeVisibleTagCount: number;
+  activeSupertagViewId: string | null;
+  supertagTagFilter: string;
+  contentScrollTop: number;
+  contentScrollLeft: number;
+  splitScrollTop: number;
+  splitScrollLeft: number;
+  sidebarScrollTop: number;
+};
+
+const DOCS_NAVIGATION_HISTORY_LIMIT = 80;
 
 export const DOCS_OPEN_NODE_TIMEOUT_MS = 10_000;
 export const DOCS_OPEN_NODE_FAILED_MESSAGE = "対象のDocsノードを開けませんでした";
@@ -719,6 +746,8 @@ export function DocsWorkspace({
     };
   }, [apiFetch, docsSource]);
   const [state, setState] = useState<DocsState>(EMPTY_STATE);
+  const stateRef = useRef(state);
+  stateRef.current = state;
   useEffect(() => {
     if (isDocsRoute) publishCanonicalDocsState(docsNavigationOwnerRef.current, state);
   }, [isDocsRoute, state]);
@@ -735,6 +764,10 @@ export function DocsWorkspace({
   const [propertiesTagId, setPropertiesTagId] = useState<string | null>(null);
   // ゴミ箱 / Search nodes はメイン領域にフルビューとして開く。tagPageId と排他。
   const [mainView, setMainView] = useState<"trash" | "search" | null>(null);
+  const mainViewRef = useRef(mainView);
+  mainViewRef.current = mainView;
+  const [searchNodeTagFilter, setSearchNodeTagFilter] = useState("");
+  const [searchNodeVisibleTagCount, setSearchNodeVisibleTagCount] = useState(40);
   useEffect(() => {
     if (mainView !== "trash" || docsReadOnly) return;
     let cancelled = false;
@@ -758,6 +791,10 @@ export function DocsWorkspace({
   const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
   const [newTagName, setNewTagName] = useState("");
   const [tagPageId, setTagPageId] = useState<string | null>(null);
+  const tagPageIdRef = useRef(tagPageId);
+  tagPageIdRef.current = tagPageId;
+  const [activeSupertagViewId, setActiveSupertagViewId] = useState<string | null>(null);
+  const [supertagTagFilter, setSupertagTagFilter] = useState("");
   const [focusRequestNodeId, setFocusRequestNodeId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -783,6 +820,8 @@ export function DocsWorkspace({
     selectRangeToNode,
     selectDomRangeById,
   } = useDocsSelection(setFocusRequestNodeId);
+  const selectedNodeIdRef = useRef(selectedNodeId);
+  selectedNodeIdRef.current = selectedNodeId;
   const [pageReferences, setPageReferences] = useState<ReferencesState>(EMPTY_REFERENCES);
   const [pageReferencesLoading, setPageReferencesLoading] = useState(false);
   const [sidebarContextMenu, setSidebarContextMenu] = useState<SidebarContextMenuState | null>(null);
@@ -833,16 +872,37 @@ export function DocsWorkspace({
     // restore the canonical value instead of leaving a blank row behind.
     const pageTitleCanonicalRef = useRef(new Map<string, string>());
   const pendingCreateHistoryIdsRef = useRef(new Set<string>());
+  // An optimistic create can reject after its editor has already moved on to
+  // the next row.  Keep that failed id quarantined so the stale editor cleanup
+  // cannot turn the rollback into a new title/body history entry or PATCH.
+  const failedOptimisticNodeIdsRef = useRef(new Set<string>());
   // DELETE returns the complete closure even when descendants were not
   // hydrated in this client snapshot. Keep it by mutation root so history and
   // selection reconciliation can remove every known ghost row deterministically.
   const archivedDescendantIdsRef = useRef(new Map<string, string[]>());
   const taskBindingInFlightRef = useRef<Set<string>>(new Set());
   const sidebarScrollNodeRef = useRef<string | null>(null);
-  const previousInitialNodeIdRef = useRef(initialNodeId);
+  const suppressSidebarAutoScrollRef = useRef(false);
+  const locationScopeRef = useRef({ currentUserId, docsSource, initialNodeId });
+  locationScopeRef.current = { currentUserId, docsSource, initialNodeId };
+  const loadedLocationScopeRef = useRef<typeof locationScopeRef.current | null>(null);
+  const locationLibraryIdRef = useRef<string | null>(null);
+  const authorizedLocationNodesRef = useRef(new Map<string, DocsNode>());
   const remoteProfilesRequestRef = useRef(0);
   const docsLoadGenerationRef = useRef(0);
   const openDocsNodeGenerationRef = useRef(0);
+  const docsNavigationHistoryRef = useRef<{ entries: DocsNavigationHistoryEntry[]; index: number }>({ entries: [], index: -1 });
+  const pendingNavigationRestoreRef = useRef<DocsNavigationHistoryEntry | null>(null);
+  const navigationRestoreGenerationRef = useRef(0);
+  const pendingNavigationOpenRestoreGenerationRef = useRef<number | null>(null);
+  const applyingNavigationScrollRestoreRef = useRef(false);
+  const [navigationRestoreVersion, setNavigationRestoreVersion] = useState(0);
+  useEffect(() => {
+    docsNavigationHistoryRef.current = { entries: [], index: -1 };
+    pendingNavigationRestoreRef.current = null;
+    pendingNavigationOpenRestoreGenerationRef.current = null;
+    navigationRestoreGenerationRef.current += 1;
+  }, [currentUserId, docsSource]);
   // Keep the actor's own Personal Library id separate from the currently
   // focused library.  A Project node may be writable while its definitions
   // remain owned by another user's library.
@@ -868,10 +928,17 @@ export function DocsWorkspace({
   const archiveSelectedNodesRef = useRef<() => Promise<void>>(async () => {});
   const loadedParentAccessRef = useRef(new Map<string, number>());
   const focusNodeIdRef = useRef(focusNodeId);
+  focusNodeIdRef.current = focusNodeId;
   const nodeLoadCountRef = useRef(new Map<string, number>());
   const nodeTagIdsRef = useRef(new Map<string, string[]>());
   const tagMutationQueueRef = useRef(new Map<string, Promise<void>>());
   const docsSaveQueue = useMemo(() => new DocsSaveQueue<DocsNode>(), []);
+  const editorFlushesRef = useRef(new Set<() => Promise<void> | void>());
+  const docsCompositionTargetRef = useRef<Element | null>(null);
+  const registerEditorFlush = useCallback((flush: () => Promise<void> | void) => {
+    editorFlushesRef.current.add(flush);
+    return () => editorFlushesRef.current.delete(flush);
+  }, []);
 
   // A navigation/state replacement must not race the last CodeMirror blur.
   // DocsSaveQueue.flush() deliberately swallows individual chain failures so
@@ -892,8 +959,32 @@ export function DocsWorkspace({
         editorCommitError = error;
       }
     }
+    let editorFlushFailed = false;
+    let editorFlushError: unknown;
+    for (const flush of Array.from(editorFlushesRef.current)) {
+      try {
+        await flush();
+      } catch (error) {
+        editorFlushFailed = true;
+        editorFlushError ??= error;
+      }
+    }
+    let nodeCreateFailed = false;
+    let nodeCreateError: unknown;
+    const nodeCreates = Array.from(nodeCreateInFlightRef.current.values());
+    if (nodeCreates.length > 0) {
+      const results = await Promise.allSettled(nodeCreates);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          nodeCreateFailed = true;
+          nodeCreateError ??= result.reason;
+        }
+      }
+    }
     await docsSaveQueue.flush();
     if (editorCommitFailed) throw editorCommitError;
+    if (editorFlushFailed) throw editorFlushError;
+    if (nodeCreateFailed) throw nodeCreateError;
   }, [docsSaveQueue]);
 
   // 展開復元で既に処理したノード。同じノードへ何度もリクエストを出さないための記録。
@@ -1385,6 +1476,23 @@ export function DocsWorkspace({
   }, [currentRows, nodesById, selectedNodeIds, splitRows]);
 
   const load = useCallback(async (options: LoadOptions = {}): Promise<DocsLoadStatus> => {
+    const loadGeneration = ++docsLoadGenerationRef.current;
+    const navigationGeneration = openDocsNodeGenerationRef.current;
+    const isCurrentLoadScope = () => workspaceMountedRef.current
+      && loadGeneration === docsLoadGenerationRef.current
+      && locationScopeRef.current.currentUserId === currentUserId
+      && locationScopeRef.current.docsSource === docsSource
+      && locationScopeRef.current.initialNodeId === initialNodeId;
+    const isCurrentNavigation = () => isCurrentLoadScope()
+      && navigationGeneration === openDocsNodeGenerationRef.current;
+    // A task update/move refreshes the current page even when the URL still
+    // names an earlier page. Only a new route/scope resumes from its target.
+    const loadedScope = loadedLocationScopeRef.current;
+    const refreshNodeId = loadedScope?.currentUserId === currentUserId
+      && loadedScope?.docsSource === docsSource
+      && loadedScope?.initialNodeId === initialNodeId
+      ? focusNodeIdRef.current
+      : null;
     // `load` replaces the canonical snapshot.  Keep this guard here as a
     // second line of defence for refresh/reload callers that do not go through
     // one of the explicit navigation handlers below.
@@ -1398,13 +1506,10 @@ export function DocsWorkspace({
       toast.error(error instanceof Error ? error.message : "Docsの保存に失敗しました。入力内容を確認してください");
       return "failed";
     }
-    const loadGeneration = ++docsLoadGenerationRef.current;
-    // Navigation callers share this token with openDocsNode/openToday.  A
-    // newer navigation must prevent this state-replacing load from publishing
-    // a stale snapshot after its own save barrier has completed.
-    const navigationGeneration = openDocsNodeGenerationRef.current;
-    const isCurrentNavigation = () => navigationGeneration === openDocsNodeGenerationRef.current;
+    if (!isCurrentNavigation()) return "superseded";
     networkSettledGenerationRef.current = null;
+    authorizedLocationNodesRef.current = new Map();
+    locationLibraryIdRef.current = null;
     setNetworkSettledGeneration(null);
     const bootstrapCacheKey = `${DOCS_BOOTSTRAP_CACHE_PREFIX}${String(docsSource ?? "local")}`;
 
@@ -1430,8 +1535,11 @@ export function DocsWorkspace({
         cachedBootstrapEtag = cachedBootstrap && isDocsBootstrapCacheEntry(cachedValue)
           ? cachedValue.etag
           : null;
+        const cachedLocation = cachedBootstrap
+          ? await readDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: docsLibraryIdForState(cachedBootstrap) })
+          : null;
         if (
-          cachedBootstrap &&
+          !cachedLocation && cachedBootstrap &&
           cachedBootstrap.nodes.length > 0 &&
           loadGeneration === docsLoadGenerationRef.current &&
           isCurrentNavigation()
@@ -1491,14 +1599,26 @@ export function DocsWorkspace({
         if (options.nodeId && !remoteNodes.some((node) => node.id === options.nodeId)) {
           throw new Error("対象のDocsノードを読み込めませんでした");
         }
+        const remoteLibraryId = docsLibraryIdForState(nextState);
+        const location = !options.nodeId && !initialNodeId
+          ? await readDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: remoteLibraryId })
+          : null;
+        const restoredNode = location && remoteNodes.find((node) => node.id === location.nodeId
+          && node.docs_library_id === location.libraryId && !node.archived_at);
         const defaultNodeId =
           (options.nodeId && remoteNodes.some((node) => node.id === options.nodeId)
             ? options.nodeId
             : initialNodeId && remoteNodes.some((node) => node.id === initialNodeId)
               ? initialNodeId
-              : remoteNodes[0]?.id) ?? null;
+              : restoredNode?.id ?? remoteNodes.find((node) => !node.archived_at)?.id) ?? null;
         if (!isCurrentNavigation()) return "superseded";
+        locationLibraryIdRef.current = remoteLibraryId;
+        loadedLocationScopeRef.current = { currentUserId, docsSource, initialNodeId };
+        authorizedLocationNodesRef.current = new Map(remoteNodes.map((node) => [node.id, node]));
+        void writeDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: remoteLibraryId },
+          remoteNodes.find((node) => node.id === defaultNodeId));
         setState(nextState);
+        focusNodeIdRef.current = defaultNodeId;
         setFocusNodeId(defaultNodeId);
         selectedNodeIdsRef.current = defaultNodeId ? [defaultNodeId] : [];
         selectionAnchorNodeIdRef.current = defaultNodeId;
@@ -1543,7 +1663,8 @@ export function DocsWorkspace({
       // Stop waiting after the open timeout so one hung GET cannot pin the
       // initial skeleton, then abandon that shared flight so the next
       // fetchDocsBootstrap can start a new request.
-      const requestedFocusId = options.nodeId ?? initialNodeId ?? null;
+      let requestedFocusId = options.nodeId ?? refreshNodeId ?? initialNodeId ?? null;
+      let restoredLocation: DocsLastLocation | null = null;
       const bootstrapPromise = fetchDocsBootstrap({
         cached: cachedBootstrap,
         etag: cachedBootstrapEtag,
@@ -1573,18 +1694,38 @@ export function DocsWorkspace({
         abandonDocsBootstrapInFlight();
       }
       const data = settledValue(bootstrapResult);
-      if (data) {
+      if (data && isCurrentLoadScope()) {
         actorDocsLibraryIdRef.current = docsLibraryIdForState(data) ?? actorDocsLibraryIdRef.current;
+        locationLibraryIdRef.current = docsLibraryIdForState(data);
+        // A user may open a lazy page before bootstrap reveals the actor's
+        // library. Finish only its metadata/pending bookmark, never its UI.
+        if (!isCurrentNavigation()) {
+          const openedNode = focusNodeIdRef.current
+            ? authorizedLocationNodesRef.current.get(focusNodeIdRef.current)
+            : undefined;
+          void writeDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: locationLibraryIdRef.current }, openedNode);
+        }
+      }
+      if (!isCurrentNavigation()) return "superseded";
+      if (data) {
+        if (!requestedFocusId && !options.focusToday && !options.date) {
+          restoredLocation = await readDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: docsLibraryIdForState(data) });
+          if (!isCurrentNavigation()) return "superseded";
+          requestedFocusId = restoredLocation?.nodeId ?? null;
+        }
       }
       const firstNodeId = requestedFocusId
         ?? data?.nodes.find((node) => node.system_key === "home")?.id
         ?? data?.nodes[0]?.id
         ?? null;
+      let focusedTreeResult: PromiseSettledResult<DocsNeighborhoodResponse> | null = null;
+      let preserveStoredLocation = false;
       let focusedTree: DocsNeighborhoodResponse | null = null;
       let focusedChildren: DocsNeighborhoodResponse | null = null;
       let focusedDetails: DocsNeighborhoodResponse | null = null;
       if (earlyNeighborhoodPromise) {
         const [treeResult, childrenResult, detailsResult] = await earlyNeighborhoodPromise;
+        focusedTreeResult = treeResult;
         focusedTree = settledValue(treeResult);
         focusedChildren = settledValue(childrenResult);
         focusedDetails = settledValue(detailsResult);
@@ -1606,9 +1747,27 @@ export function DocsWorkspace({
             requestTimeoutMs,
           ),
         ]);
+        focusedTreeResult = treeResult;
         focusedTree = settledValue(treeResult);
         focusedChildren = settledValue(childrenResult);
         focusedDetails = settledValue(detailsResult);
+      }
+      if (restoredLocation) {
+        const restoredNodeId = focusedTree?.focus_node_id ?? restoredLocation.nodeId;
+        const restoredNode = focusedTree?.nodes?.find((node) => node.id === restoredNodeId
+          && node.docs_library_id === restoredLocation.libraryId && !node.archived_at);
+        if (!restoredNode) {
+          const status = focusedTreeResult?.status === "rejected"
+            ? (focusedTreeResult.reason as { status?: number } | undefined)?.status
+            : undefined;
+          // An inaccessible/missing/archived target is replaced by safe Home.
+          // A timeout or transport/server failure keeps the bookmark for retry.
+          preserveStoredLocation = focusedTreeResult?.status === "rejected"
+            && ![403, 404, 410].includes(status ?? 0);
+          focusedTree = null;
+          focusedChildren = null;
+          focusedDetails = null;
+        }
       }
       let todayTree: DocsNeighborhoodResponse | null = null;
       let todayChildren: DocsNeighborhoodResponse | null = null;
@@ -1661,30 +1820,38 @@ export function DocsWorkspace({
       if (options.nodeId && !nextState.nodes.some((node) => node.id === options.nodeId)) {
         throw new Error("対象のDocsノードを読み込めませんでした");
       }
-      const requestedNodeId = focusedTreeState?.focus_node_id ?? options.nodeId ?? initialNodeId;
+      const requestedNodeId = focusedTreeState?.focus_node_id
+        ?? (restoredLocation ? null : requestedFocusId);
       const requestedPresent = Boolean(
-        requestedNodeId && nextState.nodes.some((node) => node.id === requestedNodeId),
+        requestedNodeId && nextState.nodes.some((node) => node.id === requestedNodeId && !node.archived_at),
       );
       if (initialNodeId && !requestedPresent && !options.nodeId && (data || focusedTree || today)) {
         toast.error("対象のDocsノードを読み込めませんでした");
       }
-      const initialNodeChanged = previousInitialNodeIdRef.current !== initialNodeId;
-      previousInitialNodeIdRef.current = initialNodeId;
       const defaultNodeId = today?.node.id
         ?? (requestedPresent ? requestedNodeId : null)
-        ?? (firstNodeId && nextState.nodes.some((node) => node.id === firstNodeId) ? firstNodeId : null)
-        ?? nextState.nodes.find((node) => node.system_key === "home")?.id
-        ?? nextState.nodes[0]?.id
+        ?? (!restoredLocation && firstNodeId && nextState.nodes.some((node) => node.id === firstNodeId && !node.archived_at) ? firstNodeId : null)
+        ?? nextState.nodes.find((node) => node.system_key === "home" && !node.archived_at)?.id
+        ?? nextState.nodes.find((node) => !node.archived_at)?.id
         ?? null;
       // state を作り直した直後に記録を捨てる。読込前に捨てると、この setState で
       // 上書きされる先読み結果を「復元済み」と誤認して二度と展開されない。
       expandRestoreDoneRef.current = new Set();
       expandRestoreLoadCountRef.current = 0;
       if (!isCurrentNavigation()) return "superseded";
+      loadedLocationScopeRef.current = { currentUserId, docsSource, initialNodeId };
+      authorizedLocationNodesRef.current = new Map(nextState.nodes.map((node) => [node.id, node]));
       setState(nextState);
-      setFocusNodeId((current) => (today ? today.node.id : initialNodeChanged ? defaultNodeId : current ?? defaultNodeId));
-      setSelectedNodeId((current) => {
-        const nextId = today ? today.node.id : initialNodeChanged ? defaultNodeId : current ?? defaultNodeId;
+      focusNodeIdRef.current = defaultNodeId;
+      setFocusNodeId(defaultNodeId);
+      if (!preserveStoredLocation && (today || !initialNodeId || requestedPresent)) {
+        const verifiedNode = today?.node
+          ?? focusedTree?.nodes?.find((node) => node.id === defaultNodeId)
+          ?? (!requestedFocusId || restoredLocation ? data?.nodes.find((node) => node.id === defaultNodeId) : undefined);
+        void writeDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: locationLibraryIdRef.current }, verifiedNode);
+      }
+      setSelectedNodeId(() => {
+        const nextId = defaultNodeId;
         selectedNodeIdsRef.current = nextId ? [nextId] : [];
         selectionAnchorNodeIdRef.current = nextId;
         setSelectedNodeIds(nextId ? [nextId] : []);
@@ -1702,6 +1869,7 @@ export function DocsWorkspace({
         // foreign-node route fails to resolve.  The route is either empty or
         // focused on the requested library, never a stale mixed state.
         setState(EMPTY_STATE);
+        focusNodeIdRef.current = null;
         setFocusNodeId(null);
         selectedNodeIdsRef.current = [];
         selectionAnchorNodeIdRef.current = null;
@@ -1721,6 +1889,7 @@ export function DocsWorkspace({
     }
   }, [
     apiFetch,
+    currentUserId,
     docsReadOnly,
     docsSource,
     flushPendingDocsEditorWritesBeforeNavigation,
@@ -1778,18 +1947,50 @@ export function DocsWorkspace({
     return request;
   }, [apiFetch]);
 
+  const createLazyNodeLoadGuard = useCallback((nodeId: string, controller: AbortController) => {
+    const loadGeneration = docsLoadGenerationRef.current;
+    const navigationGeneration = openDocsNodeGenerationRef.current;
+    const requestedNode = stateRef.current.nodes.find((node) => node.id === nodeId);
+    const requestedNodeLibraryId = requestedNode
+      ? requestedNode.docs_library_id || docsLibraryIdForState(stateRef.current)
+      : null;
+    const scope = locationScopeRef.current;
+    const isCurrentScope = () => workspaceMountedRef.current
+      && !controller.signal.aborted
+      && loadGeneration === docsLoadGenerationRef.current
+      && scope.currentUserId === locationScopeRef.current.currentUserId
+      && scope.docsSource === locationScopeRef.current.docsSource
+      && scope.initialNodeId === locationScopeRef.current.initialNodeId;
+    const canCommit = (current: DocsState, incoming: DocsNeighborhoodResponse) => {
+      if (!isCurrentScope()) return false;
+      const currentLibraryId = docsLibraryIdForState(current);
+      // While a new tree is loading, the old library remains interactive and
+      // can start lazy loads under the new navigation token. Keep those loads
+      // tied to their originating node even when the token still matches.
+      if (requestedNodeLibraryId && requestedNodeLibraryId !== currentLibraryId) return false;
+      if (navigationGeneration === openDocsNodeGenerationRef.current) return true;
+      // Opening another page must not discard a legitimate sidebar expansion
+      // in the same library. It must, however, stop an older response from
+      // rebasing the canonical snapshot after cross-library navigation.
+      const incomingLibraryId = docsLibraryIdForState(incoming)
+        ?? requestedNodeLibraryId
+        ?? current.nodes.find((node) => node.id === nodeId)?.docs_library_id;
+      return Boolean(incomingLibraryId && incomingLibraryId === currentLibraryId);
+    };
+    return { isCurrentScope, canCommit };
+  }, []);
+
   const loadNodeChildren = useCallback((nodeId: string, cursor?: string | null) => {
     const requestKey = `${nodeId}:${cursor ?? "first"}`;
     const inFlight = nodeChildrenInFlightRef.current.get(requestKey);
     if (inFlight) return inFlight.promise;
-    const requestGeneration = docsLoadGenerationRef.current;
-    const isCurrentScope = () => requestGeneration === docsLoadGenerationRef.current;
     const controller = new AbortController();
+    const { isCurrentScope, canCommit } = createLazyNodeLoadGuard(nodeId, controller);
     markNodeLoading(nodeId, true);
     const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     const promise = apiFetch<DocsNeighborhoodResponse>(`/api/docs/nodes/${nodeId}/children${query}`, { signal: controller.signal })
       .then((data) => {
-        if (!isCurrentScope()) return {};
+        if (!canCommit(stateRef.current, data)) return {};
         loadedParentAccessRef.current.set(nodeId, Date.now());
         const protectedIds = new Set<string>();
         let protectedId = focusNodeIdRef.current;
@@ -1806,7 +2007,10 @@ export function DocsWorkspace({
               .map(([parentId]) => parentId)
           : [];
         for (const parentId of evictParents) loadedParentAccessRef.current.delete(parentId);
-        setState((current) => evictDocsSubtrees(mergeLoadedDocsState(current, data), evictParents));
+        setState((current) => {
+          if (!canCommit(current, data)) return current;
+          return evictDocsSubtrees(mergeLoadedDocsState(current, data), evictParents);
+        });
         return data;
       })
       .catch((error) => {
@@ -1820,7 +2024,7 @@ export function DocsWorkspace({
       });
     nodeChildrenInFlightRef.current.set(requestKey, { controller, promise });
     return promise;
-  }, [apiFetch, markNodeLoading, nodesById]);
+  }, [apiFetch, createLazyNodeLoadGuard, markNodeLoading, nodesById]);
 
   // Blank legacy parents are intentionally omitted from every visible
   // projection.  Do not wait for a user click on the hidden row to trigger
@@ -1903,14 +2107,16 @@ export function DocsWorkspace({
   const loadNodeDetails = useCallback((nodeId: string) => {
     const inFlight = nodeDetailsInFlightRef.current.get(nodeId);
     if (inFlight) return inFlight.promise;
-    const requestGeneration = docsLoadGenerationRef.current;
-    const isCurrentScope = () => requestGeneration === docsLoadGenerationRef.current;
     const controller = new AbortController();
+    const { isCurrentScope, canCommit } = createLazyNodeLoadGuard(nodeId, controller);
     markNodeLoading(nodeId, true);
     const promise = apiFetch<DocsNeighborhoodResponse>(`/api/docs/nodes/${nodeId}/details`, { signal: controller.signal })
       .then((data) => {
-        if (!isCurrentScope()) return {};
-        setState((current) => mergeLoadedDocsState(current, data));
+        if (!canCommit(stateRef.current, data)) return {};
+        setState((current) => {
+          if (!canCommit(current, data)) return current;
+          return mergeLoadedDocsState(current, data);
+        });
         return data;
       })
       .catch((error) => {
@@ -1924,7 +2130,7 @@ export function DocsWorkspace({
       });
     nodeDetailsInFlightRef.current.set(nodeId, { controller, promise });
     return promise;
-  }, [apiFetch, markNodeLoading]);
+  }, [apiFetch, createLazyNodeLoadGuard, markNodeLoading]);
 
   const ensureNodeDetailsLoaded = useCallback((nodeId: string) => {
     if ((state.details_loaded_ids ?? []).includes(nodeId)) return Promise.resolve(null);
@@ -2115,6 +2321,73 @@ export function DocsWorkspace({
     });
   }, [ensureNodeChildrenLoaded, setSidebarCollapsed, sidebarCollapsed]);
 
+  const captureDocsNavigationEntry = useCallback((): DocsNavigationHistoryEntry => {
+    const content = document.querySelector<HTMLElement>('[data-docs-history-main-scroll="main"]');
+    const splitContent = document.querySelector<HTMLElement>('[data-docs-history-main-scroll="split"]');
+    const sidebar = document.querySelector<HTMLElement>("[data-docs-history-sidebar-scroll]");
+    return {
+      focusNodeId: focusNodeIdRef.current,
+      selectedNodeId: selectedNodeIdRef.current,
+      selectedNodeIds: [...selectedNodeIdsRef.current],
+      selectionAnchorNodeId: selectionAnchorNodeIdRef.current,
+      mainView: mainViewRef.current,
+      tagPageId: tagPageIdRef.current,
+      splitNodeId,
+      collapsedNodeIds: [...collapsed],
+      sidebarCollapsedNodeIds: [...sidebarCollapsed],
+      rightPanel,
+      propertiesOpen,
+      propertiesTagId,
+      searchNodeTagFilter,
+      searchNodeVisibleTagCount,
+      activeSupertagViewId,
+      supertagTagFilter,
+      contentScrollTop: content?.scrollTop ?? 0,
+      contentScrollLeft: content?.scrollLeft ?? 0,
+      splitScrollTop: splitContent?.scrollTop ?? 0,
+      splitScrollLeft: splitContent?.scrollLeft ?? 0,
+      sidebarScrollTop: sidebar?.scrollTop ?? 0,
+    };
+  }, [activeSupertagViewId, collapsed, propertiesOpen, propertiesTagId, rightPanel, searchNodeTagFilter, searchNodeVisibleTagCount, selectedNodeIdsRef, selectionAnchorNodeIdRef, sidebarCollapsed, splitNodeId, supertagTagFilter]);
+
+  const queueDocsNavigationScrollRestore = useCallback((entry: DocsNavigationHistoryEntry) => {
+    pendingNavigationRestoreRef.current = entry;
+    setNavigationRestoreVersion((version) => version + 1);
+  }, []);
+
+  const recordDocsNavigation = useCallback((origin: DocsNavigationHistoryEntry, targetNodeId: string): boolean => {
+    if (
+      origin.focusNodeId === targetNodeId
+      && origin.mainView === null
+      && origin.tagPageId === null
+    ) return false;
+    const history = docsNavigationHistoryRef.current;
+    let entries = history.entries.slice(0, history.index + 1);
+    if (history.index < 0) {
+      entries = [origin];
+    } else {
+      entries[history.index] = origin;
+    }
+    entries.push({
+      ...origin,
+      focusNodeId: targetNodeId,
+      selectedNodeId: targetNodeId,
+      selectedNodeIds: [targetNodeId],
+      selectionAnchorNodeId: targetNodeId,
+      mainView: null,
+      tagPageId: null,
+      contentScrollTop: 0,
+      contentScrollLeft: 0,
+      splitScrollTop: 0,
+      splitScrollLeft: 0,
+    });
+    if (entries.length > DOCS_NAVIGATION_HISTORY_LIMIT) {
+      entries = entries.slice(-DOCS_NAVIGATION_HISTORY_LIMIT);
+    }
+    docsNavigationHistoryRef.current = { entries, index: entries.length - 1 };
+    return true;
+  }, []);
+
   useEffect(() => {
     expandNodeRef.current = expandNode;
   }, [expandNode]);
@@ -2122,14 +2395,39 @@ export function DocsWorkspace({
   const applyOpenDocsNodeSelection = useCallback((nodeId: string) => {
     setMainView(null);
     setTagPageId(null);
+    setLoading(false);
+    networkSettledGenerationRef.current = docsLoadGenerationRef.current;
+    setNetworkSettledGeneration(docsLoadGenerationRef.current);
+    focusNodeIdRef.current = nodeId;
     setFocusNodeId(nodeId);
     selectSingleNode(nodeId);
   }, [selectSingleNode]);
 
-  const openDocsNode = useCallback(async (nodeId: string): Promise<DocsLoadStatus> => {
+  const invalidatePendingDocsNavigation = useCallback(() => {
+    const hasPendingOpenRestore = pendingNavigationOpenRestoreGenerationRef.current !== null;
+    const hasPendingScrollRestore = pendingNavigationRestoreRef.current !== null;
+    if (!hasPendingOpenRestore && !hasPendingScrollRestore) return;
+    navigationRestoreGenerationRef.current += 1;
+    if (hasPendingOpenRestore) openDocsNodeGenerationRef.current += 1;
+    pendingNavigationRestoreRef.current = null;
+    pendingNavigationOpenRestoreGenerationRef.current = null;
+  }, []);
+
+  const handleDocsScrollCapture = useCallback(() => {
+    if (applyingNavigationScrollRestoreRef.current) return;
+    if (
+      pendingNavigationOpenRestoreGenerationRef.current !== null
+      || pendingNavigationRestoreRef.current !== null
+    ) {
+      invalidatePendingDocsNavigation();
+    }
+  }, [invalidatePendingDocsNavigation]);
+
+  const openDocsNode = useCallback(async (nodeId: string, navigationOptions: { recordHistory?: boolean } = {}): Promise<DocsLoadStatus> => {
     if (!workspaceMountedRef.current) {
       throw new Error(DOCS_WORKSPACE_UNMOUNTED_MESSAGE);
     }
+    if (navigationOptions.recordHistory !== false) navigationRestoreGenerationRef.current += 1;
     const generation = ++openDocsNodeGenerationRef.current;
     const finishIfCurrent = (status: DocsLoadStatus): DocsLoadStatus => {
       if (!workspaceMountedRef.current) {
@@ -2139,7 +2437,18 @@ export function DocsWorkspace({
       return status;
     };
 
-    const shouldCommitOpen = () => generation === openDocsNodeGenerationRef.current;
+    const loadGeneration = docsLoadGenerationRef.current;
+    const shouldCommitOpen = () => workspaceMountedRef.current
+      && generation === openDocsNodeGenerationRef.current
+      && loadGeneration === docsLoadGenerationRef.current
+      && locationScopeRef.current.currentUserId === currentUserId
+      && locationScopeRef.current.docsSource === docsSource;
+    const rememberOpenedNode = (node: DocsNode | undefined) => {
+      if (shouldCommitOpen()) {
+        loadedLocationScopeRef.current = { currentUserId, docsSource, initialNodeId: locationScopeRef.current.initialNodeId };
+        void writeDocsLastLocation({ actorId: currentUserId, source: docsSource, libraryId: locationLibraryIdRef.current }, node);
+      }
+    };
 
     try {
       await flushPendingDocsEditorWritesBeforeNavigation();
@@ -2153,10 +2462,24 @@ export function DocsWorkspace({
       return finishIfCurrent("failed");
     }
 
+    if (!shouldCommitOpen()) return "superseded";
+    const navigationOrigin = navigationOptions.recordHistory === false
+      ? null
+      : captureDocsNavigationEntry();
     if (nodesByIdRef.current.has(nodeId)) {
+      const recorded = navigationOrigin ? recordDocsNavigation(navigationOrigin, nodeId) : false;
       applyOpenDocsNodeSelection(nodeId);
+      const historyEntry = docsNavigationHistoryRef.current.entries[docsNavigationHistoryRef.current.index];
+      if (recorded && historyEntry) queueDocsNavigationScrollRestore(historyEntry);
+      rememberOpenedNode(authorizedLocationNodesRef.current.get(nodeId));
       if (!docsReadOnly) {
-        void loadNodeNeighborhood(nodeId, { shouldCommit: shouldCommitOpen });
+        void loadNodeNeighborhood(nodeId, { shouldCommit: shouldCommitOpen }).then((data) => {
+          const node = (data as DocsNeighborhoodResponse).nodes?.find((node) => node.id === nodeId);
+          if (shouldCommitOpen() && node) authorizedLocationNodesRef.current.set(nodeId, node);
+          rememberOpenedNode(node);
+        });
+      } else {
+        rememberOpenedNode(nodesByIdRef.current.get(nodeId));
       }
       void ensureNodeChildrenLoaded(nodeId);
       void ensureNodeDetailsLoaded(nodeId);
@@ -2193,6 +2516,7 @@ export function DocsWorkspace({
 
     const currentStatus = finishIfCurrent("success");
     if (currentStatus !== "success") return currentStatus;
+    if (!shouldCommitOpen()) return "superseded";
 
     const nodeReady = nodesByIdRef.current.has(nodeId)
       || Boolean(neighborhood.nodes?.some((node) => node.id === nodeId));
@@ -2201,17 +2525,28 @@ export function DocsWorkspace({
       return "failed";
     }
 
+    const recorded = navigationOrigin ? recordDocsNavigation(navigationOrigin, nodeId) : false;
     applyOpenDocsNodeSelection(nodeId);
+    const historyEntry = docsNavigationHistoryRef.current.entries[docsNavigationHistoryRef.current.index];
+    if (recorded && historyEntry) queueDocsNavigationScrollRestore(historyEntry);
+    const openedNode = neighborhood.nodes?.find((node) => node.id === nodeId);
+    if (openedNode) authorizedLocationNodesRef.current.set(nodeId, openedNode);
+    rememberOpenedNode(openedNode);
     void ensureNodeChildrenLoaded(nodeId);
     void ensureNodeDetailsLoaded(nodeId);
     return "success";
   }, [
     applyOpenDocsNodeSelection,
+    captureDocsNavigationEntry,
+    currentUserId,
     docsReadOnly,
+    docsSource,
     ensureNodeChildrenLoaded,
     ensureNodeDetailsLoaded,
     flushPendingDocsEditorWritesBeforeNavigation,
     loadNodeNeighborhood,
+    queueDocsNavigationScrollRestore,
+    recordDocsNavigation,
   ]);
 
   const handleMeetingImportImported = useCallback(async (result: MeetingImportResponse) => {
@@ -2251,6 +2586,109 @@ export function DocsWorkspace({
   const openDocsNodeRef = useRef(openDocsNode);
   openDocsNodeRef.current = openDocsNode;
 
+  const applyDocsNavigationHistoryEntry = useCallback((entry: DocsNavigationHistoryEntry) => {
+    focusNodeIdRef.current = entry.focusNodeId;
+    setFocusNodeId(entry.focusNodeId);
+    setMainView(entry.mainView);
+    mainViewRef.current = entry.mainView;
+    setTagPageId(entry.tagPageId);
+    tagPageIdRef.current = entry.tagPageId;
+    setSplitNodeId(entry.splitNodeId);
+    setCollapsed(new Set(entry.collapsedNodeIds));
+    setSidebarCollapsed(new Set(entry.sidebarCollapsedNodeIds));
+    setRightPanel(entry.rightPanel);
+    setPropertiesOpen(entry.propertiesOpen);
+    setPropertiesTagId(entry.propertiesTagId);
+    setSearchNodeTagFilter(entry.searchNodeTagFilter);
+    setSearchNodeVisibleTagCount(entry.searchNodeVisibleTagCount);
+    setActiveSupertagViewId(entry.activeSupertagViewId);
+    setSupertagTagFilter(entry.supertagTagFilter);
+    selectedNodeIdRef.current = entry.selectedNodeId;
+    selectedNodeIdsRef.current = [...entry.selectedNodeIds];
+    selectionAnchorNodeIdRef.current = entry.selectionAnchorNodeId;
+    setSelectedNodeId(entry.selectedNodeId);
+    setSelectedNodeIds([...entry.selectedNodeIds]);
+    setSelectionAnchorNodeId(entry.selectionAnchorNodeId);
+    suppressSidebarAutoScrollRef.current = true;
+    sidebarScrollNodeRef.current = null;
+    queueDocsNavigationScrollRestore(entry);
+  }, [queueDocsNavigationScrollRestore, selectedNodeIdsRef, selectionAnchorNodeIdRef, setCollapsed, setSidebarCollapsed, setSelectedNodeId, setSelectedNodeIds, setSelectionAnchorNodeId]);
+
+  const navigateDocsHistory = useCallback((direction: -1 | 1) => {
+    const history = docsNavigationHistoryRef.current;
+    if (history.index < 0) return;
+    invalidatePendingDocsNavigation();
+    navigationRestoreGenerationRef.current += 1;
+    history.entries[history.index] = captureDocsNavigationEntry();
+    const targetIndex = history.index + direction;
+    if (targetIndex < 0 || targetIndex >= history.entries.length) return;
+    const target = history.entries[targetIndex];
+    const generation = navigationRestoreGenerationRef.current;
+    const restore = () => {
+      if (generation !== navigationRestoreGenerationRef.current || !workspaceMountedRef.current) return;
+      docsNavigationHistoryRef.current = { entries: history.entries, index: targetIndex };
+      applyDocsNavigationHistoryEntry(target);
+    };
+    if (target.focusNodeId && target.focusNodeId !== focusNodeIdRef.current) {
+      pendingNavigationOpenRestoreGenerationRef.current = generation;
+      void openDocsNodeRef.current(target.focusNodeId, { recordHistory: false })
+        .then((status) => {
+          if (pendingNavigationOpenRestoreGenerationRef.current === generation) {
+            pendingNavigationOpenRestoreGenerationRef.current = null;
+          }
+          if (status === "success") restore();
+        })
+        .catch(() => {
+          if (pendingNavigationOpenRestoreGenerationRef.current === generation) {
+            pendingNavigationOpenRestoreGenerationRef.current = null;
+          }
+        });
+      return;
+    }
+    // A same-node history entry can switch to a table/tag view and unmount
+    // the body editor too, so it needs the same save barrier as page changes.
+    pendingNavigationOpenRestoreGenerationRef.current = generation;
+    void flushPendingDocsEditorWritesBeforeNavigation()
+      .then(restore)
+      .catch((error: unknown) => {
+        if (generation === navigationRestoreGenerationRef.current) {
+          toast.error(error instanceof Error ? error.message : "Docsの保存に失敗しました。入力内容を確認してください");
+        }
+      })
+      .finally(() => {
+        if (pendingNavigationOpenRestoreGenerationRef.current === generation) {
+          pendingNavigationOpenRestoreGenerationRef.current = null;
+        }
+      });
+  }, [applyDocsNavigationHistoryEntry, captureDocsNavigationEntry, flushPendingDocsEditorWritesBeforeNavigation, invalidatePendingDocsNavigation]);
+
+  useEffect(() => {
+    const entry = pendingNavigationRestoreRef.current;
+    if (!entry || typeof window === "undefined") return;
+    const frame = window.requestAnimationFrame(() => {
+      if (pendingNavigationRestoreRef.current !== entry) return;
+      const content = document.querySelector<HTMLElement>('[data-docs-history-main-scroll="main"]');
+      const splitContent = document.querySelector<HTMLElement>('[data-docs-history-main-scroll="split"]');
+      const sidebar = document.querySelector<HTMLElement>("[data-docs-history-sidebar-scroll]");
+      applyingNavigationScrollRestoreRef.current = true;
+      try {
+        if (content) {
+          content.scrollTop = entry.contentScrollTop;
+          content.scrollLeft = entry.contentScrollLeft;
+        }
+        if (splitContent) {
+          splitContent.scrollTop = entry.splitScrollTop;
+          splitContent.scrollLeft = entry.splitScrollLeft;
+        }
+        if (sidebar) sidebar.scrollTop = entry.sidebarScrollTop;
+        pendingNavigationRestoreRef.current = null;
+      } finally {
+        applyingNavigationScrollRestoreRef.current = false;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusNodeId, mainView, navigationRestoreVersion, tagPageId]);
+
   useEffect(() => {
     // handlerはWorkspaceのmount中は同一identityで登録し、openerだけ
     // ref経由で最新化する。state更新のたびに再登録すると、in-flight中に
@@ -2269,6 +2707,11 @@ export function DocsWorkspace({
   }, [setOpenNodeHandler]);
 
   useEffect(() => {
+    if (suppressSidebarAutoScrollRef.current) {
+      suppressSidebarAutoScrollRef.current = false;
+      sidebarScrollNodeRef.current = null;
+      return;
+    }
     sidebarScrollNodeRef.current = focusNodeId;
   }, [focusNodeId]);
 
@@ -2315,6 +2758,7 @@ export function DocsWorkspace({
     // Today and page navigation share one latest-navigation-wins token. A
     // newer openDocsNode/openToday invalidates this request while it is
     // waiting for the editor save barrier or network load.
+    navigationRestoreGenerationRef.current += 1;
     const generation = ++openDocsNodeGenerationRef.current;
     const isCurrentNavigation = () => generation === openDocsNodeGenerationRef.current;
     try {
@@ -2329,11 +2773,22 @@ export function DocsWorkspace({
       return isCurrentNavigation() ? "failed" : "superseded";
     }
     if (!isCurrentNavigation()) return "superseded";
+    const navigationOrigin = captureDocsNavigationEntry();
     setMainView(null);
+    mainViewRef.current = null;
     setTagPageId(null);
+    tagPageIdRef.current = null;
     const status = await load({ focusToday: true, date });
-    return isCurrentNavigation() ? status : "superseded";
-  }, [flushPendingDocsEditorWritesBeforeNavigation, load]);
+    if (!isCurrentNavigation()) return "superseded";
+    if (status === "success") {
+      const targetNodeId = focusNodeIdRef.current;
+      if (targetNodeId && recordDocsNavigation(navigationOrigin, targetNodeId)) {
+        const historyEntry = docsNavigationHistoryRef.current.entries[docsNavigationHistoryRef.current.index];
+        if (historyEntry) queueDocsNavigationScrollRestore(historyEntry);
+      }
+    }
+    return status;
+  }, [captureDocsNavigationEntry, flushPendingDocsEditorWritesBeforeNavigation, load, queueDocsNavigationScrollRestore, recordDocsNavigation]);
 
   useEffect(() => {
     if (!focusNodeReferenceId) {
@@ -2409,10 +2864,18 @@ export function DocsWorkspace({
       const fallbackNodeId = selectedNodeIdsRef.current[0] ?? selectionAnchorNodeIdRef.current ?? null;
       return fallbackNodeId ? { nodeId: fallbackNodeId, surface: "body" as const } : null;
     };
+    const handleCompositionStart = (event: CompositionEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("[data-testid='docs-block-editor']")) docsCompositionTargetRef.current = target;
+    };
+    const handleCompositionEnd = () => { docsCompositionTargetRef.current = null; };
     const handleGlobalKey = (event: KeyboardEvent) => {
-      if (event.isComposing) return;
+      if (event.isComposing || event.keyCode === 229 || docsCompositionTargetRef.current?.isConnected) return;
       const target = event.target instanceof Element ? event.target : null;
       const keyboardTarget = target ?? (document.activeElement instanceof Element ? document.activeElement : null);
+      const docsSurface = keyboardTarget?.closest('[data-shell-workspace="docs"], [data-shell-region="docs-navigation"]');
+      if (!docsSurface) return;
+      if (keyboardTarget?.closest("[data-daily-capture]")) return;
       if (shouldArchiveSelectionFromKeyboard({
         key: event.key,
         ctrlKey: event.ctrlKey,
@@ -2428,8 +2891,76 @@ export function DocsWorkspace({
         void archiveSelectedNodesRef.current();
       }
       const key = event.key.toLowerCase();
-      const editableTarget = target?.closest(".cm-editor, input, textarea, select, [contenteditable='true']");
-      const docsEditorTarget = target?.closest("[data-testid='docs-block-editor']");
+      const editableTarget = keyboardTarget?.closest(".cm-editor, input, textarea, select, [contenteditable='true']");
+      const docsEditorTarget = keyboardTarget?.closest("[data-testid='docs-block-editor']");
+      const dialogTarget = keyboardTarget?.closest('[role="dialog"], [data-daily-capture]');
+      // Page navigation also belongs to the focused outline body. Keep form
+      // fields and other contenteditables out of this exception.
+      const pageNavigationTarget = !editableTarget || Boolean(
+        docsEditorTarget
+        && keyboardTarget?.closest(".cm-content[contenteditable='true']")
+        && !keyboardTarget?.closest("[data-docs-field-control]"),
+      );
+      const isPageNavigation = event.altKey
+        && !event.ctrlKey
+        && !event.metaKey
+        && !event.shiftKey
+        && !event.getModifierState("AltGraph")
+        && pageNavigationTarget
+        && !dialogTarget
+        && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp");
+      const isHistoryNavigation = isPageNavigation
+        && (event.key === "ArrowLeft" || event.key === "ArrowRight");
+      // Consume held navigation keys too, so native browser history cannot
+      // run after the first Docs navigation or cancel its pending save.
+      if (isPageNavigation && event.repeat) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (!isHistoryNavigation) invalidatePendingDocsNavigation();
+      const selectedNodeForOpen = selectedNodeIdRef.current ?? selectedNodeIdsRef.current.at(-1) ?? null;
+      const activeOutlineNodeId = keyboardTarget?.closest("[data-docs-node-id]")?.getAttribute("data-docs-node-id")
+        ?? keyboardTarget?.closest("[data-docs-editor-node-id]")?.getAttribute("data-docs-editor-node-id");
+      const nonCodeMirrorEditable = Boolean(
+        keyboardTarget?.closest("input, textarea, select, [data-docs-field-control]")
+        || keyboardTarget?.closest("[contenteditable='true']") && !keyboardTarget?.closest(".cm-editor"),
+      );
+      if (
+        event.ctrlKey
+        && !event.altKey
+        && !event.shiftKey
+        && !event.metaKey
+        && !event.repeat
+        && event.key === "Enter"
+        && docsSurface
+        && !dialogTarget
+        && !nonCodeMirrorEditable
+        && (!editableTarget?.closest(".cm-editor") || activeOutlineNodeId === selectedNodeForOpen)
+      ) {
+        const selectedId = selectedNodeForOpen;
+        if (selectedId && nodesByIdRef.current.has(selectedId)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          void openDocsNode(selectedId);
+          return;
+        }
+      }
+      if (isHistoryNavigation) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        navigateDocsHistory(event.key === "ArrowLeft" ? -1 : 1);
+        return;
+      }
+      if (isPageNavigation && event.key === "ArrowUp") {
+        const current = focusNodeIdRef.current ? nodesByIdRef.current.get(focusNodeIdRef.current) : null;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (current?.parent_id) {
+          void openDocsNode(current.parent_id);
+        }
+        return;
+      }
       if (
         event.ctrlKey
         && event.altKey
@@ -2473,7 +3004,7 @@ export function DocsWorkspace({
         event.preventDefault();
         openToday();
       }
-      if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight") && focusNode?.day_date) {
+      if (!editableTarget && !dialogTarget && event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey && (event.key === "ArrowLeft" || event.key === "ArrowRight") && focusNode?.day_date) {
         const targetDate = nodeDateDelta(focusNode, event.key === "ArrowLeft" ? -1 : 1);
         if (targetDate) {
           event.preventDefault();
@@ -2554,7 +3085,10 @@ export function DocsWorkspace({
       }
     };
     const handleGlobalKeyUp = (event: KeyboardEvent) => {
-      if (event.isComposing) return;
+      if (event.isComposing || event.keyCode === 229) return;
+      const target = event.target instanceof Element ? event.target : document.activeElement;
+      if (!target?.closest('[data-shell-workspace="docs"], [data-shell-region="docs-navigation"]')) return;
+      if (target?.closest("[data-daily-capture]")) return;
       if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
         const active = activeDocsNode();
         const activeNodeId = (document.activeElement as HTMLElement | null)?.closest("[data-docs-node-id]")?.getAttribute("data-docs-node-id");
@@ -2566,13 +3100,17 @@ export function DocsWorkspace({
     document.addEventListener("keyup", handleGlobalKeyUp, true);
     window.addEventListener("keydown", handleGlobalKey, true);
     window.addEventListener("keyup", handleGlobalKeyUp, true);
+    window.addEventListener("compositionstart", handleCompositionStart, true);
+    window.addEventListener("compositionend", handleCompositionEnd, true);
     return () => {
       document.removeEventListener("keydown", handleGlobalKey, true);
       document.removeEventListener("keyup", handleGlobalKeyUp, true);
       window.removeEventListener("keydown", handleGlobalKey, true);
       window.removeEventListener("keyup", handleGlobalKeyUp, true);
+      window.removeEventListener("compositionstart", handleCompositionStart, true);
+      window.removeEventListener("compositionend", handleCompositionEnd, true);
     };
-  }, [abortBodyNodeLoads, collapseSidebarNode, collapseVisibleNodes, collapseVisibleSidebarNodes, currentRows, docsReadOnly, expandSidebarNode, expandVisibleNodes, expandVisibleSidebarNodes, extendNodeSelection, focusNode, nodesById, openClipIngest, openDocsNode, openToday, persistExpanded, selectRangeToNode, selectSingleNode, selectionAnchorNodeId, splitRows]);
+  }, [abortBodyNodeLoads, collapseSidebarNode, collapseVisibleNodes, collapseVisibleSidebarNodes, currentRows, docsReadOnly, expandSidebarNode, expandVisibleNodes, expandVisibleSidebarNodes, extendNodeSelection, focusNode, invalidatePendingDocsNavigation, navigateDocsHistory, nodesById, openClipIngest, openDocsNode, openToday, persistExpanded, selectRangeToNode, selectSingleNode, selectionAnchorNodeId, splitRows]);
 
   useEffect(() => {
     const handleCopy = (event: ClipboardEvent) => {
@@ -2860,7 +3398,7 @@ export function DocsWorkspace({
       throw error;
     };
     if (options.optimistic) {
-      void persistNode.then(applyPersistedNode).catch((error) => {
+      const handledPersistence = persistNode.then(applyPersistedNode).catch((error) => {
         options.onPersistenceError?.(id, error);
         nodeTagIdsRef.current.delete(id);
         setState((current) => ({
@@ -2869,7 +3407,17 @@ export function DocsWorkspace({
           node_supertags: current.node_supertags.filter((relation) => relation.node_id !== id),
         }));
         toast.error(error instanceof Error ? error.message : "Docsノードの作成に失敗しました");
+        throw error;
       });
+      // Navigation must wait until the rollback callback above has restored an
+      // editor-only draft before it treats this optimistic create as failed.
+      nodeCreateInFlightRef.current.set(id, handledPersistence);
+      const clearHandledPersistence = () => {
+        if (nodeCreateInFlightRef.current.get(id) === handledPersistence) {
+          nodeCreateInFlightRef.current.delete(id);
+        }
+      };
+      void handledPersistence.then(clearHandledPersistence, clearHandledPersistence);
       if (options.focusOnCreate !== false) {
         selectSingleNode(optimisticNode.id);
         setFocusRequestNodeId(optimisticNode.id);
@@ -2980,12 +3528,9 @@ export function DocsWorkspace({
       // operation.  Do not re-run the full Docs loader here: it temporarily
       // unmounts the outline (and its pending blank editor row), which drops
       // focus exactly when Undo/Redo is expected to remain in the editor.
-      // Keep the intended titles attached to the session through the final
-      // projection render. Clearing the hint in a second state update lets a
-      // stale pre-PATCH row overwrite the mounted CM view during the narrow
-      // response/render gap; the next history operation replaces this
-      // revision, while the server response itself still updates `rows`.
-      setHistorySync((current) => ({ revision: current.revision + 1, nodeIds, titles: current.titles ?? titles }));
+      // Keep the initial history hint through the final projection render.
+      // A second revision for this same operation would replay its old title
+      // over text entered while the history PATCH was settling.
     } finally {
       applyingHistoryRef.current = false;
     }
@@ -3788,8 +4333,10 @@ export function DocsWorkspace({
       ...current,
       supertags: mergeById(current.supertags, data.supertag),
     }));
+    invalidatePendingDocsNavigation();
     setMainView(null);
     setTagPageId(data.supertag.id);
+    setActiveSupertagViewId(null);
     setRightPanel("tags");
     return data.supertag;
   };
@@ -3991,6 +4538,7 @@ export function DocsWorkspace({
       focusOnCreate: input.focusOnCreate !== false,
       insertAtStart,
       onPersistenceError: (nodeId, error) => {
+        failedOptimisticNodeIdsRef.current.add(nodeId);
         // A failed optimistic POST must not leave a phantom create in the
         // Workspace history.  Otherwise the next Ctrl+Z would try to archive
         // a node that was already rolled back from state.
@@ -4012,6 +4560,9 @@ export function DocsWorkspace({
       patches: [{ type: "create", node: snapshotDocsNode({ ...created, body_json: bodyJson, display_props: { ...created.display_props, ...displayPatch } }) }],
     });
     pendingCreateHistoryIdsRef.current.add(created.id);
+    if (input.awaitPersistence) {
+      return nodeCreateInFlightRef.current.get(created.id) ?? Promise.resolve(created);
+    }
     return { ...created, body_json: bodyJson, body_text: nextTitle, display_props: { ...created.display_props, ...displayPatch } };
   };
 
@@ -4349,12 +4900,14 @@ export function DocsWorkspace({
     onCommitPending: (operation) => {
       editorCommitInFlightRef.current = operation;
     },
+    registerEditorFlush,
     canMutateNode,
     canCleanupNode: canCleanupProjectInfoNode,
     onNodeProtection: (target, action) => {
       toast.error(`${docsNodeProtectionMessage(target)}（${action}）`);
     },
     onCommitTitle: async (target, title, patch) => {
+      if (failedOptimisticNodeIdsRef.current.has(target.id)) return target;
       // Empty titles are editor-only transient state.  Do not optimistically
       // replace the existing row or call the API; this also keeps table/blur
       // writers from turning a 400 response into a disappearing node.  The
@@ -4551,6 +5104,7 @@ export function DocsWorkspace({
     pushHistory,
     removeTag,
     replaceNodeTitles,
+    registerEditorFlush,
     runDocsAiCommand,
     saveField,
     selectSingleNode,
@@ -4855,7 +5409,11 @@ export function DocsWorkspace({
         ) : null}
         </div>
       </div>
-       <div className="min-h-0 flex-1 overflow-auto px-5 py-4" data-docs-scroll-container>
+       <div
+         className="min-h-0 flex-1 overflow-auto px-5 py-4"
+         data-docs-scroll-container
+         data-docs-history-main-scroll={compact ? "split" : "main"}
+       >
          {node ? (
           <>
             <div
@@ -4886,6 +5444,7 @@ export function DocsWorkspace({
               ) : (
               <DocsEditorProvider value={docsEditorContextValue}>
               <OutlineBlockEditor
+                key={node.id}
                 rows={outlineEditorRows}
                 documentRow={documentEditorRow}
                 emptyParentId={node.id}
@@ -4996,7 +5555,16 @@ export function DocsWorkspace({
     >
       <div className="border-b border-border px-4 py-3">
         <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-semibold text-foreground">Documentation</span>
+          <div className="flex items-center gap-1">
+            <span className="text-sm font-semibold text-foreground">Documentation</span>
+            <HelpPopover label="Docsのキーボード操作">
+              <p>Ctrl+Enter: 選択中のノードを開きます。</p>
+              <p>Alt+← / Alt+→: Docs内の移動履歴を戻る / 進みます。</p>
+              <p>Alt+↑: 現在のページの親へ移動します。</p>
+              <p>Ctrl+Alt+← / →: Dayページで前日 / 翌日へ移動します。</p>
+              <p>Ctrl+Alt+↑ / ↓: Outlineのノードを同じ階層で移動します。</p>
+            </HelpPopover>
+          </div>
           {canCreateRootNode ? (
             <button
               type="button"
@@ -5019,6 +5587,7 @@ export function DocsWorkspace({
                 setDocsSource(nextSource);
                 setMainView(null);
                 setTagPageId(null);
+                setActiveSupertagViewId(null);
               })
               .catch((error) => {
                 toast.error(error instanceof Error ? error.message : "Docsの保存に失敗しました。入力内容を確認してください");
@@ -5036,7 +5605,7 @@ export function DocsWorkspace({
         </AppSelect>
         {docsReadOnly && <ReadOnlyBadge className="mt-1">Enterprise Docs（読み取り専用）</ReadOnlyBadge>}
       </div>
-      <div className="min-h-0 flex-1 overflow-auto px-2 py-3">
+      <div className="min-h-0 flex-1 overflow-auto px-2 py-3" data-docs-history-sidebar-scroll>
         <SidebarButton
           icon={CalendarDays}
           label="Today"
@@ -5079,8 +5648,10 @@ export function DocsWorkspace({
           label="Supertags"
           active={tagPageId === SUPERTAGS_OVERVIEW_ID}
           onClick={() => {
+            invalidatePendingDocsNavigation();
             setMainView(null);
             setTagPageId(SUPERTAGS_OVERVIEW_ID);
+            setActiveSupertagViewId(null);
             setRightPanel("tags");
           }}
         />
@@ -5089,6 +5660,7 @@ export function DocsWorkspace({
           label="Search nodes"
           active={mainView === "search"}
           onClick={() => {
+            invalidatePendingDocsNavigation();
             setTagPageId(null);
             setMainView("search");
           }}
@@ -5098,6 +5670,7 @@ export function DocsWorkspace({
           label="ゴミ箱"
           active={mainView === "trash"}
           onClick={() => {
+            invalidatePendingDocsNavigation();
             setTagPageId(null);
             setMainView("trash");
           }}
@@ -5195,7 +5768,10 @@ export function DocsWorkspace({
     moveTargets: commandMoveTargets,
     nodeTools: commandNodeTools,
     onAddChild: (node) => void createNode(node.id, null, "新しいノード"),
-    onOpenSplit: (node) => setSplitNodeId(node.id),
+    onOpenSplit: (node) => {
+      invalidatePendingDocsNavigation();
+      setSplitNodeId(node.id);
+    },
     onToggleCheckbox: (node) => void toggleNodeCheckbox(node),
     onApplyTag: (node, tag) => void applyTagToActionNodes(node, tag.id),
     onMove: (node, target, leaveReference) => void moveActionNodes(node, target.id, leaveReference),
@@ -5224,6 +5800,9 @@ export function DocsWorkspace({
         !isDocsRoute && "min-h-[640px]",
       )}
       data-shell-workspace="docs"
+      onClickCapture={invalidatePendingDocsNavigation}
+      onChangeCapture={invalidatePendingDocsNavigation}
+      onScrollCapture={handleDocsScrollCapture}
       onKeyDownCapture={handleWorkspaceKeyDownCapture}
       onKeyUpCapture={handleWorkspaceKeyUpCapture}
       onDragOver={handleMeetingImportDragOver}
@@ -5235,6 +5814,10 @@ export function DocsWorkspace({
           <SupertagPage
             apiFetch={apiFetch}
             tag={activeTagPage}
+          activeViewId={activeSupertagViewId}
+          onActiveViewChange={setActiveSupertagViewId}
+          tagFilter={supertagTagFilter}
+          onTagFilterChange={setSupertagTagFilter}
             tags={state.supertags}
             views={state.views}
             nodes={visibleNodes}
@@ -5244,9 +5827,14 @@ export function DocsWorkspace({
             projects={state.projects}
             fieldsByTag={fieldsByTag}
             allSupertagFields={state.supertag_fields}
-            onDocument={() => setTagPageId(null)}
+            onDocument={() => {
+              invalidatePendingDocsNavigation();
+              setTagPageId(null);
+            }}
             onOpenTag={(tagId) => {
+              invalidatePendingDocsNavigation();
               setTagPageId(tagId);
+              setActiveSupertagViewId(null);
               setRightPanel("tags");
             }}
             onOpenNode={openDocsNode}
@@ -5281,6 +5869,13 @@ export function DocsWorkspace({
             onOpenNode={(nodeId) => {
               openDocsNode(nodeId);
             }}
+            tagFilter={searchNodeTagFilter}
+            onTagFilterChange={(value) => {
+              setSearchNodeTagFilter(value);
+              setSearchNodeVisibleTagCount(40);
+            }}
+            visibleTagCount={searchNodeVisibleTagCount}
+            onLoadMoreTags={() => setSearchNodeVisibleTagCount((count) => count + 40)}
           />
         ) : (
           renderPanel(focusNode, currentRows)

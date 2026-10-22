@@ -9,6 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 interface SettingsPayload {
   settings?: {
@@ -118,7 +119,17 @@ export function SpotifySection() {
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="spotify">
       <CardHeader
         className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        data-settings-target-activation="spotify"
         onClick={() => setExpanded((value) => !value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((value) => !value);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between gap-3 text-sm">
           <span className="flex min-w-0 items-center gap-2">
@@ -139,12 +150,12 @@ export function SpotifySection() {
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-3 rounded border p-3">
                 <div className="space-y-1">
-                  <Label htmlFor="spotify-enabled" className="text-sm font-medium">
-                    Spotify連携を有効にする
-                  </Label>
-                  <p className="text-xs text-muted-foreground">
-                    Spotifyの検索、再生制御、キーワード検出をアプリ全体で利用します。
-                  </p>
+                  <div className="inline-flex items-center gap-1">
+                    <Label htmlFor="spotify-enabled" className="text-sm font-medium">
+                      Spotify連携を有効にする
+                    </Label>
+                    <HelpPopover label="Spotify連携を有効にする">Spotifyの検索、再生制御、キーワード検出をアプリ全体で利用します。</HelpPopover>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <Badge variant={enabled ? "default" : "secondary"}>

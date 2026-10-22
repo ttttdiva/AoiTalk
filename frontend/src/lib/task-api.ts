@@ -1,3 +1,4 @@
+import { withBasePath } from "@/lib/base-path";
 // ブラウザから直接呼ぶ用（"use client"コンポーネントから使用）
 // 全て /api/ 経由（Next.js Route Handler）
 
@@ -69,8 +70,12 @@ export type Task = {
   source: string;
   created_by?: string | null;
   completed_at?: string | null;
+  archived_at?: string | null;
+  deleted_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  project_is_completed?: boolean;
+  project_deleted_at?: string | null;
   metadata: Record<string, unknown>;
   assignees: TaskAssignee[];
   tags: Tag[];
@@ -162,6 +167,7 @@ export type RecurrenceRule = {
 export type TaskOccurrence = {
   id: string;
   task_id: string;
+  deleted_at?: string | null;
   project_id?: string | null;
   project_name?: string | null;
   project_color?: string | null;
@@ -223,6 +229,7 @@ export type TimeEntry = {
   space_name?: string | null;
   original_started_at?: string | null;
   original_ended_at?: string | null;
+  deleted_at?: string | null;
   remote_server_id?: string;
   remote_server_name?: string;
   remote_server_color?: string | null;
@@ -387,7 +394,7 @@ async function request<T>(
       "/api/projects",
     ].includes(path);
     if (shouldRedirectToLogin && typeof window !== "undefined") {
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
     }
     throw new TaskApiError("認証が必要です", 401, null);
   }
@@ -433,7 +440,7 @@ async function uploadRequest<T>(path: string, form: FormData): Promise<T> {
   });
   if (res.status === 401) {
     if (typeof window !== "undefined") {
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
     }
     throw new TaskApiError("Authentication required", 401);
   }
@@ -598,6 +605,11 @@ export const taskApi = {
       tasks.map(normalizeTaskResponse),
     );
   },
+  listTodayTasks: (init?: RequestInit) =>
+    requestList<Task[]>("/api/tasks?today_summary=true", {
+      ...init,
+      cache: "no-store",
+    }).then((tasks) => tasks.map(normalizeTaskResponse)),
   getTask: (taskId: string, scope?: Scope) => {
     const params = buildScopeQuery(scope);
     const query = params.toString() ? `?${params.toString()}` : "";
@@ -841,6 +853,21 @@ export const taskApi = {
       `/api/task-occurrences?${params}`,
       init,
     ).then((occurrences) => occurrences.map(normalizeOccurrenceResponse));
+  },
+  listTodayOccurrences: (
+    startFrom: string,
+    endTo: string,
+    init?: RequestInit,
+  ) => {
+    const params = new URLSearchParams({
+      start_from: startFrom,
+      end_to: endTo,
+      today_summary: "true",
+    });
+    return request<TaskOccurrence[]>(`/api/task-occurrences?${params}`, {
+      ...init,
+      cache: "no-store",
+    }).then((occurrences) => occurrences.map(normalizeOccurrenceResponse));
   },
   moveOccurrence: (
     taskId: string,

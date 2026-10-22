@@ -879,6 +879,54 @@ async def _execute_selector(
     return await _maybe_await(_invoke_service(execute, session, kwargs))
 
 
+_CLEANUP_SUCCESS_STATUSES = frozenset({"completed", "idempotent", "succeeded", "already_clean"})
+
+
+def _summarize_cleanup_results(results: Sequence[Mapping[str, Any]]) -> tuple[str, list[str]]:
+    """Preserve the coordinator's terminal status in the route response.
+
+    The coordinator can commit the database and then report a filesystem
+    failure.  The route must not replace that typed ``partial`` result with a
+    generic ``completed`` envelope, otherwise clients cannot distinguish a
+    durable DB deletion from unfinished filesystem cleanup.
+    """
+
+    statuses: list[str] = []
+    failures: list[str] = []
+    for result in results:
+        raw_status = result.get("status")
+        status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+        statuses.append(status)
+        raw_failures = result.get("failures")
+        if isinstance(raw_failures, Sequence) and not isinstance(raw_failures, (str, bytes, bytearray)):
+            for failure in raw_failures:
+                if isinstance(failure, str) and failure.strip() and failure.strip() not in failures:
+                    failures.append(failure.strip()[:128])
+        if status not in _CLEANUP_SUCCESS_STATUSES | {"partial", "failed"}:
+            if "invalid_cleanup_status" not in failures:
+                failures.append("invalid_cleanup_status")
+
+    has_failed_run = "failed" in statuses or "invalid_cleanup_status" in failures
+    has_durable_result = any(
+        status in _CLEANUP_SUCCESS_STATUSES | {"partial"}
+        for status in statuses
+    )
+    if has_failed_run:
+        # A batch can contain a durable success followed by a failed run.  It
+        # is partial because the response must retain the successful run's
+        # outcome instead of making the whole batch look unexecuted.
+        if has_durable_result:
+            return "partial", failures or ["cleanup_failed"]
+        return "failed", failures or ["cleanup_failed"]
+    if "partial" in statuses or failures:
+        return "partial", failures
+    if statuses and all(status == "idempotent" for status in statuses):
+        return "idempotent", []
+    if statuses and all(status in _CLEANUP_SUCCESS_STATUSES for status in statuses):
+        return "completed", []
+    return "failed", ["cleanup_failed"]
+
+
 def register_verification_data_routes(app: FastAPI, server: "WebChatServer") -> None:
     """Register admin-only verification/test-data maintenance endpoints."""
 
@@ -1084,18 +1132,38 @@ def register_verification_data_routes(app: FastAPI, server: "WebChatServer") -> 
                         )
                     )
                 except Exception as exc:
-                    raise _service_error_to_http(exc) from exc
+                    mapped = _service_error_to_http(exc)
+                    if not deleted:
+                        raise mapped from exc
+                    # Earlier selectors may already have committed their DB
+                    # purge before a later selector fails.  Retain those
+                    # durable results in a partial envelope instead of
+                    # turning the whole batch into an opaque HTTP error.
+                    raw_code = getattr(exc, "code", None)
+                    failure_code = (
+                        raw_code
+                        if isinstance(raw_code, str)
+                        and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", raw_code)
+                        else "cleanup_failed"
+                    )
+                    deleted.append({"status": "failed", "failures": [failure_code]})
+                    break
                 if not isinstance(result, Mapping):
-                    raise HTTPException(status_code=500, detail="Invalid verification cleanup response")
+                    if not deleted:
+                        raise HTTPException(status_code=500, detail="Invalid verification cleanup response")
+                    deleted.append({"status": "failed", "failures": ["invalid_cleanup_response"]})
+                    break
                 deleted.append(dict(result))
             if callable(getattr(session, "commit", None)):
                 await _maybe_await(session.commit())
+            status, failures = _summarize_cleanup_results(deleted)
             return JSONResponse(
                 {
-                    "status": "completed",
+                    "status": status,
                     "selectors": [s.model_dump() for s in payload.selectors],
                     "preview_digest": expected_listing_digest,
                     "deleted": deleted,
+                    "failures": failures,
                     "counts": {
                         "selectors": len(payload.selectors),
                         "runs": len(deleted),

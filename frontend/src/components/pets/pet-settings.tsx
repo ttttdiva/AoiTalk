@@ -80,7 +80,7 @@ export function PetSettings() {
   </section>;
 }
 
-/** Settings overview owns only this compact entry; server state stays in PetProvider. */
+/** The appearance settings group owns this compact entry; server state stays in PetProvider. */
 export function PetSettingsEntry() {
   const context = usePet();
   if (!context?.available) return null;

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -14,6 +14,7 @@ from ..services.deep_research_service import (
     DeepResearchJob,
     DeepResearchManager,
     DeepResearchRequest,
+    DeepResearchIdempotencyConflictError,
     DeepResearchManagerClosedError,
     DeepResearchQueueFullError,
 )
@@ -23,6 +24,12 @@ class StartDeepResearchPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(..., min_length=2, max_length=4000)
+    client_request_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    strategy: Literal["off", "imozuru"] = "off"
     mode: str = "detailed"
     max_iterations: int = Field(3, ge=1, le=8)
     questions_per_iteration: int = Field(3, ge=1, le=6)
@@ -47,6 +54,19 @@ class StartDeepResearchPayload(BaseModel):
             raise ValueError("query must contain at least two non-whitespace characters")
         return normalized
 
+    @field_validator("client_request_id")
+    @classmethod
+    def _client_request_id_must_contain_text(
+        cls,
+        value: Optional[str],
+    ) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("client_request_id must not be empty")
+        return normalized
+
 
 def _job_payload(job: DeepResearchJob, *, include_report: bool = True) -> dict[str, Any]:
     payload = job.to_dict(include_report=include_report)
@@ -57,7 +77,12 @@ def _job_payload(job: DeepResearchJob, *, include_report: bool = True) -> dict[s
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
-        for key in ("session_context", "project_metadata", "privacy_snapshot"):
+        for key in (
+            "session_context",
+            "project_metadata",
+            "privacy_snapshot",
+            "_idempotency",
+        ):
             metadata.pop(key, None)
         payload["metadata"] = metadata
     payload.pop("privacy_snapshot", None)
@@ -505,6 +530,7 @@ def create_deep_research_router(
             job = await manager.start_job(
                 DeepResearchRequest(
                     query=body.query,
+                    strategy=body.strategy,
                     mode=body.mode,
                     max_iterations=body.max_iterations,
                     questions_per_iteration=body.questions_per_iteration,
@@ -519,7 +545,14 @@ def create_deep_research_router(
                     project_metadata=project_metadata,
                 ),
                 user_id=user_id,
+                client_request_id=body.client_request_id,
             )
+        except DeepResearchIdempotencyConflictError as exc:
+            raise _api_error(
+                409,
+                "idempotency_conflict",
+                "同じ調査要求IDが異なる内容で再利用されました",
+            ) from exc
         except DeepResearchQueueFullError as exc:
             raise _api_error(429, "queue_full", "調査キューが混雑しています") from exc
         except DeepResearchManagerClosedError as exc:

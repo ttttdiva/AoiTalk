@@ -78,7 +78,7 @@ class TelephonyLiveRuntime:
     def __init__(self, service, *, snapshot, api_key, sideband_provider=None):
         self.service, self.snapshot = service, snapshot
         self.principal = ActorPrincipal.agent(snapshot["agent_id"])
-        self.actor = LiveVoiceActor(user_id="", role="agent", display_name="AI employee",
+        self.actor = LiveVoiceActor(user_id="", role="agent", display_name="Agent",
             agent_id=self.principal.agent_id, agent_revision_id=snapshot["agent_revision_id"])
         self.provider = sideband_provider or _SIPSidebandProvider(self, api_key=api_key, config=service.config)
         self.live = LiveVoiceService(provider=self.provider, config=service.config, db_manager=service.db,

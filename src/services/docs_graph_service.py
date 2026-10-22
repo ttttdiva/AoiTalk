@@ -824,9 +824,16 @@ class DocsGraphService:
         user_id: uuid.UUID | None,
         change_summary: str,
         source_refs: list[dict[str, Any]] | None = None,
+        *,
+        sync_references: bool = True,
     ) -> None:
         await self.upsert_search_index(node)
-        await self.sync_reference_edges(node, user_id)
+        # Lifecycle-only changes must preserve the existing reference graph.
+        # Re-resolving an archived source against only active targets would
+        # delete valid edges to the rest of an archived subtree in depth-first
+        # archive order. Content edits keep the historical re-resolution path.
+        if sync_references:
+            await self.sync_reference_edges(node, user_id)
         self.session.add(
             KnowledgeRevision(
                 node_id=node.id,
@@ -1919,7 +1926,10 @@ class DocsGraphService:
             node.root_page_id = new_root
             stack.extend(children.get(node.id, []))
 
-    async def archive_node(self, *, node: KnowledgeNode, user_id: uuid.UUID | None) -> KnowledgeNode:
+    async def archive_node(
+        self, *, node: KnowledgeNode, user_id: uuid.UUID | None,
+        archived_at: datetime | None = None,
+    ) -> KnowledgeNode:
         identity_system_key = str(getattr(node, "system_key", "") or "").strip()
         if (
             identity_system_key == "project_information_root"
@@ -1933,10 +1943,15 @@ class DocsGraphService:
             user_id,
             project_id=_coerce_uuid(getattr(node, "project_id", None)),
         )
-        node.archived_at = _now()
+        node.archived_at = archived_at if archived_at is not None else _now()
         node.updated_by = user_id
-        node.updated_at = _now()
-        await self.record_node_change(node, user_id, "nodeをアーカイブ")
+        node.updated_at = node.archived_at
+        await self.record_node_change(
+            node,
+            user_id,
+            "nodeをアーカイブ",
+            sync_references=False,
+        )
         # アーカイブ時は連携タスクを unlink する（不変条件 1.6: nodes/archive → task unlink）。
         await self._unlink_bound_task(node=node, user_id=user_id)
         await self.session.flush()
@@ -1997,12 +2012,14 @@ class DocsGraphService:
             return [(row.id, int(row.depth)) for row in result]
 
         closure_snapshot = await snapshot_closure()
+        if any(depth >= 512 for _item_id, depth in closure_snapshot):
+            raise ValueError("Docs subtreeが安全確認の深さ上限を超えるためアーカイブできません")
         closure_ids = [item_id for item_id, _depth in closure_snapshot]
         if not closure_ids:
             raise ValueError("Docs subtreeが見つかりません")
         pointer_result = await self.session.execute(
             select(Project.id)
-            .where(Project.knowledge_node_id.in_(closure_ids))
+            .where(docs_id_predicate(Project.knowledge_node_id, closure_ids, self.session))
             .order_by(Project.id)
             .with_for_update()
         )
@@ -2012,9 +2029,11 @@ class DocsGraphService:
             select(KnowledgeNode)
             .where(
                 KnowledgeNode.docs_library_id == library_id,
-                KnowledgeNode.id.in_(closure_ids),
+                docs_id_predicate(KnowledgeNode.id, closure_ids, self.session),
             )
+            .order_by(KnowledgeNode.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         locked_nodes = list(locked_result.scalars().all())
         if len(locked_nodes) != len(closure_ids):
@@ -2022,6 +2041,8 @@ class DocsGraphService:
         fresh_snapshot = await snapshot_closure()
         if {item_id for item_id, _depth in fresh_snapshot} != set(closure_ids):
             raise ValueError("Docs subtreeが同時変更されたためアーカイブを中止しました")
+        if next(node for node in locked_nodes if node.id == root_id).archived_at is not None:
+            return []
         depth_by_id = {item_id: depth for item_id, depth in closure_snapshot}
         ordered = sorted(locked_nodes, key=lambda item: (depth_by_id.get(item.id, 0), item.id))
         if any(
@@ -2034,9 +2055,12 @@ class DocsGraphService:
         ):
             raise ValueError("Project canonical/stale identityを含むDocs subtreeはアーカイブできません")
         archived: list[KnowledgeNode] = []
+        # Web restoration identifies an archive operation by archived_at.
+        # Preserve independent archives and stamp this entire batch once.
+        archived_at = _now()
         for node in ordered:
             if node.archived_at is None:
-                await self.archive_node(node=node, user_id=user_id)
+                await self.archive_node(node=node, user_id=user_id, archived_at=archived_at)
                 archived.append(node)
         return archived
 
@@ -2154,6 +2178,12 @@ class DocsGraphService:
             self.session, library, user_id
         ):
             raise PermissionError("Docs workspaceへの書き込み権限がありません")
+
+        # Share the library row fence with the Web Today route. This also
+        # serializes Day-tag and ancestor creation for different dates.
+        await self.session.execute(
+            select(DocsLibrary.id).where(DocsLibrary.id == docs_library_id).with_for_update(key_share=True)
+        )
 
         day_iso = day.isoformat()
         # Day タグ（resolve_supertag は Day を作成/取得できる）。

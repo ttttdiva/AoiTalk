@@ -103,6 +103,12 @@ def _catalog_main_effort(config: Any, provider: str, model: str) -> str:
     model_id = str(model or "").strip()
     if not provider_id or not model_id:
         return ""
+    if provider_id == "openai_compatible_local":
+        from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
+        from ..llm.provider_mode_adapters import resolve_strata_response_mode
+
+        if managed_local_runtime_for_model(config, model_id) == "strata":
+            return resolve_strata_response_mode(config)
     effort_keys = {
         "openai": "openai.reasoning_effort",
         "deepseek": "deepseek.reasoning_effort",
@@ -145,7 +151,9 @@ def _catalog_main_effort(config: Any, provider: str, model: str) -> str:
 
         options = [
             str(item).strip()
-            for item in reasoning_effort_options_for_model(provider_id, model_id)
+            for item in reasoning_effort_options_for_model(
+                provider_id, model_id, config=config
+            )
             if str(item).strip()
         ]
     except Exception:
@@ -217,37 +225,16 @@ def _agent_team_section(config: Any) -> dict[str, Any]:
 # Context resolver compatibility entrypoint
 
 
-def _legacy_agent_team_scope_active(
-    config: Any,
-    *,
-    user: Any = None,
-    project: Any = None,
-    session: Any = None,
-    generation_profile: str | None = None,
-    app_target_id: str | None = None,
-    development_status: str | None = None,
-    story_mode: str | None = None,
-) -> dict[str, Any]:
-    from .agent_team_v3 import agent_team_scope_active
-
-    return agent_team_scope_active(
-        config,
-        user=user,
-        project=project,
-        session=session,
-        generation_profile=generation_profile,
-        app_target_id=app_target_id,
-        development_status=development_status,
-        story_mode=story_mode,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Runtime resilience: normalized failures, circuit breaker, and interruption
 # continuation state.  These are in-memory/request-scoped by design; no DB
 # table or migration is required.
 
 _NON_CIRCUIT_ERROR_CODES = {
+    # A command ran inside the already-authorized workspace and returned a
+    # non-zero exit. This is task-domain evidence for the model to diagnose,
+    # not a failure of the tool runtime itself.
+    "command_failed",
     "not_found",
     "ambiguous_target",
     "user_validation",
@@ -261,6 +248,17 @@ _NON_CIRCUIT_ERROR_CODES = {
     "tool_argument_conflict",
     "tool_argument_missing",
     "tool_argument_invalid",
+    # media_search/media_read argument and scope errors are corrected by the
+    # model on the next call; they are not a failing backend.
+    "invalid_search_request",
+    "invalid_read_request",
+    "invalid_locator",
+    "conversation_context_required",
+    "search_scope_not_permitted",
+    "read_scope_not_permitted",
+    "query_source_budget_exceeded",
+    "evidence_changed",
+    "evidence_version_required",
 }
 
 # Failure signatures may be copied into circuit-open tool payloads and
@@ -270,6 +268,10 @@ _NON_CIRCUIT_ERROR_CODES = {
 _SAFE_FAILURE_CODES = frozenset(
     {
         *_NON_CIRCUIT_ERROR_CODES,
+        "command_nonzero_exit",
+        # A command tool failure that is neither a verified nonzero exit nor a
+        # typed outcome (scope denial, timeout, malformed wrapper) fails closed.
+        "command_unclassified_failure",
         "tool_error",
         "circuit_open",
         "docs_access_internal",
@@ -289,8 +291,30 @@ _SAFE_FAILURE_CODES = frozenset(
         "layout_validation_failed",
         "persistence_failed",
         "unexpected_generation_failure",
+        "authenticated_user_required",
+        "media_original_unavailable",
+        "media_search_internal_error",
+        "media_read_internal_error",
     }
 )
+
+# Only these codes are an explicit, runtime-owned infrastructure fault that may
+# open the per-turn circuit.  Everything else (uncoded failures, an unlisted
+# ``error_code`` such as a bad read range, ``tool_error``) is something the
+# model can correct by changing its call; a repeat of the *same* call is bounded
+# by ``ToolNoProgressGuard`` rather than by this family-wide breaker.
+_INTERNAL_CIRCUIT_CODES = frozenset(
+    _SAFE_FAILURE_CODES
+    - _NON_CIRCUIT_ERROR_CODES
+    - {"tool_error", "command_nonzero_exit", "circuit_open"}
+)
+
+
+def is_internal_tool_failure_code(code: Any) -> bool:
+    """True only for an explicit infrastructure fault code."""
+
+    return str(code or "").strip().lower() in _INTERNAL_CIRCUIT_CODES
+
 
 _SAFE_DOCS_DIAGNOSTIC_OPERATIONS = frozenset(
     {
@@ -353,6 +377,33 @@ _SAFE_DIAGNOSTIC_EXCEPTION_TYPES = frozenset(
 )
 
 
+_COMMAND_FAMILY_TOOL_NAMES = frozenset(
+    {"execute_command", "read_command_output", "write_command_input", "stop_command"}
+)
+
+
+def tool_failure_scope(tool_name: Any, arguments: Any = None) -> str:
+    """Digest of one command action (command, cwd, shell, job); empty otherwise.
+
+    Command failures share generic codes, so the breaker keys them per action
+    instead of letting one command's fault suppress unrelated commands.
+    """
+
+    if str(tool_name or "").rsplit(".", 1)[-1].strip().lower() not in _COMMAND_FAMILY_TOOL_NAMES:
+        return ""
+    source = arguments if isinstance(arguments, dict) else {}
+    identity = {
+        key: source.get(key)
+        for key in ("command", "working_directory", "shell", "job_id")
+        if key in source
+    }
+    try:
+        rendered = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(rendered.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def tool_failure_family(tool_name: Any) -> str:
     """Normalize concrete tool names to a retry/circuit family.
 
@@ -373,6 +424,18 @@ def tool_failure_family(tool_name: Any) -> str:
         "list_directory",
     }:
         return "workspace"
+    # Local semantic search and original reads fail for different reasons
+    # (query/scope vs. locator/ACL). Sharing one family let a media_read
+    # failure suppress every later media_search in the same turn.
+    if name in _COMMAND_FAMILY_TOOL_NAMES:
+        # Command runtime faults must not share the catch-all ``unknown``
+        # family: that would let one command's scope denial or timeout
+        # suppress unrelated file-edit tools in the same turn.
+        return "command"
+    if name == "media_search":
+        return "media_search"
+    if name == "media_read":
+        return "media_read"
     if name.startswith(("media_", "spotify_")):
         return "media"
     # A provider-controlled function name is not an operator-controlled
@@ -389,10 +452,15 @@ class ToolFailureSignature:
     tool_family: str
     error_code: str
     root_cause: str
+    # Opaque digest of the failing action (e.g. one command line).  Failures
+    # that share a generic code but come from different actions must not open
+    # a circuit for each other.
+    scope: str = ""
 
     @property
     def key(self) -> str:
-        return f"{self.tool_family}:{self.error_code}:{self.root_cause}"
+        base = f"{self.tool_family}:{self.error_code}:{self.root_cause}"
+        return f"{base}@{self.scope}" if self.scope else base
 
 
 def _normalize_root_cause(value: Any) -> str:
@@ -424,14 +492,15 @@ def _normalize_root_cause(value: Any) -> str:
     return "tool_error"
 
 
-def normalize_tool_failure_signature(tool_family: Any, error_code: Any = "", root_cause: Any = "") -> ToolFailureSignature:
+def normalize_tool_failure_signature(tool_family: Any, error_code: Any = "", root_cause: Any = "", scope: Any = "") -> ToolFailureSignature:
     family = re.sub(r"[^a-z0-9_.-]+", "_", str(tool_family or "unknown").strip().lower()) or "unknown"
-    if family not in {"docs", "project", "workspace", "media", "unknown"}:
+    if family not in {"docs", "project", "workspace", "media", "media_search", "media_read", "command", "unknown"}:
         family = "unknown"
     code = re.sub(r"[^a-z0-9_.-]+", "_", str(error_code or "unknown").strip().lower()) or "unknown"
     if code not in _SAFE_FAILURE_CODES:
         code = "tool_error"
-    return ToolFailureSignature(family, code, _normalize_root_cause(root_cause))
+    safe_scope = re.sub(r"[^a-f0-9]+", "", str(scope or "").strip().lower())[:32]
+    return ToolFailureSignature(family, code, _normalize_root_cause(root_cause), safe_scope)
 
 
 def parse_structured_tool_failure(value: Any) -> dict[str, Any] | None:
@@ -468,6 +537,7 @@ def parse_structured_tool_failure(value: Any) -> dict[str, Any] | None:
     retryable_value = payload.get("retryable", False)
     retryable = retryable_value if isinstance(retryable_value, bool) else False
     return {
+        "success": False,
         "error_code": str(payload.get("error_code") or payload.get("code") or "tool_error"),
         "retryable": retryable,
         "error": error,
@@ -501,7 +571,7 @@ class ToolFailureCircuitBreaker:
     def failed_tool_count(self) -> int:
         return self._failed_tool_count
 
-    def check(self, tool_family: str, failure: Any = None, *, error_code: str = "", retryable: bool | None = None, root_cause: str = "") -> ToolFailureDecision:
+    def check(self, tool_family: str, failure: Any = None, *, error_code: str = "", retryable: bool | None = None, root_cause: str = "", scope: str = "") -> ToolFailureDecision:
         parsed = parse_structured_tool_failure(failure)
         if parsed:
             error_code = parsed["error_code"]
@@ -509,9 +579,9 @@ class ToolFailureCircuitBreaker:
             root_cause = parsed.get("root_cause") or parsed["error"]
         if retryable is None:
             retryable = False
-        signature = normalize_tool_failure_signature(tool_family, error_code, root_cause)
+        signature = normalize_tool_failure_signature(tool_family, error_code, root_cause, scope)
         code = signature.error_code
-        if code in _NON_CIRCUIT_ERROR_CODES:
+        if code in _NON_CIRCUIT_ERROR_CODES or code not in _INTERNAL_CIRCUIT_CODES:
             return ToolFailureDecision(True, bool(retryable), signature=signature, reason="user-resolvable failure")
         if bool(retryable):
             return ToolFailureDecision(True, True, signature=signature, reason="retryable failure")
@@ -529,11 +599,21 @@ class ToolFailureCircuitBreaker:
     def allow(self, tool_family: str, failure: Any = None, **kwargs: Any) -> bool:
         return self.check(tool_family, failure, **kwargs).allowed
 
-    def is_open(self, tool_family: str) -> bool:
-        """Return whether any normalized failure in ``tool_family`` is open."""
+    def is_open(self, tool_family: str, scope: str = "") -> bool:
+        """Return whether a normalized failure in ``tool_family`` is open.
+
+        With ``scope`` only unscoped keys and keys of that exact action count,
+        so another action's failure never suppresses this one.
+        """
 
         family = str(tool_family or "unknown").strip().lower()
-        return any(key.startswith(f"{family}:") for key in self._opened)
+        safe_scope = re.sub(r"[^a-f0-9]+", "", str(scope or "").strip().lower())[:32]
+        for key in self._opened:
+            if not key.startswith(f"{family}:"):
+                continue
+            if not safe_scope or "@" not in key or key.endswith(f"@{safe_scope}"):
+                return True
+        return False
 
     def snapshot(self) -> dict[str, Any]:
         return {"failed_tool_count": self._failed_tool_count, "counts": dict(self._counts), "opened": sorted(self._opened), "suppressed": dict(self._suppressed)}

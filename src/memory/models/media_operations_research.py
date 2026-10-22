@@ -45,6 +45,8 @@ _PLATFORM_COLUMNS: tuple[tuple[str, str], ...] = (
     ("patreon", "platform_patreon"),
     ("youtube", "platform_youtube"),
     ("instagram", "platform_instagram"),
+    ("fanza", "platform_fanza"),
+    ("tiktok", "platform_tiktok"),
 )
 
 
@@ -259,6 +261,18 @@ class ResearchRoutineRevision(Base):
         server_default=text("false"),
     )
     platform_instagram = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    platform_fanza = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    platform_tiktok = Column(
         Boolean,
         nullable=False,
         default=False,
@@ -887,6 +901,7 @@ class EditorialProgramRevision(Base):
     default_creative_recipe_ref = Column(String(164), nullable=True)
     default_qa_policy_ref = Column(String(164), nullable=True)
     experiment_ref = Column(String(164), nullable=True)
+    max_publications = Column(Integer, nullable=True)
     draft_generation_policy = Column(String(64), nullable=False, default="human_review", server_default="human_review")
     content_hash = Column(
         String(64),
@@ -910,6 +925,7 @@ class EditorialProgramRevision(Base):
     )
 
     __table_args__ = (
+        CheckConstraint("max_publications IS NULL OR (max_publications >= 0 AND max_publications <= 10000)", name="ck_media_editorial_program_revisions_publication_cap"),
         CheckConstraint(
             "version > 0",
             name="ck_media_editorial_program_revisions_version",
@@ -958,6 +974,7 @@ class EditorialProgramRevision(Base):
             "default_qa_policy_ref": self.default_qa_policy_ref,
             "experiment_ref": self.experiment_ref,
             "draft_generation_policy": self.draft_generation_policy,
+            "max_publications": self.max_publications,
             "content_hash": self.content_hash,
             "created_by": _uuid(self.created_by),
             "created_at": _dt(self.created_at),
@@ -999,6 +1016,7 @@ class ContentItem(Base):
     )
     title = Column(String(500), nullable=False)
     brief = Column(Text, nullable=False)
+    input_kind = Column(String(16), nullable=False, default="research", server_default="research")
     version = Column(Integer, nullable=False, default=1, server_default="1")
     status = Column(String(16), nullable=False, default="draft", server_default="draft", index=True)
     persona_revision_id = Column(
@@ -1048,6 +1066,10 @@ class ContentItem(Base):
             name="ck_media_content_items_version",
         ),
         CheckConstraint(
+            "input_kind IN ('research', 'user_authored')",
+            name="ck_media_content_items_input_kind",
+        ),
+        CheckConstraint(
             "status IN ('draft', 'ready', 'in_progress', 'published', 'archived')",
             name="ck_media_content_items_status",
         ),
@@ -1075,6 +1097,7 @@ class ContentItem(Base):
             "project_id": _uuid(self.project_id),
             "title": self.title,
             "brief": self.brief,
+            "input_kind": self.input_kind or "research",
             "version": int(self.version or 1),
             "status": self.status,
             "persona_revision_id": _uuid(self.persona_revision_id),

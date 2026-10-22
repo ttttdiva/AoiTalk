@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repository": "https://github.com/jkudish/jev-browser",
+    "version": "0.8.5",
+    "commit": "d8f1ce0c6d09a8cbe43110ecbe884ecb842083ec"
+  },
+  "bundle_sha256": "abe13cf607c1d8f7dfabdab1426694eb6828fcb87708fa31032e1aaf63d47e70",
+  "patch_sha256": "4954ba8780ef2a35d0bf88dfe89e49975cca57fade98ad35b6c9ea543e54fedd",
+  "package_lock_sha256": "13af11bee98b52b677f66a9e17a57fa3cc226bd59f38c7a0a3f0ae4c798e4ff1",
+  "notices_sha256": "0088808ad2f826d3f283c4ed754e82fdfa289569f68adc88643a46264a1667e6",
+  "node_version": "24.21.0",
+  "playwright_version": "1.63.0",
+  "esbuild_version": "0.28.2",
+  "dependencies": [
+    {
+      "name": "@ai-sdk/anthropic",
+      "version": "4.0.76",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/gateway",
+      "version": "4.0.108",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/google",
+      "version": "4.0.92",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/openai",
+      "version": "4.0.89",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/openai-compatible",
+      "version": "3.0.66",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/provider",
+      "version": "4.0.25",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@ai-sdk/provider-utils",
+      "version": "5.0.57",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "@jkudish/jev-agent-tools",
+      "version": "0.2.0",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "61ada187d8ec32d7ee7a31fe6d9ec1623cf02e43b9333300fdf8b3508a383717"
+      }
+    },
+    {
+      "name": "@mixmark-io/domino",
+      "version": "2.2.0",
+      "license": "BSD-2-Clause",
+      "notices": {
+        "LICENSE": "9672b5ea831c360425e95b806b302e502582dd9718b056f29c40cf241daecb68"
+      }
+    },
+    {
+      "name": "@typesafe-ai/sdk",
+      "version": "0.6.0",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "f7c12f055628204172796b98c08c910b521ab8278e6217fa8af622140e618d94"
+      }
+    },
+    {
+      "name": "@vercel/oidc",
+      "version": "3.2.0",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b070d77bfb2c52a1dd6996de0ce5f64c49a0ca55c889b163a963ddf5cb001ee2"
+      }
+    },
+    {
+      "name": "@workflow/serde",
+      "version": "4.1.0",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE.md": "39248a57eaac37e120c65bae851c6382bf722fc87c3452bf6a245caef96db739"
+      }
+    },
+    {
+      "name": "ai",
+      "version": "7.0.133",
+      "license": "Apache-2.0",
+      "notices": {
+        "LICENSE": "b4f9adb7c568904834d0dd6cc98d16c390d21ca32fc17ae7a267715269bd5529"
+      }
+    },
+    {
+      "name": "eventsource-parser",
+      "version": "3.1.1",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "835eb611a23301b27115ca1be9f754c876e643ceb7fe63049c6b50609a1cafeb"
+      }
+    },
+    {
+      "name": "turndown",
+      "version": "7.2.4",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "a055e3a15db4b4cbb5af381230eba085603126d7d5d8c4dae45ee85b877a9729"
+      }
+    },
+    {
+      "name": "turndown-plugin-gfm",
+      "version": "1.0.2",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "a055e3a15db4b4cbb5af381230eba085603126d7d5d8c4dae45ee85b877a9729"
+      }
+    },
+    {
+      "name": "zod",
+      "version": "4.6.5",
+      "license": "MIT",
+      "notices": {
+        "LICENSE": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8"
+      }
+    }
+  ]
+}

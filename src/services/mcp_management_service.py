@@ -291,6 +291,7 @@ class MCPManagementService:
                 command=actual_config.get("command"),
                 args=actual_config.get("args", []),
                 env=child_env,
+                **({"cwd": actual_config["cwd"]} if actual_config.get("cwd") else {}),
             )
             if success:
                 logger.info("MCPサーバー '%s' の再起動に成功しました", server_name)

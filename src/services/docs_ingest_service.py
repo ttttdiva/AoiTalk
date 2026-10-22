@@ -102,6 +102,7 @@ _SAFE_GENERATION_KINDS = frozenset(
         GenerationErrorKind.AUTHENTICATION,
         GenerationErrorKind.PERMISSION_DENIED,
         GenerationErrorKind.MODEL_NOT_FOUND,
+        GenerationErrorKind.PRICE_LIMIT,
         GenerationErrorKind.INVALID_REQUEST,
         GenerationErrorKind.CONTEXT_LENGTH,
         GenerationErrorKind.CONNECTION,

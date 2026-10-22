@@ -22,7 +22,7 @@ from inspect import isawaitable
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from ..memory.models.media_operations_metrics import (
@@ -40,7 +40,10 @@ from ..memory.models.media_operations_metrics import (
     MediaMetricIngestionRun,
     MetricSnapshot,
     RevenueEvent,
+    RevenueCostRecord,
 )
+from .media_revenue_costs import COST_INPUT_FIELDS, effective_cost_records, revenue_cost_projection
+from ..memory.models.media_operations_costs import MediaCostEntry, MediaCostAllocation
 from ..memory.models.media_operations import (
     MEDIA_PLATFORM_VALUES,
     Persona,
@@ -255,6 +258,12 @@ def _assert_human_write(actor: Any) -> None:
         raise MediaOperationsAuthorizationError(
             "metrics authority mutations require a human or administrator"
         )
+
+
+def _assert_cost_human_write(actor: Any) -> None:
+    _assert_human_write(actor)
+    if str(_actor_field(actor, "actor_type", "")).lower() != "human" or _actor_field(actor, "is_agent", False):
+        raise MediaOperationsAuthorizationError("cost evidence mutations require an authenticated human")
 
 
 def _assert_ingestion_actor(actor: Any) -> None:
@@ -2686,7 +2695,7 @@ class MediaOperationsMetricsService(MediaOperationsService):
         if existing is not None:
             if existing.event_hash != event_hash:
                 raise MediaOperationsConflictError("idempotency key was already used with different revenue event")
-            return existing.to_safe_dict()
+            return _safe_revenue_dict(existing)
         row_payload = dict(payload)
         row_payload.pop("project_id", None)
         row_payload.update(
@@ -3277,11 +3286,351 @@ class MediaOperationsMetricsService(MediaOperationsService):
 
     import_patron_csv_revenue = import_patreon_csv_revenue
 
+    async def _lock_cost_entry_root(self, session: Any, entry_id: UUID) -> MediaCostEntry:
+        # A no-op UPDATE changes no immutable evidence, but takes a write lock
+        # on SQLite too (where SELECT FOR UPDATE alone is silently ignored).
+        # Both correction and allocation acquire this lock before reading head
+        # or allocation state, closing their otherwise cross-table race.
+        await self._execute(session, update(MediaCostEntry).where(MediaCostEntry.id == entry_id).values(entry_id=MediaCostEntry.entry_id))
+        return await self._get_row(session, MediaCostEntry, entry_id, "cost_entry_id", for_update=True)
+
+    async def create_cost_entry(
+        self, session: Any | None = None, actor: Any | None = None, *,
+        persona_ref: Any, window_start: Any, window_end: Any, currency: Any,
+        basis: Any, source: Any = "manual", project_id: Any = None,
+        content_ref: Any = None, fee_amount: Any = None,
+        production_cost_amount: Any = None, human_cost_amount: Any = None,
+        human_minutes: Any = None, missing_reasons: Any = None,
+        coverage_complete: Any = False, coverage_note: Any, evidence: Any,
+        correction_of_id: Any = None, idempotency_key: Any,
+    ) -> dict[str, Any]:
+        """Save cost evidence before any sale exists; revisions precede allocation."""
+        session = self._resolve_session(session)
+        if actor is None:
+            raise MediaOperationsValidationError("actor is required")
+        _assert_cost_human_write(actor)
+        actor_id, project_uuid = await self._scope_for_create(session, actor, project_id)
+        persona = _ref(persona_ref, "persona_ref")
+        content = _optional_ref(content_ref, "content_ref")
+        await self._validate_reference_graph(session, actor, project_uuid=project_uuid,
+                                             persona_ref=persona, content_variant_ref=content)
+        start, end = _datetime(window_start, "window_start"), _datetime(window_end, "window_end")
+        if start > end:
+            raise MediaOperationsValidationError("window_start must not be after window_end")
+        currency_value = _required_text(currency, "currency", 3).upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency_value):
+            raise MediaOperationsValidationError("currency must have three uppercase letters")
+        source_value = _enum(source, ("manual", "imported"), "source", "manual")
+        basis_value = _enum(basis, ("estimated", "settled"), "basis")
+        if type(coverage_complete) is not bool:
+            raise MediaOperationsValidationError("coverage_complete must be a boolean")
+        reasons = _mapping(missing_reasons if missing_reasons is not None else {}, "missing_reasons")
+        if set(reasons) - set(COST_INPUT_FIELDS):
+            raise MediaOperationsValidationError("missing_reasons contains an unsupported cost field")
+        values = dict(fee_amount=fee_amount, production_cost_amount=production_cost_amount,
+                      human_cost_amount=human_cost_amount, human_minutes=human_minutes)
+        missing = {}
+        for name, value in values.items():
+            if value is None:
+                missing[name] = _required_text(reasons.get(name), f"missing_reasons.{name}", 500)
+            else:
+                try:
+                    values[name] = _finite_number(value, name, allow_negative=name != "human_minutes")
+                except (ValueError, OverflowError) as exc:
+                    raise MediaOperationsValidationError(f"{name} is outside the supported range") from exc
+                if name in reasons:
+                    raise MediaOperationsValidationError(f"{name} cannot have both a value and a missing reason")
+        correction_uuid = _as_uuid(correction_of_id, "correction_of_id", required=False)
+        payload = dict(project_id=str(project_uuid) if project_uuid else None,
+                       persona_ref=persona, content_ref=content,
+                       window_start=start.isoformat(), window_end=end.isoformat(),
+                       currency=currency_value, source=source_value, basis=basis_value,
+                       **values, missing_reasons=missing, coverage_complete=coverage_complete,
+                       coverage_note=_required_text(coverage_note, "coverage_note", 2000),
+                       evidence=_normalize_evidence(evidence, "evidence", required=True),
+                       correction_of_id=str(correction_uuid) if correction_uuid else None)
+        digest, key = sha256_json(payload), _required_text(idempotency_key, "idempotency_key", 255)
+        previous = None
+        lookup_owner = actor_id
+        if correction_uuid is not None:
+            previous = await self._get_row(session, MediaCostEntry, correction_uuid, "correction_of_id")
+            await self._assert_entity_access(session, actor, previous, permission="write")
+            if previous.project_id != project_uuid:
+                raise MediaOperationsValidationError("cost correction cannot change project_id")
+            lookup_owner = previous.owner_user_id
+        existing = await self._find_scoped_idempotency(session, MediaCostEntry, owner_user_id=lookup_owner, project_id=project_uuid, key=key)
+        if existing is not None:
+            await self._assert_entity_access(session, actor, existing, permission="write")
+            if existing.entry_hash != digest:
+                raise MediaOperationsConflictError("idempotency key was already used with different cost evidence")
+            return await self._cost_entry_dict(session, existing)
+        ident = uuid4()
+        root_id, revision, owner_id = ident, 1, actor_id
+        if previous is not None:
+            root = await self._lock_cost_entry_root(session, previous.entry_id)
+            head = await self._scalar(session, select(MediaCostEntry).where(MediaCostEntry.entry_id == root.id).order_by(MediaCostEntry.revision.desc()).limit(1))
+            if head.id != previous.id:
+                raise MediaOperationsConflictError("cost entry changed; reload before correcting")
+            if await session.get(MediaCostAllocation, root.id) is not None:
+                raise MediaOperationsConflictError("allocated cost evidence is fixed; correction is unsupported")
+            for field in ("project_id", "persona_ref", "content_ref", "window_start", "window_end", "currency", "source", "basis"):
+                expected = getattr(previous, field)
+                expected = expected.isoformat() if isinstance(expected, datetime) else str(expected) if isinstance(expected, UUID) else expected
+                if payload[field] != expected:
+                    raise MediaOperationsValidationError(f"cost correction cannot change {field}")
+            root_id, revision, owner_id = root.id, head.revision + 1, root.owner_user_id
+        row_values = dict(payload)
+        row_values.update(project_id=project_uuid, window_start=start, window_end=end, correction_of_id=correction_uuid)
+        row = MediaCostEntry(id=ident, entry_id=root_id, revision=revision, owner_user_id=owner_id,
+                             **row_values, entry_hash=digest, idempotency_key=key, created_by=actor_id)
+        session.add(row)
+        try:
+            await self._flush_commit(session)
+        except IntegrityError as exc:
+            await self._rollback(session)
+            recovered = await self._find_scoped_idempotency(session, MediaCostEntry, owner_user_id=lookup_owner, project_id=project_uuid, key=key)
+            if recovered is not None and recovered.entry_hash == digest:
+                return await self._cost_entry_dict(session, recovered)
+            raise MediaOperationsConflictError("cost entry changed; reload before correcting") from exc
+        return await self._cost_entry_dict(session, row)
+
+    async def _cost_entry_dict(self, session: Any, row: MediaCostEntry) -> dict[str, Any]:
+        allocation = await session.get(MediaCostAllocation, row.entry_id)
+        return {
+            **row.to_safe_dict(), "allocation_status": "allocated" if allocation else "unallocated",
+            "allocated_revenue_event_id": str(allocation.revenue_event_id) if allocation else None,
+            **{f"unallocated_{field}": 0.0 if allocation else getattr(row, field) for field in COST_INPUT_FIELDS},
+        }
+
+    async def list_cost_entries(self, session: Any | None = None, actor: Any | None = None, *,
+                                persona_ref: Any, project_id: Any = None, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        session = self._resolve_session(session)
+        if actor is None:
+            raise MediaOperationsValidationError("actor is required")
+        actor_id, project_uuid = await self._scope_for_list(session, actor, project_id)
+        persona = _ref(persona_ref, "persona_ref")
+        page_limit, page_offset = _bounded_page(limit, offset)
+        scope = MediaCostEntry.project_id == project_uuid if project_uuid else (MediaCostEntry.project_id.is_(None) & (MediaCostEntry.owner_user_id == actor_id))
+        # Filter latest revisions before pagination; historical rows never inflate totals.
+        latest = select(MediaCostEntry.entry_id, func.max(MediaCostEntry.revision).label("revision")).where(scope, MediaCostEntry.persona_ref == persona).group_by(MediaCostEntry.entry_id).subquery()
+        rows = await self._scalars(session, select(MediaCostEntry).join(latest, (MediaCostEntry.entry_id == latest.c.entry_id) & (MediaCostEntry.revision == latest.c.revision)).order_by(MediaCostEntry.created_at.desc(), MediaCostEntry.id.desc()).limit(page_limit).offset(page_offset))
+        return [await self._cost_entry_dict(session, row) for row in rows]
+
+    async def get_cost_entry_history(self, session: Any | None = None, actor: Any | None = None,
+                                     entry_id: Any = None, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        session = self._resolve_session(session)
+        if actor is None or entry_id is None:
+            raise MediaOperationsValidationError("actor and entry_id are required")
+        row = await self._get_row(session, MediaCostEntry, entry_id, "entry_id")
+        await self._assert_entity_access(session, actor, row, permission="read")
+        page_limit, page_offset = _bounded_page(limit, offset)
+        statement = select(MediaCostEntry).where(MediaCostEntry.entry_id == row.entry_id).order_by(MediaCostEntry.revision.desc())
+        rows = await self._scalars(session, statement.limit(page_limit + 1).offset(page_offset))
+        head = await self._scalar(session, statement.limit(1))
+        return {"items": [await self._cost_entry_dict(session, item) for item in rows[:page_limit]],
+                "effective": await self._cost_entry_dict(session, head), "has_more": len(rows) > page_limit}
+
+    async def allocate_cost_entry(self, session: Any | None = None, actor: Any | None = None,
+                                   event_id: Any = None, cost_entry_id: Any = None, *,
+                                   correction_of_id: Any = None, idempotency_key: Any) -> dict[str, Any]:
+        session = self._resolve_session(session)
+        if actor is None:
+            raise MediaOperationsValidationError("actor is required")
+        _assert_cost_human_write(actor)
+        entry = await self._get_row(session, MediaCostEntry, cost_entry_id, "cost_entry_id")
+        actor_id = await self._assert_entity_access(session, actor, entry, permission="write")
+        await self._lock_cost_entry_root(session, entry.entry_id)
+        event = await self._get_row(session, RevenueEvent, event_id, "event_id", for_update=True)
+        await self._assert_entity_access(session, actor, event, permission="write")
+        allocation = await session.get(MediaCostAllocation, entry.entry_id)
+        if allocation is not None:
+            if allocation.revenue_event_id != event.id or allocation.cost_entry_revision_id != entry.id:
+                raise MediaOperationsConflictError("cost entry is already allocated; moving or dividing an allocation is unsupported")
+            # Validate the original command's key/body through the normal replay path.
+        else:
+            head = await self._scalar(session, select(MediaCostEntry).where(MediaCostEntry.entry_id == entry.entry_id).order_by(MediaCostEntry.revision.desc()).limit(1))
+            if head.id != entry.id:
+                raise MediaOperationsConflictError("cost entry changed; reload its latest revision before allocation")
+        if (entry.owner_user_id != event.owner_user_id or entry.project_id != event.project_id
+                or entry.persona_ref != event.persona_ref or entry.currency != event.currency
+                or entry.content_ref is not None and entry.content_ref != event.content_ref
+                or not entry.window_start <= event.event_at <= entry.window_end):
+            raise MediaOperationsValidationError("cost allocation must match owner, project, persona, content, currency and window")
+        values = {name: getattr(entry, name) for name in (*COST_INPUT_FIELDS, "currency", "source", "basis", "missing_reasons", "coverage_complete", "coverage_note")}
+        values["evidence"] = [dict(item, url=item["ref"]) if item.get("kind") == "url" else dict(item) for item in entry.evidence]
+        for item in values["evidence"]:
+            item.pop("evidence_hash", None)
+            if item.get("kind") == "url":
+                item.pop("ref", None)
+        root_id, entry_uuid, event_uuid = entry.entry_id, entry.id, event.id
+        try:
+            record = await self.create_revenue_cost_record(session, actor, event_uuid, **values,
+                        correction_of_id=correction_of_id, idempotency_key=idempotency_key,
+                        _cost_entry_id=entry_uuid, _defer_commit=True)
+            if allocation is None:
+                session.add(MediaCostAllocation(cost_entry_id=root_id, cost_entry_revision_id=entry_uuid,
+                            revenue_event_id=event_uuid, cost_record_id=UUID(record["id"]), created_by=actor_id))
+            await self._flush_commit(session)
+            return record
+        except IntegrityError as exc:
+            await self._rollback(session)
+            raise MediaOperationsConflictError("cost entry was allocated concurrently; reload before retrying") from exc
+
+    async def create_revenue_cost_record(
+        self, session: Any | None = None, actor: Any | None = None,
+        event_id: Any = None, *, currency: Any, source: Any = "manual",
+        basis: Any, fee_amount: Any = None, production_cost_amount: Any = None,
+        human_cost_amount: Any = None, human_minutes: Any = None,
+        missing_reasons: Any = None, coverage_complete: Any = False,
+        coverage_note: Any, evidence: Any, correction_of_id: Any = None,
+        idempotency_key: Any, _cost_entry_id: UUID | None = None, _defer_commit: bool = False,
+    ) -> dict[str, Any]:
+        """Append a complete replacement cost statement, never a second allocation.
+
+        The event row serializes writers in PostgreSQL. Revision/predecessor
+        uniqueness also rejects concurrent branches on databases without row
+        locks. Idempotent replay is checked before checking the current head.
+        """
+        session = self._resolve_session(session)
+        if actor is None or event_id is None:
+            raise MediaOperationsValidationError("actor and event_id are required")
+        _assert_cost_human_write(actor)
+        event = await self._get_row(session, RevenueEvent, event_id, "event_id", for_update=True)
+        actor_id = await self._assert_entity_access(session, actor, event, permission="write")
+        currency_value = _required_text(currency, "currency", 3).upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency_value) or currency_value != event.currency:
+            raise MediaOperationsValidationError("cost currency must match its revenue event")
+        source_value = _enum(source, ("manual", "imported"), "source", "manual")
+        basis_value = _enum(basis, ("estimated", "settled"), "basis")
+        if basis_value != ("settled" if event.settlement_at is not None else "estimated"):
+            raise MediaOperationsValidationError("cost basis must match its revenue event")
+        if type(coverage_complete) is not bool:
+            raise MediaOperationsValidationError("coverage_complete must be a boolean")
+        reasons = _mapping(missing_reasons if missing_reasons is not None else {}, "missing_reasons")
+        if set(reasons) - set(COST_INPUT_FIELDS):
+            raise MediaOperationsValidationError("missing_reasons contains an unsupported cost field")
+        values = dict(fee_amount=fee_amount, production_cost_amount=production_cost_amount,
+                      human_cost_amount=human_cost_amount, human_minutes=human_minutes)
+        missing = {}
+        for name, value in values.items():
+            if value is None:
+                missing[name] = _required_text(reasons.get(name), f"missing_reasons.{name}", 500)
+            else:
+                try:
+                    values[name] = _finite_number(value, name, allow_negative=name != "human_minutes" and event.event_type != "sale")
+                except (ValueError, OverflowError) as exc:
+                    raise MediaOperationsValidationError(f"{name} is outside the supported range") from exc
+                if name in reasons:
+                    raise MediaOperationsValidationError(f"{name} cannot have both a value and a missing reason")
+        correction_uuid = _as_uuid(correction_of_id, "correction_of_id", required=False)
+        key = _required_text(idempotency_key, "idempotency_key", 255)
+        payload = {
+            "revenue_event_id": str(event.id), "revenue_event_hash": event.event_hash,
+            "cost_entry_id": str(_cost_entry_id) if _cost_entry_id else None,
+            "currency": currency_value, "source": source_value, "basis": basis_value,
+            "attribution_method": "direct_event",
+            "window_start": event.event_at.isoformat(), "window_end": event.event_at.isoformat(),
+            **values, "missing_reasons": missing, "coverage_complete": coverage_complete,
+            "coverage_note": _required_text(coverage_note, "coverage_note", 2000),
+            "evidence": _normalize_evidence(evidence, "evidence", required=True),
+            "correction_of_id": str(correction_uuid) if correction_uuid else None,
+        }
+        cost_hash = sha256_json(payload)
+
+        async def replay():
+            return await self._scalar(session, select(RevenueCostRecord).where(
+                RevenueCostRecord.revenue_event_id == event.id,
+                RevenueCostRecord.idempotency_key == key,
+            ).limit(1))
+
+        existing = await replay()
+        if existing is not None:
+            if existing.cost_hash != cost_hash:
+                raise MediaOperationsConflictError("idempotency key was already used with different cost evidence")
+            return self._cost_record_dict(event, existing)
+        head = await self._scalar(session, select(RevenueCostRecord).where(
+            RevenueCostRecord.revenue_event_id == event.id,
+        ).order_by(RevenueCostRecord.revision.desc()).limit(1))
+        if head is None:
+            if correction_uuid is not None:
+                raise MediaOperationsConflictError("initial cost record cannot correct another record")
+            revision = 1
+        else:
+            if correction_uuid != head.id:
+                raise MediaOperationsConflictError("cost evidence changed; reload before correcting the latest record")
+            if head.cost_entry_id is not None:
+                raise MediaOperationsConflictError("allocated cost evidence is fixed; editing or moving an allocation is unsupported")
+            if source_value != head.source or basis_value != head.basis or currency_value != head.currency:
+                raise MediaOperationsValidationError("cost correction cannot change source, basis or currency")
+            revision = head.revision + 1
+        row_values = dict(payload)
+        row_values.update(revenue_event_id=event.id, window_start=event.event_at,
+                          window_end=event.event_at, correction_of_id=correction_uuid,
+                          cost_entry_id=_cost_entry_id)
+        row = RevenueCostRecord(
+            id=uuid4(), owner_user_id=event.owner_user_id, project_id=event.project_id,
+            revision=revision, **row_values, cost_hash=cost_hash,
+            idempotency_key=key, created_by=actor_id,
+        )
+        session.add(row)
+        try:
+            if _defer_commit:
+                await self._flush_only(session)
+            else:
+                await self._flush_commit(session)
+        except IntegrityError as exc:
+            # Rollback expires ORM objects; retain the immutable event id first.
+            event_uuid = row_values["revenue_event_id"]
+            await self._rollback(session)
+            event = await self._get_row(session, RevenueEvent, event_uuid, "event_id")
+            recovered = await replay()
+            if recovered is not None and recovered.cost_hash == cost_hash:
+                return self._cost_record_dict(event, recovered)
+            raise MediaOperationsConflictError("cost evidence changed; reload before correcting the latest record") from exc
+        return self._cost_record_dict(event, row)
+
+    @staticmethod
+    def _cost_record_dict(event: RevenueEvent, row: RevenueCostRecord) -> dict[str, Any]:
+        projection = revenue_cost_projection(event, row)
+        return {
+            **row.to_safe_dict(), "cost_authority": projection["cost_authority"],
+            "profit_amount": projection["profit_amount"], "profit_status": projection["profit_status"],
+        }
+
+    async def list_revenue_cost_records(
+        self, session: Any | None = None, actor: Any | None = None,
+        event_id: Any = None, *, limit: int = 100, offset: int = 0,
+    ) -> dict[str, Any]:
+        session = self._resolve_session(session)
+        if actor is None or event_id is None:
+            raise MediaOperationsValidationError("actor and event_id are required")
+        event = await self._get_row(session, RevenueEvent, event_id, "event_id")
+        await self._assert_entity_access(session, actor, event, permission="read")
+        page_limit, page_offset = _bounded_page(limit, offset)
+        statement = select(RevenueCostRecord).where(RevenueCostRecord.revenue_event_id == event.id).order_by(RevenueCostRecord.revision.desc())
+        rows = await self._scalars(session, statement.limit(page_limit + 1).offset(page_offset))
+        head = rows[0] if page_offset == 0 and rows else await self._scalar(session, statement.limit(1))
+        return {"items": [self._cost_record_dict(event, row) for row in rows[:page_limit]],
+                "effective": self._cost_record_dict(event, head) if head else None,
+                "has_more": len(rows) > page_limit}
+
+    async def _revenue_cost_heads(self, session: Any, events: list[Any]) -> dict[str, Any]:
+        if not events:
+            return {}
+        # The caller has already authorized each event. No unrelated cost rows
+        # or cross-owner event identifiers are included in this query.
+        rows = await self._scalars(session, select(RevenueCostRecord).where(
+            RevenueCostRecord.revenue_event_id.in_([event.id for event in events]),
+        ))
+        return effective_cost_records(rows)
+
     async def list_revenue_events(self, session: Any | None = None, actor: Any | None = None, *, project_id: Any = None, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         session = self._resolve_session(session)
         if actor is None:
             raise MediaOperationsValidationError("actor is required")
-        return [_safe_revenue_dict(row) for row in await self._list(session, actor, RevenueEvent, project_id=project_id, limit=limit, offset=offset)]
+        events = await self._list(session, actor, RevenueEvent, project_id=project_id, limit=limit, offset=offset)
+        heads = await self._revenue_cost_heads(session, events)
+        return [{**_safe_revenue_dict(row), **revenue_cost_projection(row, heads.get(str(row.id)))} for row in events]
 
     async def get_revenue_event(self, session: Any | None = None, actor: Any | None = None, event_id: Any = None) -> dict[str, Any]:
         session = self._resolve_session(session)
@@ -3289,7 +3638,8 @@ class MediaOperationsMetricsService(MediaOperationsService):
             raise MediaOperationsValidationError("actor and event_id are required")
         row = await self._get_row(session, RevenueEvent, event_id, "event_id")
         await self._assert_entity_access(session, actor, row, permission="read")
-        return _safe_revenue_dict(row)
+        heads = await self._revenue_cost_heads(session, [row])
+        return {**_safe_revenue_dict(row), **revenue_cost_projection(row, heads.get(str(row.id)))}
 
 
 # Compatibility names used by early WS7 planning notes.

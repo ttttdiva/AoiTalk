@@ -26,6 +26,7 @@ from .file_explorer_service import (
     get_directory_tree,
     walk_workspace_tree,
     search_workspace_entries,
+    search_workspace_content,
     # Editor functions
     save_file,
     get_full_content,
@@ -75,6 +76,7 @@ __all__ = [
     "get_directory_tree",
     "walk_workspace_tree",
     "search_workspace_entries",
+    "search_workspace_content",
     "resolve_workspace_path",
     "resolve_upload_target",
     # Editor functions

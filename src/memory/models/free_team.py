@@ -26,6 +26,11 @@ from sqlalchemy.orm import relationship
 from .base import Base, _encrypted_text_property
 
 
+# These are the existing shared model-group pools, never per-user/key pools.
+OPENAI_DAILY_QUOTA_GROUPS = {"openai-sol-daily": "1m", "openai-luna-daily": "10m"}
+OPENAI_SAFETY_TOKENS = Decimal("30000")
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
@@ -156,6 +161,8 @@ class FreeTeamQuotaPool(Base):
     provider_observed_usage = Column(
         Numeric(24, 6), nullable=False, default=Decimal("0")
     )
+    provider_sync_state = Column(JSON, nullable=True)
+    provider_sync_version = Column(Integer, nullable=False, default=0)
     status = Column(String(40), nullable=False, default="active", index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(
@@ -169,24 +176,40 @@ class FreeTeamQuotaPool(Base):
     @property
     def provider_sync_delta(self) -> Decimal:
         observed = Decimal(self.provider_observed_usage or 0)
-        consumed = Decimal(self.consumed or 0)
-        return max(Decimal("0"), observed - consumed)
+        state = self.provider_sync_state or {}
+        try:
+            delta = Decimal(str(state["external_delta"]))
+            if state.get("schema_version") == 1 and Decimal(str(state["observed_total"])) == observed and delta.is_finite() and delta >= 0:
+                return delta
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            pass
+        # Old observations have no trustworthy local overlap watermark. Count
+        # them in full; subtracting today's changing consumption is unsafe.
+        return max(Decimal("0"), observed)
 
     @property
     def safety_margin(self) -> Decimal:
         ratio = Decimal(self.safety_margin_ratio or 0)
         units = Decimal(self.safety_margin_units or 0)
-        return max(units, Decimal(self.limit_value or 0) * ratio)
+        return max(units, Decimal(self.limit_value or 0) * ratio,
+                   OPENAI_SAFETY_TOKENS if self.id in OPENAI_DAILY_QUOTA_GROUPS else Decimal("0"))
+
+    @property
+    def daily_cap(self) -> Decimal:
+        limit = Decimal(self.limit_value or 0)
+        if self.id in OPENAI_DAILY_QUOTA_GROUPS:
+            from ...services.pricing.free_tier import FREE_TIER_LIMITS
+            limit = min(limit, Decimal(FREE_TIER_LIMITS["tier_3_plus"][OPENAI_DAILY_QUOTA_GROUPS[self.id]]))
+        return max(Decimal("0"), limit - self.safety_margin)
 
     @property
     def available(self) -> Decimal:
         return max(
             Decimal("0"),
-            Decimal(self.limit_value or 0)
+            self.daily_cap
             - Decimal(self.consumed or 0)
             - Decimal(self.reserved or 0)
             - self.provider_sync_delta
-            - self.safety_margin,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +221,10 @@ class FreeTeamQuotaPool(Base):
             "consumed": _number(self.consumed),
             "reserved": _number(self.reserved),
             "available": _number(self.available),
+            "daily_cap": _number(self.daily_cap),
+            "configured_daily_cap": _number(self.daily_cap),
+            "model_group": OPENAI_DAILY_QUOTA_GROUPS.get(self.id),
+            "stop_reason": self.status if self.status != "active" else ("budget_exhausted" if self.available <= 0 else ""),
             "safety_margin_ratio": _number(self.safety_margin_ratio),
             "safety_margin_units": _number(self.safety_margin_units),
             "window_start": _iso(self.window_start),
@@ -205,6 +232,7 @@ class FreeTeamQuotaPool(Base):
             "reset_policy": _safe_public_mapping(self.reset_policy or {}),
             "last_provider_sync_at": _iso(self.last_provider_sync_at),
             "provider_observed_usage": _number(self.provider_observed_usage),
+            "provider_external_delta": _number(self.provider_sync_delta),
             "status": self.status,
         }
 
@@ -312,6 +340,7 @@ class FreeTeamReservation(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     expires_at = Column(DateTime, nullable=False, index=True)
     finalized_at = Column(DateTime, nullable=True)
+    settlement_version = Column(Integer, nullable=False, default=0)
 
     candidate = relationship("FreeTeamCandidateModel")
 

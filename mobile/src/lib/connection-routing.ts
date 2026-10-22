@@ -4,13 +4,20 @@ import NetInfo, {
 } from "@react-native-community/netinfo";
 import * as SecureStore from "expo-secure-store";
 import { PermissionsAndroid, Platform } from "react-native";
-import { STORAGE_KEYS } from "../constants/config";
+import { DEFAULT_PORTAL_URL, STORAGE_KEYS } from "../constants/config";
 import {
   normalizeApiUrl,
   requireConfiguredApiUrl,
 } from "./api-url";
+import { normalizeGatewayServiceUrl, normalizePortalUrl } from "./portal-auth";
+
+export type NetworkConnectionMode = "direct" | "gateway";
 
 export interface NetworkEndpointRoutingConfig {
+  /** Legacy records omit this field and are migrated as direct mode. */
+  mode?: NetworkConnectionMode;
+  /** Independent Gateway portal root; direct cellular URL remains preserved. */
+  portalUrl?: string;
   enabled: boolean;
   wifiSsid: string;
   wifiApiUrl: string;
@@ -24,8 +31,18 @@ export interface CurrentNetworkInfo {
   connected: boolean | null;
 }
 
+export interface NetworkRouteSnapshot {
+  /** Network generation increments across Wi-Fi/cellular/SSID transitions. */
+  networkKey: string;
+  routingRevision: number;
+}
+
 /** A read-only probe supplied by api-client without creating a module cycle. */
-export type NetworkEndpointProbe = (url: string) => Promise<boolean>;
+export type NetworkEndpointProbe = (
+  url: string,
+  timeoutMs?: number,
+  signal?: AbortSignal,
+) => Promise<boolean | string>;
 
 export interface NetworkEndpointResolution {
   /** Ordered, de-duplicated endpoints for the current network. */
@@ -34,13 +51,23 @@ export interface NetworkEndpointResolution {
   networkKey: string;
   /** Durable routing revision captured while resolving the candidates. */
   routingRevision: number;
+  /** Route kind for each candidate, parallel to `candidates`. */
+  candidateModes?: NetworkConnectionMode[];
 }
 
 export interface ResolveApiUrlOptions {
   /** Probe candidates before selecting one when there is more than one. */
   probe?: NetworkEndpointProbe;
-  /** How long a successful or failed probe may be reused. */
+  /** How long a successful probe may be reused. */
   healthTtlMs?: number;
+  /** Delay before confirming an all-routes probe failure with read-only probes. */
+  failureConfirmationDelayMs?: number;
+  /** Selected public Gateway service (`https://host/at`) for gateway mode. */
+  gatewayApiUrl?: string;
+  /** Abort only this caller; shared route/auth work remains safe to finish. */
+  signal?: AbortSignal;
+  /** Called after route/network selection and before the first health probe. */
+  onResolution?: (resolution: NetworkEndpointResolution) => void;
 }
 
 /** No configured route answered its read-only AoiTalk health probe. */
@@ -49,7 +76,7 @@ export class ApiEndpointUnavailableError extends Error {
   readonly networkKey: string;
 
   constructor(candidates: readonly string[], networkKey: string) {
-    super("No configured AoiTalk API endpoint is reachable");
+    super("AoiTalkサーバーへ接続できませんでした。通信状態を確認して再試行してください。");
     this.name = "ApiEndpointUnavailableError";
     this.candidates = [...candidates];
     this.networkKey = networkKey;
@@ -58,6 +85,8 @@ export class ApiEndpointUnavailableError extends Error {
 
 export const DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG: NetworkEndpointRoutingConfig =
   {
+    mode: "direct",
+    portalUrl: DEFAULT_PORTAL_URL,
     enabled: false,
     wifiSsid: "",
     wifiApiUrl: "",
@@ -65,13 +94,16 @@ export const DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG: NetworkEndpointRoutingConf
   };
 
 let configuredNetInfo = false;
+let networkSubscription: (() => void) | null = null;
 let cachedConfig: NetworkEndpointRoutingConfig | null = null;
 let routingRevision = 0;
 
-/** Short-lived route health cache; failures must never pin the app offline. */
+/** Successful route health may be reused briefly; failed probes are never cached. */
 export const NETWORK_ENDPOINT_HEALTH_TTL_MS = 30_000;
+export const NETWORK_ENDPOINT_FAILURE_CONFIRMATION_DELAY_MS = 250;
+export const NETWORK_DISCONNECT_CONFIRMATION_DELAY_MS = 150;
 interface RouteHealthCacheEntry {
-  reachable: boolean;
+  endpoint: string;
   checkedAt: number;
 }
 const routeHealthCache = new Map<string, RouteHealthCacheEntry>();
@@ -86,6 +118,24 @@ function normalizeSsid(value: string | null | undefined): string {
   return (value ?? "").trim();
 }
 
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(Object.assign(new Error("Routing probe was aborted"), { name: "AbortError" }));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(Object.assign(new Error("Routing probe was aborted"), { name: "AbortError" }));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
  * Normalize settings before persistence. Disabled routes are intentionally
  * opaque so an invalid legacy value can be retained until the user enables
@@ -95,6 +145,8 @@ export function normalizeNetworkEndpointRoutingConfig(
   config: NetworkEndpointRoutingConfig,
 ): NetworkEndpointRoutingConfig {
   return {
+    mode: config.mode === "gateway" ? "gateway" : "direct",
+    portalUrl: config.portalUrl?.trim() || DEFAULT_PORTAL_URL,
     enabled: config.enabled,
     wifiSsid: config.wifiSsid.trim(),
     wifiApiUrl: config.enabled ? normalizeUrl(config.wifiApiUrl) : config.wifiApiUrl,
@@ -110,6 +162,18 @@ export function validateNetworkEndpointRoutingConfig(
 ): NetworkEndpointRoutingConfig {
   const normalized = normalizeNetworkEndpointRoutingConfig(config);
   if (!normalized.enabled) return normalized;
+
+  if (normalized.mode === "gateway") {
+    return {
+      ...normalized,
+      wifiApiUrl: normalized.wifiApiUrl
+        ? requireConfiguredApiUrl(normalized.wifiApiUrl)
+        : "",
+      // `cellularApiUrl` remains a legacy/direct route value. Gateway mode
+      // derives its `/at` service from the independent portal root below.
+      portalUrl: normalizePortalUrl(normalized.portalUrl || DEFAULT_PORTAL_URL),
+    };
+  }
 
   return {
     ...normalized,
@@ -131,6 +195,14 @@ export function configureNetworkEndpointRouting(): void {
   if (configuredNetInfo) return;
   configuredNetInfo = true;
   NetInfo.configure({ shouldFetchWiFiSSID: true });
+  const subscribe = (NetInfo as unknown as {
+    addEventListener?: (listener: (state: NetInfoState) => void) => () => void;
+  }).addEventListener;
+  if (typeof subscribe === "function") {
+    networkSubscription = subscribe((state) => {
+      observeNetworkState(networkFromState(state));
+    });
+  }
 }
 
 async function requestWifiSsidPermission(): Promise<boolean> {
@@ -146,20 +218,39 @@ async function requestWifiSsidPermission(): Promise<boolean> {
   }
 }
 
-function parseConfig(raw: string | null): NetworkEndpointRoutingConfig {
-  if (!raw) return DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG;
+function parseConfig(raw: string | null): {
+  config: NetworkEndpointRoutingConfig;
+  legacyModeMissing: boolean;
+} {
+  if (!raw) return {
+    config: DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG,
+    legacyModeMissing: false,
+  };
   try {
     const parsed = JSON.parse(raw) as Partial<NetworkEndpointRoutingConfig>;
     return {
+      config: {
+      // Existing settings deliberately have only enabled/wifiSsid/wifiApiUrl/
+      // cellularApiUrl. Treating the missing discriminator as direct retains
+      // every legacy value while making the new selection explicit.
+      mode: parsed.mode === "gateway" ? "gateway" : "direct",
+      portalUrl: typeof parsed.portalUrl === "string" && parsed.portalUrl.trim()
+        ? parsed.portalUrl
+        : DEFAULT_PORTAL_URL,
       enabled: Boolean(parsed.enabled),
       wifiSsid: typeof parsed.wifiSsid === "string" ? parsed.wifiSsid : "",
       wifiApiUrl:
         typeof parsed.wifiApiUrl === "string" ? parsed.wifiApiUrl : "",
       cellularApiUrl:
         typeof parsed.cellularApiUrl === "string" ? parsed.cellularApiUrl : "",
+      },
+      legacyModeMissing: parsed.mode !== "direct" && parsed.mode !== "gateway",
     };
   } catch {
-    return DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG;
+    return {
+      config: DEFAULT_NETWORK_ENDPOINT_ROUTING_CONFIG,
+      legacyModeMissing: false,
+    };
   }
 }
 
@@ -182,8 +273,31 @@ export async function getNetworkEndpointRoutingConfig(): Promise<NetworkEndpoint
       continue;
     }
 
-    cachedConfig = parsed;
-    return parsed;
+    if (parsed.legacyModeMissing && raw) {
+      // Migrate only the discriminator. Existing key, route values and even
+      // disabled legacy URL text remain intact until the user edits them.
+      let migratedRaw: Record<string, unknown> = {};
+      try {
+        const candidate = JSON.parse(raw) as unknown;
+        if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+          migratedRaw = { ...(candidate as Record<string, unknown>) };
+        }
+      } catch {
+        // parseConfig already supplied the safe known-field projection.
+      }
+      migratedRaw.mode = "direct";
+      await SecureStore.setItemAsync(
+        STORAGE_KEYS.NETWORK_ENDPOINT_ROUTING,
+        JSON.stringify(Object.keys(migratedRaw).length > 1 ? migratedRaw : parsed.config),
+      );
+      if (routingRevision !== revisionAtStart) {
+        if (cachedConfig) return cachedConfig;
+        continue;
+      }
+    }
+
+    cachedConfig = parsed.config;
+    return parsed.config;
   }
 }
 
@@ -220,6 +334,25 @@ export async function getCurrentNetworkInfo(): Promise<CurrentNetworkInfo> {
   const canReadSsid = await requestWifiSsidPermission();
   const network = networkFromState(await NetInfo.fetch());
   return canReadSsid ? network : { ...network, ssid: null };
+}
+
+/** Read and record the current path identity for request snapshot checks. */
+export async function getCurrentNetworkRouteSnapshot(): Promise<NetworkRouteSnapshot> {
+  const network = await getCurrentNetworkInfo();
+  observeNetworkState(network);
+  return {
+    networkKey: networkKey(network),
+    routingRevision,
+  };
+}
+
+/** Return the last path observed by routing or NetInfo without another probe. */
+export function getObservedNetworkRouteSnapshot(): NetworkRouteSnapshot | null {
+  if (lastNetworkIdentity === null) return null;
+  return {
+    networkKey: `${networkGeneration}:${lastNetworkIdentity}`,
+    routingRevision,
+  };
 }
 
 function networkKey(network: CurrentNetworkInfo): string {
@@ -263,25 +396,44 @@ function uniqueCandidates(candidates: string[]): string[] {
 }
 
 /**
- * Resolve ordered route candidates without probing them.  A configured
- * public/cellular route is authoritative when present; the basic endpoint is
- * used only when that route is not configured.
+ * Resolve ordered route candidates without probing them. Direct mode retains
+ * the legacy basic/public behavior; Gateway mode has only the optional
+ * SSID-matching LAN candidate and the selected portal `/at` service.
  */
 export async function getNetworkEndpointResolution(
   fallbackApiUrl: string,
+  options: Pick<ResolveApiUrlOptions, "gatewayApiUrl" | "signal"> = {},
 ): Promise<NetworkEndpointResolution> {
   const fallback = normalizeUrl(fallbackApiUrl);
 
   for (;;) {
+    if (options.signal?.aborted) {
+      throw Object.assign(new Error("Routing resolution was aborted"), { name: "AbortError" });
+    }
     const revisionAtStart = routingRevision;
     const config = await getNetworkEndpointRoutingConfig();
     if (routingRevision !== revisionAtStart) continue;
 
-    if (!config.enabled) {
+    const mode = config.mode ?? "direct";
+
+    if (!config.enabled && mode === "direct") {
       return {
         candidates: [fallback],
         networkKey: "disabled",
         routingRevision: revisionAtStart,
+        candidateModes: ["direct"],
+      };
+    }
+
+    if (!config.enabled && mode === "gateway") {
+      const gatewayApiUrl = normalizeGatewayServiceUrl(
+        options.gatewayApiUrl ?? `${config.portalUrl || DEFAULT_PORTAL_URL}/at`,
+      );
+      return {
+      candidates: [gatewayApiUrl],
+        networkKey: "gateway-disabled",
+        routingRevision: revisionAtStart,
+        candidateModes: ["gateway"],
       };
     }
 
@@ -289,7 +441,7 @@ export async function getNetworkEndpointResolution(
     try {
       network = await getCurrentNetworkInfo();
     } catch {
-      // NetInfo/permission failures cannot block the public/basic endpoint.
+      // NetInfo/permission failures cannot block the selected internet route.
       network = { type: "unknown", ssid: null, connected: null };
     }
     if (routingRevision !== revisionAtStart) continue;
@@ -297,11 +449,27 @@ export async function getNetworkEndpointResolution(
     observeNetworkState(network);
 
     if (network.connected === false) {
-      return {
-        candidates: [],
-        networkKey: networkKey(network),
-        routingRevision: revisionAtStart,
-      };
+      // NetInfo can briefly emit a disconnected snapshot while Android is
+      // switching/validating an otherwise healthy Wi-Fi path. Confirm once
+      // before turning that transient sample into "no route candidates".
+      await delay(NETWORK_DISCONNECT_CONFIRMATION_DELAY_MS, options.signal);
+      if (routingRevision !== revisionAtStart) continue;
+      try {
+        const confirmed = await getCurrentNetworkInfo();
+        if (routingRevision !== revisionAtStart) continue;
+        observeNetworkState(confirmed);
+        network = confirmed;
+      } catch {
+        // Keep the original disconnected sample only when confirmation itself
+        // is unavailable; callers will surface a real no-path state below.
+      }
+      if (network.connected === false) {
+        return {
+          candidates: [],
+          networkKey: networkKey(network),
+          routingRevision: revisionAtStart,
+        };
+      }
     }
 
     const wifiSsid = normalizeSsid(config.wifiSsid);
@@ -314,14 +482,32 @@ export async function getNetworkEndpointResolution(
     const publicOrBasic = config.cellularApiUrl
       ? normalizeUrl(config.cellularApiUrl)
       : fallback;
-    const candidates = matchingWifi && config.wifiApiUrl
-      ? [normalizeUrl(config.wifiApiUrl), publicOrBasic]
-      : [publicOrBasic];
+    const candidates = mode === "gateway"
+      ? [
+        ...(matchingWifi && config.wifiApiUrl
+          ? [normalizeUrl(config.wifiApiUrl)]
+          : []),
+        // Gateway mode has no direct/basic fallback. The selected internet
+        // route is always the configured portal's `/at` service.
+        normalizeGatewayServiceUrl(
+          options.gatewayApiUrl ?? `${config.portalUrl || DEFAULT_PORTAL_URL}/at`,
+        ),
+      ]
+      : matchingWifi && config.wifiApiUrl
+        ? [normalizeUrl(config.wifiApiUrl), publicOrBasic]
+        : [publicOrBasic];
 
     return {
       candidates: uniqueCandidates(candidates),
       networkKey: networkKey(network),
       routingRevision: revisionAtStart,
+      candidateModes: uniqueCandidates(candidates).map((candidate) =>
+        mode === "gateway" && candidate === normalizeGatewayServiceUrl(
+          options.gatewayApiUrl ?? `${config.portalUrl || DEFAULT_PORTAL_URL}/at`,
+        )
+          ? "gateway"
+          : "direct",
+      ),
     };
   }
 }
@@ -338,20 +524,28 @@ export async function resolveApiUrlForCurrentNetwork(
   options: ResolveApiUrlOptions = {},
 ): Promise<string> {
   for (;;) {
-    const resolution = await getNetworkEndpointResolution(fallbackApiUrl);
+    const resolution = await getNetworkEndpointResolution(fallbackApiUrl, {
+      gatewayApiUrl: options.gatewayApiUrl,
+      signal: options.signal,
+    });
+    options.onResolution?.(resolution);
+    if (options.signal?.aborted) {
+      throw Object.assign(new Error("Routing probe was aborted"), { name: "AbortError" });
+    }
     const candidates = resolution.candidates;
 
     if (candidates.length === 0) {
       throw new ApiEndpointUnavailableError(candidates, resolution.networkKey);
     }
 
-    // Routing off, a non-matching network, and a single configured endpoint
-    // retain the old no-preflight behavior.
-    if (!options.probe || candidates.length <= 1) {
+    // Routing disabled retains the old no-preflight behavior in direct mode.
+    // Explicit route selections are probed before any mutation is sent.
+    if (!options.probe || resolution.networkKey === "disabled") {
       return candidates[0] ?? "";
     }
 
     let resolutionChanged = false;
+    const failedCandidates: string[] = [];
     for (const candidate of candidates) {
       if (routingRevision !== resolution.routingRevision) {
         resolutionChanged = true;
@@ -362,29 +556,88 @@ export async function resolveApiUrlForCurrentNetwork(
       const now = Date.now();
       const ttl = options.healthTtlMs ?? NETWORK_ENDPOINT_HEALTH_TTL_MS;
       const cached = routeHealthCache.get(cacheKey);
-      let reachable: boolean;
+      let reachableEndpoint: string | null;
 
       if (cached && now - cached.checkedAt <= ttl) {
-        reachable = cached.reachable;
+        reachableEndpoint = cached.endpoint;
       } else {
         try {
-          reachable = await options.probe(candidate);
-        } catch {
-          // Invalid routes and probe failures are treated as unavailable so a
-          // configured public route can still rescue a dead LAN route.
-          reachable = false;
+          const probed = await options.probe(candidate, undefined, options.signal);
+          reachableEndpoint =
+            typeof probed === "string"
+              ? probed.trim().replace(/\/+$/, "")
+              : probed
+                ? candidate
+                : null;
+        } catch (error) {
+          if (options.signal?.aborted) {
+            throw error;
+          }
+          reachableEndpoint = null;
         }
         if (routingRevision !== resolution.routingRevision) {
           resolutionChanged = true;
           break;
         }
-        routeHealthCache.set(cacheKey, {
-          reachable,
-          checkedAt: Date.now(),
-        });
+        if (reachableEndpoint) {
+          routeHealthCache.set(cacheKey, {
+            endpoint: reachableEndpoint,
+            checkedAt: Date.now(),
+          });
+        } else {
+          // A single failed read-only probe is not durable evidence that the
+          // route is down. Never pin it in the 30s success cache.
+          routeHealthCache.delete(cacheKey);
+          failedCandidates.push(candidate);
+        }
       }
 
-      if (reachable) return candidate;
+      if (reachableEndpoint) return reachableEndpoint;
+    }
+
+    if (resolutionChanged) continue;
+
+    // All candidates failed once. Mutation requests have not been sent yet, so
+    // it is safe to absorb a short transport/health blip by confirming with one
+    // more round of read-only probes before declaring the route unavailable.
+    if (failedCandidates.length > 0) {
+      await delay(
+        options.failureConfirmationDelayMs ??
+          NETWORK_ENDPOINT_FAILURE_CONFIRMATION_DELAY_MS,
+        options.signal,
+      );
+      for (const candidate of failedCandidates) {
+        if (routingRevision !== resolution.routingRevision) {
+          resolutionChanged = true;
+          break;
+        }
+        let reachableEndpoint: string | null = null;
+        try {
+          const probed = await options.probe(candidate, undefined, options.signal);
+          reachableEndpoint =
+            typeof probed === "string"
+              ? probed.trim().replace(/\/+$/, "")
+              : probed
+                ? candidate
+                : null;
+        } catch (error) {
+          if (options.signal?.aborted) {
+            throw error;
+          }
+          reachableEndpoint = null;
+        }
+        if (routingRevision !== resolution.routingRevision) {
+          resolutionChanged = true;
+          break;
+        }
+        if (reachableEndpoint) {
+          routeHealthCache.set(routeHealthCacheKey(resolution, candidate), {
+            endpoint: reachableEndpoint,
+            checkedAt: Date.now(),
+          });
+          return reachableEndpoint;
+        }
+      }
     }
 
     if (resolutionChanged) continue;

@@ -39,7 +39,6 @@ export type FilesEntryMetadata = {
 
 export type FilesMediaSource = {
   uri: string;
-  headers?: Record<string, string>;
 };
 
 export type FilesMediaKind =

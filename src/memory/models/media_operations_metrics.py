@@ -343,7 +343,7 @@ class MediaMetricIngestionRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "provider IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')",
+            "provider IN ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')",
             name="ck_media_metric_ingestion_runs_provider",
         ),
         CheckConstraint(
@@ -1001,4 +1001,73 @@ __all__ = [
     "ExperimentMetricInput",
     "MetricSnapshotInput",
     "RevenueEvent",
+    "RevenueCostRecord",
 ]
+
+
+class RevenueCostRecord(Base):
+    """Immutable revision of three cost categories allocated to one revenue event."""
+
+    __tablename__ = "media_revenue_cost_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    revenue_event_id = Column(UUID(as_uuid=True), ForeignKey("media_revenue_events.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    revenue_event_hash = Column(String(64), nullable=False)
+    cost_entry_id = Column(UUID(as_uuid=True), ForeignKey("media_cost_entries.id", ondelete="RESTRICT"), nullable=True)
+    revision = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False)
+    source = Column(String(16), nullable=False)
+    basis = Column(String(16), nullable=False)
+    attribution_method = Column(String(32), nullable=False)
+    window_start = Column(DateTime, nullable=False)
+    window_end = Column(DateTime, nullable=False)
+    fee_amount = Column(Float, nullable=True)
+    production_cost_amount = Column(Float, nullable=True)
+    human_cost_amount = Column(Float, nullable=True)
+    human_minutes = Column(Float, nullable=True)
+    missing_reasons = Column(JSON, nullable=False)
+    coverage_complete = Column(Boolean, nullable=False)
+    coverage_note = Column(Text, nullable=False)
+    evidence = Column(JSON, nullable=False)
+    correction_of_id = Column(UUID(as_uuid=True), ForeignKey("media_revenue_cost_records.id", ondelete="RESTRICT"), nullable=True)
+    cost_hash = Column(String(64), nullable=False)
+    idempotency_key = Column(String(255), nullable=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("revenue_event_id", "revision", name="uq_media_revenue_cost_revision"),
+        UniqueConstraint("revenue_event_id", "idempotency_key", name="uq_media_revenue_cost_idempotency"),
+        UniqueConstraint("correction_of_id", name="uq_media_revenue_cost_successor"),
+        CheckConstraint("revision >= 1", name="ck_media_revenue_cost_revision"),
+        CheckConstraint("source IN ('manual', 'imported')", name="ck_media_revenue_cost_source"),
+        CheckConstraint("basis IN ('estimated', 'settled')", name="ck_media_revenue_cost_basis"),
+        CheckConstraint("attribution_method = 'direct_event'", name="ck_media_revenue_cost_attribution"),
+        CheckConstraint("window_start = window_end", name="ck_media_revenue_cost_window"),
+        CheckConstraint("length(currency) = 3", name="ck_media_revenue_cost_currency"),
+        CheckConstraint("length(cost_hash) = 64 AND length(revenue_event_hash) = 64", name="ck_media_revenue_cost_hash"),
+        CheckConstraint("human_minutes IS NULL OR human_minutes >= 0", name="ck_media_revenue_cost_minutes"),
+        CheckConstraint("(revision = 1 AND correction_of_id IS NULL) OR (revision > 1 AND correction_of_id IS NOT NULL)", name="ck_media_revenue_cost_predecessor"),
+    )
+
+    def to_safe_dict(self) -> Dict[str, Any]:
+        return {
+            "id": _uuid(self.id), "revenue_event_id": _uuid(self.revenue_event_id),
+            "owner_user_id": _uuid(self.owner_user_id), "project_id": _uuid(self.project_id),
+            "revenue_event_hash": self.revenue_event_hash, "revision": self.revision,
+            "cost_entry_id": _uuid(self.cost_entry_id),
+            "currency": self.currency, "source": self.source, "basis": self.basis,
+            "attribution_method": self.attribution_method,
+            "window_start": _dt(self.window_start), "window_end": _dt(self.window_end),
+            "fee_amount": self.fee_amount, "production_cost_amount": self.production_cost_amount,
+            "human_cost_amount": self.human_cost_amount, "human_minutes": self.human_minutes,
+            "missing_reasons": self.missing_reasons or {}, "coverage_complete": self.coverage_complete,
+            "coverage_note": self.coverage_note, "evidence": self.evidence or [],
+            "correction_of_id": _uuid(self.correction_of_id), "cost_hash": self.cost_hash,
+            "idempotency_key": self.idempotency_key, "created_by": _uuid(self.created_by),
+            "created_at": _dt(self.created_at),
+        }
+
+    to_dict = to_safe_dict

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import traceback
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -15,23 +19,113 @@ from src.llm.generation_error import GenerationErrorKind, user_message_for_gener
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_SAFE_DIAGNOSTIC_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+_MAX_EXCEPTION_CLASS_LENGTH = 96
+_MAX_SOURCE_PATH_LENGTH = 128
+_MAX_SOURCE_FUNCTION_LENGTH = 64
+_MAX_SOURCE_FRAME_LENGTH = 192
+_MAX_SOURCE_LINE = 10_000_000
+
+
+def _bounded_diagnostic_token(value: str, *, limit: int) -> str:
+    """Keep diagnostic metadata printable and bounded without reading values."""
+
+    token = _SAFE_DIAGNOSTIC_CHARS.sub("_", value)[:limit]
+    return token or "unknown"
+
+
+def _is_allowlisted_source_path(relative_path: Path) -> bool:
+    return (
+        (len(relative_path.parts) == 1 and relative_path.name == "main.py")
+        or (
+            len(relative_path.parts) >= 2
+            and relative_path.parts[0] == "src"
+            and relative_path.suffix == ".py"
+        )
+    )
+
+
+def _safe_unhandled_exception_metadata(exc: BaseException) -> tuple[str, str]:
+    """Return bounded exception class and allowlisted source-frame metadata.
+
+    This helper intentionally reads only type/code-object metadata.  It never
+    formats the exception, walks locals, or serializes a traceback.  A source
+    frame is eligible only when its resolved path is ``main.py`` at the project
+    root or a ``.py`` file below ``src/``; resolving before the relative-path
+    check also excludes symlinks that point outside the repository.
+    """
+
+    try:
+        exception_type = type(exc)
+        class_parts = (
+            getattr(exception_type, "__module__", None),
+            getattr(exception_type, "__qualname__", None),
+        )
+        raw_class = ".".join(
+            part for part in class_parts if isinstance(part, str) and part
+        )
+        exception_class = _bounded_diagnostic_token(
+            raw_class,
+            limit=_MAX_EXCEPTION_CLASS_LENGTH,
+        )
+        source_frame = "unknown"
+        for frame, lineno in traceback.walk_tb(exc.__traceback__):
+            try:
+                filename = frame.f_code.co_filename
+                if not isinstance(filename, str):
+                    continue
+                project_root = Path(os.path.abspath(str(_PROJECT_ROOT)))
+                lexical_path = Path(os.path.abspath(filename))
+                lexical_relative_path = lexical_path.relative_to(project_root)
+                if not _is_allowlisted_source_path(lexical_relative_path):
+                    continue
+
+                # Resolve only after the lexical containment/allowlist check.
+                # This avoids touching arbitrary outside or UNC paths while
+                # still rejecting an allowlisted path that escapes through a
+                # local symlink.
+                resolved_path = lexical_path.resolve()
+                relative_path = resolved_path.relative_to(project_root)
+                if not _is_allowlisted_source_path(relative_path):
+                    continue
+
+                safe_path = "/".join(
+                    _bounded_diagnostic_token(part, limit=64)
+                    for part in relative_path.parts
+                )[:_MAX_SOURCE_PATH_LENGTH]
+                function_name = frame.f_code.co_name
+                if not isinstance(function_name, str):
+                    function_name = "unknown"
+                safe_function = _bounded_diagnostic_token(
+                    function_name,
+                    limit=_MAX_SOURCE_FUNCTION_LENGTH,
+                )
+                try:
+                    safe_lineno = max(0, min(int(lineno), _MAX_SOURCE_LINE))
+                except (TypeError, ValueError, OverflowError):
+                    safe_lineno = 0
+                source_suffix = f":{safe_function}:{safe_lineno}"
+                path_limit = max(
+                    1,
+                    _MAX_SOURCE_FRAME_LENGTH - len(source_suffix),
+                )
+                source_frame = f"{safe_path[:path_limit]}{source_suffix}"
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                continue
+        return exception_class, source_frame
+    except Exception:
+        return "unknown", "unknown"
+
+
 INTERNAL_ERROR_CATEGORY = "internal_error"
 INTERNAL_ERROR_CODE = "internal_error"
 LLM_UNAVAILABLE_CATEGORY = "llm_unavailable"
-HYDRUS_ERROR_CATEGORY = "hydrus"
-_SAFE_HYDRUS_ERROR_MESSAGES = {
-    "hydrus_not_configured": "Hydrus接続が設定されていません。Settingsで接続を設定してください",
-    "hydrus_legacy_owner_ambiguous": "既存のHydrus設定を安全に移行できません。現在のユーザーとして明示的に取り込んでください",
-    "hydrus_legacy_owner_conflict": "既存のHydrus設定の所有者を確認できません",
-    "hydrus_endpoint_policy_rejected": "Hydrus API URLが許可されていません",
-    "hydrus_endpoint_resolution_failed": "Hydrus API URLの名前解決に失敗しました",
-    "hydrus_credential_unreadable": "Hydrus接続設定を読み取れません",
-    "hydrus_credential_store_unavailable": "Hydrus接続設定を一時的に読み取れません",
-    "hydrus_auth_failed": "Hydrus Clientの認証または権限を確認してください",
-    "hydrus_unreachable": "Hydrus Clientに接続できません",
-    "hydrus_upstream_error": "Hydrus APIエラー",
+STORAGE_UNAVAILABLE_CATEGORY = "storage_unavailable"
+_SAFE_STORAGE_ERROR_MESSAGES = {
+    "storage_unavailable": "素材の保存先を利用できません。接続状態と登録記録を確認してください。",
+    "storage_busy": "素材の保存先で処理が続いています。少し待ってから登録記録を確認してください。",
 }
-_SAFE_HYDRUS_ERROR_CODES = frozenset(_SAFE_HYDRUS_ERROR_MESSAGES)
 _SAFE_LLM_ERROR_CODES = frozenset(
     {
         GenerationErrorKind.INSUFFICIENT_QUOTA,
@@ -39,6 +133,7 @@ _SAFE_LLM_ERROR_CODES = frozenset(
         GenerationErrorKind.AUTHENTICATION,
         GenerationErrorKind.PERMISSION_DENIED,
         GenerationErrorKind.MODEL_NOT_FOUND,
+        GenerationErrorKind.PRICE_LIMIT,
         GenerationErrorKind.INVALID_REQUEST,
         GenerationErrorKind.CONTEXT_LENGTH,
         GenerationErrorKind.CONNECTION,
@@ -62,11 +157,11 @@ _SAFE_ERROR_CATEGORIES = frozenset(
         INTERNAL_ERROR_CATEGORY,
         "not_found",
         LLM_UNAVAILABLE_CATEGORY,
-        HYDRUS_ERROR_CATEGORY,
+        STORAGE_UNAVAILABLE_CATEGORY,
         *(member.value for member in CharacterLookupErrorCategory),
     }
 )
-_SAFE_ERROR_CODES = _SAFE_ERROR_CATEGORIES | frozenset({"character_not_found"}) | _SAFE_HYDRUS_ERROR_CODES
+_SAFE_ERROR_CODES = _SAFE_ERROR_CATEGORIES | frozenset({"character_not_found"})
 _SAFE_DETAIL_FIELDS = frozenset(
     {"category", "code", "trace_id", "request_id", "message"}
 )
@@ -123,6 +218,14 @@ def build_internal_error_payload(
     return payload
 
 
+def build_storage_unavailable_detail(code: str) -> dict[str, str] | None:
+    """Canonical public detail only; never forward a storage exception string."""
+    message = _SAFE_STORAGE_ERROR_MESSAGES.get(code)
+    if message is None:
+        return None
+    return {"category": STORAGE_UNAVAILABLE_CATEGORY, "code": code, "message": message}
+
+
 def whitelist_error_detail(
     detail: object,
     request: Request | None,
@@ -147,6 +250,8 @@ def whitelist_error_detail(
         code_allowlist = _SAFE_ERROR_CODES
         if category == LLM_UNAVAILABLE_CATEGORY:
             code_allowlist |= _SAFE_LLM_ERROR_CODES
+        elif category == STORAGE_UNAVAILABLE_CATEGORY:
+            code_allowlist |= frozenset(_SAFE_STORAGE_ERROR_MESSAGES)
         code = _allowlisted_machine_value(
             raw_code,
             allowlist=code_allowlist,
@@ -155,17 +260,7 @@ def whitelist_error_detail(
 
     message = f"An unexpected internal error occurred. trace_id={trace_id}"
     retryable: bool | None = None
-    if category == HYDRUS_ERROR_CATEGORY:
-        # Hydrus routes may expose only one of the static machine-code/message
-        # pairs below.  Ignore arbitrary upstream exception text and downgrade
-        # malformed pairs to the generic internal payload.
-        expected_message = _SAFE_HYDRUS_ERROR_MESSAGES.get(code)
-        if expected_message is None or detail.get("message") != expected_message:
-            category = INTERNAL_ERROR_CATEGORY
-            code = INTERNAL_ERROR_CODE
-        else:
-            message = expected_message
-    elif category == LLM_UNAVAILABLE_CATEGORY:
+    if category == LLM_UNAVAILABLE_CATEGORY:
         # A typed LLM error may expose only the exact static message generated
         # by ``classify_generation_error``.  Valid category/code pairs with a
         # caller-supplied message are treated as untrusted and downgraded to
@@ -184,6 +279,17 @@ def whitelist_error_detail(
             # Retryability is derived from the canonical code.  Ignore any
             # caller-provided ``retryable`` field, which is untrusted input.
             retryable = code in _RETRYABLE_LLM_ERROR_CODES
+    elif category == STORAGE_UNAVAILABLE_CATEGORY:
+        expected_message = _SAFE_STORAGE_ERROR_MESSAGES.get(code)
+        if expected_message is None or detail.get("message") != expected_message:
+            category = INTERNAL_ERROR_CATEGORY
+            code = INTERNAL_ERROR_CODE
+        else:
+            message = expected_message
+    elif code == STORAGE_UNAVAILABLE_CATEGORY:
+        # An untyped storage exception is still untrusted. Only the canonical
+        # category/code/message tuple may identify a storage availability error.
+        code = INTERNAL_ERROR_CODE
 
     payload: dict[str, Any] = {
         "category": category,
@@ -257,10 +363,15 @@ def register_http_error_handlers(app: FastAPI) -> None:
             return _json_error_response(status_code=exc.status_code, detail=payload)
 
         payload = build_internal_error_payload(request)
+        exception_class, source_frame = _safe_unhandled_exception_metadata(exc)
         logger.error(
-            "Unhandled exception at %s %s trace_id=%s",
+            "Unhandled exception at %s %s trace_id=%s request_id=%s "
+            "exception_class=%s source_frame=%s",
             request.method,
             request.url.path,
             payload["trace_id"],
+            payload.get("request_id", "-"),
+            exception_class,
+            source_frame,
         )
         return _json_error_response(status_code=500, detail=payload)

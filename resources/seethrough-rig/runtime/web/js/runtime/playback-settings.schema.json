@@ -1,0 +1,435 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "wind",
+      "label": "風",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "風を有効にする",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "Wind",
+            "WindBlow"
+          ]
+        },
+        {
+          "id": "wind",
+          "label": "そよ風",
+          "type": "number",
+          "default": 0,
+          "parameters": [
+            "Wind"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.01,
+          "enabledWhen": {
+            "wind.enabled": true
+          }
+        },
+        {
+          "id": "windBlow",
+          "label": "風が吹く",
+          "type": "number",
+          "default": 0,
+          "parameters": [
+            "WindBlow"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.01,
+          "enabledWhen": {
+            "wind.enabled": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "blink",
+      "label": "瞬き",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "自動瞬き",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ]
+        },
+        {
+          "id": "intervalMode",
+          "label": "間隔の種類",
+          "type": "enum",
+          "default": "random",
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "options": [
+            {
+              "value": "random",
+              "label": "ランダム"
+            },
+            {
+              "value": "fixed",
+              "label": "固定"
+            }
+          ]
+        },
+        {
+          "id": "intervalMin",
+          "label": "最短 / 固定間隔",
+          "type": "number",
+          "default": 2.2,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0.2,
+          "max": 30,
+          "step": 0.1,
+          "unit": "s",
+          "description": "固定モードではこの秒数を使います"
+        },
+        {
+          "id": "intervalMax",
+          "label": "最長間隔",
+          "type": "number",
+          "default": 6,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0.2,
+          "max": 30,
+          "step": 0.1,
+          "unit": "s",
+          "enabledWhen": {
+            "blink.intervalMode": "random"
+          }
+        },
+        {
+          "id": "closeDuration",
+          "label": "閉じる時間",
+          "type": "number",
+          "default": 0.075,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0.01,
+          "max": 0.5,
+          "step": 0.005,
+          "unit": "s"
+        },
+        {
+          "id": "holdDuration",
+          "label": "閉じている時間",
+          "type": "number",
+          "default": 0.035,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.005,
+          "unit": "s"
+        },
+        {
+          "id": "openDuration",
+          "label": "開く時間",
+          "type": "number",
+          "default": 0.13,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0.01,
+          "max": 1,
+          "step": 0.005,
+          "unit": "s"
+        },
+        {
+          "id": "durationRandomness",
+          "label": "時間のばらつき",
+          "type": "number",
+          "default": 0,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0,
+          "max": 0.8,
+          "step": 0.01
+        },
+        {
+          "id": "doubleProbability",
+          "label": "二連続の確率",
+          "type": "number",
+          "default": 0.18,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.01
+        },
+        {
+          "id": "doubleGap",
+          "label": "二連続の間隔",
+          "type": "number",
+          "default": 0.12,
+          "parameters": [
+            "EyeLOpen",
+            "EyeROpen"
+          ],
+          "min": 0.03,
+          "max": 1,
+          "step": 0.01,
+          "unit": "s"
+        }
+      ]
+    },
+    {
+      "id": "breath",
+      "label": "呼吸",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "呼吸",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "Breath",
+            "AngleY"
+          ]
+        },
+        {
+          "id": "period",
+          "label": "周期",
+          "type": "number",
+          "default": 3.6,
+          "parameters": [
+            "Breath",
+            "AngleY"
+          ],
+          "min": 0.5,
+          "max": 20,
+          "step": 0.1,
+          "unit": "s"
+        },
+        {
+          "id": "amplitude",
+          "label": "大きさ",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "Breath",
+            "AngleY"
+          ],
+          "min": 0,
+          "max": 2,
+          "step": 0.01
+        }
+      ]
+    },
+    {
+      "id": "idle",
+      "label": "待機モーション",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "待機モーション",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "AngleX",
+            "AngleY",
+            "AngleZ",
+            "BodyAngleX",
+            "BodyAngleY",
+            "BodyAngleZ"
+          ]
+        },
+        {
+          "id": "speed",
+          "label": "速さ",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "AngleX",
+            "AngleY",
+            "AngleZ",
+            "BodyAngleX",
+            "BodyAngleY",
+            "BodyAngleZ"
+          ],
+          "min": 0,
+          "max": 3,
+          "step": 0.01
+        },
+        {
+          "id": "headAmplitude",
+          "label": "頭の大きさ",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "AngleX",
+            "AngleY",
+            "AngleZ"
+          ],
+          "min": 0,
+          "max": 2,
+          "step": 0.01
+        },
+        {
+          "id": "bodyAmplitude",
+          "label": "体の大きさ",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "BodyAngleX",
+            "BodyAngleY",
+            "BodyAngleZ"
+          ],
+          "min": 0,
+          "max": 2,
+          "step": 0.01
+        }
+      ]
+    },
+    {
+      "id": "gaze",
+      "label": "視線",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "視線",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ]
+        },
+        {
+          "id": "intervalMin",
+          "label": "最短間隔",
+          "type": "number",
+          "default": 0.6,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ],
+          "min": 0.1,
+          "max": 30,
+          "step": 0.1,
+          "unit": "s"
+        },
+        {
+          "id": "intervalMax",
+          "label": "最長間隔",
+          "type": "number",
+          "default": 3,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ],
+          "min": 0.1,
+          "max": 30,
+          "step": 0.1,
+          "unit": "s"
+        },
+        {
+          "id": "range",
+          "label": "可動範囲",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.01
+        },
+        {
+          "id": "tracking",
+          "label": "ポインター追従",
+          "type": "boolean",
+          "default": false,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ]
+        },
+        {
+          "id": "follow",
+          "label": "頭・体の追従",
+          "type": "number",
+          "default": 0.6,
+          "parameters": [
+            "EyeBallX",
+            "EyeBallY"
+          ],
+          "min": 0,
+          "max": 1,
+          "step": 0.01
+        }
+      ]
+    },
+    {
+      "id": "physics",
+      "label": "物理",
+      "fields": [
+        {
+          "id": "enabled",
+          "label": "物理演算",
+          "type": "boolean",
+          "default": true,
+          "parameters": [
+            "PhysicsGain"
+          ]
+        },
+        {
+          "id": "gain",
+          "label": "揺れの強さ",
+          "type": "number",
+          "default": 1,
+          "parameters": [
+            "PhysicsGain"
+          ],
+          "min": 0,
+          "max": 2,
+          "step": 0.01
+        }
+      ]
+    }
+  ],
+  "constraints": [
+    {
+      "kind": "ordered",
+      "paths": [
+        "blink.intervalMin",
+        "blink.intervalMax"
+      ],
+      "when": {
+        "blink.intervalMode": "random"
+      }
+    },
+    {
+      "kind": "ordered",
+      "paths": [
+        "gaze.intervalMin",
+        "gaze.intervalMax"
+      ]
+    }
+  ]
+}

@@ -135,7 +135,7 @@
       "required": ["id", "domain", "criticality", "transport", "operations", "mobile", "roles", "permissions", "scope", "offline", "persistence", "mutation", "acceptance"],
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
-        "domain": {"type": "string", "enum": ["auth", "navigation", "chat", "memory", "tasks", "projects", "files", "docs", "story", "trpg", "settings"]},
+        "domain": {"type": "string", "enum": ["auth", "navigation", "apps", "chat", "memory", "tasks", "projects", "files", "docs", "settings", "operations"]},
         "criticality": {"type": "string", "enum": ["p0", "p1", "p2"]},
         "transport": {"type": "string", "enum": ["fastapi", "sync", "local", "external", "next_bff"]},
         "operations": {"type": "array", "items": {"$ref": "#/$defs/operation"}, "uniqueItems": true},

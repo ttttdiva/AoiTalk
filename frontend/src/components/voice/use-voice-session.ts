@@ -26,6 +26,7 @@ import {
   type RealtimePresentationEvent,
 } from "./use-realtime-webrtc";
 import { useCharacterAudioTransport } from "./use-character-audio-transport";
+import { clearRigConversation, setRigConversation } from "@/lib/aoirig/conversation";
 
 export type VoiceSessionPhase =
   | "idle"
@@ -360,6 +361,11 @@ export function useVoiceSession({
 
   const handlePresentationEvent = useCallback(
     (event: RealtimePresentationEvent) => {
+      const owner = sessionModeRef;
+      if (event.type === "user_speaking" || event.type === "session_ready" || event.type === "response_completed") setRigConversation(characterName, owner, "listening");
+      if (event.type === "response_started") setRigConversation(characterName, owner, "thinking");
+      if (event.type === "playback_started") setRigConversation(characterName, owner, "speaking");
+      if (event.type === "provider_error") clearRigConversation(characterName, owner);
       const telemetry = presentationTelemetryEvent(event);
       if (telemetry) reportEvent(telemetry);
       switch (event.type) {
@@ -436,8 +442,14 @@ export function useVoiceSession({
           break;
       }
     },
-    [appendTranscript, reportEvent, setSafeState],
+    [characterName, appendTranscript, reportEvent, setSafeState],
   );
+
+  useEffect(() => {
+    const owner = sessionModeRef;
+    if (state.phase !== "connected") clearRigConversation(characterName, owner);
+    return () => clearRigConversation(characterName, owner);
+  }, [characterName, state.phase]);
 
   const webrtc = useRealtimeWebRTC({
     onPresentationEvent: handlePresentationEvent,
@@ -506,6 +518,7 @@ export function useVoiceSession({
   );
 
   const characterAudio = useCharacterAudioTransport({
+    characterName,
     sessionId: state.sessionId,
     enabled:
       sessionModeRef.current === "realtime_character_tts" && !!state.sessionId,

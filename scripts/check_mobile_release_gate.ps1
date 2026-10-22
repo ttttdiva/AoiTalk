@@ -6,6 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Git emits UTF-8 JSON; Windows PowerShell otherwise decodes its output using the legacy console code page.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
 if (-not $Base) {
     $upstream = & git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
     if ($LASTEXITCODE -eq 0 -and $upstream -and $upstream -ne '@{u}') {
@@ -26,7 +29,7 @@ if (-not $Base) {
 }
 
 $files = @(& git diff --name-only "$Base..$Target")
-$mobile = @($files | Where-Object { $_ -match '^(mobile/|mobile\\)' })
+$mobile = @($files | Where-Object { $_ -match '^(mobile/|mobile\\|resources/chat-background/|resources\\chat-background\\)' })
 $required = ($mobile.Count -gt 0 -and -not $ReleaseDisabled)
 
 function Read-MobileExpoConfig([string]$Ref) {

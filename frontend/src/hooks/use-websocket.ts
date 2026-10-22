@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import { useEffect, useRef, useCallback, useState } from "react";
 import type {
   ChatAttachmentKind,
@@ -10,7 +12,7 @@ import type {
 import type { MentionItem } from "@/components/chat/mention-menu";
 import type { ExternalModelPromptResponseInput } from "@/components/chat/chat-permission-dialogs";
 import { isWebSocketMessageForSession } from "@/lib/chat-websocket-events";
-import { isOversizedMailAttachment } from "@/lib/chat-attachment-validation";
+import { chatAttachmentError } from "@/lib/chat-attachment-validation";
 import { buildWebSocketUrl } from "@/lib/websocket-url";
 import { toast } from "sonner";
 
@@ -88,16 +90,18 @@ async function uploadProjectAttachment(
   projectId: string,
   file: File,
   kind: ChatAttachmentKind,
+  signal?: AbortSignal,
 ): Promise<UploadedProjectAttachment> {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("kind", kind);
   formData.append("directory", kind === "attachment" ? "attachments" : "management");
 
-  const res = await fetch(`/api/projects/${projectId}/management/files`, {
+  const res = await fetch(withBasePath(`/api/projects/${projectId}/management/files`), {
     method: "POST",
     credentials: "include",
     body: formData,
+    signal,
   });
   if (!res.ok) {
     throw new UploadHttpError(await readUploadError(res), res.status);
@@ -112,14 +116,15 @@ async function uploadProjectAttachment(
   };
 }
 
-async function uploadUserAttachment(file: File): Promise<UploadedUserAttachment> {
+async function uploadUserAttachment(file: File, signal?: AbortSignal): Promise<UploadedUserAttachment> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const res = await fetch("/api/user/attachments", {
+  const res = await fetch(withBasePath("/api/user/attachments"), {
     method: "POST",
     credentials: "include",
     body: formData,
+    signal,
   });
   if (!res.ok) {
     throw new UploadHttpError(await readUploadError(res), res.status);
@@ -191,18 +196,139 @@ function attachmentToContext(
   return `[${label}: ${attachment.name}]${location ? ` ${location}` : ""}`;
 }
 
+export type PreparedChatAttachmentPayload = {
+  attachments: ChatAttachmentMetadata[];
+  images?: Array<{ data: string; mimeType: string; name: string }>;
+  audio?: { data: string; mimeType: string; name: string };
+  video?: { path: string; mimeType?: string; name: string; size?: number };
+  attachment_context: string;
+  upload_failed: boolean;
+};
+
+/** Shared attachment preparation for WebSocket and REST dispatch fallback. */
+export async function prepareChatAttachmentPayload(
+  content: string,
+  files: File[],
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<PreparedChatAttachmentPayload> {
+  const attachments: ChatAttachmentMetadata[] = files.map((file) =>
+    createBaseAttachment(file),
+  );
+  const imageFiles = files.filter(isImageFile);
+  const images = imageFiles.length > 0
+    ? await Promise.all(imageFiles.map((file) => fileToMediaPayload(file)))
+    : undefined;
+  const audioFile = files.find(isAudioFile);
+  const videoFile = files.find(isVideoFile);
+  const recognitionNotice =
+    files.filter(isAudioFile).length > 1 || files.filter(isVideoFile).length > 1
+      ? "[認識範囲: 音声・動画の補助認識はそれぞれ先頭1件。検索には保存済み添付の全件を使用できます。]"
+      : "";
+  const audio = audioFile ? await fileToMediaPayload(audioFile) : undefined;
+  const mailPayloads = await Promise.all(
+    files.map(async (file, index) =>
+      isMailFile(file) ? { index, payload: await fileToMediaPayload(file) } : null,
+    ),
+  );
+  for (const item of mailPayloads) {
+    if (item) attachments[item.index].data_url = item.payload.data;
+  }
+
+  let uploadFailed = false;
+  for (const [index, file] of files.entries()) {
+    const baseAttachment = attachments[index] ?? createBaseAttachment(file);
+    const kind: ChatAttachmentKind = projectId
+      ? inferProjectAttachmentKind(content, file)
+      : "attachment";
+    try {
+      if (projectId) {
+        const uploaded = await uploadProjectAttachment(projectId, file, kind, signal);
+        attachments[index] = {
+          ...baseAttachment,
+          name: uploaded.name,
+          path: `_projects/project_${projectId}/${uploaded.path}`,
+          project_relative_path: uploaded.path,
+          kind: uploaded.kind,
+          registered: uploaded.registered,
+          size: uploaded.size ?? baseAttachment.size,
+        };
+      } else {
+        const uploaded = await uploadUserAttachment(file, signal);
+        attachments[index] = {
+          ...baseAttachment,
+          name: uploaded.name,
+          path: uploaded.path,
+          kind,
+          registered: false,
+          size: uploaded.size ?? baseAttachment.size,
+        };
+      }
+    } catch (error) {
+      uploadFailed = true;
+      const detail =
+        error instanceof UploadHttpError
+          ? /\bHTTP \d{3}\b/.test(error.message)
+            ? error.message
+            : `${error.message} (HTTP ${error.status})`
+          : error instanceof Error
+            ? error.message
+            : "unknown error";
+      attachments[index] = {
+        ...baseAttachment,
+        kind,
+        upload_failed: true,
+        error: detail,
+      };
+    }
+  }
+
+  const videoIndex = videoFile ? files.indexOf(videoFile) : -1;
+  const videoAttachment = videoIndex >= 0 ? attachments[videoIndex] : undefined;
+  const video = videoFile && videoAttachment?.path && !videoAttachment.upload_failed
+    ? {
+        path: videoAttachment.path,
+        mimeType: videoAttachment.mime_type || videoFile.type || undefined,
+        name: videoAttachment.name || videoFile.name,
+        size: videoAttachment.size ?? videoFile.size,
+      }
+    : undefined;
+  const attachmentContext = files
+    .map((file, index) => attachmentToContext(attachments[index], file))
+    .join("\n");
+  return {
+    attachments,
+    images,
+    audio,
+    video,
+    attachment_context: recognitionNotice
+      ? `${attachmentContext}\n${recognitionNotice}`
+      : attachmentContext,
+    upload_failed: uploadFailed,
+  };
+}
+
 export function useWebSocket(
   sessionId: string | null,
   generationAgentRunId: string | null = null,
+  expectedAgentId: string | null = null,
+  contextProjectHintId: string | null | undefined = undefined,
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(sessionId);
+  const contextProjectHintIdRef = useRef<string | null | undefined>(
+    contextProjectHintId,
+  );
   const reconnectTimerRef = useRef<number | null>(null);
   const connectionGenerationRef = useRef(0);
   const [connectionGeneration, setConnectionGeneration] = useState(0);
   const [isConnected, setIsConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<WSMessage | null>(null);
   const streamBufferRef = useRef("");
+
+  useEffect(() => {
+    contextProjectHintIdRef.current = contextProjectHintId;
+  }, [contextProjectHintId]);
 
   useEffect(() => {
     const currentSessionId = sessionId;
@@ -323,13 +449,26 @@ export function useWebSocket(
       commandCapabilities?: ChatCommandCapability[],
       toolsRequired?: boolean,
       appContext?: { appId: string; targetId: string } | null,
+      signal?: AbortSignal,
     ) => {
       const ws = wsRef.current;
-      if (ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
-      if (files?.some(isOversizedMailAttachment)) {
-        toast.error("メールファイルは 10 MB までです");
-        return Promise.resolve(false);
+      if (signal?.aborted || ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
+      const attachmentError = chatAttachmentError(files ?? []);
+      if (attachmentError) {
+        toast.error(attachmentError);
+        return Promise.reject(new Error("添付ファイルが送信上限を超えています。"));
       }
+      const controller = new AbortController();
+      let timeout: ReturnType<typeof setTimeout>;
+      let abort = () => {};
+      const interrupted = new Promise<boolean>((resolve, reject) => {
+        abort = () => { controller.abort(); resolve(false); };
+        signal?.addEventListener("abort", abort, { once: true });
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error("添付付きメッセージの送信受付がタイムアウトしました。"));
+        }, 120_000);
+      });
       const buildPayload = async () => {
         const data: Record<string, unknown> = { message: content };
         if (clientMessageId) data.client_message_id = clientMessageId;
@@ -340,6 +479,9 @@ export function useWebSocket(
           data.tools_required = toolsRequired;
         }
         if (projectId) data.project_id = projectId;
+        if (contextProjectHintIdRef.current !== undefined) {
+          data.context_project_hint_id = contextProjectHintIdRef.current;
+        }
         data.include_project_context = includeProjectContext === true;
         // Include explicit nulls so removing/changing the chip can update the
         // durable ConversationSession scope on the server.
@@ -349,93 +491,23 @@ export function useWebSocket(
         }
         const payloadSessionId = targetSessionId ?? sessionIdRef.current;
         if (payloadSessionId) data.session_id = payloadSessionId;
+        if (expectedAgentId) data.expected_agent_id = expectedAgentId;
 
         if (files && files.length > 0) {
-          const attachments: ChatAttachmentMetadata[] = files.map((file) =>
-            createBaseAttachment(file),
+          const prepared = await prepareChatAttachmentPayload(
+            content,
+            files,
+            projectId,
+            controller.signal,
           );
-          const imageFiles = files.filter(isImageFile);
-          if (imageFiles.length > 0) {
-            data.images = await Promise.all(
-              imageFiles.map((file) => fileToMediaPayload(file)),
-            );
+          if (prepared.upload_failed) {
+            throw new Error("添付ファイルを保存できなかったため送信を中止しました。");
           }
-          const audioFile = files.find(isAudioFile);
-          if (audioFile) {
-            data.audio = await fileToMediaPayload(audioFile);
-          }
-          const videoFile = files.find(isVideoFile);
-          const mailPayloads = await Promise.all(
-            files.map(async (file, index) =>
-              isMailFile(file) ? { index, payload: await fileToMediaPayload(file) } : null,
-            ),
-          );
-          for (const item of mailPayloads) {
-            if (item) attachments[item.index].data_url = item.payload.data;
-          }
-
-          // 形式を問わず常時サーバー保存し、LLM へはパス参照だけを渡す
-          for (const [index, file] of files.entries()) {
-            const baseAttachment = attachments[index] ?? createBaseAttachment(file);
-            const kind: ChatAttachmentKind = projectId
-              ? inferProjectAttachmentKind(content, file)
-              : "attachment";
-            try {
-              if (projectId) {
-                const uploaded = await uploadProjectAttachment(projectId, file, kind);
-                attachments[index] = {
-                  ...baseAttachment,
-                  name: uploaded.name,
-                  path: `_projects/project_${projectId}/${uploaded.path}`,
-                  project_relative_path: uploaded.path,
-                  kind: uploaded.kind,
-                  registered: uploaded.registered,
-                  size: uploaded.size ?? baseAttachment.size,
-                };
-              } else {
-                const uploaded = await uploadUserAttachment(file);
-                attachments[index] = {
-                  ...baseAttachment,
-                  name: uploaded.name,
-                  path: uploaded.path,
-                  kind,
-                  registered: false,
-                  size: uploaded.size ?? baseAttachment.size,
-                };
-              }
-            } catch (error) {
-              const detail =
-                error instanceof UploadHttpError
-                  ? /\bHTTP \d{3}\b/.test(error.message)
-                    ? error.message
-                    : `${error.message} (HTTP ${error.status})`
-                  : error instanceof Error
-                    ? error.message
-                    : "unknown error";
-              attachments[index] = {
-                ...baseAttachment,
-                kind,
-                upload_failed: true,
-                error: detail,
-              };
-            }
-          }
-          if (videoFile) {
-            const videoIndex = files.indexOf(videoFile);
-            const videoAttachment = attachments[videoIndex];
-            if (videoAttachment?.path && !videoAttachment.upload_failed) {
-              data.video = {
-                path: videoAttachment.path,
-                mimeType: videoAttachment.mime_type || videoFile.type || undefined,
-                name: videoAttachment.name || videoFile.name,
-                size: videoAttachment.size ?? videoFile.size,
-              };
-            }
-          }
-          data.attachments = attachments;
-          data.attachment_context = attachments
-            .map((attachment, index) => attachmentToContext(attachment, files[index]))
-            .join("\n");
+          data.attachments = prepared.attachments;
+          data.attachment_context = prepared.attachment_context;
+          if (prepared.images) data.images = prepared.images;
+          if (prepared.audio) data.audio = prepared.audio;
+          if (prepared.video) data.video = prepared.video;
         }
 
         if (mentions && mentions.length > 0) {
@@ -455,19 +527,22 @@ export function useWebSocket(
           data.response_model = responseModel;
         }
 
-        if (wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) {
+        if (controller.signal.aborted || wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) {
           return false;
         }
         ws.send(JSON.stringify({ type: "user_message", data }));
         return true;
       };
 
-      return buildPayload().catch((error) => {
-        console.error(error);
-        return false;
+      // A thrown send/preparation error is a rejected submission, not a
+      // disconnected socket. Let callers restore the draft instead of waiting
+      // indefinitely for a reconnect that may never happen.
+      return Promise.race([buildPayload(), interrupted]).finally(() => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
       });
     },
-    []
+    [expectedAgentId]
   );
 
   const sendPermissionResponse = useCallback(
@@ -583,7 +658,12 @@ export function useWebSocket(
     [],
   );
 
-  const stopGeneration = useCallback((targetSessionId?: string | null) => {
+  const stopGeneration = useCallback(
+    (
+      targetSessionId?: string | null,
+      targetAgentRunId?: string | null,
+      targetClientMessageId?: string | null,
+    ) => {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return false;
     const effectiveSessionId = targetSessionId ?? sessionIdRef.current;
     wsRef.current.send(
@@ -593,13 +673,18 @@ export function useWebSocket(
           session_id: effectiveSessionId,
           agent_run_id:
             effectiveSessionId === sessionIdRef.current
-              ? generationAgentRunId
+              ? targetAgentRunId ?? generationAgentRunId
               : null,
+          ...(targetClientMessageId
+            ? { client_message_id: targetClientMessageId }
+            : {}),
         },
       }),
     );
     return true;
-  }, [generationAgentRunId]);
+    },
+    [generationAgentRunId],
+  );
 
   const sendSteering = useCallback(
     (

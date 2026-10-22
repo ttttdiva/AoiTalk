@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bz2
+import email
 import hashlib
 import io
 import json
@@ -806,18 +807,14 @@ def _verify_python(
                 ]
                 if len(metadata_names) != 1:
                     _fail(f"offline Python wheel metadata is missing or ambiguous: {rel}")
-                metadata = archive.read(metadata_names[0]).decode("utf-8", "strict")
-        except (OSError, zipfile.BadZipFile, UnicodeDecodeError) as exc:
+                metadata = email.message_from_bytes(archive.read(metadata_names[0]))
+        except (OSError, zipfile.BadZipFile) as exc:
             _fail(f"offline Python wheel is not a valid wheel archive: {rel}: {exc}")
-        fields: dict[str, str] = {}
-        for line in metadata.splitlines():
-            if ":" in line and not line[:1].isspace():
-                key, value = line.split(":", 1)
-                if key in {"Name", "Version"}:
-                    fields[key] = value.strip()
-        if not fields.get("Name") or not fields.get("Version"):
-            _fail(f"offline Python wheel metadata lacks Name/Version: {rel}")
-        identity = (normalized_name(fields["Name"]), fields["Version"])
+        names = metadata.get_all("Name", [])
+        versions = metadata.get_all("Version", [])
+        if len(names) != 1 or len(versions) != 1 or not names[0].strip() or not versions[0].strip():
+            _fail(f"offline Python wheel metadata lacks unique Name/Version headers: {rel}")
+        identity = (normalized_name(names[0].strip()), versions[0].strip())
         if identity in wheel_metadata:
             _fail(f"offline Python wheelhouse contains duplicate distribution/version: {identity[0]}=={identity[1]}")
         wheel_metadata[identity] = (rel, digest)
@@ -1100,6 +1097,11 @@ def hydrate_archive(archive: Path, destination: Path) -> Path:
         total = 0
         seen: set[str] = set()
         with zipfile.ZipFile(archive) as bundle:
+            required = sum(info.file_size for info in bundle.infolist())
+            if required > MAX_UNCOMPRESSED_BYTES:
+                _fail("companion ZIP uncompressed size exceeds safety limit")
+            if shutil.disk_usage(stage).free < required + 64 * 1024**2:
+                _fail("insufficient persistent capacity for companion hydration")
             for info in bundle.infolist():
                 name, is_dir = _safe_zip_name(info.filename)
                 key = name.casefold()

@@ -8,7 +8,7 @@ publication approval with generic Agent tables.
 ## Terminology and source of truth
 
 * **Persona / Brand / 発信人格** is the public Media identity.  It is not an
-  AI employee and remains available for manual operation.
+  Agent and remains available for manual operation.
 * **Agent** is the worker identity.  A `PersonaOperatorAssignment` explicitly
   binds an Agent to a Persona with a role (operator, strategist, researcher,
   creator, analyst or publisher) and optional capability ceiling.

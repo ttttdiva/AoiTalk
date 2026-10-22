@@ -1,3 +1,4 @@
+import { docsIdIn } from "@/lib/server/docs-id-condition";
 import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -796,14 +797,15 @@ export async function getKnowledgeNodeDescendantIds(
   }
 
   const descendants: string[] = [];
-  const queue = [...(childrenByParent.get(nodeId) ?? [])];
-  const seen = new Set<string>();
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || seen.has(current)) continue;
-    seen.add(current);
-    descendants.push(current);
-    queue.push(...(childrenByParent.get(current) ?? []));
+  const queue = [nodeId];
+  const seen = new Set([nodeId]);
+  for (let index = 0; index < queue.length; index += 1) {
+    for (const childId of childrenByParent.get(queue[index]) ?? []) {
+      if (seen.has(childId)) continue;
+      seen.add(childId);
+      descendants.push(childId);
+      queue.push(childId);
+    }
   }
   return descendants;
 }
@@ -3074,7 +3076,7 @@ export async function getAllProjectKnowledgeNodePointerIds(
   nodeIds?: readonly string[],
 ): Promise<Set<string>> {
   const pointerCondition = nodeIds && nodeIds.length > 0
-    ? inArray(projects.knowledgeNodeId, Array.from(nodeIds))
+    ? docsIdIn(projects.knowledgeNodeId, nodeIds)
     : sql`${projects.knowledgeNodeId} is not null`;
   const pointerQuery = tx
     .select({ knowledgeNodeId: projects.knowledgeNodeId })
@@ -3190,6 +3192,43 @@ export async function purgeExpiredDocsArchiveDatabase(
       (id) => presentRoots.has(id) && !blockedRoots.has(id),
     );
     if (purgedIds.length === 0) return;
+
+    // A node delete fires several SET NULL and revision CASCADE triggers.
+    // Their generated names can sort differently after migrations; updating
+    // one capture pointer while another points at an already cascaded revision
+    // can then fail 23503. Clear all affected pointers atomically while the
+    // locked nodes and their revisions still exist, including descendants.
+    // Keep the candidate history and any links to retained content intact.
+    const purgedRoots = new Set(purgedIds);
+    const purgedClosureIds = [...new Set(
+      closure.filter((row) => purgedRoots.has(row.rootId)).map((row) => row.id),
+    )];
+    await tx.execute(sql`
+      with purged_nodes as materialized (
+        select id from knowledge_nodes
+        where ${docsIdIn(knowledgeNodes.id, purgedClosureIds)}
+      ), purged_revisions as materialized (
+        select id from knowledge_revisions
+        where node_id in (select id from purged_nodes)
+      )
+      update knowledge_capture_candidates
+      set published_node_id = case
+            when published_node_id in (select id from purged_nodes) then null
+            else published_node_id end,
+          target_node_id = case
+            when target_node_id in (select id from purged_nodes) then null
+            else target_node_id end,
+          target_revision_id = case
+            when target_revision_id in (select id from purged_revisions) then null
+            else target_revision_id end,
+          published_revision_id = case
+            when published_revision_id in (select id from purged_revisions) then null
+            else published_revision_id end
+      where published_node_id in (select id from purged_nodes)
+         or target_node_id in (select id from purged_nodes)
+         or target_revision_id in (select id from purged_revisions)
+         or published_revision_id in (select id from purged_revisions)
+    `);
 
     if (typeof tx.insert === "function") {
       const batchId = createDeletionBatchId();

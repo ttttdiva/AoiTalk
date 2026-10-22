@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { TabsContent } from "@/components/ui/tabs";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   defaultModeForOptions,
   providerSelection,
@@ -91,9 +92,10 @@ export function LlmProjectAutomationRouting({
       className="mt-3 space-y-3"
       data-testid="project-automation-routing-panel"
     >
-      <p className="text-xs text-muted-foreground">
-        Project Overview / Project Steward の自動化処理に使うモデルです。既定では Base Model を継承します。
-      </p>
+      <div className="inline-flex items-center gap-1 text-xs">
+        <span>Project Automation</span>
+        <HelpPopover label="Project Automation">Project Overview / Project Steward の自動化処理に使うモデルです。既定では Base Model を継承します。</HelpPopover>
+      </div>
 
       <div className="max-w-xs space-y-1">
         <Label className="text-xs">Route</Label>
@@ -144,11 +146,14 @@ export function LlmProjectAutomationRouting({
           <Label className="text-xs">モデル</Label>
           <AppSelect
             aria-label="Project Automation model"
-            value={draft.model}
+            value={draft.customModel.trim() || draft.model}
             onChange={(event) => selectModel(event.target.value)}
             disabled={saving || inherit || !selectedProvider}
             className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30"
           >
+            {draft.customModel.trim() && !(selectedProvider?.models ?? []).some((item) => item.id === draft.customModel.trim()) && (
+              <option value={draft.customModel.trim()}>{draft.customModel.trim()}</option>
+            )}
             {(selectedProvider?.models ?? []).map((item) => (
               <option key={item.id} value={item.id}>
                 {item.label}
@@ -160,34 +165,6 @@ export function LlmProjectAutomationRouting({
 
       {!inherit && (
         <>
-          <div className="space-y-1">
-            <Label className="text-xs">カスタムモデルID</Label>
-            <Input
-              aria-label="Project Automation custom model"
-              value={draft.customModel}
-              onChange={(event) => {
-                const customModel = event.target.value;
-                const modelId = customModel.trim() || draft.model;
-                const nextEffortOptions = reasoningEffortOptionsForModel(
-                  selectedProvider,
-                  modelId,
-                );
-                setDraft((current) => ({
-                  ...current,
-                  customModel,
-                  mode: nextEffortOptions.length
-                    ? defaultModeForOptions(
-                      nextEffortOptions,
-                      current.mode || "medium",
-                    )
-                    : "",
-                }));
-              }}
-              placeholder="候補にないモデルIDを直接入力"
-              disabled={saving}
-              className="h-8"
-            />
-          </div>
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1">

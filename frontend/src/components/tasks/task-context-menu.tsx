@@ -198,7 +198,27 @@ export function TaskContextMenu({ menu, onClose, onRefresh }: Props) {
           }),
         );
       } else {
-        const started = await taskApi.startTimer(task.id);
+        const started = await taskApi.startTimer(
+          task.id,
+          occurrenceContext?.occurrence_id || undefined,
+        );
+        if (occurrenceContext?.start_at) {
+          try {
+            await taskApi.updateOccurrenceStatus(task.id, {
+              occurrence_id: occurrenceContext.occurrence_id ?? null,
+              occurrence_start_at: occurrenceContext.start_at,
+              occurrence_end_at: occurrenceContext.end_at ?? null,
+              original_start_at:
+                occurrenceContext.original_start_at ?? occurrenceContext.start_at,
+              status: "in_progress",
+              ...(occurrenceContext.all_day != null
+                ? { all_day: occurrenceContext.all_day }
+                : {}),
+            });
+          } catch (err) {
+            console.error("タイマー開始後の発生回ステータス更新失敗:", err);
+          }
+        }
         window.dispatchEvent(
           new CustomEvent("timer-changed", {
             detail: { activeEntry: started },

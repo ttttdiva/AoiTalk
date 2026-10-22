@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from ...memory.database import get_database_manager
 from ...memory.models import ConversationSession
@@ -17,6 +18,35 @@ from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
     from ..server import WebChatServer
+
+
+class AgentRunActivityDTO(BaseModel):
+    """Bounded Agent activity row; prompts/events/transcripts are excluded."""
+
+    id: str
+    status: str | None = None
+    run_type: str | None = None
+    session_id: str | None = None
+    project_id: str | None = None
+    task_id: str | None = None
+    work_item_id: str | None = None
+    agent_id: str | None = None
+    agent_revision_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    error: str | None = None
+    execution_manifest: dict[str, Any] | None = None
+    resource_refs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AgentRunHistoryResponse(BaseModel):
+    """Safe Agent-wide run history contract (conversation bodies omitted)."""
+
+    success: bool = True
+    agent_id: str
+    runs: list[AgentRunActivityDTO] = Field(default_factory=list)
 
 
 def register_agent_run_routes(app: FastAPI, server: "WebChatServer") -> None:
@@ -194,6 +224,57 @@ def register_agent_run_routes(app: FastAPI, server: "WebChatServer") -> None:
                 "success": True,
                 "session_id": session_id,
                 "agent_runs": runs,
+            }
+        )
+
+    @app.get(
+        "/api/agents/{agent_id}/agent-runs",
+        response_model=AgentRunHistoryResponse,
+        operation_id="list_agent_run_history",
+    )
+    async def list_agent_agent_runs(
+        agent_id: str,
+        request: Request,
+        status: str | None = None,
+        limit: int = Query(50, ge=1, le=200),
+        _: None = Depends(require_auth),
+    ):
+        """Return Agent history after rechecking each conversation scope.
+
+        Agent ownership is an execution identity, not a grant to read every
+        private session the Agent has touched.  Rows linked to sessions the
+        caller cannot open are omitted from the history projection.
+        """
+
+        try:
+            UUID(str(agent_id))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid agent id") from exc
+        user_info = await _current_user(request)
+        service = AgentRunService()
+        runs = await service.list_runs(agent_id=agent_id, status=status, limit=limit)
+        visible: list[dict] = []
+        for run in runs:
+            if str(run.get("agent_id") or "") != str(agent_id):
+                continue
+            try:
+                if run.get("session_id"):
+                    await _assert_session_access(run.get("session_id"), user_info)
+                    await _assert_run_binding(run)
+                    if run.get("project_id"):
+                        await _assert_project_access(str(run["project_id"]), user_info)
+                elif str(user_info.get("role") or "") != "admin" and str(
+                    run.get("user_id") or ""
+                ) != str(user_info.get("id") or ""):
+                    continue
+            except HTTPException:
+                continue
+            visible.append(service.activity_run_projection(run))
+        return JSONResponse(
+            {
+                "success": True,
+                "agent_id": str(agent_id),
+                "runs": visible,
             }
         )
 

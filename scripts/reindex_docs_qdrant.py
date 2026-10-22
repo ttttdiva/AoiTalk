@@ -31,10 +31,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.migrate_embeddinggemma2 import shadow_config
 from src.memory.database import DatabaseManager
 from src.memory.models import DocsLibrary
-from src.rag.config import EmbeddingConfig, QdrantConfig, get_rag_config
 from src.rag.docs_index import DocsIndexService
+from src.rag.shadow_migration import read_only_source_session
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,25 +54,34 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _run(args: argparse.Namespace) -> dict[str, int]:
-    config = get_rag_config()
-    qdrant = config.qdrant
-    embedding = config.embedding
-    if args.local_path is not None:
-        qdrant = replace(qdrant, local_path=str(args.local_path))
-    if args.device is not None:
-        embedding = replace(embedding, device=args.device)
-    config = replace(config, qdrant=qdrant, embedding=embedding, docs_enabled=True)
-
-    service = DocsIndexService(config)
-    if not await service.initialize():
-        raise RuntimeError("Docs semantic index could not initialize (Qdrant/embedding unavailable)")
-
     db = DatabaseManager()
-    if not await db.initialize():
-        raise RuntimeError("Database migrations must complete before reindexing Docs")
-    session = await db.get_session()
+    service = None
+    session = None
     totals = {"libraries": 0, "nodes": 0, "reindexed": 0, "removed": 0}
     try:
+        # ``get_rag_config`` constructs Config(), which may seed/fill defaults
+        # when this standalone process has not initialized the DB manager yet.
+        # Read the persisted global projection directly so a reindex can never
+        # silently target the default Qdrant endpoint or rewrite app settings.
+        async with read_only_source_session(db.SessionLocal) as source_session:
+            config = await shadow_config(source_session)
+
+        qdrant = config.qdrant
+        embedding = config.embedding
+        if args.local_path is not None:
+            qdrant = replace(qdrant, local_path=str(args.local_path))
+        if args.device is not None:
+            embedding = replace(embedding, device=args.device)
+        config = replace(config, qdrant=qdrant, embedding=embedding, docs_enabled=True)
+
+        service = DocsIndexService(config)
+        if not await service.initialize():
+            raise RuntimeError("Docs semantic index could not initialize (Qdrant/embedding unavailable)")
+
+        # The operator command assumes its source schema is already provisioned.
+        # Use the raw factory so this read-only derived-index operation never
+        # runs migrations or creates/fills app-config tables as a side effect.
+        session = db.SessionLocal()
         library_ids = (
             await session.execute(
                 select(DocsLibrary.id).order_by(DocsLibrary.id)
@@ -85,21 +95,45 @@ async def _run(args: argparse.Namespace) -> dict[str, int]:
         library_ids = sorted(set(library_ids) | indexed_ids, key=str)
         for library_id in library_ids:
             result = await service.reconcile_library(session, library_id)
+            if result.get("status") != "synced":
+                status = result.get("status") or "unknown"
+                raise RuntimeError(
+                    f"Docs semantic index reconciliation failed for {library_id}: {status}"
+                )
             totals["libraries"] += 1
             totals["nodes"] += int(result.get("total", 0))
             totals["reindexed"] += int(result.get("reindexed", 0))
             totals["removed"] += int(result.get("removed", 0))
     finally:
-        await session.close()
-        await db.close()
-        if service.client is not None and hasattr(service.client, "close"):
-            service.client.close()
+        try:
+            if session is not None:
+                await session.close()
+        finally:
+            try:
+                await db.close()
+            finally:
+                if service is not None:
+                    client = getattr(service, "client", None)
+                    try:
+                        close_client = getattr(client, "close", None)
+                        if callable(close_client):
+                            close_client()
+                    finally:
+                        embedding = getattr(service, "embedding", None)
+                        close_embedding = getattr(embedding, "close", None)
+                        if callable(close_embedding):
+                            close_embedding()
     return totals
 
 
 def main() -> None:
     args = _parse_args()
-    print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, sort_keys=True))
+    # Config projection and encrypted source fields are read-only: a missing
+    # local/DPAPI key must fail instead of creating a new key during reindex.
+    from src.security.field_crypto import _readonly_data_key_access
+
+    with _readonly_data_key_access():
+        print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, sort_keys=True))
 
 
 if __name__ == "__main__":

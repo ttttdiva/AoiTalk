@@ -23,6 +23,7 @@ from .models import (
     RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
     AppGrant, AppJob, ProjectApp,
 )
+from ..task_time import timer_now_db
 from ..services.project_permissions import (
     PROJECT_MEMBER_DEFAULT_PERMISSIONS,
     get_default_project_permissions,
@@ -766,7 +767,11 @@ class ProjectRepository:
                 ),
                 TimeEntry.deleted_at.is_(None),
             )
-            .values(deleted_at=now, updated_at=now)
+            .values(
+                deleted_at=now,
+                updated_at=now,
+                ended_at=func.coalesce(TimeEntry.ended_at, timer_now_db()),
+            )
         )
         await session.execute(
             update(TaskOccurrence)

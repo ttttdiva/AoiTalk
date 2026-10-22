@@ -3,6 +3,7 @@ RAG configuration management.
 """
 
 import os
+import math
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
@@ -32,6 +33,10 @@ class QdrantConfig:
     collection_name: str = DEFAULT_COLLECTION_NAME
     api_key: Optional[str] = None
     local_path: Optional[str] = None  # If set, use local file storage instead of server
+    mode: str = "external"  # local-managed explicitly owns a local Docker server
+    image: Optional[str] = None  # qdrant/qdrant:v1.16.3@sha256:<verified digest>
+    storage_path: Optional[str] = None  # Existing absolute path inside Docker's host
+    wsl_distribution: Optional[str] = None  # Required only for Windows + WSL Docker
     
     def get_collection_name_for_project(self, project_id: Optional[str] = None) -> str:
         """Get collection name for a specific project.
@@ -51,27 +56,45 @@ class QdrantConfig:
             port=data.get('port', cls.port),
             collection_name=data.get('collection_name', DEFAULT_COLLECTION_NAME),
             api_key=data.get('api_key'),
-            local_path=data.get('local_path')  # None = use server, path = local file storage
+            local_path=data.get('local_path'),  # None = server, path = embedded
+            mode=data.get('mode', 'external'),
+            image=data.get('image'),
+            storage_path=data.get('storage_path'),
+            wsl_distribution=data.get('wsl_distribution'),
         )
 
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model configuration."""
-    model: str = "BAAI/bge-m3"
-    batch_size: int = 32
-    device: str = "cuda"  # cuda or cpu
-    allow_cpu_fallback: bool = True
-    
+    """One fixed embedding model; only runtime placement is configurable."""
+    batch_size: int = 8
+    device: str = "auto"
+    cache_dir: Optional[str] = None
+    local_files_only: bool = True
+    worker_python: Optional[str] = None
+    request_timeout_seconds: float = 180.0
+    idle_timeout_seconds: float = 300.0  # Zero keeps the worker until manual release/close.
+
+    def __post_init__(self):
+        if not math.isfinite(self.idle_timeout_seconds) or self.idle_timeout_seconds < 0:
+            raise ValueError("idle_timeout_seconds must be finite and non-negative")
+
+    @property
+    def model(self) -> str:
+        from .embedding_identity import MODEL_ID
+        return MODEL_ID
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'EmbeddingConfig':
+        # Retired model/fallback keys cannot select another dense encoder.
         return cls(
-            model=data.get('model', cls.model),
-            batch_size=data.get('batch_size', cls.batch_size),
+            batch_size=max(1, int(data.get('batch_size', cls.batch_size))),
             device=data.get('device', cls.device),
-            allow_cpu_fallback=data.get(
-                'allow_cpu_fallback', cls.allow_cpu_fallback
-            )
+            cache_dir=data.get('cache_dir') or os.environ.get('AOITALK_EMBEDDING_CACHE'),
+            local_files_only=bool(data.get('local_files_only', True)),
+            worker_python=data.get('worker_python') or os.environ.get('AOITALK_EMBEDDING_WORKER_PYTHON'),
+            request_timeout_seconds=max(1.0, float(data.get('request_timeout_seconds',180))),
+            idle_timeout_seconds=float(data.get('idle_timeout_seconds', cls.idle_timeout_seconds)),
         )
 
 

@@ -9,17 +9,22 @@ import base64
 import bz2
 from contextlib import contextmanager
 from contextvars import ContextVar
+import ctypes
+import errno
 import fnmatch
 import filecmp
 import gzip
+import hashlib
 import io
 import json
+import logging
 import lzma
 import mimetypes
 import os
 import re
 import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import time
@@ -33,6 +38,23 @@ import py7zr
 from py7zr.io import Py7zIO, WriterFactory
 
 from ..text_content import TextContentError, read_safe_text
+
+logger = logging.getLogger(__name__)
+
+
+class DirectoryMoveNotSupportedError(RuntimeError):
+    """Raised when this platform cannot safely move a directory without replace."""
+
+
+class FileMoveNotSupportedError(RuntimeError):
+    """Raised when a file move cannot safely remove its source entry."""
+
+
+_SAFE_DELETE_UNSUPPORTED_WINERRORS = {1, 50, 87, 120}
+_SAFE_DELETE_UNSUPPORTED_MESSAGE = (
+    "このWindows環境またはファイルシステムでは、ハンドル単位の安全な削除を利用できません"
+)
+
 
 # Constants
 SHORTCUT_EXTENSION = ".lnk"
@@ -167,6 +189,62 @@ def workspace_root_context(root: Path | str):
         yield selected
     finally:
         _WORKSPACE_ROOT_OVERRIDE.reset(token)
+
+
+def _hint_files_index(*paths: Any) -> None:
+    """Tell the Files semantic index which paths changed (never fails the write)."""
+    try:
+        from ...services.workspace_file_index import hint_workspace_paths
+
+        hint_workspace_paths([path for path in paths if path is not None])
+    except Exception:
+        pass
+
+
+def _capture_upload_publication(
+    source_path: Path,
+    published_path: Path,
+) -> Dict[str, Any]:
+    """Capture the private ownership proof for an upload temp file.
+
+    The caller invokes the observer only after the temp file has been
+    published.  Keeping this metadata private avoids adding filesystem
+    identity details to the public upload response while still allowing a
+    transactional caller to avoid undoing another writer's change.
+    """
+
+    source_stat = source_path.stat()
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise OSError("uploaded temp path is not a regular file")
+
+    digest = hashlib.sha256()
+    with source_path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+    return {
+        "path": published_path,
+        "st_dev": int(source_stat.st_dev),
+        "st_ino": int(source_stat.st_ino),
+        "st_mode": int(source_stat.st_mode),
+        "st_size": int(source_stat.st_size),
+        "st_mtime_ns": int(source_stat.st_mtime_ns),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _cleanup_upload_temp(path: Optional[Path]) -> None:
+    """Best-effort cleanup for a temp file owned by one upload attempt."""
+
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to remove upload temp file: %s", path)
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -1030,9 +1108,10 @@ def upload_file_stream(
     filename: str,
     content: BinaryIO,
     is_admin: bool = False,
-    allow_overwrite: bool = True,
+    allow_overwrite: bool = False,
     *,
     allow_external: bool = False,
+    _publication_observer=None,
 ) -> Dict[str, Any]:
     """
     Upload a file to the specified directory.
@@ -1078,6 +1157,11 @@ def upload_file_stream(
                         break
                     destination.write(chunk)
                     size_bytes += len(chunk)
+            publication = None
+            if _publication_observer is not None:
+                # Hash the private temp file before publication.  The
+                # observer is called only after the atomic publish succeeds.
+                publication = _capture_upload_publication(temp_path, file_path)
             if allow_overwrite:
                 os.replace(temp_path, file_path)
             else:
@@ -1091,12 +1175,23 @@ def upload_file_stream(
                         "error": f"ファイル「{safe_name}」は既に存在します",
                         "code": "already_exists",
                     }
-                temp_path.unlink()
+            if publication is not None:
+                try:
+                    # Record ownership immediately after atomic publication,
+                    # before best-effort cleanup of the no-overwrite link.
+                    _publication_observer(publication)
+                except Exception:
+                    # Ownership bookkeeping must not turn a successful file
+                    # publication into a failed public upload response.
+                    pass
+            if not allow_overwrite:
+                _cleanup_upload_temp(temp_path)
             temp_path = None
         finally:
             if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+                _cleanup_upload_temp(temp_path)
         rel_path = _format_path_for_response(file_path, root)
+        _hint_files_index(file_path)
 
         return {
             "success": True,
@@ -1115,7 +1210,7 @@ def upload_file(
     filename: str,
     content: bytes,
     is_admin: bool = False,
-    allow_overwrite: bool = True,
+    allow_overwrite: bool = False,
     *,
     allow_external: bool = False,
 ) -> Dict[str, Any]:
@@ -1337,6 +1432,7 @@ def archive_items(
             _write_selected_items_to_archive(archive, resolved_items)
         os.replace(temporary_path, archive_path)
         temporary_path = None
+        _hint_files_index(archive_path)
 
         return {
             "success": True,
@@ -1675,6 +1771,7 @@ def extract_archives(
                 }
             )
 
+        _hint_files_index(*created_roots)
         return {
             "success": True,
             "message": f"{len(extracted)}件の圧縮ファイルを展開しました",
@@ -1813,6 +1910,7 @@ def rename_item(path: str, new_name: str, is_admin: bool = False) -> Dict[str, A
     try:
         target.rename(new_path)
         rel_path = _format_path_for_response(new_path, root)
+        _hint_files_index(target, new_path)
 
         return {
             "success": True,
@@ -1824,7 +1922,1173 @@ def rename_item(path: str, new_name: str, is_admin: bool = False) -> Dict[str, A
         return {"success": False, "error": f"名前変更に失敗: {str(e)}"}
 
 
-def move_item(src_path: str, dest_path: str, is_admin: bool = False) -> Dict[str, Any]:
+def _move_item_collision_result(
+    source: Path,
+    destination: Path,
+    *,
+    allow_overwrite: bool,
+) -> Dict[str, Any] | None:
+    """Describe a move collision without changing either filesystem entry."""
+
+    target = destination / source.name
+    if not target.exists() and not target.is_symlink():
+        return None
+
+    try:
+        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(
+            os.path.abspath(target)
+        ) or os.path.samefile(source, target):
+            return {
+                "success": True,
+                "same_file": True,
+                "overwrite_size": int(target.stat().st_size),
+            }
+    except (FileNotFoundError, OSError, RuntimeError):
+        pass
+
+    try:
+        source_stat = source.lstat()
+        target_stat = target.lstat()
+    except (FileNotFoundError, OSError, RuntimeError):
+        return {
+            "success": False,
+            "error_code": "unsupported_collision",
+            "error": "移動先を安全に置き換えられません",
+        }
+
+    if (
+        _is_link_or_reparse(source)
+        or _is_link_or_reparse(target)
+        or not stat.S_ISREG(source_stat.st_mode)
+        or not stat.S_ISREG(target_stat.st_mode)
+    ):
+        return {
+            "success": False,
+            "error_code": "unsupported_collision",
+            "error": "上書きできるのは通常のファイル同士の移動だけです",
+        }
+
+    if not allow_overwrite:
+        return {
+            "success": False,
+            "error_code": "already_exists",
+            "error": f"移動先に「{source.name}」が既に存在します",
+        }
+
+    return {
+        "success": True,
+        "same_file": False,
+        "overwrite_size": int(target_stat.st_size),
+        "target_identity": _capture_move_file_identity(target),
+    }
+
+
+def inspect_move_item_collision(
+    src_path: str,
+    dest_path: str,
+    *,
+    is_admin: bool = False,
+    allow_overwrite: bool = False,
+) -> Dict[str, Any] | None:
+    """Check the effective destination of a move before quota admission."""
+
+    source, source_valid = _resolve_path(src_path, is_admin=is_admin)
+    destination, destination_valid = _resolve_path(dest_path, is_admin=is_admin)
+    if (
+        not source_valid
+        or not destination_valid
+        or not source.exists()
+        or not destination.is_dir()
+    ):
+        return None
+    return _move_item_collision_result(
+        source,
+        destination,
+        allow_overwrite=allow_overwrite,
+    )
+
+
+def _capture_move_file_identity(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        item_stat = path.lstat()
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    return (
+        int(item_stat.st_dev),
+        int(item_stat.st_ino),
+        int(item_stat.st_mode),
+        int(item_stat.st_size),
+        int(item_stat.st_mtime_ns),
+    )
+
+
+def _move_identity_matches(path: Path, expected: Any) -> bool:
+    if not isinstance(expected, (tuple, list)) or len(expected) != 5:
+        return False
+    return _capture_move_file_identity(path) == tuple(int(value) for value in expected)
+
+
+def _move_file_key(path: Path) -> tuple[int, int] | None:
+    try:
+        item_stat = path.lstat()
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    return int(item_stat.st_dev), int(item_stat.st_ino)
+
+
+def _is_destination_exists_error(error: OSError) -> bool:
+    return (
+        isinstance(error, FileExistsError)
+        or error.errno in {errno.EEXIST, getattr(errno, "EISDIR", -1)}
+        or getattr(error, "winerror", None) in {80, 183}
+    )
+
+
+def _move_stream_digest(source_stream: BinaryIO) -> bytes:
+    """Hash an already-open file and restore its position for later I/O."""
+
+    source_stream.seek(0)
+    digest = hashlib.sha256()
+    while True:
+        chunk = source_stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    source_stream.seek(0)
+    return digest.digest()
+
+
+def _move_source_key_from_stat(item_stat: os.stat_result) -> tuple[int, int]:
+    return int(item_stat.st_dev), int(item_stat.st_ino)
+
+
+def _open_move_source(source: Path) -> BinaryIO:
+    """Open a source with the rights needed for safe Windows deletion.
+
+    A pathname unlink cannot prove that it still names the object that was
+    copied.  Windows can mark the opened object delete-pending through its
+    handle, so the final deletion remains tied to that object even if the
+    pathname is replaced.  Other platforms intentionally use a normal read
+    handle and fail closed before deleting the source (see
+    ``_delete_open_move_source``).
+    """
+
+    if os.name != "nt":
+        return source.open("rb")
+
+    return _open_windows_move_stream(source, 0x80000000)  # GENERIC_READ
+
+
+def _open_windows_move_stream(
+    source: Path,
+    desired_access: int,
+    share_mode: int = 0x00000001 | 0x00000002 | 0x00000004,
+    creation_disposition: int = 3,
+    fd_flags: int | None = None,
+    stream_mode: str = "rb",
+) -> BinaryIO:
+    """Open a Windows file handle with the requested sharing modes."""
+
+    try:
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        handle = kernel32.CreateFileW(
+            str(source),
+            desired_access,
+            share_mode,
+            None,
+            creation_disposition,
+            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(
+                int(handle),
+                fd_flags
+                if fd_flags is not None
+                else os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+        return os.fdopen(fd, stream_mode)
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            "この環境では移動元を安全に削除できないため、別ボリュームへのファイル移動を実行できません"
+        ) from exc
+
+
+def _open_move_delete_source(source: Path) -> BinaryIO:
+    """Open a fresh handle that has DELETE access for exact-object removal."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動元の安全な削除を保証できないため、別ボリュームへのファイル移動を実行できません"
+        )
+    return _open_windows_move_stream(
+        source,
+        0x80000000 | 0x00000100 | 0x00010000,  # READ | FILE_WRITE_ATTRIBUTES | DELETE
+        0x00000001,  # FILE_SHARE_READ; block writers/deleters until close
+    )
+
+
+def _open_move_destination(destination: Path) -> BinaryIO:
+    """Create a fallback target with handle ownership on Windows."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動元を安全に削除できないため、別ボリュームへのファイル移動を実行できません"
+        )
+    try:
+        return _open_windows_move_stream(
+            destination,
+            0x80000000
+            | 0x40000000
+            | 0x00000100
+            | 0x00010000,  # READ | WRITE | FILE_WRITE_ATTRIBUTES | DELETE
+            0x00000001,  # FILE_SHARE_READ; block replacement/writes while owned
+            1,  # CREATE_NEW
+            os.O_RDWR | getattr(os, "O_BINARY", 0),
+            "w+b",
+        )
+    except OSError as exc:
+        if _is_destination_exists_error(exc):
+            raise FileExistsError(str(destination)) from exc
+        raise
+
+
+def _assert_move_source_unchanged(
+    source: Path,
+    source_stream: BinaryIO,
+    source_key: tuple[int, int],
+    source_digest: bytes,
+) -> None:
+    """Reject replacement or content changes observed through the copy."""
+
+    if _move_file_key(source) != source_key:
+        raise FileMoveNotSupportedError(
+            "移動元がコピー中に置き換えられたため、ファイル移動を中止しました"
+        )
+    if _move_source_key_from_stat(os.fstat(source_stream.fileno())) != source_key:
+        raise FileMoveNotSupportedError(
+            "移動元がコピー中に置き換えられたため、ファイル移動を中止しました"
+        )
+    if _move_stream_digest(source_stream) != source_digest:
+        raise FileMoveNotSupportedError(
+            "移動元の内容がコピー中に変化したため、ファイル移動を中止しました"
+        )
+
+
+def _assert_move_source_identity(source: Path, source_key: tuple[int, int]) -> None:
+    """Reject a source pathname replacement without rereading its content."""
+
+    if _move_file_key(source) != source_key:
+        raise FileMoveNotSupportedError(
+            "移動元がコピー中に置き換えられたため、ファイル移動を中止しました"
+        )
+
+
+def _lock_open_move_source(source_stream: BinaryIO) -> tuple[Any, Any]:
+    """Take an exclusive Windows byte-range lock before final deletion."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動元の安全な削除を保証できないため、別ボリュームへのファイル移動を実行できません"
+        )
+
+    try:
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+        ]
+        kernel32.LockFileEx.restype = wintypes.BOOL
+        kernel32.UnlockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+        ]
+        kernel32.UnlockFileEx.restype = wintypes.BOOL
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        overlapped = _Overlapped()
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_stream.fileno()))
+        if not kernel32.LockFileEx(
+            handle,
+            0x00000002 | 0x00000001,  # LOCKFILE_EXCLUSIVE_LOCK | FAIL_IMMEDIATELY
+            0,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            ctypes.byref(overlapped),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return kernel32, overlapped
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            "この環境では移動元を安全にロックできないため、別ボリュームへのファイル移動を実行できません"
+        ) from exc
+
+
+def _mark_open_move_file_for_delete(
+    source_stream: BinaryIO,
+    kernel32: Any | None = None,
+) -> None:
+    """Mark an opened Windows file object delete-pending."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動元を安全に削除できないため、別ボリュームへのファイル移動を実行できません"
+        )
+
+    try:
+        from ctypes import wintypes
+        import msvcrt
+
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        class _FileDispositionInfoEx(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.DWORD)]
+
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        disposition = _FileDispositionInfoEx(
+            0x00000001 | 0x00000010  # DELETE | IGNORE_READONLY_ATTRIBUTE
+        )
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_stream.fileno()))
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            21,  # FileDispositionInfoEx
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            if (
+                getattr(error, "winerror", None) in _SAFE_DELETE_UNSUPPORTED_WINERRORS
+                or getattr(error, "errno", None) in _SAFE_DELETE_UNSUPPORTED_WINERRORS
+            ):
+                raise FileMoveNotSupportedError(
+                    _SAFE_DELETE_UNSUPPORTED_MESSAGE
+                ) from error
+            raise error
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            _SAFE_DELETE_UNSUPPORTED_MESSAGE
+        ) from exc
+
+
+def _clear_readonly_on_open_move_file(source_stream: BinaryIO) -> None:
+    """Clear only the owned handle's READONLY attribute for cleanup."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動先を安全に削除できないため、コピーを破棄できません"
+        )
+
+    try:
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+                ("Reserved", wintypes.DWORD),
+            ]
+
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        info = _FileBasicInfo()
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_stream.fileno()))
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            0,  # FileBasicInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        info.FileAttributes &= ~0x00000001  # FILE_ATTRIBUTE_READONLY
+        if info.FileAttributes == 0:
+            info.FileAttributes = 0x00000080  # FILE_ATTRIBUTE_NORMAL
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            0,  # FileBasicInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            "この環境では移動先の読み取り専用属性を安全に解除できません"
+        ) from exc
+
+
+def _mark_open_move_file_for_delete_legacy(source_stream: BinaryIO) -> None:
+    """Legacy cleanup-only delete for an already-owned writable handle."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境では移動先を安全に削除できないため、コピーを破棄できません"
+        )
+
+    try:
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        disposition = _FileDispositionInfo(1)
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source_stream.fileno()))
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            4,  # FileDispositionInfo
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            "この環境では移動先を安全に削除できないため、コピーを破棄できません"
+        ) from exc
+
+
+def _copy_open_move_basic_metadata(
+    source_stream: BinaryIO,
+    destination_stream: BinaryIO,
+) -> None:
+    """Copy Windows basic timestamps/attributes between owned handles."""
+
+    if os.name != "nt":
+        raise FileMoveNotSupportedError(
+            "この環境ではファイル属性を安全にコピーできません"
+        )
+
+    try:
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+                ("Reserved", wintypes.DWORD),
+            ]
+
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        source_handle = wintypes.HANDLE(
+            msvcrt.get_osfhandle(source_stream.fileno())
+        )
+        destination_handle = wintypes.HANDLE(
+            msvcrt.get_osfhandle(destination_stream.fileno())
+        )
+        info = _FileBasicInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            source_handle,
+            0,  # FileBasicInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.SetFileInformationByHandle(
+            destination_handle,
+            0,  # FileBasicInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, ImportError) as exc:
+        raise FileMoveNotSupportedError(
+            "この環境ではファイル属性を安全にコピーできません"
+        ) from exc
+    except OSError as exc:
+        raise FileMoveNotSupportedError(
+            "移動元のファイル属性を移動先へ安全にコピーできません"
+        ) from exc
+
+
+def _delete_open_move_source(
+    source: Path,
+    source_key: tuple[int, int],
+    source_digest: bytes,
+    destination: Path,
+    destination_key: tuple[int, int],
+    destination_stream: BinaryIO,
+) -> tuple[int, int, int, int, int]:
+    """Delete exactly the copied source object, or fail closed."""
+
+    delete_stream = _open_move_delete_source(source)
+    kernel32 = None
+    overlapped = None
+    try:
+        kernel32, overlapped = _lock_open_move_source(delete_stream)
+        _assert_move_source_unchanged(
+            source,
+            delete_stream,
+            source_key,
+            source_digest,
+        )
+        if _move_file_key(destination) != destination_key or (
+            _move_source_key_from_stat(os.fstat(destination_stream.fileno()))
+            != destination_key
+        ):
+            raise FileExistsError(str(destination))
+        # Copy metadata while both owned handles are stable.  Path-based
+        # copystat would need to reopen the destination and conflict with its
+        # FILE_SHARE_READ ownership.
+        _copy_open_move_basic_metadata(delete_stream, destination_stream)
+        published_identity = _capture_move_file_identity(destination)
+        if published_identity is None:
+            raise FileExistsError(str(destination))
+        _mark_open_move_file_for_delete(delete_stream, kernel32)
+        return published_identity
+    except OSError as exc:
+        if isinstance(exc, FileExistsError):
+            raise
+        if isinstance(exc, FileMoveNotSupportedError):
+            raise
+        raise FileMoveNotSupportedError(
+            "移動元を開いたファイルとして安全に削除できないため、ファイル移動を中止しました"
+        ) from exc
+    finally:
+        if kernel32 is not None and overlapped is not None:
+            try:
+                import msvcrt
+
+                handle = ctypes.c_void_p(msvcrt.get_osfhandle(delete_stream.fileno()))
+                kernel32.UnlockFileEx(
+                    handle,
+                    0,
+                    0xFFFFFFFF,
+                    0xFFFFFFFF,
+                    ctypes.byref(overlapped),
+                )
+            except (AttributeError, ImportError, OSError, ValueError):
+                pass
+        delete_stream.close()
+
+
+def _remove_owned_move_destination(
+    destination_stream: BinaryIO | None,
+    destination_key: tuple[int, int] | None,
+) -> None:
+    """Remove only a fallback target through its still-owned Windows handle."""
+
+    if destination_stream is None or destination_key is None or os.name != "nt":
+        return
+    try:
+        if (
+            _move_source_key_from_stat(os.fstat(destination_stream.fileno()))
+            != destination_key
+        ):
+            return
+        _mark_open_move_file_for_delete(destination_stream)
+    except (OSError, RuntimeError):
+        try:
+            _clear_readonly_on_open_move_file(destination_stream)
+            _mark_open_move_file_for_delete_legacy(destination_stream)
+        except (OSError, RuntimeError):
+            logger.warning("Failed to remove owned fallback target through its handle")
+
+
+def _atomic_rename_file_no_replace(source: Path, destination: Path) -> None:
+    """Move a file atomically without replacing a concurrent destination."""
+
+    if os.name == "nt":
+        try:
+            # Windows os.rename maps to a no-replace rename.  Keeping the
+            # source and destination in one filesystem makes this the same
+            # atomic operation as the Linux renameat2 path below.
+            os.rename(source, destination)
+        except OSError as exc:
+            if _is_destination_exists_error(exc):
+                raise FileExistsError(str(destination)) from exc
+            raise
+        return
+
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = libc.renameat2
+        except (AttributeError, OSError) as exc:
+            raise FileMoveNotSupportedError(
+                "この環境では置換なしのファイル移動を利用できません"
+            ) from exc
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            1,  # RENAME_NOREPLACE
+        )
+        if result == 0:
+            return
+        error_code = ctypes.get_errno()
+        if error_code in {errno.EEXIST, getattr(errno, "ENOTEMPTY", -1)}:
+            raise FileExistsError(str(destination))
+        if error_code == errno.EXDEV:
+            raise OSError(error_code, os.strerror(error_code), str(destination))
+        if error_code in {
+            errno.ENOSYS,
+            errno.EINVAL,
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            raise FileMoveNotSupportedError(
+                "この環境では置換なしのファイル移動を利用できません"
+            ) from OSError(error_code, os.strerror(error_code), str(destination))
+        raise OSError(error_code, os.strerror(error_code), str(destination))
+
+    raise FileMoveNotSupportedError(
+        "この環境では置換なしのファイル移動を利用できません"
+    )
+
+
+def _move_regular_file_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    identity_out: list[tuple[int, int, int, int, int] | None] | None = None,
+) -> None:
+    """Move a file without allowing a concurrent target to be replaced."""
+
+    try:
+        source_identity = _capture_move_file_identity(source)
+        if source_identity is None:
+            raise FileMoveNotSupportedError(
+                "移動元を確認できないため、ファイル移動を中止しました"
+            )
+        _atomic_rename_file_no_replace(source, destination)
+    except OSError as exc:
+        if _is_destination_exists_error(exc):
+            raise FileExistsError(str(destination)) from exc
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise FileMoveNotSupportedError(
+                "移動元を安全に移動できないため、ファイル移動を中止しました"
+            ) from exc
+        if os.name != "nt":
+            raise FileMoveNotSupportedError(
+                "この環境では移動元を安全に削除できないため、別ボリュームへのファイル移動を実行できません"
+            ) from exc
+        # Cross-volume Windows moves use the handle-owned copy path below.
+        # It deletes the exact source object and never unlinks a pathname
+        # observed after the copy.
+        created_key: tuple[int, int] | None = None
+        source_stream: BinaryIO | None = None
+        destination_stream: BinaryIO | None = None
+        try:
+            source_stream = _open_move_source(source)
+            source_stat = os.fstat(source_stream.fileno())
+            source_key = _move_source_key_from_stat(source_stat)
+            if not stat.S_ISREG(source_stat.st_mode) or _move_file_key(source) != source_key:
+                raise FileMoveNotSupportedError(
+                    "移動元が通常のファイルではなくなったため、ファイル移動を中止しました"
+                )
+            source_digest = _move_stream_digest(source_stream)
+            _assert_move_source_identity(source, source_key)
+            destination_stream = _open_move_destination(destination)
+            created_stat = os.fstat(destination_stream.fileno())
+            created_key = (int(created_stat.st_dev), int(created_stat.st_ino))
+            shutil.copyfileobj(source_stream, destination_stream)
+            destination_stream.flush()
+            if _move_stream_digest(destination_stream) != source_digest:
+                raise FileMoveNotSupportedError(
+                    "コピー中に移動元の内容が変化したため、ファイル移動を中止しました"
+                )
+            if created_key is None or _move_file_key(destination) != created_key:
+                raise FileExistsError(str(destination))
+            published_identity = _delete_open_move_source(
+                source,
+                source_key,
+                source_digest,
+                destination,
+                created_key,
+                destination_stream,
+            )
+            if identity_out is not None:
+                identity_out.append(published_identity)
+        except Exception:
+            _remove_owned_move_destination(destination_stream, created_key)
+            raise
+        finally:
+            if source_stream is not None and not source_stream.closed:
+                source_stream.close()
+            if destination_stream is not None and not destination_stream.closed:
+                destination_stream.close()
+        return
+    except FileMoveNotSupportedError:
+        raise
+
+    if not _move_identity_matches(destination, source_identity):
+        restored = False
+        if not (source.exists() or source.is_symlink()):
+            try:
+                _atomic_rename_file_no_replace(destination, source)
+                restored = True
+            except Exception:
+                logger.exception(
+                    "Failed to restore a file after source identity changed: "
+                    "source=%s destination=%s",
+                    source,
+                    destination,
+                )
+        if not restored:
+            logger.error(
+                "File source changed during move; destination left untouched: "
+                "source=%s destination=%s",
+                source,
+                destination,
+            )
+        raise FileMoveNotSupportedError(
+            "移動元が移動中に変化したためファイル移動を中止しました"
+        )
+
+    published_identity = _capture_move_file_identity(destination)
+    if identity_out is not None:
+        identity_out.append(published_identity)
+
+
+def _atomic_rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Use a platform primitive that refuses every existing destination entry."""
+    if os.name == "nt":
+        try:
+            os.rename(source, destination)
+        except OSError as exc:
+            if _is_destination_exists_error(exc):
+                raise FileExistsError(str(destination)) from exc
+            if exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == 17:
+                raise DirectoryMoveNotSupportedError(
+                    "別ボリュームへのフォルダ移動は安全に実行できません"
+                ) from exc
+            raise
+        return
+
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = libc.renameat2
+        except (AttributeError, OSError) as exc:
+            raise DirectoryMoveNotSupportedError(
+                "この環境では置換なしのフォルダ移動を利用できません"
+            ) from exc
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            1,  # RENAME_NOREPLACE
+        )
+        if result == 0:
+            return
+        error_code = ctypes.get_errno()
+        if error_code in {errno.EEXIST, getattr(errno, "ENOTEMPTY", -1)}:
+            raise FileExistsError(str(destination))
+        if error_code == errno.EXDEV:
+            raise DirectoryMoveNotSupportedError(
+                "別ボリュームへのフォルダ移動は安全に実行できません"
+            ) from OSError(error_code, os.strerror(error_code), str(destination))
+        if error_code in {
+            errno.ENOSYS,
+            errno.EINVAL,
+            getattr(errno, "EOPNOTSUPP", -1),
+        }:
+            raise DirectoryMoveNotSupportedError(
+                "この環境では置換なしのフォルダ移動を利用できません"
+            ) from OSError(error_code, os.strerror(error_code), str(destination))
+        raise OSError(error_code, os.strerror(error_code), str(destination))
+
+    raise DirectoryMoveNotSupportedError(
+        "この環境では置換なしのフォルダ移動を利用できません"
+    )
+
+
+def _move_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    identity_out: list[tuple[int, int, int, int, int] | None] | None = None,
+) -> None:
+    """Atomically move one directory without replacing any destination entry."""
+
+    source_identity = _capture_move_file_identity(source)
+    if (
+        source_identity is None
+        or _is_link_or_reparse(source)
+        or not stat.S_ISDIR(source.lstat().st_mode)
+    ):
+        raise DirectoryMoveNotSupportedError(
+            "移動元が通常のフォルダではなくなったため移動を中止しました"
+        )
+
+    _atomic_rename_directory_no_replace(source, destination)
+    if not _move_identity_matches(destination, source_identity):
+        restored = False
+        if not (source.exists() or source.is_symlink()):
+            try:
+                _move_directory_no_replace(destination, source)
+                restored = True
+            except Exception:
+                logger.exception(
+                    "Failed to restore a directory after source identity changed: "
+                    "source=%s destination=%s",
+                    source,
+                    destination,
+                )
+        if not restored:
+            logger.error(
+                "Directory source changed during move; destination left untouched: "
+                "source=%s destination=%s",
+                source,
+                destination,
+            )
+        raise DirectoryMoveNotSupportedError(
+            "移動元が移動中に変化したためフォルダ移動を中止しました"
+        )
+
+    if identity_out is not None:
+        identity_out.append(source_identity)
+
+
+def _restore_staged_move_entry(
+    backup_path: Path,
+    target: Path,
+    transaction_dir: Path,
+) -> bool:
+    """Restore a raced target only when the destination name is vacant."""
+
+    if target.exists() or target.is_symlink():
+        return False
+    try:
+        if backup_path.is_file() and not backup_path.is_symlink():
+            try:
+                _move_regular_file_no_replace(backup_path, target)
+            except FileMoveNotSupportedError:
+                # The backup is operation-owned.  Restore it with the
+                # platform no-replace rename primitive when a cross-volume
+                # copy cannot safely delete its source.
+                _atomic_rename_directory_no_replace(backup_path, target)
+        else:
+            if target.exists() or target.is_symlink():
+                return False
+            os.rename(backup_path, target)
+        _cleanup_move_overwrite_backup(transaction_dir)
+        return True
+    except (OSError, RuntimeError):
+        logger.exception(
+            "Failed to restore a changed move target; backup retained: %s",
+            backup_path,
+        )
+        return False
+
+
+def _create_move_overwrite_backup(
+    target: Path,
+    *,
+    expected_identity: Any,
+) -> tuple[Path, Path]:
+    """Move an existing target into protected trash until the move commits."""
+
+    if not _move_identity_matches(target, expected_identity):
+        raise FileExistsError(str(target))
+
+    workspace_root = get_root_dir()
+    try:
+        target.relative_to(workspace_root)
+        target_is_in_workspace = True
+    except ValueError:
+        target_is_in_workspace = False
+    try:
+        same_volume = target_is_in_workspace and (
+            os.stat(workspace_root).st_dev == os.stat(target.parent).st_dev
+        )
+    except OSError:
+        same_volume = False
+    backup_parent = workspace_root if same_volume else target.parent
+    trash_root = backup_parent / TRASH_DIR_NAME
+    if trash_root.exists() or trash_root.is_symlink():
+        if _is_link_or_reparse(trash_root) or not trash_root.is_dir():
+            raise OSError("移動先の退避先が安全ではありません")
+    else:
+        trash_root.mkdir()
+    if _is_link_or_reparse(trash_root) or not trash_root.is_dir():
+        raise OSError("移動先の退避先が安全ではありません")
+    transaction_root = trash_root / "move-transactions"
+    if transaction_root.exists() or transaction_root.is_symlink():
+        if _is_link_or_reparse(transaction_root) or not transaction_root.is_dir():
+            raise OSError("移動先の退避先が安全ではありません")
+    else:
+        transaction_root.mkdir()
+    if _is_link_or_reparse(transaction_root) or not transaction_root.is_dir():
+        raise OSError("移動先の退避先が安全ではありません")
+    transaction_dir = transaction_root / uuid.uuid4().hex
+    transaction_dir.mkdir(parents=True, exist_ok=False)
+    backup_path = transaction_dir / "payload"
+    try:
+        os.replace(target, backup_path)
+    except Exception:
+        try:
+            transaction_dir.rmdir()
+            transaction_dir.parent.rmdir()
+        except OSError:
+            pass
+        raise
+    if not _move_identity_matches(backup_path, expected_identity):
+        restored = _restore_staged_move_entry(
+            backup_path,
+            target,
+            transaction_dir,
+        )
+        if not restored:
+            logger.error(
+                "Move target changed during staging; backup retained: target=%s backup=%s",
+                target,
+                backup_path,
+            )
+        raise FileExistsError(str(target))
+    return transaction_dir, backup_path
+
+
+def _cleanup_move_overwrite_backup(transaction_dir: Path | None) -> None:
+    if transaction_dir is None:
+        return
+    try:
+        shutil.rmtree(transaction_dir)
+    except OSError:
+        logger.warning("Failed to remove move overwrite backup: %s", transaction_dir)
+        return
+    for parent in (transaction_dir.parent,):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
+def _rollback_overwrite_move(
+    source: Path,
+    target: Path,
+    backup_path: Path,
+    transaction_dir: Path,
+    *,
+    published_identity: Any,
+) -> bool:
+    """Restore the source and prior destination after a failed replacement."""
+
+    try:
+        source_exists = source.exists() or source.is_symlink()
+        target_exists = target.exists() or target.is_symlink()
+        if not source_exists and target_exists:
+            if not _move_identity_matches(target, published_identity):
+                logger.error(
+                    "Move rollback left a changed destination untouched; backup retained: "
+                    "source=%s destination=%s backup=%s",
+                    source,
+                    target,
+                    backup_path,
+                )
+                return False
+            _move_regular_file_no_replace(target, source)
+        elif source_exists and target_exists:
+            if not _move_identity_matches(target, published_identity):
+                logger.error(
+                    "Move rollback left a concurrent destination untouched; backup retained: "
+                    "source=%s destination=%s backup=%s",
+                    source,
+                    target,
+                    backup_path,
+                )
+                return False
+            try:
+                same_file = os.path.samefile(source, target)
+            except OSError:
+                same_file = False
+            if not same_file:
+                logger.error(
+                    "Move rollback preserved distinct source and destination entries: "
+                    "source=%s destination=%s backup=%s",
+                    source,
+                    target,
+                    backup_path,
+                )
+                return False
+            target.unlink()
+
+        if target.exists() or target.is_symlink():
+            return False
+        try:
+            _move_regular_file_no_replace(backup_path, target)
+        except FileMoveNotSupportedError:
+            # The transaction payload is private to this move, so the
+            # no-replace rename is the safe rollback path when copy fallback
+            # is unsupported on this platform.
+            _atomic_rename_directory_no_replace(backup_path, target)
+        _cleanup_move_overwrite_backup(transaction_dir)
+        return True
+    except (OSError, RuntimeError):
+        logger.exception(
+            "Failed to restore overwritten move: source=%s destination=%s backup=%s",
+            source,
+            target,
+            backup_path,
+        )
+        return False
+
+
+def finalize_move_item(result: Dict[str, Any]) -> None:
+    """Discard a retained overwrite backup after its caller commits."""
+
+    result.pop("_move_published_identity", None)
+    transaction = result.pop("_move_overwrite_transaction", None)
+    if not isinstance(transaction, dict):
+        return
+    _cleanup_move_overwrite_backup(Path(transaction["directory"]))
+
+
+def rollback_move_item(
+    result: Dict[str, Any],
+    source_path: Path,
+    destination_path: Path,
+) -> bool:
+    """Restore a retained overwrite move after its caller rolls back."""
+
+    published_identity = result.pop("_move_published_identity", None)
+    transaction = result.pop("_move_overwrite_transaction", None)
+    if isinstance(transaction, dict):
+        return _rollback_overwrite_move(
+            source_path,
+            destination_path,
+            Path(transaction["backup"]),
+            Path(transaction["directory"]),
+            published_identity=transaction.get("published_identity", published_identity),
+        )
+
+    if source_path.exists() or source_path.is_symlink():
+        return True
+    if not (destination_path.exists() or destination_path.is_symlink()):
+        return False
+    try:
+        if not _move_identity_matches(destination_path, published_identity):
+            logger.error(
+                "Move rollback left a changed destination untouched: source=%s destination=%s",
+                source_path,
+                destination_path,
+            )
+            return False
+        if destination_path.is_dir() and not destination_path.is_symlink():
+            _move_directory_no_replace(destination_path, source_path)
+        else:
+            _move_regular_file_no_replace(destination_path, source_path)
+        return source_path.exists() or source_path.is_symlink()
+    except (OSError, RuntimeError):
+        logger.exception(
+            "Failed to restore moved item: source=%s destination=%s",
+            source_path,
+            destination_path,
+        )
+        return False
+
+
+def move_item(
+    src_path: str,
+    dest_path: str,
+    is_admin: bool = False,
+    *,
+    allow_overwrite: bool = False,
+    retain_overwrite_backup: bool = False,
+) -> Dict[str, Any]:
     """
     Move a file or directory.
 
@@ -1868,28 +3132,133 @@ def move_item(src_path: str, dest_path: str, is_admin: bool = False) -> Dict[str
         return {"success": False, "error": "移動先はディレクトリである必要があります"}
 
     new_path = dest / src.name
-    same_path = os.path.normcase(os.path.abspath(src)) == os.path.normcase(
-        os.path.abspath(new_path)
+    collision = _move_item_collision_result(
+        src,
+        dest,
+        allow_overwrite=allow_overwrite,
     )
-    if same_path:
+    if collision and collision.get("same_file"):
         return {
             "success": True,
             "message": f"「{src.name}」は既に移動先にあります",
             "new_path": _format_path_for_response(src, root),
         }
-    if new_path.exists():
-        return {"success": False, "error": f"移動先に「{src.name}」が既に存在します"}
+    if collision and not collision.get("success"):
+        return collision
 
+    transaction_dir: Path | None = None
+    backup_path: Path | None = None
+    if collision and collision.get("overwrite_size") is not None:
+        try:
+            transaction_dir, backup_path = _create_move_overwrite_backup(
+                new_path,
+                expected_identity=collision.get("target_identity"),
+            )
+        except FileExistsError:
+            return {
+                "success": False,
+                "error_code": "already_exists",
+                "error": f"移動先に「{src.name}」が既に存在します",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"上書き先の退避に失敗: {e}",
+            }
+    published_identity: list[tuple[int, int, int, int, int] | None] = []
     try:
-        shutil.move(str(src), str(new_path))
+        if backup_path is not None:
+            _move_regular_file_no_replace(
+                src,
+                new_path,
+                identity_out=published_identity,
+            )
+        elif src.is_file():
+            _move_regular_file_no_replace(
+                src,
+                new_path,
+                identity_out=published_identity,
+            )
+        elif src.is_dir():
+            _move_directory_no_replace(
+                src,
+                new_path,
+                identity_out=published_identity,
+            )
+        else:
+            return {
+                "success": False,
+                "error_code": "move_not_supported",
+                "error": "移動元は通常のファイルまたはフォルダである必要があります",
+            }
         rel_path = _format_path_for_response(new_path, root)
+        _hint_files_index(src, new_path)
 
-        return {
+        result = {
             "success": True,
             "message": f"「{src.name}」を移動しました",
             "new_path": rel_path,
         }
+        if retain_overwrite_backup:
+            result["_move_published_identity"] = (
+                published_identity[0] if published_identity else None
+            )
+        if transaction_dir is not None and backup_path is not None:
+            if retain_overwrite_backup:
+                result["_move_overwrite_transaction"] = {
+                    "directory": str(transaction_dir),
+                    "backup": str(backup_path),
+                    "size": int(collision["overwrite_size"]),
+                    "published_identity": (
+                        published_identity[0] if published_identity else None
+                    ),
+                }
+            else:
+                _cleanup_move_overwrite_backup(transaction_dir)
+        return result
+    except FileExistsError:
+        if transaction_dir is not None and backup_path is not None:
+            _rollback_overwrite_move(
+                src,
+                new_path,
+                backup_path,
+                transaction_dir,
+                published_identity=(published_identity[0] if published_identity else None),
+            )
+        return {
+            "success": False,
+            "error_code": "already_exists",
+            "error": f"移動先に「{src.name}」が既に存在します",
+        }
+    except FileMoveNotSupportedError as e:
+        if transaction_dir is not None and backup_path is not None:
+            _rollback_overwrite_move(
+                src,
+                new_path,
+                backup_path,
+                transaction_dir,
+                published_identity=(published_identity[0] if published_identity else None),
+            )
+        return {
+            "success": False,
+            "error_code": "move_not_supported",
+            "error": str(e),
+        }
+    except DirectoryMoveNotSupportedError as e:
+        return {
+            "success": False,
+            "error_code": "move_not_supported",
+            "error": str(e),
+        }
     except Exception as e:
+        if transaction_dir is not None and backup_path is not None:
+            _rollback_overwrite_move(
+                src,
+                new_path,
+                backup_path,
+                transaction_dir,
+                published_identity=(published_identity[0] if published_identity else None),
+            )
         return {"success": False, "error": f"移動に失敗: {str(e)}"}
 
 
@@ -1988,6 +3357,7 @@ def copy_item(
             shutil.copy2(str(src), str(new_path))
 
         rel_path = _format_path_for_response(new_path, root)
+        _hint_files_index(new_path)
 
         return {
             "success": True,
@@ -2316,6 +3686,7 @@ def restore_from_trash(
         shutil.rmtree(str(entry_dir), onerror=_remove_readonly)
     except OSError:
         pass
+    _hint_files_index(dest_path)
 
     return {
         "success": True,
@@ -2379,6 +3750,7 @@ def delete_item(
                     "error": "ゴミ箱へ退避できない場所は削除できません",
                 }
             _physical_delete(target)
+        _hint_files_index(target)
 
         return {
             "success": True,
@@ -2813,6 +4185,40 @@ def walk_workspace_tree(
     }
 
 
+# Regex match time is bounded per input and across the whole search request.
+# A line/name length cap alone does not prevent exponential backtracking.
+SEARCH_REGEX_MAX_PATTERN_LENGTH = 200
+SEARCH_REGEX_MATCH_TIMEOUT_SECONDS = 0.05
+SEARCH_REGEX_TOTAL_TIMEOUT_SECONDS = 2.0
+
+
+class _BoundedSearchRegex:
+    def __init__(self, query: str):
+        if len(query) > SEARCH_REGEX_MAX_PATTERN_LENGTH:
+            raise ValueError(f"正規表現は{SEARCH_REGEX_MAX_PATTERN_LENGTH}文字以内で指定してください")
+        try:
+            import regex as regex_engine
+        except ImportError as exc:
+            # Literal search still works during a partial dependency install.
+            # Never fall back to stdlib re for an untrusted regex.
+            raise ValueError("正規表現検索に必要な regex パッケージがありません") from exc
+        self.deadline = time.monotonic() + SEARCH_REGEX_TOTAL_TIMEOUT_SECONDS
+        try:
+            self.pattern = regex_engine.compile(query, regex_engine.IGNORECASE | regex_engine.VERSION0)
+        except regex_engine.error as exc:
+            raise ValueError(f"正規表現が無効です: {exc}") from exc
+
+    def search(self, value: str):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("regex search deadline exceeded")
+        return self.pattern.search(
+            value,
+            timeout=min(SEARCH_REGEX_MATCH_TIMEOUT_SECONDS, remaining),
+            concurrent=True,
+        )
+
+
 def search_workspace_entries(
     query: str,
     path: str = "",
@@ -2837,12 +4243,12 @@ def search_workspace_entries(
     root = get_root_dir()
     max_results = max(1, min(int(max_results or 1), 200))
     query_lower = query_text.lower()
-    query_pattern: Optional[re.Pattern[str]] = None
+    query_pattern: Optional[_BoundedSearchRegex] = None
     if regex:
         try:
-            query_pattern = re.compile(query_text, re.IGNORECASE)
-        except re.error as exc:
-            return {"success": False, "error": f"正規表現が無効です: {exc}"}
+            query_pattern = _BoundedSearchRegex(query_text)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
     # `*` / `?` を含むクエリは glob、含まなければ従来通りの部分一致で扱う。
     use_glob = not regex and ("*" in query_text or "?" in query_text)
     extension_filter = {
@@ -2918,6 +4324,8 @@ def search_workspace_entries(
             if len(results) >= max_results:
                 truncated = True
                 break
+    except TimeoutError:
+        return {"success": False, "error": "正規表現検索が時間上限に達しました。式を単純にするか、検索範囲を絞ってください"}
     except Exception as exc:
         return {"success": False, "error": f"Search failed: {exc}"}
 
@@ -2928,6 +4336,166 @@ def search_workspace_entries(
         "results": results,
         "total_returned": len(results),
         "truncated": truncated,
+    }
+
+
+# 本文検索の走査上限。名前検索と同じ走査エントリ上限に加え、1ファイルと
+# 1リクエストあたりの読み取りバイト数で打ち切る（索引を使わない同期走査のため）。
+CONTENT_SEARCH_MAX_SCANNED = 10000
+CONTENT_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
+CONTENT_SEARCH_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+CONTENT_SEARCH_MAX_MATCHES_PER_FILE = 3
+CONTENT_SEARCH_MAX_PATTERN_LENGTH = 200
+CONTENT_SEARCH_REGEX_LINE_LIMIT = 1000
+CONTENT_SEARCH_SNIPPET_CHARS = 160
+
+
+def _content_snippet(line: str, start: int, end: int) -> str:
+    """一致位置を中心に、1行を表示用の長さへ切り詰める。"""
+    text = line.rstrip("\r\n")
+    if len(text) <= CONTENT_SEARCH_SNIPPET_CHARS:
+        return text.strip()
+    half = max(0, (CONTENT_SEARCH_SNIPPET_CHARS - (end - start)) // 2)
+    left = max(0, start - half)
+    right = min(len(text), left + CONTENT_SEARCH_SNIPPET_CHARS)
+    left = max(0, right - CONTENT_SEARCH_SNIPPET_CHARS)
+    return ("…" if left > 0 else "") + text[left:right].strip() + ("…" if right < len(text) else "")
+
+
+def search_workspace_content(
+    query: str,
+    path: str = "",
+    max_results: int = 50,
+    is_admin: bool = False,
+    regex: bool = False,
+) -> Dict[str, Any]:
+    """Search text file bodies under ``path`` (literal or regex, case-insensitive).
+
+    Only text files (``TEXT_EXTENSIONS``) are read.  Hidden/protected entries
+    (``.git`` / ``.trash``), symlinks and reparse points are skipped exactly
+    like the name search.  Traversal stops at ``CONTENT_SEARCH_MAX_SCANNED``
+    entries or ``CONTENT_SEARCH_MAX_TOTAL_BYTES`` read bytes; files larger than
+    ``CONTENT_SEARCH_MAX_FILE_BYTES`` are skipped and counted.
+    """
+    query_text = str(query or "").strip()
+    if not query_text:
+        return {"success": False, "error": "query is required."}
+    if len(query_text) > CONTENT_SEARCH_MAX_PATTERN_LENGTH:
+        return {
+            "success": False,
+            "error": f"検索文字列は{CONTENT_SEARCH_MAX_PATTERN_LENGTH}文字以内で指定してください",
+        }
+
+    target, valid = _resolve_path(path, is_admin=is_admin)
+    if not valid:
+        return {"success": False, "error": "Invalid workspace path."}
+    if not target.exists() or not target.is_dir():
+        return {"success": False, "error": "Search root is not an existing directory."}
+
+    pattern: Optional[_BoundedSearchRegex] = None
+    if regex:
+        try:
+            pattern = _BoundedSearchRegex(query_text)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+    needle = query_text.casefold()
+
+    root = get_root_dir()
+    max_results = max(1, min(int(max_results or 1), 200))
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    scanned_files = 0
+    bytes_read = 0
+    skipped_large = 0
+    truncated = False
+    limit_reason: Optional[str] = None
+
+    def find_matches(content: str) -> tuple[int, list[dict[str, Any]]]:
+        count = 0
+        matches: list[dict[str, Any]] = []
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            if pattern is not None:
+                found = pattern.search(line[:CONTENT_SEARCH_REGEX_LINE_LIMIT])
+                if found is None:
+                    continue
+                span = found.span()
+            else:
+                index = line.casefold().find(needle)
+                if index < 0:
+                    continue
+                span = (index, index + len(needle))
+            count += 1
+            if len(matches) < CONTENT_SEARCH_MAX_MATCHES_PER_FILE:
+                matches.append({"line": line_number, "text": _content_snippet(line, *span)})
+        return count, matches
+
+    try:
+        for item in target.rglob("*"):
+            scanned += 1
+            if scanned > CONTENT_SEARCH_MAX_SCANNED:
+                truncated, limit_reason = True, "scan"
+                break
+            if _is_hidden_under(item, target) or _is_link_or_reparse(item):
+                continue
+            try:
+                if not item.is_file():
+                    continue
+            except OSError:
+                continue
+            if _text_extension_key(item) not in TEXT_EXTENSIONS:
+                continue
+            try:
+                stat_result = item.stat()
+            except (OSError, PermissionError):
+                continue
+            if stat_result.st_size > CONTENT_SEARCH_MAX_FILE_BYTES:
+                skipped_large += 1
+                continue
+            if bytes_read + stat_result.st_size > CONTENT_SEARCH_MAX_TOTAL_BYTES:
+                truncated, limit_reason = True, "bytes"
+                break
+            bytes_read += stat_result.st_size
+            scanned_files += 1
+            try:
+                content, _encoding = read_safe_text(item, known_text_extensions=TEXT_EXTENSIONS)
+            except (TextContentError, OSError, UnicodeError):
+                continue
+            match_count, matches = find_matches(content)
+            if match_count == 0:
+                continue
+            results.append(
+                {
+                    "name": item.name,
+                    "path": _format_path_for_response(item, root),
+                    "kind": "file",
+                    "modified_at": datetime.fromtimestamp(stat_result.st_mtime).isoformat(),
+                    "extension": item.suffix.lower(),
+                    "type": _get_file_type(item),
+                    "size_bytes": stat_result.st_size,
+                    "size_display": _format_size(stat_result.st_size),
+                    "match_count": match_count,
+                    "matches": matches,
+                }
+            )
+            if len(results) >= max_results:
+                truncated, limit_reason = True, "results"
+                break
+    except TimeoutError:
+        return {"success": False, "error": "正規表現検索が時間上限に達しました。式を単純にするか、検索範囲を絞ってください"}
+    except Exception as exc:
+        return {"success": False, "error": f"Search failed: {exc}"}
+
+    return {
+        "success": True,
+        "mode": "content",
+        "query": query_text,
+        "root_path": _format_path_for_response(target, root),
+        "results": results,
+        "total_returned": len(results),
+        "truncated": truncated,
+        "limit_reason": limit_reason,
+        "scanned_files": scanned_files,
+        "skipped_large_files": skipped_large,
     }
 
 
@@ -2971,6 +4539,7 @@ def save_file(
     try:
         target.write_text(content, encoding=encoding)
         stat = target.stat()
+        _hint_files_index(target)
         return {
             "success": True,
             "message": f"ファイル「{target.name}」を保存しました",

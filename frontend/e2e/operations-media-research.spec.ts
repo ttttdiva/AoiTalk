@@ -107,7 +107,7 @@ test.describe(
         );
 
         await page.goto(
-          "/operations",
+          "/operations?tab=overview",
         );
 
         await expect(

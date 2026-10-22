@@ -16,7 +16,13 @@ import type { components } from "./api-types.gen";
 
 // ========== チャット ==========
 
+/** Server-owned state projection used by every native conversation history surface. */
+export type ConversationHistoryStatus =
+  components["schemas"]["ConversationHistorySessionProjection"]["history_status"];
+
 export interface ConversationSession {
+  /** Native-only state: owned locally, not yet registered on the server. */
+  is_local_only?: boolean;
   id: string;
   user_id: string;
   character_name: string;
@@ -25,14 +31,38 @@ export interface ConversationSession {
   last_activity?: string | null;
   message_count: number;
   is_active: boolean;
+  is_pinned?: boolean;
+  pinned_at?: string | null;
+  pin_updated_at?: string | null;
   project_id?: string | null;
   is_group_chat?: boolean;
   app_id?: string | null;
   app_target_id?: string | null;
+  /** Agent主体のbinding。キャラクターpresentationとは独立している。 */
+  agent_id?: string | null;
+  agent_display_name?: string | null;
+  agent_state?: string | null;
+  latest_revision_id?: string | null;
+  agent_character_id?: string | null;
+  /** Offline binding is waiting for the dedicated CAS endpoint. */
+  agent_binding_pending?: boolean;
+  agent_binding_error?: string | null;
   development_status?: "working" | "waiting_for_user" | "completed" | null;
+  /**
+   * Server-owned, cross-surface history state.  Mobile must not infer this
+   * from development_status or from a per-session generation poll.
+   */
+  history_status?: ConversationHistoryStatus | null;
+  /** Completion fence for the latest assistant response used by read races. */
+  history_completed_at?: string | null;
   last_read_at?: string | null;
   is_unread?: boolean;
   context?: Record<string, unknown> | null;
+  /** Durable server-owned marker for the private AoiDots root. */
+  private_agent_root?: boolean | null;
+  purpose?: string | null;
+  readonly_binding?: boolean | null;
+  private_agent_root_metadata?: Record<string, unknown> | null;
   parent_session_id?: string | null;
   forked_from_message_id?: string | null;
   group_character_names?: string[];
@@ -53,6 +83,10 @@ export interface ConversationMessage {
   parent_message_id?: string | null;
   branch_index: number;
   is_active_branch: boolean;
+  /** Server-owned sender projection; Agent messages are never shown as Human. */
+  sender_type?: "user" | "human" | "agent" | "character" | "assistant" | "service" | string | null;
+  sender_id?: string | null;
+  sender_display_name?: string | null;
 }
 
 export interface AgentRunTimelineItem {
@@ -82,7 +116,10 @@ export interface AgentRun {
   title?: string;
   error?: string | null;
   agent_id?: string | null;
+  revision_id?: string | null;
   agent_revision_id?: string | null;
+  work_item_id?: string | null;
+  session_id?: string | null;
   task_id?: string | null;
   acting_subagent_id?: string | null;
   previous_attempt_run_id?: string | null;
@@ -90,6 +127,22 @@ export interface AgentRun {
   execution_manifest?: Record<string, unknown> | null;
   execution_manifest_hash?: string | null;
   timeline?: AgentRunTimelineItem[];
+}
+
+/** Safe Agent catalog projection. Never contains authority, tools, or prompts. */
+export interface ConversationAgent {
+  id: string;
+  display_name: string;
+  state?: string | null;
+  latest_revision_id?: string | null;
+  character_id?: string | null;
+  character_name?: string | null;
+  updated_at?: string | null;
+  utilization?: {
+    active_sessions?: number;
+    active_runs?: number;
+    [key: string]: unknown;
+  } | null;
 }
 
 // ========== タスク ==========
@@ -266,7 +319,19 @@ export interface Task {
   deletion_batch_id?: string | null;
   metadata: Record<string, unknown>;
   assignees: TaskAssignee[];
+  /**
+   * Whether the response carried an authoritative assignee collection.
+   *
+   * SQLite task rows do not store this aggregate, and older task endpoints
+   * may omit it (or expose only primary_assignee_user_id).  Mobile uses this
+   * marker to avoid turning an unknown collection into an explicit clear
+   * during an unrelated PATCH.  It is a client-side response marker, not a
+   * wire request field.
+   */
+  assignees_complete?: boolean;
   tags: Tag[];
+  /** See assignees_complete; omitted/null tag aggregates are not clears. */
+  tags_complete?: boolean;
   active_time_entry?: TimeEntry | null;
   estimated_hours?: number | null;
   sort_order?: number;
@@ -360,391 +425,6 @@ export interface ProjectStorageUsage {
   };
 }
 
-// ========== Story Studio（canonical /api/story） ==========
-
-export type StoryWorkKind = "novel" | "trpg";
-
-export interface StoryWork {
-  id: string;
-  user_id: string;
-  title: string;
-  synopsis?: string | null;
-  plot?: string | null;
-  style_guide?: string | null;
-  kind: StoryWorkKind | string;
-  status: string;
-  target_episode_chars: number;
-  planned_episode_count?: number | null;
-  start_episode_id?: string | null;
-  ui_state: Record<string, unknown>;
-  model_override: Record<string, unknown>;
-  image_settings: Record<string, unknown>;
-  resolved_model?: string | null;
-  model_layer?: string | null;
-  episode_count?: number | null;
-  char_count?: number | null;
-  total_chars?: number | null;
-  notes_count?: number | null;
-  characters_count?: number | null;
-  rulebooks_count?: number | null;
-  branch_count?: number | null;
-  route_episode_count?: number | null;
-  route_chars?: number | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-  archived_at?: string | null;
-}
-
-export interface StoryEpisode {
-  id: string;
-  work_id: string;
-  title: string;
-  plot?: string | null;
-  summary?: string | null;
-  summary_locked?: boolean;
-  premise_note?: string | null;
-  status: string;
-  target_chars?: number | null;
-  char_count: number;
-  body?: string | null;
-  body_etag?: string | null;
-  map_x?: number | null;
-  map_y?: number | null;
-  sort_hint?: number;
-  current_rev_no?: number;
-  created_at?: string | null;
-  updated_at?: string | null;
-  archived_at?: string | null;
-}
-
-export interface StoryLink {
-  id: string;
-  work_id: string;
-  from_episode_id: string;
-  to_episode_id: string;
-  choice_label?: string | null;
-  position?: number;
-  is_primary?: boolean;
-  created_at?: string | null;
-}
-
-export interface StoryGraph {
-  episodes: StoryEpisode[];
-  links: StoryLink[];
-  start_episode_id?: string | null;
-}
-
-/** Canonical /api/story/works/{work_id}/structure operations. */
-export type StoryStructureOperation =
-  | { op: "add_link"; from: string; to: string; choice_label?: string | null; is_primary?: boolean; position?: number }
-  | { op: "remove_link"; id: string }
-  | { op: "update_link"; id: string; choice_label?: string | null; position?: number; is_primary?: boolean }
-  | { op: "insert_between"; link_id: string; episode_id: string }
-  | { op: "set_start"; episode_id: string }
-  | { op: "reorder_linear"; episode_ids: string[] }
-  | { op: "duplicate_as_branch"; episode_id: string; choice_label?: string | null; new_title?: string | null };
-
-export interface StoryOverview {
-  work: StoryWork;
-  graph: StoryGraph;
-  current_route: string[];
-}
-
-export interface StoryCharacter {
-  id: string;
-  user_id: string;
-  /** Present only on /works/{work_id}/characters projections. */
-  work_id?: string;
-  character_id?: string;
-  name: string;
-  aliases: string[];
-  summary?: string | null;
-  description?: string | null;
-  notes?: string | null;
-  ai_mode: string;
-  keywords: string[];
-  image_path?: string | null;
-  role_note?: string | null;
-  position?: number | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-  archived_at?: string | null;
-}
-
-export interface StoryWorkCharacter {
-  work_id: string;
-  character_id: string;
-  role_note?: string | null;
-  position?: number;
-}
-
-export interface StoryRulebook {
-  id: string;
-  user_id: string;
-  /** Present only on /works/{work_id}/rulebooks projections. */
-  work_id?: string;
-  rulebook_id?: string;
-  name: string;
-  content?: string | null;
-  enabled?: boolean | null;
-  position?: number | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-  archived_at?: string | null;
-}
-
-export interface StoryWorkRulebook {
-  work_id: string;
-  rulebook_id: string;
-  enabled: boolean;
-  position: number;
-}
-
-export interface StoryNote {
-  id: string;
-  work_id: string;
-  title: string;
-  content?: string | null;
-  ai_mode: string;
-  keywords: string[];
-  position: number;
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
-export interface StoryEpisodeRevision {
-  id: string;
-  episode_id: string;
-  rev_no: number;
-  title?: string | null;
-  plot?: string | null;
-  body?: string | null;
-  message?: string | null;
-  origin: string;
-  body_sha256: string;
-  char_count: number;
-  created_by: string;
-  created_at?: string | null;
-}
-
-export interface StoryRevisionList {
-  items: StoryEpisodeRevision[];
-  limit: number;
-  offset: number;
-}
-
-export interface StoryBodyUpdateResponse {
-  id: string;
-  body_etag?: string | null;
-  char_count: number;
-  current_rev_no: number;
-  revision?: StoryEpisodeRevision | null;
-  pre_revision?: StoryEpisodeRevision | null;
-}
-
-export interface StoryJob {
-  id: string;
-  work_id: string;
-  kind: string;
-  payload: Record<string, unknown>;
-  status: string;
-  progress: Record<string, unknown>;
-  result?: Record<string, unknown> | null;
-  error?: string | null;
-  created_at?: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-}
-
-export interface StoryWritingSession {
-  id: string;
-  work_id: string;
-  episode_id?: string | null;
-  conversation_session_id?: string | null;
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
-export interface StoryContextPreview {
-  prompt: string;
-  injected: Array<Record<string, string>>;
-  model: Record<string, string>;
-  resolved_model?: string | null;
-  model_layer?: string | null;
-  estimated_chars: number;
-}
-
-export interface StorySearchHit {
-  episode_id: string;
-  title: string;
-  snippet: string;
-  field?: string | null;
-  match_start?: number | null;
-  match_end?: number | null;
-}
-
-export interface StorySearchResponse {
-  query: string;
-  results: StorySearchHit[];
-}
-
-export interface StorySplitResponse {
-  source: Record<string, unknown>;
-  created: Record<string, unknown>;
-  links: Record<string, unknown>;
-}
-
-/** Local-only conflict snapshot kept beside a durable manuscript draft. */
-export interface StoryLocalDraft {
-  auth_scope?: string;
-  episode_id: string;
-  body: string;
-  expected_etag?: string | null;
-  server_snapshot?: StoryEpisode | null;
-  conflict_status: "draft" | "conflict";
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
-// ========== TRPG ==========
-
-export interface TrpgRoom {
-  id: string;
-  /** Story Work backing this play session (the canonical API field). */
-  work_id?: string;
-  /** Canonical session title. */
-  title?: string;
-  /**
-   * Legacy names are kept as optional read-only projections for the mobile
-   * websocket adapter.  They are not sent back to the server.
-   */
-  room_code?: string | null;
-  room_title?: string;
-  status: string;
-  gm_mode: string;
-  host_user_id?: string | null;
-  invite_code?: string | null;
-  snapshot?: Record<string, unknown> | null;
-  image_settings?: TrpgImageSettings | null;
-  participants?: TrpgParticipant[];
-  recent_events?: TrpgLog[];
-  logs?: TrpgLog[];
-  shared_state?: Record<string, unknown> | null;
-  created_at?: string | null;
-  current_scene_id?: string | null;
-  /** Optional scene projection returned by older TRPG snapshots. */
-  current_scene?: TrpgSceneSummary | null;
-  updated_at?: string | null;
-  ended_at?: string | null;
-}
-
-/** Minimal scene projection used by the TRPG room view; not a Story legacy model. */
-export interface TrpgSceneSummary {
-  id: string;
-  title: string;
-  description?: string | null;
-}
-
-export interface TrpgParticipant {
-  id: string;
-  /** Canonical API session relationship. */
-  session_id?: string;
-  /** Legacy projection consumed by existing log/state views. */
-  play_session_id?: string;
-  user_id?: string | null;
-  display_name: string;
-  role: string;
-  story_character_id?: string | null;
-  character_id?: string | null;
-  is_npc?: boolean;
-  joined_at?: string | null;
-  left_at?: string | null;
-  avatar_url?: string | null;
-  color?: string | null;
-  seat_index?: number | null;
-  pc_state?: Record<string, unknown> | null;
-  is_connected?: boolean;
-  is_active_participant?: boolean;
-}
-
-export interface TrpgLog {
-  id: string;
-  play_session_id: string;
-  participant_id?: string | null;
-  log_type: string;
-  content: string;
-  metadata?: Record<string, unknown> | null;
-  created_at?: string | null;
-  participant_name?: string | null;
-}
-
-export interface TrpgPrivateMessage {
-  id: string;
-  play_session_id: string;
-  sender_participant_id?: string | null;
-  sender_label: string;
-  target_participant_ids: string[];
-  content: string;
-  metadata?: Record<string, unknown> | null;
-  created_at?: string | null;
-}
-
-/** Canonical /api/trpg/sessions image generation settings projection. */
-export interface TrpgImageSettings {
-  enabled?: boolean;
-  engine?: string;
-  workflow_path?: string | null;
-  style?: string;
-  negative_prompt?: string;
-  [key: string]: unknown;
-}
-
-/** Canonical participant-owned private state returned by the TRPG Play API. */
-export interface TrpgPrivateState {
-  id: string;
-  session_id: string;
-  participant_id: string;
-  state: Record<string, unknown>;
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
-/** GM-visible projection; the backend only includes entries shared with GM. */
-export interface TrpgGmPrivateState {
-  participant_id: string;
-  display_name?: string | null;
-  state: Record<string, unknown>;
-  updated_at?: string | null;
-}
-
-/** Read-only TRPG rulebook profile exposed by /api/trpg/rulesets. */
-export interface TrpgRulesetProfile {
-  key?: string;
-  ruleset_key?: string;
-  name?: string;
-  label?: string;
-  display_name?: string;
-  enabled?: boolean;
-  [key: string]: unknown;
-}
-
-export interface TrpgRulesetListResponse {
-  rulesets: TrpgRulesetProfile[];
-  count: number;
-}
-
-/** Read-only reference search bundle exposed by the canonical TRPG API. */
-export interface TrpgReferenceBundle {
-  rules: Array<Record<string, unknown>>;
-  creatures: Array<Record<string, unknown>>;
-  mechanic_links: Array<Record<string, unknown>>;
-  count: number;
-}
-
-export interface TrpgReferenceStats {
-  [key: string]: unknown;
-}
-
 // ========== WebSocket ==========
 
 export type ChatResponseModelSelection = components["schemas"]["ResponseModelSelection"];
@@ -756,6 +436,7 @@ export interface ChatResponseModelOption extends ChatResponseModelSelection {
   reasoningEffortOptions?: string[];
   reasoningEffortDefault?: string | null;
   reasoningEffortKind?: string;
+  supportsReasoning?: boolean;
   isCurrent?: boolean;
 }
 
@@ -771,6 +452,7 @@ export interface LlmCatalogModelOption {
   reasoning_effort_options?: string[];
   reasoning_effort_default?: string | null;
   reasoning_effort_kind?: string;
+  supports_reasoning?: boolean;
 }
 
 export interface LlmCatalogProvider {

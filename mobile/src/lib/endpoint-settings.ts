@@ -17,6 +17,23 @@ export interface EndpointSettings {
   routing: NetworkEndpointRoutingConfig;
 }
 
+let endpointSettingsWriteQueue: Promise<void> = Promise.resolve();
+
+/** Read both legacy-compatible records through the same public settings type. */
+export async function readEndpointSettings(): Promise<EndpointSettings> {
+  await endpointSettingsWriteQueue;
+  const [storedApiUrl, routing] = await Promise.all([
+    getApiUrl(),
+    getNetworkEndpointRoutingConfig(),
+  ]);
+  return {
+    apiUrl: storedApiUrl || DEFAULT_API_URL,
+    routing,
+  };
+}
+
+export const getEndpointSettings = readEndpointSettings;
+
 /**
  * Persist the basic endpoint and network routing without exposing a new
  * server/routing combination during a partial write.
@@ -24,7 +41,7 @@ export interface EndpointSettings {
 export async function saveEndpointSettings(
   settings: EndpointSettings,
 ): Promise<void> {
-  try {
+  const write = endpointSettingsWriteQueue.then(async () => {
     const normalizedApiUrl = requireConfiguredApiUrl(settings.apiUrl);
     const normalizedRouting = validateNetworkEndpointRoutingConfig(
       settings.routing,
@@ -40,24 +57,30 @@ export async function saveEndpointSettings(
     const basicWriteNeeded =
       !storedApiUrl || normalizeApiUrl(storedApiUrl) !== normalizedApiUrl;
 
-    if (!basicWriteNeeded && previousFingerprint === nextFingerprint) {
-      // A route-only edit must remain exactly one routing write.
-      await saveNetworkEndpointRoutingConfig(normalizedRouting);
-      return;
-    }
+    try {
+      if (!basicWriteNeeded && previousFingerprint === nextFingerprint) {
+        // A route-only edit remains one atomic routing-schema write.
+        await saveNetworkEndpointRoutingConfig(normalizedRouting);
+        return;
+      }
 
-    if (previousFingerprint !== nextFingerprint) {
-      // A new durable server must never be paired with the old active route.
-      await saveNetworkEndpointRoutingConfig({
-        ...previousRouting,
-        enabled: false,
-      });
+      if (previousFingerprint !== nextFingerprint) {
+        // A new durable server must never be paired with the old active route.
+        // Disable the old route before changing the identity, then publish the
+        // requested route as one final schema write.
+        await saveNetworkEndpointRoutingConfig({
+          ...previousRouting,
+          enabled: false,
+        });
+        clearApiUrlCache();
+      }
+
+      if (basicWriteNeeded) await saveApiUrl(normalizedApiUrl);
+      await saveNetworkEndpointRoutingConfig(normalizedRouting);
+    } finally {
       clearApiUrlCache();
     }
-
-    if (basicWriteNeeded) await saveApiUrl(normalizedApiUrl);
-    await saveNetworkEndpointRoutingConfig(normalizedRouting);
-  } finally {
-    clearApiUrlCache();
-  }
+  });
+  endpointSettingsWriteQueue = write.catch(() => undefined);
+  return write;
 }

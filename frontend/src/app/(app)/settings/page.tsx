@@ -1,15 +1,19 @@
 "use client";
 
+import "@/components/settings/settings-layout.css";
+
 import {
   useState,
   useEffect,
   useCallback,
   useRef,
+  Suspense,
   type ReactNode,
 } from "react";
 import useSWR from "swr";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -21,9 +25,8 @@ import {
   Bell,
   AudioLines,
   Bug,
-  ChevronDown,
-  ChevronUp,
   CircleHelp,
+  Eye,
   KeyRound,
   Keyboard,
   Loader2,
@@ -33,7 +36,6 @@ import {
   Plug,
   Search,
   ShieldCheck,
-  SlidersHorizontal,
   Smartphone,
   UserCog,
 } from "lucide-react";
@@ -46,6 +48,7 @@ import { UserExportSection } from "@/components/settings/user-export-section";
 import { CharactersSection } from "@/components/settings/characters-section";
 import { McpSection } from "@/components/settings/mcp-section";
 import { CostDashboardSection } from "@/components/settings/cost-dashboard-section";
+import { UsageRecordDetail } from "@/components/settings/usage-record-detail";
 import { MemorySection } from "@/components/settings/memory-section";
 import { ComfyUISection } from "@/components/settings/comfyui-section";
 import { SnippetsSection } from "@/components/settings/snippets-section";
@@ -55,6 +58,7 @@ import { RemoteServerSection } from "@/components/settings/remote-server-section
 import { UserManagementConsole } from "@/components/settings/user-management-console";
 import { HeartbeatsSection } from "@/components/settings/heartbeats-section";
 import { VerificationDataSettings } from "@/components/settings/VerificationDataSettings";
+import { CommandWorkspaceUnconfinedSection } from "@/components/settings/command-workspace-unconfined-section";
 import { LlmModelSection } from "@/components/settings/llm-model-section";
 import { AutonomousTaskExecutionSection } from "@/components/settings/autonomous-task-execution-section";
 import { SearchSettingsSection } from "@/components/settings/search-settings-section";
@@ -62,33 +66,41 @@ import { BrowserAgentSettingsSection } from "@/components/settings/browser-agent
 import { PcBridgeSettingsSection } from "@/components/settings/pc-bridge-settings-section";
 import { SpotifySection } from "@/components/settings/spotify-section";
 import { EditorSettingsSection } from "@/components/settings/editor-settings-section";
+import { ChatBackgroundAnimationSettings } from "@/components/settings/chat-background-animation-settings";
+import { FileTransferSettings } from "@/components/settings/file-transfer-settings";
 import { YomiLinterSection } from "@/components/settings/yomi-linter-section";
-import { NavigationTabsSection } from "@/components/settings/navigation-tabs-section";
 import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 import {
   SettingsCategoryNavigation,
   type SettingsCategoryId,
 } from "@/components/settings/settings-category-navigation";
 import {
-  QUICK_SETTING_REGISTRY,
   getSettingsTarget,
   isSettingsCategoryId,
   type SettingsTargetId,
 } from "@/components/settings/settings-target-registry";
-import { SettingsOverview } from "@/components/settings/settings-overview";
-import { HydrusSettingsSection } from "@/components/settings/hydrus-settings-section";
 import { CookieManagementSection } from "@/components/settings/cookie-management-section";
 import { openSettingsTarget } from "@/components/settings/settings-target-navigation";
 import {
   getSettingsScrollContainer,
+  captureSettingsOuterScroll,
   pushSettingsCategoryHash,
+  pushSettingsTargetHash,
+  restoreSettingsOuterScroll,
   scrollSettingsCategory,
+  type SettingsOuterScrollSnapshot,
   type SettingsScrollBehavior,
 } from "@/components/settings/settings-scroll-navigation";
 import { getTaskNotificationsDefaultEnabled } from "@/lib/user-settings";
 import { useUserSettings } from "@/contexts/user-settings-context";
+import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
 import { serializeAudioPlayerSettings } from "@/lib/audio-player-settings";
 import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
+import { PetSettingsEntry } from "@/components/pets/pet-settings";
+import {
+  SettingsSearch,
+  type SettingsSearchResult,
+} from "@/components/settings/settings-search";
 
 function requestSettingsFrame(callback: () => void): number {
   if (typeof window === "undefined") return -1;
@@ -191,52 +203,7 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
   project_management: "メインassistantが案件情報Docs・WBS・タスク系の直接ツールを使う権限です。",
 };
 
-type QuickSettingId = SettingsTargetId;
-type QuickSettingDefinition = (typeof QUICK_SETTING_REGISTRY)[number];
-
-const DEFAULT_QUICK_SETTING_IDS: QuickSettingId[] = [
-  "task-notifications",
-  "web-search",
-  "user-memory",
-  "google-calendar",
-  "webex",
-  "snippets",
-  "integrations",
-];
-
-function getQuickSettingDefinition(id: QuickSettingId) {
-  return QUICK_SETTING_REGISTRY.find((item) => item.id === id);
-}
-
-function normalizeQuickSettingIds(value: unknown): QuickSettingId[] {
-  if (!Array.isArray(value)) return DEFAULT_QUICK_SETTING_IDS;
-  const validIds = new Set(QUICK_SETTING_REGISTRY.map((item) => item.id));
-  const normalized: QuickSettingId[] = [];
-  for (const id of value) {
-    if (
-      typeof id === "string" &&
-      validIds.has(id as QuickSettingId) &&
-      !normalized.includes(id as QuickSettingId)
-    ) {
-      normalized.push(id as QuickSettingId);
-    }
-  }
-  return normalized;
-}
-
-function getQuickSettingIds(settings: Record<string, unknown>): QuickSettingId[] {
-  const quickSettings = settings.quick_settings;
-  if (
-    typeof quickSettings !== "object" ||
-    quickSettings === null ||
-    Array.isArray(quickSettings)
-  ) {
-    return DEFAULT_QUICK_SETTING_IDS;
-  }
-  return normalizeQuickSettingIds(
-    (quickSettings as Record<string, unknown>).pins,
-  );
-}
+const DEFAULT_SETTINGS_CATEGORY: SettingsCategoryId = "conversation";
 
 function SettingsGroup({
   id,
@@ -251,213 +218,59 @@ function SettingsGroup({
 }) {
   return (
     <section id={id} className="scroll-mt-5 space-y-3" data-settings-group={id}>
-      <div className="flex items-center gap-2 border-b border-border-subtle pb-2">
+      <div className="settings-group-heading flex items-center gap-2 border-b border-border-subtle pb-2">
         <span className="text-primary">{icon}</span>
         <h2 tabIndex={-1} className="text-sm font-semibold tracking-tight">
           {title}
         </h2>
       </div>
-      <div className="space-y-3">{children}</div>
+      <div className="settings-section-stack">{children}</div>
     </section>
   );
 }
 
 /**
  * Keeps a stable target around legacy section components that do not accept an
- * id prop yet. `contents` preserves their layout while hash navigation can
+ * id prop yet. The frame also owns the section width while hash navigation can
  * still locate and open the first disclosure in the section.
  */
 function SettingsTargetFrame({
   targetId,
+  width = "standard",
   children,
 }: {
   targetId: SettingsTargetId;
+  width?: "standard" | "wide";
   children: ReactNode;
 }) {
   return (
     <div
       data-settings-target={targetId}
-      className="contents"
+      data-settings-target-frame={targetId}
+      data-settings-width={width}
+      className="min-w-0"
     >
       {children}
+      <span
+        data-settings-target-focus-anchor={targetId}
+        tabIndex={-1}
+        className="sr-only"
+      />
     </div>
   );
 }
 
-function isVisibleSettingsTarget(targetId: string, isAdmin: boolean) {
+function isVisibleSettingsTarget(
+  targetId: string,
+  isAdmin: boolean,
+  options: { petAvailable?: boolean } = {},
+) {
   const target = getSettingsTarget(targetId);
-  return target && (!target.adminOnly || isAdmin) ? target : null;
-}
-
-function QuickSettings() {
-  const { settings, patch } = useUserSettings();
-  const [editing, setEditing] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [feedback, setFeedback] = useState<string | null>(null);
-  const selectedIds = getQuickSettingIds(settings);
-  const selectedItems = selectedIds
-    .map(getQuickSettingDefinition)
-    .filter((item): item is QuickSettingDefinition => Boolean(item));
-
-  const saveSelectedIds = async (nextIds: QuickSettingId[]) => {
-    setSaving(true);
-    setFeedback(null);
-    try {
-      await patch({ quick_settings: { pins: nextIds } });
-      setFeedback("よく使う設定を保存しました。");
-    } catch (error) {
-      setFeedback(error instanceof Error ? error.message : "保存に失敗しました。");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const addItem = (id: QuickSettingId) => {
-    if (selectedIds.includes(id)) return;
-    void saveSelectedIds([...selectedIds, id]);
-  };
-
-  const removeItem = (id: QuickSettingId) => {
-    void saveSelectedIds(selectedIds.filter((value) => value !== id));
-  };
-
-  const moveItem = (id: QuickSettingId, direction: -1 | 1) => {
-    const index = selectedIds.indexOf(id);
-    const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= selectedIds.length) return;
-    const next = [...selectedIds];
-    [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-    void saveSelectedIds(next);
-  };
-
-  const availableItems = QUICK_SETTING_REGISTRY.filter(
-    (item) => !selectedIds.includes(item.id),
-  );
-
-  return (
-    <SettingsDisclosure title="よく使う設定">
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => setEditing((value) => !value)}
-          >
-            <SlidersHorizontal className="mr-1 size-3" />
-            {editing ? "完了" : "編集"}
-          </Button>
-        </div>
-        {feedback && (
-          <p role="status" className="text-xs text-muted-foreground">
-            {feedback}
-          </p>
-        )}
-        {selectedItems.length > 0 ? (
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {selectedItems.map(({ id, targetId, label, icon: Icon }) => (
-              <a
-                key={id}
-                href={`#${targetId}`}
-                data-settings-target-link={targetId}
-                className="inline-flex h-7 items-center justify-start gap-1 rounded-md border bg-background px-2.5 text-[0.8rem] font-medium transition-colors hover:bg-muted"
-              >
-                <Icon className="size-4" />
-                {label}
-              </a>
-            ))}
-          </div>
-        ) : (
-          <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
-            よく使う設定は未選択です。
-          </p>
-        )}
-        {editing && (
-          <div className="space-y-3 rounded-md border p-3">
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-muted-foreground">
-                表示中
-              </p>
-              {selectedItems.length > 0 ? (
-                <div className="space-y-2">
-                  {selectedItems.map(({ id, label, icon: Icon }, index) => (
-                    <div
-                      key={id}
-                      className="flex items-center justify-between gap-2 rounded border px-2 py-1.5"
-                    >
-                      <span className="flex min-w-0 items-center gap-2 text-sm">
-                        <Icon className="size-4 shrink-0" />
-                        <span className="truncate">{label}</span>
-                      </span>
-                      <div className="flex shrink-0 items-center gap-1">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={saving || index === 0}
-                          onClick={() => moveItem(id, -1)}
-                          title="上へ"
-                        >
-                          <ChevronUp className="size-3" />
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={saving || index === selectedItems.length - 1}
-                          onClick={() => moveItem(id, 1)}
-                          title="下へ"
-                        >
-                          <ChevronDown className="size-3" />
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="xs"
-                          disabled={saving}
-                          onClick={() => removeItem(id)}
-                        >
-                          外す
-                        </Button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  表示中の項目はありません。
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-muted-foreground">
-                追加できる項目
-              </p>
-              {availableItems.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {availableItems.map(({ id, label, icon: Icon }) => (
-                    <Button
-                      key={id}
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={saving}
-                      onClick={() => addItem(id)}
-                    >
-                      <Icon className="mr-1 size-3" />
-                      {label}
-                    </Button>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  追加できる項目はありません。
-                </p>
-              )}
-            </div>
-          </div>
-        )}
-    </SettingsDisclosure>
-  );
+  if (!target || (target.adminOnly && !isAdmin)) return null;
+  if (target.capability === "entertainment" && options.petAvailable !== true) {
+    return null;
+  }
+  return target;
 }
 
 function ToolPermissionsCard({
@@ -653,6 +466,13 @@ const SETTINGS_SWR_OPTIONS = {
 
 export default function SettingsPage() {
   const confirm = useConfirm();
+  const runtime = useOptionalRuntimeContext();
+  // RuntimeProvider starts with an unresolved feature snapshot. Keep a direct
+  // pet deep link intact until that capability is known, otherwise a valid
+  // Personal pet link would be discarded before the provider mounts it.
+  const petCapabilityPending = runtime !== null && runtime.runtimeFeatures === null;
+  const petAvailable =
+    runtime?.runtimeFeatures?.application_features?.entertainment === true;
   const [loading, setLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState<AuthStatus["user"] | null>(
     null,
@@ -714,12 +534,14 @@ export default function SettingsPage() {
   const [customInstructionsSaving, setCustomInstructionsSaving] =
     useState(false);
   const [activeCategory, setActiveCategory] =
-    useState<SettingsCategoryId>("overview");
+    useState<SettingsCategoryId>(DEFAULT_SETTINGS_CATEGORY);
   const categoryScrollFrameRef = useRef<number | null>(null);
   const directTargetFrameRef = useRef<number | null>(null);
   const navigationGenerationRef = useRef(0);
   const categoryScrollObserverRef = useRef<ResizeObserver | null>(null);
   const categoryScrollWatchTimeoutRef = useRef<number | null>(null);
+  const outerScrollSnapshotRef = useRef<SettingsOuterScrollSnapshot | null>(null);
+  const outerScrollRestoreFrameRef = useRef<number | null>(null);
   const lastHashSyncKeyRef = useRef<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<{
     kind: "success" | "error";
@@ -825,6 +647,66 @@ export default function SettingsPage() {
     [cancelCategoryScroll],
   );
 
+  // Hash history traversal is handled by Settings' inner scroll container.
+  // Keep the Shared Shell/document scroll owners out of the browser's native
+  // fragment/session restoration path while this page is mounted.
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    const snapshot = captureSettingsOuterScroll();
+    outerScrollSnapshotRef.current = snapshot;
+    const settingsPathname = window.location.pathname;
+    const previousRestoration = window.history.scrollRestoration;
+    try {
+      window.history.scrollRestoration = "manual";
+    } catch {
+      // Older embedded browsers may expose this as read-only.
+    }
+
+    const restore = () => {
+      if (window.location.pathname !== settingsPathname) {
+        if (outerScrollRestoreFrameRef.current !== null) {
+          cancelSettingsFrame(outerScrollRestoreFrameRef.current);
+          outerScrollRestoreFrameRef.current = null;
+        }
+        try {
+          window.history.scrollRestoration = previousRestoration;
+        } catch {
+          // Ignore read-only history implementations.
+        }
+        return;
+      }
+      const current = outerScrollSnapshotRef.current;
+      if (!current) return;
+      restoreSettingsOuterScroll(current);
+      if (outerScrollRestoreFrameRef.current !== null) {
+        cancelSettingsFrame(outerScrollRestoreFrameRef.current);
+      }
+      outerScrollRestoreFrameRef.current = requestSettingsFrame(() => {
+        outerScrollRestoreFrameRef.current = null;
+        const latest = outerScrollSnapshotRef.current;
+        if (latest) restoreSettingsOuterScroll(latest);
+      });
+    };
+
+    restore();
+    window.addEventListener("popstate", restore);
+    window.addEventListener("hashchange", restore);
+    return () => {
+      window.removeEventListener("popstate", restore);
+      window.removeEventListener("hashchange", restore);
+      if (outerScrollRestoreFrameRef.current !== null) {
+        cancelSettingsFrame(outerScrollRestoreFrameRef.current);
+        outerScrollRestoreFrameRef.current = null;
+      }
+      outerScrollSnapshotRef.current = null;
+      try {
+        window.history.scrollRestoration = previousRestoration;
+      } catch {
+        // Ignore read-only history implementations.
+      }
+    };
+  }, []);
+
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
@@ -899,6 +781,10 @@ export default function SettingsPage() {
       // once authStatusLoaded flips true.
       if (!authStatusLoaded) return;
       const rawHash = window.location.hash.replace(/^#/, "");
+      // Only defer the capability-gated pet target. Other categories and
+      // targets must keep their normal deep-link/ACL fallback even if the
+      // runtime feature request is slow or unavailable.
+      if (petCapabilityPending && rawHash === "pet") return;
       // Browsers commonly emit both popstate and hashchange when traversing
       // hash history.  Treat that pair as one navigation so the same section
       // cannot receive two smooth-scroll requests.
@@ -912,10 +798,10 @@ export default function SettingsPage() {
         directTargetFrameRef.current = null;
       }
       if (!rawHash) {
-        setActiveCategory("overview");
+        setActiveCategory(DEFAULT_SETTINGS_CATEGORY);
         return;
       }
-      const target = isVisibleSettingsTarget(rawHash, isAdmin);
+      const target = isVisibleSettingsTarget(rawHash, isAdmin, { petAvailable });
       if (target) {
         setActiveCategory(target.category);
         if (target.openDisclosure === false) {
@@ -924,6 +810,13 @@ export default function SettingsPage() {
         }
         const generation = navigationGenerationRef.current;
         const targetHash = `#${target.targetId}`;
+        if (window.location.hash !== targetHash) {
+          window.history.replaceState(
+            null,
+            "",
+            `${window.location.pathname}${window.location.search}${targetHash}`,
+          );
+        }
         let directTargetFrameRan = false;
         const directTargetFrame = requestSettingsFrame(() => {
           directTargetFrameRan = true;
@@ -949,18 +842,18 @@ export default function SettingsPage() {
         // Category registry ids are always valid except admin/support for a
         // non-admin user. Keep those paths safe and visibly recoverable.
         if ((rawHash === "admin" || rawHash === "support") && !isAdmin) {
-          setActiveCategory("overview");
-          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#overview`);
-          scheduleCategoryScroll("overview", "auto");
+          setActiveCategory(DEFAULT_SETTINGS_CATEGORY);
+          window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+          scheduleCategoryScroll(DEFAULT_SETTINGS_CATEGORY, "auto");
           return;
         }
         setActiveCategory(rawHash);
         scheduleCategoryScroll(rawHash, "auto");
         return;
       }
-      setActiveCategory("overview");
-      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#overview`);
-      scheduleCategoryScroll("overview", "auto");
+      setActiveCategory(DEFAULT_SETTINGS_CATEGORY);
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+      scheduleCategoryScroll(DEFAULT_SETTINGS_CATEGORY, "auto");
     };
     syncHash();
     window.addEventListener("hashchange", syncHash);
@@ -969,7 +862,7 @@ export default function SettingsPage() {
       window.removeEventListener("hashchange", syncHash);
       window.removeEventListener("popstate", syncHash);
     };
-  }, [authStatusLoaded, cancelCategoryScroll, isAdmin, scheduleCategoryScroll]);
+  }, [authStatusLoaded, cancelCategoryScroll, isAdmin, petAvailable, petCapabilityPending, scheduleCategoryScroll]);
 
   const handleCategorySelect = useCallback((category: SettingsCategoryId) => {
     setActiveCategory(category);
@@ -986,6 +879,47 @@ export default function SettingsPage() {
     lastHashSyncKeyRef.current = `${category}|${authStatusLoaded ? "loaded" : "pending"}|${isAdmin ? "admin" : "user"}`;
     scheduleCategoryScroll(category, "smooth");
   }, [authStatusLoaded, cancelCategoryScroll, isAdmin, scheduleCategoryScroll]);
+
+  const handleSearchSelect = useCallback(
+    (result: SettingsSearchResult) => {
+      if (result.type === "category") {
+        handleCategorySelect(result.category.id);
+        return;
+      }
+
+      const target = result.target;
+      setActiveCategory(target.category);
+      cancelCategoryScroll();
+      navigationGenerationRef.current += 1;
+      if (directTargetFrameRef.current !== null) {
+        cancelSettingsFrame(directTargetFrameRef.current);
+        directTargetFrameRef.current = null;
+      }
+
+      const targetHash = `#${target.targetId}`;
+      pushSettingsTargetHash(target.targetId);
+      const generation = navigationGenerationRef.current;
+      lastHashSyncKeyRef.current = `${target.targetId}|${authStatusLoaded ? "loaded" : "pending"}|${isAdmin ? "admin" : "user"}`;
+      let directTargetFrameRan = false;
+      const directTargetFrame = requestSettingsFrame(() => {
+        directTargetFrameRan = true;
+        directTargetFrameRef.current = null;
+        if (
+          generation !== navigationGenerationRef.current ||
+          window.location.hash !== targetHash
+        ) {
+          return;
+        }
+        openSettingsTarget(target.targetId, {
+          isCurrent: () =>
+            generation === navigationGenerationRef.current &&
+            window.location.hash === targetHash,
+        });
+      });
+      if (!directTargetFrameRan) directTargetFrameRef.current = directTargetFrame;
+    },
+    [authStatusLoaded, cancelCategoryScroll, handleCategorySelect, isAdmin],
+  );
 
   const handleRunMobileCommand = useCallback(
     async (commandId: string, requiresConfirmation?: boolean) => {
@@ -1200,10 +1134,10 @@ export default function SettingsPage() {
     >
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
         <div className="border-b border-border-subtle px-1 pb-3 pt-2">
-          <h2 className="text-base font-semibold tracking-tight">Settings</h2>
-          <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
-            項目をカテゴリから開きます
-          </p>
+          <div className="inline-flex items-center gap-1">
+            <h2 className="text-base font-semibold tracking-tight">設定</h2>
+            <HelpPopover label="設定">項目をカテゴリから開きます</HelpPopover>
+          </div>
         </div>
         <div className="pt-2">
           <SettingsCategoryNavigation
@@ -1225,17 +1159,20 @@ export default function SettingsPage() {
   const showMobileCommandsError = Boolean(isAdmin && mobileCommandsError);
 
   return (
-    <div className="settings-page w-full space-y-6 px-6 py-5 pb-10" data-settings-page>
-      <div className="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-4">
+    <div className="settings-page w-full min-w-0 space-y-6 px-3 py-5 pb-10 sm:px-6" data-settings-page>
+      <div className="settings-page-header border-b border-border-subtle pb-4">
         <div>
         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">AoiTalk Workspace</p>
-        <h1 className="mt-1 text-2xl font-semibold tracking-tight">設定</h1>
-        <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-          よく使う項目から、会話、操作、通知、ナレッジ、連携、権限、管理へ順番に整理しています。
-        </p>
+        <div className="inline-flex items-center gap-1">
+          <h1 className="mt-1 text-2xl font-semibold tracking-tight">設定</h1>
+          <HelpPopover label="設定">会話、音声、通知、連携、権限などの設定を管理します。</HelpPopover>
         </div>
-        <div className="rounded-sm border border-border-subtle bg-card px-2.5 py-1.5 text-[11px] text-muted-foreground dark:bg-surface-charcoal">
-          Settings / {currentUser?.role === "admin" ? "Admin" : "Workspace"}
+        <SettingsSearch
+          isAdmin={isAdmin}
+          petAvailable={petAvailable}
+          onSelect={handleSearchSelect}
+          className="mt-3"
+        />
         </div>
       </div>
 
@@ -1245,8 +1182,8 @@ export default function SettingsPage() {
           aria-live="polite"
           className={
             settingsError || showMobileCommandsError || crawlersError || actionFeedback?.kind === "error"
-              ? "rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-              : "rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground"
+              ? "settings-page-status rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+              : "settings-page-status rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground"
           }
         >
           {settingsError && (
@@ -1277,12 +1214,6 @@ export default function SettingsPage() {
         </div>
       )}
 
-      <SettingsOverview
-        isAdmin={isAdmin}
-        onSelectCategory={handleCategorySelect}
-        quickSettings={<QuickSettings />}
-      />
-
       <SettingsGroup
         id="conversation"
         title="会話・AI応答"
@@ -1300,9 +1231,14 @@ export default function SettingsPage() {
           }
         >
           <div className="space-y-2">
-            <Label htmlFor="custom-instructions" className="text-xs">
-              すべての会話に追加するユーザー別指示
-            </Label>
+            <div className="flex items-center gap-1">
+              <Label htmlFor="custom-instructions" className="text-xs">
+                すべての会話に追加するユーザー別指示
+              </Label>
+              <HelpPopover label="すべての会話に追加するユーザー別指示">
+                LLMの会話プロンプトへ毎回追加されます。
+              </HelpPopover>
+            </div>
             <LongTextEditor
               id="custom-instructions"
               value={customInstructions}
@@ -1312,10 +1248,7 @@ export default function SettingsPage() {
               fontSize={12}
               placeholder="例: 返答は簡潔に。重要な判断は理由も書く。"
             />
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-xs text-muted-foreground">
-                LLMの会話プロンプトへ毎回追加されます。
-              </p>
+            <div className="flex items-center justify-end gap-2">
               <Button
                 size="sm"
                 onClick={handleCustomInstructionsSave}
@@ -1328,7 +1261,7 @@ export default function SettingsPage() {
         </SettingsDisclosure>
         <SettingsTargetFrame targetId="memory"><MemorySection /></SettingsTargetFrame>
         <SettingsTargetFrame targetId="characters"><CharactersSection /></SettingsTargetFrame>
-        <SettingsTargetFrame targetId="llm-model"><LlmModelSection isAdmin={isAdmin} /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="llm-model" width="wide"><LlmModelSection isAdmin={isAdmin} /></SettingsTargetFrame>
       </SettingsGroup>
 
       <SettingsGroup
@@ -1340,13 +1273,22 @@ export default function SettingsPage() {
       </SettingsGroup>
 
       <SettingsGroup
+        id="appearance"
+        title="表示・外観"
+        icon={<Eye className="size-4" />}
+      >
+        <SettingsTargetFrame targetId="chat-background-animation"><ChatBackgroundAnimationSettings /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="editor-settings"><EditorSettingsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="audio-player"><AudioPlayerSettingsCard /></SettingsTargetFrame>
+        <PetSettingsEntry />
+      </SettingsGroup>
+
+      <SettingsGroup
         id="input"
         title="入力・操作"
         icon={<Keyboard className="size-4" />}
       >
-        <SettingsTargetFrame targetId="navigation-tabs"><NavigationTabsSection /></SettingsTargetFrame>
-        <SettingsTargetFrame targetId="editor-settings"><EditorSettingsSection /></SettingsTargetFrame>
-        <SettingsTargetFrame targetId="audio-player"><AudioPlayerSettingsCard /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="file-transfer-compatibility"><FileTransferSettings /></SettingsTargetFrame>
         <SettingsTargetFrame targetId="snippets"><SnippetsSection /></SettingsTargetFrame>
         {isAdmin && (
           <SettingsDisclosure
@@ -1472,15 +1414,17 @@ export default function SettingsPage() {
         >
             <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
               <div className="space-y-1">
-                <Label
-                  htmlFor="task-notifications-default"
-                  className="text-xs font-medium"
-                >
-                  新規タスクの通知をデフォルトONにする
-                </Label>
-                <p className="text-xs text-muted-foreground">
-                  OFFにすると、新しく作るタスクは通知オフで開始します。
-                </p>
+                <div className="flex items-center gap-1">
+                  <Label
+                    htmlFor="task-notifications-default"
+                    className="text-xs font-medium"
+                  >
+                    新規タスクの通知をデフォルトONにする
+                  </Label>
+                  <HelpPopover label="新規タスクの通知をデフォルトONにする">
+                    OFFにすると、新しく作るタスクは通知オフで開始します。
+                  </HelpPopover>
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <Checkbox
@@ -1500,9 +1444,14 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="task-notification-minutes" className="text-xs">
-                Start Date の何分前に通知するか
-              </Label>
+              <div className="flex items-center gap-1">
+                <Label htmlFor="task-notification-minutes" className="text-xs">
+                  Start Date の何分前に通知するか
+                </Label>
+                <HelpPopover label="Start Date の何分前に通知するか">
+                  個別タスクで通知オフにしていない場合の既定値です。
+                </HelpPopover>
+              </div>
               <div className="flex items-center gap-2">
                 <Input
                   id="task-notification-minutes"
@@ -1527,9 +1476,6 @@ export default function SettingsPage() {
                   {taskNotificationSaving ? "保存中..." : "保存"}
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">
-                個別タスクで通知オフにしていない場合の既定値です。
-              </p>
             </div>
         </SettingsDisclosure>
         <SettingsTargetFrame targetId="google-calendar"><GoogleCalendarSection /></SettingsTargetFrame>
@@ -1617,10 +1563,9 @@ export default function SettingsPage() {
         title="外部連携"
         icon={<Plug className="size-4" />}
       >
-        <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3" data-settings-integrations-grid>
+        <div className="settings-integrations-grid" data-settings-integrations-grid>
           <SettingsTargetFrame targetId="webex"><WebexSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="spotify"><SpotifySection /></SettingsTargetFrame>
-          <SettingsTargetFrame targetId="hydrus"><HydrusSettingsSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="comfyui"><ComfyUISection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="cookie-management"><CookieManagementSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="mcp"><McpSection
@@ -1717,10 +1662,10 @@ export default function SettingsPage() {
           )}
         </SettingsDisclosure>
         {isAdmin && currentUser && (
-          <SettingsTargetFrame targetId="login-history"><LoginHistorySection isAdmin /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="login-history" width="wide"><LoginHistorySection isAdmin /></SettingsTargetFrame>
         )}
         {currentUser && (
-          <SettingsTargetFrame targetId="cost-dashboard"><CostDashboardSection isAdmin={currentUser.role === "admin"} /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="cost-dashboard" width="wide"><Suspense><UsageRecordDetail /></Suspense><CostDashboardSection isAdmin={currentUser.role === "admin"} /></SettingsTargetFrame>
         )}
       </SettingsGroup>
 
@@ -1730,11 +1675,12 @@ export default function SettingsPage() {
           title="管理・運用"
           icon={<UserCog className="size-4" />}
         >
-          <SettingsTargetFrame targetId="user-management"><UserManagementConsole currentUser={currentUser} /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="user-management" width="wide"><UserManagementConsole currentUser={currentUser} /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="user-export"><UserExportSection /></SettingsTargetFrame>
-          <SettingsTargetFrame targetId="skills"><SkillsSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="skills" width="wide"><SkillsSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="heartbeats"><HeartbeatsSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="verification-data"><VerificationDataSettings /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="command-workspace-unconfined"><CommandWorkspaceUnconfinedSection isAdmin /></SettingsTargetFrame>
         </SettingsGroup>
       )}
 

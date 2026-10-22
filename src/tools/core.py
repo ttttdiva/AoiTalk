@@ -19,9 +19,34 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+from types import UnionType
 import asyncio
 import contextvars
 import inspect
+
+
+def coerce_boolean_argument(tool_name: str, argument: str, value: Any) -> Any:
+    """Return a real bool for a schema ``boolean`` argument or reject it.
+
+    Providers sometimes serialize booleans as the JSON strings ``"True"`` /
+    ``"false"``; a bare truthiness test would read ``"False"`` as true.  Only
+    those exact spellings are recovered.  ``None`` stays "not supplied" and any
+    other value is a recoverable argument error instead of a guessed bool.
+    """
+
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().casefold()
+        if token == "true":
+            return True
+        if token == "false":
+            return False
+    raise ToolArgumentValidationError(
+        tool_name,
+        code="tool_argument_invalid",
+        argument_names=(argument,),
+    )
 
 
 @dataclass
@@ -68,6 +93,18 @@ class ToolArgumentValidationError(ValueError):
         super().__init__(f"{self.tool_name}: {label}")
 
 
+class ToolPolicyDeniedError(Exception):
+    """Execution policy refused a call before any side effect was started.
+
+    The reason is policy-authored text (never tool output), so it may be shown
+    to the model.  The router records the call with ``executed=False``.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason or "denied by task execution policy").strip()
+        super().__init__(self.reason)
+
+
 @dataclass
 class ToolDefinition:
     """バックエンド非依存のツール定義"""
@@ -85,6 +122,9 @@ class ToolDefinition:
     availability: Optional[Dict[str, Any]] = None
     argument_aliases: Dict[str, str] = field(default_factory=dict)
     hidden_argument_names: tuple[str, ...] = field(default_factory=tuple)
+    execution_check: Optional[Callable[[], Optional[str]]] = field(
+        default=None, repr=False, compare=False
+    )
     _legacy_variadic_kwargs: bool = field(
         default=False,
         init=False,
@@ -282,6 +322,11 @@ class ToolDefinition:
                 code="tool_argument_missing",
                 argument_names=missing,
             )
+        for param in self.parameters:
+            if param.type == "boolean" and param.name in normalized:
+                normalized[param.name] = coerce_boolean_argument(
+                    self.name, param.name, normalized[param.name]
+                )
         return normalized
 
     def to_json_schema(self) -> Dict[str, Any]:
@@ -334,25 +379,60 @@ class ToolDefinition:
 
     def execute(self, **kwargs) -> Any:
         """ツールを実行（全バックエンドで共通）"""
+        self._check_execution()
         normalized = self.normalize_arguments(kwargs)
-        result = self.function(**normalized)
-        if asyncio.iscoroutine(result):
-            # 非同期関数の場合、イベントループで実行
-            try:
-                loop = asyncio.get_running_loop()
-                import concurrent.futures
-                # ``asyncio.run`` in a fresh worker thread would otherwise
-                # start with an empty ContextVar context.  Tool execution is
-                # still part of the same logical turn, so copy the current
-                # context (including TurnContext/task/reference scope) into
-                # that thread before driving the coroutine.
-                current_context = contextvars.copy_context()
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(current_context.run, asyncio.run, result)
-                    return future.result()
-            except RuntimeError:
-                return asyncio.run(result)
-        return result
+        from ..services.agent_authority_guard import guard_agent_tool_call_sync
+        from ..services.turn_context import get_turn_context
+
+        authority = guard_agent_tool_call_sync(
+            self.name,
+            normalized,
+            tool_definition=self,
+            config=get_turn_context().agent_execution_config,
+        )
+        if not authority.allowed:
+            raise PermissionError(f"Agent authority denied tool {self.name}")
+
+        def invoke() -> Any:
+            result = self.function(**normalized)
+            if asyncio.iscoroutine(result):
+                # 非同期関数の場合、イベントループで実行
+                try:
+                    asyncio.get_running_loop()
+                    from ..services.tool_mutation_resource_guard import (
+                        sync_lease_context_active,
+                    )
+
+                    # A resource-lease bridge owns the current event loop;
+                    # return the coroutine so that bridge can await it on the
+                    # same loop and preserve loop-bound callbacks.
+                    if sync_lease_context_active():
+                        return result
+                    import concurrent.futures
+
+                    # ``asyncio.run`` in a fresh worker thread would otherwise
+                    # start with an empty ContextVar context.  Tool execution
+                    # is still part of the same logical turn, so copy the
+                    # current context (including TurnContext/task/reference
+                    # scope) into that thread before driving the coroutine.
+                    current_context = contextvars.copy_context()
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        future = pool.submit(current_context.run, asyncio.run, result)
+                        return future.result()
+                except RuntimeError:
+                    return asyncio.run(result)
+            return result
+
+        from ..services.tool_mutation_resource_guard import (
+            execute_with_mutation_resource_lease_sync,
+        )
+
+        return execute_with_mutation_resource_lease_sync(
+            self,
+            normalized,
+            invoke,
+            context=get_turn_context(),
+        )
 
     async def execute_async(self, **kwargs) -> Any:
         """ツールを非同期実行
@@ -361,13 +441,45 @@ class ToolDefinition:
         重いコマンドやユーザー承認待ちの間ループ全体が停止し、SSE配信も
         承認応答の受信も止まって実質フリーズする。
         """
+        self._check_execution()
         normalized = self.normalize_arguments(kwargs)
-        if self.is_async or inspect.iscoroutinefunction(self.function):
-            return await self._await_with_timeout(self.function(**normalized))
+        from ..services.agent_authority_guard import guard_agent_tool_call_async
 
-        return await self._await_with_timeout(
-            asyncio.to_thread(lambda: self.function(**normalized))
+        from ..services.turn_context import get_turn_context
+
+        authority = await guard_agent_tool_call_async(
+            self.name,
+            normalized,
+            tool_definition=self,
+            config=get_turn_context().agent_execution_config,
         )
+        if not authority.allowed:
+            raise PermissionError(f"Agent authority denied tool {self.name}")
+
+        async def invoke() -> Any:
+            if self.is_async or inspect.iscoroutinefunction(self.function):
+                return await self._await_with_timeout(self.function(**normalized))
+            return await self._await_with_timeout(
+                asyncio.to_thread(lambda: self.function(**normalized))
+            )
+
+        from ..services.tool_mutation_resource_guard import (
+            execute_with_mutation_resource_lease,
+        )
+
+        return await execute_with_mutation_resource_lease(
+            self,
+            normalized,
+            invoke,
+            context=get_turn_context(),
+        )
+
+    def _check_execution(self) -> None:
+        """Recheck server-owned availability even for a retained definition."""
+        if self.execution_check is not None:
+            reason = self.execution_check()
+            if reason:
+                raise PermissionError(f"Tool disabled: {self.name}: {reason}")
 
     async def _await_with_timeout(self, awaitable: Any) -> Any:
         """timeout_seconds が設定されていれば外側からも打ち切る。"""
@@ -389,18 +501,33 @@ _TYPE_MAP: Dict[type, str] = {
 }
 
 
+def _is_union(py_type: Any) -> bool:
+    """``Optional[X]`` と PEP 604 の ``X | None`` を同じ Union として扱う。
+
+    ``list[str] | None`` の origin は ``typing.Union`` ではなく
+    ``types.UnionType`` になる。ここを見落とすと配列/辞書引数が string として
+    モデルへ公開され、``targets="docs,conversation"`` のような文字列が届く。
+    """
+    return get_origin(py_type) in (Union, UnionType)
+
+
+def _union_members(py_type: Any) -> tuple[list[Any], bool]:
+    args = get_args(py_type)
+    non_none = [a for a in args if a is not type(None)]
+    return non_none, len(non_none) != len(args)
+
+
 def _resolve_type(py_type: Any) -> tuple:
     """Python型からJSON Schema型と optional フラグを解決する"""
     origin = get_origin(py_type)
 
-    # Optional[X] = Union[X, None] の処理
-    if origin is Union:
-        args = get_args(py_type)
-        non_none = [a for a in args if a is not type(None)]
+    # Optional[X] = Union[X, None] / X | None の処理
+    if _is_union(py_type):
+        non_none, has_none = _union_members(py_type)
         if len(non_none) == 1:
             inner_type, _ = _resolve_type(non_none[0])
-            return inner_type, True
-        return "string", True
+            return inner_type, has_none
+        return "string", has_none
 
     # List[str] / Dict[str, Any] のような generic alias は origin で判定する。
     # ここを素の _TYPE_MAP 参照にすると list 系が全て "string" に落ち、
@@ -417,8 +544,8 @@ def _resolve_param_schema(py_type: Any, json_type: str) -> Optional[Dict[str, An
         return None
 
     target = py_type
-    if get_origin(target) is Union:
-        non_none = [a for a in get_args(target) if a is not type(None)]
+    if _is_union(target):
+        non_none, _ = _union_members(target)
         if len(non_none) == 1:
             target = non_none[0]
 

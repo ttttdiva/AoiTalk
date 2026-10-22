@@ -8,6 +8,7 @@ different provider.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import math
@@ -159,6 +160,7 @@ class MeetingLocalLlmService:
         self.gateway = gateway or privacy_gateway or OutboundPrivacyGateway(config)
         self.http_client = http_client_factory or http_client
         self._reduced: OrderedDict[str, str] = OrderedDict()
+        self._lease_cleanup_tasks: set[asyncio.Task[Any]] = set()
 
     @staticmethod
     def _finite_timeout(value: Any) -> float:
@@ -201,6 +203,134 @@ class MeetingLocalLlmService:
             tool="meeting-processing",
             model=self.model,
         )
+
+    def _acquire_runtime_consumer_lease(self):
+        """Protect a managed local endpoint for the whole meeting artifact."""
+
+        if self.provider != "openai_compatible_local":
+            return None
+        try:
+            from ..service_manager import (
+                _acquire_managed_local_runtime_consumer_for_route,
+            )
+            return _acquire_managed_local_runtime_consumer_for_route(
+                self.config,
+                provider=self.provider,
+                model=self.model,
+                consumer="meeting",
+            )
+        except Exception:
+            raise
+
+    def acquire_runtime_consumer_lease(self):
+        """Prepare and hold one meeting job's managed local runtime lease."""
+
+        if self.provider != "openai_compatible_local":
+            return None
+        from ..llm.manager import TargetConfig
+        from ..service_manager import ensure_openai_compatible_local_server
+
+        target_config = TargetConfig(
+            self.config,
+            {
+                "llm_provider": self.provider,
+                "llm_model": self.model,
+                "openai_compatible_local.model": self.model,
+            },
+        )
+        ensure_openai_compatible_local_server(
+            target_config,
+            model=self.model,
+            raise_on_launch_error=True,
+            force_restart=False,
+        )
+        return self._acquire_runtime_consumer_lease()
+
+    async def release_runtime_consumer_lease_async(self, lease: Any) -> None:
+        """Release a managed-runtime lease without blocking the event loop."""
+
+        release = getattr(lease, "release", None)
+        if callable(release):
+            release_task = asyncio.create_task(
+                asyncio.to_thread(release),
+                name="meeting-local-llm-runtime-lease-release",
+            )
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError:
+                self._track_lease_cleanup(release_task)
+                raise
+
+    def _track_lease_cleanup(self, task: asyncio.Task[Any]) -> None:
+        self._lease_cleanup_tasks.add(task)
+        def finish(done: asyncio.Task[Any]) -> None:
+            self._lease_cleanup_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except Exception:
+                error = None
+            if error is not None:
+                # Do not make a late background cleanup task an unhandled
+                # exception; the owning worker will surface its own failure.
+                pass
+
+        task.add_done_callback(finish)
+
+    async def drain_runtime_consumer_lease_cleanup(self) -> None:
+        """Wait for late acquire/release cleanup before service shutdown."""
+
+        while True:
+            pending = tuple(
+                task for task in self._lease_cleanup_tasks if not task.done()
+            )
+            if not pending:
+                break
+            await asyncio.shield(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+
+    async def shutdown(self) -> None:
+        """Drain runtime lease cleanup owned by this service instance."""
+
+        await self.drain_runtime_consumer_lease_cleanup()
+
+    async def acquire_runtime_consumer_lease_async(self):
+        """Acquire in a worker thread and release a late result after cancel.
+
+        The synchronous service-manager call may launch/readiness-wait a local
+        runtime. Shielding the thread task prevents cancellation from orphaning
+        a lease that completes just after the caller has stopped waiting.
+        """
+
+        acquire_task = asyncio.create_task(
+            asyncio.to_thread(self.acquire_runtime_consumer_lease),
+            name="meeting-local-llm-runtime-lease",
+        )
+        try:
+            return await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            async def settle_late_acquire() -> None:
+                try:
+                    lease = await acquire_task
+                except Exception:
+                    return
+                if lease is not None:
+                    try:
+                        await self.release_runtime_consumer_lease_async(lease)
+                    except Exception:
+                        # The owner has already cancelled; retain cleanup as a
+                        # best-effort safety path without reviving the caller.
+                        pass
+
+            self._track_lease_cleanup(
+                asyncio.create_task(
+                    settle_late_acquire(),
+                    name="meeting-local-llm-late-lease-cleanup",
+                )
+            )
+            raise
 
     async def _execute_http(self, payload: Mapping[str, Any], *, method: str, url: str) -> Any:
         async with _client_context(self.http_client, timeout=self.timeout) as client:
@@ -358,6 +488,19 @@ class MeetingLocalLlmService:
         return output
 
     async def generate_minutes(self, input_value: Any = None, *, transcript: Any = None, title_hint: str = "", **kwargs: Any) -> MeetingLlmResult:
+        lease = await self.acquire_runtime_consumer_lease_async()
+        try:
+            return await self._generate_minutes_unleased(
+                input_value,
+                transcript=transcript,
+                title_hint=title_hint,
+                **kwargs,
+            )
+        finally:
+            if lease is not None:
+                await self.release_runtime_consumer_lease_async(lease)
+
+    async def _generate_minutes_unleased(self, input_value: Any = None, *, transcript: Any = None, title_hint: str = "", **kwargs: Any) -> MeetingLlmResult:
         transcript_value = transcript if transcript is not None else kwargs.get("transcript", input_value)
         transcript, embedded_title = self._coerce_transcript(transcript_value)
         title_hint = title_hint or embedded_title
@@ -366,6 +509,20 @@ class MeetingLocalLlmService:
         return MeetingLlmResult(markdown=markdown, source_digest=digest)
 
     async def generate_memo(self, input_value: Any = None, *, transcript: Any = None, title_hint: str = "", source_digest: str | None = None, **kwargs: Any) -> MeetingLlmResult:
+        lease = await self.acquire_runtime_consumer_lease_async()
+        try:
+            return await self._generate_memo_unleased(
+                input_value,
+                transcript=transcript,
+                title_hint=title_hint,
+                source_digest=source_digest,
+                **kwargs,
+            )
+        finally:
+            if lease is not None:
+                await self.release_runtime_consumer_lease_async(lease)
+
+    async def _generate_memo_unleased(self, input_value: Any = None, *, transcript: Any = None, title_hint: str = "", source_digest: str | None = None, **kwargs: Any) -> MeetingLlmResult:
         transcript_value = transcript if transcript is not None else kwargs.get("transcript", input_value)
         transcript, embedded_title = self._coerce_transcript(transcript_value)
         title_hint = title_hint or embedded_title

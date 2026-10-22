@@ -396,7 +396,8 @@ class MessagingMixin:
         # All generation events leave through this method.  Additive envelope
         # fields keep older clients compatible while giving newer clients a
         # durable deduplication key and a monotonic ordering hint per session/run.
-        payload = dict(event_data)
+        from ...memory.models.conversations import public_message_metadata
+        payload = public_message_metadata(dict(event_data))
         nested_data = payload.get("data")
         nested_record = nested_data if isinstance(nested_data, dict) else {}
         if session_id and not payload.get("session_id"):
@@ -421,7 +422,23 @@ class MessagingMixin:
             or f"ws:{event_type}:{session_id or 'global'}:{agent_run_id or 'runless'}:{event_sequence}"
         )
         payload["event_sequence"] = event_sequence
-        await self.manager.broadcast({"type": event_type, **payload})
+        if event_type == "memory_selection_progress":
+            # The session can be shared while this automatic-memory trace is
+            # private to its sender. Never trust a user_id in the event payload.
+            from ...services.agent_run_service import AgentRunService
+            try:
+                run = await AgentRunService().get_run(str(agent_run_id or ""))
+            except Exception:
+                return
+            if not isinstance(run, Mapping) or str(run.get("session_id") or "") != str(session_id or ""):
+                return
+            owner = str(run.get("user_id") or "").strip()
+            if not owner:
+                return
+            payload.pop("user_id", None)
+            await self.manager.broadcast({"type": event_type, **payload}, user_id=owner)
+        else:
+            await self.manager.broadcast({"type": event_type, **payload})
 
     async def _broadcast_new_message(self, entry: dict):
         """Broadcast a message envelope with a stable additive event identity."""
@@ -527,6 +544,10 @@ class MessagingMixin:
     def set_llm_client_change_callback(self, callback):
         """Set callback called when the active LLM client changes."""
         self.on_llm_client_change = callback
+
+    def set_session_llm_route_change_callback(self, callback):
+        """Set callback for retiring session-scoped response-model clients."""
+        self.on_session_llm_route_change = callback
 
     def _configure_heartbeat_execution(self) -> None:
         """Install the single durable Heartbeat callback and broadcasters."""

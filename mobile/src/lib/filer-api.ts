@@ -1,5 +1,4 @@
 import { fetchApi, getBaseUrl } from "./api-client";
-import { getToken } from "./auth";
 import type { FilerEntry } from "../types/api";
 
 type FilerConfigPayload = {
@@ -104,16 +103,15 @@ export const filerApi = {
 
   async getFileUrl(filePath: string): Promise<string> {
     const baseUrl = await getBaseUrl();
-    const token = await getToken();
-    return `${baseUrl}/api/filer/file?path=${encodeURIComponent(filePath)}&token=${token || ""}`;
+    return `${baseUrl}/api/filer/file?path=${encodeURIComponent(filePath)}`;
   },
 
   async getThumbnailUrl(filePath: string, mimeType?: string): Promise<string> {
     const baseUrl = await getBaseUrl();
-    const token = await getToken();
     const endpoint = mimeType?.startsWith("video/")
       ? "video-thumbnail"
       : "image-thumbnail";
-    return `${baseUrl}/api/filer/${endpoint}?path=${encodeURIComponent(filePath)}&token=${token || ""}`;
+    return `${baseUrl}/api/filer/${endpoint}?path=${encodeURIComponent(filePath)}`;
   },
+
 };

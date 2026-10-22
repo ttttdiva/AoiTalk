@@ -38,6 +38,7 @@ from ..memory.models import (
     AgentRunEdge,
     AgentRunEvent,
     AgentRunToolCall,
+    AgentWorkItem,
     App,
     AppGrant,
     AppJob,
@@ -56,6 +57,7 @@ from ..memory.models import (
     DocsLibrary,
     KnowledgeAiSuggestion,
     KnowledgeAttachment,
+    KnowledgeCaptureCandidate,
     KnowledgeEdge,
     KnowledgeEditEvent,
     KnowledgeField,
@@ -1034,6 +1036,8 @@ _PROJECT_AUXILIARY: tuple[tuple[Any, str], ...] = (
     (ProjectSchedulePhase, "project_id"),
     (ContextMemory, "project_id"),
     (ScopedMemoryJob, "project_id"),
+    (AgentWorkItem, "project_id"),
+    (KnowledgeCaptureCandidate, "project_id"),
     (SkillProposal, "project_id"),
     (SkillUsageReceipt, "project_id"),
     (HeartbeatRunState, "project_id"),
@@ -1791,6 +1795,123 @@ class VerificationCleanupCoordinator:
                 return False
         return True
 
+    def _soft_deleted_forensic_evidence_ok(
+        self,
+        row: Any,
+        entry: ManifestEntry,
+        *,
+        run_id: str,
+        source: str,
+    ) -> bool:
+        """Allow exact-ID purge of soft-deleted rows without inventing provenance.
+
+        Verification fixtures sometimes lose disposable metadata after a normal
+        API soft-delete.  Operators may still purge those tombstones when the
+        manifest carries positive identity evidence (exact UUID + owner + name +
+        deleted_at) under an ``operator_exact_ids:`` source.  Empty expected
+        metadata is required so this path cannot be used to paper over a
+        mismatched ``qa_fixture`` / run marker.
+        """
+
+        if not str(source or "").startswith("operator_exact_ids:"):
+            return False
+        if getattr(row, "deleted_at", None) is None:
+            return False
+        required = {"deleted_at", "owner_id", "name"}
+        if not required.issubset({str(key) for key in entry.assertions.keys()}):
+            return False
+        if entry.metadata:
+            return False
+        actual_metadata = self._metadata_for(row)
+        for key in ("verification_run_id", "run_id"):
+            if key in actual_metadata and str(actual_metadata[key]) != str(run_id):
+                return False
+        if entry.owner_id is not None and str(getattr(row, "owner_id", "") or "") != str(entry.owner_id):
+            return False
+        return self._assertions_match(row, entry.assertions)
+
+    async def _ensure_soft_deleted_task_batches(
+        self,
+        session: AsyncSession,
+        graph: Mapping[str, Any],
+    ) -> dict[str, str]:
+        """Mint deletion batches for project-cascade tombstones that lack one.
+
+        ``ProjectRepository.delete_project`` soft-deletes tasks without a
+        ``deletion_batch_id``.  The scoped task purge requires a batch for
+        every frozen task, so forensic soft-deleted project purge assigns an
+        exact batch to those already-tombstoned rows before physical removal.
+        Live tasks are refused: they must go through canonical delete first.
+        """
+
+        from uuid import uuid4
+
+        task_ids = tuple(graph.get("tasks", ()))
+        existing = {
+            str(task_id): str(batch_id)
+            for task_id, batch_id in dict(graph.get("task_batches", {}) or {}).items()
+            if batch_id
+        }
+        assigned: dict[str, str] = dict(existing)
+        for raw_task_id in task_ids:
+            task_key = str(raw_task_id)
+            if assigned.get(task_key):
+                continue
+            identity = _uuid_or_none(raw_task_id)
+            if identity is None:
+                raise VerificationCleanupError(
+                    "soft-deleted task purge requires UUID task identities",
+                    code="manifest_invalid_identity",
+                    status_code=422,
+                    details={"task_id": task_key},
+                )
+            row = await session.get(Task, identity)
+            if row is None:
+                raise VerificationCleanupError(
+                    "a frozen task target disappeared before purge",
+                    code="task_target_missing",
+                    status_code=409,
+                    details={"task_ids": [task_key]},
+                )
+            if getattr(row, "deleted_at", None) is None:
+                raise VerificationCleanupError(
+                    "live task cannot receive a forensic deletion batch",
+                    code="task_batch_missing",
+                    status_code=409,
+                    details={"task_id": task_key},
+                )
+            current_batch = getattr(row, "deletion_batch_id", None)
+            if current_batch is not None:
+                assigned[task_key] = str(current_batch)
+                continue
+            new_batch = uuid4()
+            await session.execute(
+                update(Task)
+                .where(Task.id == identity)
+                .values(deletion_batch_id=new_batch)
+            )
+            await session.execute(
+                update(TaskOccurrence)
+                .where(
+                    TaskOccurrence.task_id == identity,
+                    TaskOccurrence.deleted_at.is_not(None),
+                    TaskOccurrence.deletion_batch_id.is_(None),
+                )
+                .values(deletion_batch_id=new_batch)
+            )
+            await session.execute(
+                update(TimeEntry)
+                .where(
+                    TimeEntry.task_id == identity,
+                    TimeEntry.deleted_at.is_not(None),
+                    TimeEntry.deletion_batch_id.is_(None),
+                )
+                .values(deletion_batch_id=new_batch)
+            )
+            assigned[task_key] = str(new_batch)
+        await session.flush()
+        return assigned
+
     async def _load_target_rows(self, session: AsyncSession, manifest: CleanupManifest) -> dict[tuple[str, str], Any]:
         model_by_type = {"project": Project, "task": Task, "user": User}
         rows: dict[tuple[str, str], Any] = {}
@@ -1816,12 +1937,18 @@ class VerificationCleanupCoordinator:
                     details={"entity_type": entry.entity_type, "entity_id": entry.entity_id},
                 )
             if not self._metadata_matches(self._metadata_for(row), entry.metadata, run_id=manifest.run_id):
-                raise VerificationCleanupError(
-                    "target provenance does not match manifest",
-                    code="target_provenance_mismatch",
-                    status_code=409,
-                    details={"entity_type": entry.entity_type, "entity_id": entry.entity_id},
-                )
+                if not self._soft_deleted_forensic_evidence_ok(
+                    row,
+                    entry,
+                    run_id=manifest.run_id,
+                    source=manifest.source,
+                ):
+                    raise VerificationCleanupError(
+                        "target provenance does not match manifest",
+                        code="target_provenance_mismatch",
+                        status_code=409,
+                        details={"entity_type": entry.entity_type, "entity_id": entry.entity_id},
+                    )
             if entry.owner_id is not None:
                 actual_owner = getattr(row, "owner_id", None)
                 if actual_owner is None:
@@ -1842,6 +1969,152 @@ class VerificationCleanupCoordinator:
                 )
             rows[(entry.entity_type, entry.entity_id)] = row
         return rows
+
+    async def _snapshot_scoped_memory_jobs(
+        self,
+        session: AsyncSession,
+        *,
+        project_id: UUID,
+        owner_id: Any,
+        session_ids: Iterable[Any],
+        lock: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Freeze every job affected by the exact project/session graph.
+
+        A nullable project pointer does not prevent a session FK cascade.
+        Record both identities and bindings so a stable job ID cannot hide a
+        changed owner or conversation between preview and execution.
+        """
+        frozen_sessions = tuple(_uuid_or_none(value) for value in session_ids)
+        if any(value is None for value in frozen_sessions):
+            raise VerificationCleanupError(
+                "memory job graph has an invalid session identity",
+                code="shared_conversation_graph",
+                status_code=409,
+            )
+        selector = ScopedMemoryJob.project_id == project_id
+        if frozen_sessions:
+            selector = selector | ScopedMemoryJob.session_id.in_(frozen_sessions)
+        statement = select(ScopedMemoryJob).where(selector).execution_options(populate_existing=True)
+        if lock:
+            statement = statement.with_for_update()
+        result = await session.execute(statement)
+        jobs = result.scalars().all()
+        owner_uuid = _uuid_or_none(owner_id)
+        bindings: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            job_project = getattr(job, "project_id", None)
+            if (
+                (job_project is not None and _uuid_or_none(job_project) != project_id)
+                or owner_uuid is None
+                or _uuid_or_none(getattr(job, "user_id", None)) != owner_uuid
+            ):
+                raise VerificationCleanupError(
+                    "memory job crosses a protected project or owner boundary",
+                    code="shared_conversation_graph",
+                    status_code=409,
+                    details={
+                        "project_id": str(project_id),
+                        "table": "scoped_memory_jobs",
+                        "job_id": str(job.id),
+                    },
+                )
+            bindings[str(job.id)] = {
+                "session_id": str(job.session_id),
+                "project_id": str(job_project) if job_project is not None else None,
+                "user_id": str(owner_uuid),
+                "docs_candidates": [],
+            }
+        if bindings:
+            # Deleting a job SET NULLs its DocsCandidate source pointer. A
+            # candidate outside this project/owner must not be changed as an
+            # implicit side effect. Freeze these references as well; the job
+            # locks above prevent new FK references during the final fence.
+            candidates_statement = (
+                select(DocsCandidate)
+                .where(DocsCandidate.source_job_id.in_(_column_values(ScopedMemoryJob, "id", bindings)))
+                .execution_options(populate_existing=True)
+            )
+            if lock:
+                candidates_statement = candidates_statement.with_for_update()
+            candidates_result = await session.execute(candidates_statement)
+            for candidate in candidates_result.scalars().all():
+                if (
+                    _uuid_or_none(candidate.project_id) != project_id
+                    or _uuid_or_none(candidate.created_by) != owner_uuid
+                ):
+                    raise VerificationCleanupError(
+                        "memory job candidate crosses a protected project or owner boundary",
+                        code="shared_conversation_graph",
+                        status_code=409,
+                        details={"project_id": str(project_id), "table": "docs_candidates", "candidate_id": str(candidate.id)},
+                    )
+                bindings[str(candidate.source_job_id)]["docs_candidates"].append(str(candidate.id))
+            for binding in bindings.values():
+                binding["docs_candidates"].sort()
+        return dict(sorted(bindings.items()))
+
+    async def _lock_scoped_memory_job_graph(
+        self, session: AsyncSession, project_id: UUID, graph: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Reject unseen FK effects before the first project-graph purge.
+
+        Lock the referenced parent rows before re-reading jobs: PostgreSQL FK
+        key-share locks then prevent new project/session dependents until the
+        surrounding deletion transaction finishes. Lock the jobs as well so
+        their bindings cannot change after this final comparison.
+        """
+        project = await session.scalar(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if project is None:
+            raise VerificationCleanupError(
+                "project disappeared before graph purge", code="target_missing", status_code=409
+            )
+        session_ids = _column_values(ConversationSession, "id", graph.get("sessions", ()))
+        if session_ids:
+            locked = await session.execute(
+                select(ConversationSession.id, ConversationSession.project_id)
+                .where(ConversationSession.id.in_(session_ids))
+                .with_for_update()
+            )
+            locked_sessions = locked.all()
+            if _ids(row[0] for row in locked_sessions) != _ids(session_ids):
+                raise VerificationCleanupError(
+                    "conversation graph changed before purge", code="graph_mismatch", status_code=409
+                )
+            # The canonical lifecycle detaches these exact sessions before
+            # purge. A concurrent move into another project is not part of
+            # that approved effect and must never be deleted by its stable ID.
+            if any(
+                row[1] is not None and _uuid_or_none(row[1]) != project_id
+                for row in locked_sessions
+            ):
+                raise VerificationCleanupError(
+                    "conversation session moved to a protected project",
+                    code="shared_conversation_graph",
+                    status_code=409,
+                    details={"project_id": str(project_id), "table": "conversation_sessions"},
+                )
+        bindings = await self._snapshot_scoped_memory_jobs(
+            session,
+            project_id=project_id,
+            owner_id=project.owner_id,
+            session_ids=session_ids,
+            lock=True,
+        )
+        expected_ids = _ids(graph.get("scoped_memory_jobs", ()))
+        if _ids(bindings) != expected_ids or bindings != graph.get("scoped_memory_job_bindings", {}):
+            raise VerificationCleanupError(
+                "memory job graph changed since preview",
+                code="graph_mismatch",
+                status_code=409,
+                details={"project_id": str(project_id), "graph_key": "scoped_memory_jobs"},
+            )
+        return expected_ids
 
     async def _snapshot_project(
         self,
@@ -1867,7 +2140,7 @@ class VerificationCleanupCoordinator:
                 status_code=409,
                 details={"entity_type": "project", "entity_id": str(project_id)},
             )
-        graph: dict[str, tuple[str, ...]] = {}
+        graph: dict[str, Any] = {}
         task_rows = await _select_models(session, Task, "project_id", [project_id])
         task_ids = _ids(row.id for row in task_rows)
         # A task parent pointer is a self-referential NO ACTION edge in some
@@ -1994,12 +2267,37 @@ class VerificationCleanupCoordinator:
                 details={"entity_type": "project", "entity_id": str(project_id)},
             )
         if getattr(project_row, "deleted_at", None) is not None:
-            raise VerificationCleanupError(
-                "project target is already deleted",
-                code="project_already_deleted",
-                status_code=409,
-                details={"project_id": str(project_id)},
-            )
+            # Soft-deleted forensic purge: require positive identity evidence in
+            # the frozen assertions instead of inventing disposable metadata.
+            required = {"deleted_at", "owner_id", "name"}
+            if not required.issubset({str(key) for key in entry.assertions.keys()}):
+                raise VerificationCleanupError(
+                    "project target is already deleted",
+                    code="project_already_deleted",
+                    status_code=409,
+                    details={"project_id": str(project_id)},
+                )
+            if entry.metadata:
+                raise VerificationCleanupError(
+                    "soft-deleted forensic purge requires empty provenance metadata",
+                    code="target_provenance_mismatch",
+                    status_code=409,
+                    details={"project_id": str(project_id)},
+                )
+            if not self._assertions_match(project_row, entry.assertions):
+                raise VerificationCleanupError(
+                    "soft-deleted project assertions do not match target",
+                    code="target_assertion_mismatch",
+                    status_code=409,
+                    details={"project_id": str(project_id)},
+                )
+            if entry.owner_id is not None and str(getattr(project_row, "owner_id", "") or "") != str(entry.owner_id):
+                raise VerificationCleanupError(
+                    "soft-deleted project owner does not match manifest",
+                    code="target_owner_mismatch",
+                    status_code=409,
+                    details={"project_id": str(project_id)},
+                )
 
         # Optional manifest anchors provide an additional identity fence for
         # one-time forensic cleanup.  They are never used as selectors, but a
@@ -2315,6 +2613,15 @@ class VerificationCleanupCoordinator:
             graph["messages"] = _ids(await _select_ids(session, ConversationMessage, "session_id", graph["sessions"]))
             graph["session_participants"] = _ids(await _select_ids(session, ConversationParticipant, "session_id", graph["sessions"]))
 
+        memory_job_bindings = await self._snapshot_scoped_memory_jobs(
+            session,
+            project_id=project_id,
+            owner_id=project_row.owner_id,
+            session_ids=graph["sessions"],
+        )
+        graph["scoped_memory_jobs"] = _ids(memory_job_bindings)
+        graph["scoped_memory_job_bindings"] = memory_job_bindings
+
         # Deleting a session/message can trigger ON DELETE SET NULL on rows
         # owned by another project (forks, memory jobs, agent/story records,
         # and other future models).  Such a side effect would mutate
@@ -2517,7 +2824,7 @@ class VerificationCleanupCoordinator:
         # audit/provenance tables by design.
         for model, column_name in _PROJECT_AUXILIARY:
             name = getattr(model, "__tablename__", model.__name__).lower()
-            if name in {"projects", "conversation_sessions", "agent_runs"}:
+            if name in {"projects", "conversation_sessions", "agent_runs", "scoped_memory_jobs"}:
                 continue
             ids = await _select_ids(session, model, column_name, [project_id])
             if ids:
@@ -2994,7 +3301,10 @@ class VerificationCleanupCoordinator:
         return counts
 
     async def _purge_project_graph(self, session: AsyncSession, project_id: UUID, graph: Mapping[str, Any], *, delete_project_row: bool = True) -> dict[str, int]:
+        memory_job_ids = await self._lock_scoped_memory_job_graph(session, project_id, graph)
         counts: dict[str, int] = {}
+        if memory_job_ids:
+            counts["scoped_memory_jobs"] = await _delete_where(session, ScopedMemoryJob, "id", memory_job_ids)
         task_ids = tuple(graph.get("tasks", ()))
         counts.update(
             await self._purge_task_graph(
@@ -3187,11 +3497,18 @@ class VerificationCleanupCoordinator:
                 session, SkillProposalHistory, "proposal_id", proposal_ids
             )
 
+        # AgentWorkItem rows are snapshotted for evidence, but their
+        # ``agent_work_events`` ledger is protected by an immutable
+        # BEFORE UPDATE OR DELETE trigger and this role cannot set
+        # ``session_replication_role``.  Do not DELETE work items here;
+        # the project-row delete SET NULLs ``agent_work_items.project_id``
+        # / ``task_id`` and leaves the append-only events intact.
+
         # ProjectRepository already removed most of these rows.  Repeating an
         # exact-ID delete is idempotent and closes the remaining FK graph.
         for model, column_name in _PROJECT_AUXILIARY:
             name = getattr(model, "__tablename__", model.__name__)
-            if name in {"conversation_sessions", "agent_runs"}:
+            if name in {"conversation_sessions", "agent_runs", "agent_work_items", "scoped_memory_jobs"}:
                 continue
             count = await _delete_where(session, model, column_name, [project_id])
             if count:
@@ -3633,6 +3950,12 @@ class VerificationCleanupCoordinator:
             # provenance/graph check is the TOCTOU fence for the admin BFF.
             rows = await _maybe_await(self._load_target_rows(session, frozen))
             graph = await _maybe_await(self._snapshot(session, frozen, rows))
+            if _sha256({"manifest": frozen.digest, "graph": graph}) != confirmation_digest:
+                raise VerificationCleanupError(
+                    "cleanup graph changed since preview",
+                    code="graph_mismatch",
+                    status_code=409,
+                )
             # Validate user ownership/foreign-key blockers before any task or
             # project canonical method gets a chance to commit.  Projects in
             # this same frozen manifest are explicitly allowed because their
@@ -3658,9 +3981,23 @@ class VerificationCleanupCoordinator:
             # Task tombstones must be created before ProjectRepository removes
             # Project memberships.  For a project target, every task in the
             # frozen graph is an exact canonical delete candidate; no title or
-            # status inference is used.
+            # status inference is used.  Soft-deleted forensic projects are
+            # skipped here: ``delete_task`` refuses permission checks against
+            # tombstoned projects, and batches are ensured immediately before
+            # physical purge instead.
+            already_deleted_projects: set[str] = set()
+            for project_id in graph["projects"]:
+                project_uuid = _uuid_or_none(project_id)
+                getter = getattr(session, "get", None)
+                current_project = None
+                if project_uuid is not None and callable(getter):
+                    current_project = await _maybe_await(getter(Project, project_uuid))
+                if current_project is not None and getattr(current_project, "deleted_at", None) is not None:
+                    already_deleted_projects.add(str(project_id))
             task_batches: dict[str, str] = {}
             for project_id, project_graph in graph["projects"].items():
+                if str(project_id) in already_deleted_projects:
+                    continue
                 for task_id in project_graph.get("tasks", ()):
                     task_result = await self._canonical_delete_task(session, _uuid_or_none(task_id), actor)  # type: ignore[arg-type]
                     deleted["tasks"].append(task_result)
@@ -3691,12 +4028,29 @@ class VerificationCleanupCoordinator:
                         task_batches[str(selected_task_id)] = str(batch_id)
 
             # Remove only blocking LocalTask children, then invoke the
-            # repository's canonical project lifecycle.
+            # repository's canonical project lifecycle.  Soft-deleted forensic
+            # targets skip the repository soft-delete (it ignores tombstones)
+            # and go straight to the exact-ID physical purge after ensuring
+            # cascade-deleted tasks carry deletion batches.
             for project_id, project_graph in graph["projects"].items():
                 prep = await self._prepare_project_canonical_delete(session, project_graph)
                 if prep:
                     deleted.setdefault("prepared", {})[project_id] = prep
-                project_deleted = await self._canonical_delete_project(session, _uuid_or_none(project_id))  # type: ignore[arg-type]
+                project_uuid = _uuid_or_none(project_id)
+                current_project = None
+                getter = getattr(session, "get", None)
+                if project_uuid is not None and callable(getter):
+                    current_project = await _maybe_await(getter(Project, project_uuid))
+                already_deleted = current_project is not None and getattr(current_project, "deleted_at", None) is not None
+                if already_deleted:
+                    ensured_batches = await self._ensure_soft_deleted_task_batches(session, project_graph)
+                    project_graph = {**dict(project_graph), "task_batches": ensured_batches}
+                    graph["projects"][project_id] = project_graph
+                    deleted["projects"].append(
+                        {"project_id": project_id, "deleted": True, "already_deleted": True}
+                    )
+                    continue
+                project_deleted = await self._canonical_delete_project(session, project_uuid)  # type: ignore[arg-type]
                 if not project_deleted:
                     raise VerificationCleanupError(
                         "canonical project deletion did not remove the target",

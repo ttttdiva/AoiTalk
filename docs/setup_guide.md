@@ -58,7 +58,7 @@ setup.bat
 7. `scripts/init_db_schema.py` で DB schema を初期化 / migration
 8. `npm run build:production` で production Next.js build を生成
 
-NVIDIA Windows の PyTorch 正常系は CUDA 12.8 (`cu128`) です。CUDA 対応 PyTorch を導入しても、Whisper の既定 device は CPU、`fp16` は false のままです。一方、BGE-M3 embedding と Reranker は CUDA を正常系とし、CUDA が使えない場合だけ設定に従って CPU fallback します。Linux/WSL は `setup.sh` の既存方針を使い、Windows 用 cu128 index を流用しません。llama.cpp/llama-server の GPU offload は PyTorch と独立しています。
+NVIDIA Windows の PyTorch 正常系は CUDA 12.8 (`cu128`) です。CUDA 対応 PyTorch を導入しても、Whisper の既定 device は CPU、`fp16` は false のままです。EmbeddingGemma 2 は専用venvの常駐workerを使用し、`device: auto` はCUDA/BF16またはCPU/FP32を選びます。別モデルへのfallbackはありません。専用workerは公式cu128またはCPU wheelを導入します。Rerankerのdevice設定は独立しています。llama.cpp/llama-server の GPU offload は PyTorch と独立しています。詳細は [検索基盤と移行手順](embeddinggemma2_search.md) を参照してください。
 
 Irodori の依存理由と個別 smoke は [irodori_tts.md](irodori_tts.md) を参照してください。
 
@@ -68,7 +68,7 @@ Irodori の依存理由と個別 smoke は [irodori_tts.md](irodori_tts.md) を�
 run.bat
 ```
 
-`run.bat` は `venv\Scripts\python.exe` が Python 3.12+ であることを確認し、ルート `.env` を `frontend/.env` へコピーして `main.py` を起動します。終了コード `42` は restart 契約です。
+`run.bat` は `venv\Scripts\python.exe` が Python 3.12+ であることを確認し、ルート `.env` を `frontend/.env` へコピーして `main.py` を起動します。通常起動は既存の依存関係と検証済み `.next` production build を使い、`npm ci` や frontend build を自動実行しません。依存関係・artifact・source fingerprint が不足または不一致の場合は、稼働中サービスを停止せず手動手順を案内して終了します。終了コード `42` は restart 契約です。
 
 既定ポート:
 
@@ -176,7 +176,28 @@ venv\Scripts\python.exe -m alembic heads
 
 - `frontend/package.json` の `build` / `build:production` がコマンドの正本です。
 - setup scripts は production build を生成します。
-- repo の検証方針は [AGENTS.md](../AGENTS.md) を参照し、変更と無関係な full build を毎回実行しません。
+- build はまずNext標準のfrontend dotenv（`.env.production.local`、`.env.local`、`.env.production`、`.env`）を読み、その不足値だけ選択した設定rootの`.env`からNext build childへin-memoryで渡します。通常は現在のcheckout rootを使います。別checkoutや隔離検証で別の正規設定rootを使う場合だけ、秘密値を含めない絶対パスを明示してください。自動で親ディレクトリや別worktreeを探索しません。
+
+```powershell
+$env:AOITALK_BUILD_CONFIG_ROOT = "<config-root>"
+cd frontend
+npm run build:production
+```
+
+`AOITALK_BUILD_CONFIG_ROOT` が相対パス、存在しないパス、ディレクトリでないパスの場合はbuildを開始せず終了します。設定値やsecretをfrontendへコピーする必要はありません。
+- 通常起動の自己修復buildは行いません。依存関係が無い場合は次を実行します。
+
+```powershell
+cd frontend
+npm ci
+```
+
+artifactまたはfingerprintが不一致の場合は、次を実行してから`run.bat`を起動します。
+
+```powershell
+cd frontend
+npm run build:production
+```
 
 ## Qdrant
 

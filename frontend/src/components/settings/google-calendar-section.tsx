@@ -14,6 +14,7 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   disconnectGoogleCalendar,
   getGoogleCalendarSettings,
@@ -163,7 +164,17 @@ export function GoogleCalendarSection() {
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="google-calendar">
       <CardHeader
         className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        data-settings-target-activation="google-calendar"
         onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setExpanded((v) => !v);
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">
@@ -203,15 +214,14 @@ export function GoogleCalendarSection() {
                 <p className="text-xs text-muted-foreground">
                   Server is missing Google Calendar OAuth environment variables.
                 </p>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  Direct create also auto-syncs tasks with a timed Start Date.
-                </p>
-              )}
+              ) : null}
             </div>
 
             <div className="space-y-2">
-              <Label className="text-xs">Default Google Calendar action</Label>
+              <div className="inline-flex items-center gap-1">
+                <Label className="text-xs">Default Google Calendar action</Label>
+                <HelpPopover label="Default Google Calendar action">Direct create also auto-syncs tasks with a timed Start Date.</HelpPopover>
+              </div>
               <Select
                 value={settings.default_action}
                 onValueChange={handleActionChange}
@@ -235,12 +245,15 @@ export function GoogleCalendarSection() {
             </div>
 
             <div className="space-y-2">
-              <Label
-                htmlFor="google-calendar-reminder-minutes"
-                className="text-xs"
-              >
-                Google event reminder minutes before
-              </Label>
+              <div className="inline-flex items-center gap-1">
+                <Label
+                  htmlFor="google-calendar-reminder-minutes"
+                  className="text-xs"
+                >
+                  Google event reminder minutes before
+                </Label>
+                <HelpPopover label="Google event reminder minutes before">Used for events created directly in Google Calendar. Per-task AoiTalk notifications stay controlled on each task.</HelpPopover>
+              </div>
               <div className="flex items-center gap-2">
                 <Input
                   id="google-calendar-reminder-minutes"
@@ -264,10 +277,6 @@ export function GoogleCalendarSection() {
                   Save
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">
-                Used for events created directly in Google Calendar. Per-task
-                AoiTalk notifications stay controlled on each task.
-              </p>
             </div>
 
             <div className="flex flex-wrap gap-2">

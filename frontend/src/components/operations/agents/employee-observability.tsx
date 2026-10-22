@@ -17,7 +17,7 @@ export function EmployeeLiveInfo({ projection }: { projection?: EmployeeProjecti
     {projection.job_title && <span className="block">{projection.job_title}</span>}
     <span className="block">主所属: {projection.primary_space_id || "未設定"}</span>
     <span className="block">現在の仕事: {projection.current_work?.state || "待機"}</span>
-    <span className="block">Team: {projection.agent_team_id || "未設定"} / Profile: {projection.execution_profile_id || "未設定"}</span>
+    <span className="block">Execution Team: {projection.agent_team_id || "未設定"} / Profile: {projection.execution_profile_id || "未設定"}</span>
     {info && <><span className="block">有効な自動化: {info.active_rule_count ?? "非表示・未取得"} / 電話受付: {info.phone.route_count ?? "非表示・未取得"}</span>
       <span className="block">連携: {info.integration_readiness ? readinessLabels[info.integration_readiness.status] ?? "未確認" : "非表示・未取得"}</span>
       {info.uncertain_action_count !== null && info.uncertain_action_count > 0 && <span className="block font-medium text-amber-700 dark:text-amber-300">要確認 {info.uncertain_action_count}件 — 再実行禁止</span>}

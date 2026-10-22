@@ -7,7 +7,7 @@ import {
   type RefObject,
 } from "react";
 import type { useRouter } from "next/navigation";
-import { chatApi } from "@/lib/chat-api";
+import { chatApi, createStableClientSessionId } from "@/lib/chat-api";
 import type {
   ConversationMessage,
   ConversationSession,
@@ -81,6 +81,21 @@ function createDeepResearchClientMessageId(): string {
     return crypto.randomUUID();
   }
   return `deep-research-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+const UUID_CLIENT_MESSAGE_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function resolveClientSessionId(
+  clientMessageId: string,
+  sessionIdsByMessageId: Map<string, string>,
+): string {
+  if (UUID_CLIENT_MESSAGE_ID.test(clientMessageId)) return clientMessageId;
+  const existing = sessionIdsByMessageId.get(clientMessageId);
+  if (existing) return existing;
+  const created = createStableClientSessionId();
+  sessionIdsByMessageId.set(clientMessageId, created);
+  return created;
 }
 
 type FailureDetails = {
@@ -179,6 +194,8 @@ type UseDeepResearchMessageArgs = {
   dispatchChatTimeline: Dispatch<ChatTimelineAction>;
   dispatchGeneration: Dispatch<ChatGenerationEvent>;
   upsertSession: (session: ConversationSession) => void;
+  newSessionAgentId?: string | null;
+  onSessionAgentConsumed?: () => void;
 };
 
 /**
@@ -198,6 +215,8 @@ export function useDeepResearchMessage({
   dispatchChatTimeline,
   dispatchGeneration,
   upsertSession,
+  newSessionAgentId = null,
+  onSessionAgentConsumed,
 }: UseDeepResearchMessageArgs) {
   const draftUserId = useCurrentUserId();
   // A completed report must remain retryable when only its assistant-message
@@ -207,6 +226,9 @@ export function useDeepResearchMessage({
   const pendingAssistantPersistenceRef = useRef(
     new Map<string, PendingAssistantPersistence>(),
   );
+  // Retries of a provisional message with a non-UUID client id must send the
+  // same canonical client session id after an uncertain createSession result.
+  const clientSessionIdsByMessageIdRef = useRef(new Map<string, string>());
 
   const retryDeepResearchAssistantPersistence = useCallback(
     async (assistantClientMessageId: string): Promise<boolean> => {
@@ -332,14 +354,42 @@ export function useDeepResearchMessage({
         }
 
         if (!sessionId) {
-          const data = await chatApi.createSession(
-            await chatApi.getCurrentCharacterName(),
-            projectId,
-            undefined,
-            null,
-            generationReadyMain,
+          const researchCharacterName = await chatApi.getCurrentCharacterName();
+          const clientSessionId = resolveClientSessionId(
+            generationClientMessageId,
+            clientSessionIdsByMessageIdRef.current,
           );
+          const data = newSessionAgentId
+            ? await chatApi.createSession(
+                researchCharacterName,
+                projectId,
+                undefined,
+                null,
+                generationReadyMain,
+                newSessionAgentId,
+                clientSessionId,
+              )
+            : await chatApi.createSession(
+                researchCharacterName,
+                projectId,
+                undefined,
+                null,
+                generationReadyMain,
+                undefined,
+                clientSessionId,
+              );
+          if (
+            newSessionAgentId &&
+            data.session.agent_id !== newSessionAgentId
+          ) {
+            throw new Error(
+              "サーバーでAgent bindingを確認できなかったため、Deep Researchを開始しませんでした。",
+            );
+          }
           sessionId = data.session.id;
+          clientSessionIdsByMessageIdRef.current.delete(
+            generationClientMessageId,
+          );
           try {
             const applied = await applyPendingNewChatLlmSettingsToSession(
               sessionId,
@@ -389,6 +439,9 @@ export function useDeepResearchMessage({
           }
           addSession(data.session);
           upsertSession(data.session);
+          if (newSessionAgentId && data.session.agent_id === newSessionAgentId) {
+            onSessionAgentConsumed?.();
+          }
           activateSession(sessionId);
           const href = `/chat?s=${encodeURIComponent(sessionId)}`;
           if (!navigateChatSessionInPlace(href)) {
@@ -458,6 +511,10 @@ export function useDeepResearchMessage({
         failurePhase = "research-start";
         const started = await deepResearchApi.startJob({
           query: content,
+          // The same conversation message identity is also the server-side
+          // idempotency key, so an uncertain start retry replays this job.
+          client_request_id: generationClientMessageId,
+          strategy: "imozuru",
           mode: "detailed",
           max_iterations: 3,
           questions_per_iteration: 3,
@@ -716,6 +773,8 @@ export function useDeepResearchMessage({
       router,
       updateSidebarTitle,
       upsertSession,
+      newSessionAgentId,
+      onSessionAgentConsumed,
     ],
   );
 

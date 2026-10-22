@@ -21,6 +21,7 @@ services:
       OPENAI_COMPATIBLE_LOCAL_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-http://host.docker.internal:18080/v1}
       # Never let a known llama.cpp profile imply ownership of the router.
       LLAMA_CPP_AUTO_START: "false"
+      STRATA_AUTO_START: "false"
       OPENROUTER_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-https://openrouter.ai/api/v1}
       # Kept as a compatibility pass-through for older images.  An unset
       # value is intentional: model selection belongs to the provider-specific

@@ -289,7 +289,13 @@ export function writeChatLlmPreferences(
   return write;
 }
 
-/** サーバー候補から消えた/非表示になった選択を明示的にserver defaultへ正規化する。 */
+/**
+ * サーバー候補から一時的に消えた選択を保持する。
+ *
+ * カタログの取得失敗・空応答・provider側の廃止反映は、保存済みの
+ * provider/model を別の候補へ暗黙に置き換える根拠にならない。保持した
+ * response_model は再取得後にそのまま再評価でき、UIには状態だけを通知する。
+ */
 export function normalizeTargetAgainstServerOptions(
   target: ChatResponseTarget,
   options: readonly ChatResponseModelOption[],
@@ -305,11 +311,8 @@ export function normalizeTargetAgainstServerOptions(
   if (available) return { target, message: null };
 
   const rejectedLabel = `${target.responseModel.provider} / ${target.responseModel.model}`;
-  const current = options.find((option) => option.isCurrent);
   return {
-    target: { kind: "server" },
-    message: current
-      ? `${rejectedLabel} は現在利用できないため、サーバー既定（${current.providerLabel} / ${current.modelLabel}）へ戻しました。`
-      : `${rejectedLabel} は現在利用できないため、サーバー既定へ戻しました。`,
+    target,
+    message: `${rejectedLabel} は現在利用できない状態です。選択は保持しています。モデル一覧を更新してから送信してください。`,
   };
 }

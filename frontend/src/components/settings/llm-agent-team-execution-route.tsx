@@ -2,11 +2,16 @@
 
 import { useEffect, useMemo } from "react";
 import { AppSelect } from "@/components/ui/app-select";
+import { Badge } from "@/components/ui/badge";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   canonicalExecutionRoute,
+  executionRoutePresentation,
+  isJevRoute,
   reasoningEffortOptionsForModel,
   type ExecutionRoute,
   type LlmModelCatalogResponse,
+  type TeamExecutionProfile,
 } from "./llm-model-section-types";
 
 type RoutePreset = "inherit_same" | "inherit_lower" | "inherit_explicit" | "explicit_model";
@@ -175,6 +180,83 @@ function routeFromPreset(
   return explicitModelRoute(current, {}, catalog);
 }
 
+function routePolicyText(route: Partial<ExecutionRoute>): string {
+  if (route.inherit_model !== false) {
+    if (route.effort_policy === "lower") return "Main effortより1段下げる";
+    if (route.effort_policy === "explicit") return route.effort ? `effort ${route.effort}` : "effortを明示";
+    return route.effort_policy === "default" ? "Mainのモデル既定" : "Mainと同じ";
+  }
+  if (route.effort_policy === "explicit" && route.effort) return `effort ${route.effort}`;
+  return "モデル既定";
+}
+
+/** Compact, read-only route summary shared by the Settings surfaces. */
+export function ExecutionRouteSummary({
+  route,
+  mainProvider,
+  mainModel,
+  ariaLabel,
+}: {
+  route: Partial<ExecutionRoute> | null | undefined;
+  mainProvider?: string;
+  mainModel?: string;
+  ariaLabel?: string;
+}) {
+  if (isJevRoute(route)) return null;
+  const presentation = executionRoutePresentation(route, mainProvider, mainModel);
+  const routeText = presentation.backend === "free_team"
+    ? "Free Team"
+    : presentation.provider || presentation.model
+      ? `${presentation.provider || "(provider未設定)"} / ${presentation.model || "(model未設定)"}`
+      : "Main route未解決";
+  return (
+    <span className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground" aria-label={ariaLabel} data-route-backend={presentation.backend}>
+      <Badge variant="outline" className="px-1.5 py-0 text-[9px]">{presentation.label}</Badge>
+      <span>{routeText}</span>
+      <span>· {routePolicyText(route ?? {})}</span>
+    </span>
+  );
+}
+
+/** Read-only effective route list for the selected Team Execution Profile. */
+export function ExecutionProfileEffectiveRoutePreview({
+  profile,
+  subagents,
+  mainProvider,
+  mainModel,
+}: {
+  profile: TeamExecutionProfile;
+  subagents: Record<string, { name?: string }>;
+  mainProvider: string;
+  mainModel: string;
+}) {
+  const ids = Object.keys(subagents);
+  if (!ids.length) return null;
+  return (
+    <section className="space-y-1 rounded border border-border/70 bg-muted/20 p-2" aria-label="Effective route preview">
+      <div className="inline-flex items-center gap-1 text-[10px] font-medium">
+        Effective route preview
+        <HelpPopover label="Effective route preview">
+          このProfileを選んだ場合のSubagent別の解決結果（読み取り専用）です。
+        </HelpPopover>
+      </div>
+      <ul className="space-y-1">
+        {ids.map((subagentId) => {
+          const route = profile.overrides[subagentId] ?? profile.default_route;
+          const source = profile.overrides[subagentId] ? "Subagent override" : "Default Subagent Route";
+          return (
+            <li key={subagentId} className="space-y-0.5 text-[10px]">
+              <span className="font-medium">{subagents[subagentId]?.name || subagentId}</span>
+              <span className="ml-1 text-muted-foreground">· {source}</span>
+              <ExecutionRouteSummary route={route} mainProvider={mainProvider} mainModel={mainModel} ariaLabel={`${subagentId} effective route`} />
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 export function ExecutionRouteEditor({
   route,
   onChange,
@@ -194,11 +276,11 @@ export function ExecutionRouteEditor({
   mainModel: string;
 }) {
   const availableProviders = useMemo(
-    () => catalog.providers.filter((item) => item.selection_kind !== "routing_profile" && item.disabled !== true && item.unavailable !== true),
+    () => catalog.providers.filter((item) => item.selection_kind !== "routing_profile" && item.disabled !== true && item.unavailable !== true && !isJevRoute({ provider: item.id, model: item.label })),
     [catalog.providers],
   );
   const providerCatalog = availableProviders.find((item) => item.id === route.provider);
-  const modelCatalog = providerCatalog?.models ?? [];
+  const modelCatalog = (providerCatalog?.models ?? []).filter((item) => !isJevRoute({ provider: route.provider, model: item.id }));
   const inheritEffortValues = useMemo(
     () => inheritEffortChoices(catalog, route.effort, mainProvider, mainModel),
     [catalog, mainModel, mainProvider, route.effort],
@@ -206,6 +288,8 @@ export function ExecutionRouteEditor({
   const routeEffortValues = route.model
     ? routeEffortOptions(catalog, route.provider, route.model)
     : [];
+  const hiddenProviderRoute = isJevRoute({ provider: route.provider });
+  const hiddenModelRoute = isJevRoute({ provider: route.provider, model: route.model });
   const modelKnown = modelHasCatalogEntry(catalog, route.provider, route.model);
   const effortChoices = route.inherit_model ? inheritEffortValues : routeEffortValues;
   const preset = routePreset(route);
@@ -253,28 +337,28 @@ export function ExecutionRouteEditor({
             <span>プロバイダー</span>
             <AppSelect
               aria-label={`${ariaPrefix}のプロバイダー`}
-              value={route.provider}
+              value={hiddenProviderRoute ? "" : route.provider}
               onChange={(event) => onChange(explicitModelRoute(route, { provider: event.target.value, model: "" }, catalog))}
               disabled={disabled}
               className="h-8 w-full"
             >
               <option value="">プロバイダーを選択</option>
               {availableProviders.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-              {route.provider && !availableProviders.some((item) => item.id === route.provider) && <option value={route.provider}>現在の設定</option>}
+              {route.provider && !isJevRoute({ provider: route.provider }) && !availableProviders.some((item) => item.id === route.provider) && <option value={route.provider}>現在の設定</option>}
             </AppSelect>
           </label>
           <label className="space-y-1 text-[10px] text-muted-foreground">
             <span>モデル</span>
             <AppSelect
               aria-label={`${ariaPrefix}のモデル`}
-              value={route.model}
+              value={hiddenModelRoute ? "" : route.model}
               onChange={(event) => onChange(explicitModelRoute(route, { model: event.target.value }, catalog))}
               disabled={disabled || !route.provider}
               className="h-8 w-full"
             >
               <option value="">モデルを選択</option>
               {modelCatalog.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-              {route.model && !modelCatalog.some((item) => item.id === route.model) && <option value={route.model}>現在の設定</option>}
+              {route.model && !isJevRoute({ provider: route.provider, model: route.model }) && !modelCatalog.some((item) => item.id === route.model) && <option value={route.model}>現在の設定</option>}
             </AppSelect>
           </label>
         </div>
@@ -302,6 +386,7 @@ export function ExecutionRouteEditor({
       {showUnsupportedEffort && (
         <p className="text-[10px] text-muted-foreground">このモデルは推論の強さの明示指定に対応していません。</p>
       )}
+      <ExecutionRouteSummary route={route} mainProvider={mainProvider} mainModel={mainModel} ariaLabel={`${ariaPrefix}のeffective route`} />
     </div>
   );
 }

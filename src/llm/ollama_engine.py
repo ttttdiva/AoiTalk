@@ -28,7 +28,6 @@ from ..services.turn_context import (
     get_turn_context,
 )
 from ..services.user_settings_service import get_user_custom_instructions_sync
-from ..services.story_chat_context import run_story_chat_context_sync
 from ..services.outbound_privacy_service import EgressDescriptor, OutboundPrivacyGateway, PrivacyError
 from ..tools.adapters import OpenAIAPIAdapter
 from ..tools.registry import ToolRegistry
@@ -49,6 +48,7 @@ from .agent_runtime import (
     build_tool_hint_context_sync,
     compose_tool_hint_user_message,
     guard_tool_execution_claims,
+    dialogue_provider_wire_max_output_tokens,
     run_openai_tool_call_loop,
 )
 from .prompts import build_unified_instructions
@@ -60,8 +60,10 @@ from .provider_mode_adapters import (
 )
 from .conversation_context import (
     build_prompt_messages,
+    canonical_model_transcript_for_history,
     normalize_usage,
     persist_usage_sync,
+    project_prompt_cache_key,
     stable_cache_key,
 )
 from .openai_compatible_local_profiles import openai_compatible_server_profile
@@ -80,17 +82,18 @@ from .turn_stream_events import (
 )
 from .context_snapshot import (
     capture_context_manifest_before_context_clear,
-    context_bundle_components,
+    context_bundle_partition_components,
     context_manifest_metadata,
     openai_compatible_request_components,
     reconcile_snapshot,
     sanitized_snapshot_series,
     snapshot,
-    without_text_from_last_role,
+    without_text,
 )
 from .tool_exposure import filtered_registry_for_client
 from .tool_policy import (
     project_progress_review_active,
+    get_current_user_input,
     reset_current_user_input,
     set_current_user_input,
 )
@@ -104,6 +107,9 @@ _HELP_STREAM_PROVIDER_STATE_FIELDS = (
     "_last_tool_loop_messages",
     "_last_context_snapshots",
     "_current_context_bundle",
+    "_current_prompt_stable_context",
+    "_current_prompt_dynamic_context",
+    "_current_project_cache_revision",
     "_current_dynamic_context",
     "_current_dynamic_context_metadata",
     "_last_privacy_payload",
@@ -232,7 +238,6 @@ class OllamaClient:
         if (
             not self._lightweight_ephemeral_client
             and config
-            and _config_get(config, "use_tools", True)
         ):
             self._tool_registry = build_runtime_tool_registry_for_client(
                 build_runtime_tool_registry,
@@ -260,6 +265,9 @@ class OllamaClient:
         # this at every boundary so reused clients/provider switches cannot
         # carry a prior project's context into a new request.
         self._current_context_bundle: Optional[ContextBundle] = None
+        self._current_prompt_stable_context: list[tuple[str, str]] = []
+        self._current_prompt_dynamic_context: list[tuple[str, str]] = []
+        self._current_project_cache_revision: str = ""
         self._current_dynamic_context: list[tuple[str, str]] = []
         self._current_dynamic_context_metadata: dict[str, dict[str, Any]] = {}
         self.keep_alive = _config_get(config, "ollama.keep_alive", None)
@@ -379,7 +387,16 @@ class OllamaClient:
             if not isinstance(final_payload, dict):
                 raise PrivacyError("Ollama outbound payload is malformed")
             self._last_privacy_payload = dict(final_payload)
-            return self.client.chat.completions.create(**final_payload)
+            from .generation_budget import current_generation_budget, record_bounded_model_request
+            budget = current_generation_budget.get()
+            if budget is not None and budget.interruptible_transport:
+                from .bounded_completion import execute_interruptible_completion
+
+                budget.record_request(final_payload)
+                return execute_interruptible_completion(self.client, final_payload, budget)
+            budget = record_bounded_model_request(final_payload)
+            client = self.client.with_options(max_retries=0) if budget else self.client
+            return client.chat.completions.create(**final_payload)
 
         self._last_privacy_payload = dict(payload)
         return gateway.execute_sync(
@@ -434,14 +451,18 @@ class OllamaClient:
                 if context_bundle is not None
                 else self._context_bundle_for_turn()
             )
-            rendered_bundle, bundle_parts = context_bundle_components(bundle)
+            stable_bundle, dynamic_bundle, bundle_parts = (
+                context_bundle_partition_components(bundle)
+            )
             observed_messages = list(api_kwargs.get("messages") or [])
-            if rendered_bundle:
-                observed_messages = without_text_from_last_role(
-                    observed_messages,
-                    f"[Current ContextBundle]\n{rendered_bundle.strip()}",
-                    role="user",
-                )
+            for label, value in (
+                ("Stable Project Context", stable_bundle),
+                ("Current ContextBundle", dynamic_bundle),
+            ):
+                if value:
+                    observed_messages = without_text(
+                        observed_messages, f"[{label}]\n{value.strip()}"
+                    )
             dynamic_context = [
                 item
                 for item in (getattr(self, "_current_dynamic_context", []) or [])
@@ -549,11 +570,14 @@ class OllamaClient:
             self._last_model_transcript = []
             return
         source_messages = self._last_tool_loop_messages or messages
-        self._last_model_transcript = [
-            dict(message)
-            for message in source_messages
-            if message.get("role") in {"user", "assistant", "tool"}
-        ]
+        self._last_model_transcript = canonical_model_transcript_for_history(
+            [
+                dict(message)
+                for message in source_messages
+                if message.get("role") in {"user", "assistant", "tool"}
+            ],
+            current_user_input=get_current_user_input(),
+        )
         if response_text:
             self._last_model_transcript.append({"role": "assistant", "content": response_text})
         if callable(getattr(self.history_manager, "set_model_messages", None)):
@@ -586,12 +610,16 @@ class OllamaClient:
                 # disabled path uses the JSON loop/plain completion.  Neither
                 # path consumes the legacy textual ``[TOOL_CALL]`` syntax.
                 tool_protocol="native",
+                available_tool_names=(
+                    [item.name for item in filtered_registry_for_client(self, self._tool_registry).get_all()]
+                    if getattr(self, "_tool_registry", None) is not None else None
+                ),
             )
         except Exception as exc:
             logger.warning("[OllamaClient] Falling back to basic prompt: %s", exc)
             return f"あなたは{self.character_name}です。"
 
-    def _build_effective_system_prompt(self, story_context=None) -> str:
+    def _build_effective_system_prompt(self) -> str:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             # Ignore stale isolated/character overrides while the trusted
             # Guide-only Help turn is active.
@@ -606,8 +634,8 @@ class OllamaClient:
         override = str(getattr(self, "_system_prompt_override", "") or "").strip()
         if override:
             return override
-        if story_context:
-            return story_context.prompt
+        if getattr(self, "config", None):
+            self.system_prompt = self._build_system_prompt()
         return getattr(self, "system_prompt", "")
 
     def set_character(self, character_name: str) -> None:
@@ -668,12 +696,16 @@ class OllamaClient:
                 self._privacy_session_context["privacy_mode"] = str(
                     metadata.get("privacy_mode") or ""
                 )
-        self.system_prompt = self._build_system_prompt()
+        # Owner binding for lightweight controllers must not rebuild the
+        # ordinary character/user-settings prompt.
+        if not getattr(self, "_lightweight_ephemeral_client", False):
+            self.system_prompt = self._build_system_prompt()
 
     def _build_messages(
         self,
         user_input: str,
         *,
+        stable_context: Optional[list[tuple[str, str]]] = None,
         dynamic_context: Optional[list[tuple[str, str]]] = None,
     ) -> List[Dict[str, Any]]:
         suppress_automatic_context = bool(
@@ -695,6 +727,9 @@ class OllamaClient:
                     else getattr(self.history_manager, "summary", "")
                 ),
                 current_user_input=user_input,
+                stable_context=(
+                    [] if suppress_automatic_context else stable_context or []
+                ),
                 dynamic_context=(
                     [] if suppress_automatic_context else dynamic_context or []
                 ),
@@ -764,12 +799,28 @@ class OllamaClient:
                 break
         if not tool_hint_context and not suppress_automatic_context:
             tool_hint_context = self._build_tool_hint_context(user_input)
-        dynamic_context: list[tuple[str, str]] = []
-        bundle = None if suppress_automatic_context else self._context_bundle_for_turn()
-        rendered_bundle = bundle.render_for_prompt() if bundle else ""
-        if rendered_bundle:
-            dynamic_context.append(("Current ContextBundle", rendered_bundle))
-        if tool_hint_context:
+        stable_context = (
+            []
+            if suppress_automatic_context
+            else list(getattr(self, "_current_prompt_stable_context", []) or [])
+        )
+        dynamic_context = (
+            []
+            if suppress_automatic_context
+            else list(getattr(self, "_current_prompt_dynamic_context", []) or [])
+        )
+        if not dynamic_context and not suppress_automatic_context:
+            bundle = self._context_bundle_for_turn()
+            stable_block, dynamic_block = (
+                bundle.render_partitioned_for_prompt() if bundle else ("", "")
+            )
+            if stable_block and not stable_context:
+                stable_context.append(("Stable Project Context", stable_block))
+            if dynamic_block:
+                dynamic_context.append(("Current ContextBundle", dynamic_block))
+        if tool_hint_context and not any(
+            str(item[0]) == "Current tool hints" for item in dynamic_context
+        ):
             dynamic_context.append(("Current tool hints", tool_hint_context))
         return [
             *messages,
@@ -781,7 +832,8 @@ class OllamaClient:
                     else getattr(self.history_manager, "summary", "")
                 ),
                 current_user_input=self._build_json_tool_user_message(user_input),
-                dynamic_context=([] if suppress_automatic_context else dynamic_context),
+                stable_context=stable_context,
+                dynamic_context=dynamic_context,
             ),
         ]
 
@@ -792,6 +844,24 @@ class OllamaClient:
         max_tokens: Optional[int],
         tools_enabled: bool = True,
     ) -> Dict[str, Any]:
+        budget_user_input = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if isinstance(message, dict)
+                and str(message.get("role") or "") == "user"
+            ),
+            "",
+        )
+        projected_max_tokens = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=budget_user_input,
+            requested=max_tokens,
+        )
+        if projected_max_tokens is not None:
+            if projected_max_tokens <= 0:
+                raise ValueError("AgentDialogue provider budget is exhausted")
+            max_tokens = projected_max_tokens
         api_kwargs: Dict[str, Any] = {
             "model": self.model_name,
             "messages": messages,
@@ -823,20 +893,37 @@ class OllamaClient:
         if suppress_automatic_context:
             self._cache_key = None
         else:
-            self._cache_key = stable_cache_key(
+            self._cache_key = project_prompt_cache_key(
                 user_id=self._get_session_user_id(),
                 session_id=getattr(self, "current_session_id", None),
-                project_id=self.current_project_id,
+                project_id=(
+                    self.current_project_id or get_turn_context().project_id
+                ),
                 character=self.character_name,
                 model=self.model_name,
                 system_prompt=self.system_prompt,
                 tool_schemas=api_kwargs.get("tools", []),
                 provider="ollama",
+                stable_context=getattr(self, "_current_prompt_stable_context", []),
+                context_revision=getattr(self, "_current_project_cache_revision", ""),
                 branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
                 summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
                 server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
             )
 
+        payload_cap = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=budget_user_input,
+            requested=int(api_kwargs.get("max_tokens") or 0),
+            payload=api_kwargs,
+        )
+        if payload_cap is not None:
+            if payload_cap <= 0:
+                raise ValueError("AgentDialogue provider budget is exhausted")
+            api_kwargs["max_tokens"] = min(
+                int(api_kwargs.get("max_tokens") or payload_cap),
+                payload_cap,
+            )
         return api_kwargs
 
     def chat(
@@ -898,6 +985,9 @@ class OllamaClient:
             messages = [system_message, user_message]
         self._last_context_snapshots = []
         self._current_context_bundle = None
+        self._current_prompt_stable_context = []
+        self._current_prompt_dynamic_context = []
+        self._current_project_cache_revision = ""
         self._current_dynamic_context = []
         self._current_dynamic_context_metadata = {}
         api_kwargs = self._build_api_kwargs(messages, temperature, max_tokens)
@@ -924,6 +1014,8 @@ class OllamaClient:
             system_prompt = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         def create_extraction() -> Any:
             started_at = time.monotonic()
+            config = getattr(self, "config", None)
+            output_limit = config.get("runtime.target_max_output_tokens", 1200) if config else 1200
             response = self._execute_chat_request(
                 {
                     "model": self.model_name,
@@ -932,7 +1024,7 @@ class OllamaClient:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 1200,
+                    "max_tokens": min(1200, max(1, int(output_limit or 1200))),
                 },
             )
             self._capture_and_persist_usage(
@@ -1049,6 +1141,9 @@ class OllamaClient:
             self._sync_privacy_gateway()
             self._last_context_snapshots = []
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
             self._current_dynamic_context = []
             self._current_dynamic_context_metadata = {}
             api_kwargs = self._build_api_kwargs(
@@ -1102,17 +1197,6 @@ class OllamaClient:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()
-
-    def _get_story_chat_context_sync(self):
-        """Resolve the trusted StoryWritingSession for this conversation."""
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return None
-        if not self.current_session_id:
-            return None
-        return run_story_chat_context_sync(
-            self._run_async_sync,
-            str(self.current_session_id),
-        )
 
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
         # Request-scoped TurnContext wins over mutable provider fields.  The
@@ -1252,6 +1336,15 @@ class OllamaClient:
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
     ) -> Union[str, Generator[str, None, None]]:
+        projected_max_tokens = dialogue_provider_wire_max_output_tokens(
+            self,
+            user_input=user_input,
+            requested=max_tokens,
+        )
+        if projected_max_tokens is not None:
+            if projected_max_tokens <= 0:
+                raise ValueError("AgentDialogue provider budget is exhausted")
+            max_tokens = projected_max_tokens
         isolated_provider_state = (
             _snapshot_help_stream_provider_state(self)
             if bool(getattr(get_turn_context(), "suppress_automatic_context", False))
@@ -1287,6 +1380,9 @@ class OllamaClient:
             # Reused provider instances must never carry a prior turn's
             # ContextBundle into this request.
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
             self._current_dynamic_context = []
             self._current_dynamic_context_metadata = {}
             project_context = self._resolve_project_context_sync()
@@ -1318,21 +1414,24 @@ class OllamaClient:
             tool_hint_duration_ms = (
                 time.perf_counter() - tool_hint_started
             ) * 1000
+            stable_context: list[tuple[str, str]] = []
             dynamic_context: list[tuple[str, str]] = []
-            rendered_bundle = (
-                self._current_context_bundle.render_for_prompt()
+            stable_block, dynamic_block = (
+                self._current_context_bundle.render_partitioned_for_prompt()
                 if self._current_context_bundle
-                else ""
+                else ("", "")
             )
-            if rendered_bundle:
-                dynamic_context.append(
-                    (
-                        "Current ContextBundle",
-                        rendered_bundle,
-                    )
-                )
+            if stable_block:
+                stable_context.append(("Stable Project Context", stable_block))
+            if dynamic_block:
+                dynamic_context.append(("Current ContextBundle", dynamic_block))
             if tool_hint_context:
                 dynamic_context.append(("Current tool hints", tool_hint_context))
+            self._current_prompt_stable_context = list(stable_context)
+            self._current_prompt_dynamic_context = list(dynamic_context)
+            self._current_project_cache_revision = str(
+                getattr(self._current_context_bundle, "project_cache_revision", "") or ""
+            )
             self._current_dynamic_context = list(dynamic_context)
             self._current_dynamic_context_metadata = {
                 "Current ContextBundle": {"duration_ms": context_bundle_duration_ms},
@@ -1363,7 +1462,11 @@ class OllamaClient:
                         original_request=user_input,
                     ),
                     context=render_messages_for_review(
-                        self._build_messages(user_input, dynamic_context=dynamic_context)
+                        self._build_messages(
+                            user_input,
+                            stable_context=stable_context,
+                            dynamic_context=dynamic_context,
+                        )
                     ),
                     user_input=user_input,
                     initial_response=response_text,
@@ -1375,6 +1478,7 @@ class OllamaClient:
 
             messages = self._build_messages(
                 user_input,
+                stable_context=stable_context,
                 dynamic_context=dynamic_context,
             )
             if image_data and messages:
@@ -1490,6 +1594,9 @@ class OllamaClient:
                         capture_context_manifest_before_context_clear(self)
                 finally:
                     self._current_context_bundle = None
+                    self._current_prompt_stable_context = []
+                    self._current_prompt_dynamic_context = []
+                    self._current_project_cache_revision = ""
                     self._current_dynamic_context = []
                     self._current_dynamic_context_metadata = {}
                 if isolated_gateway_active:
@@ -1622,6 +1729,11 @@ class OllamaClient:
             )
             return response
         except Exception as exc:
+            from .generation_budget import current_generation_budget
+
+            budget = current_generation_budget.get()
+            if budget is not None:
+                budget.checkpoint()
             optional_keys = {"tools", "tool_choice", "reasoning_effort", "reasoning"}
             if not optional_keys.intersection(api_kwargs):
                 raise
@@ -1676,6 +1788,7 @@ class OllamaClient:
             return_result=True,
             config=self.config,
             user_input=user_input,
+            budget_client=self,
             event_callback=event_callback,
             restore_tool_arguments=self._privacy_gateway.restore_tool_arguments,
         )
@@ -1809,6 +1922,9 @@ class OllamaClient:
                     capture_context_manifest_before_context_clear(self)
             finally:
                 self._current_context_bundle = None
+                self._current_prompt_stable_context = []
+                self._current_prompt_dynamic_context = []
+                self._current_project_cache_revision = ""
                 self._current_dynamic_context = []
                 self._current_dynamic_context_metadata = {}
                 if hasattr(self, "_aoitalk_help_gateway_restore"):

@@ -27,6 +27,7 @@ import {
   isApiTimeoutError,
 } from "../lib/api-client";
 import { getToken, getTokenAuthScope } from "../lib/auth";
+import { isMobileReadOnlyDiagnosticsEnabled } from "../lib/read-only-diagnostics";
 import { randomId } from "./outbox";
 
 /** Compatibility retry limit for pre-journal rows. */
@@ -944,6 +945,7 @@ async function flushLegacyQueue(
 export async function flushPendingClipIngests(
   overrides: Partial<PendingClipIngestFlushDeps> = {},
 ): Promise<void> {
+  if (isMobileReadOnlyDiagnosticsEnabled()) return;
   const deps = { ...defaultFlushDeps, ...overrides };
   // Explicit legacy dependency injection is supported only for old callers.
   if (deps.reconcile === undefined || deps.ingest) {

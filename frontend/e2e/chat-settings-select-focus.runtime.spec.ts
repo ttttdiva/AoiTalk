@@ -21,7 +21,7 @@ const REQUIRED_SELECTS = [
   "Provider",
   "Model",
   "推論・LLMモード",
-  "Agent Team",
+  "Execution Team",
   "Execution Profile",
   "キャラクター",
 ] as const;
@@ -291,7 +291,7 @@ async function closeInnerIfOpen(page: Page) {
 async function ensureWritersTeamForMultipleProfiles(page: Page) {
   // Auto only exposes Execution Profile=None. Pick Writers first so the
   // profile list has None + Coding + Research before the contract runs.
-  const team = page.getByRole("combobox", { name: "Agent Team" });
+  const team = page.getByRole("combobox", { name: "Execution Team" });
   const profile = page.getByRole("combobox", { name: "Execution Profile" });
   await expect(team).toBeVisible();
   await expect(team).toBeEnabled();

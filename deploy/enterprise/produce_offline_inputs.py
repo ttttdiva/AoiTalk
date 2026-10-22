@@ -23,7 +23,7 @@ import tempfile
 
 from enterprise_release_common import (
     COMMIT, ContractError, atomic_json, binding_digest, file_records, hash_file,
-    no_links, publish_directory, read_json, regular_files, tree_digest,
+    no_links, preflight_publication, publish_directory, read_json, regular_files, tree_digest,
 )
 from offline_registry_source import RegistrySource
 
@@ -55,6 +55,9 @@ def inspect_source(handoff: Path) -> tuple[dict, Path]:
         raise ContractError("producer requires the canonical sanitized source tree")
     if manifest.get("target_build", {}).get("architecture") != "linux/amd64":
         raise ContractError("unsupported target build architecture")
+    dockerfile = (source / "Dockerfile").read_text(encoding="utf-8-sig")
+    if re.search(r"(?im)^[ \t]*#[ \t]*syntax[ \t]*=", dockerfile):
+        raise ContractError("offline handoff Dockerfile must use the bundled frontend without a syntax directive")
     files = regular_files(source)
     if not files or any(p.name == ".env" or p.suffix.lower() in {".gguf", ".safetensors", ".key", ".pem", ".pfx"} for p in files):
         raise ContractError("source violates the producer secret/model boundary")
@@ -102,13 +105,15 @@ class DockerProducer:
 
     @staticmethod
     def build_arguments(source: Path, output: Path, pins: list[dict], secret: Path, tag: str, iid: Path) -> list[str]:
-        dockerfile = (source / "Dockerfile").read_text(encoding="utf-8")
+        dockerfile = (source / "Dockerfile").read_text(encoding="utf-8-sig")
+        if re.search(r"(?im)^[ \t]*#[ \t]*syntax[ \t]*=", dockerfile):
+            raise ContractError("offline handoff Dockerfile must use the bundled frontend without a syntax directive")
         prefixes = set(re.findall(r"(?m)^ARG ([A-Z][A-Z0-9_]*)_OFFLINE_BUILD=0\s*$", dockerfile))
         if len(prefixes) != 1:
             raise ContractError("Dockerfile offline build argument is missing or ambiguous")
         prefix = prefixes.pop()
         args = ["buildx", "build", "--platform", "linux/amd64", "--pull=false", "--no-cache", "--network=none",
-                "--build-arg", "BUILDKIT_SYNTAX=dockerfile.v0", "--build-arg", f"{prefix}_OFFLINE_BUILD=1",
+                "--build-arg", f"{prefix}_OFFLINE_BUILD=1",
                 "--build-arg", "NPM_INSTALL_MODE=offline", "--build-context", f"offline-inputs={output}",
                 "--build-context", f"npm-cache={output / 'npm-cache'}", "--secret", f"id=nextauth_secret,src={secret}",
                 "--load", "--tag", tag, "--iidfile", str(iid), "--progress=plain"]
@@ -147,7 +152,77 @@ def verify_proof(root: Path, handoff: dict, source: Path) -> None:
         raise ContractError("producer closure proof is missing, failed, or bound to different inputs")
 
 
-def collect(handoff: Path, destination: Path, *, docker=None, registry=None) -> dict:
+
+def verify_completed_inputs(root: Path, handoff: Path) -> dict:
+    """Revalidate every byte and the proof against this exact source handoff."""
+    from offline_inputs import verify_companion
+
+    manifest, source = inspect_source(handoff)
+    if (manifest.get("offline_producer") or {}).get("version") != 1:
+        raise ContractError("handoff does not declare the supported producer contract")
+    root = no_links(root)
+    verify_proof(root, manifest, source)
+    document = read_json(root / "offline-build-manifest.json")
+    # A private synthetic embedded binding invokes the unchanged canonical
+    # consumer without editing the caller's handoff, source or checkpoint.
+    with tempfile.TemporaryDirectory(prefix="enterprise-input-verify-") as raw:
+        verify_root = Path(raw)
+        shutil.copytree(source, verify_root / "source")
+        check = dict(manifest)
+        check["offline_build"] = dict(manifest.get("offline_build", {}),
+            format=document["format"], version=1, enabled=True, mode="embedded", source_commit=manifest["source_commit"],
+            source_tree_sha256=tree_digest(source), handoff_binding_sha256=binding_digest(manifest),
+            manifest_sha256=hash_file(root / "offline-build-manifest.json"),
+            npm_lock_sha256=hash_file(source / "frontend/package-lock.json"), pyproject_sha256=hash_file(source / "pyproject.toml"))
+        atomic_json(verify_root / "bundle-manifest.json", check)
+        verify_companion(root, verify_root / "bundle-manifest.json")
+    return document
+
+
+def retain_completed_oci(staging: Path, pins: list[dict], parent: Path) -> Path | None:
+    """Keep only completed public OCI layouts as untrusted retry-cache input."""
+    if not pins:
+        return None
+    parent = no_links(parent)
+    if not parent.is_dir():
+        raise ContractError("OCI retry cache parent must be an existing directory")
+    layouts = []
+    seen = set()
+    for pin in pins:
+        name = pin.get("name", "")
+        if (not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name)
+                or name in seen or pin.get("oci_layout") != f"images/{name}"):
+            raise ContractError("invalid completed OCI layout")
+        seen.add(name)
+        layout = no_links(staging / "images" / name)
+        for child in layout.rglob("*"):
+            no_links(child)
+            if child.is_dir() and child.relative_to(layout).as_posix() not in {"blobs", "blobs/sha256"}:
+                raise ContractError("unexpected directory in completed OCI layout")
+        files = regular_files(layout)
+        names = {p.relative_to(layout).as_posix() for p in files}
+        if not {"index.json", "oci-layout"} <= names or any(
+                name not in {"index.json", "oci-layout"}
+                and not re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name) for name in names):
+            raise ContractError("unexpected file in completed OCI layout")
+        layouts.append((name, layout))
+    cache = Path(tempfile.mkdtemp(prefix=".enterprise-oci-retry-", dir=parent))
+    try:
+        images = cache / "images"
+        images.mkdir(mode=0o700)
+        for name, layout in layouts:
+            # Same-filesystem rename avoids another multi-GiB copy on failure.
+            # The existing cache consumer still re-fetches descriptors and hashes
+            # every copied blob; retaining bytes grants no release authority.
+            os.rename(layout, images / name)
+        return cache
+    except BaseException:
+        shutil.rmtree(cache, ignore_errors=True)
+        raise
+
+
+def collect(handoff: Path, destination: Path, *, docker=None, registry=None, blob_cache: Path | None = None,
+            failure_cache_parent: Path | None = None) -> dict:
     manifest, source = inspect_source(handoff)
     if (manifest.get("offline_producer") or {}).get("version") != 1:
         raise ContractError("handoff does not declare the supported producer contract")
@@ -156,8 +231,18 @@ def collect(handoff: Path, destination: Path, *, docker=None, registry=None) -> 
     if destination.exists() or source == destination or source in destination.parents or destination in source.parents:
         raise ContractError("producer output must be a new directory outside source")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    preflight_publication(destination.parent)
+    failure_cache_parent = no_links(failure_cache_parent or destination.parent)
+    if failure_cache_parent == source or source in failure_cache_parent.parents:
+        raise ContractError("OCI retry cache must remain outside source")
     docker = docker or DockerProducer()
-    registry = registry or RegistrySource()
+    if blob_cache is not None:
+        blob_cache = no_links(blob_cache)
+        if any(blob_cache == root or blob_cache in root.parents or root in blob_cache.parents for root in (source, destination)):
+            raise ContractError("OCI blob cache must not overlap source or output")
+        if registry is not None:
+            raise ContractError("OCI blob cache cannot be combined with a registry override")
+    registry = registry or RegistrySource(blob_cache=blob_cache)
     pins = [row for row in manifest.get("image_pins", []) if row.get("kind") in {"dependency", "build-base"}]
     if not pins or len({row["name"] for row in pins}) != len(pins):
         raise ContractError("invalid handoff image pin set")
@@ -165,8 +250,9 @@ def collect(handoff: Path, destination: Path, *, docker=None, registry=None) -> 
     if set(bases) != {"dockerfile-node", "dockerfile-python"}:
         raise ContractError("producer requires the exact Node/Python base set")
     staging = Path(tempfile.mkdtemp(prefix=".enterprise-collect-", dir=destination.parent))
+    image_pins = []
+    completed = False
     try:
-        image_pins = []
         for row in pins:
             print(f"[Enterprise producer] OCI: {row['name']}", flush=True)
             image_pins.append(registry.collect(row, staging))
@@ -187,7 +273,7 @@ def collect(handoff: Path, destination: Path, *, docker=None, registry=None) -> 
         atomic_json(staging / "offline-build-manifest.json", document)
         # Fail on opaque/incomplete OCI, .deb control/index metadata and wheels
         # before spending time in the real no-network production build.
-        from offline_inputs import validate_payload, verify_companion
+        from offline_inputs import validate_payload
         validate_payload(staging)
         docker.prove(source, staging, image_pins)
         if tree_digest(source) != source_hash:
@@ -201,29 +287,33 @@ def collect(handoff: Path, destination: Path, *, docker=None, registry=None) -> 
         if sum(row["size_bytes"] for row in document["files"]) > 64 * 1024**3:
             raise ContractError("complete companion exceeds the 64GiB safety limit")
         atomic_json(staging / "offline-build-manifest.json", document)
-        verify_proof(staging, manifest, source)
-        # Verify the complete source-bound consumer contract without changing
-        # the caller's manifest or source. The canonical packager subsequently
-        # binds the transport ZIP hash and filename.
-        with tempfile.TemporaryDirectory(prefix="enterprise-input-verify-") as raw:
-            verify_root = Path(raw)
-            shutil.copytree(source, verify_root / "source")
-            check = dict(manifest)
-            check["offline_build"] = dict(manifest.get("offline_build", {}),
-                format=document["format"], version=1, enabled=True, mode="embedded", source_commit=manifest["source_commit"],
-                source_tree_sha256=source_hash, handoff_binding_sha256=binding_digest(manifest),
-                manifest_sha256=hash_file(staging / "offline-build-manifest.json"),
-                npm_lock_sha256=hash_file(source / "frontend/package-lock.json"), pyproject_sha256=hash_file(source / "pyproject.toml"))
-            atomic_json(verify_root / "bundle-manifest.json", check)
-            verify_companion(staging, verify_root / "bundle-manifest.json")
+        verify_completed_inputs(staging, handoff)
+        completed = True
         # The release packager serializes its output directory. Refuse reuse;
         # never merge a failed attempt with a previous companion.
         if destination.exists():
             raise ContractError("producer output appeared during collection")
         publish_directory(staging, destination)
         return {"status": "complete", "source_commit": manifest["source_commit"], "manifest_sha256": hash_file(destination / "offline-build-manifest.json")}
+    except BaseException:
+        if completed:
+            # Publication may fail on the filesystem after the expensive proof.
+            # Keep the exact validated tree in place; retaining it must not rely
+            # on another rename, and must not split out its OCI layouts.
+            checkpoint = staging if staging.exists() else destination
+            print(f"[Enterprise producer] Validated input checkpoint retained: {checkpoint}",
+                  file=sys.stderr, flush=True)
+        else:
+            try:
+                cache = retain_completed_oci(staging, image_pins, failure_cache_parent)
+                if cache is not None:
+                    print(f"[Enterprise producer] OCI retry cache retained: {cache}", file=sys.stderr, flush=True)
+            except Exception as retention_error:
+                print("[Enterprise producer] OCI retry cache retention failed: "
+                      + type(retention_error).__name__, file=sys.stderr, flush=True)
+        raise
     finally:
-        if staging.exists():
+        if not completed and staging.exists():
             shutil.rmtree(staging)
 
 
@@ -233,9 +323,14 @@ def main() -> int:
     producer = sub.add_parser("collect")
     producer.add_argument("--handoff", required=True, type=Path)
     producer.add_argument("--output", required=True, type=Path)
+    producer.add_argument("--oci-blob-cache", type=Path,
+                          help="optional read-only previous producer directory; only SHA256/size-verified OCI config/layer bytes are reused")
     args = parser.parse_args()
     try:
-        result = collect(args.handoff, args.output)
+        if args.oci_blob_cache is None:
+            result = collect(args.handoff, args.output)
+        else:
+            result = collect(args.handoff, args.output, blob_cache=args.oci_blob_cache)
     except ContractError as exc:
         # ContractError messages are deliberately authored by this producer and
         # contain no command output, bearer token, or credential-bearing URL.

@@ -91,6 +91,8 @@ _PLATFORM_ATTRIBUTES: tuple[tuple[str, str], ...] = (
     ("patreon", "platform_patreon"),
     ("youtube", "platform_youtube"),
     ("instagram", "platform_instagram"),
+    ("fanza", "platform_fanza"),
+    ("tiktok", "platform_tiktok"),
 )
 
 

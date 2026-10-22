@@ -633,6 +633,16 @@ class KnowledgeCaptureWorker:
             elif status == "retryable":
                 retry = _target(candidate_module, ("retry_candidate",))
                 lease_token = _field(claim, "lease_token")
+                validation_code = _field(outcome, "validation_error_code")
+                validation_field = _field(outcome, "validation_error_field")
+                error_code = "capture_retryable_error"
+                error_message = _field(outcome, "reason")
+                if validation_code in {"malformed_json", "schema_validation_failed", "sensitive_output"}:
+                    from .knowledge_capture_contract import ResolutionKnowledgeValidationError, safe_resolution_validation_diagnostic
+
+                    safe_field = safe_resolution_validation_diagnostic(ResolutionKnowledgeValidationError("", field=validation_field))["field"]
+                    error_code = "capture_" + validation_code
+                    error_message = f"model output failed validation: {validation_code} field={safe_field}"
                 if retry is not None and lease_token:
                     await _invoke(
                         retry,
@@ -642,9 +652,9 @@ class KnowledgeCaptureWorker:
                             "worker_id": self.worker_id,
                             "lease_token": lease_token,
                             "expected_version": expected_version,
-                            "error_code": "capture_retryable_error",
+                            "error_code": error_code,
                             "error_message": _bounded_worker_text(
-                                _field(outcome, "reason"),
+                                error_message,
                                 512,
                                 "capture retryable error",
                             ),

@@ -4,7 +4,7 @@ OpenAI Codex CLI backend implementation.
 Usage: codex exec [--model MODEL] --json
 
 MCP: Codex CLI reads MCP config from ~/.codex/config.toml
-     No command-line option is available.
+     Runtime capability gates use configuration overrides to disable servers.
 """
 
 import base64
@@ -23,7 +23,12 @@ from ..generation_policy import (
     get_current_generation_policy,
 )
 from ..tool_policy import get_current_user_input, looks_like_managed_workspace_request
-from .base import CLIBackendBase, CLIEventCallback, CLISessionCapabilities
+from .base import (
+    CLIBackendBase,
+    CLIEventCallback,
+    CLIInvocationOptions,
+    CLISessionCapabilities,
+)
 from ..turn_stream_events import emit_assistant_text, emit_thinking
 
 logger = logging.getLogger(__name__)
@@ -67,6 +72,34 @@ def agent_team_cli_context(*, workspace_access: str = "read"):
     finally:
         _active_agent_team_cli.reset(token)
 
+
+def _resolve_sandbox(
+    *,
+    policy: Any,
+    agent_team_cli: dict[str, Any] | None,
+    managed_workspace_request: bool,
+    plain_generation: bool,
+) -> str:
+    """Return the ``--sandbox`` value for one Codex invocation."""
+    sandbox = (
+        str(agent_team_cli.get("workspace_access") or "read-only")
+        if agent_team_cli
+        else "read-only" if managed_workspace_request or plain_generation else os.getenv("CODEX_SANDBOX")
+    )
+    if agent_team_cli:
+        sandbox = "workspace-write" if sandbox == "write" else "read-only"
+    if sandbox is None:
+        sandbox = (
+            "workspace-write"
+            if (
+                policy.permission_policy == PermissionPolicy.AUTO_APPROVE
+                and not managed_workspace_request
+            )
+            else "read-only"
+        )
+    return sandbox.strip()
+
+
 _CODEX_ADAPTER_PREAMBLE = """\
 You are the model backend inside the AoiTalk app.
 Use the AoiTalk tools listed in the system context through the documented
@@ -82,7 +115,7 @@ the database directly. Use only the listed high-level AoiTalk tools.
 """
 
 _AGENT_TEAM_CLI_PREAMBLE = """\
-You are an Agent Team CLI worker inside AoiTalk.
+You are an Execution Team CLI worker inside AoiTalk.
 Use provider-native filesystem/search/shell/edit/test/build tools for the
 repository workspace within the assigned sandbox. Use the listed AoiTalk
 high-level tools for Docs, Tasks, Projects, Calendar, WBS, Memory, and
@@ -98,6 +131,10 @@ class CodexCLIBackend(CLIBackendBase):
     """Codex CLI backend implementation."""
 
     scoped_execution_delegate = True
+    provider_state_env_name = "CODEX_HOME"
+    provider_state_root_supported = True
+    # Codex owns repository file search/read/edit and shell natively.
+    native_repository_tools = True
 
     _native_sessions_available: Optional[bool] = None
 
@@ -119,6 +156,63 @@ class CodexCLIBackend(CLIBackendBase):
         self._stream_round = 0
         self._usage_event_index = 0
         self._pending_agent_message = None
+
+    def native_repository_capabilities_for_scope(self, scope: Any) -> frozenset:
+        """Native capabilities of the next invocation inside ``scope``.
+
+        Managed-workspace and plain generations remove Codex's shell entirely,
+        so nothing is native there.  Otherwise reads are native and edits/shell
+        become native only when the resolved sandbox is ``workspace-write``.
+        """
+        agent_team_cli = _active_agent_team_cli.get()
+        managed = looks_like_managed_workspace_request(get_current_user_input() or "")
+        plain = _active_disable_native_tools.get()
+        if agent_team_cli and not plain:
+            managed = False
+        if managed or plain:
+            return frozenset()
+        capabilities = {"read"}
+        sandbox = _resolve_sandbox(
+            policy=get_current_generation_policy(),
+            agent_team_cli=agent_team_cli,
+            managed_workspace_request=managed,
+            plain_generation=plain,
+        )
+        if (
+            sandbox == "workspace-write"
+            and str(getattr(scope, "workspace_access_level", "") or "") == "write"
+        ):
+            capabilities.update({"edit", "shell"})
+        return frozenset(capabilities)
+
+    # Codex's CLI has no setting that removes the independent apply_patch
+    # schema. shell_tool=false alone is not a complete filesystem/tool-free
+    # gate; do not claim its plain-generation mode enforces that contract.
+    # Upstream core/src/tools/spec_plan.rs registers ApplyPatchHandler from
+    # model_info independently of ShellTool; the CLI does not expose ToolPolicy.
+    supports_tool_free_capability_gates = False
+
+    def native_feature_gate_args(self, disabled_features) -> list[str] | None:
+        """Remove disabled native schemas and reject their direct invocation."""
+        # MCP tables merge with host configuration: mcp_servers={} cannot
+        # remove unenumerated host servers. There is no portable whole-MCP
+        # exclusion flag, so refuse before starting the native CLI.
+        if {"filesystem", "mcp"} & set(disabled_features):
+            return None
+        args: list[str] = []
+        if "search" in disabled_features:
+            args.extend(["-c", 'web_search="disabled"'])
+        if disabled_features:
+            # A native child must not reopen the disabled parent capability.
+            args.extend(["--disable", "multi_agent", "--disable", "multi_agent_v2"])
+        return args
+
+    def native_mcp_gate_args(self, blocked_servers) -> list[str] | None:
+        # enabled=false alone is invalid when the server is absent on the
+        # host. Supplying a transport can conflict with a merged HTTP/stdio
+        # entry. AoiTalk cannot prove the native host configuration matches
+        # its registry; refuse instead of modifying an unknown transport.
+        return None if blocked_servers else []
 
     def get_session_capabilities(self) -> CLISessionCapabilities:
         if self.__class__._native_sessions_available is None:
@@ -152,14 +246,44 @@ class CodexCLIBackend(CLIBackendBase):
                     return str(value).strip()
         return super().extract_native_session_id(raw_output)
 
+    def validate_invocation_options(self, options: CLIInvocationOptions) -> None:
+        super().validate_invocation_options(options)
+        if options.sandbox is not None:
+            if isinstance(options.sandbox, bool):
+                return
+            value = str(options.sandbox).strip().lower()
+            if value not in {
+                "native_default",
+                "restricted",
+                "standard",
+                "read-only",
+                "workspace-write",
+                "danger-full-access",
+                "on-request",
+                "never",
+            }:
+                raise ValueError(f"Codex CLI does not support sandbox mode: {options.sandbox}")
+        policy = options.effective_approval_policy
+        if policy in {"native_default", "standard"}:
+            return
+        if policy == "accept_edits":
+            raise ValueError("Codex CLI does not support accept_edits permission mode")
+        if policy not in {"on-request", "untrusted", "never"}:
+            raise ValueError(f"Codex CLI does not support approval policy: {policy}")
+
     def get_cli_command(self, prompt: str) -> List[str]:
         """Build a Codex CLI command."""
         policy = get_current_generation_policy()
+        options = self.get_invocation_options()
         managed_workspace_request = looks_like_managed_workspace_request(
             get_current_user_input() or ""
         )
         plain_generation = _active_disable_native_tools.get()
         agent_team_cli = _active_agent_team_cli.get()
+        if plain_generation:
+            # Tool-free generation is a stricter contract than an ambient
+            # Agent Team opt-in. It must never regain native tools.
+            agent_team_cli = None
         if agent_team_cli:
             # Agent Team CLI-native path is distinct from the normal managed
             # workspace path.  The provider still gets a sandbox, but native
@@ -167,11 +291,16 @@ class CodexCLIBackend(CLIBackendBase):
             managed_workspace_request = False
             plain_generation = False
         bin_path = os.getenv("CODEX_BIN", "codex")
+        if self._active_run_scope() is not None:
+            from ...security.wsl_bwrap_backend import scoped_codex_executable
+
+            bin_path = scoped_codex_executable(bin_path)
         action = str(getattr(self, "_active_native_session_action", "stateless"))
         session_id = str(getattr(self, "_active_native_session_id", "") or "").strip()
         cmd = [
             bin_path,
             "exec",
+            "--yolo",
             "--json",
             "--color",
             "never",
@@ -182,9 +311,9 @@ class CodexCLIBackend(CLIBackendBase):
             ephemeral = True
         if ephemeral:
             cmd.append("--ephemeral")
-        if policy.profile == GenerationProfile.CHAT or managed_workspace_request or plain_generation:
+        if options is None and (policy.profile == GenerationProfile.CHAT or managed_workspace_request or plain_generation):
             cmd.append("--ignore-rules")
-        if managed_workspace_request or plain_generation:
+        if options is None and (managed_workspace_request or plain_generation):
             # Managed workspace operations must be mediated by AoiTalk's
             # high-level tools.  A read-only sandbox still exposes Codex's
             # native shell for reads, so isolate this invocation from user
@@ -200,12 +329,33 @@ class CodexCLIBackend(CLIBackendBase):
                 ]
             )
 
-        model_override = _active_model_override.get()
-        model = (
-            str(model_override or "").strip()
-            if model_override is not _MODEL_OVERRIDE_UNSET
-            else self._model or os.getenv("CODEX_MODEL")
-        )
+        if options is None and plain_generation:
+            # Ignore user/project tool configuration and close optional host
+            # capabilities as well as the two shell implementations above.
+            for feature in (
+                "apps", "plugins", "remote_plugin", "computer_use", "browser_use",
+                "browser_use_external", "browser_use_full_cdp_access", "in_app_browser",
+                "multi_agent", "multi_agent_v2", "image_generation", "view_image",
+                "code_mode", "code_mode_host", "skill_search", "skill_mcp_dependency_install",
+                "hooks", "workspace_dependencies", "tool_suggest", "auth_elicitation",
+                "request_permissions_tool", "memories", "goals", "in_app_local_automation",
+            ):
+                cmd.extend(["--disable", feature])
+            cmd.extend([
+                "--enable", "skip_host_skill_discovery",
+                "-c", 'web_search="disabled"',
+                "-c", "project_doc_max_bytes=0",
+            ])
+
+        if options is not None:
+            model = str(options.model or "").strip()
+        else:
+            model_override = _active_model_override.get()
+            model = (
+                str(model_override or "").strip()
+                if model_override is not _MODEL_OVERRIDE_UNSET
+                else self._model or os.getenv("CODEX_MODEL")
+            )
         if model:
             cmd.extend(["--model", model])
 
@@ -213,38 +363,52 @@ class CodexCLIBackend(CLIBackendBase):
             cmd.extend(["--image", str(image_path)])
 
         reasoning_effort = (
-            self._reasoning_effort
-            if self._reasoning_effort is not None
-            else os.getenv("CODEX_REASONING_EFFORT")
+            options.effective_effort
+            if options is not None
+            else (
+                self._reasoning_effort
+                if self._reasoning_effort is not None
+                else os.getenv("CODEX_REASONING_EFFORT")
+            )
         )
         if reasoning_effort:
             cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
-        approval_policy = (
-            "never"
-            if policy.permission_policy == PermissionPolicy.AUTO_APPROVE
-            else os.getenv("CODEX_APPROVAL_POLICY")
-        )
+        if options is not None:
+            requested_policy = options.effective_approval_policy
+            approval_policy = {
+                "standard": "never",
+            }.get(requested_policy, requested_policy if requested_policy in {"never", "on-request", "untrusted"} else None)
+            if requested_policy == "native_default":
+                approval_policy = None
+        else:
+            approval_policy = (
+                "never"
+                if policy.permission_policy == PermissionPolicy.AUTO_APPROVE
+                else os.getenv("CODEX_APPROVAL_POLICY")
+            )
         if approval_policy:
             cmd.extend(["-c", f'approval_policy="{approval_policy.strip()}"'])
 
-        sandbox = (
-            str(agent_team_cli.get("workspace_access") or "read-only")
-            if agent_team_cli
-            else "read-only" if managed_workspace_request or plain_generation else os.getenv("CODEX_SANDBOX")
-        )
-        if agent_team_cli:
-            sandbox = "workspace-write" if sandbox == "write" else "read-only"
-        if sandbox is None:
-            sandbox = (
-                "workspace-write"
-                if (
-                    policy.permission_policy == PermissionPolicy.AUTO_APPROVE
-                    and not managed_workspace_request
-                )
-                else "read-only"
+        if options is not None:
+            if options.sandbox is None:
+                sandbox = "workspace-write" if options.effective_approval_policy == "standard" else None
+            elif isinstance(options.sandbox, bool):
+                sandbox = "workspace-write" if options.sandbox else "read-only"
+            else:
+                requested_sandbox = str(options.sandbox).strip().lower()
+                sandbox = {
+                    "restricted": "read-only",
+                    "standard": "workspace-write",
+                    "native_default": None,
+                }.get(requested_sandbox, requested_sandbox)
+        else:
+            sandbox = _resolve_sandbox(
+                policy=policy,
+                agent_team_cli=agent_team_cli,
+                managed_workspace_request=managed_workspace_request,
+                plain_generation=plain_generation,
             )
-        sandbox = sandbox.strip()
         if sandbox:
             cmd.extend(["--sandbox", sandbox])
 
@@ -617,6 +781,59 @@ class CodexCLIBackend(CLIBackendBase):
 
         return f"Codex CLI の実行に失敗しました: {error_message}"
 
+    def validate_success_output(self, raw_output: str, stderr: str) -> Optional[str]:
+        """Reject Codex JSON failure events and missing final messages."""
+
+        if self.get_invocation_options() is None:
+            return None
+        events: list[dict[str, Any]] = []
+        for line in str(raw_output or "").splitlines():
+            try:
+                value = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+        if not events:
+            self._set_cli_diagnostic(
+                status="failed",
+                state="failed",
+                error_code="codex_missing_final_message",
+            )
+            return "Codex CLI did not return a structured final message"
+        saw_agent_message = False
+        for event in events:
+            event_type = str(event.get("type") or "").lower()
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            item_type = str(item.get("type") or "").lower()
+            failed = event_type in {"error", "turn.failed", "turn_failure", "failed"}
+            failed = failed or item_type in {"error", "failure", "failed"}
+            failed = failed or str(item.get("status") or "").lower() in {"error", "failed", "failure"}
+            failed = failed or bool(event.get("error")) or bool(item.get("error"))
+            if failed:
+                self._set_cli_diagnostic(
+                    status="failed",
+                    state="failed",
+                    error_code="codex_turn_failed",
+                )
+                detail = (
+                    event.get("message")
+                    or (event.get("error") or {}).get("message")
+                    if isinstance(event.get("error"), dict)
+                    else event.get("error")
+                ) or item.get("error") or "Codex CLI reported a failed turn"
+                return f"Codex CLI reported a failed turn: {str(detail)[:1000]}"
+            if item_type == "agent_message" and isinstance(item.get("text"), str) and item.get("text", "").strip():
+                saw_agent_message = True
+        if events and not saw_agent_message:
+            self._set_cli_diagnostic(
+                status="failed",
+                state="failed",
+                error_code="codex_missing_final_message",
+            )
+            return "Codex CLI did not return a final agent message"
+        return None
+
     def _format_usage_limit_error(self, message: str) -> str:
         tail = message[len(_USAGE_LIMIT_PREFIX):]
         model, _, rest = tail.partition(". ")
@@ -646,6 +863,7 @@ class CodexCLIBackend(CLIBackendBase):
         ephemeral: Optional[bool] = None,
         model_override: object = _MODEL_OVERRIDE_UNSET,
         disable_native_tools: bool = False,
+        invocation_options: Optional[CLIInvocationOptions] = None,
     ):
         """Codex accepts one initial instruction stream, so pass it via stdin."""
         self._reset_stream_state()
@@ -656,26 +874,32 @@ class CodexCLIBackend(CLIBackendBase):
         if disable_native_tools:
             disable_native_tools_token = _active_disable_native_tools.set(True)
         policy = get_current_generation_policy()
+        raw_prompt = bool(invocation_options.raw_prompt) if invocation_options is not None else False
         combined_prompt = prompt
-        if system_context:
+        if system_context and not raw_prompt:
             combined_prompt = (
                 f"{system_context}\n\nUser request:\n{prompt}" if prompt else system_context
             )
-        if str(native_session_action or "stateless") != "resume":
+        if (
+            not raw_prompt
+            and str(native_session_action or "stateless") != "resume"
+            and not disable_native_tools
+        ):
             preamble = _AGENT_TEAM_CLI_PREAMBLE if _active_agent_team_cli.get() else _CODEX_ADAPTER_PREAMBLE
             combined_prompt = f"{preamble}\n\n{combined_prompt}"
 
         try:
             return super().execute_prompt(
-                "",
+                prompt if raw_prompt else "",
                 cwd=cwd,
                 timeout=timeout,
                 extra_args=extra_args,
-                system_context=combined_prompt,
+                system_context=(system_context if raw_prompt else combined_prompt),
                 event_callback=event_callback,
                 native_session_id=native_session_id,
                 native_session_action=native_session_action,
                 ephemeral=ephemeral,
+                invocation_options=invocation_options,
             )
         finally:
             if disable_native_tools_token is not None:

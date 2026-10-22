@@ -13,6 +13,7 @@ import { getSqlite } from "./client";
 import {
   hasPendingForegroundSqliteWrite,
   runBackgroundSqliteWrite,
+  runForegroundSqliteWrite,
 } from "./sqlite-write-coordinator";
 
 export type DocsSqliteAsyncStatement = {
@@ -53,17 +54,21 @@ export function docsSqliteAsyncAvailable(): boolean {
   }
 }
 
+async function executeDocsExclusiveTransaction<T>(
+  task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
+): Promise<T> {
+  let result!: T;
+  await asAsyncDatabase().withExclusiveTransactionAsync(async (tx) => {
+    result = await task(tx);
+  });
+  return result;
+}
+
 /** Run a Docs operation in one native SQLite transaction. */
 export function withDocsExclusiveTransaction<T>(
   task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
 ): Promise<T> {
-  return runBackgroundSqliteWrite(async () => {
-    let result!: T;
-    await asAsyncDatabase().withExclusiveTransactionAsync(async (tx) => {
-      result = await task(tx);
-    });
-    return result;
-  });
+  return runBackgroundSqliteWrite(() => executeDocsExclusiveTransaction(task));
 }
 
 class ForegroundSqliteWriteRequestedError extends Error {
@@ -79,29 +84,30 @@ function yieldIfForegroundWriteIsWaiting(): void {
   }
 }
 
-function foregroundYieldingTransaction(
+function guardedDocsTransaction(
   tx: DocsSqliteAsyncTransaction,
+  checkActive: () => void,
 ): DocsSqliteAsyncTransaction {
   const yielding: DocsSqliteAsyncTransaction = {
     getAllAsync: <T>(
       source: string,
       ...params: unknown[]
     ): Promise<T[]> => {
-      yieldIfForegroundWriteIsWaiting();
+      checkActive();
       return tx.getAllAsync<T>(source, ...params);
     },
     getFirstAsync: <T>(
       source: string,
       ...params: unknown[]
     ): Promise<T | null> => {
-      yieldIfForegroundWriteIsWaiting();
+      checkActive();
       return tx.getFirstAsync<T>(source, ...params);
     },
     runAsync: (
       source: string,
       ...params: unknown[]
     ): Promise<unknown> => {
-      yieldIfForegroundWriteIsWaiting();
+      checkActive();
       return tx.runAsync(source, ...params);
     },
   };
@@ -110,13 +116,13 @@ function foregroundYieldingTransaction(
     yielding.prepareAsync = async (
       source: string,
     ): Promise<DocsSqliteAsyncStatement> => {
-      yieldIfForegroundWriteIsWaiting();
+      checkActive();
       const statement = await tx.prepareAsync!(source);
       return {
         executeAsync: (
           params?: unknown[] | Record<string, unknown>,
         ): Promise<unknown> => {
-          yieldIfForegroundWriteIsWaiting();
+          checkActive();
           return statement.executeAsync(params);
         },
         // Resource cleanup must never be skipped merely because foreground
@@ -135,31 +141,44 @@ function foregroundYieldingTransaction(
  *
  * A foreground request causes the current native transaction to throw and
  * roll back at the next SQLite statement boundary. The coordinator then
- * executes the queued foreground write before this background transaction is
- * re-enqueued. No two SQLite writes run concurrently.
+ * executes the waiting foreground writes before one non-yielding retry. That
+ * retry joins the foreground FIFO: later polling writes cannot keep it from
+ * starting or repeatedly roll back its progress. No writes run concurrently.
+ * Interactive writes arriving during this retry wait for its atomic commit.
  *
  * Use only for callbacks whose externally visible effects are contained in
  * the SQLite transaction and therefore safe to repeat after rollback.
  */
 export async function withForegroundYieldingDocsExclusiveTransaction<T>(
   task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
+  assertActive: () => void = () => undefined,
 ): Promise<T> {
-  for (;;) {
-    try {
-      return await withDocsExclusiveTransaction(async (tx) => {
-        const result = await task(foregroundYieldingTransaction(tx));
-        // Close the small window between the final SQL statement and commit.
-        yieldIfForegroundWriteIsWaiting();
-        return result;
-      });
-    } catch (error) {
-      if (!(error instanceof ForegroundSqliteWriteRequestedError)) {
-        throw error;
-      }
-      // The failed exclusive transaction has rolled back. Re-enqueue the
-      // complete background transaction; coordinator priority lets the
-      // already-waiting foreground operation run first.
+  const attempt = async (
+    tx: DocsSqliteAsyncTransaction,
+    yieldToForeground: boolean,
+  ): Promise<T> => {
+    const checkActive = () => {
+      assertActive();
+      if (yieldToForeground) yieldIfForegroundWriteIsWaiting();
+    };
+    checkActive();
+    const result = await task(guardedDocsTransaction(tx, checkActive));
+    // Cancellation must roll back even when it arrives after the final SQL.
+    checkActive();
+    return result;
+  };
+  try {
+    return await withDocsExclusiveTransaction((tx) => attempt(tx, true));
+  } catch (error) {
+    if (!(error instanceof ForegroundSqliteWriteRequestedError)) {
+      throw error;
     }
+    // Native rollback has completed. Join behind already-waiting interactive
+    // writes, then finish exactly one atomic retry without voluntary rollback.
+    // Real SQLite/callback failures still reject and release the queue.
+    return runForegroundSqliteWrite(() =>
+      executeDocsExclusiveTransaction((tx) => attempt(tx, false)),
+    );
   }
 }
 

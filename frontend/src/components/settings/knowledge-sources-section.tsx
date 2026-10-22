@@ -24,6 +24,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 type SourceStatus = "created" | "syncing" | "synced" | "error" | string;
 
@@ -309,7 +310,7 @@ export function KnowledgeSourcesSection() {
 
   return (
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0" data-settings-surface="knowledge-sources">
-      <CardHeader className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]" onClick={handleExpand}>
+      <CardHeader className="cursor-pointer select-none border-b border-border dark:border-[#333335] px-3 py-3 transition-colors hover:bg-muted dark:bg-[#242426]" role="button" tabIndex={0} aria-expanded={expanded} data-settings-target-activation="knowledge-sources" onClick={handleExpand} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); handleExpand(); } }}>
         <CardTitle className="flex items-center justify-between gap-3 text-sm">
           <span className="flex min-w-0 items-center gap-2">
             <FileSearch className="size-4" />
@@ -364,17 +365,19 @@ export function KnowledgeSourcesSection() {
                   onChange={(event) => setGrowiName(event.target.value)}
                   placeholder="社内Wiki (GROWI)"
                 />
-                <Label className="text-xs text-muted-foreground">
-                  GROWIのURL（社内ネットワークから到達できるベースURL）
-                </Label>
+                <div className="inline-flex items-center gap-1">
+                  <Label className="text-xs text-muted-foreground">GROWIのURL</Label>
+                  <HelpPopover label="GROWIのURL">社内ネットワークから到達できるベースURLを指定します。</HelpPopover>
+                </div>
                 <Input
                   value={growiBaseUrl}
                   onChange={(event) => setGrowiBaseUrl(event.target.value)}
                   placeholder="https://wiki.example.co.jp"
                 />
-                <Label className="text-xs text-muted-foreground">
-                  APIトークン（GROWIの個人設定 &gt; API Token で発行）
-                </Label>
+                <div className="inline-flex items-center gap-1">
+                  <Label className="text-xs text-muted-foreground">APIトークン</Label>
+                  <HelpPopover label="GROWI APIトークン">GROWIの個人設定 &gt; API Token で発行したトークンを指定します。</HelpPopover>
+                </div>
                 <Input
                   type="password"
                   value={growiToken}

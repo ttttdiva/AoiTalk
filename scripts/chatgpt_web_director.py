@@ -57,14 +57,8 @@ def default_profile_dir() -> Path:
 
 def provider_python_candidates(root: Path) -> list[Path]:
     if sys.platform == "win32":
-        return [
-            root / "venv" / "Scripts" / "python.exe",
-            root / ".venv" / "Scripts" / "python.exe",
-        ]
-    return [
-        root / "venv" / "bin" / "python",
-        root / ".venv" / "bin" / "python",
-    ]
+        return [root / "venv" / "Scripts" / "python.exe"]
+    return [root / "venv" / "bin" / "python"]
 
 
 def current_has_playwright() -> bool:
@@ -107,7 +101,7 @@ def reexec_into_playwright() -> None:
                 "error": "playwright_missing",
                 "message": (
                     "Playwright 付き Python が見つかりません。"
-                    f" AOITALK_ROOT={root} の venv / .venv を確認してください。"
+                    f" AOITALK_ROOT={root} の venv を確認してください。"
                 ),
                 "aoitalk_root": str(root),
                 "python": sys.executable,

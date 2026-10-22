@@ -8,7 +8,9 @@ test.describe("設定セクションの初期表示", () => {
     await mockAuthenticatedApis(page);
   });
 
-  test("主要な設定本文を閉じて表示し、見出し操作で展開できる", async ({ page }) => {
+  test("主要な設定本文を閉じて表示し、見出し操作で展開できる", async ({
+    page,
+  }) => {
     let yomiStatusRequests = 0;
     await page.route("**/api/python-proxy/**", async (route) => {
       const url = new URL(route.request().url());
@@ -64,88 +66,99 @@ test.describe("設定セクションの初期表示", () => {
         });
         return;
       }
+      if (url.pathname === "/api/python-proxy/runtime/features") {
+        await route.fulfill({
+          json: {
+            features: {},
+            application_features: { entertainment: true },
+          },
+        });
+        return;
+      }
       await route.fallback();
     });
     await page.goto("/settings");
     expect(yomiStatusRequests).toBe(0);
-
-    const disclosureCard = page
-      .locator('button[aria-expanded]')
-      .filter({ hasText: "誤読リスク検出" })
-      .locator('xpath=ancestor::*[@data-slot="card"][1]');
-    const existingCompactCard = page
-      .locator('[data-slot="card-title"]')
-      .filter({ hasText: "埋め込みカード" })
-      .locator('xpath=ancestor::*[@data-slot="card"][1]');
-    const existingCompactTitle = existingCompactCard.locator('[data-slot="card-title"]');
-    const disclosureBox = await disclosureCard.boundingBox();
-    const existingCompactBox = await existingCompactCard.boundingBox();
-    const disclosureTriggerBox = await disclosureCard
-      .locator('button[aria-expanded]')
-      .boundingBox();
-    const disclosureTitleBox = await disclosureCard
-      .locator('button[aria-expanded] > span')
-      .boundingBox();
-    const existingCompactTitleBox = await existingCompactTitle.boundingBox();
-    expect(disclosureBox?.height).toBe(existingCompactBox?.height);
-    expect(disclosureTriggerBox?.height).toBe(
-      disclosureBox ? disclosureBox.height - 2 : undefined,
-    );
-    expect(disclosureTitleBox?.x).toBe(existingCompactTitleBox?.x);
+    await expect(
+      page
+        .getByRole("navigation", { name: "設定カテゴリ" })
+        .locator('[data-settings-target="admin"]'),
+    ).toBeVisible();
+    await expect(
+      page.locator(
+        '[data-settings-disclosure="true"][data-settings-target="pet"]',
+      ),
+    ).toBeVisible();
 
     const cases = [
       {
-        title: "よく使う設定",
-        body: page.getByRole("button", { name: "編集", exact: true }),
-      },
-      {
+        targetId: "yomi-linter",
         title: "誤読リスク検出",
-        body: page.getByText("誤読候補を検出します。読みの推測や原文の書換えは行いません。"),
+        body: page.getByText(
+          "誤読候補を検出します。読みの推測や原文の書換えは行いません。",
+        ),
       },
       {
+        targetId: "yomi-dictionary",
         title: "共通読み辞書",
         body: page.getByPlaceholder("表記（例: 魔王魂）"),
       },
       {
+        targetId: "yomi-candidates",
         title: "未解決の誤読候補",
         body: page.getByText("候補テスト", { exact: true }),
       },
       {
+        targetId: "editor-settings",
+        title: "埋め込みカード",
+        body: page.getByText("URL の既定表示", { exact: true }),
+      },
+      {
+        targetId: "pet",
+        title: "画面のペット",
+        body: page.getByRole("region", { name: "ペットの設定", exact: true }),
+      },
+      {
+        targetId: "task-notifications",
         title: "タスク通知",
         body: page.getByText("新規タスクの通知をデフォルトONにする"),
       },
       {
+        targetId: "restart-shortcut",
         title: "ショートカット",
         body: page.getByText("Alt+Shift+R でバックエンドを即時再起動"),
       },
       {
+        targetId: "remote-server",
         title: "外部AoiTalkサーバー接続",
         body: page.getByText("Enterpriseサーバーへの自動接続"),
       },
       {
+        targetId: "tool-permissions",
         title: "ツール権限",
         body: page.getByText("ファイル直接ツール"),
       },
       {
+        targetId: "mcp",
         title: "MCP",
         body: page.getByText("MCPを有効化"),
       },
     ];
 
     for (const item of cases) {
-      const trigger = page
-        .locator('button[aria-expanded]')
-        .filter({ hasText: item.title });
+      const trigger = page.locator(
+        `[data-settings-target-activation="${item.targetId}"], [data-settings-disclosure="true"][data-settings-target="${item.targetId}"] button[aria-expanded]`,
+      );
       await expect(trigger).toHaveAttribute("aria-expanded", "false");
       await expect(item.body).toHaveCount(0);
-      await trigger.click();
+      await trigger.click({ force: true });
       await expect(trigger).toHaveAttribute("aria-expanded", "true");
       await expect(item.body).toBeVisible();
       if (item.title === "誤読リスク検出") {
         expect(yomiStatusRequests).toBe(1);
         await expect(page.getByText("検出しきい値: 0.70")).toBeVisible();
       }
-      await trigger.click();
+      await trigger.click({ force: true });
       await expect(item.body).toHaveCount(0);
     }
   });

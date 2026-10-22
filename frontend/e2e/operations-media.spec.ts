@@ -18,7 +18,7 @@ function emptySlots() {
 }
 
 test.describe("Operations Media Persona", () => {
-  test("bare /operations is Overview and legacy tabs keep their query routes", async ({
+  test("explicit Overview and legacy tabs keep their query routes", async ({
     page,
   }) => {
     await addAuthCookie(page);
@@ -77,15 +77,21 @@ test.describe("Operations Media Persona", () => {
       },
     );
 
-    await page.goto("/operations");
+    await page.goto("/operations?tab=overview");
 
     await expect(page.getByTestId("operations-command-center")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Operations Map" })).toBeVisible();
 
     const operationsNavigation =
       page.getByRole("navigation", {
         name: "Operationsワークスペース",
       });
+
+    // Compact navigation keeps secondary routes in accessible groups.
+    for (const label of ["発信・制作", "外部案件"]) {
+      const group = operationsNavigation.locator("summary").filter({ hasText: label });
+      if (await group.isVisible()) await group.click();
+    }
 
     await expect(
       operationsNavigation.getByRole(

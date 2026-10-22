@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { toast } from "sonner";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -125,30 +126,26 @@ export function LlmProviderVisibilitySettings({
   }
 
   return (
-    <details className="rounded-md border">
-      <summary className="flex cursor-pointer items-center justify-between gap-2 p-3 text-xs font-medium">
-        <span className="min-w-0">
-          <span className="block truncate">ヘッダーのLLMプロバイダー表示</span>
-          <span className="mt-1 block text-[10px] text-muted-foreground">
-            管理者が全ユーザー共通の表示を管理
-          </span>
-        </span>
-        {saving && (
-          <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" />
-            保存中...
-          </span>
-        )}
-      </summary>
+    <div className="flex items-start rounded-md border">
+      <details className="min-w-0 flex-1">
+        <summary className="flex cursor-pointer items-center justify-between gap-2 rounded-l-md p-3 text-xs font-medium">
+          <span className="min-w-0 truncate">ヘッダーのLLMプロバイダー表示</span>
+          {saving && (
+            <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+              <Loader2 className="size-3 animate-spin" />
+              保存中...
+            </span>
+          )}
+        </summary>
 
-      <div className="space-y-3 border-t p-3">
-        <p className="text-[10px] text-muted-foreground">
-          チェックを外したプロバイダーは通常のチャット選択肢から非表示になります。
-          接続設定、APIキー、現在のモデル設定、API利用権限は変更されません。
-          {isAdmin ? "" : "（表示設定の変更は管理者のみ可能です。）"}
-        </p>
+        <div className="space-y-3 border-t p-3">
+          {!isAdmin ? (
+            <p className="text-[10px] text-muted-foreground">
+              表示設定の変更は管理者のみ可能です。
+            </p>
+          ) : null}
 
-        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="grid gap-2 sm:grid-cols-2">
           {providers.map((provider) => {
             const hidden = isProviderHidden(provider.id, {
               hidden_provider_ids: hiddenProviderIds,
@@ -179,8 +176,16 @@ export function LlmProviderVisibilitySettings({
               </div>
             );
           })}
+          </div>
         </div>
-      </div>
-    </details>
+      </details>
+      <span className="shrink-0 self-start p-2.5">
+        <HelpPopover label="ヘッダーのLLMプロバイダー表示">
+          <p>管理者が全ユーザー共通の表示を管理します。</p>
+          <p>チェックを外したプロバイダーは通常のチャット選択肢から非表示になります。</p>
+          <p>接続設定、APIキー、現在のモデル設定、API利用権限は変更されません。</p>
+        </HelpPopover>
+      </span>
+    </div>
   );
 }

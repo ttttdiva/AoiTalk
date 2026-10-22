@@ -426,44 +426,40 @@ class VoicevoxEngine:
                 self._set_audio_query_value(audio_query, 'intonation_scale', 'intonationScale', intonation)
                 self._set_audio_query_value(audio_query, 'volume_scale', 'volumeScale', volume)
                 
-                # Synthesize audio through the gateway as a separate request.
-                def send_synthesis(protected_payload: Any):
+                # The privacy gateway snapshots/reviews JSON. Passing the SDK
+                # AudioQuery (which owns an HTTP session) loses its methods during
+                # serialization and also cannot represent approved edits. Send
+                # only the wire query, then use precisely the approved mapping.
+                query_data = getattr(audio_query, "data", None)
+                if not isinstance(query_data, Mapping):
+                    dump = getattr(audio_query, "model_dump", None) or getattr(audio_query, "dict", None)
+                    query_data = dump(by_alias=True) if callable(dump) else None
+                if not isinstance(query_data, Mapping):
+                    raise PrivacyError("VOICEVOX audio query has no serializable data")
+
+                async def send_synthesis(protected_payload: Any):
                     if not isinstance(protected_payload, Mapping):
-                        raise PrivacyError(
-                            "VOICEVOX synthesis payload is malformed"
-                        )
+                        raise PrivacyError("VOICEVOX synthesis payload is malformed")
                     outbound_query = protected_payload.get("audio_query")
-                    if outbound_query is not audio_query:
-                        # ``audio_query`` is the object returned by the first
-                        # provider transaction.  A reviewer may redact scalar
-                        # fields in a mapping copy, but the SDK's synthesis
-                        # method requires that approved object; never fall
-                        # back to the pre-review value when it is omitted.
-                        if outbound_query is None:
-                            raise PrivacyError(
-                                "VOICEVOX synthesis audio query is unavailable"
-                            )
+                    if not isinstance(outbound_query, Mapping):
+                        raise PrivacyError("VOICEVOX synthesis audio query is unavailable")
                     try:
-                        outbound_speaker = int(
-                            protected_payload.get("speaker", speaker_id)
-                        )
-                    except (TypeError, ValueError) as exc:
-                        raise PrivacyError(
-                            "VOICEVOX synthesis speaker is invalid"
-                        ) from exc
-                    # The SDK method is bound to the query object returned by
-                    # ``create_audio_query``.  Preserve this exact approved
-                    # object rather than reaching back to raw request state.
-                    query_to_send = outbound_query
-                    synth = getattr(query_to_send, "synthesis", None)
-                    if not callable(synth):
-                        raise PrivacyError(
-                            "VOICEVOX synthesis audio query is not sendable"
-                        )
-                    return synth(speaker=outbound_speaker)
+                        outbound_speaker = int(protected_payload["speaker"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise PrivacyError("VOICEVOX synthesis speaker is invalid") from exc
+                    if self.session is None or self.session.closed:
+                        raise PrivacyError("VOICEVOX HTTP session is unavailable")
+                    async with self.session.post(
+                        f"{self.base_url}/synthesis",
+                        params={"speaker": outbound_speaker},
+                        json=dict(outbound_query),
+                        allow_redirects=False,
+                    ) as response:
+                        response.raise_for_status()
+                        return await response.read()
 
                 audio_data = await self._execute_async(
-                    {"speaker": speaker_id, "audio_query": audio_query},
+                    {"speaker": speaker_id, "audio_query": dict(query_data)},
                     action="tts.voicevox.synthesis",
                     path="/synthesis",
                     sender=send_synthesis,

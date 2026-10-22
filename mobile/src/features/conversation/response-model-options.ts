@@ -37,6 +37,7 @@ function modelLabel(model: LlmCatalogModelOption | undefined, fallback: string) 
 
 export function buildResponseModelOptions(
   catalog: LlmModelCatalogResponse,
+  savedResponseTarget?: { provider?: string | null; model?: string | null } | null,
 ): ChatResponseModelOption[] {
   // The server's global catalog metadata is the presentation authority used by
   // chat. Per-user visibility is legacy state and must not gate this projection.
@@ -44,6 +45,8 @@ export function buildResponseModelOptions(
   const deploymentHasRestrictions = hasDeploymentProviderRestrictions(deployment);
   const currentProvider = catalog.current.provider.trim();
   const currentModel = catalog.current.model.trim();
+  const savedProvider = savedResponseTarget?.provider?.trim() ?? "";
+  const savedModel = savedResponseTarget?.model?.trim() ?? "";
   const providers = new Map(
     catalog.providers.map((provider) => [normalizeProviderId(provider.id), provider]),
   );
@@ -56,12 +59,12 @@ export function buildResponseModelOptions(
   const targetProviderId =
     deployment?.fixed === true && effectiveProvider
       ? effectiveProvider
-      : normalizeProviderId(currentProvider) ?? currentProvider;
+      : normalizeProviderId(savedProvider || currentProvider) ?? (savedProvider || currentProvider);
   const targetProvider = providers.get(targetProviderId);
   const targetModel =
     deployment?.fixed === true && effectiveProvider && effectiveModel
       ? effectiveModel
-      : currentModel;
+      : savedModel || currentModel;
   const result: ChatResponseModelOption[] = [];
   const seen = new Set<string>();
 
@@ -95,6 +98,9 @@ export function buildResponseModelOptions(
         reasoningEffortOptions: [...model.reasoning_effort_options],
         reasoningEffortDefault: model.reasoning_effort_default,
         reasoningEffortKind: model.reasoning_effort_kind,
+      } : {}),
+      ...(typeof model?.supports_reasoning === "boolean" ? {
+        supportsReasoning: model.supports_reasoning,
       } : {}),
       label: isCurrent
         ? `${providerLabel} / ${displayModel} (現在)`
@@ -132,8 +138,20 @@ export function buildResponseModelOptions(
     const currentCatalogModel = currentCatalogModels.find(
       (model) => model.id === targetModel,
     );
-    if (currentCatalogModel) {
-      addOption(currentCatalogProvider, targetModel, currentCatalogModel);
+    const currentUnverifiedModel =
+      currentCatalogModel
+      ?? (currentCatalogProvider.availability?.state === "not_checked"
+        ? currentCatalogProvider.models?.find((model) => model.id === targetModel)
+        : undefined);
+    // A cloud provider's catalog may be stale, unavailable, or return an
+    // explicit empty list while the persisted selection is still the exact
+    // route the user asked to use. Keep that ID visible without inventing
+    // metadata; strict local runtimes remain fail-closed above.
+    const preserveCloudTarget =
+      !currentCatalogModel &&
+      !STRICT_RUNTIME_PROVIDERS.has(currentCatalogProvider.id.trim().toLowerCase());
+    if (currentUnverifiedModel || preserveCloudTarget) {
+      addOption(currentCatalogProvider, targetModel, currentUnverifiedModel);
     }
   }
 

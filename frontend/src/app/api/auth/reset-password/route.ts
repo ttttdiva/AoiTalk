@@ -1,5 +1,9 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
+import {
+  authResponse,
+  denyGatewayAuthFallback,
+} from "@/lib/server/browser-handoff";
 
 const MAX_RESET_TOKEN_LENGTH = 8192;
 const MAX_PASSWORD_LENGTH = 1024;
@@ -29,13 +33,25 @@ async function readResetPasswordInput(
 }
 
 export async function POST(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+
   const input = await readResetPasswordInput(request);
   if (!input) {
-    return Response.json({ detail: "入力が不正です" }, { status: 400 });
+    return authResponse(NextResponse.json({ detail: "入力が不正です" }, { status: 400 }));
   }
-  return proxyRequestToPythonApi(request, {
+  const response = await proxyRequestToPythonApi(request, {
     path: ["auth", "reset-password"],
     user: {},
     body: JSON.stringify(input),
   });
+  return authResponse(response);
+}
+
+export async function GET(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+  return authResponse(
+    new NextResponse(null, { status: 405, headers: { allow: "POST" } }),
+  );
 }

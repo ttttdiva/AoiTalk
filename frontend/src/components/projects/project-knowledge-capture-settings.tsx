@@ -9,6 +9,7 @@ import {
 } from "@/lib/knowledge-capture";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 type ProjectKnowledgeCaptureSettingsProps = {
   projectId: string;
@@ -107,13 +108,11 @@ export function ProjectKnowledgeCaptureSettings({
       data-testid="project-knowledge-capture-settings"
     >
       <CardHeader className="border-b border-border">
-        <CardTitle className="flex items-center gap-2 text-base font-semibold">
+        <CardTitle className="inline-flex items-center gap-2 text-base font-semibold">
           <Settings2 className="size-4" />
           解決ナレッジ化
+          <HelpPopover label="解決ナレッジ化">解決した作業から、再利用できる手順をこのProjectのDocs候補として整理します。</HelpPopover>
         </CardTitle>
-        <p className="text-sm text-muted-foreground">
-          解決した作業から、再利用できる手順をこのProjectのDocs候補として整理します。
-        </p>
       </CardHeader>
       <CardContent className="space-y-4 pt-5">
         {!canManageSettings ? (

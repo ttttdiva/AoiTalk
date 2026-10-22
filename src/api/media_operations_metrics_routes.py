@@ -198,6 +198,92 @@ class PatreonRevenueImportRequest(_MetricsCommandModel):
         return self
 
 
+class RevenueCostRecordCreateRequest(_MetricsCommandModel):
+    """Three cost categories allocated wholly to the selected revenue event."""
+
+    currency: str = Field(min_length=3, max_length=3, pattern=r"^[A-Za-z]{3}$")
+    source: Literal["manual", "imported"] = "manual"
+    basis: Literal["estimated", "settled"]
+    fee_amount: float | None = Field(default=None, strict=True, allow_inf_nan=False, ge=-1e12, le=1e12)
+    production_cost_amount: float | None = Field(default=None, strict=True, allow_inf_nan=False, ge=-1e12, le=1e12)
+    human_cost_amount: float | None = Field(default=None, strict=True, allow_inf_nan=False, ge=-1e12, le=1e12)
+    human_minutes: float | None = Field(default=None, strict=True, allow_inf_nan=False, ge=0, le=1e12)
+    missing_reasons: dict[str, str] = Field(default_factory=dict, max_length=4)
+    coverage_complete: bool = Field(default=False, strict=True)
+    coverage_note: str = Field(min_length=1, max_length=2000)
+    evidence: list[EvidenceRefRequest] = Field(min_length=1, max_length=32)
+    correction_of_id: str | None = None
+
+
+class CostEvidenceRefResponse(EvidenceRefRequest):
+    # Normalized URL evidence uses ref, unlike the command's url spelling.
+    ref: str | None = Field(default=None, max_length=4000)
+    evidence_hash: str
+
+
+class RevenueCostRecordResponse(RevenueCostRecordCreateRequest):
+    id: str
+    revenue_event_id: str
+    owner_user_id: str
+    project_id: str | None
+    revenue_event_hash: str
+    cost_entry_id: str | None
+    revision: int
+    attribution_method: Literal["direct_event"]
+    window_start: datetime
+    window_end: datetime
+    cost_hash: str
+    idempotency_key: str
+    created_by: str | None
+    created_at: datetime
+    cost_authority: str
+    profit_amount: float | None
+    profit_status: str
+    evidence: list[CostEvidenceRefResponse]
+
+
+class RevenueCostRecordHistoryResponse(_MetricsResponseModel):
+    items: list[RevenueCostRecordResponse]
+    effective: RevenueCostRecordResponse | None
+    has_more: bool
+
+
+class MediaCostEntryCreateRequest(RevenueCostRecordCreateRequest):
+    project_id: str | None = None
+    persona_ref: str = Field(min_length=1, max_length=164)
+    content_ref: str | None = Field(default=None, max_length=164)
+    window_start: datetime
+    window_end: datetime
+
+
+class MediaCostEntryResponse(MediaCostEntryCreateRequest):
+    id: str
+    entry_id: str
+    revision: int
+    owner_user_id: str
+    entry_hash: str
+    idempotency_key: str
+    created_by: str | None
+    created_at: datetime
+    evidence: list[CostEvidenceRefResponse]
+    allocation_status: Literal["unallocated", "allocated"]
+    allocated_revenue_event_id: str | None
+    unallocated_fee_amount: float | None
+    unallocated_production_cost_amount: float | None
+    unallocated_human_cost_amount: float | None
+    unallocated_human_minutes: float | None
+
+
+class MediaCostEntryHistoryResponse(_MetricsResponseModel):
+    items: list[MediaCostEntryResponse]
+    effective: MediaCostEntryResponse | None
+    has_more: bool
+
+
+class MediaCostEntryAllocateRequest(_MetricsCommandModel):
+    correction_of_id: str | None = None
+
+
 class LearningProposalCreateRequest(_MetricsCommandModel):
     project_id: str | None = None
     subject_type: Literal["persona", "account", "content", "publication", "experiment", "general"]
@@ -379,6 +465,36 @@ def create_media_operations_metrics_router(
         actor = await current_actor(request)
         return await _with_session(get_db_manager, lambda session: _invoke(media.get_revenue_event, session, actor, event_id))
 
+    @router.get("/revenue-events/{event_id}/cost-records", response_model=RevenueCostRecordHistoryResponse, operation_id="media_list_revenue_cost_records")
+    async def list_revenue_costs(event_id: str, request: Request, limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0), _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.list_revenue_cost_records, session, actor, event_id, limit=limit, offset=offset))
+
+    @router.post("/revenue-events/{event_id}/cost-records", response_model=RevenueCostRecordResponse, operation_id="media_create_revenue_cost_record")
+    async def create_revenue_cost(event_id: str, payload: RevenueCostRecordCreateRequest, request: Request, idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)], _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.create_revenue_cost_record, session, actor, event_id, **_dump(payload), idempotency_key=idempotency_key))
+
+    @router.get("/cost-entries", response_model=list[MediaCostEntryResponse], operation_id="media_list_cost_entries")
+    async def list_cost_entries(request: Request, persona_ref: str = Query(min_length=1, max_length=164), project_id: str | None = Query(default=None), limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0), _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.list_cost_entries, session, actor, persona_ref=persona_ref, project_id=project_id, limit=limit, offset=offset))
+
+    @router.post("/cost-entries", response_model=MediaCostEntryResponse, operation_id="media_create_cost_entry")
+    async def create_cost_entry(payload: MediaCostEntryCreateRequest, request: Request, idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)], _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.create_cost_entry, session, actor, **_dump(payload), idempotency_key=idempotency_key))
+
+    @router.get("/cost-entries/{entry_id}/history", response_model=MediaCostEntryHistoryResponse, operation_id="media_get_cost_entry_history")
+    async def cost_entry_history(entry_id: str, request: Request, limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0), _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.get_cost_entry_history, session, actor, entry_id, limit=limit, offset=offset))
+
+    @router.post("/revenue-events/{event_id}/cost-entries/{cost_entry_id}/allocate", response_model=RevenueCostRecordResponse, operation_id="media_allocate_cost_entry")
+    async def allocate_cost_entry(event_id: str, cost_entry_id: str, payload: MediaCostEntryAllocateRequest, request: Request, idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=255)], _: Any = Depends(require_auth_dependency)) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(media.allocate_cost_entry, session, actor, event_id, cost_entry_id, **_dump(payload), idempotency_key=idempotency_key))
+
     @router.get("/learning-proposals", response_model=list[ResponseObject], operation_id="media_list_learning_proposals")
     async def list_learning(request: Request, project_id: str | None = Query(default=None), limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0), _: Any = Depends(require_auth_dependency)) -> Any:
         actor = await current_actor(request)
@@ -406,6 +522,13 @@ __all__ = [
     "ExperimentResultCreateRequest",
     "ExperimentAnalysisRequest",
     "RevenueEventCreateRequest",
+    "RevenueCostRecordCreateRequest",
+    "RevenueCostRecordResponse",
+    "RevenueCostRecordHistoryResponse",
+    "MediaCostEntryCreateRequest",
+    "MediaCostEntryResponse",
+    "MediaCostEntryHistoryResponse",
+    "MediaCostEntryAllocateRequest",
     "PatreonRevenueImportRequest",
     "LearningProposalCreateRequest",
     "create_media_operations_metrics_router",

@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   useState,
@@ -12,18 +14,23 @@ import {
 import {
   Plus,
   Menu,
+  ListFilter,
   MessageSquare,
   Loader2,
+  CheckCircle2,
+  CircleAlert,
   MoreHorizontal,
   Trash2,
   Pencil,
+  Pin,
+  PinOff,
 } from "lucide-react";
 import {
   chatApi,
   type ConversationSession,
 } from "@/lib/chat-api";
 import { useProject } from "@/contexts/project-context";
-import { formatRelativeTime } from "@/lib/utils";
+import { cn, formatRelativeTime } from "@/lib/utils";
 import { toast } from "sonner";
 import { useChatSessions } from "@/contexts/chat-session-context";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
@@ -63,8 +70,15 @@ import {
   groupChatSessionsByProject,
   isChatSessionUnread,
   isChatSessionWorking,
+  filterChatSessionsByStatus,
+  getChatSessionHistoryStatus,
+  CHAT_HISTORY_STATUS_OPTIONS,
+  isChatHistoryStatusFilter,
+  readChatHistoryStatusFilter,
+  persistChatHistoryStatusFilter,
   sortChatSessions,
   type ChatHistoryView,
+  type ChatHistoryStatusFilter,
 } from "@/lib/chat-session-view";
 import {
   ChatSessionContextMenu,
@@ -126,7 +140,7 @@ function handleSidebarAnchorNavigation(
 
   event.preventDefault();
   if (!navigateChatSessionInPlace(href)) {
-    window.location.href = href;
+    window.location.href = withBasePath(href);
   }
 }
 
@@ -143,6 +157,7 @@ export function ChatSidebar() {
     sessionsError,
     addSession,
     removeSession,
+    markSessionRead,
     updateSession,
     updateSessionTitle,
   } = useChatSessions();
@@ -154,6 +169,8 @@ export function ChatSidebar() {
   const [sessionContextMenu, setSessionContextMenu] =
     useState<ChatSessionContextMenuState | null>(null);
   const [historyView, setHistoryView] = useState<ChatHistoryView>("timeline");
+  const [historyStatus, setHistoryStatus] =
+    useState<ChatHistoryStatusFilter>("all");
 
   useEffect(() => {
     const saved = readChatHistoryView();
@@ -161,8 +178,17 @@ export function ChatSidebar() {
   }, []);
 
   useEffect(() => {
+    const saved = readChatHistoryStatusFilter();
+    if (saved) setHistoryStatus(saved);
+  }, []);
+
+  useEffect(() => {
     persistChatHistoryView(historyView);
   }, [historyView]);
+
+  useEffect(() => {
+    persistChatHistoryStatusFilter(historyStatus);
+  }, [historyStatus]);
 
   useEffect(() => {
     setActiveSessionId(searchParamSessionId);
@@ -230,6 +256,40 @@ export function ChatSidebar() {
       }
     },
     [activeSessionId, router, removeSession],
+  );
+
+  const handleToggleSessionPin = useCallback(
+    async (session: ConversationSession) => {
+      const nextPinned = !session.is_pinned;
+      const optimisticChangedAt = new Date().toISOString();
+      updateSession(session.id, (current) => ({
+        ...current,
+        is_pinned: nextPinned,
+        pinned_at: nextPinned ? optimisticChangedAt : null,
+        pin_updated_at: optimisticChangedAt,
+      }));
+      try {
+        const response = await chatApi.updateSessionPinned(
+          session.id,
+          nextPinned,
+        );
+        updateSession(session.id, (current) => ({
+          ...current,
+          ...response.session,
+        }));
+        toast.success(nextPinned ? "会話をピン留めしました" : "ピン留めを解除しました");
+      } catch (err) {
+        console.error("セッションのピン状態更新エラー:", err);
+        updateSession(session.id, (current) => ({
+          ...current,
+          is_pinned: session.is_pinned,
+          pinned_at: session.pinned_at,
+          pin_updated_at: session.pin_updated_at,
+        }));
+        toast.error("ピン状態の更新に失敗しました");
+      }
+    },
+    [updateSession],
   );
 
   const closeTitleEditDialog = useCallback(() => {
@@ -308,28 +368,22 @@ export function ChatSidebar() {
     setSessionContextMenu(null);
   }, []);
 
-  const markSessionRead = useCallback(
-    (sessionId: string) => {
-      updateSession(sessionId, (session) => ({
-        ...session,
-        is_unread: false,
-      }));
-      void chatApi.markSessionRead(sessionId).catch(() => {
-        // 読み込み自体は継続し、次回の履歴取得でサーバー状態へ戻す。
-      });
-    },
-    [updateSession],
+  const statusFilteredSessions = useMemo(
+    () => filterChatSessionsByStatus(sessions, historyStatus),
+    [historyStatus, sessions],
   );
-
-  const sortedSessions = useMemo(() => sortChatSessions(sessions), [sessions]);
+  const sortedSessions = useMemo(
+    () => sortChatSessions(statusFilteredSessions),
+    [statusFilteredSessions],
+  );
 
   const projectNameById = useMemo(
     () => new Map(allProjects.map((project) => [project.id, project.name])),
     [allProjects],
   );
   const projectGroups = useMemo(
-    () => groupChatSessionsByProject(sessions, projectNameById),
-    [projectNameById, sessions],
+    () => groupChatSessionsByProject(statusFilteredSessions, projectNameById),
+    [projectNameById, statusFilteredSessions],
   );
   const visibleRows: Array<
     | { kind: "group"; key: string; label: string; count: number }
@@ -370,6 +424,48 @@ export function ChatSidebar() {
             <DropdownMenu>
               <DropdownMenuTrigger
                 className="flex size-6 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-container-high hover:text-primary"
+                aria-label={`履歴の状態で絞り込み（${CHAT_HISTORY_STATUS_OPTIONS.find((option) => option.value === historyStatus)?.label ?? "すべて"}）`}
+                title="履歴の状態で絞り込み"
+                data-testid="chat-history-status-filter"
+              >
+                <ListFilter className="size-4" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuLabel>履歴の状態</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  value={historyStatus}
+                  onValueChange={(value) => {
+                    if (isChatHistoryStatusFilter(value)) {
+                      setHistoryStatus(value);
+                    }
+                  }}
+                >
+                  {CHAT_HISTORY_STATUS_OPTIONS.map((option) => {
+                    const StatusIcon =
+                      option.value === "ready"
+                        ? CheckCircle2
+                        : option.value === "needs_attention"
+                          ? CircleAlert
+                          : option.value === "working"
+                            ? Loader2
+                            : ListFilter;
+                    return (
+                      <DropdownMenuRadioItem
+                        key={option.value}
+                        value={option.value}
+                        closeOnClick
+                      >
+                        <StatusIcon aria-hidden="true" />
+                        {option.label}
+                      </DropdownMenuRadioItem>
+                    );
+                  })}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className="flex size-6 items-center justify-center rounded text-text-secondary transition-colors hover:bg-surface-container-high hover:text-primary"
                 aria-label="表示方法"
                 title="表示方法"
               >
@@ -401,7 +497,9 @@ export function ChatSidebar() {
             )}
             {!sessionsError && sortedSessions.length === 0 && (
               <li className="px-4 py-6 text-center text-xs text-muted-foreground">
-                会話がありません
+                {historyStatus === "all"
+                  ? "会話がありません"
+                  : "この状態の会話はありません"}
               </li>
             )}
             {!sessionsError &&
@@ -420,6 +518,15 @@ export function ChatSidebar() {
                   : null;
                 const isWorking = isChatSessionWorking(s);
                 const isUnread = isChatSessionUnread(s, activeSessionId);
+                const sessionStatus = getChatSessionHistoryStatus(s);
+                const SessionStatusIcon =
+                  sessionStatus === "ready"
+                    ? CheckCircle2
+                    : sessionStatus === "needs_attention"
+                      ? CircleAlert
+                      : isWorking
+                        ? Loader2
+                        : MessageSquare;
                 return (
                   <SidebarMenuItem
                     key={s.id}
@@ -441,13 +548,26 @@ export function ChatSidebar() {
                       }
                       className="group/session-item h-auto min-h-10 rounded-md border-l-2 border-transparent px-2 py-1.5 text-on-surface-variant data-active:!border-primary data-active:!bg-surface-slate data-active:!font-medium data-active:!text-on-surface data-active:!shadow-none data-active:hover:!bg-surface-slate hover:bg-surface-container hover:text-on-surface"
                     >
-                      {isWorking ? (
-                        <Loader2
-                          className="size-4 shrink-0 animate-spin text-sky-400 group-data-active/menu-button:!text-primary"
-                          aria-label="エージェントが作業中"
+                      <SessionStatusIcon
+                        className={cn(
+                          "size-4 shrink-0 group-data-active/menu-button:!text-primary",
+                          isWorking && "animate-spin text-sky-400",
+                        )}
+                        aria-label={
+                          sessionStatus === "working"
+                            ? "処理中"
+                            : sessionStatus === "ready"
+                              ? "準備完了"
+                              : sessionStatus === "needs_attention"
+                                ? "要確認"
+                                : undefined
+                        }
+                      />
+                      {s.is_pinned && (
+                        <Pin
+                          className="size-3.5 shrink-0 text-primary"
+                          aria-label="ピン留め済み"
                         />
-                      ) : (
-                        <MessageSquare className="size-4 shrink-0 group-data-active/menu-button:!text-primary" />
                       )}
                       {isUnread && (
                         <span
@@ -479,6 +599,20 @@ export function ChatSidebar() {
                         <MoreHorizontal className="size-4" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent side="right" align="start">
+                        <DropdownMenuItem
+                          mnemonic="P"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleToggleSessionPin(s);
+                          }}
+                        >
+                          {s.is_pinned ? (
+                            <PinOff className="mr-2 size-4" />
+                          ) : (
+                            <Pin className="mr-2 size-4" />
+                          )}
+                          {s.is_pinned ? "ピン留めを解除" : "ピン留め"}
+                        </DropdownMenuItem>
                         <DropdownMenuItem
                           mnemonic="E"
                           onClick={(e) => {
@@ -512,6 +646,7 @@ export function ChatSidebar() {
         menu={sessionContextMenu}
         onClose={closeSessionContextMenu}
         onRename={handleOpenTitleEdit}
+        onTogglePin={handleToggleSessionPin}
         onDelete={handleDeleteSession}
       />
       <Dialog

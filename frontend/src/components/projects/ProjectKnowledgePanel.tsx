@@ -12,7 +12,8 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { AppSelect } from "@/components/ui/app-select";
 
@@ -279,10 +280,10 @@ export function ProjectKnowledgePanel({
           <span>関連Docs /</span>
           <span>Project Knowledge</span>
           {projectName ? <span className="max-w-full truncate text-sm font-normal text-muted-foreground">{projectName}</span> : null}
+          <HelpPopover label="Project Knowledge">
+            このタブはプロジェクトで参照するDocsの索引です。本文はDocsで管理し、ここでは正本Docsと関連資料の参照だけを整理します。
+          </HelpPopover>
         </CardTitle>
-        <CardDescription>
-          このタブはプロジェクトで参照するDocsの索引です。本文はDocsで管理し、ここでは正本Docsと関連資料の参照だけを整理します。
-        </CardDescription>
         <div className="flex flex-wrap gap-2 pt-1 text-xs text-muted-foreground" data-testid="project-knowledge-summary">
           <span className="rounded-full border border-border px-2 py-0.5">
             正本Docs: {canonical.length > 0 ? `${canonical.length}件` : "未設定"}
@@ -301,12 +302,14 @@ export function ProjectKnowledgePanel({
 
         <section aria-labelledby="project-knowledge-canonical-heading" className="space-y-2">
           <div className="flex items-center justify-between gap-2">
-            <h3 id="project-knowledge-canonical-heading" className="text-sm font-semibold">Canonical Project Information</h3>
+            <h3 id="project-knowledge-canonical-heading" className="inline-flex items-center gap-1 text-sm font-semibold">
+              Canonical Project Information
+              <HelpPopover label="Canonical Project Information">
+                案件情報タブに紐づく唯一の正本Docsです。ここでは参照先を確認し、編集はDocsで行います。
+              </HelpPopover>
+            </h3>
             <Badge variant="outline">read-only</Badge>
           </div>
-          <p className="text-xs leading-5 text-muted-foreground">
-            案件情報タブに紐づく唯一の正本Docsです。ここでは参照先を確認し、編集はDocsで行います。
-          </p>
           {loading ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />読み込み中…</p>
           ) : canonical.length === 0 ? (
@@ -330,12 +333,15 @@ export function ProjectKnowledgePanel({
 
         <section aria-labelledby="project-knowledge-related-heading" className="space-y-3">
           <div className="flex items-center justify-between gap-2">
-            <h3 id="project-knowledge-related-heading" className="text-sm font-semibold">関連Docs</h3>
+            <h3 id="project-knowledge-related-heading" className="inline-flex items-center gap-1 text-sm font-semibold">
+              関連Docs
+              <HelpPopover label="関連Docs">
+                <p>Project Knowledgeは別のDocs本文ではなく、再利用する資料への参照インデックスです。関連付けを外してもDocs自体は削除されません。</p>
+                <p>このプロジェクトのメンバーは関連Docsの索引を閲覧できます。編集にはmanage_settings権限が必要です。</p>
+              </HelpPopover>
+            </h3>
             {!canManageSettings ? <Badge variant="outline">read-only</Badge> : null}
           </div>
-          <p className="text-xs leading-5 text-muted-foreground">
-            Project Knowledgeは別のDocs本文ではなく、再利用する資料への参照インデックスです。関連付けを外してもDocs自体は削除されません。
-          </p>
 
           {canManageSettings ? (
             <div className="space-y-3 rounded-md border border-dashed border-border p-3" data-testid="project-knowledge-attach-form">
@@ -409,9 +415,7 @@ export function ProjectKnowledgePanel({
                 </div>
               ) : null}
             </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">このプロジェクトのメンバーは関連Docsの索引を閲覧できます。編集にはmanage_settings権限が必要です。</p>
-          )}
+          ) : null}
 
           {related.length === 0 ? (
             <p className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted-foreground">

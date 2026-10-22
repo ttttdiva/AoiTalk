@@ -3,6 +3,7 @@ import { SignJWT } from "jose";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { SESSION_COOKIE_NAME } from "../src/lib/session-cookie";
 
 function readEnvValue(key: string) {
   const envPath = resolve(process.cwd(), ".env");
@@ -36,7 +37,7 @@ test("opens a conversation from sidebar history", async ({ page }) => {
   const token = await createSessionToken("user-1");
   await page.context().addCookies([
     {
-      name: "aoitalk_session",
+      name: SESSION_COOKIE_NAME,
       value: token,
       domain: "127.0.0.1",
       path: "/",
@@ -158,14 +159,6 @@ test("opens a conversation from sidebar history", async ({ page }) => {
           ],
         },
       });
-      return;
-    }
-
-    if (
-      url.pathname ===
-      `/api/python-proxy/scenarios/logs/by-conversation/${sessionId}`
-    ) {
-      await route.fulfill({ json: null });
       return;
     }
 

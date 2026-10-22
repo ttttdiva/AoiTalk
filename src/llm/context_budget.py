@@ -66,6 +66,7 @@ def resolve_context_budget(
     api_key: str | None = None,
     requested_max_tokens: int | None = None,
     override_context_window_tokens: int | None = None,
+    response_tokens_override: int | None = None,
 ) -> ContextBudget:
     """Resolve the active context window and convert it to character budgets."""
     if override_context_window_tokens:
@@ -77,6 +78,7 @@ def resolve_context_budget(
             config=config,
             provider_key=provider_key,
             requested_max_tokens=requested_max_tokens,
+            response_tokens_override=response_tokens_override,
         )
 
     explicit = _configured_context_window_tokens(config, provider_key)
@@ -87,6 +89,37 @@ def resolve_context_budget(
             config=config,
             provider_key=provider_key,
             requested_max_tokens=requested_max_tokens,
+            response_tokens_override=response_tokens_override,
+        )
+
+    managed_context = _managed_llama_cpp_context_window_tokens(
+        config=config,
+        provider_key=provider_key,
+        model_name=model_name,
+    )
+    if managed_context:
+        return build_context_budget(
+            context_window_tokens=managed_context,
+            source="config",
+            config=config,
+            provider_key=provider_key,
+            requested_max_tokens=requested_max_tokens,
+            response_tokens_override=response_tokens_override,
+        )
+
+    strata_context = _managed_strata_context_window_tokens(
+        config=config,
+        provider_key=provider_key,
+        model_name=model_name,
+    )
+    if strata_context:
+        return build_context_budget(
+            context_window_tokens=strata_context,
+            source="config",
+            config=config,
+            provider_key=provider_key,
+            requested_max_tokens=requested_max_tokens,
+            response_tokens_override=response_tokens_override,
         )
 
     # The official OpenAI model API does not return context limits.  Consult
@@ -101,6 +134,7 @@ def resolve_context_budget(
                 config=config,
                 provider_key=provider_key,
                 requested_max_tokens=requested_max_tokens,
+                response_tokens_override=response_tokens_override,
             )
 
     if _probe_enabled(config, provider_key):
@@ -117,6 +151,7 @@ def resolve_context_budget(
                 config=config,
                 provider_key=provider_key,
                 requested_max_tokens=requested_max_tokens,
+                response_tokens_override=response_tokens_override,
             )
 
     return build_context_budget(
@@ -125,6 +160,7 @@ def resolve_context_budget(
         config=config,
         provider_key=provider_key,
         requested_max_tokens=requested_max_tokens,
+        response_tokens_override=response_tokens_override,
     )
 
 
@@ -135,6 +171,7 @@ def build_context_budget(
     config: Any = None,
     provider_key: str = "openai_compatible_local",
     requested_max_tokens: int | None = None,
+    response_tokens_override: int | None = None,
 ) -> ContextBudget:
     window = _bounded_context_tokens(context_window_tokens)
     response_tokens = _response_tokens(
@@ -142,6 +179,7 @@ def build_context_budget(
         provider_key=provider_key,
         requested_max_tokens=requested_max_tokens,
         context_window_tokens=window,
+        response_tokens_override=response_tokens_override,
     )
     safety_tokens = max(384, int(window * 0.06))
     input_tokens = max(1024, window - response_tokens - safety_tokens)
@@ -172,6 +210,28 @@ def build_context_budget(
         history_message_chars=history_message_chars,
         suppress_parent_tools_after_tool_hints=suppress_parent_tools,
     )
+
+
+TOOL_GENERATION_ALLOWANCE_TOKENS = 4096
+
+
+def completion_allowance_tokens(
+    budget: ContextBudget,
+    prompt_tokens: int,
+    *,
+    ceiling: int = TOOL_GENERATION_ALLOWANCE_TOKENS,
+) -> int:
+    """Completion tokens that fit after the actual prompt, bounded by ``ceiling``.
+
+    ``budget.response_tokens`` is only the prompt-planning reserve.  This is
+    the wire allowance: the real payload (messages + tool schemas), this
+    allowance and the safety margin must fit the context window.  There is no
+    floor: an overfull prompt yields 0 so the caller can compact or fail
+    before sending instead of overrunning the window.
+    """
+    safety_tokens = max(384, int(budget.context_window_tokens * 0.06))
+    available = budget.context_window_tokens - safety_tokens - max(0, prompt_tokens)
+    return max(0, min(ceiling, available))
 
 
 def clip_text(text: str, max_chars: int | None) -> str:
@@ -259,6 +319,138 @@ def _configured_context_window_tokens(config: Any, provider_key: str) -> int | N
     return None
 
 
+def _managed_llama_cpp_context_window_tokens(
+    *,
+    config: Any,
+    provider_key: str,
+    model_name: str | None,
+) -> int | None:
+    """Resolve the effective context for a known, AoiTalk-managed llama.cpp target.
+
+    ``resolve_context_budget`` runs before a managed server is guaranteed to be
+    online.  Keep this path pure: it only reads the same environment, nested
+    settings, and trusted profile metadata used by the launch resolver.  A
+    known model ID alone is insufficient because the same OpenAI-compatible
+    provider can point at an operator-owned endpoint.
+    """
+    if provider_key != "openai_compatible_local":
+        return None
+
+    configured_provider = str(
+        _config_get(config, "llm_provider", "") or ""
+    ).strip().casefold()
+    if configured_provider and configured_provider != provider_key:
+        return None
+
+    selected_model = str(
+        model_name
+        or _config_get(config, "openai_compatible_local.model", "")
+        or _config_get(config, "llm_model", "")
+        or ""
+    ).strip()
+    if not selected_model or selected_model.casefold() == "local-model":
+        return None
+
+    # Import lazily so the generic budget helper remains usable in lightweight
+    # provider paths without eagerly constructing any runtime state.
+    from .openai_compatible_local_profiles import (
+        llama_cpp_model_profile,
+        managed_local_runtime_for_model,
+    )
+
+    profile = llama_cpp_model_profile(selected_model)
+    if (
+        not profile
+        or managed_local_runtime_for_model(config, selected_model) != "llama_cpp"
+    ):
+        return None
+
+    raw = _config_get(config, "openai_compatible_local.llama_cpp", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    if not _llama_cpp_auto_start_enabled(raw):
+        return None
+    if _external_local_deployment(config):
+        return None
+
+    profile_default = _parse_int(profile.get("default_context_size"))
+    if not profile_default:
+        return None
+
+    # Match _llama_cpp_settings: a non-empty environment value takes
+    # precedence, and an invalid value falls back to the profile default.
+    env_value = os.getenv("LLAMA_CPP_CONTEXT_SIZE")
+    if env_value is not None and str(env_value).strip():
+        return _bounded_context_tokens(
+            _parse_int(env_value) or profile_default
+        )
+
+    nested_value = raw.get("context_size")
+    if nested_value is not None and str(nested_value).strip():
+        return _bounded_context_tokens(
+            _parse_int(nested_value) or profile_default
+        )
+
+    return _bounded_context_tokens(profile_default)
+
+
+def _managed_strata_context_window_tokens(
+    *,
+    config: Any,
+    provider_key: str,
+    model_name: str | None,
+) -> int | None:
+    """Use the Strata runtime's configured context for a known Strata model.
+
+    Strata serves a fixed ``--max-context``; without this the budget fell back
+    to the 8192 default and clipped every tool result to a few lines even
+    though the loaded model had a 32k window.
+    """
+    if provider_key != "openai_compatible_local":
+        return None
+    selected_model = str(model_name or "").strip()
+    if not selected_model:
+        return None
+    from .openai_compatible_local_profiles import (
+        managed_local_runtime_for_model,
+        strata_model_profile,
+    )
+
+    if strata_model_profile(selected_model) is None:
+        return None
+    if managed_local_runtime_for_model(config, selected_model) != "strata":
+        return None
+    raw = _config_get(config, "openai_compatible_local.strata", {})
+    configured = _parse_int(raw.get("context_size")) if isinstance(raw, dict) else None
+    return _bounded_context_tokens(configured or 32768)
+
+
+def _llama_cpp_auto_start_enabled(settings: dict[str, Any]) -> bool:
+    """Mirror llama.cpp launch resolution for the auto-start ownership flag."""
+    value = os.getenv("LLAMA_CPP_AUTO_START")
+    if value is None or not str(value).strip():
+        value = settings.get("auto_start", True)
+    return _config_bool(value, True)
+
+
+def _external_local_deployment(config: Any) -> bool:
+    """Reuse the deployment contract before applying a local profile default."""
+    if str(_config_get(config, "runtime.target_base_url", "") or "").strip():
+        return True
+    try:
+        from .deployment_resolver import resolve_llm_deployment
+
+        deployment = resolve_llm_deployment(config)
+    except Exception:
+        # An unresolved deployment is not safe evidence of AoiTalk ownership.
+        return True
+    return bool(
+        deployment
+        and deployment.backend == "external"
+        and deployment.effective_provider == "openai_compatible_local"
+    )
+
+
 def _probe_context_window_tokens(
     *,
     base_url: str,
@@ -327,13 +519,21 @@ def _response_tokens(
     provider_key: str,
     requested_max_tokens: int | None,
     context_window_tokens: int,
+    response_tokens_override: int | None = None,
 ) -> int:
     configured = _parse_int(
         _config_get(config, f"{provider_key}.context_budget.response_reserve_tokens")
     )
     requested = _parse_int(requested_max_tokens)
     raw = requested or configured or DEFAULT_RESPONSE_TOKENS
-    upper = max(256, min(4096, int(context_window_tokens * 0.35)))
+    scoped_upper = _parse_int(response_tokens_override)
+    upper = max(
+        256,
+        min(
+            scoped_upper if scoped_upper is not None else 4096,
+            int(context_window_tokens * 0.35),
+        ),
+    )
     return _clamp_int(raw, 256, upper)
 
 

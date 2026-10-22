@@ -737,32 +737,52 @@ class GroupChatManager:
                 ),
             )
             started_at = time.perf_counter()
-            result = await run_native_agent_once(
-                agent,
-                "",
-                api_key=transport.get("api_key"),
-                base_url=transport.get("base_url"),
-                default_headers=transport.get("default_headers"),
-                provider_label=effective_provider,
-                config=runtime_config,
-            )
-            # NativeRunResult currently carries the provider on the runner,
-            # not on the result object.  Keep compatibility with adapters that
-            # expose their actual label while retaining the transport label as
-            # the authoritative fallback.
-            actual_provider = (
-                getattr(result, "provider_label", None)
-                or getattr(result, "provider", None)
-                or effective_provider
-            )
-            self._persist_usage_records(
-                char_data,
-                getattr(result, "usage_records", None),
-                provider=str(actual_provider).strip().lower() or effective_provider,
-                model=str(model),
-                started_at=started_at,
-            )
-            return result.final_output or ""
+            consumer_lease = None
+            if effective_provider == "openai_compatible_local":
+                try:
+                    from ..service_manager import (
+                        _acquire_managed_local_runtime_consumer_for_route,
+                    )
+                    consumer_lease = _acquire_managed_local_runtime_consumer_for_route(
+                        runtime_config,
+                        provider=effective_provider,
+                        model=str(model),
+                        consumer="group",
+                    )
+                except Exception:
+                    # A conflicting managed local consumer must fail the group
+                    # turn before native transport can issue a raw request.
+                    raise
+            try:
+                result = await run_native_agent_once(
+                    agent,
+                    "",
+                    api_key=transport.get("api_key"),
+                    base_url=transport.get("base_url"),
+                    default_headers=transport.get("default_headers"),
+                    provider_label=effective_provider,
+                    config=runtime_config,
+                )
+                # NativeRunResult currently carries the provider on the runner,
+                # not on the result object.  Keep compatibility with adapters that
+                # expose their actual label while retaining the transport label as
+                # the authoritative fallback.
+                actual_provider = (
+                    getattr(result, "provider_label", None)
+                    or getattr(result, "provider", None)
+                    or effective_provider
+                )
+                self._persist_usage_records(
+                    char_data,
+                    getattr(result, "usage_records", None),
+                    provider=str(actual_provider).strip().lower() or effective_provider,
+                    model=str(model),
+                    started_at=started_at,
+                )
+                return result.final_output or ""
+            finally:
+                if consumer_lease is not None:
+                    consumer_lease.release()
         except Exception as e:
             logger.error(f"グループチャットLLM呼び出し失敗: {e}")
             return f"[{char_data.get('name', '???')}の応答生成に失敗しました]"

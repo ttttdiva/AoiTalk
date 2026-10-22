@@ -13,7 +13,7 @@ import yaml
 
 
 DEFAULT_CONFIG_YAML = r"""
-default_character: 案件管理アシスタント
+default_character: シビュラ
 app_config_schema_version: 2
 llm_model: gpt-5.6-luna
 llm_provider: openai
@@ -79,6 +79,17 @@ openai_compatible_local:
   mlx_lm:
     auto_start: true
     command: ''
+  strata:
+    # Source stays pinned; explicit Setup is the only installation entry.
+    source_root: ''
+    data_dir: ''
+    gguf_dir: ''
+    host: 127.0.0.1
+    port: 8080
+    context_size: 32768
+    vision: none
+    auto_start: true
+    readiness_timeout: 600
   freetoken:
     executable: ft
     version: ''
@@ -118,6 +129,19 @@ context_compression:
   history_compaction_enabled: true
   history_tool_result_max_chars: 2400
   history_tool_result_total_chars: 24000
+  # Within one long tool-loop turn, older tool results in the OUTGOING
+  # request copy are deterministically compacted once the request exceeds
+  # trigger_chars (or budget_ratio of the model input budget, if smaller).
+  # The canonical turn transcript is never changed.  Code-level fallbacks in
+  # src/llm/turn_context_shaping.py use the same values, so DB-stored
+  # environments without these keys get the same behavior.
+  within_turn:
+    enabled: true
+    trigger_chars: 120000
+    budget_ratio: 0.6
+    target_ratio: 0.6
+    result_max_chars: 1600
+    min_result_chars: 400
   mode: auto
   min_chars: 3000
   tool_result_max_chars: null
@@ -325,23 +349,7 @@ agent_team:
       - architecture_planner
       - code_implementer
       - code_reviewer
-      execution_profiles: {}
-    story:
-      team_id: story
-      name: Story
-      description: Storyの執筆、取り込み、整合性・キャラクター口調レビュー。
-      enabled: true
-      sort_order: 30
-      activation:
-        mode: contextual
-        contexts:
-        - story
-      subagent_ids:
-      - story_writer
-      - story_consistency_reviewer
-      - character_voice_reviewer
-      - story_import
-      - general_worker
+      - employee_operator
       execution_profiles: {}
   subagents:
     general_worker:
@@ -407,7 +415,7 @@ agent_team:
     code_explorer:
       subagent_id: code_explorer
       name: コード調査
-      description: コードベース、依存関係、データフロー、既存実装等を調査するread-only Agent。
+      description: コードベース、依存関係、データフロー、既存実装等を調査するread-only Subagent。
       instructions: コードベース、依存関係、データフロー、既存実装を調査し、ファイルを変更しない。
       enabled: true
       capability_ids: [workspace_read, repo_map]
@@ -419,7 +427,7 @@ agent_team:
     architecture_planner:
       subagent_id: architecture_planner
       name: 設計
-      description: 実装方針、責務境界、影響範囲等を整理するread-only Agent。
+      description: 実装方針、責務境界、影響範囲等を整理するread-only Subagent。
       instructions: 実装方針、責務境界、影響範囲等を整理し、実装計画を提案する。
       enabled: true
       capability_ids: [workspace_read, repo_map]
@@ -431,7 +439,7 @@ agent_team:
     code_implementer:
       subagent_id: code_implementer
       name: 実装
-      description: 実際にWorkspaceで変更を行うAgent。
+      description: 実際にWorkspaceで変更を行うSubagent。
       instructions: 割り当てられた変更をWorkspace sandboxで実装する。API providerではAoiTalk Workspace mutation tools、CLI providerではCLI native filesystem/search/shell/edit/test/build等を利用する。
       enabled: true
       capability_ids: [workspace_read, workspace_write, repo_map, command_execute, aoi_tools]
@@ -452,49 +460,13 @@ agent_team:
       max_instances: 4
       max_workspace_access: read
       allow_cli_native_tools: true
-    story_writer:
-      subagent_id: story_writer
-      name: 執筆
-      description: Story contextを読み、本文や設定資料を作成・更新する。
-      instructions: Story contextを読み、本文や設定資料を作成・更新する。
+    employee_operator:
+      subagent_id: employee_operator
+      name: 社員業務
+      description: 管理者が設定した自動化と電話受付を担当する。
+      instructions: 承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。
       enabled: true
-      capability_ids: [story_read, story_write]
-      scalable: false
-      default_instances: 1
-      max_instances: 1
-      max_workspace_access: none
-      allow_cli_native_tools: false
-    story_consistency_reviewer:
-      subagent_id: story_consistency_reviewer
-      name: 設定整合性レビュー
-      description: 世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報の整合性を確認するread-only Agent。
-      instructions: 世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報をread-onlyで確認し、矛盾を報告する。
-      enabled: true
-      capability_ids: [story_read]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: none
-      allow_cli_native_tools: false
-    character_voice_reviewer:
-      subagent_id: character_voice_reviewer
-      name: キャラクター・口調レビュー
-      description: キャラクターの人格、性格、口調、設定、既存発言との整合性を確認するread-only Agent。
-      instructions: キャラクターの人格、性格、口調、設定、既存発言との整合性をread-onlyで確認し、逸脱を報告する。
-      enabled: true
-      capability_ids: [story_read]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: none
-      allow_cli_native_tools: false
-    story_import:
-      subagent_id: story_import
-      name: Story取り込み
-      description: 既存のStory素材取り込み機能を担当する。
-      instructions: 既存のStory素材を取り込み、無関係な変更を避けて正規化する。
-      enabled: true
-      capability_ids: [story_read, story_import]
+      capability_ids: [external_action_propose, telephony_control]
       scalable: false
       default_instances: 1
       max_instances: 1
@@ -526,6 +498,7 @@ external_model_privacy:
 browser_agent:
   enabled: true
   jev_enabled: true
+  dedicated_enabled: false
   max_steps: 24
   timeout_seconds: 300
 
@@ -564,6 +537,9 @@ search:
   - searxng
   - wikipedia
   local_max_results: 5
+  jev_rerank_enabled: false
+  # Enable only when this SearXNG instance returns public Web results, not intranet data.
+  jev_rerank_searxng_public: false
   include_local_knowledge: false
 deep_research:
   queue_capacity: 8
@@ -637,8 +613,9 @@ skills:
   enabled: true
   directory: config/skills
 voice_sessions:
-  default_mode: realtime_native
+  default_mode: pipeline
   allowed_modes:
+    - pipeline
     - realtime_native
     - realtime_character_tts
   realtime:
@@ -658,6 +635,11 @@ voice_sessions:
     queue_depth: 2
 apps:
   enabled: true
+  actions:
+    # Action execution is opt-in.  A fresh install must not expose a runnable
+    # server or PC target until an operator has configured and enabled one.
+    enabled: false
+    execution_targets: {}
   managed_tool_promotion:
     # Agent-generated managed scripts are server-owned and may be promoted to
     # Apps only after independent successful observations.  The runtime
@@ -747,6 +729,25 @@ agent_harness:
     before_run: null
     after_run: null
     before_remove: null
+cli_development_sessions:
+  # The common CLI session API remains visible for diagnostics, but execution
+  # is opt-in and fail-closed on a fresh installation.
+  enabled: false
+  trusted_windows:
+    enabled: false
+    execution_lane: trusted_windows
+    allowed_roots: []
+    allowed_owner_ids: []
+    allowed_agent_ids: []
+    provider_cache_roots: {}
+    allowed_permission_modes:
+    - native_default
+
+decision_layer:
+  jev_free_team_routing_enabled: true
+  jev_free_team_shadow_mode: false
+  # Optional extra signal in the existing review loop; Host checks stay authoritative.
+  jev_completion_verification_enabled: false
 
 agentic_completion:
   max_rounds: 12
@@ -886,8 +887,8 @@ speech_recognition:
       stream_chunk_duration: 1.0
     whisper:
       chunk_length: 1.0
-      device: cpu
-      fp16: false
+      device: auto
+      fp16: true
       language: ja
       model: large-v3
       temperature: 0.0
@@ -935,6 +936,7 @@ tts:
       aivoice: detect_only
       cevio: detect_only
       nijivoice: detect_only
+      gemini_tts: detect_only
 tts_settings:
   voicevox:
     host: 127.0.0.1
@@ -981,6 +983,19 @@ tts_settings:
     frequency_penalty: 0.0
     best_of_n_enabled: false
     best_of_n_n: 1
+  gemini_tts:
+    # API key: GEMINI_API_KEY (or GOOGLE_API_KEY). Never stored here.
+    # gemini-3.8-flash-lite-tts: low latency/cost (default)
+    # gemini-3.8-flash-tts: most expressive
+    model: gemini-3.8-flash-lite-tts
+    voice: Kore
+    # Default delivery direction when a character has no style of its own.
+    style: ""
+    # Retained for character-settings compatibility; Gemini 3.8 TTS auto-detects
+    # the input language and does not accept languageCode in Interactions API.
+    language_code: ""
+    timeout: 180.0
+    max_chars_per_request: 600
 moderations: false
 use_tools: true
 rag:
@@ -990,9 +1005,8 @@ rag:
     local_path: cache/qdrant
     collection_name: aoitalk_knowledge
   embedding:
-    model: BAAI/bge-m3
-    batch_size: 32
-    device: cuda
+    batch_size: 8
+    device: auto
   reranker:
     model: BAAI/bge-reranker-v2-m3
     top_n: 5
@@ -1075,6 +1089,10 @@ knowledge:
   organizer:
     default_dry_run: true
     batch_size: 200
+local_agent_tasks:
+  command_workspace_unconfined:
+    user_ids: []
+    agent_calls: []
 mobile_ui:
   enabled: true
   default_view: chat
@@ -1101,6 +1119,30 @@ mobile_ui:
 def load_default_config() -> Dict[str, Any]:
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", DEFAULT_CONFIG_YAML)
     config = yaml.safe_load(sanitized) or {}
+    # User/Project Files semantic index (search.files_index).  The canonical
+    # default lives beside its validator; existing DB rows receive the new
+    # branch through the store's missing-key default fill without touching
+    # any persisted user value.
+    from .services.workspace_file_index import default_files_index_settings
+
+    search_defaults = config.setdefault("search", {})
+    if isinstance(search_defaults, dict):
+        search_defaults.setdefault("files_index", default_files_index_settings())
+    # Keep the built-in Team Execution Profile catalog in the canonical Agent
+    # Team seed.  The same additive helper is applied during App Config
+    # migration for existing v3 rows, so fresh and saved configurations share
+    # identical IDs/routes without allowing later deletions to be resurrected.
+    try:
+        from .services.agent_team_v3 import seed_agent_team_execution_profile_presets
+
+        agent_team = config.get("agent_team")
+        if isinstance(agent_team, dict):
+            config["agent_team"] = seed_agent_team_execution_profile_presets(agent_team)
+    except Exception:
+        # Defaults must remain loadable during minimal bootstrap/import checks;
+        # App Config migration will retry canonical seeding once services are
+        # available.
+        pass
     # Keep the persisted seed profile-independent while projecting the
     # Enterprise default to protected transport at bootstrap.  Existing DB
     # values (including an explicit Personal ``direct`` choice) are handled

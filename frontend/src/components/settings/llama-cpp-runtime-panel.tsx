@@ -6,6 +6,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { HelpPopover } from "@/components/ui/help-popover";
 import {
   reservedLlamaCppExtraArg,
   type LlamaCppRuntimeProfile,
@@ -155,12 +156,14 @@ export function LlamaCppRuntimePanel({
       aria-label="llama.cpp runtime設定"
       className="space-y-3 rounded-md border border-sky-500/30 bg-sky-50/30 p-3 dark:bg-sky-950/10"
     >
-      <div className="space-y-1">
+      <div className="inline-flex items-center gap-1">
         <h3 className="text-xs font-semibold">llama.cpp / llama-server runtime</h3>
-        <p className="text-[10px] text-muted-foreground">
-          既存の <code>/v1</code> 互換ローカル provider を使います。設定保存時に、選択中のモデルと一緒に
-          backendへ渡し、<code>auto_start</code> が有効なら既存の自動起動経路を利用します。
-        </p>
+        <HelpPopover label="llama.cpp runtime">
+          <p>
+            既存の <code>/v1</code> 互換ローカル provider を使います。設定保存時に、選択中のモデルと一緒に
+            backendへ渡し、<code>auto_start</code> が有効なら既存の自動起動経路を利用します。
+          </p>
+        </HelpPopover>
       </div>
 
       {runtimeState && runtimeState !== "ready" && runtimeState !== "unmanaged" && (
@@ -230,6 +233,9 @@ export function LlamaCppRuntimePanel({
             {profile.default_gpu_layers !== undefined && (
               <p>default GPU layers: <code>{profile.default_gpu_layers}</code></p>
             )}
+            {profile.default_parallel !== undefined && (
+              <p>default parallel slots: <code>{profile.default_parallel}</code></p>
+            )}
             {profile.auxiliary_artifacts?.map((artifact) => (
               <p key={`${artifact.id ?? artifact.filename}-auxiliary`}>
                 {artifact.kind ?? "auxiliary"}: <code>{artifact.filename}</code>
@@ -248,8 +254,13 @@ export function LlamaCppRuntimePanel({
                     ? `top_p=${profile.sampling_defaults.top_p}` : null,
                   profile.sampling_defaults.top_k !== undefined
                     ? `top_k=${profile.sampling_defaults.top_k}` : null,
+                  profile.sampling_defaults.repeat_penalty !== undefined
+                    ? `repeat_penalty=${profile.sampling_defaults.repeat_penalty}` : null,
                 ].filter(Boolean).join(", ")}</code>
               </p>
+            )}
+            {profile.thinking_mode && (
+              <p>thinking mode: <code>{profile.thinking_mode}</code></p>
             )}
             {profile.jinja_required && <p>chat template: <code>Jinja (--jinja)</code></p>}
             {profile.chat_template && <p>chat template: <code>{profile.chat_template}</code></p>}
@@ -261,11 +272,13 @@ export function LlamaCppRuntimePanel({
               <>
                 <p>
                   MTP profile: <code>{mtpProfile.mode || "declared"}</code>
-                  {mtpProfile.artifact_filename
-                    ? <> · artifact: <code>{mtpProfile.artifact_filename}</code></>
-                    : mtpProfile.companion_filenames?.length
-                      ? <> · artifacts: <code>{mtpProfile.companion_filenames.join(", ")}</code></>
-                      : null}
+                  {mtpProfile.embedded_in_primary
+                    ? <> · <code>primary GGUF内蔵</code></>
+                    : mtpProfile.artifact_filename
+                      ? <> · artifact: <code>{mtpProfile.artifact_filename}</code></>
+                      : mtpProfile.companion_filenames?.length
+                        ? <> · artifacts: <code>{mtpProfile.companion_filenames.join(", ")}</code></>
+                        : null}
                 </p>
                 {mtpProfile.minimum_llama_cpp_build !== undefined && (
                   <p>MTP minimum llama.cpp build: <code>{mtpProfile.minimum_llama_cpp_build}</code></p>
@@ -302,7 +315,10 @@ export function LlamaCppRuntimePanel({
 
       <div className="grid gap-3 md:grid-cols-2">
         <div className="space-y-1">
-          <Label className="text-xs" htmlFor="llama-cpp-executable">実行ファイル</Label>
+          <div className="inline-flex items-center gap-1">
+            <Label className="text-xs" htmlFor="llama-cpp-executable">実行ファイル</Label>
+            <HelpPopover label="実行ファイル">空欄なら環境変数またはPATHからの自動解決に任せます。</HelpPopover>
+          </div>
           <Input
             id="llama-cpp-executable"
             aria-label="llama.cpp executable"
@@ -311,7 +327,6 @@ export function LlamaCppRuntimePanel({
             placeholder={typeof navigator !== "undefined" && navigator.userAgent.includes("Windows") ? "llama-server.exe" : "llama-server"}
             disabled={saving}
           />
-          <p className="text-[10px] text-muted-foreground">空欄なら環境変数またはPATHからの自動解決に任せます。</p>
         </div>
         <div className="space-y-1">
           <Label className="text-xs" htmlFor="llama-cpp-model-path">GGUF model path</Label>
@@ -359,20 +374,22 @@ export function LlamaCppRuntimePanel({
 
       {mtpDeclared && (
         <div className="space-y-2 rounded border border-violet-500/30 bg-violet-50/30 p-2 dark:bg-violet-950/10">
-          <label className="flex items-center gap-2 text-xs">
-            <Checkbox
-              aria-label="MTP / Multi-Token Prediction"
-              checked={mtpEnabled}
-              onCheckedChange={(checked) => update("mtp_enabled", checked === true)}
-              disabled={saving}
-            />
-            <span>MTP / Multi-Token Prediction</span>
-          </label>
-          {mtpProfile?.mode === "companion" && (
-            <p className="text-[10px] text-muted-foreground">
-              互換性が確認された候補だけを既存のモデル保存領域から自動検出します。見つからない場合も、本体は通常の非MTPモードで起動します。
-            </p>
-          )}
+          <div className="flex items-center gap-2 text-xs">
+            <label className="flex items-center gap-2">
+              <Checkbox
+                aria-label="MTP / Multi-Token Prediction"
+                checked={mtpEnabled}
+                onCheckedChange={(checked) => update("mtp_enabled", checked === true)}
+                disabled={saving}
+              />
+              <span>MTP / Multi-Token Prediction</span>
+            </label>
+            {mtpProfile?.mode === "companion" ? (
+              <HelpPopover label="MTP / Multi-Token Prediction">
+                互換性が確認された候補だけを既存のモデル保存領域から自動検出します。見つからない場合も、本体は通常の非MTPモードで起動します。
+              </HelpPopover>
+            ) : null}
+          </div>
         </div>
       )}
 
@@ -432,7 +449,12 @@ export function LlamaCppRuntimePanel({
       </div>
 
       <div className="space-y-1">
-        <Label className="text-xs" htmlFor="llama-cpp-extra-args">追加引数（1行1引数）</Label>
+        <div className="inline-flex items-center gap-1">
+          <Label className="text-xs" htmlFor="llama-cpp-extra-args">追加引数（1行1引数）</Label>
+          <HelpPopover label="追加引数">
+            空行を除き、各行をそのままargvの1要素として送信します。シェル展開やコマンド連結は行いません。
+          </HelpPopover>
+        </div>
         <Textarea
           id="llama-cpp-extra-args"
           aria-label="llama.cpp extra args"
@@ -443,9 +465,6 @@ export function LlamaCppRuntimePanel({
           disabled={saving}
           className="min-h-16 text-xs"
         />
-        <p className="text-[10px] text-muted-foreground">
-          空行を除き、各行をそのままargvの1要素として送信します。シェル展開やコマンド連結は行いません。
-        </p>
         {reservedExtraArg && (
           <p role="alert" className="text-[10px] text-destructive">
             {reservedExtraArg} はruntimeが管理する引数のため指定できません。Host/port等の上の項目を使ってください。

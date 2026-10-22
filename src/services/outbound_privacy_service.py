@@ -139,6 +139,8 @@ EXTERNAL_PROVIDER_IDS = frozenset(
         "openai_realtime",
         "gemini",
         "openrouter",
+        # The localhost proxy forwards prompts to OpenCode Zen, so the
+        # provider remains external even when its configured URL is loopback.
         "deepseek",
         "deepinfra",
         "kimi",
@@ -185,7 +187,6 @@ LOCAL_PROVIDER_IDS = frozenset(
         "aivisspeech",
         "voicevox",
         "comfyui",
-        "hydrus",
     }
 )
 CLI_PROVIDER_IDS = frozenset(
@@ -1658,7 +1659,6 @@ def provider_classification(
                     "aivisspeech",
                     "voicevox",
                     "comfyui",
-                    "hydrus",
                 }
                 else "unknown"
             )
@@ -3444,6 +3444,7 @@ class OutboundPrivacyGateway:
         source_kind: str = "external_egress",
         model: str | None = None,
         semantic_exempt_values: Iterable[str] | None = None,
+        credential_identity: Mapping[str, str] | None = None,
     ) -> Any:
         """Protect, review and invoke one external sender exactly once.
 
@@ -3491,10 +3492,14 @@ class OutboundPrivacyGateway:
             final_payload = result.payload
         # Calling the sender is the commit point.  Keep it outside the review
         # callback and invoke it once with the exact approved value.
+        if active_provider.strip().lower() == "openai":
+            from .free_team_service import execute_budgeted_openai_request
+            return await execute_budgeted_openai_request(final_payload,
+                config=self.config, provider=active_provider,
+                model=model or active_descriptor.model, identity=credential_identity,
+                sender=active_sender)
         sent = active_sender(final_payload)
-        if inspect.isawaitable(sent):
-            sent = await sent
-        return sent
+        return await sent if inspect.isawaitable(sent) else sent
 
     def execute_sync(
         self,
@@ -3508,6 +3513,7 @@ class OutboundPrivacyGateway:
         source_kind: str = "external_egress",
         model: str | None = None,
         semantic_exempt_values: Iterable[str] | None = None,
+        credential_identity: Mapping[str, str] | None = None,
     ) -> Any:
         """Synchronous counterpart of :meth:`execute` for blocking adapters."""
 
@@ -3543,7 +3549,14 @@ class OutboundPrivacyGateway:
         final_payload = getattr(result, "final_payload", None)
         if final_payload is None and getattr(result, "payload", None) is not None:
             final_payload = result.payload
-        sent = active_sender(final_payload)
+        if active_provider.strip().lower() == "openai":
+            from .free_team_service import execute_budgeted_openai_request
+            sent = execute_budgeted_openai_request(final_payload,
+                config=self.config, provider=active_provider,
+                model=model or active_descriptor.model, identity=credential_identity,
+                sender=active_sender)
+        else:
+            sent = active_sender(final_payload)
         if inspect.isawaitable(sent):
             # A blocking adapter occasionally runs on an event-loop thread.
             # Use a daemon bridge rather than nest asyncio.run or block an
@@ -3554,6 +3567,7 @@ class OutboundPrivacyGateway:
                 sent = asyncio.run(sent)
             else:
                 future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+                sender_context = contextvars.copy_context()
 
                 def run_sender() -> None:
                     try:
@@ -3565,7 +3579,7 @@ class OutboundPrivacyGateway:
                             pass
 
                 threading.Thread(
-                    target=run_sender,
+                    target=lambda: sender_context.run(run_sender),
                     name="aoitalk-egress-sender",
                     daemon=True,
                 ).start()

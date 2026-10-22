@@ -1,0 +1,18 @@
+/* Keep the existing compact metrics readable inside the Project-only slot.
+   The supplied Memory Overview and other Dashboard consumers are unchanged. */
+.metrics :global(.text-xs) {
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.metrics :global([class~="text-[10px]"]),
+.metrics :global([class~="text-[11px]"]),
+.metrics :global(.recharts-legend-wrapper) {
+  font-size: 0.75rem !important;
+  line-height: 1.5;
+}
+
+.metrics h3 {
+  font-size: 1rem;
+  line-height: 1.5;
+}

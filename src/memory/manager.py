@@ -69,6 +69,7 @@ class ConversationMemoryManager:
         self._summarization_tasks: Dict[str, asyncio.Task] = {}
         self._indexing_tasks: set[asyncio.Task] = set()
         self._background_tasks: set[asyncio.Task] = set()
+        self._deferred_cross_session_indexes: dict[str, list] = {}
         self._resource_scope = AsyncResourceScope("conversation-memory")
         self._cleanup_done = False
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -366,7 +367,8 @@ class ConversationMemoryManager:
                                      sender_id: Optional[str] = None,
                                      sender_display_name: Optional[str] = None,
                                      llm_client = None,
-                                     message_id: Optional[str] = None) -> ConversationMessage:
+                                     message_id: Optional[str] = None,
+                                     defer_cross_session_index: bool = False) -> ConversationMessage:
         """Add message to a specific conversation session by ID
         
         Args:
@@ -440,35 +442,67 @@ class ConversationMemoryManager:
                 str(session_project_id) if session_project_id else None
             )
 
-            async def _index_in_background():
-                try:
-                    cross_session_memory = get_cross_session_memory()
-                    await cross_session_memory.index_message(
-                        message_id=message_id,
-                        session_id=session_id,
-                        user_id=index_user_id,
-                        role=role,
-                        content=content,
-                        character_name=index_character_name,
-                        project_id=index_project_id,
-                        timestamp=message_created_at,
-                    )
-                except Exception as e:
-                    # Indexing failure should not affect main flow
-                    print(f"[ConversationMemoryManager] Warning: Cross-session indexing failed: {e}")
-            
-            task = self._spawn_background(
-                _index_in_background(),
-                name=f"cross-session-index-{message_id}",
-            )
-            if task is not None:
-                self._indexing_tasks.add(task)
+            index_job = {
+                "message_id": message_id,
+                "session_id": session_id,
+                "user_id": index_user_id,
+                "role": role,
+                "content": content,
+                "character_name": index_character_name,
+                "project_id": index_project_id,
+                "timestamp": message_created_at,
+            }
+            if defer_cross_session_index:
+                # 応答を画面に出すまで埋め込みモデルをロードしない。
+                self._deferred_cross_session_indexes.setdefault(
+                    str(session_id), []
+                ).append(index_job)
+            else:
+                task = self._spawn_background(
+                    self._index_cross_session_message(index_job),
+                    name=f"cross-session-index-{message_id}",
+                )
+                if task is not None:
+                    self._indexing_tasks.add(task)
 
         if session_info and (session_info.message_count or 0) >= self.config.max_active_messages:
             await self._trigger_summarization(session_info, llm_client)
 
         return message
-    
+
+    async def _index_cross_session_message(self, job: dict) -> None:
+        try:
+            from ..services.media_index_worker import notify_media_source
+            from ..services.search_sources import SearchSourceResolver, SearchScope, SourceRef
+            from .database import get_db_session
+            from uuid import UUID
+
+            # Persist recovery before the volatile background attempt. The
+            # canonical reconciler can replace an invalid owner with a current
+            # legal joined participant; the original author remains provenance.
+            notify_media_source(job["user_id"], "conversation_message", job["message_id"])
+            cross_session_memory = get_cross_session_memory()
+            async with await get_db_session() as session:
+                resolver = SearchSourceResolver(session, SearchScope(UUID(str(job["user_id"]))))
+                await cross_session_memory.index_current_message(resolver, SourceRef("conversation_message", job["message_id"]))
+        except Exception as e:
+            print(
+                "[ConversationMemoryManager] Warning: Cross-session indexing failed: "
+                f"{e}"
+            )
+
+    def schedule_deferred_cross_session_indexes(self, session_id: str) -> None:
+        """画面に応答が出たあと、そのセッションの索引だけを始める。"""
+
+        jobs = self._deferred_cross_session_indexes.pop(str(session_id), [])
+        for job in jobs:
+            task = self._spawn_background(
+                self._index_cross_session_message(job),
+                name=f"cross-session-index-{job.get('message_id')}",
+            )
+            if task is not None:
+                self._indexing_tasks.add(task)
+
     def _should_save_message(self, role: str, success: bool) -> bool:
         """Check if message should be saved based on configuration
         
@@ -666,6 +700,8 @@ class ConversationMemoryManager:
         time_range: str = "all",
         max_results: Optional[int] = None,
         project_id: Optional[str] = None,
+        search_window=None,
+        raise_on_unavailable: bool = False,
     ) -> List[Dict[str, Any]]:
         """Search conversation memory
         
@@ -680,10 +716,18 @@ class ConversationMemoryManager:
         Returns:
             List[Dict[str, Any]]: Search results
         """
+        if not self.config.enable_search:
+            if raise_on_unavailable:
+                from .search_errors import MemorySearchUnavailable
+                raise MemorySearchUnavailable("disabled")
+            return []
         if not self._initialized:
             await self.initialize()
 
         if self.search_service is None:
+            if raise_on_unavailable:
+                from .search_errors import MemorySearchUnavailable
+                raise MemorySearchUnavailable("index_unavailable")
             return []
 
         return await self.search_service.search_conversation_memory(
@@ -693,6 +737,8 @@ class ConversationMemoryManager:
             time_range,
             max_results,
             project_id=project_id,
+            **({"search_window": search_window} if search_window is not None else {}),
+            **({"raise_on_unavailable": True} if raise_on_unavailable else {}),
         )
     
     async def get_recent_messages(self, user_id: str, character_name: str, count: int = 10) -> List[Dict[str, Any]]:

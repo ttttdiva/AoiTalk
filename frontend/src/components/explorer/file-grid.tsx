@@ -13,6 +13,7 @@ import {
 import { useExplorer } from "@/contexts/explorer-context";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
 import { useFilerOperations } from "@/hooks/use-filer-operations";
+import { useExplorerLongPressContextMenu } from "@/hooks/use-explorer-long-press-context-menu";
 import {
   getFileServeUrl,
   getImageThumbnailUrl,
@@ -25,10 +26,6 @@ import {
   sortExplorerDirectories,
   sortExplorerFiles,
 } from "@/lib/explorer-sort";
-import {
-  Pagination,
-  paginateCombinedItems,
-} from "@/components/explorer/pagination";
 
 // ファイルタイプ判定
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"];
@@ -280,20 +277,17 @@ export function FileGrid({
     refresh,
     sortKey,
     sortDir,
-    isHfMode,
-    isHydrusMode,
     capabilities,
     userId,
   } = useExplorer();
   const { transfer } = useFilerOperations({ capabilities, refresh });
+  const longPressHandlers = useExplorerLongPressContextMenu();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
-  const [hfPage, setHfPage] = useState(1);
   // Keep a render-time principal identity so an A user's grid cannot survive
   // the first render after logout/login to B while effects are still running.
   const [gridUserId, setGridUserId] = useState<string | null>(userId);
   const principalReady = gridUserId === userId;
-  const HF_PAGE_SIZE = 60;
   const displayedPathSet = useMemo(
     () =>
       new Set([
@@ -313,26 +307,9 @@ export function FileGrid({
 
   const thumbSize = THUMB_SIZES[thumbIndex];
 
-  const hfPageKey = useMemo(
-    () =>
-      JSON.stringify({
-        dirs: (directories ?? browseData?.directories ?? []).map((item) => item.path),
-        files: (files ?? browseData?.files ?? []).map((item) => item.path),
-        sortKey,
-        sortDir,
-      }),
-    [browseData?.directories, browseData?.files, directories, files, sortDir, sortKey],
-  );
-
   useEffect(() => {
     setGridUserId(userId);
   }, [userId]);
-
-  useEffect(() => {
-    // The page is derived from the current listing identity; reset it when
-    // navigation/search/sort changes so stale HF pages cannot remain visible.
-    if (isHfMode) setHfPage(1);
-  }, [hfPageKey, isHfMode]);
 
   const changeThumbSize = useCallback((delta: number) => {
     setThumbIndex((prev) => {
@@ -436,31 +413,13 @@ export function FileGrid({
   const minColumns = 3;
   const gridTemplate = `repeat(auto-fill, minmax(min(${cellWidth}px, calc((100% - ${(minColumns - 1) * 4}px) / ${minColumns})), 1fr))`;
 
-  // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
-  // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
   const sourceDirectories = directories ?? browseData?.directories ?? [];
   const sourceFiles = files ?? browseData?.files ?? [];
-  const sortedDirs = isHydrusMode
-    ? sourceDirectories
-    : sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
-  const sortedFiles = isHydrusMode
-    ? sourceFiles
-    : sortExplorerFiles(sourceFiles, sortKey, sortDir);
-  const paged = paginateCombinedItems(
-    sortedDirs,
-    sortedFiles,
-    isHfMode ? hfPage : 1,
-    HF_PAGE_SIZE,
-  );
-  const totalGridPages = paged.totalPages;
-  const effectiveHfPage = isHfMode ? paged.page : 1;
-  useEffect(() => {
-    // Clamp after a delete/refresh reduces the total number of pages.
-    if (isHfMode && hfPage > totalGridPages) setHfPage(totalGridPages);
-  }, [hfPage, isHfMode, totalGridPages]);
+  const sortedDirs = sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
+  const sortedFiles = sortExplorerFiles(sourceFiles, sortKey, sortDir);
   if (!browseData || !principalReady) return null;
-  const visibleDirs = isHfMode ? paged.directories : sortedDirs;
-  const visibleFiles = isHfMode ? paged.files : sortedFiles;
+  const visibleDirs = sortedDirs;
+  const visibleFiles = sortedFiles;
   const orderedPaths = [
     ...visibleDirs.map((dir) => dir.path),
     ...visibleFiles.map((file) => file.path),
@@ -478,6 +437,7 @@ export function FileGrid({
       <div
         data-explorer-grid="true"
         className="grid gap-3 p-1 sm:grid-cols-[repeat(auto-fill,minmax(132px,1fr))] sm:gap-4"
+        {...longPressHandlers}
         style={{
           gridTemplateColumns: gridTemplate,
         }}
@@ -599,15 +559,6 @@ export function FileGrid({
           </div>
         ))}
       </div>
-      {isHfMode && totalGridPages > 1 && (
-        <Pagination
-          page={effectiveHfPage}
-          totalPages={totalGridPages}
-          onPageChange={setHfPage}
-          className="justify-center px-2 pb-2"
-          label="HFページ"
-        />
-      )}
     </div>
   );
 }

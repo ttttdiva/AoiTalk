@@ -98,9 +98,19 @@ def _enterprise_scope_config() -> Any:
     return Config()
 
 
-def _validate_enterprise_command_backend() -> None:
-    """Require the configured file-scoped backend before command calls."""
+def _validate_enterprise_command_backend(*, run_scope=None, harness_scope=None) -> str:
+    """Validate the backend selected by the trusted server-issued scope."""
 
+    from ...security.harness_execution_scope import resolve_command_backend_kind
+
+    backend_kind = resolve_command_backend_kind(
+        run_scope=run_scope,
+        harness_scope=harness_scope,
+    )
+    if backend_kind == "native_windows":
+        return backend_kind
+    if backend_kind != "wsl_bwrap":
+        raise RuntimeError("trusted scoped command backend is unavailable")
     from ...security.wsl_bwrap_backend import get_wsl_bwrap_backend
 
     backend = get_wsl_bwrap_backend()
@@ -109,6 +119,25 @@ def _validate_enterprise_command_backend() -> None:
     available = getattr(backend, "is_available", None)
     if not callable(available) or not available():
         raise RuntimeError("file-scoped WSL2/bubblewrap backend is unavailable")
+    return backend_kind
+
+
+def _command_execution_boundary() -> dict[str, Any]:
+    """Return truthful, non-secret execution-boundary evidence for receipts."""
+
+    from ...security.harness_execution_scope import resolve_command_backend_kind
+
+    try:
+        backend_kind = resolve_command_backend_kind()
+    except Exception:
+        return {
+            "backend_kind": "selection_denied",
+            "filesystem_isolation": None,
+        }
+    return {
+        "backend_kind": backend_kind,
+        "filesystem_isolation": backend_kind == "wsl_bwrap" if backend_kind else None,
+    }
 
 
 def _enterprise_sensitive_filter_active() -> bool:
@@ -210,7 +239,10 @@ def _enterprise_execution_scope(*, require_backend: bool = False):
                 raise RuntimeError("HarnessExecutionScope and AgentRunScope do not match")
 
         if require_backend:
-            _validate_enterprise_command_backend()
+            _validate_enterprise_command_backend(
+                run_scope=adapter_scope,
+                harness_scope=upper_scope,
+            )
     except Exception as exc:
         yield _enterprise_scope_error(exc, operation="execution")
         return
@@ -1213,6 +1245,79 @@ def _check_absolute_path_allowed(path: str) -> Optional[str]:
     return path_outside_allowed_error(path)
 
 
+def _agent_dialogue_read_root() -> tuple[Optional[Path], Optional[str]]:
+    """Return the active non-native AgentDialogue read root, if any.
+
+    AgentDialogue workspace state is a server-issued lease, not a path-like
+    capability supplied by model text.  Keep the ordinary/native resolver
+    lanes unchanged and fail closed when an Agent workspace marker survives
+    without its bound workspace object.
+    """
+
+    try:
+        from ...llm.tool_policy import get_current_agent_workspace_scope
+        from ...services.agent_dialogue_workspace import (
+            get_current_agent_dialogue_workspace,
+        )
+    except Exception:
+        # The optional scope modules are absent only in stripped embeddings;
+        # no workspace marker means the legacy resolver remains compatible.
+        return None, None
+
+    workspace = get_current_agent_dialogue_workspace()
+    scope = get_current_agent_workspace_scope()
+    if workspace is None:
+        if isinstance(scope, dict) and any(
+            scope.get(key) not in (None, "")
+            for key in ("session_id", "agent_id", "run_id", "resource_key")
+        ):
+            return None, "Agent workspace binding is unavailable"
+        return None, None
+
+    # A native workspace must be resolved by the issued AgentRunScope branch
+    # above. Never replace that scope with this read-only root fallback.
+    if bool(getattr(workspace, "native_allowed", False)):
+        return None, "Native Agent workspace requires an issued run scope"
+    if not bool(getattr(workspace, "readonly", False)):
+        return None, "Agent workspace is not read-only"
+    try:
+        workspace.assert_provider_entry()
+    except Exception:
+        return None, "Agent workspace lease is not active"
+
+    if isinstance(scope, dict):
+        for scope_key, workspace_key in (
+            ("session_id", "session_id"),
+            ("agent_id", "agent_id"),
+            ("run_id", "run_id"),
+        ):
+            scoped_value = str(scope.get(scope_key) or "").strip()
+            workspace_value = str(getattr(workspace, workspace_key, "") or "").strip()
+            if scoped_value and workspace_value and scoped_value != workspace_value:
+                return None, "Agent workspace identity changed"
+        if scope.get("native_allowed") is True or scope.get("readonly") is False:
+            return None, "Agent workspace scope is not read-only"
+
+    try:
+        raw_root = Path(workspace.workspace_path).expanduser().absolute()
+        # Validate the lexical issued root before resolving it.  A lease does
+        # not make a directory replacement safe: if the root (or one of its
+        # parents) is swapped for a symlink/junction after allocation, resolve
+        # alone would otherwise adopt the external target.
+        from ..file_explorer import file_explorer_service
+
+        if not file_explorer_service.is_safe_workspace_path(
+            raw_root.parent, raw_root
+        ):
+            return None, "Agent workspace root is not safe"
+        root = raw_root.resolve(strict=True)
+        if not root.is_dir():
+            return None, "Agent workspace root is unavailable"
+    except (OSError, RuntimeError, ValueError):
+        return None, "Agent workspace root is unavailable"
+    return root, None
+
+
 def _resolve_read_target(
     path: str,
     *,
@@ -1256,6 +1361,53 @@ def _resolve_read_target(
             return resolved, bool(raw and os.path.isabs(raw)), None
         except RunScopeViolation as exc:
             return None, bool(raw and os.path.isabs(raw)), str(exc)
+
+    agent_root, agent_root_error = _agent_dialogue_read_root()
+    if agent_root_error:
+        return None, bool(raw and os.path.isabs(raw)), agent_root_error
+    if agent_root is not None:
+        # A bound non-native Agent turn never falls back to the global or
+        # current-user workspace. Reuse the FileExplorer resolver and its
+        # component/reparse checks under the issued private root.
+        from ..file_explorer import file_explorer_service
+
+        raw_is_absolute = bool(
+            os.path.isabs(raw)
+            or ntpath.isabs(raw)
+            or raw.startswith(("/", "\\"))
+        )
+        try:
+            if raw_is_absolute:
+                if not file_explorer_service.is_safe_workspace_path(
+                    agent_root, raw
+                ):
+                    return None, True, "Path is outside the Agent workspace"
+                resolved_path = Path(raw).expanduser().absolute().resolve()
+            else:
+                with file_explorer_service.workspace_root_context(agent_root):
+                    resolved_path, valid = file_explorer_service.resolve_workspace_path(
+                        raw,
+                        is_admin=False,
+                    )
+                if not valid:
+                    return None, False, "Path is outside the Agent workspace"
+                resolved_path = Path(resolved_path).resolve()
+            resolved_path.relative_to(agent_root)
+            if not file_explorer_service.is_safe_workspace_path(
+                agent_root, resolved_path
+            ):
+                return None, raw_is_absolute, "Path is outside the Agent workspace"
+        except (OSError, RuntimeError, ValueError):
+            return None, raw_is_absolute, "Path is outside the Agent workspace"
+
+        resolved = str(resolved_path)
+        denied = _check_absolute_path_allowed(resolved)
+        if denied:
+            return None, raw_is_absolute, denied
+        sensitive = _enterprise_sensitive_path_error(resolved)
+        if sensitive:
+            return None, raw_is_absolute, str(sensitive["error"])
+        return resolved, raw_is_absolute, None
 
     if raw and os.path.isabs(raw):
         denied = _check_absolute_path_allowed(raw)
@@ -1747,8 +1899,9 @@ def execute_command(
 
     Args:
         command: 実行するコマンド（例：「dir」「ls -la」「python script.py」）
-        working_directory: コマンドを実行するディレクトリ。read_file / search_files と
-            同じくworkspace相対パス（例: `_apps/app_xxx`）を指定できる
+        working_directory: コマンドを実行するディレクトリ。省略または ``.`` でworkspace rootを使う。
+            subdirectoryは既存のworkspace相対ディレクトリ（例: `_apps/app_xxx`）を指定し、
+            workspace basenameを重ねない
         timeout: タイムアウト秒数（省略時は設定値。前景実行のみ有効）
         shell: 使用するシェル（auto / cmd / powershell / bash）
         run_in_background: Trueで別プロセスとして起動し、即座に job_id を返す
@@ -1787,13 +1940,13 @@ def execute_command(
     if permission_error:
         return permission_error
 
-    # Keep the existing confirmation/permission contract first.  Ordinary
-    # Enterprise commands are always fail-closed: a native employee capability
-    # is intentionally not a shell authority because a same-token process
-    # cannot guarantee AoiTalk Project/Docs mediation.  Explicit
-    # AgentRunScope/HarnessExecutionScope calls continue through the bounded
-    # WSL2/bubblewrap backend.  This also keeps background lifecycle APIs
-    # denied before touching the process-global registry.
+    # Keep the existing confirmation/permission contract first. Ordinary
+    # Enterprise commands remain fail-closed. A server-issued scoped run then
+    # uses its immutable backend selection: WSL2/bubblewrap where selected, or
+    # the explicit native Windows task path under the current OS user token.
+    # The latter has no OS filesystem isolation and is never selected from
+    # model/tool arguments. Unscoped Enterprise turns still cannot touch the
+    # process-global background registry.
     enterprise_identity_error = _enterprise_unscoped_command_error()
     if enterprise_identity_error:
         return enterprise_identity_error
@@ -1823,6 +1976,7 @@ def execute_command(
             "job_id": job_id,
             "message": f"バックグラウンドで起動しました (job_id={job_id})。"
                        f"read_command_output で出力を確認し、stop_command で停止できます。",
+            **_command_execution_boundary(),
         }
 
     # --- 前景実行 ---
@@ -1880,6 +2034,7 @@ def execute_command(
         "duration_seconds": round(result.duration_seconds, 3),
         "truncated": formatted["truncated"],
         "timed_out": result.timed_out,
+        **_command_execution_boundary(),
     }
 
     if not result.success:
@@ -2117,6 +2272,22 @@ def assert_no_active_scoped_jobs(scope: Any | None = None) -> Dict[str, Any]:
     return get_background_job_registry().assert_no_active_scoped_jobs(scope)
 
 
+_READ_FAILURE_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,63}")
+
+
+def _read_failure(message: str, code: str) -> Dict[str, Any]:
+    """Return a read_file failure carrying a fixed, secret-free reason code.
+
+    ``error`` is exactly the runtime's opted-in sentence so durable receipts
+    can extract the code without scanning free-form ``(reason:)`` tags.
+    Human-readable detail stays in ``message``.
+    """
+
+    safe_code = code if _READ_FAILURE_CODE_RE.fullmatch(code or "") else "read_failed"
+    detail = str(message or "").strip() or "ファイルを読み取れませんでした"
+    tagged = f"Tool execution failed. (reason: {safe_code})"
+    return {"success": False, "error": tagged, "error_code": safe_code, "message": detail}
+
 
 @tool
 @_enterprise_scoped()
@@ -2146,7 +2317,32 @@ def read_file(
         max_chars: Maximum characters of text to return (default 5000).
 
     Returns:
-        Dict[str, Any]: File content and metadata.
+        Dict[str, Any]: File content and metadata. For line-numbered text the
+        reported window describes what the text really shows: ``start_line``
+        and ``end_line`` are the first and last displayed line, ``total_lines``
+        is the line count of the file, ``truncated`` is True when the display
+        cap cut the window short (the text ends with a truncated note), and
+        ``next_start_line`` is the line to request next in that case (otherwise
+        None, so an explicit ``end_line`` request is never silently continued).
+
+        Window contract (identical for text and converted documents):
+
+        * ``start_line``/``end_line`` describe exactly the lines placed in
+          ``content``; ``end_line`` is clamped to ``total_lines``.
+        * ``total_lines`` always reports the whole file, so a caller can
+          paginate any file type on its own.
+        * ``truncated`` is True only when the display cap (100 lines) cut the
+          requested window short; ``next_start_line`` is populated exactly when
+          ``truncated`` is True (it equals ``end_line + 1``) and is None
+          otherwise. A caller-supplied ``end_line`` is honoured verbatim and is
+          never silently continued.
+        * Converted documents (.eml/.msg/.docx/.xlsx/.pptx/.pdf) render the
+          requested window without a display cap, so for them ``truncated`` is
+          always False and ``next_start_line`` is always None; continue by
+          asking again with a new ``start_line``.
+        * A window outside the file (``start_line`` past ``total_lines``, or
+          ``end_line`` before ``start_line``) is a typed failure with
+          ``error_code == "read_invalid_line_range"`` for both kinds.
 
     Examples:
         >>> read_file("日記フォルダ/2026-01-18.md")
@@ -2160,7 +2356,20 @@ def read_file(
         allow_native_employee=True,
     )
     if error or not resolved:
-        return {"success": False, "error": error or "パスを解決できませんでした"}
+        return _read_failure(
+            error or "パスを解決できませんでした",
+            "read_path_outside_workspace",
+        )
+    if not os.path.exists(resolved):
+        return _read_failure(
+            f"ファイルが見つかりません: {path}",
+            "read_path_not_found",
+        )
+    if os.path.isdir(resolved):
+        return _read_failure(
+            f"ディレクトリはread_fileで読み取れません（list_directoryを使用）: {path}",
+            "read_path_is_directory",
+        )
 
     # Gemini API が float を渡すことがあるので int へ寄せる。
     if start_line is not None:
@@ -2178,45 +2387,69 @@ def read_file(
                 result = service.get_full_content(resolved, is_admin=True)
             except Exception as e:
                 logger.error(f"Error in read_file: {e}", exc_info=True)
-                return {"success": False, "error": f"予期しないエラー: {str(e)}"}
+                return _read_failure(f"予期しないエラー: {str(e)}", "read_failed")
             if not result.get("success"):
-                return result
-            lines = str(result.get("content") or "").splitlines()
-            first = max(0, (start_line or 1) - 1)
-            last = len(lines) if end_line is None else max(first, end_line)
+                return _read_failure(
+                    str(result.get("error") or "ファイルを読み取れませんでした"),
+                    str(result.get("error_code") or "read_failed"),
+                )
+            # 空の変換結果は本文テキスト側 (空ファイル = 1 行の空行) と揃える。
+            lines = str(result.get("content") or "").splitlines() or [""]
+            total_lines = len(lines)
+            # 本文テキスト側 (FileEditor.view) と同じ窓の契約: start_line<1 と
+            # end_line<start_line は typed error、end_line=-1 は末尾まで。
+            start = 1 if start_line is None else start_line
+            end = None if end_line == -1 else end_line
+            if start < 1 or start > total_lines or (
+                end is not None and end < start
+            ):
+                return _read_failure(
+                    f"start_line={start}, end_line={end_line} は "
+                    f"全 {total_lines} 行の範囲外です",
+                    "read_invalid_line_range",
+                )
+            first = start - 1
+            end_line = end
+            last = total_lines if end_line is None else min(end_line, total_lines)
             selected = lines[first:last]
+            # 変換ドキュメントは表示上限を掛けずに依頼された窓を丸ごと描画する。
+            # 契約上 next_start_line は truncated のときだけ入るので、明示
+            # end_line の窓は暗黙に継続しない (常に None)。
             return {
                 "success": True,
                 "type": "mail" if converted_suffix in {".eml", ".msg"} else "office",
                 "path": path,
                 "content": "\n".join(selected),
                 "start_line": first + 1,
-                "end_line": first + len(selected),
+                "end_line": last,
+                "total_lines": total_lines,
+                "truncated": False,
+                "next_start_line": None,
             }
         try:
             editor = get_file_editor()
             service = _workspace_service()
-            content = editor.view(
+            window = editor.view_window(
                 resolved,
                 start_line=start_line,
                 end_line=end_line,
                 max_file_size=service.MAX_READ_FILE_SIZE,
             )
         except FileEditorError as e:
-            result = {"success": False, "error": str(e)}
-            if getattr(e, "error_code", ""):
-                result["error_code"] = e.error_code
-            return result
+            return _read_failure(str(e), str(getattr(e, "error_code", "") or "read_failed"))
         except Exception as e:
             logger.error(f"Error in read_file: {e}", exc_info=True)
-            return {"success": False, "error": f"予期しないエラー: {str(e)}"}
+            return _read_failure(f"予期しないエラー: {str(e)}", "read_failed")
         return {
             "success": True,
             "type": "text",
             "path": path,
-            "content": content,
-            "start_line": start_line or 1,
-            "end_line": end_line,
+            "content": window.text,
+            "start_line": window.start_line,
+            "end_line": window.end_line,
+            "total_lines": window.total_lines,
+            "truncated": window.truncated,
+            "next_start_line": window.next_start_line,
         }
 
     try:
@@ -2233,8 +2466,14 @@ def read_file(
         )
     except Exception as e:
         logger.error(f"Error in read_file: {e}", exc_info=True)
-        return {"success": False, "error": f"予期しないエラー: {str(e)}"}
+        return _read_failure(f"予期しないエラー: {str(e)}", "read_failed")
 
+    if not result.get("success"):
+        failure = _read_failure(
+            str(result.get("error") or "ファイルを読み取れませんでした"),
+            str(result.get("error_code") or "read_failed"),
+        )
+        result = {**result, **failure}
     if result.get("success") and result.get("type") in {"text", "office", "mail"}:
         result["offset"] = offset
         result["max_chars"] = max_chars
@@ -2249,11 +2488,10 @@ def read_file(
         result.pop("data_url", None)
         result.pop("content", None)
         result.update(
-            {
-                "success": False,
-                "error_code": "binary_file",
-                "error": "バイナリファイルはread_fileでテキストとして読み取れません",
-            }
+            _read_failure(
+                "バイナリファイルはread_fileでテキストとして読み取れません",
+                "binary_file",
+            )
         )
     if is_absolute:
         result["path"] = path
@@ -2815,6 +3053,39 @@ def list_directory(
     return result
 
 
+def _content_only_args_ignored_in_name_search(
+    *,
+    glob: Optional[str],
+    output_mode: str,
+    offset: int,
+    context_lines: int,
+    max_matches_per_file: int,
+    fixed_strings: bool,
+    include_ignored: bool,
+) -> List[str]:
+    """Names of content-only args whose values differ from their defaults.
+
+    Explicit provenance is unavailable, so only non-default values count:
+    ``output_mode="content"`` (the default) is never reported.
+    """
+    ignored: List[str] = []
+    if glob:
+        ignored.append("glob")
+    if str(output_mode or "content") != "content":
+        ignored.append("output_mode")
+    if offset:
+        ignored.append("offset")
+    if context_lines:
+        ignored.append("context_lines")
+    if max_matches_per_file != 20:
+        ignored.append("max_matches_per_file")
+    if fixed_strings:
+        ignored.append("fixed_strings")
+    if include_ignored:
+        ignored.append("include_ignored")
+    return ignored
+
+
 @tool
 @_enterprise_scoped()
 def search_files(
@@ -2825,32 +3096,41 @@ def search_files(
     include_dirs: bool = True,
     include_files: bool = True,
     max_results: int = 50,
+    glob: Optional[str] = None,
+    output_mode: str = "content",
+    offset: int = 0,
+    context_lines: int = 0,
+    max_matches_per_file: int = 20,
+    fixed_strings: bool = False,
+    include_ignored: bool = False,
 ) -> Dict[str, Any]:
-    """Search files and folders by name, or search inside file contents.
+    """Default: filename search. Set search_content=true to grep file contents (regex).
 
-    By default this matches names under the search root, returning folders as
-    well as files, so it is the way to locate a workspace item you only know by
-    name. `query` is a glob when it contains `*` or `?`, otherwise a
-    case-insensitive substring. Set `search_content=True` to grep file contents
-    with a regular expression instead. The path is workspace-relative
-    ("" for the workspace root) or absolute.
+    Name search: `query` is a glob if it has `*`/`?`, else a substring.
+    Content search (search_content=True): use it on a narrowed path/glob, then
+    read only the hit lines with read_file(start_line, end_line). Dependency,
+    build, cache and .gitignore'd files are skipped unless you pass that
+    folder/file as `path`. A page ends at max_results files: continue with
+    next_offset. status: ok, no_matches, partial, interrupted, invalid_regex, error.
 
     Args:
-        query: Name pattern, or a regular expression when search_content is True.
-        path: Workspace-relative or absolute search root ("" for workspace root).
-        extensions: Optional extension filter (e.g. [".py", ".md"]).
-        search_content: True to search file contents instead of names.
-        include_dirs: False to skip folders in name search.
-        include_files: False to skip files in name search.
-        max_results: Maximum results to return (default 50).
+        query: Name pattern, or regex when search_content is True.
+        path: Workspace-relative/absolute folder or file ("" = workspace root).
+        extensions: Extension filter, e.g. [".py"].
+        search_content: True to search inside files.
+        include_dirs: False to skip folders (name search).
+        include_files: False to skip files (name search).
+        max_results: Results per page (default 50; files for content search).
+        glob: Content search file globs, e.g. "*.py,src/**/*.ts"; "!" excludes.
+        output_mode: "content" (lines), "files" or "count".
+        offset: Files to skip; pass the previous next_offset.
+        context_lines: Context lines around a match (0-5).
+        max_matches_per_file: Lines shown per file (default 20).
+        fixed_strings: True to match query literally.
+        include_ignored: True to also search .gitignore'd files.
 
     Returns:
         Dict[str, Any]: Search results.
-
-    Examples:
-        >>> search_files("AIエージェント共有")
-        >>> search_files("*.py", "src", max_results=100)
-        >>> search_files("TODO", "src", search_content=True)
     """
     print(f"[Tool] search_files が呼び出されました: {query} in {path}")
 
@@ -2865,12 +3145,18 @@ def search_files(
     if search_content:
         try:
             fs = get_file_system()
-            result = fs.search_files(
+            result = fs.search_content(
                 query,
                 resolved,
                 extensions=extensions,
-                search_content=True,
+                glob=glob,
+                output_mode=output_mode,
+                offset=offset,
                 max_results=int(max_results or 50),
+                context_lines=context_lines,
+                max_matches_per_file=max_matches_per_file,
+                fixed_strings=fixed_strings,
+                include_ignored=include_ignored,
                 exclude_path=(
                     lambda candidate: bool(
                         _enterprise_sensitive_path_error(str(candidate))
@@ -2884,7 +3170,7 @@ def search_files(
         except Exception as e:
             logger.error(f"Error in search_files: {e}", exc_info=True)
             return {"success": False, "error": f"予期しないエラー: {str(e)}"}
-        return {"success": True, "query": query, "content": result}
+        return result
 
     try:
         service = _workspace_service()
@@ -2897,6 +3183,21 @@ def search_files(
             extensions=extensions,
             is_admin=True,
         )
+        ignored = _content_only_args_ignored_in_name_search(
+            glob=glob,
+            output_mode=output_mode,
+            offset=offset,
+            context_lines=context_lines,
+            max_matches_per_file=max_matches_per_file,
+            fixed_strings=fixed_strings,
+            include_ignored=include_ignored,
+        )
+        if ignored and isinstance(result, dict):
+            result["note"] = (
+                "Name search ran (search_content=false): matched file/folder names only; "
+                f"ignored content-only args: {', '.join(ignored)}. "
+                "Pass search_content=true to search inside files."
+            )
         if result.get("success") and _enterprise_sensitive_filter_active():
             result["results"] = [
                 entry

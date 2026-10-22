@@ -484,18 +484,393 @@ class AgentIdentityService:
             raise AgentIdentityAuthorizationError("administrator authorization required")
         return actor
 
+    async def _assert_active_human_owner(self, session, owner_user_id: Any) -> UUID:
+        """Validate a real active human for owner-only private provisioning.
+
+        Private AoiDots provisioning is intentionally separate from the admin
+        CRUD surface.  The owner must still be a database-backed active
+        ``User``; a request-shaped role, an Agent UUID, or a synthetic
+        service principal cannot satisfy this check.
+        """
+
+        owner = self._require_human(owner_user_id)
+        possible_agent = await session.get(Agent, owner)
+        if possible_agent is not None and hasattr(possible_agent, "state"):
+            raise AgentIdentityAuthorizationError("Agent principals cannot own private provisioning")
+        user = await session.get(User, owner)
+        if user is None or not bool(user.is_active):
+            raise AgentIdentityAuthorizationError("an active human owner is required")
+        return owner
+
+    @staticmethod
+    def _revision_content_payload(revision: Any) -> dict[str, Any]:
+        """Rebuild the canonical hash material for one AgentRevision row."""
+
+        def value(name: str, default: Any = None) -> Any:
+            if isinstance(revision, Mapping):
+                return revision.get(name, default)
+            return getattr(revision, name, default)
+
+        def mapping_value(primary: str, alias: str) -> dict[str, Any]:
+            raw = value(primary, value(alias, {}))
+            return dict(raw) if isinstance(raw, Mapping) else {}
+
+        return {
+            "agent_id": str(value("agent_id") or ""),
+            "display_name": str(value("display_name") or ""),
+            "mission": str(value("mission") or ""),
+            "responsibility_summary": str(value("responsibility_summary") or ""),
+            "operational_instructions": str(value("operational_instructions") or ""),
+            "agent_team_id": str(value("agent_team_id") or ""),
+            "execution_profile_id": str(value("execution_profile_id") or ""),
+            "allowed_subagent_ids": list(value("allowed_subagent_ids") or []),
+            "capability_ceiling": list(
+                value("capability_ceiling_json", value("capability_ceiling", [])) or []
+            ),
+            "wake_policy": mapping_value("wake_policy_json", "wake_policy"),
+            "budget_policy": mapping_value("budget_policy_json", "budget_policy"),
+            "concurrency_policy": mapping_value(
+                "concurrency_policy_json", "concurrency_policy"
+            ),
+        }
+
+    @classmethod
+    def _revision_content_hash(cls, revision: Any) -> str:
+        return sha256_json(cls._revision_content_payload(revision))
+
+    @classmethod
+    def _assert_revision_content_hash(cls, revision: Any) -> str:
+        expected = cls._revision_content_hash(revision)
+        actual = str(
+            revision.get("content_hash")
+            if isinstance(revision, Mapping)
+            else getattr(revision, "content_hash", "")
+        ).strip().lower()
+        if actual != expected:
+            raise AgentIdentityConflictError("Agent revision content hash is invalid")
+        return expected
+
+    def _assert_private_general_worker_route(
+        self,
+        revision: Any,
+        *,
+        config: Any | None = None,
+    ) -> None:
+        """Require the pure catalog/profile preflight for ``general_worker``.
+
+        Private bootstrap must not import provider SDKs, Spotify tools, or the
+        full ToolRegistry merely to decide whether a pinned Team/Profile/
+        Subagent declaration is structurally executable.  ``manual`` is the
+        explicit Main-inherit profile; it is accepted only after Team
+        membership, enabled Subagent state, and capability intersection are
+        validated.  Runtime/provider construction remains a later gate.
+        """
+
+        def read(name: str, default: Any = None) -> Any:
+            if isinstance(revision, Mapping):
+                return revision.get(name, default)
+            return getattr(revision, name, default)
+
+        route_config = config if config is not None else self.config
+        team_id = str(read("agent_team_id") or "").strip()
+        profile_id = str(read("execution_profile_id") or "").strip()
+        allowed = {
+            str(item).strip()
+            for item in (read("allowed_subagent_ids") or [])
+            if str(item).strip()
+        }
+        if team_id != "general" or profile_id != "manual" or "general_worker" not in allowed:
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable")
+
+        teams = {str(key): value for key, value in AGENT_TEAM_DEFAULT_TEAMS.items()}
+        try:
+            for item in agent_team_v3_teams(route_config):
+                if isinstance(item, Mapping) and str(item.get("team_id") or "").strip():
+                    teams[str(item["team_id"])] = dict(item)
+        except Exception as exc:
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable") from exc
+        team = teams.get(team_id)
+        members = {
+            str(item).strip()
+            for item in (team or {}).get("subagent_ids", [])
+            if str(item).strip()
+        }
+        if not team or team.get("enabled", True) is False or "general_worker" not in members:
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable")
+
+        subagents = dict(AGENT_TEAM_SUBAGENT_CATALOG)
+        try:
+            for item in agent_team_v3_subagents(route_config):
+                if isinstance(item, Mapping) and str(item.get("subagent_id") or "").strip():
+                    subagents[str(item["subagent_id"])] = dict(item)
+        except Exception as exc:
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable") from exc
+        worker = subagents.get("general_worker") or {}
+        if worker.get("enabled", True) is False:
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable")
+        declared_capabilities = {
+            str(item).strip()
+            for item in (worker.get("capability_ids") or [])
+            if str(item).strip()
+        }
+        revision_capabilities = {
+            str(item).strip()
+            for item in (read("capability_ceiling_json", read("capability_ceiling", [])) or [])
+            if str(item).strip()
+        }
+        if not (declared_capabilities & revision_capabilities & set(AGENT_TEAM_CAPABILITY_CATALOG)):
+            raise AgentIdentityConflictError("private Agent general_worker route is unavailable")
+
+    async def _create_private_agent_and_revision(
+        self,
+        session,
+        *,
+        owner_user_id: Any,
+        purpose: Any = "aoidots",
+        config: Any | None = None,
+        agent_id: Any | None = None,
+        revision_id: Any | None = None,
+        private_role: Any = "root",
+        agent_idempotency_key: Any | None = None,
+        revision_idempotency_key: Any | None = None,
+    ) -> tuple[Agent, AgentRevision]:
+        """Create the ordinary Agent identity used by a private root.
+
+        This is an internal transaction helper for
+        :class:`AgentPrivateProvisioningService`.  It deliberately does not
+        accept an actor role, provider/model, prompt, scheduler, or arbitrary
+        capability list.  The root uses the regular ``general``/``manual``
+        topology and the small capability catalog intersection that is safe
+        for the private root.
+        """
+
+        owner = await self._assert_active_human_owner(session, owner_user_id)
+        purpose_text = _text(purpose, "purpose", max_length=64)
+        if purpose_text != "aoidots":
+            raise AgentIdentityValidationError("private provisioning purpose must be aoidots")
+        role_text = _text(private_role, "private_role", max_length=32)
+        if role_text not in {"root", "general_worker"}:
+            raise AgentIdentityValidationError("unsupported private Agent role")
+
+        # These are the only private-root settings that can be derived from
+        # normal Agent configuration.  In particular, callers cannot widen
+        # the capability ceiling or select a provider/model here.
+        supplied = config if isinstance(config, Mapping) else {}
+        default_name = "AoiDots" if role_text == "root" else "AoiDots General Worker"
+        display_name = _text(
+            supplied.get("display_name", default_name) if role_text == "root" else default_name,
+            "display_name",
+            max_length=160,
+        )
+        team_id = _text(supplied.get("agent_team_id", "general"), "agent_team_id", max_length=100)
+        profile_id = _text(supplied.get("execution_profile_id", "manual"), "execution_profile_id", max_length=100)
+        if team_id != "general" or profile_id != "manual":
+            raise AgentIdentityValidationError("private provisioning requires the general/manual Agent topology")
+        capability_ceiling = [
+            capability
+            for capability in ("aoi_tools", "web_read")
+            if capability in AGENT_TEAM_CAPABILITY_CATALOG
+        ]
+        allowed_private_subagents = (
+            ["general_researcher", "general_worker"]
+            if role_text == "root"
+            else ["general_worker"]
+        )
+        team, profile, subagents, ceiling = self._validate_team_refs(
+            team_id,
+            profile_id,
+            allowed_private_subagents,
+            capability_ceiling,
+        )
+        owner_text = str(owner)
+        agent_key = _idempotency(
+            agent_idempotency_key
+            or (
+                f"{purpose_text}:agent:{owner_text}"
+                if role_text == "root"
+                else f"private-worker:{owner_text}:general:v1"
+            ),
+            "private_agent_idempotency_key",
+        )
+        revision_key = _idempotency(
+            revision_idempotency_key
+            or (
+                f"{purpose_text}:revision:{owner_text}:1"
+                if role_text == "root"
+                else f"private-worker:{owner_text}:general:v1:revision"
+            ),
+            "private_revision_idempotency_key",
+        )
+        mission = "" if role_text == "root" else "Provide bounded general-purpose assistance for the owner."
+        responsibility = "" if role_text == "root" else "Owner-scoped general worker for AoiDots jobs."
+        concurrency_policy = (
+            {"max_parallel_runs": 1, "max_parallel_tasks": 1}
+            if role_text == "root"
+            else {"max_parallel_runs": 2, "max_parallel_tasks": 2}
+        )
+        create_hash = sha256_json(
+            {"display_name": display_name, "slug": None, "character_id": None}
+        )
+        expected_agent_id = _uuid(agent_id, "agent_id", required=False)
+        expected_revision_id = _uuid(revision_id, "agent_revision_id", required=False)
+
+        created_agent = False
+        agent = (
+            await session.execute(
+                select(Agent).where(Agent.idempotency_key == agent_key).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if agent is None:
+            agent = Agent(
+                id=expected_agent_id or uuid4(),
+                display_name=display_name,
+                slug=None,
+                state="draft",
+                character_id=None,
+                create_hash=create_hash,
+                idempotency_key=agent_key,
+                created_by=owner,
+            )
+            session.add(agent)
+            await session.flush()
+            created_agent = True
+        elif (
+            agent.create_hash != create_hash
+            or agent.created_by != owner
+            or agent.display_name != display_name
+            or (expected_agent_id is not None and agent.id != expected_agent_id)
+        ):
+            raise AgentIdentityConflictError("private Agent identity is owned by another configuration")
+        else:
+            # A private root is allowed to activate the identity it created in
+            # this transaction.  A later bootstrap must never reactivate a
+            # paused/retired row or overwrite a pre-existing Agent setup.
+            if str(agent.state or "") != "active":
+                raise AgentIdentityConflictError("private Agent identity is inactive")
+
+        content = {
+            "agent_id": str(agent.id),
+            "display_name": display_name,
+            "mission": mission,
+            "responsibility_summary": responsibility,
+            "operational_instructions": "",
+            "agent_team_id": team,
+            "execution_profile_id": profile,
+            "allowed_subagent_ids": subagents,
+            "capability_ceiling": ceiling,
+            "wake_policy": {"mode": "manual"},
+            "budget_policy": {},
+            "concurrency_policy": concurrency_policy,
+        }
+        digest = sha256_json(content)
+        revision = (
+            await session.execute(
+                select(AgentRevision)
+                .where(
+                    AgentRevision.agent_id == agent.id,
+                    AgentRevision.idempotency_key == revision_key,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if revision is None:
+            if not created_agent:
+                raise AgentIdentityConflictError("private Agent already has no canonical revision")
+            latest = (
+                await session.execute(
+                    select(func.max(AgentRevision.version)).where(AgentRevision.agent_id == agent.id)
+                )
+            ).scalar_one()
+            version = int(latest or 0) + 1
+            if version != 1:
+                raise AgentIdentityConflictError("private Agent has an unexpected existing revision")
+            revision = AgentRevision(
+                id=expected_revision_id or uuid4(),
+                agent_id=agent.id,
+                version=version,
+                display_name=display_name,
+                mission=mission,
+                responsibility_summary=responsibility,
+                operational_instructions="",
+                agent_team_id=team,
+                execution_profile_id=profile,
+                allowed_subagent_ids=subagents,
+                capability_ceiling_json=ceiling,
+                wake_policy_json={"mode": "manual"},
+                budget_policy_json={},
+                concurrency_policy_json=concurrency_policy,
+                content_hash=digest,
+                idempotency_key=revision_key,
+                created_by=owner,
+            )
+            session.add(revision)
+            await session.flush()
+        elif (
+            revision.content_hash != digest
+            or revision.agent_id != agent.id
+            or revision.created_by != owner
+            or (expected_revision_id is not None and revision.id != expected_revision_id)
+        ):
+            raise AgentIdentityConflictError("private Agent revision is owned by another configuration")
+
+        self._assert_revision_content_hash(revision)
+
+        # A private identity must have one concrete ordinary work-role route
+        # before it is exposed to Chat/Operations.  Resolve against the
+        # pinned Team/Profile/Subagent graph and fail closed on any missing
+        # route; silently inheriting an ambient Main fallback would widen the
+        # private Agent's authority.
+        self._assert_private_general_worker_route(revision, config=config)
+
+        if created_agent:
+            agent.state = "active"
+            agent.updated_at = datetime.utcnow()
+        return agent, revision
+
     def _known_teams(self) -> dict[str, dict[str, Any]]:
         known = {str(key): value for key, value in AGENT_TEAM_DEFAULT_TEAMS.items()}
         try:
             for item in agent_team_v3_teams(self.config):
                 if isinstance(item, Mapping) and str(item.get("team_id") or "").strip():
-                    known[str(item["team_id"])] = dict(item)
+                    team = dict(item)
+                    known[str(team["team_id"])] = team
         except Exception:
             logger.debug("agent team config unavailable; using canonical defaults", exc_info=True)
         return known
 
+    def _revision_route_warnings(self, revision: Mapping[str, Any]) -> list[dict[str, str]]:
+        """Report unavailable selected routes without prescribing new grants."""
+
+        from .agent_model_routing import (
+            AgentModelRouteError,
+            AgentRoutingPins,
+            resolve_agent_subagent_route,
+        )
+
+        pins = AgentRoutingPins.from_revision(revision)
+        warnings = []
+        for subagent_id in pins.allowed_subagent_ids:
+            try:
+                resolve_agent_subagent_route(self.config, pins, subagent_id)
+            except AgentModelRouteError as exc:
+                warnings.append({
+                    "code": exc.code,
+                    "subagent_id": subagent_id,
+                    "message": "このRevisionで選択されたTeam/Profile/Subagentの実行ルートを利用できません。設定を確認してください。",
+                })
+        return warnings
+
+    def _revision_projection(self, revision: Any) -> dict[str, Any]:
+        payload = revision.to_safe_dict() if hasattr(revision, "to_safe_dict") else dict(revision)
+        warnings = self._revision_route_warnings(payload)
+        if warnings:
+            payload["route_warnings"] = warnings
+        return payload
+
     async def employee_catalog(self, *, actor_user_id: Any) -> dict[str, Any]:
         """Safe editor choices from the same catalogs used at revision save."""
+        from .agent_model_routing import preview_execution_profile_routes
+
         session = await self._session()
         try:
             await self._assert_admin(session, actor_user_id)
@@ -521,6 +896,14 @@ class AgentIdentityService:
                 for item in list_team_execution_profiles(self.config, team_id)
                 if item.get("enabled") is not False and item["profile_id"] not in {"manual", "free-team"}
             )
+            # Read-only effective Subagent routes (provider/model/effort
+            # identifiers only) so the Agent editor can show which model each
+            # Subagent will actually use.  Editing stays in Settings.
+            for profile in profiles:
+                profile["routes"] = preview_execution_profile_routes(
+                    self.config, team_id, profile["profile_id"],
+                    subagent_ids=[member["subagent_id"] for member in members],
+                )
             teams.append({"team_id": team_id, "name": team.get("name", team_id),
                           "subagents": members, "execution_profiles": profiles})
         return {"teams": teams, "capabilities": list(AGENT_TEAM_CAPABILITY_CATALOG.values()),
@@ -553,9 +936,16 @@ class AgentIdentityService:
             item for item in agent_team_v3_subagents(self.config)
             if isinstance(item, Mapping) and item.get("subagent_id") and item.get("enabled") is not False
         ]
+        configured_disabled_subagents = {
+            str(item.get("subagent_id") or "").strip()
+            for item in agent_team_v3_subagents(self.config)
+            if isinstance(item, Mapping)
+            and item.get("subagent_id")
+            and item.get("enabled") is False
+        }
         known_subagents = {
             key for key, value in AGENT_TEAM_SUBAGENT_CATALOG.items()
-            if value.get("enabled", True) is not False
+            if value.get("enabled", True) is not False and key not in configured_disabled_subagents
         }
         known_subagents.update(str(item.get("subagent_id") or "") for item in configured_subagents)
         subagents = _string_list(allowed_subagent_ids, label="allowed_subagent_ids", allowed=known_subagents)
@@ -617,7 +1007,7 @@ class AgentIdentityService:
             )
             session.add(row)
             await session.flush()
-            payload = row.to_safe_dict()
+            payload = self._revision_projection(row)
             await session.commit()
             return payload
         except IntegrityError:
@@ -651,6 +1041,50 @@ class AgentIdentityService:
         finally:
             await session.close()
 
+    async def update_thumbnail(self, *, agent_id: Any, artifact_id: Any | None, expected_artifact_id: Any | None, actor_user_id: Any) -> dict[str, Any]:
+        """Select an owned, verified image without changing Agent authority or Persona links."""
+        from io import BytesIO
+        from PIL import Image, UnidentifiedImageError
+        from .operations_service import OperationsError, OperationsService
+
+        aid = _uuid(agent_id, "agent_id")
+        image_id = _uuid(artifact_id, "artifact_id", required=False)
+        expected = _uuid(expected_artifact_id, "expected_artifact_id", required=False)
+        session = await self._session()
+        try:
+            actor = await self._assert_admin(session, actor_user_id)
+            row = (await session.execute(select(Agent).where(Agent.id == aid).with_for_update())).scalar_one_or_none()
+            if row is None:
+                raise AgentIdentityNotFoundError("Agent not found")
+            if row.thumbnail_artifact_id != expected:
+                raise AgentIdentityConflictError("Agent thumbnail has changed")
+            if image_id is not None:
+                try:
+                    artifact, content = await OperationsService().get_artifact_content(session, {"id": actor, "actor_type": "human"}, image_id)
+                except OperationsError as exc:
+                    raise AgentIdentityError("image artifact is unavailable", status_code=exc.status_code) from exc
+                if artifact["owner_user_id"] != str(actor):
+                    raise AgentIdentityAuthorizationError("image artifact must be owned by the administrator")
+                formats = {"image/png": "PNG", "image/jpeg": "JPEG"}
+                if artifact["mime_type"] not in formats:
+                    raise AgentIdentityValidationError("thumbnail must be a PNG or JPEG image")
+                try:
+                    with Image.open(BytesIO(content)) as image:
+                        if image.format != formats[artifact["mime_type"]] or image.width * image.height > 32_000_000:
+                            raise AgentIdentityValidationError("thumbnail image format or dimensions are invalid")
+                        image.verify()
+                except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+                    raise AgentIdentityValidationError("thumbnail image is invalid") from exc
+            row.thumbnail_artifact_id = image_id
+            row.updated_at = datetime.utcnow()
+            await session.commit()
+            return {"agent_id": str(aid), "artifact_id": str(image_id) if image_id else None}
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
     create = create_agent
     list = list_agents
     get = get_agent
@@ -673,6 +1107,7 @@ class AgentIdentityService:
                 revision = (await session.execute(select(AgentRevision).where(AgentRevision.agent_id == row.id).order_by(AgentRevision.version.desc()).limit(1))).scalar_one_or_none()
                 if revision is None:
                     raise AgentIdentityConflictError("Agent revision is required before activation")
+                self._assert_revision_content_hash(revision)
                 self._validate_team_refs(revision.agent_team_id, revision.execution_profile_id,
                                          revision.allowed_subagent_ids, revision.capability_ceiling_json)
             changed = await session.execute(update(Agent).where(Agent.id == row.id, Agent.state == row.state)
@@ -762,7 +1197,7 @@ class AgentIdentityService:
             if existing is not None:
                 if existing.content_hash != digest:
                     raise AgentIdentityConflictError("revision idempotency key was used with different content")
-                return existing.to_safe_dict()
+                return self._revision_projection(existing)
             if str(agent.state or "") == "retired":
                 raise AgentIdentityConflictError("retired Agents cannot receive new revisions")
             latest = (await session.execute(select(func.max(AgentRevision.version)).where(AgentRevision.agent_id == aid))).scalar_one()
@@ -781,14 +1216,14 @@ class AgentIdentityService:
             )
             session.add(row)
             await session.flush()
-            payload = row.to_safe_dict()
+            payload = self._revision_projection(row)
             await session.commit()
             return payload
         except IntegrityError:
             await session.rollback()
             winner = (await session.execute(select(AgentRevision).where(AgentRevision.agent_id == aid, AgentRevision.idempotency_key == key))).scalar_one_or_none()
             if winner is not None and winner.content_hash == digest:
-                return winner.to_safe_dict()
+                return self._revision_projection(winner)
             if winner is not None:
                 raise AgentIdentityConflictError("revision idempotency key was used with different content")
             raise AgentIdentityConflictError("Agent revision creation conflicted")
@@ -803,7 +1238,7 @@ class AgentIdentityService:
         session = await self._session()
         try:
             rows = (await session.execute(select(AgentRevision).where(AgentRevision.agent_id == aid).order_by(AgentRevision.version.desc()).limit(min(max(int(limit or 100), 1), 200)))).scalars().all()
-            return [row.to_safe_dict() for row in rows]
+            return [self._revision_projection(row) for row in rows]
         finally:
             await session.close()
 
@@ -814,7 +1249,7 @@ class AgentIdentityService:
         session = await self._session()
         try:
             row = await session.get(AgentRevision, rid)
-            return row.to_safe_dict() if row else None
+            return self._revision_projection(row) if row else None
         finally:
             await session.close()
 
@@ -829,6 +1264,9 @@ class AgentIdentityService:
             await self._assert_admin(session, actor_user_id)
             if await session.get(Agent, aid) is None:
                 raise AgentIdentityNotFoundError("Agent not found")
+            from .agent_organization_service import lock_reporting_graph, validate_manager_graph
+
+            await lock_reporting_graph(session)
             row = await session.get(AgentOrganizationProfile, aid)
             primary_space = _uuid(
                 payload["primary_space_id"]
@@ -863,6 +1301,7 @@ class AgentIdentityService:
                 manager_row = await session.get(Agent, manager_agent)
                 if manager_row is None or str(manager_row.state or "") != "active":
                     raise AgentIdentityNotFoundError("manager Agent not found")
+            await validate_manager_graph(session, aid, manager_agent)
             autonomy = _text(
                 payload.get("autonomy_level", row.autonomy_level if row else "supervised"),
                 "autonomy_level",
@@ -1002,6 +1441,40 @@ class AgentIdentityService:
             agent_id=agent_id, target_id=persona_id, target_model=Persona, target_label="Persona",
             actor_user_id=actor_user_id, values={"role": role_text, "is_primary": bool(is_primary), "capability_ceiling": _capability_list(capability_ceiling), "active_from": active_from, "active_until": active_until},
         )
+
+    async def update_persona_operator_ceiling(self, *, agent_id: Any, assignment_id: Any, capability_ceiling: Any, expected_capability_ceiling: Any, actor_user_id: Any) -> dict[str, Any]:
+        if not Features.is_enabled("virtual_company"):
+            raise AgentIdentityFeatureDisabledError("virtual company features are disabled")
+        aid = _uuid(agent_id, "agent_id")
+        rid = _uuid(assignment_id, "assignment_id")
+        ceiling = _capability_list(capability_ceiling)
+        expected = _capability_list(expected_capability_ceiling, label="expected_capability_ceiling")
+        session = await self._session()
+        try:
+            await self._assert_admin(session, actor_user_id)
+            row = await session.get(PersonaOperatorAssignment, rid, with_for_update=True)
+            if row is None or row.agent_id != aid:
+                raise AgentIdentityNotFoundError("assignment not found")
+            if row.state != "active":
+                raise AgentIdentityConflictError("inactive assignments cannot be edited")
+            await self._assert_assignment_target(session, Persona, row.persona_id, "Persona")
+            persona = await session.get(Persona, row.persona_id)
+            # Preserve the owner's operating authorization for a personal Persona.
+            # Another administrator must not widen a grant issued by its owner.
+            if persona.project_id is None and persona.owner_user_id is not None and persona.owner_user_id != _uuid(actor_user_id, "actor_user_id"):
+                raise AgentIdentityAuthorizationError("personal Persona ceiling requires its owner")
+            if row.capability_ceiling_json != expected:
+                raise AgentIdentityConflictError("Persona capability ceiling changed")
+            row.capability_ceiling_json = ceiling
+            row.updated_at = datetime.utcnow()
+            result = row.to_safe_dict()
+            await session.commit()
+            return result
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
     async def _create_assignment(self, model: Any, *, agent_id: Any, target_id: Any, target_model: Any, target_label: str, actor_user_id: Any, values: dict[str, Any]) -> dict[str, Any]:
         if not Features.is_enabled("virtual_company"):

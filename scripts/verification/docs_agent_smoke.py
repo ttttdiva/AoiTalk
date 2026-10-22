@@ -1,4 +1,4 @@
-"""Exercise Docs Agent protocols with real PostgreSQL, BGE-M3 and local Qdrant.
+"""Exercise Docs Agent protocols with real PostgreSQL, EmbeddingGemma 2 and local Qdrant.
 
 Requires an explicitly disposable local database. Never accepts the application
 database. All canonical rows created here are synthetic and removed on exit.
@@ -116,7 +116,7 @@ async def run():
             cursor = page["next_cursor"]
             assert pages < 100
         assert page["coverage_complete"]
-        return {"success": True, "disposable": True, "driver": "asyncpg", "embedding": "BAAI/bge-m3",
+        return {"success": True, "disposable": True, "driver": "asyncpg", "embedding": "google/embeddinggemma-2",
                 "vector_store": "Qdrant in-memory", "migration": "20260908_0005",
                 "atomic_mutation": True, "receipt_replay": True, "durable_index_delivery": True,
                 "authorized_semantic_search": True, "coverage_complete": True,

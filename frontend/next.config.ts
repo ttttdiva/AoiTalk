@@ -1,5 +1,10 @@
 import type { NextConfig } from "next";
+import { resolve } from "node:path";
+import { normalizeBasePath } from "./src/lib/base-path";
 
+const publicBasePath = normalizeBasePath(
+  process.env.AOITALK_PUBLIC_BASE_PATH || process.env.NEXT_PUBLIC_BASE_PATH,
+);
 const productionLifecycle =
   process.env.npm_lifecycle_event === "build:production" ||
   process.env.npm_lifecycle_event === "start";
@@ -13,7 +18,38 @@ const resolvedDistDir =
         ? ".next-verify"
         : ".next");
 
+const incomingRequestLogIgnore = [
+  /\/operations\/media\/oauth\/callback(?:[/?]|$)/,
+  /\/api\/auth\/handoff\/(?:start|authorize|callback|requests|exchange|client-authorize)(?:[/?]|$)/,
+];
+
 const nextConfig: NextConfig = {
+  logging: { incomingRequests: { ignore: incomingRequestLogIgnore } },
+  // The fixed runtime is a sibling resource inside this repository, never87.
+  turbopack: { root: resolve(/* turbopackIgnore: true */ __dirname, "..") },
+  outputFileTracingRoot: resolve(/* turbopackIgnore: true */ __dirname, ".."),
+  // Docs attachments resolve user-owned workspace files at runtime after the
+  // database ACL and realpath boundary checks. Never copy the whole runtime
+  // workspace tree into the route's standalone trace.
+  outputFileTracingExcludes: {
+    "/api/docs/attachments/*": ["../workspaces/**/*"],
+  },
+  basePath: publicBasePath || undefined,
+  env: {
+    NEXT_PUBLIC_BASE_PATH: publicBasePath,
+    NEXT_PUBLIC_BROWSER_TITLE:
+      process.env.AOITALK_BROWSER_TITLE ||
+      process.env.NEXT_PUBLIC_BROWSER_TITLE ||
+      "AoiTalk",
+    NEXT_PUBLIC_BROWSER_ICON:
+      process.env.AOITALK_BROWSER_ICON ||
+      process.env.NEXT_PUBLIC_BROWSER_ICON ||
+      "/favicon.ico",
+    NEXT_PUBLIC_BROWSER_BRANDING_ORIGINS:
+      process.env.AOITALK_BROWSER_BRANDING_ORIGINS ||
+      process.env.NEXT_PUBLIC_BROWSER_BRANDING_ORIGINS ||
+      "",
+  },
   // 開発・通常検証が稼働中の本番成果物を上書きしないよう出力先を分離する。
   // next dev は .next-dev、npm run build は .next-verify を使用する。
   // npm run build:production と next start だけが本番の .next を使用する。
@@ -31,6 +67,58 @@ const nextConfig: NextConfig = {
   },
   // LAN内の他端末からもアクセスを許可
   allowedDevOrigins: ["127.0.0.1", "localhost", "192.168.*.*", "10.*.*.*", "172.16.*.*", "100.*.*.*"],
+  async redirects() {
+    if (!publicBasePath) return [];
+
+    // A production build can be mounted at /at while users still open the
+    // Next.js listener directly on the LAN (for example http://<LAN-IP>:3002/).
+    // Redirect the historical unprefixed browser pages into the configured
+    // mount instead of returning the basePath 404 page.
+    const directEntryRoots = [
+      "apps",
+      "calendar",
+      "change-password",
+      "chat",
+      "docs",
+      "filer",
+      "files",
+      "login",
+      "operations",
+      "projects",
+      "reports",
+      "reset-password",
+      "settings",
+      "tasks",
+    ];
+
+    return [
+      {
+        source: "/",
+        destination: `${publicBasePath}/chat`,
+        permanent: false,
+        basePath: false as const,
+      },
+      ...directEntryRoots.map((root) => ({
+        source: `/${root}/:path*`,
+        destination: `${publicBasePath}/${root}/:path*`,
+        permanent: false,
+        basePath: false as const,
+      })),
+      {
+        source: "/favicon.ico",
+        destination: `${publicBasePath}/favicon.ico`,
+        permanent: false,
+        basePath: false as const,
+      },
+      {
+        source: "/notifications-sw.js",
+        destination: `${publicBasePath}/notifications-sw.js`,
+        permanent: false,
+        basePath: false as const,
+      },
+    ];
+  },
+
   async rewrites() {
     const pythonApi =
       process.env.PYTHON_API_URL || "http://127.0.0.1:3000";

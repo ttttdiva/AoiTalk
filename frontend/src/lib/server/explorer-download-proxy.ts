@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isClientRequestAbort } from "./proxy-cancellation";
+import { createDownstreamResponseLifetime } from "./downstream-response-lifetime";
 import {
   fetchPythonApi,
   NO_STORE_HEADERS,
@@ -136,6 +138,7 @@ export async function proxyExplorerDownload(
     if (value) requestHeaders[name] = value;
   }
 
+  const responseLifetime = createDownstreamResponseLifetime(request.signal);
   try {
     let body: BodyInit | undefined;
     if (!isGetOrHead) {
@@ -163,9 +166,10 @@ export async function proxyExplorerDownload(
         user,
         headers: requestHeaders,
         body,
-        signal: request.signal,
+        signal: responseLifetime.signal,
       },
     );
+    responseLifetime.detach();
     const responseHeaders: Record<string, string> = { ...NO_STORE_HEADERS };
     for (const name of FORWARDED_RESPONSE_HEADERS) {
       const value = response.headers.get(name);
@@ -174,11 +178,12 @@ export async function proxyExplorerDownload(
     const hasNoBody =
       method === "HEAD" || [204, 205, 304].includes(response.status);
 
-    return new NextResponse(hasNoBody ? null : response.body, {
+    return new NextResponse(hasNoBody || !response.body ? null : responseLifetime.wrap(response.body), {
       status: response.status,
       headers: responseHeaders,
     });
   } catch (error) {
+    responseLifetime.detach();
     if (error instanceof RequestBodyTooLargeError) {
       return NextResponse.json(
         { detail: "ダウンロード対象の一覧が大きすぎます" },
@@ -191,12 +196,8 @@ export async function proxyExplorerDownload(
         { status: 400, headers: NO_STORE_HEADERS },
       );
     }
-    if (
-      request.signal.aborted ||
-      (error instanceof DOMException && error.name === "AbortError") ||
-      (error instanceof Error && error.name === "AbortError")
-    ) {
-      throw error;
+    if (isClientRequestAbort(error, request.signal)) {
+      return new NextResponse(null, { status: 499, headers: NO_STORE_HEADERS });
     }
     return NextResponse.json(
       { detail: "Python APIに接続できません" },
@@ -204,3 +205,4 @@ export async function proxyExplorerDownload(
     );
   }
 }
+

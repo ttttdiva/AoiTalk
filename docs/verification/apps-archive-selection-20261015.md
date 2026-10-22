@@ -1,0 +1,11 @@
+# Apps ダウンロード選択・応答確認
+
+状態: INCOMPLETE_WEBUI_UNVERIFIED。本番未反映。
+
+FWの実manifestはWindows PowerShell / standalone_webとAoiTalk static_webの構成で、Officeマクロ拡張子だけを認識する旧クイック選択では対象なしとなっていた。宣言されたentrypointが可視ファイル内にあるsource packageにも対応した。依存不明の実行用ファイルは保守的に保持し、正確な最小依存集合とは称さない。既存Officeマクロ選択を維持。
+
+通常ZIPも認証付きfetch後にapplication/zipを確認する。HTMLのログイン・エラー応答をarchive.htmとして保存することを避ける。AVDで観測された問題の発生元を特定したという意味ではない。
+
+実React 19 / BaseUIを使用した対象Vitest 31件PASS。manifest両target、必要ファイル選択、保存URL、build/distと入れ子のoutput保持、entrypoint不在、HTML応答・通信失敗を含む。独立静的レビュー実施。
+
+実ブラウザはVM Chromiumのsocket EPERMで起動失敗し、承認された昇格再試行でも同じ結果。AVD / 公開ポータル実受入、全体Next buildは未実施。別途ZIPストリーム寿命の修正もVM検証中で、この変更だけで空ZIP解消済みとは扱わない。

@@ -3,7 +3,7 @@ RAG (Retrieval Augmented Generation) module for AoiTalk.
 
 This module provides document retrieval capabilities using:
 - Qdrant: Vector database for similarity search
-- BAAI/bge-m3: Embedding model
+- google/embeddinggemma-2: Embedding model
 - BAAI/bge-reranker-v2-gemma: Reranking model  
 - LlamaIndex: Document processing
 """

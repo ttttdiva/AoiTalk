@@ -73,6 +73,7 @@ export interface LlamaCppSamplingDefaults {
   temperature?: number;
   top_p?: number;
   top_k?: number;
+  repeat_penalty?: number;
 }
 
 /**
@@ -97,6 +98,7 @@ export interface LlamaCppRuntimeProfile {
   gguf_shard_count?: number | string;
   gguf_repository_subdir?: string;
   default_gpu_layers?: number | string;
+  default_parallel?: number | string;
   required_llama_cpp_commit?: string;
   quantization?: string;
   native_context_size?: number | string;
@@ -105,6 +107,7 @@ export interface LlamaCppRuntimeProfile {
   mmproj_filename?: string;
   mmproj_required?: boolean;
   sampling_defaults?: LlamaCppSamplingDefaults;
+  thinking_mode?: string;
   minimum_llama_cpp_build?: number | string;
   reasoning_tools_minimum_llama_cpp_build?: number | string;
   required_args?: string[];
@@ -151,6 +154,8 @@ export interface LlamaCppMtpProfile {
   /** Optional MTP-only runtime gates; these are descriptive/read-only. */
   minimum_llama_cpp_build?: number | string;
   required_llama_cpp_commit?: string;
+  /** The selected primary GGUF itself contains the embedded MTP tensors. */
+  embedded_in_primary?: boolean;
   embedded_variant?: {
     primary_filename: string;
     filenames: string[];
@@ -310,6 +315,9 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
       required: metadataBoolean(rawMtp.required),
       minimum_llama_cpp_build: nestedMtpMinimum,
       required_llama_cpp_commit: nestedMtpCommit,
+      embedded_in_primary: rawMtpMode === "embedded"
+        ? metadataBoolean(rawMtp.embedded_in_primary)
+        : undefined,
       embedded_variant: embeddedVariant,
       compatibility: rawMtp.compatibility === undefined ? undefined : String(rawMtp.compatibility),
       reason: rawMtp.reason === undefined ? undefined : String(rawMtp.reason),
@@ -355,6 +363,7 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
       temperature: numericMetadata((raw.sampling_defaults as Record<string, unknown>).temperature),
       top_p: numericMetadata((raw.sampling_defaults as Record<string, unknown>).top_p),
       top_k: numericMetadata((raw.sampling_defaults as Record<string, unknown>).top_k),
+      repeat_penalty: numericMetadata((raw.sampling_defaults as Record<string, unknown>).repeat_penalty),
     } satisfies LlamaCppSamplingDefaults
     : undefined;
   const profile: LlamaCppRuntimeProfile = {
@@ -382,6 +391,7 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
     gguf_shard_count: metadataScalar(raw.gguf_shard_count),
     gguf_repository_subdir: metadataText(raw.gguf_repository_subdir),
     default_gpu_layers: metadataScalar(raw.default_gpu_layers),
+    default_parallel: metadataScalar(raw.default_parallel),
     required_llama_cpp_commit: metadataText(raw.required_llama_cpp_commit),
     quantization: raw.quantization === undefined ? undefined : String(raw.quantization),
     native_context_size: scalar(raw.native_context_size ?? raw.native_context_length),
@@ -390,6 +400,7 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
     mmproj_filename: auxiliaryArtifacts?.find((item) => item.kind === "mmproj")?.filename,
     mmproj_required: auxiliaryArtifacts?.some((item) => item.kind === "mmproj" && item.required),
     sampling_defaults: samplingDefaults,
+    thinking_mode: metadataText(raw.thinking_mode),
     minimum_llama_cpp_build: scalar(raw.minimum_llama_cpp_build),
     reasoning_tools_minimum_llama_cpp_build: scalar(raw.reasoning_tools_minimum_llama_cpp_build),
     required_args: requiredArgs,
@@ -524,6 +535,8 @@ export interface LlmProviderCatalog {
   availability?: {
     state?: string;
     error?: string | null;
+    /** Non-error status text, e.g. a stopped managed runtime in standby. */
+    message?: string | null;
   };
   configured_model?: string;
   supports_custom_model: boolean;
@@ -549,6 +562,7 @@ export interface LlmProviderCatalog {
     /** Generic llama.cpp/llama-server settings for the local provider. */
     llama_cpp?: LlamaCppRuntimeSettings;
     freetoken?: FreeTokenRuntimeSettings;
+    strata?: FreeTokenRuntimeSettings;
     /** Read-only alias retained by older catalog payloads. */
     runtime_settings?: LlamaCppRuntimeSettings;
     /** Provider-level runtime profile for legacy/current catalog payloads. */
@@ -573,11 +587,11 @@ export interface LlmProviderCatalog {
   selection_kind?: "static" | "routing_profile";
 }
 
-export type ManagedLocalRuntime = "llama_cpp" | "freetoken";
+export type ManagedLocalRuntime = "llama_cpp" | "freetoken" | "strata";
 
 function normalizedManagedLocalRuntime(value: unknown): ManagedLocalRuntime | null {
   const runtime = String(value ?? "").trim().toLowerCase().replace(".", "_");
-  return runtime === "llama_cpp" || runtime === "freetoken" ? runtime : null;
+  return runtime === "llama_cpp" || runtime === "freetoken" || runtime === "strata" ? runtime : null;
 }
 
 export function managedLocalRuntimeForSelection(
@@ -1048,7 +1062,33 @@ export interface LlmEngineResponse {
   message?: string;
 }
 
+export interface StrataSetupRequest {
+  action?: "setup" | "configure" | "start" | "stop";
+  setup_confirmed?: boolean;
+  base_url?: string;
+  strata?: {
+    source_root?: string;
+    data_dir?: string;
+    gguf_dir?: string;
+    context_size?: number;
+    vision?: "none" | "cpu" | "gpu";
+    port?: number;
+    auto_start?: boolean;
+  };
+}
+
 export interface LocalRuntimeStatus {
+  strata?: {
+    context_size: number;
+    vision: "none" | "cpu" | "gpu";
+    host: string;
+    port: number;
+    auto_start: boolean;
+    operator_only: boolean;
+    setup_notice: string;
+    source_revision: string;
+    source_url: string;
+  } | null;
   task_id: string | null;
   model: string;
   runtime: ManagedLocalRuntime | string | null;
@@ -1089,10 +1129,20 @@ export interface LocalRuntimeStatus {
   server: {
     status: string;
     ready: boolean | null;
+    base_url?: string;
+    context_size?: number;
+    vision?: boolean;
+    startup_progress?: {
+      phase: "loading" | "reading_weights" | "allocating_cache" | "initializing";
+      elapsed_s: number;
+    } | null;
+    /** Strata: prepared + auto_start + stopped. The next chat turn starts it. */
+    auto_start_on_send?: boolean;
   };
   actions: {
     prepare: boolean;
     poll: boolean;
+    cancel?: boolean;
     retry: boolean;
     installer_required: boolean;
   };
@@ -1296,12 +1346,34 @@ export interface AgentTeamActivation {
 
 export type ExecutionRouteEffortPolicy = "same" | "lower" | "explicit" | "default";
 
+/**
+ * Safe presentation metadata for a resolved Execution Route.
+ *
+ * `backend` is supplied by the canonical API for read-only previews.  The
+ * provider fallback keeps older catalog responses useful without teaching
+ * each surface its own provider heuristic.
+ */
+export type ExecutionRouteBackend = "local" | "api" | "cli" | "free_team" | "unknown";
+
+export type ExecutionRoutePresentation = {
+  backend: ExecutionRouteBackend;
+  label: "Local" | "API" | "CLI" | "Free Team" | "Unknown";
+  provider: string;
+  model: string;
+  effort: string;
+  inherited: boolean;
+};
+
 export interface ExecutionRoute {
   inherit_model: boolean;
   provider: string;
   model: string;
   effort_policy: ExecutionRouteEffortPolicy;
   effort: string;
+  /** Read-only metadata accepted from effective-route projections. */
+  backend?: string;
+  route_source?: string;
+  inherits_main?: boolean;
 }
 
 export interface TeamExecutionProfile {
@@ -1310,6 +1382,13 @@ export interface TeamExecutionProfile {
   enabled: boolean;
   default_route: ExecutionRoute;
   overrides: Record<string, ExecutionRoute>;
+}
+
+/** A canonical API may expose the same profile under a preset catalog. */
+export interface ExecutionProfilePreset extends Partial<TeamExecutionProfile> {
+  preset_id?: string;
+  team_id?: string;
+  description?: string;
 }
 
 export interface AgentTeamTeam {
@@ -1321,6 +1400,9 @@ export interface AgentTeamTeam {
   activation: AgentTeamActivation;
   subagent_ids: string[];
   execution_profiles: Record<string, TeamExecutionProfile>;
+  /** Read-only aliases used by canonical preset catalog responses. */
+  execution_profile_presets?: ExecutionProfilePreset[] | Record<string, ExecutionProfilePreset>;
+  profile_presets?: ExecutionProfilePreset[] | Record<string, ExecutionProfilePreset>;
 }
 
 export interface AgentTeamSubagent {
@@ -1337,7 +1419,7 @@ export interface AgentTeamSubagent {
   allow_cli_native_tools: boolean;
 }
 
-/** Canonical persisted Agent Team schema.  GET-only metadata is deliberately
+/** Canonical persisted Execution Team schema.  GET-only metadata is deliberately
  * represented by AgentTeamConfigEnvelope rather than this type. */
 export interface AgentTeamConfig {
   schema_version: 3;
@@ -1345,6 +1427,8 @@ export interface AgentTeamConfig {
   orchestration_mode: "standard" | "director";
   teams: Record<string, AgentTeamTeam>;
   subagents: Record<string, AgentTeamSubagent>;
+  /** Backend seed marker; preserve it across a GET → edit → PUT cycle. */
+  preset_seed_version?: number;
 }
 
 export interface AgentTeamCapabilityInfo {
@@ -1367,6 +1451,9 @@ export interface AgentTeamConfigEnvelope extends AgentTeamConfig {
   };
   effective_route?: Record<string, unknown>;
   provider_model_options?: Record<string, unknown>;
+  /** Optional read-only catalog aliases used by newer canonical responses. */
+  execution_profile_presets?: ExecutionProfilePreset[] | Record<string, ExecutionProfilePreset>;
+  profile_presets?: ExecutionProfilePreset[] | Record<string, ExecutionProfilePreset>;
 }
 
 export function emptyAgentTeamConfig(): AgentTeamConfig {
@@ -1407,10 +1494,7 @@ export function emptyAgentTeamConfig(): AgentTeamConfig {
   addSubagent("architecture_planner", "設計", "実装方針、責務境界、影響範囲等を整理。", "実装方針を分析し、限定された計画を提案します。", "read", ["workspace_read", "repo_map"], true, 4, true);
   addSubagent("code_implementer", "実装", "実際に変更を行うAgent。", "割り当てられた変更をworkspace sandboxで実装します。", "write", ["workspace_read", "workspace_write", "repo_map", "command_execute", "aoi_tools"], true, 4, true);
   addSubagent("code_reviewer", "コードレビュー", "diff、コード、関連状態をレビューする。", "read-onlyで変更をレビューし、対応が必要な指摘を返します。", "read", ["workspace_read", "repo_map"], true, 4, true);
-  addSubagent("story_writer", "執筆", "Story contextを読み、本文や設定資料を作成・更新。", "Story contextを読み、本文や設定資料を作成・更新します。", "none", ["story_read", "story_write"], false, 1, false);
-  addSubagent("story_consistency_reviewer", "設定整合性レビュー", "世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報の整合性を確認。", "read-onlyでStory情報の整合性を確認します。", "none", ["story_read"], true, 4, false);
-  addSubagent("character_voice_reviewer", "キャラクター・口調レビュー", "キャラクターの人格、性格、口調、設定、既存発言との整合性を確認。", "read-onlyでキャラクターの人格・口調との整合性を確認します。", "none", ["story_read"], true, 4, false);
-  addSubagent("story_import", "Story取り込み", "Story素材取り込み。", "既存のStory素材を取り込み、正規化します。", "none", ["story_read", "story_import"], false, 1, false);
+  addSubagent("employee_operator", "Agent業務", "承認済みの外部Actionと電話受付を担当する。", "登録済みActionPolicyで許可された外部操作だけを扱います。", "none", ["external_action_propose", "telephony_control"], false, 1, false);
   return {
     schema_version: 3,
     delegation_enabled: false,
@@ -1429,21 +1513,11 @@ export function emptyAgentTeamConfig(): AgentTeamConfig {
       app_development: {
         team_id: "app_development",
         name: "App Development",
-        description: "AoiTalkアプリ開発の調査、設計、実装、レビューを担うTeam。",
+        description: "AoiTalkアプリ開発の調査、設計、実装、レビューと承認済み外部操作を担うTeam。",
         enabled: true,
         sort_order: 20,
         activation: { mode: "contextual", contexts: ["app_development"] },
-        subagent_ids: ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer"],
-        execution_profiles: {},
-      },
-      story: {
-        team_id: "story",
-        name: "Story",
-        description: "Story contextでの執筆、整合性確認、取り込みを担うTeam。",
-        enabled: true,
-        sort_order: 30,
-        activation: { mode: "contextual", contexts: ["story"] },
-        subagent_ids: ["story_writer", "story_consistency_reviewer", "character_voice_reviewer", "story_import", "general_worker"],
+        subagent_ids: ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer", "employee_operator"],
         execution_profiles: {},
       },
     },
@@ -1500,6 +1574,90 @@ export function canonicalExecutionRoute(value: Partial<ExecutionRoute> | null | 
   };
 }
 
+const LOCAL_ROUTE_PROVIDERS = new Set([
+  "llama_cpp",
+  "freetoken",
+  "strata",
+  "ollama",
+  "sglang",
+  "openai_compatible_local",
+  "local",
+]);
+
+/** Jev is a parent-owned decision service, never a selectable model route. */
+export function isJevRoute(value: { provider?: unknown; model?: unknown; route_source?: unknown } | null | undefined): boolean {
+  const fields = [value?.provider, value?.model, value?.route_source]
+    .map((item) => String(item ?? "").trim().toLowerCase());
+  return fields.some((item) => item === "jev" || item.startsWith("jev-") || item.includes("jev_decision"));
+}
+
+/** Return the stable Local/API/CLI classification used by settings previews. */
+export function executionRouteBackend(value: {
+  provider?: unknown;
+  model?: unknown;
+  backend?: unknown;
+  route_source?: unknown;
+} | null | undefined): ExecutionRouteBackend {
+  const provider = String(value?.provider ?? "").trim().toLowerCase();
+  const model = String(value?.model ?? "").trim().toLowerCase();
+  const explicit = String(value?.backend ?? "").trim().toLowerCase();
+  if (provider === "routing-profile" && model === "free-team") return "free_team";
+  // Local providers may be exposed through an OpenAI-compatible API.  The
+  // catalog's transport field then says `api`, but the operator-facing
+  // classification must still identify the actual local runtime.
+  if (LOCAL_ROUTE_PROVIDERS.has(provider) || provider.endsWith("_local")) return "local";
+  if (explicit === "local" || explicit === "llama_cpp" || explicit === "freetoken" || explicit === "strata") return "local";
+  if (explicit === "cli" || explicit === "native_cli") return "cli";
+  if (explicit === "api") return "api";
+  if (provider.endsWith("-cli") || provider === "cli" || provider === "native_cli") return "cli";
+  if (!provider && !model) return "unknown";
+  return "api";
+}
+
+export function executionRouteBackendLabel(value: {
+  provider?: unknown;
+  model?: unknown;
+  backend?: unknown;
+  route_source?: unknown;
+} | null | undefined): ExecutionRoutePresentation["label"] {
+  const backend = executionRouteBackend(value);
+  return backend === "local"
+    ? "Local"
+    : backend === "cli"
+      ? "CLI"
+      : backend === "free_team"
+        ? "Free Team"
+        : backend === "api"
+          ? "API"
+          : "Unknown";
+}
+
+/**
+ * Resolve the safe, display-only projection of one route.  Inherited routes
+ * use the currently selected Main provider/model, while preserving the route
+ * policy so `lower` is not presented as if it were an explicit effort.
+ */
+export function executionRoutePresentation(
+  route: Partial<ExecutionRoute> | null | undefined,
+  mainProvider = "",
+  mainModel = "",
+): ExecutionRoutePresentation {
+  const raw = route ?? {};
+  const inherited = raw.inherit_model !== false;
+  const provider = String(inherited ? mainProvider : raw.provider ?? "").trim();
+  const model = String(inherited ? mainModel : raw.model ?? "").trim();
+  const effort = String(raw.effort ?? "").trim();
+  const classification = { provider, model, backend: raw.backend, route_source: raw.route_source };
+  return {
+    backend: executionRouteBackend(classification),
+    label: executionRouteBackendLabel(classification),
+    provider,
+    model,
+    effort,
+    inherited,
+  };
+}
+
 export function canonicalTeamExecutionProfile(
   id: string,
   value: Partial<TeamExecutionProfile> | null | undefined,
@@ -1525,7 +1683,7 @@ export function canonicalTeamExecutionProfile(
 
 /** Strip all GET-only metadata before a canonical PUT. */
 export function canonicalAgentTeamConfig(value: AgentTeamConfig | AgentTeamConfigEnvelope): AgentTeamConfig {
-  return {
+  const result: AgentTeamConfig = {
     schema_version: 3,
     delegation_enabled: Boolean(value.delegation_enabled),
     orchestration_mode: value.orchestration_mode === "director" ? "director" : "standard",
@@ -1565,6 +1723,55 @@ export function canonicalAgentTeamConfig(value: AgentTeamConfig | AgentTeamConfi
       }]),
     ),
   };
+  const seedVersion = Number(value.preset_seed_version);
+  if (Number.isFinite(seedVersion) && seedVersion > 0) {
+    result.preset_seed_version = Math.trunc(seedVersion);
+  }
+  return result;
+}
+
+function profilePresetEntries(
+  value: ExecutionProfilePreset[] | Record<string, ExecutionProfilePreset> | undefined,
+): Array<[string, ExecutionProfilePreset]> {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => {
+      const profileId = String(item?.profile_id || item?.preset_id || `preset_${index}`);
+      return [profileId, { ...item, profile_id: profileId }];
+    });
+  }
+  return Object.entries(value ?? {}).map(([fallbackId, item]) => {
+    const profileId = String(item?.profile_id || item?.preset_id || fallbackId);
+    return [profileId, { ...item, profile_id: profileId }];
+  });
+}
+
+/**
+ * Merge read-only canonical preset aliases into the existing Team profile
+ * editor.  Configured profiles win, so manual/free-team and user edits keep
+ * their current behavior when a response contains both views.
+ */
+export function canonicalAgentTeamConfigWithPresets(value: AgentTeamConfig | AgentTeamConfigEnvelope): AgentTeamConfig {
+  const result = canonicalAgentTeamConfig(value);
+  const source = value as AgentTeamConfigEnvelope;
+  const candidates: Array<[string, ExecutionProfilePreset]> = [];
+  for (const entry of profilePresetEntries(source.execution_profile_presets)) candidates.push(entry);
+  for (const entry of profilePresetEntries(source.profile_presets)) candidates.push(entry);
+  for (const [teamId, team] of Object.entries(source.teams ?? {})) {
+    for (const entry of profilePresetEntries(team.execution_profile_presets)) candidates.push([entry[0], { ...entry[1], team_id: entry[1]?.team_id ?? teamId }]);
+    for (const entry of profilePresetEntries(team.profile_presets)) candidates.push([entry[0], { ...entry[1], team_id: entry[1]?.team_id ?? teamId }]);
+  }
+  for (const [fallbackId, preset] of candidates) {
+    const teamId = String(preset?.team_id ?? "").trim();
+    if (!teamId || !result.teams[teamId]) continue;
+    const profileId = String(preset?.profile_id || preset?.preset_id || fallbackId).trim();
+    if (!profileId || result.teams[teamId].execution_profiles[profileId]) continue;
+    result.teams[teamId].execution_profiles[profileId] = canonicalTeamExecutionProfile(profileId, {
+      ...preset,
+      profile_id: profileId,
+      name: preset?.name || (preset as { display_name?: string })?.display_name || profileId,
+    }, result.teams[teamId].subagent_ids);
+  }
+  return result;
 }
 
 export interface OllamaPullTask {
@@ -1737,9 +1944,13 @@ export function providerSourceLabel(source: string): string {
   }
 }
 
-export function providerSelection(provider: LlmProviderCatalog | null | undefined): ProviderDraft {
+export function providerSelection(
+  provider: LlmProviderCatalog | null | undefined,
+  preferredModel?: string | null,
+): ProviderDraft {
   const firstModel = provider?.models[0]?.id ?? "";
-  const configuredModel = provider?.configured_model?.trim();
+  const configuredModel =
+    preferredModel?.trim() || provider?.configured_model?.trim();
   if (!configuredModel) {
     return { model: firstModel, customModel: "" };
   }

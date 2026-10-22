@@ -15,7 +15,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode
 from typing import Any, Dict, Optional
 from uuid import UUID, uuid4
 from ..base import BaseAssistant
@@ -32,6 +32,21 @@ from ..chat_attachment_utils import (
     sanitize_chat_attachments,
 )
 from ..conversation_title_events import maybe_generate_and_broadcast_session_title
+from ..post_response_work import (
+    schedule_after_visible_response,
+    schedule_deferred_session_index,
+)
+from ..response_model_cache import (
+    begin_response_model_use,
+    cached_response_model_client,
+    current_response_model_cache_session,
+    end_response_model_use,
+    remember_response_model_client,
+    response_model_cache_key,
+    response_model_cache_session,
+    retire_response_model_session,
+    wrap_response_model_title_work,
+)
 from ...llm.context_budget import clip_text
 from ...llm.agentic_completion import response_looks_like_unfinished_work
 from ...llm.generation_policy import (
@@ -41,6 +56,7 @@ from ...llm.generation_policy import (
 from ...llm.generation_error import empty_response_failure
 from ...llm.generation_cancellation import (
     get_current_generation_cancellation,
+    AgentDialogueInputPending,
     PlanningInteractionTerminated,
 )
 from ...llm.tool_policy import (
@@ -50,7 +66,9 @@ from ...llm.tool_policy import (
 )
 from ...runtime_features import runtime_feature_manager
 from ...services.agent_run_service import (
+    AgentChatAdmissionError,
     AgentRunService,
+    PreproviderFailureProof,
     get_current_agent_run_id,
     redact_sensitive_chat_metadata,
     sanitize_assistant_display_text,
@@ -60,7 +78,10 @@ from ...services.agent_run_service import (
 )
 from ...services.agent_team_service import agent_team_orchestration_mode
 from ...services.outbound_privacy_service import OutboundPrivacyGateway
+from ...services.semantic_citation import safe_verified_media_read_url
 from ...services.turn_context import (
+    AgentDialogueContinuationTarget,
+    get_turn_context,
     override_turn_context,
     reset_turn_context,
     set_turn_context,
@@ -69,6 +90,509 @@ from ...utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 
 logger = logging.getLogger(__name__)
+
+_NATIVE_AGENT_CLI_PROVIDERS = frozenset(
+    {"claude-cli", "codex-cli", "grok-cli", "antigravity-cli"}
+)
+
+
+def _request_owned_agent_provider_stop(provider: Any) -> Any:
+    """Ask an owned provider SDK to stop the exact current request.
+
+    The durable Run cancellation event remains the fence for every provider.
+    This additive hook gives SDKs with an explicit request interrupt a chance
+    to stop in flight before the callback task is drained.  Shared/ambient
+    clients are never passed here; Terminal registers it only for the
+    request-owned Agent client.
+    """
+
+    targets = [provider]
+    for attribute in ("provider", "client", "_provider", "_client"):
+        candidate = getattr(provider, attribute, None)
+        if candidate is not None and candidate not in targets:
+            targets.append(candidate)
+    for target in targets:
+        for method_name in (
+            "cancel_generation",
+            "cancel_request",
+            "interrupt_generation",
+            "stop_generation",
+            "abort_generation",
+            "interrupt",
+            "abort",
+            "cancel",
+        ):
+            method = getattr(target, method_name, None)
+            if callable(method):
+                return method()
+        transport = getattr(target, "_transport", None)
+        thread_id = getattr(target, "_thread_id", None)
+        turn_id = getattr(target, "_turn_id", None)
+        send = getattr(transport, "send", None)
+        if callable(send) and thread_id and turn_id:
+            return send(
+                {
+                    "id": "aoitalk-agent-dialogue-stop",
+                    "method": "turn/interrupt",
+                    "params": {"threadId": str(thread_id), "turnId": str(turn_id)},
+                }
+            )
+    return None
+
+
+_MEDIA_READ_CITATION_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_MEDIA_READ_MAX_URLS = 8
+_MEDIA_READ_CITATION_EVENT_KEYS = frozenset(
+    {
+        "body_sha256",
+        "derived_text_start",
+        "derived_text_end",
+        "text_start",
+        "text_end",
+        "text_length",
+        "chunk_id",
+        "chunk_index",
+        "page_number",
+        "start_seconds",
+        "end_seconds",
+        "unit_id",
+    }
+)
+def _citation_uuid(value: Any) -> str | None:
+    """Return a canonical UUID string for server-issued source identity."""
+
+    try:
+        return str(UUID(str(value)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _safe_canonical_media_url(
+    value: Any,
+    *,
+    target_kind: str,
+    locator: Mapping[str, Any] | None,
+    unit_id: str | None,
+    source_id: str | None,
+) -> str | None:
+    """Apply the shared canonical URL allowlist at the terminal boundary."""
+    # Keep the API's same-origin/control-byte contract as the first gate.  The
+    # import is intentionally local: importing a router at module load time
+    # would create an avoidable assistant/API import cycle.
+    try:
+        from ...api.media_search_routes import safe_local_url
+
+        if safe_local_url(value) is None:
+            return None
+    except Exception:
+        # The strict checks below remain the fail-closed fallback when a
+        # lightweight terminal test or an alternate runtime has no router.
+        pass
+    return safe_verified_media_read_url(
+        value,
+        target_kind=target_kind,
+        locator=locator,
+        unit_id=unit_id,
+        source_id=source_id,
+    )
+
+
+def _verified_media_read_urls(tool_result: Mapping[str, Any]) -> list[str]:
+    """Project links only from a successful, complete ``media_read`` result."""
+
+    tool_name = str(tool_result.get("tool") or tool_result.get("name") or "")
+    if tool_name.rsplit(".", 1)[-1].strip().casefold() != "media_read":
+        return []
+    if tool_result.get("error"):
+        return []
+    output = tool_result.get("output")
+    if not isinstance(output, str):
+        return []
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    if payload.get("success") is not True or payload.get("complete") is not True:
+        return []
+    if "warnings" in payload:
+        warnings = payload.get("warnings")
+        if not isinstance(warnings, list) or warnings:
+            return []
+
+    arguments = tool_result.get("arguments")
+    if not isinstance(arguments, Mapping):
+        arguments = {}
+    target_kind = str(
+        payload.get("target_kind") or arguments.get("target_kind") or "media"
+    ).strip().casefold()
+    if target_kind not in {"media", "docs", "knowledge", "conversation"}:
+        return []
+
+    locator = arguments.get("locator")
+    if not isinstance(locator, Mapping):
+        locator = payload.get("locator")
+    if not isinstance(locator, Mapping):
+        locator = {}
+    unit_id = _citation_uuid(arguments.get("unit_id") or payload.get("unit_id"))
+    source_id = _citation_uuid(payload.get("source_id"))
+
+    if target_kind in {"docs", "knowledge", "conversation"}:
+        citation = payload.get("citation")
+        if not isinstance(citation, Mapping):
+            return []
+        body_hash = citation.get("body_sha256")
+        if not isinstance(body_hash, str) or not _MEDIA_READ_CITATION_HASH_RE.fullmatch(body_hash):
+            return []
+        locator_id = _citation_uuid(locator.get("id"))
+        if not locator_id:
+            return []
+        if target_kind == "conversation" and not _citation_uuid(locator.get("session_id")):
+            return []
+        expected_kind = {
+            "docs": "docs_node",
+            "knowledge": "knowledge_document",
+            "conversation": "conversation_message",
+        }[target_kind]
+        if locator.get("kind") != expected_kind:
+            return []
+        source_kind = str(payload.get("source_kind") or expected_kind)
+        if source_kind != expected_kind:
+            return []
+        if source_id and source_id != locator_id:
+            return []
+    elif target_kind == "media":
+        source_kind = str(payload.get("source_kind") or "").strip()
+        if not source_kind or not source_id or not unit_id:
+            return []
+
+    urls: list[str] = []
+    for key in ("original_url", "conversation_url"):
+        safe = _safe_canonical_media_url(
+            payload.get(key),
+            target_kind=target_kind,
+            locator=locator,
+            unit_id=unit_id,
+            source_id=source_id,
+        )
+        if safe and safe not in urls:
+            urls.append(safe)
+
+    # A media source may be a conversation attachment.  The current read
+    # returns verified session/message identity, so construct the canonical
+    # chat locator instead of preserving its legacy ``session=`` URL.
+    if target_kind == "media" and not urls:
+        session_id = _citation_uuid(payload.get("session_id"))
+        message_id = _citation_uuid(payload.get("message_id"))
+        if session_id and message_id:
+            urls.append(f"/chat?s={session_id}&message={message_id}")
+    return urls[:_MEDIA_READ_MAX_URLS]
+
+
+def _project_media_read_tool_result(
+    tool_result: Mapping[str, Any],
+    urls: list[str],
+) -> dict[str, Any]:
+    """Strip media-read bodies before tool results reach audit/UI storage."""
+
+    projected = {
+        key: tool_result[key]
+        for key in ("tool", "name", "arguments", "args", "tool_call_id")
+        if key in tool_result
+    }
+    output = tool_result.get("output")
+    try:
+        payload = json.loads(output) if isinstance(output, str) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, Mapping):
+        payload = {}
+
+    bounded: dict[str, Any] = {}
+    for key in (
+        "success",
+        "complete",
+    ):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            bounded[key] = value
+    for key in (
+        "target_kind",
+        "source_kind",
+        "source_id",
+        "unit_id",
+        "session_id",
+        "message_id",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value and len(value) <= 256:
+            if not any(ord(char) < 32 or ord(char) == 127 for char in value):
+                bounded[key] = value
+    citation = payload.get("citation")
+    if isinstance(citation, Mapping):
+        bounded_citation: dict[str, Any] = {}
+        for key in _MEDIA_READ_CITATION_EVENT_KEYS:
+            value = citation.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                bounded_citation[key] = value
+            elif isinstance(value, str) and value and len(value) <= 256:
+                if not any(ord(char) < 32 or ord(char) == 127 for char in value):
+                    bounded_citation[key] = value
+        if bounded_citation:
+            bounded["citation"] = bounded_citation
+    if "warnings" in payload:
+        warnings = payload.get("warnings")
+        if not isinstance(warnings, list) or warnings:
+            bounded["warnings"] = ["unverified"]
+    if bounded.get("success") is not True or bounded.get("complete") is not True:
+        bounded.pop("citation", None)
+
+    if urls:
+        safe_url = urls[0]
+        bounded[
+            "conversation_url" if safe_url.startswith("/chat?") else "original_url"
+        ] = safe_url
+    error = payload.get("error") or tool_result.get("error")
+    if not bounded.get("success"):
+        if isinstance(error, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", error):
+            bounded["error"] = error
+        else:
+            bounded["error"] = "media_read_failed"
+
+    projected["output"] = json.dumps(
+        bounded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    for key in ("result", "raw", "content", "text"):
+        projected.pop(key, None)
+    projected["error"] = "" if bounded.get("success") else bounded.get("error", "")
+    if urls:
+        projected["urls"] = list(urls[:_MEDIA_READ_MAX_URLS])
+    else:
+        projected.pop("urls", None)
+    return projected
+
+
+def _media_read_tool_result_identity(
+    tool_result: Mapping[str, Any],
+) -> str | None:
+    """Return the bounded identity used to suppress duplicate read links."""
+
+    if str(tool_result.get("tool") or tool_result.get("name") or "").rsplit(
+        ".", 1
+    )[-1].strip().casefold() != "media_read":
+        return None
+    urls = tool_result.get("urls")
+    if not isinstance(urls, list):
+        urls = []
+    urls = tuple(
+        str(value).strip()
+        for value in urls
+        if isinstance(value, str) and value.strip()
+    )
+    if not urls:
+        return None
+    try:
+        payload = json.loads(tool_result.get("output"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, Mapping):
+        return None
+    arguments = tool_result.get("arguments")
+    if not isinstance(arguments, Mapping):
+        arguments = {}
+    locator = arguments.get("locator")
+    if not isinstance(locator, Mapping):
+        locator = payload.get("locator")
+    if not isinstance(locator, Mapping):
+        locator = {}
+    citation = payload.get("citation")
+    if not isinstance(citation, Mapping):
+        citation = {}
+    identity = {
+        "target_kind": str(
+            payload.get("target_kind") or arguments.get("target_kind") or ""
+        ).strip(),
+        "locator": {
+            key: str(locator.get(key)).strip()
+            for key in ("kind", "id", "session_id", "docs_library_id")
+            if locator.get(key) is not None
+        },
+        "body_sha256": str(citation.get("body_sha256") or "").strip().casefold(),
+        "urls": urls,
+    }
+    source_ref = {
+        key: str(payload.get(key) or arguments.get(key) or "").strip()
+        for key in ("source_id", "unit_id")
+        if str(payload.get(key) or arguments.get(key) or "").strip()
+    }
+    identity["source_ref"] = source_ref
+    if not identity["target_kind"] or (
+        not identity["locator"] and not source_ref
+    ):
+        return None
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+
+
+async def _append_completed_media_read_tool_results(
+    *,
+    llm_client: Any,
+    agent_run_id: str | None,
+    search_tool_results: list[dict[str, Any]],
+    suppress_automatic_context: bool,
+) -> None:
+    """Project verified media links from this run's cached native ledger.
+
+    The run-keyed peek is deliberately the only source here.  Shared client
+    compatibility fields can belong to another turn and must not become
+    assistant metadata for this response.
+    """
+
+    if suppress_automatic_context or not str(agent_run_id or "").strip():
+        return
+    try:
+        if bool(get_turn_context().suppress_automatic_context):
+            return
+    except Exception:
+        pass
+    normalized_run_id = str(agent_run_id).strip()
+    try:
+        getter = getattr(llm_client, "peek_completed_agent_run_state", None)
+    except Exception:
+        return
+    if callable(getter):
+        try:
+            # A supported getter is authoritative.  Do not fall back to a
+            # copied compatibility map when it explicitly returns no state.
+            run_state = await _peek_client_agent_run_state(
+                llm_client,
+                normalized_run_id,
+            )
+        except Exception:
+            return
+    else:
+        try:
+            state_map = getattr(
+                llm_client,
+                "_native_completed_agent_run_states",
+                None,
+            )
+            if not isinstance(state_map, Mapping):
+                return
+            lock = getattr(
+                llm_client,
+                "_native_completed_agent_run_states_lock",
+                None,
+            )
+            if hasattr(lock, "__enter__") and hasattr(lock, "__exit__"):
+                with lock:
+                    copied_states = dict(state_map)
+            else:
+                copied_states = dict(state_map)
+            copied_state = copied_states.get(normalized_run_id)
+            if not isinstance(copied_state, Mapping):
+                return
+            raw_tool_calls = copied_state.get("tool_calls")
+            if not isinstance(raw_tool_calls, (list, tuple)):
+                return
+            run_state = (
+                list(raw_tool_calls),
+                None,
+                str(copied_state.get("failure") or ""),
+            )
+        except Exception:
+            return
+    if not isinstance(run_state, tuple) or not run_state:
+        return
+    tool_calls = run_state[0]
+    if not isinstance(tool_calls, (list, tuple)):
+        return
+    try:
+        from ...llm.unified_turn_runtime import (
+            UnifiedToolCall,
+            UnifiedToolResult,
+            _bounded_media_read_event_output,
+        )
+    except Exception:
+        return
+
+    existing_identities = {
+        identity
+        for item in search_tool_results
+        if (identity := _media_read_tool_result_identity(item)) is not None
+    }
+    for call in tool_calls:
+        normalized = _agent_run_tool_call_payload(call)
+        tool_name = str(normalized.get("tool") or "").strip()
+        if tool_name.rsplit(".", 1)[-1].casefold() != "media_read":
+            continue
+        arguments = normalized.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        output = normalized.get("result")
+        if not isinstance(output, str):
+            continue
+        try:
+            bounded_output = _bounded_media_read_event_output(
+                UnifiedToolResult(
+                    call=UnifiedToolCall(
+                        tool=tool_name,
+                        arguments=dict(arguments),
+                    ),
+                    output=output,
+                    success=bool(normalized.get("successful")),
+                    error=str(normalized.get("error") or ""),
+                )
+            )
+            bounded_payload = json.loads(bounded_output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(bounded_payload, Mapping):
+            continue
+
+        # Keep only locator fields already bounded by the shared runtime
+        # projection.  Native arguments can contain provider-specific extras;
+        # none of them belong in assistant metadata.
+        safe_arguments: dict[str, Any] = {}
+        for key in ("target_kind", "unit_id"):
+            value = bounded_payload.get(key)
+            if isinstance(value, str) and value:
+                safe_arguments[key] = value
+        locator = bounded_payload.get("locator")
+        if isinstance(locator, Mapping):
+            safe_locator = {
+                key: value
+                for key in ("kind", "id", "session_id", "docs_library_id")
+                if isinstance(value := locator.get(key), str) and value
+            }
+            if safe_locator:
+                safe_arguments["locator"] = safe_locator
+        normalized_error = str(normalized.get("error") or "")
+        if not normalized.get("successful") and not normalized_error:
+            normalized_error = "media_read_failed"
+        bounded_tool_result = {
+            "tool": tool_name,
+            "arguments": safe_arguments,
+            "output": bounded_output,
+            "error": normalized_error,
+        }
+        urls = _verified_media_read_urls(bounded_tool_result)
+        if not urls:
+            continue
+        projected = _project_media_read_tool_result(bounded_tool_result, urls)
+        identity = _media_read_tool_result_identity(projected)
+        if identity is None or identity in existing_identities:
+            continue
+        search_tool_results.append(
+            {
+                key: value
+                for key, value in projected.items()
+                if key != "tool_call_id"
+            }
+        )
+        existing_identities.add(identity)
 
 
 # 以下の AgentRun 系ヘルパ/定数と AgentRunEventEmitter は agent_run_events.py へ
@@ -93,6 +617,7 @@ from .agent_run_events import (  # noqa: F401
     _looks_like_cli_execution_error,
     _main_agent_run_model,
     _main_agent_run_provider,
+    _peek_client_agent_run_state,
     _should_fail_agent_run_completion,
 )
 from .terminal_commands import TerminalCommandsMixin, WorkIntakeHandledError
@@ -390,6 +915,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             character_name=self.character_name
         )
         self._chat_turn_lock = asyncio.Lock()
+        # Legacy Character turns retain the process-wide compatibility lock.
+        # Agent-backed turns use one lock per conversation session so two
+        # different sessions can keep independent clients/history in flight.
+        self._chat_turn_locks: dict[str, asyncio.Lock] = {}
         self._chat_turn_persistence: Optional[ChatTurnPersistence] = None
         self._response_model_clients: dict[tuple[str, ...], Any] = {}
 
@@ -458,7 +987,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         provider, model = identity
         effort = response_model.get("reasoning_effort") if response_model else None
         # An explicit turn effort must not reuse/mutate the shared active client.
-        cache_key = (*identity, str(effort)) if effort is not None else identity
+        session_id = current_response_model_cache_session()
+        cache_key = response_model_cache_key(session_id, provider, model, effort)
         if effort is None and base_llm_client and self._active_client_matches_response_model(
             base_llm_client,
             provider,
@@ -466,7 +996,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         ):
             return base_llm_client
 
-        cached = self._response_model_clients.get(cache_key)
+        cached = cached_response_model_client(self, cache_key)
         if cached is not None:
             return cached
 
@@ -487,8 +1017,33 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         )
         if hasattr(client, "set_system_prompt"):
             client.set_system_prompt(system_prompt)
-        self._response_model_clients[cache_key] = client
+        remember_response_model_client(
+            self,
+            cache_key,
+            client,
+            session_id=session_id,
+        )
         return client
+
+    async def retire_response_model_session(self, session_id: str) -> dict[str, int]:
+        """Retire only cached response-model clients owned by one session."""
+
+        return await retire_response_model_session(self, session_id)
+
+    def _chat_turn_lock_for_session(
+        self,
+        session_id: Optional[str],
+        *,
+        agent_execution: Any | None = None,
+    ) -> asyncio.Lock:
+        if agent_execution is None:
+            return self._chat_turn_lock
+        key = str(session_id or "__default__").strip() or "__default__"
+        lock = self._chat_turn_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_turn_locks[key] = lock
+        return lock
 
     def _get_chat_turn_persistence(self, llm_client=None) -> ChatTurnPersistence:
         memory_manager = getattr(llm_client, "memory_manager", None)
@@ -501,6 +1056,101 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         ):
             self._chat_turn_persistence = ChatTurnPersistence(memory_manager)
         return self._chat_turn_persistence
+
+    @staticmethod
+    def _project_agent_dialogue_assistant_metadata(
+        metadata: Mapping[str, Any] | None,
+        *,
+        agent_run_id: str | None,
+        dialogue_metadata: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Attach server-derived Dialogue identity to one saved reply.
+
+        Provider/client metadata is not an authority source for transport
+        receipts.  The caller supplies the marker loaded from the exact
+        durable AgentRun before provider setup; only its bounded identity
+        fields cross into the assistant ConversationMessage row.
+        """
+
+        projected = dict(metadata or {})
+        run_id = str(agent_run_id or "").strip()
+        marker = dialogue_metadata if isinstance(dialogue_metadata, Mapping) else {}
+        dialogue_id = str(marker.get("dialogue_id") or "").strip()
+        if not run_id or not dialogue_id:
+            return projected
+        projected["agent_run_id"] = run_id
+        projected["agent_dialogue_id"] = dialogue_id
+        delivery_id = str(marker.get("delivery_id") or "").strip()
+        if delivery_id:
+            projected["agent_dialogue_delivery_id"] = delivery_id
+        role = str(marker.get("role") or "").strip().casefold()
+        if role in {"root", "worker"}:
+            projected["agent_dialogue"] = {
+                "dialogue_id": dialogue_id,
+                "role": role,
+                **({"delivery_id": delivery_id} if delivery_id else {}),
+            }
+        control_revision = marker.get("control_revision")
+        if control_revision is not None:
+            try:
+                projected["agent_dialogue_control_revision"] = int(control_revision)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return projected
+
+    @staticmethod
+    def _append_agent_dialogue_continuation_target(
+        prompt: str,
+        target: AgentDialogueContinuationTarget | None,
+    ) -> str:
+        """Carry only server-issued continuation IDs into the provider prompt."""
+
+        if not isinstance(target, AgentDialogueContinuationTarget):
+            return str(prompt or "")
+        carrier = {
+            "target_kind": "human_answer_continuation",
+            "dialogue_id": target.dialogue_id,
+            "input_id": target.input_id,
+            "input_revision": target.input_revision,
+            "control_revision": target.control_revision,
+            "source_run_id": target.source_run_id,
+            "source_work_item_id": target.source_work_item_id,
+            "source_message_id": target.source_message_id,
+            "source_session_id": target.source_session_id,
+            "source_agent_id": target.source_agent_id,
+            "source_agent_revision_id": target.source_agent_revision_id,
+            "answer_message_id": target.answer_message_id,
+            "root_session_id": target.root_session_id,
+            "root_agent_id": target.root_agent_id,
+            "root_agent_revision_id": target.root_agent_revision_id,
+            "root_run_id": target.root_run_id,
+            "root_work_item_id": target.root_work_item_id,
+        }
+        return (
+            f"{str(prompt or '')}\n\n"
+            "[AoiTalk server continuation target]\n"
+            f"{json.dumps(carrier, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}\n"
+            "[/AoiTalk server continuation target]"
+        )
+
+    @staticmethod
+    def _bound_agent_assistant_sender(
+        agent_execution: Any | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Resolve the trusted sender tuple for one bound Agent turn.
+
+        A normal Agent Chat reply is still a ``ConversationMessage`` with
+        role ``assistant``.  Its actor fields must come from the immutable
+        execution binding, while Character/unbound turns keep their legacy
+        sender fields.  Provider metadata is intentionally never consulted.
+        """
+
+        binding = getattr(agent_execution, "binding", None)
+        agent_id = str(getattr(binding, "agent_id", "") or "").strip()
+        if not agent_id:
+            return None, None, None
+        display_name = str(getattr(binding, "display_name", "") or "").strip()
+        return "agent", agent_id, display_name or None
 
     def _get_chat_turn_metadata(
         self,
@@ -965,6 +1615,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         edit_message_id=None,
         response_model=None,
         client_message_id=None,
+        expected_agent_id=None,
+        expected_agent_provided=False,
         attachments=None,
         attachment_context=None,
         skip_user_persistence=False,
@@ -987,6 +1639,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         verified_project_attachment=False,
         suppress_automatic_context=False,
         strict_project_scope=False,
+        context_project_hint_id=None,
+        typed_resume_answer=False,
+        typed_resume_answer_body=None,
+        typed_resume_answer_id=None,
     ):
         """Process user message sent from the WebUI
 
@@ -1059,7 +1715,774 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             return
         if persist_content is None:
             persist_content = message
+        if typed_resume_answer:
+            if not isinstance(typed_resume_answer_body, str) or not typed_resume_answer_body.strip():
+                raise ValueError("typed resume answer body is missing")
+            # Keep the durable receiver trigger/message identity unchanged;
+            # project the separately trusted answer body only into this
+            # provider turn and its planning/prompt inputs.
+            message = typed_resume_answer_body
+            persist_content = typed_resume_answer_body
         llm_client = self._get_active_llm_client()
+        agent_execution = None
+        agent_client_owned = False
+        agent_tool_scope_token = None
+        agent_run_scope_token = None
+        agent_harness_scope_token = None
+        native_preflight_host_allowed = False
+        agent_dialogue_authority_token = None
+        agent_workspace_scope_token = None
+        agent_dialogue_workspace_context = None
+        agent_dialogue_workspace = None
+        agent_provider_cancel_callback_remove = None
+        agent_run_context_token = None
+        # Provider factories and native scope assertions read the exact Run
+        # ContextVar.  Bind it before any Agent workspace/provider setup;
+        # source-client attributes are only compatibility markers.
+        if agent_run_id:
+            agent_run_context_token = set_current_agent_run_id(agent_run_id)
+        human_resource_lease_context = None
+        human_resource_scope_token = None
+        interactive_work_claim = None
+        persisted_agent_run = None
+        dialogue_metadata: dict[str, Any] = {}
+        dialogue_continuation_target: AgentDialogueContinuationTarget | None = None
+        initial_root_binding_failure_code = None
+        setup_cleanup_done = False
+        response_model_cache_use = None
+        workflow_response_model_cache_use = None
+
+        async def _await_setup_cleanup(awaitable: Any) -> None:
+            """Drain one setup cleanup operation even after task cancellation."""
+
+            task = asyncio.ensure_future(awaitable)
+            while True:
+                try:
+                    await asyncio.shield(task)
+                    return
+                except asyncio.CancelledError:
+                    if task.done():
+                        return
+
+        async def _await_workspace_exit_in_current_task(awaitable: Any) -> None:
+            """Run workspace ``__aexit__`` in the task that called ``__aenter__``."""
+
+            current_task = asyncio.current_task()
+            uncancel = getattr(current_task, "uncancel", None)
+            if callable(uncancel):
+                while current_task.cancelling():
+                    uncancel()
+            await awaitable
+
+        async def _cleanup_agent_setup_resources(
+            error: BaseException | None = None,
+        ) -> None:
+            """Release every resource acquired before the main turn try."""
+
+            nonlocal setup_cleanup_done
+            nonlocal agent_provider_cancel_callback_remove
+            nonlocal agent_client_owned
+            nonlocal interactive_work_claim
+            nonlocal agent_dialogue_workspace_context
+            nonlocal agent_workspace_scope_token
+            nonlocal agent_tool_scope_token
+            nonlocal agent_dialogue_authority_token
+            nonlocal agent_harness_scope_token
+            nonlocal agent_run_scope_token
+            nonlocal agent_run_context_token
+            if setup_cleanup_done:
+                return
+            setup_cleanup_done = True
+            if agent_provider_cancel_callback_remove is not None:
+                try:
+                    agent_provider_cancel_callback_remove()
+                except Exception:
+                    logger.debug("Failed to remove setup provider cancel hook", exc_info=True)
+                agent_provider_cancel_callback_remove = None
+            if agent_client_owned:
+                cleanup = getattr(llm_client, "cleanup", None)
+                if callable(cleanup):
+                    try:
+                        result = cleanup()
+                        if inspect.isawaitable(result):
+                            await _await_setup_cleanup(result)
+                    except Exception:
+                        logger.warning("Failed to cleanup Agent provider after setup failure", exc_info=True)
+                agent_client_owned = False
+            if interactive_work_claim is not None:
+                try:
+                    from ...services.chat_execution_adapter import (
+                        settle_interactive_chat_work,
+                    )
+
+                    raw_setup_code = str(
+                        getattr(error, "code", "") or ""
+                    ).strip().casefold()
+                    if raw_setup_code.startswith("agent_route_"):
+                        setup_error_code = raw_setup_code
+                    elif raw_setup_code.startswith("interactive_admission_"):
+                        setup_error_code = raw_setup_code
+                    elif raw_setup_code.startswith("interactive_"):
+                        setup_error_code = f"interactive_admission_{raw_setup_code}"
+                    else:
+                        setup_error_code = ""
+                    result = settle_interactive_chat_work(
+                        interactive_work_claim,
+                        success=False,
+                        cancelled=isinstance(error, asyncio.CancelledError),
+                        error=(
+                            "Agent setup cancelled"
+                            if isinstance(error, asyncio.CancelledError)
+                            else setup_error_code or "Agent setup failed"
+                        ),
+                    )
+                    if inspect.isawaitable(result):
+                        await _await_setup_cleanup(result)
+                except Exception:
+                    logger.warning("Failed to settle Agent Work after setup failure", exc_info=True)
+                interactive_work_claim = None
+            if agent_dialogue_workspace_context is not None:
+                try:
+                    result = agent_dialogue_workspace_context.__aexit__(
+                        type(error) if error is not None else None,
+                        error,
+                        error.__traceback__ if error is not None else None,
+                    )
+                    if inspect.isawaitable(result):
+                        await _await_workspace_exit_in_current_task(result)
+                except Exception:
+                    logger.warning("Failed to release Agent workspace after setup failure", exc_info=True)
+                agent_dialogue_workspace_context = None
+            if agent_workspace_scope_token is not None:
+                try:
+                    from ...llm.tool_policy import reset_current_agent_workspace_scope
+
+                    reset_current_agent_workspace_scope(agent_workspace_scope_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent workspace scope", exc_info=True)
+                agent_workspace_scope_token = None
+            if agent_tool_scope_token is not None:
+                try:
+                    from ...llm.tool_policy import reset_current_agent_tool_scope
+
+                    reset_current_agent_tool_scope(agent_tool_scope_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent tool scope", exc_info=True)
+                agent_tool_scope_token = None
+            if agent_dialogue_authority_token is not None:
+                try:
+                    from ...llm.tool_policy import reset_current_agent_dialogue_authority
+
+                    reset_current_agent_dialogue_authority(agent_dialogue_authority_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent dialogue authority", exc_info=True)
+                agent_dialogue_authority_token = None
+            if agent_harness_scope_token is not None:
+                try:
+                    from ...security.harness_execution_scope import reset_harness_execution_scope
+
+                    reset_harness_execution_scope(agent_harness_scope_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent harness scope", exc_info=True)
+                agent_harness_scope_token = None
+            if agent_run_scope_token is not None:
+                try:
+                    from ...security.agent_run_scope import reset_run_scope
+
+                    reset_run_scope(agent_run_scope_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent Run scope", exc_info=True)
+                agent_run_scope_token = None
+            if agent_run_context_token is not None:
+                try:
+                    reset_current_agent_run_id(agent_run_context_token)
+                except Exception:
+                    logger.debug("Failed to reset Agent Run identity", exc_info=True)
+                agent_run_context_token = None
+
+        if agent_run_id:
+            try:
+                from ...services.chat_execution_adapter import (
+                    build_agent_chat_turn_client,
+                    preflight_chat_agent_native_provider,
+                    refresh_initial_aoidots_root_proof,
+                    resolve_chat_agent_execution,
+                    start_interactive_chat_work,
+                )
+                from ...services.agent_run_scope_service import (
+                    issue_interactive_agent_run_scope,
+                )
+
+                agent_run_service_for_binding = AgentRunService(
+                    config=getattr(self, "config", None),
+                )
+                try:
+                    run_result = agent_run_service_for_binding.get_run(str(agent_run_id))
+                    persisted_agent_run = (
+                        await run_result
+                        if inspect.isawaitable(run_result)
+                        else run_result
+                    )
+                except RuntimeError as exc:
+                    # Legacy/focused embeddings may not have a database-backed
+                    # AgentRun lookup.  They cannot establish a typed Agent
+                    # identity, so retain the Character compatibility path.
+                    if "Database is not initialized" not in str(exc):
+                        raise
+                    persisted_agent_run = None
+                if isinstance(persisted_agent_run, dict):
+                    raw_metadata = persisted_agent_run.get("metadata")
+                    if not isinstance(raw_metadata, dict):
+                        raw_metadata = persisted_agent_run.get("run_metadata")
+                    if isinstance(raw_metadata, dict):
+                        candidate = raw_metadata.get("agent_dialogue")
+                        if isinstance(candidate, dict):
+                            dialogue_metadata = candidate
+                if isinstance(dialogue_metadata, dict) and dialogue_metadata.get(
+                    "dialogue_id"
+                ):
+                    dialogue_role = str(
+                        dialogue_metadata.get("role") or ""
+                    ).strip().casefold()
+                    root_human_answer = (
+                        dialogue_role == "root"
+                        and dialogue_metadata.get("source_human_answered") is True
+                    )
+                    dialogue_continuation_target = (
+                        AgentDialogueContinuationTarget.from_mapping(
+                            dialogue_metadata.get("continuation_target")
+                        )
+                        if root_human_answer
+                        else None
+                    )
+                    if (
+                        root_human_answer
+                        and dialogue_continuation_target is None
+                    ):
+                        raise AgentChatAdmissionError(
+                            "persisted Human continuation target is missing",
+                            code="dialogue_continuation_target_invalid",
+                        )
+                    # Read the canonical Human body through the persisted
+                    # source refs/hash.  Worker Agent instructions never
+                    # become an authority fallback.
+                    human_anchor = (
+                        await agent_run_service_for_binding.load_dialogue_human_anchor(
+                            run_id=str(agent_run_id),
+                            dialogue_id=str(dialogue_metadata.get("dialogue_id")),
+                        )
+                    )
+                    dialogue_metadata = {
+                        **dialogue_metadata,
+                        "source_human": human_anchor.get("refs"),
+                        "authority_digest": human_anchor.get("authority_digest"),
+                        "human_anchor": human_anchor.get("body"),
+                    }
+                # Bind the already-issued exact RunScope before workspace
+                # allocation/provider factory entry.  Native providers must
+                # never observe a late or ambient parent scope.
+                try:
+                    from ...security.agent_run_scope import (
+                        bind_run_scope,
+                        get_current_run_scope,
+                    )
+                    from ...security.harness_execution_scope import (
+                        bind_harness_execution_scope,
+                        get_current_harness_execution_scope,
+                    )
+
+                    ambient_scope = get_current_run_scope()
+                    # Preserve the original boundary before a foreign scope
+                    # is shadowed with None below. That shadow is not host
+                    # preflight authority.
+                    native_preflight_host_allowed = ambient_scope is None
+                    exact_scope = (
+                        ambient_scope
+                        if ambient_scope is not None
+                        and str(getattr(ambient_scope, "run_id", ""))
+                        == str(agent_run_id)
+                        else None
+                    )
+                    agent_run_scope_token = bind_run_scope(exact_scope)
+                    ambient_harness_scope = get_current_harness_execution_scope()
+                    exact_harness_scope = (
+                        ambient_harness_scope
+                        if exact_scope is not None
+                        and ambient_harness_scope is not None
+                        and str(getattr(ambient_harness_scope, "run_id", ""))
+                        == str(getattr(exact_scope, "run_id", ""))
+                        else None
+                    )
+                    agent_harness_scope_token = bind_harness_execution_scope(
+                        exact_harness_scope
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not bind the exact Agent execution scope before provider setup",
+                        exc_info=True,
+                    )
+                if persisted_agent_run is not None:
+                    agent_execution = await resolve_chat_agent_execution(
+                        session_id=session_id,
+                        run=persisted_agent_run,
+                        config=getattr(self, "config", None),
+                        run_id=str(agent_run_id),
+                        dialogue_role=(
+                            str(dialogue_metadata.get("role") or "").strip().casefold()
+                            or None
+                        ),
+                    )
+                if agent_execution is not None:
+                    # Admit the exact interactive Work before taking a shared
+                    # Project/workspace resource lease.  A failed Work claim
+                    # must never leave an OS workspace lock behind.
+                    interactive_work_claim = await start_interactive_chat_work(
+                        persisted_agent_run,
+                    )
+                    if (
+                        persisted_agent_run
+                        and persisted_agent_run.get("work_item_id")
+                        and interactive_work_claim is None
+                    ):
+                        raise RuntimeError("interactive Agent work lease could not be started")
+
+                    # Issue the exact native proof only after Work admission.
+                    # Workspace allocation and provider construction consume
+                    # this proof; neither one may manufacture it.
+                    from ...services.agent_dialogue_workspace import (
+                        AgentDialogueWorkspaceManager,
+                        get_current_agent_dialogue_workspace,
+                    )
+                    route = agent_execution.route
+                    route_provider = str(getattr(route, "provider", "") or "")
+                    route_model = str(getattr(route, "model", "") or "")
+                    project_scope = (
+                        str(
+                            project_id
+                            or (persisted_agent_run or {}).get("project_id")
+                            or ""
+                        ).strip()
+                        if project_id
+                        or (persisted_agent_run or {}).get("project_id")
+                        else None
+                    )
+                    # A project hint is a child-work scope only.  It may
+                    # serve as the resource fence, but it never changes
+                    # TurnContext.project_id/root context selection.
+                    if project_scope is None:
+                        project_scope = str(
+                            dialogue_metadata.get("context_project_hint_id")
+                            or ""
+                        ).strip() or None
+                    current_workspace = get_current_agent_dialogue_workspace()
+                    native_cli_route = (
+                        route_provider.strip().casefold()
+                        in _NATIVE_AGENT_CLI_PROVIDERS
+                    )
+                    issued_agent_scope = None
+                    # Replace any ambient compatibility marker with the
+                    # server-issued exact scopes only for a native CLI route.
+                    from ...security.agent_run_scope import (
+                        bind_run_scope,
+                        reset_run_scope,
+                    )
+                    from ...security.harness_execution_scope import (
+                        bind_harness_execution_scope,
+                        reset_harness_execution_scope,
+                    )
+
+                    if native_cli_route:
+                        # The persisted route and Work claim are now admitted,
+                        # but this run's native scope has not been issued yet.
+                        await preflight_chat_agent_native_provider(
+                            route_provider,
+                            allow_host_probe=native_preflight_host_allowed,
+                        )
+                        issued_agent_scope = await issue_interactive_agent_run_scope(
+                            run_id=str(agent_run_id),
+                            work_item_id=str(
+                                (persisted_agent_run or {}).get("work_item_id") or ""
+                            ),
+                            session_id=str(session_id),
+                            agent_id=str(agent_execution.agent_id),
+                            agent_revision_id=str(agent_execution.agent_revision_id),
+                            work_claim=interactive_work_claim,
+                            binding_id=str(
+                                getattr(agent_execution.binding, "binding_id", "") or ""
+                            ),
+                            binding_snapshot_hash=str(
+                                getattr(agent_execution.binding, "snapshot_hash", "") or ""
+                            ),
+                            owner_id=str(
+                                (persisted_agent_run or {}).get("user_id")
+                                or sender_user_id
+                                or ""
+                            ),
+                            project_id=project_scope,
+                            provider_id=route_provider,
+                            model_id=route_model,
+                            workspace_path=(
+                                current_workspace.workspace_path
+                                if current_workspace is not None
+                                else None
+                            ),
+                            db_manager=agent_run_service_for_binding._get_db_manager(),
+                            config=getattr(self, "config", None),
+                        )
+                        if agent_run_scope_token is not None:
+                            reset_run_scope(agent_run_scope_token)
+                        agent_run_scope_token = bind_run_scope(issued_agent_scope.scope)
+                        if agent_harness_scope_token is not None:
+                            reset_harness_execution_scope(agent_harness_scope_token)
+                        agent_harness_scope_token = bind_harness_execution_scope(
+                            issued_agent_scope.execution_scope
+                        )
+                    else:
+                        # API/local Agents keep their ordinary isolated
+                        # Dialogue workspace. Do not turn a client-side
+                        # Agent capability ceiling into OS filesystem
+                        # authority merely because the route is non-CLI.
+                        if agent_run_scope_token is not None:
+                            reset_run_scope(agent_run_scope_token)
+                        agent_run_scope_token = bind_run_scope(None)
+                        if agent_harness_scope_token is not None:
+                            reset_harness_execution_scope(agent_harness_scope_token)
+                        agent_harness_scope_token = bind_harness_execution_scope(None)
+
+                    workspace_manager = AgentDialogueWorkspaceManager()
+                    if current_workspace is None:
+                        agent_dialogue_workspace_context = workspace_manager.session(
+                            session_id=str(session_id),
+                            agent_id=str(agent_execution.agent_id),
+                            provider_id=route_provider,
+                            model_id=route_model,
+                            run_id=str(agent_run_id),
+                            owner_id=str(
+                                (persisted_agent_run or {}).get("user_id")
+                                or sender_user_id
+                                or ""
+                            ),
+                            project_id=project_scope,
+                            readonly=(
+                                issued_agent_scope.readonly
+                                if issued_agent_scope is not None
+                                else True
+                            ),
+                            native_allowed=(
+                                issued_agent_scope.native_allowed
+                                if issued_agent_scope is not None
+                                else False
+                            ),
+                            **(
+                                {
+                                    "workspace_path": str(issued_agent_scope.workspace_root),
+                                    "authorized_scope": issued_agent_scope.scope,
+                                }
+                                if issued_agent_scope is not None
+                                else {}
+                            ),
+                        )
+                        agent_dialogue_workspace = (
+                            await agent_dialogue_workspace_context.__aenter__()
+                        )
+                    else:
+                        agent_dialogue_workspace = current_workspace
+                    from ...llm.tool_policy import set_current_agent_workspace_scope
+
+                    agent_workspace_scope_token = set_current_agent_workspace_scope(
+                        session_id=agent_dialogue_workspace.session_id,
+                        agent_id=agent_dialogue_workspace.agent_id,
+                        run_id=str(agent_run_id),
+                        resource_key=agent_dialogue_workspace.resource_key,
+                        readonly=agent_dialogue_workspace.readonly,
+                        native_allowed=agent_dialogue_workspace.native_allowed,
+                    )
+
+                    if agent_dialogue_workspace is not None:
+                        # Re-read the exact route after allocation so the same
+                        # immutable workspace object is checked against the
+                        # pinned AgentRevision and passed into the provider
+                        # factory.
+                        agent_execution = await resolve_chat_agent_execution(
+                            session_id=session_id,
+                            run=persisted_agent_run,
+                            config=getattr(self, "config", None),
+                            run_id=str(agent_run_id),
+                            workspace=agent_dialogue_workspace,
+                            dialogue_role=(
+                                str(dialogue_metadata.get("role") or "").strip().casefold()
+                                or None
+                            ),
+                        )
+
+                    # Bind the persisted assistant actor from the immutable
+                    # AgentExecution binding.  This applies to ordinary
+                    # bound Agent Chat as well as Dialogue callbacks; legacy
+                    # Character/unbound turns retain their caller fields.
+                    if agent_execution is not None:
+                        (
+                            assistant_sender_type,
+                            assistant_sender_id,
+                            assistant_sender_display_name,
+                        ) = self._bound_agent_assistant_sender(agent_execution)
+
+                    source_client = getattr(self, "llm_client", llm_client)
+                    had_source_run_marker = hasattr(source_client, "_agent_run_id")
+                    previous_source_run_marker = getattr(
+                        source_client, "_agent_run_id", None
+                    )
+                    had_source_session_marker = hasattr(
+                        source_client, "current_session_id"
+                    )
+                    previous_source_session_marker = getattr(
+                        source_client, "current_session_id", None
+                    )
+                    had_source_project_marker = hasattr(
+                        source_client, "current_project_id"
+                    )
+                    previous_source_project_marker = getattr(
+                        source_client, "current_project_id", None
+                    )
+                    # The adapter verifies workspace.run_id against this
+                    # request marker.  Restore the long-lived source client
+                    # immediately after factory construction so another Chat
+                    # turn cannot inherit this Run identity.
+                    source_client._agent_run_id = str(agent_run_id)
+                    if agent_dialogue_workspace is not None:
+                        source_client.current_session_id = (
+                            agent_dialogue_workspace.session_id
+                        )
+                        source_client.current_project_id = (
+                            agent_dialogue_workspace.project_id
+                        )
+                    try:
+                        llm_client = await asyncio.to_thread(
+                            build_agent_chat_turn_client,
+                            source_client,
+                            getattr(self, "config", None),
+                            agent_execution,
+                            workspace=agent_dialogue_workspace,
+                            session_id=str(session_id),
+                            project_id=(
+                                agent_dialogue_workspace.project_id
+                                if agent_dialogue_workspace is not None
+                                else None
+                            ),
+                            run_id=str(agent_run_id),
+                        )
+                    finally:
+                        if had_source_run_marker:
+                            source_client._agent_run_id = previous_source_run_marker
+                        else:
+                            try:
+                                delattr(source_client, "_agent_run_id")
+                            except AttributeError:
+                                pass
+                        if had_source_session_marker:
+                            source_client.current_session_id = previous_source_session_marker
+                        else:
+                            try:
+                                delattr(source_client, "current_session_id")
+                            except AttributeError:
+                                pass
+                        if had_source_project_marker:
+                            source_client.current_project_id = previous_source_project_marker
+                        else:
+                            try:
+                                delattr(source_client, "current_project_id")
+                            except AttributeError:
+                                pass
+                    llm_client._agent_run_id = str(agent_run_id)
+                    # The isolated CLI gate uses the exact server-issued
+                    # proof for formal Agent MCP context and lease checks.
+                    if issued_agent_scope is not None:
+                        llm_client._agent_native_scope_proof = issued_agent_scope
+                    agent_client_owned = True
+                    cancellation_handle = get_current_generation_cancellation()
+                    if cancellation_handle is not None:
+                        agent_provider_cancel_callback_remove = (
+                            cancellation_handle.add_cancel_callback(
+                                lambda: _request_owned_agent_provider_stop(llm_client)
+                            )
+                        )
+                    # The AgentRevision route is authoritative for this turn.
+                    response_model = None
+            except asyncio.CancelledError as cancellation:
+                await _cleanup_agent_setup_resources(cancellation)
+                raise
+            except Exception as exc:
+                try:
+                    from ...services.agent_work_runtime import (
+                        InteractiveAdmissionError,
+                    )
+                except Exception:
+                    InteractiveAdmissionError = ()
+                try:
+                    from ...services.agent_model_routing import AgentModelRouteError
+                except Exception:
+                    AgentModelRouteError = ()
+                route_error_code = (
+                    str(getattr(exc, "code", "") or "").strip().casefold()
+                    if isinstance(exc, AgentModelRouteError)
+                    else ""
+                )
+                budget_error_code = (
+                    str(getattr(exc, "code", "") or "").strip().casefold()
+                    if str(getattr(exc, "code", "") or "")
+                    .strip()
+                    .casefold()
+                    .startswith("agent_dialogue_budget_")
+                    else ""
+                )
+                admission_failure_code = ""
+                if (
+                    agent_run_id
+                    and isinstance(exc, InteractiveAdmissionError)
+                ):
+                    admission_code = str(
+                        getattr(exc, "code", "interactive_admission_denied")
+                        or "interactive_admission_denied"
+                    )[:96]
+                    admission_suffix = re.sub(
+                        r"[^a-z0-9_]+",
+                        "_",
+                        admission_code.casefold().removeprefix(
+                            "interactive_admission_"
+                        ),
+                    ).strip("_")[:64] or "denied"
+                    authority_admission_reasons = {
+                        "agent_authority_denied",
+                        "agent_binding_changed",
+                        "agent_not_active",
+                        "agent_revision_mismatch",
+                        "conversation_read_denied",
+                        "human_actor_unavailable",
+                        "human_project_write_denied",
+                        "interactive_session_unavailable",
+                        "space_assignment_missing",
+                    }
+                    safe_admission_code = (
+                        f"interactive_admission_authority_{admission_suffix}"
+                        if admission_code in authority_admission_reasons
+                        else f"interactive_admission_{admission_suffix}"
+                    )
+                    safe_admission_reply = (
+                        "このAgentは現在実行枠を利用できないため、"
+                        "応答を開始できませんでした。しばらくしてから再試行してください。"
+                    )
+                    try:
+                        await agent_run_service_for_binding.fail_run(
+                            agent_run_id,
+                            safe_admission_code,
+                            result={
+                                "admission_code": admission_code,
+                                "safe_error_code": safe_admission_code,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to terminalize denied interactive Agent run: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                    admission_failure_code = safe_admission_code
+                    try:
+                        broadcaster = getattr(
+                            self.web_interface,
+                            "broadcast_stream_event",
+                            None,
+                        )
+                        if callable(broadcaster):
+                            event = broadcaster(
+                                "stream_end",
+                                {
+                                    "content": safe_admission_reply,
+                                    "message": safe_admission_reply,
+                                    "status": "failed",
+                                    "agent_run_id": agent_run_id,
+                                    "error": "interactive_agent_admission_denied",
+                                },
+                            )
+                            if inspect.isawaitable(event):
+                                await event
+                        if self.web_interface:
+                            self.web_interface.add_assistant_message(
+                                safe_admission_reply,
+                                session_id=session_id,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Failed to publish denied interactive Agent feedback",
+                            exc_info=True,
+                        )
+                await _cleanup_agent_setup_resources(exc)
+                if agent_run_id and admission_failure_code:
+                    try:
+                        await agent_run_service_for_binding.persist_agent_dialogue_failure_message(
+                            agent_run_id,
+                            admission_failure_code,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist AgentDialogue admission failure receipt: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                if agent_run_id and route_error_code.startswith("agent_route_"):
+                    try:
+                        await agent_run_service_for_binding.fail_run(
+                            agent_run_id,
+                            route_error_code,
+                            result={
+                                "source": "agent_route_setup",
+                                "safe_error_code": route_error_code[:96],
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to terminalize unavailable Agent route: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                    try:
+                        await agent_run_service_for_binding.persist_agent_dialogue_failure_message(
+                            agent_run_id,
+                            route_error_code[:96],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist AgentDialogue route failure receipt: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                if agent_run_id and budget_error_code:
+                    try:
+                        await agent_run_service_for_binding.fail_run(
+                            agent_run_id,
+                            budget_error_code,
+                            result={
+                                "source": "agent_dialogue_budget_preflight",
+                                "safe_error_code": budget_error_code[:96],
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to terminalize unsupported AgentDialogue budget: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                    try:
+                        await agent_run_service_for_binding.persist_agent_dialogue_failure_message(
+                            agent_run_id,
+                            budget_error_code[:96],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist AgentDialogue budget failure receipt: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                raise
         llm_message = build_message_with_attachment_context(
             message,
             attachment_context,
@@ -1071,12 +2494,22 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             llm_message,
             normalized_command_capabilities,
         )
-        chat_persistence = self._get_chat_turn_persistence(llm_client)
+        if dialogue_continuation_target is not None:
+            llm_message = self._append_agent_dialogue_continuation_target(
+                llm_message,
+                dialogue_continuation_target,
+            )
+        chat_persistence = (
+            ChatTurnPersistence(getattr(llm_client, "memory_manager", None))
+            if agent_execution is not None
+            else self._get_chat_turn_persistence(llm_client)
+        )
         user_message = None
         search_tool_results: list[dict[str, Any]] = []
-        agent_run_service = AgentRunService() if agent_run_id else None
-        agent_run_context_token = (
-            set_current_agent_run_id(agent_run_id) if agent_run_id else None
+        agent_run_service = (
+            AgentRunService(config=getattr(self, "config", None))
+            if agent_run_id
+            else None
         )
         turn_context_token = set_turn_context(
             user_id=sender_user_id,
@@ -1098,7 +2531,128 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             cloud_advisor_assessment=cloud_advisor_assessment,
             suppress_automatic_context=bool(suppress_automatic_context),
             strict_project_scope=bool(strict_project_scope),
+            agent_id=(agent_execution.agent_id if agent_execution is not None else None),
+            agent_revision_id=(
+                agent_execution.agent_revision_id
+                if agent_execution is not None
+                else None
+            ),
+            agent_execution_binding=(
+                agent_execution.binding if agent_execution is not None else None
+            ),
+            agent_role=(
+                agent_execution.route.role if agent_execution is not None else None
+            ),
+            agent_execution_config=(
+                getattr(self, "config", None)
+                if agent_execution is not None
+                else None
+            ),
+            agent_dialogue_id=dialogue_metadata.get("dialogue_id"),
+            agent_dialogue_role=dialogue_metadata.get("role"),
+            agent_dialogue_input_id=dialogue_metadata.get("input_id"),
+            agent_dialogue_control_revision=dialogue_metadata.get(
+                "control_revision"
+            ),
+            agent_dialogue_human_anchor=dialogue_metadata.get("human_anchor"),
+            agent_dialogue_continuation_target=dialogue_continuation_target,
+            agent_dialogue_typed_resume_answer=(
+                persist_content if typed_resume_answer else None
+            ),
+            agent_dialogue_typed_resume_answer_id=(
+                typed_resume_answer_id if typed_resume_answer else None
+            ),
+            context_project_hint_id=context_project_hint_id,
         )
+        if agent_execution is not None:
+            # Carry only an already-issued finite scope into this Agent turn.
+            # A parent/previous run scope is never allowed to leak across the
+            # exact persisted AgentRun identity; when no matching scope is
+            # present the CLI policy below selects a provider-attested
+            # tool-free lane or denies before subprocess execution.
+            try:
+                from ...security.agent_run_scope import (
+                    bind_run_scope,
+                    get_current_run_scope,
+                )
+                from ...security.harness_execution_scope import (
+                    bind_harness_execution_scope,
+                    get_current_harness_execution_scope,
+                )
+
+                ambient_run_scope = get_current_run_scope()
+                exact_run_scope = (
+                    ambient_run_scope
+                    if ambient_run_scope is not None
+                    and (
+                        not agent_run_id
+                        or str(getattr(ambient_run_scope, "run_id", ""))
+                        == str(agent_run_id)
+                    )
+                    else None
+                )
+                # Always shadow an ambient scope while the selected Agent is
+                # active.  This prevents a stale parent scope from becoming a
+                # native CLI authority merely because ContextVars propagated.
+                if agent_run_scope_token is None:
+                    agent_run_scope_token = bind_run_scope(exact_run_scope)
+                ambient_harness_scope = get_current_harness_execution_scope()
+                exact_harness_scope = (
+                    ambient_harness_scope
+                    if exact_run_scope is not None
+                    and ambient_harness_scope is not None
+                    and str(getattr(ambient_harness_scope, "run_id", ""))
+                    == str(getattr(exact_run_scope, "run_id", ""))
+                    else None
+                )
+                if agent_harness_scope_token is None:
+                    agent_harness_scope_token = bind_harness_execution_scope(
+                        exact_harness_scope
+                    )
+            except Exception:
+                # The scope modules are optional in reduced test/runtime
+                # embeddings.  Native Agent execution remains fail-closed;
+                # ordinary legacy Character turns never enter this branch.
+                logger.warning(
+                    "Could not bind the exact Agent execution scope",
+                    exc_info=True,
+                )
+            from ...llm.tool_policy import set_current_agent_tool_scope
+            from ...services.agent_authority_guard import guard_agent_tool_call_sync
+
+            def _revalidate_agent_tool(tool_name, tool_args, tool_definition):
+                return guard_agent_tool_call_sync(
+                    tool_name,
+                    tool_args,
+                    tool_definition=tool_definition,
+                    config=getattr(self, "config", None),
+                ).allowed
+
+            agent_tool_scope_token = set_current_agent_tool_scope(
+                agent_execution.binding.capability_ceiling,
+                allowed_subagent_ids=agent_execution.binding.allowed_subagent_ids,
+                revalidate=_revalidate_agent_tool,
+            )
+            dialogue_id = str(dialogue_metadata.get("dialogue_id") or "").strip()
+            dialogue_role = str(dialogue_metadata.get("role") or "").strip().casefold()
+            if dialogue_id and dialogue_role not in {"worker", "root"}:
+                raise AgentChatAdmissionError(
+                    "persisted AgentDialogue receiver role is invalid",
+                    code="dialogue_receiver_role_invalid",
+                )
+            if dialogue_id:
+                from ...llm.tool_policy import set_current_agent_dialogue_authority
+
+                agent_dialogue_authority_token = set_current_agent_dialogue_authority(
+                    human_anchor=dialogue_metadata.get("human_anchor"),
+                    role=dialogue_role,
+                    agent_id=agent_execution.agent_id,
+                    control_revision=dialogue_metadata.get("control_revision"),
+                )
+            else:
+                agent_dialogue_authority_token = None
+        else:
+            agent_dialogue_authority_token = None
         persisted_message_context_token = None
         planning_scope_cm = None
         stream_callback = None
@@ -1106,6 +2660,42 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         isolated_provider_state_snapshot = None
         original_handler_client = None
         handler_client_assigned = False
+        interactive_work_heartbeat_task = None
+        turn_response_handler = (
+            ResponseHandler(
+                llm_client,
+                character_name=self.character_name,
+                register_character_callback=False,
+            )
+            if agent_execution is not None
+            else self.response_handler
+        )
+        if interactive_work_claim is not None:
+            from ...services.chat_execution_adapter import renew_interactive_chat_work
+
+            async def _renew_interactive_work() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(15.0)
+                        if not await renew_interactive_chat_work(interactive_work_claim):
+                            logger.warning(
+                                "Interactive Agent work lease was lost: run=%s",
+                                agent_run_id,
+                            )
+                            return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Interactive Agent work lease heartbeat failed: run=%s",
+                        agent_run_id,
+                        exc_info=True,
+                    )
+
+            interactive_work_heartbeat_task = asyncio.create_task(
+                _renew_interactive_work(),
+                name=f"chat-agent-work-heartbeat:{agent_run_id}",
+            )
 
         emitter = AgentRunEventEmitter(
             agent_run_service=agent_run_service,
@@ -1117,6 +2707,51 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             command_capabilities=normalized_command_capabilities,
             search_tool_results=search_tool_results,
             user_input=message,
+        )
+
+        execution_marker = (
+            getattr(agent_execution, "root_scope_marker", None)
+            if agent_execution is not None
+            else None
+        ) or (
+            getattr(
+                getattr(agent_execution, "binding", None),
+                "_root_scope_marker",
+                None,
+            )
+            if agent_execution is not None
+            else None
+        )
+        dialogue_execution_marker = isinstance(execution_marker, Mapping) and (
+            str(
+                execution_marker.get("scope_kind")
+                or execution_marker.get("dialogue_kind")
+                or ""
+            ).strip().casefold()
+            == "agent_dialogue"
+            or bool(str(execution_marker.get("dialogue_role") or "").strip())
+        )
+        initial_root_candidate = (
+            getattr(
+                getattr(agent_execution, "binding", None),
+                "_initial_aoidots_root_applicable",
+                False,
+            )
+            is True
+            and agent_execution is not None
+            and agent_run_id
+            and not persisted_user_message_id
+            and project_id in (None, "")
+            and not str(
+                (
+                    persisted_agent_run.get("project_id")
+                    if isinstance(persisted_agent_run, Mapping)
+                    else getattr(persisted_agent_run, "project_id", None)
+                )
+                or ""
+            ).strip()
+            and not str(dialogue_metadata.get("role") or "").strip()
+            and not dialogue_execution_marker
         )
 
         if session_id and not skip_user_persistence:
@@ -1149,10 +2784,92 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         message_id=str(user_message.id)
                     )
                 if (
+                    initial_root_candidate
+                    and user_message is not None
+                    and getattr(user_message, "id", None)
+                ):
+                    from ...services.chat_execution_adapter import (
+                        bind_initial_aoidots_human_run,
+                    )
+
+                    # Direct WS fallback Runs are created before this callback
+                    # owns the canonical Human row.  Establish the durable
+                    # trigger link under a Run row lock before any optional
+                    # learning capture; the latter must never be the
+                    # authority handoff for Root proof construction.
+                    try:
+                        linked = await bind_initial_aoidots_human_run(
+                            agent_execution,
+                            session_id=str(session_id or ""),
+                            run_id=str(agent_run_id),
+                            message_id=str(user_message.id),
+                            content=str(persist_content or ""),
+                            sender_user_id=sender_user_id,
+                            client_message_id=client_message_id,
+                            dialogue_role=(
+                                str(dialogue_metadata.get("role") or "").strip().casefold()
+                                or None
+                            ),
+                            db_manager=agent_run_service_for_binding._get_db_manager(),
+                            client=llm_client,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to establish initial AoiDots Human→Run binding",
+                            exc_info=True,
+                        )
+                        linked = False
+                    if not linked:
+                        initial_root_binding_failure_code = (
+                            "interactive_admission_human_trigger_unbound"
+                        )
+                    if linked:
+                        # Direct authenticated WebSocket turns persist the
+                        # Human after Agent setup. Re-read the committed
+                        # Run/Work/trigger rows before provider tool/schema
+                        # selection so the same request binding can receive
+                        # the typed initial AoiDots Root proof.
+                        try:
+                            refreshed_proof = await refresh_initial_aoidots_root_proof(
+                                agent_execution,
+                                session_id=str(session_id or ""),
+                                run_id=str(agent_run_id),
+                                dialogue_role=(
+                                    str(dialogue_metadata.get("role") or "")
+                                    .strip()
+                                    .casefold()
+                                    or None
+                                ),
+                                db_manager=agent_run_service_for_binding._get_db_manager(),
+                                client=llm_client,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to refresh initial AoiDots Root proof",
+                                exc_info=True,
+                            )
+                            refreshed_proof = None
+                        refreshed_marker = getattr(
+                            agent_execution,
+                            "root_scope_marker",
+                            None,
+                        )
+                        if (
+                            refreshed_proof is None
+                            or not isinstance(refreshed_marker, Mapping)
+                            or str(refreshed_marker.get("scope_kind") or "").casefold()
+                            != "aoidots"
+                            or refreshed_marker.get("root_initial") is not True
+                        ):
+                            initial_root_binding_failure_code = (
+                                "interactive_admission_aoidots_root_proof_unavailable"
+                            )
+                if (
                     user_message
                     and agent_run_id
                     and sender_user_id
                     and not suppress_automatic_context
+                    and not initial_root_binding_failure_code
                 ):
                     from ...services.learning_capture_router import (
                         capture_direct_websocket_learning_best_effort,
@@ -1176,6 +2893,17 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                 )
             except Exception as e:
                 print(f"[TerminalMode] ユーザーメッセージ保存エラー: {e}")
+
+        if (
+            initial_root_candidate
+            and (user_message is None or not getattr(user_message, "id", None))
+            and not initial_root_binding_failure_code
+        ):
+            initial_root_binding_failure_code = (
+                "interactive_admission_human_persistence_unavailable"
+            )
+
+        pending_titles: list = []
 
         async def persist_assistant_reply(
             reply: Optional[str],
@@ -1203,6 +2931,12 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     )
                     return safe_reply
             try:
+                await _append_completed_media_read_tool_results(
+                    llm_client=llm_client,
+                    agent_run_id=agent_run_id,
+                    search_tool_results=search_tool_results,
+                    suppress_automatic_context=bool(suppress_automatic_context),
+                )
                 metadata = self._get_chat_turn_metadata(
                     llm_client,
                     include_generation_metrics=include_generation_metrics,
@@ -1230,6 +2964,15 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     # keep a shallow copy so no mutable/raw object is stored
                     # by reference in the persistence layer.
                     metadata.update(dict(metadata_extra))
+                # The transport receipt validates the saved assistant row
+                # against the exact server-issued Run/Dialogue/Delivery
+                # tuple.  Provider/client metadata is not an authority
+                # source; re-project only the marker loaded from the Run.
+                metadata = self._project_agent_dialogue_assistant_metadata(
+                    metadata,
+                    agent_run_id=agent_run_id,
+                    dialogue_metadata=dialogue_metadata,
+                )
                 assistant_message = await chat_persistence.save_assistant_message(
                     session_id=session_id,
                     content=safe_reply,
@@ -1239,29 +2982,155 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     sender_display_name=assistant_sender_display_name,
                     message_id=getattr(llm_client, "current_assistant_message_id", None),
                 )
+                # A provider/client may have saved the same assistant
+                # message identity through an earlier persistence seam.  The
+                # repository's idempotent early return must still receive the
+                # current server-derived Run/Dialogue receipt, otherwise a
+                # real Agent reply can retain sender fields while losing its
+                # durable run correlation.  Merge only the typed projection;
+                # provider metadata is never promoted here.
+                if agent_run_id and assistant_message is not None:
+                    message_metadata = {
+                        "agent_run_id": str(agent_run_id),
+                    }
+                    for metadata_key in (
+                        "agent_dialogue_id",
+                        "agent_dialogue_delivery_id",
+                        "agent_dialogue",
+                        "agent_dialogue_control_revision",
+                    ):
+                        if metadata_key in metadata:
+                            message_metadata[metadata_key] = metadata[metadata_key]
+                    try:
+                        await chat_persistence.update_message_metadata(
+                            session_id=session_id,
+                            message_id=str(assistant_message.id),
+                            updates=message_metadata,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to merge Agent assistant receipt metadata: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                if assistant_message is None:
+                    # save_assistant_message returns None when storage is not
+                    # ready or the content/exclusion rules dropped the reply.
+                    # The fence skip above is the only intentional skip.
+                    emitter.record_assistant_persistence_failure(
+                        "assistant_message_not_stored"
+                    )
+                    logger.error(
+                        "Assistant reply was not stored: session=%s run=%s",
+                        session_id,
+                        agent_run_id,
+                    )
                 await self._broadcast_conversation_persisted(
                     session_id=session_id,
                     role="assistant",
                     message_id=str(assistant_message.id) if assistant_message else None,
                     agent_run_id=agent_run_id,
                 )
-                # A rejected/failed turn must not start a second external
-                # title-generation request after the user cancelled an
-                # outbound transaction.  Successful assistant replies keep
-                # the existing best-effort title enhancement.
-                if generate_title:
-                    await maybe_generate_and_broadcast_session_title(
-                        web_interface=self.web_interface,
-                        session_id=session_id,
-                        chat_persistence=chat_persistence,
-                        config=getattr(self, "config", None),
-                        log_prefix="TerminalMode",
+                # 題名は画面に本文を出したあとで、このターンのモデルだけを使う。
+                # 保存と配信は待たない。
+                if generate_title and llm_client is not None:
+                    pending_titles.append(
+                        wrap_response_model_title_work(
+                            self,
+                            llm_client,
+                            session_id,
+                            lambda llm_client=llm_client, session_id=session_id, chat_persistence=chat_persistence: maybe_generate_and_broadcast_session_title(
+                                web_interface=self.web_interface,
+                                session_id=session_id,
+                                chat_persistence=chat_persistence,
+                                config=getattr(self, "config", None),
+                                log_prefix="TerminalMode",
+                                llm_client=llm_client,
+                            ),
+                        )
                     )
             except Exception as e:
                 print(f"[TerminalMode] アシスタントメッセージ保存エラー: {e}")
+                logger.error(
+                    "Assistant reply persistence failed: session=%s run=%s",
+                    session_id,
+                    agent_run_id,
+                    exc_info=True,
+                )
+                emitter.record_assistant_persistence_failure(
+                    f"{type(e).__name__}: {e}"
+                )
             return safe_reply
 
         try:
+            if initial_root_binding_failure_code:
+                # Do not enter keyword/provider/tool selection after the
+                # canonical Human→Run handoff failed.  Terminalize the exact
+                # Run first so its already admitted Work cannot remain active.
+                try:
+                    if agent_run_service is not None and agent_run_id:
+                        await agent_run_service.fail_run(
+                            str(agent_run_id),
+                            initial_root_binding_failure_code,
+                            result={
+                                "source": "initial_aoidots_root_binding",
+                                "safe_error_code": initial_root_binding_failure_code,
+                            },
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to terminalize unbound initial AoiDots Root Run: %s",
+                        agent_run_id,
+                        exc_info=True,
+                    )
+                raise AgentChatAdmissionError(
+                    "canonical Human message could not be bound to the AgentRun",
+                    code=initial_root_binding_failure_code,
+                )
+            if agent_execution is None and project_id and agent_run_id:
+                writer_capabilities = {
+                    "project_db_update",
+                    "task_update",
+                    "wbs_sync",
+                    "workspace_file_operation",
+                }
+                if writer_capabilities.intersection(
+                    set(normalized_command_capabilities)
+                ):
+                    from uuid import UUID
+
+                    from ...llm.tool_policy import set_current_shared_resource_scope
+                    from ...services.agent_dialogue_workspace import (
+                        shared_resource_lease,
+                    )
+
+                    try:
+                        project_uuid = UUID(str(project_id))
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError("invalid Human Project resource scope") from exc
+                    if agent_run_service is None:
+                        raise RuntimeError("Human writer requires a durable Run")
+                    human_run = await agent_run_service.get_run(str(agent_run_id))
+                    if not isinstance(human_run, dict):
+                        raise RuntimeError("Human writer Run is unavailable")
+                    if (
+                        str(human_run.get("session_id") or "") != str(session_id or "")
+                        or str(human_run.get("user_id") or "") != str(sender_user_id or "")
+                        or str(human_run.get("project_id") or "") != str(project_uuid)
+                    ):
+                        raise RuntimeError("Human writer Run scope does not match the Project")
+                    human_resource_lease_context = shared_resource_lease(
+                        f"project:{project_uuid}"
+                    )
+                    resource_key = await human_resource_lease_context.__aenter__()
+                    human_resource_scope_token = set_current_shared_resource_scope(
+                        session_id=str(session_id or ""),
+                        user_id=str(sender_user_id or ""),
+                        project_id=str(project_uuid),
+                        run_id=str(agent_run_id),
+                        resource_key=resource_key,
+                        permitted_write=True,
+                    )
             try:
                 from ...tools.keyword import process_keywords
 
@@ -1354,10 +3223,11 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             async def bind_session_memory_character():
                 nonlocal session_character_name
                 token = None
-                if suppress_automatic_context:
+                if suppress_automatic_context or agent_execution is not None:
                     # Help is grounded only in the canonical Guide.  Avoid
-                    # resolving or binding a conversation character because it
-                    # would reintroduce session state into the provider turn.
+                    # resolving or binding a conversation character.  An
+                    # Agent-backed turn has its own immutable revision prompt;
+                    # Character/Persona state must not override it.
                     yield
                     return
                 try:
@@ -1408,31 +3278,52 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
 
                         reset_current_memory_character_name(token)
 
-            async with self._chat_turn_lock, bind_session_memory_character():
-                base_llm_client = self._get_active_llm_client()
-                llm_client = self._get_response_model_client(
-                    response_model,
-                    base_llm_client,
+            turn_lock = self._chat_turn_lock_for_session(
+                session_id,
+                agent_execution=agent_execution,
+            )
+            async with turn_lock, bind_session_memory_character():
+                base_llm_client = (
+                    llm_client
+                    if agent_execution is not None
+                    else self._get_active_llm_client()
                 )
+                if agent_execution is None:
+                    with response_model_cache_session(session_id):
+                        llm_client = self._get_response_model_client(
+                            response_model,
+                            base_llm_client,
+                        )
+                    response_model_cache_use = begin_response_model_use(
+                        self,
+                        llm_client,
+                        session_id=session_id,
+                    )
                 if suppress_automatic_context:
                     isolated_provider_state_snapshot = _snapshot_isolated_provider_state(
                         llm_client
                     )
                 reset_turn_generation_metadata(llm_client)
                 await emitter.mark_running(llm_client)
-                chat_persistence = self._get_chat_turn_persistence(base_llm_client)
+                chat_persistence = (
+                    ChatTurnPersistence(getattr(llm_client, "memory_manager", None))
+                    if agent_execution is not None
+                    else self._get_chat_turn_persistence(llm_client)
+                )
                 original_handler_client = getattr(
-                    self.response_handler,
+                    turn_response_handler,
                     "llm_client",
                     None,
                 )
-                if self.response_handler:
-                    self.response_handler.llm_client = llm_client
-                    handler_client_assigned = True
+                if turn_response_handler:
+                    turn_response_handler.llm_client = llm_client
+                    handler_client_assigned = agent_execution is None
                 turn_user_context_snapshot = None
                 prompt_history: list[dict[str, str]] = []
-                orchestration_mode = agent_team_orchestration_mode(
-                    getattr(self, "config", None)
+                orchestration_mode = (
+                    "standard"
+                    if agent_execution is not None
+                    else agent_team_orchestration_mode(getattr(self, "config", None))
                 )
                 if llm_client:
                     if suppress_automatic_context:
@@ -1466,8 +3357,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                         "LLMクライアントがキャラクター切替に対応していません"
                                     )
                             except Exception as exc:
-                                if self.response_handler:
-                                    self.response_handler.llm_client = (
+                                if turn_response_handler:
+                                    turn_response_handler.llm_client = (
                                         original_handler_client
                                     )
                                 raise RuntimeError(
@@ -1478,14 +3369,14 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         if str(
                             getattr(llm_client, "character_name", "") or ""
                         ).strip() != session_character_name:
-                            if self.response_handler:
-                                self.response_handler.llm_client = original_handler_client
+                            if turn_response_handler:
+                                turn_response_handler.llm_client = original_handler_client
                             raise RuntimeError(
                                 "セッションのキャラクター設定が反映されませんでした: "
                                 f"{session_character_name}"
                             )
-                        if self.response_handler:
-                            self.response_handler.character_name = session_character_name
+                        if turn_response_handler:
+                            turn_response_handler.character_name = session_character_name
                     if (
                         orchestration_mode != "director"
                         or suppress_automatic_context
@@ -1551,6 +3442,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         or (skip_user_persistence and session_id)
                         or suppress_automatic_context
                     )
+                    llm_client._hold_cross_session_index = True
                     from ...services.planning_runtime import planning_turn_scope
 
                     planning_scope_cm = planning_turn_scope(
@@ -1852,8 +3744,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                     "[TerminalMode] QA Browser Playwright cleanup error: "
                                     f"{exc}"
                                 )
-                        if self.response_handler:
-                            self.response_handler.llm_client = original_handler_client
+                        if turn_response_handler:
+                            turn_response_handler.llm_client = original_handler_client
                         if llm_client:
                             llm_client.current_session_id = None
                             llm_client.current_project_id = None
@@ -1874,8 +3766,11 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                 stream_callback = None
                 steering_callback = None
                 used_streaming = False
-                supports_streaming = bool(
-                    llm_client and hasattr(llm_client, "_run_streamed_with_callback")
+                content_streaming = getattr(llm_client, "supports_content_streaming", None)
+                supports_streaming = (
+                    content_streaming
+                    if isinstance(content_streaming, bool)
+                    else bool(llm_client and hasattr(llm_client, "_run_streamed_with_callback"))
                 )
                 active_tool_operations: dict[
                     str,
@@ -1917,10 +3812,17 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         cancellation_handle = (
                             get_current_generation_cancellation()
                         )
-                        if (
+                        cancellation_requested = (
                             cancellation_handle is not None
                             and cancellation_handle.cancel_requested.is_set()
-                        ):
+                        )
+                        # A stop request must fence all new generation/UI
+                        # events, but a tool that was already in flight may
+                        # still finish.  Preserve only that terminal tool
+                        # receipt so the cancelled snapshot can retain the
+                        # completed work; never start another tool or expose a
+                        # late assistant/final stream.
+                        if cancellation_requested and event_type != "tool_end":
                             return
                         if not supports_streaming:
                             if event_type in content_stream_events:
@@ -1932,6 +3834,16 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 getattr(self, "config", None),
                                 dict(data),
                             )
+                            # Cancellation can race the callback entry check.
+                            # Refresh the fence immediately before correlating a
+                            # terminal tool event so an event that arrives after
+                            # the stop request is subject to the same active-call
+                            # allowlist below.
+                            if (
+                                cancellation_handle is not None
+                                and cancellation_handle.cancel_requested.is_set()
+                            ):
+                                cancellation_requested = True
                             tool_name = str(
                                 event_data.get("tool")
                                 or event_data.get("tool_name")
@@ -1970,6 +3882,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 )
                             elif event_type == "tool_end" and tool_name:
                                 queue = active_tool_operations.get(tool_name, [])
+                                matched_active_operation = False
                                 if not operation_id and queue:
                                     matching_index = next(
                                         (
@@ -1987,8 +3900,10 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                         operation_id, operation_started_at, _ = queue.pop(
                                             matching_index
                                         )
+                                        matched_active_operation = True
                                     elif len(queue) == 1:
                                         operation_id, operation_started_at, _ = queue.pop(0)
+                                        matched_active_operation = True
                                 elif operation_id:
                                     matching_index = next(
                                         (
@@ -2006,6 +3921,14 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                         _, operation_started_at, _ = queue.pop(
                                             matching_index
                                         )
+                                        matched_active_operation = True
+                                if cancellation_requested and not matched_active_operation:
+                                    # A cancelled turn may retain the completion
+                                    # receipt for a tool that was already started,
+                                    # but an unknown operation (including a
+                                    # post-stop tool_start that was gated above)
+                                    # must not become a synthetic UUID receipt.
+                                    return
                                 if not queue:
                                     active_tool_operations.pop(tool_name, None)
                                 operation_id = operation_id or str(uuid4())
@@ -2027,12 +3950,28 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 event_type,
                                 event_data,
                             )
-                            await emitter.record_event(
-                                f"stream.{event_type}",
-                                safe_event_data,
-                                status=safe_event_data.get("status"),
-                                message_text=safe_event_data.get("message"),
-                            )
+                            tool_result = safe_event_data.get("tool_result")
+                            if (
+                                event_type == "tool_end"
+                                and isinstance(tool_result, dict)
+                            ):
+                                citation_urls = _verified_media_read_urls(tool_result)
+                                tool_name_for_projection = str(
+                                    tool_result.get("tool")
+                                    or tool_result.get("name")
+                                    or tool_name
+                                )
+                                if (
+                                    tool_name_for_projection.rsplit(".", 1)[-1]
+                                    .strip()
+                                    .casefold()
+                                    == "media_read"
+                                ):
+                                    tool_result = _project_media_read_tool_result(
+                                        tool_result,
+                                        citation_urls,
+                                    )
+                                    safe_event_data["tool_result"] = tool_result
                             tool_result = safe_event_data.get("tool_result")
                             if (
                                 event_type == "tool_end"
@@ -2048,85 +3987,119 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                         if key != "tool_call_id"
                                     }
                                 )
+                            if (
+                                event_type != "tool_end"
+                                and cancellation_handle is not None
+                                and cancellation_handle.cancel_requested.is_set()
+                            ):
+                                return
+                            await emitter.record_event(
+                                f"stream.{event_type}",
+                                safe_event_data,
+                                status=safe_event_data.get("status"),
+                                message_text=safe_event_data.get("message"),
+                            )
+                            tool_result = safe_event_data.get("tool_result")
+                            if (
+                                event_type == "tool_end"
+                                and isinstance(tool_result, dict)
+                                and not safe_event_data.get(
+                                    "tool_result_already_recorded"
+                                )
+                            ):
                                 if agent_run_service:
-                                    tool_name = (
+                                    raw_record_tool_name = (
                                         tool_result.get("tool")
                                         or tool_result.get("name")
                                         or safe_event_data.get("tool")
                                         or safe_event_data.get("tool_name")
                                     )
-                                    if tool_name:
+                                    if raw_record_tool_name:
                                         try:
+                                            record_arguments = (
+                                                tool_result.get("arguments")
+                                                or tool_result.get("args")
+                                                or {}
+                                            )
+                                            record_result = (
+                                                tool_result.get("output")
+                                                or tool_result.get("result")
+                                                or tool_result
+                                            )
+                                            record_metadata = {
+                                                key: value
+                                                for key, value in tool_result.items()
+                                                if key
+                                                not in {
+                                                    "tool",
+                                                    "name",
+                                                    "arguments",
+                                                    "args",
+                                                    "output",
+                                                    "result",
+                                                }
+                                            }
+                                            normalized_tool_call = _agent_run_tool_call_payload(
+                                                {
+                                                    "tool": str(raw_record_tool_name),
+                                                    "arguments": record_arguments,
+                                                    "result": record_result,
+                                                    "success": tool_result.get("success"),
+                                                    "successful": tool_result.get("successful"),
+                                                    "error": tool_result.get("error"),
+                                                    "blocked_reason": tool_result.get(
+                                                        "blocked_reason"
+                                                    ),
+                                                    "tool_call_id": operation_id
+                                                    or tool_result.get("tool_call_id"),
+                                                    "metadata": record_metadata,
+                                                    "duration_ms": (
+                                                        max(
+                                                            0,
+                                                            int(
+                                                                (
+                                                                    time.monotonic()
+                                                                    - operation_started_at
+                                                                )
+                                                                * 1000
+                                                            ),
+                                                        )
+                                                        if operation_started_at is not None
+                                                        else None
+                                                    ),
+                                                }
+                                            )
                                             await agent_run_service.record_tool_call(
                                                 agent_run_id,
-                                                tool_name=str(tool_name),
-                                                arguments=tool_result.get("arguments")
-                                                or tool_result.get("args")
-                                                or {},
-                                                result=tool_result.get("output")
-                                                or tool_result.get("result")
-                                                or tool_result,
-                                                success=(
-                                                    not bool(tool_result.get("error"))
-                                                    and (
-                                                        tool_result.get("exit_code")
-                                                        is None
-                                                        or str(
-                                                            tool_result.get("exit_code")
-                                                        ).strip()
-                                                        in {"0", "0.0"}
-                                                    )
-                                                ),
+                                                tool_name=normalized_tool_call["tool"],
+                                                arguments=normalized_tool_call["arguments"],
+                                                result=normalized_tool_call["result"],
+                                                success=normalized_tool_call["successful"],
                                                 mutation_confirmed=bool(
                                                     tool_result.get("mutation_confirmed")
                                                 ),
-                                                tool_call_id=(
-                                                    operation_id
-                                                    or (
-                                                        str(
-                                                            tool_result.get(
-                                                                "tool_call_id"
-                                                            )
-                                                        )
-                                                        if tool_result.get(
-                                                            "tool_call_id"
-                                                        )
-                                                        else None
-                                                    )
+                                                tool_call_id=normalized_tool_call[
+                                                    "tool_call_id"
+                                                ],
+                                                duration_ms=normalized_tool_call.get(
+                                                    "duration_ms"
                                                 ),
-                                                duration_ms=(
-                                                    max(
-                                                        0,
-                                                        int(
-                                                            (
-                                                                time.monotonic()
-                                                                - operation_started_at
-                                                            )
-                                                            * 1000
-                                                        ),
-                                                    )
-                                                    if operation_started_at is not None
-                                                    else None
-                                                ),
-                                                metadata={
-                                                    key: value
-                                                    for key, value in tool_result.items()
-                                                    if key
-                                                    not in {
-                                                        "tool",
-                                                        "name",
-                                                        "arguments",
-                                                        "args",
-                                                        "output",
-                                                        "result",
-                                                    }
-                                                },
+                                                metadata=normalized_tool_call["metadata"],
                                             )
                                         except Exception as record_error:
                                             print(
                                                 "[TerminalMode] AgentRun tool record "
                                                 f"failed: {record_error}"
                                             )
+                            # Recheck after the durable audit/receipt boundary.
+                            # A cancellation racing this callback must not leak
+                            # a late websocket event, while the record above is
+                            # retained for cancel finalization.
+                            if (
+                                cancellation_handle is not None
+                                and cancellation_handle.cancel_requested.is_set()
+                            ):
+                                return
                             result = web_iface.broadcast_stream_event(
                                 event_type, safe_event_data
                             )
@@ -2316,12 +4289,18 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                                 configured_provider,
                                 configured_model,
                             ):
-                                workflow_main_model = self._get_response_model_client(
-                                    {
-                                        "provider": configured_provider,
-                                        "model": configured_model,
-                                    },
-                                    llm_client,
+                                with response_model_cache_session(session_id):
+                                    workflow_main_model = self._get_response_model_client(
+                                        {
+                                            "provider": configured_provider,
+                                            "model": configured_model,
+                                        },
+                                        llm_client,
+                                    )
+                                workflow_response_model_cache_use = begin_response_model_use(
+                                    self,
+                                    workflow_main_model,
+                                    session_id=session_id,
                                 )
                         workflow_result = await controller.execute(
                             workflow_source,
@@ -2465,7 +4444,6 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             )
                         return workflow_reply
                     except Exception as exc:
-                        logger = logging.getLogger(__name__)
                         # Workflow inputs are untrusted local evidence; do
                         # not dump exception text/tracebacks into normal
                         # runtime logs where paths or source literals could
@@ -2600,8 +4578,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             safe_response,
                             session_id=session_id,
                         )
-                    if self.response_handler:
-                        self.response_handler.llm_client = original_handler_client
+                    if turn_response_handler:
+                        turn_response_handler.llm_client = original_handler_client
                     if llm_client:
                         llm_client.current_session_id = None
                         llm_client.current_project_id = None
@@ -2618,7 +4596,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         )
                     return
 
-                task_id = self.response_handler._generate_task_id()
+                task_id = turn_response_handler._generate_task_id()
                 try:
                     generation_kwargs = {
                         "image_data": image_data,
@@ -2626,7 +4604,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     }
                     try:
                         generation_signature = inspect.signature(
-                            self.response_handler._generate_response_only
+                            turn_response_handler._generate_response_only
                         )
                         parameters = generation_signature.parameters
                         accepts_kwargs = any(
@@ -2639,15 +4617,15 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             generation_kwargs["steering_callback"] = steering_callback
                     except (TypeError, ValueError):
                         pass
-                    response = await self.response_handler._generate_response_only(
+                    response = await turn_response_handler._generate_response_only(
                         task_id,
                         llm_message,
                         "web",
                         **generation_kwargs,
                     )
                 finally:
-                    if self.response_handler:
-                        self.response_handler.llm_client = original_handler_client
+                    if turn_response_handler:
+                        turn_response_handler.llm_client = original_handler_client
                     if llm_client:
                         llm_client.current_session_id = None
                         llm_client.current_project_id = None
@@ -2683,9 +4661,20 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     else None
                 )
                 generation_failure_marker = getattr(
-                    self.response_handler,
+                    turn_response_handler,
                     "last_generation_failure",
                     None,
+                )
+                generation_failure_kind = str(
+                    (
+                        generation_failure_marker.get("kind")
+                        if isinstance(generation_failure_marker, Mapping)
+                        else getattr(generation_failure_marker, "kind", "")
+                    )
+                    or ""
+                ).strip().casefold()
+                approval_already_pending = (
+                    generation_failure_kind == "approval_already_pending"
                 )
                 provider_failure_text = (
                     str(mutation_evidence.get("provider_finalization_failure") or "")
@@ -2709,8 +4698,13 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         or tool_loop_failed_marker
                         or response_tool_loop_failure
                     )
+                    and not approval_already_pending
                 )
-                if response and not mutation_fallback_requested:
+                if (
+                    response
+                    and not mutation_fallback_requested
+                    and generation_failure_marker is None
+                ):
                     safe_response = await persist_assistant_reply(response)
                     await emitter.complete(response, llm_client)
                     print(f"{self.character_name}: {response}")
@@ -2758,9 +4752,17 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
 
                     # 失敗理由を分類し、ユーザーには原因と次の行動が分かる文言を返す。
                     failure = getattr(
-                        self.response_handler, "last_generation_failure", None
+                        turn_response_handler, "last_generation_failure", None
                     ) or empty_response_failure()
-                    failure_reply = failure.user_message
+                    # Keep the local provider's historical friendly fallback
+                    # visible when it returned one, while the typed marker
+                    # below still drives AgentRun/Work failure settlement.
+                    failure_reply = (
+                        str(response).strip()
+                        if generation_failure_marker is not None
+                        and str(response or "").strip()
+                        else failure.user_message
+                    )
                     safe_failure_reply = await persist_assistant_reply(
                         failure_reply,
                         generate_title=False,
@@ -2772,10 +4774,19 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         fail_detail = (
                             f"Assistant generation failed: {failure.technical_detail}"
                         )
+                    failure_kind = generation_failure_kind or str(
+                        getattr(failure, "kind", "") or ""
+                    ).strip().casefold()
+                    failure_status = (
+                        "awaiting_approval"
+                        if failure_kind == "approval_already_pending"
+                        else "failed"
+                    )
                     await emitter.fail(
                         fail_detail,
                         failure_reply,
                         llm_client,
+                        status=failure_status,
                     )
                     if stream_callback:
                         # WebUIの生成ステータスにも分類済みの理由を届ける。
@@ -2783,7 +4794,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             "stream_end",
                             {
                                 "content": safe_failure_reply,
-                                "status": "failed",
+                                "status": failure_status,
                                 "message": safe_failure_reply,
                                 "error": failure.technical_detail,
                             },
@@ -2793,6 +4804,57 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             safe_failure_reply, session_id=session_id
                         )
                     print("応答の生成に失敗しました")
+        except asyncio.CancelledError:
+            # Cancellation is a durable AgentRun outcome.  Shield the
+            # emitter so known provider usage and tool receipts reach the Run
+            # before the cancellation is re-raised; no assistant reply is
+            # created on this path.
+            try:
+                await _await_setup_cleanup(
+                    emitter.fail(
+                        "Agent generation cancelled",
+                        None,
+                        llm_client,
+                        status="cancelled",
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist cancelled AgentRun: run=%s",
+                    agent_run_id,
+                    exc_info=True,
+                )
+            raise
+        except AgentDialogueInputPending as pending:
+            # The service has already persisted the encrypted question and
+            # atomically fenced Run/Work/Input.  Do not create an assistant
+            # reply or let the normal planning catch rewrite that pause.
+            safe_reply = sanitize_assistant_display_text(pending.user_message)
+            print(
+                "[TerminalMode] AgentDialogue入力待ちで生成を終了しました: "
+                f"{pending.input_id}"
+            )
+            await emitter.fail(
+                pending.reason,
+                None,
+                llm_client,
+                status="failed",
+            )
+            if stream_callback:
+                await stream_callback(
+                    "stream_end",
+                    {
+                        "content": safe_reply,
+                        "status": "failed",
+                        "message": safe_reply,
+                        "error": pending.reason,
+                        "safe_error_code": pending.reason,
+                        "input_id": pending.input_id,
+                        "dialogue_id": pending.dialogue_id,
+                        "agent_run_id": agent_run_id,
+                    },
+                )
+            return safe_reply
         except PlanningInteractionTerminated as termination:
             safe_reply = sanitize_assistant_display_text(termination.user_message)
             print(
@@ -2834,7 +4896,27 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             return safe_reply
         except Exception as e:
             print(f"チャットメッセージ処理エラー: {e}")
-            error_reply = f"申し訳ありません。応答生成中にエラーが発生しました: {e}"
+            typed_failure_code = str(getattr(e, "code", "") or "").strip().casefold()
+            provider_failure_proof = getattr(e, "preprovider_proof", None)
+            typed_provider_failure = (
+                typed_failure_code == "agent_dialogue_provider_not_started"
+                and isinstance(provider_failure_proof, PreproviderFailureProof)
+            )
+            typed_admission_failure = bool(
+                typed_failure_code.startswith(
+                    (
+                        "interactive_admission_",
+                        "agent_dialogue_budget_",
+                        "agent_route_",
+                    )
+                )
+                or typed_provider_failure
+            )
+            error_reply = (
+                "このAgentは権限または実行枠の確認により開始できませんでした。"
+                if typed_admission_failure
+                else f"申し訳ありません。応答生成中にエラーが発生しました: {e}"
+            )
             # Never let persistence failure leave the display reply
             # uninitialized. Reserved Help turns also keep provider/DB
             # details out of the user-visible stream; the raw exception is
@@ -2858,15 +4940,106 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             failure_detail = (
                 "AoiTalk Help generation failed"
                 if suppress_automatic_context
+                else typed_failure_code
+                if typed_admission_failure
                 else str(e)
             )
-            await emitter.fail(failure_detail, safe_error_reply, llm_client)
+            await emitter.fail(
+                failure_detail,
+                safe_error_reply,
+                llm_client,
+                provider_failure_proof=(
+                    provider_failure_proof if typed_provider_failure else None
+                ),
+            )
             if self.web_interface:
                 self.web_interface.add_assistant_message(
                     safe_error_reply,
                     session_id=session_id,
                 )
         finally:
+            if interactive_work_heartbeat_task is not None:
+                interactive_work_heartbeat_task.cancel()
+                await _await_setup_cleanup(
+                    asyncio.gather(
+                        interactive_work_heartbeat_task,
+                        return_exceptions=True,
+                    )
+                )
+            if interactive_work_claim is not None:
+                try:
+                    from ...services.chat_execution_adapter import (
+                        settle_interactive_chat_work,
+                    )
+
+                    async def _settle_interactive_work_after_turn() -> None:
+                        final_run = (
+                            await AgentRunService(
+                                config=getattr(self, "config", None),
+                            ).get_run(str(agent_run_id))
+                            if agent_run_id
+                            else None
+                        )
+                        final_status = str(
+                            (final_run or {}).get("status") or ""
+                        ).casefold()
+                        await settle_interactive_chat_work(
+                            interactive_work_claim,
+                            success=final_status == "succeeded",
+                            cancelled=final_status == "cancelled",
+                            awaiting_approval=final_status == "awaiting_approval",
+                            error=(
+                                str(
+                                    (final_run or {}).get("error")
+                                    or "interactive chat failed"
+                                )
+                                if final_status != "succeeded"
+                                else None
+                            ),
+                        )
+
+                    await _await_setup_cleanup(_settle_interactive_work_after_turn())
+                except Exception:
+                    logger.warning(
+                        "Failed to settle interactive Agent work: run=%s",
+                        agent_run_id,
+                        exc_info=True,
+                    )
+            if agent_tool_scope_token is not None:
+                from ...llm.tool_policy import reset_current_agent_tool_scope
+
+                reset_current_agent_tool_scope(agent_tool_scope_token)
+            if agent_dialogue_authority_token is not None:
+                from ...llm.tool_policy import reset_current_agent_dialogue_authority
+
+                reset_current_agent_dialogue_authority(agent_dialogue_authority_token)
+            if agent_harness_scope_token is not None:
+                from ...security.harness_execution_scope import (
+                    reset_harness_execution_scope,
+                )
+
+                reset_harness_execution_scope(agent_harness_scope_token)
+            if agent_run_scope_token is not None:
+                from ...security.agent_run_scope import reset_run_scope
+
+                reset_run_scope(agent_run_scope_token)
+            for title_work in pending_titles:
+                schedule_after_visible_response(
+                    title_work,
+                    name="conversation-title",
+                )
+            end_response_model_use(self, response_model_cache_use)
+            end_response_model_use(self, workflow_response_model_cache_use)
+            schedule_deferred_session_index(
+                getattr(chat_persistence, "memory_manager", None),
+                session_id,
+            )
+            schedule_deferred_session_index(
+                getattr(llm_client, "memory_manager", None),
+                session_id,
+            )
+            if llm_client is not None:
+                llm_client._hold_cross_session_index = False
             if suppress_automatic_context:
                 # Help priming intentionally clears provider-local history, but
                 # that is a turn-local view.  Restore the ordinary client
@@ -2890,6 +5063,37 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             reset_turn_context(turn_context_token)
             if agent_run_context_token is not None:
                 reset_current_agent_run_id(agent_run_context_token)
+            if agent_provider_cancel_callback_remove is not None:
+                try:
+                    agent_provider_cancel_callback_remove()
+                finally:
+                    agent_provider_cancel_callback_remove = None
+            if agent_client_owned:
+                cleanup = getattr(llm_client, "cleanup", None)
+                if callable(cleanup):
+                    result = cleanup()
+                    if inspect.isawaitable(result):
+                        await result
+            if agent_dialogue_workspace_context is not None:
+                try:
+                    await agent_dialogue_workspace_context.__aexit__(None, None, None)
+                finally:
+                    agent_dialogue_workspace_context = None
+            if agent_workspace_scope_token is not None:
+                from ...llm.tool_policy import reset_current_agent_workspace_scope
+
+                reset_current_agent_workspace_scope(agent_workspace_scope_token)
+                agent_workspace_scope_token = None
+            if human_resource_scope_token is not None:
+                from ...llm.tool_policy import reset_current_shared_resource_scope
+
+                reset_current_shared_resource_scope(human_resource_scope_token)
+                human_resource_scope_token = None
+            if human_resource_lease_context is not None:
+                try:
+                    await human_resource_lease_context.__aexit__(None, None, None)
+                finally:
+                    human_resource_lease_context = None
 
     async def _cleanup_mode_specific(self):
         """Cleanup terminal mode specific resources"""

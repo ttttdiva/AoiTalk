@@ -17,6 +17,7 @@ from .chat_attachment_utils import (
     build_message_with_attachment_context,
 )
 from ..llm.conversation_context import (
+    canonical_model_transcript_for_history,
     compact_model_transcript_for_history,
     merge_model_transcript_snapshot,
 )
@@ -355,6 +356,7 @@ class ChatTurnPersistence:
             sender_type=sender_type,
             sender_id=sender_id,
             sender_display_name=sender_display_name,
+            defer_cross_session_index=True,
             **message_identity,
         )
         # Project Q&A is curated from the completed user+assistant turn by
@@ -395,7 +397,11 @@ class ChatTurnPersistence:
         updater = getattr(self.memory_manager.repository, "update_message_metadata", None)
         if not callable(updater):
             return False
-        return bool(await updater(session_id, message_id, updates))
+        try:
+            normalized_updates = dict(updates or {})
+        except (TypeError, ValueError):
+            return False
+        return bool(await updater(session_id, message_id, normalized_updates))
 
     async def save_assistant_message(
         self,
@@ -424,6 +430,7 @@ class ChatTurnPersistence:
             sender_type=sender_type,
             sender_id=sender_id,
             sender_display_name=sender_display_name,
+            defer_cross_session_index=True,
             **message_identity,
         )
 
@@ -631,6 +638,10 @@ class ChatTurnPersistence:
                             if key in msg
                         }
                     )
+            model_messages = canonical_model_transcript_for_history(model_messages)
+            previous_transcript = canonical_model_transcript_for_history(
+                previous_transcript
+            )
             if hasattr(history_manager, "set_model_messages"):
                 history_manager.set_model_messages(model_messages)
             full_model_transcript = [

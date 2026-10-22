@@ -40,8 +40,7 @@ export type FilerUndoEntry =
   | { kind: "delete"; entries: FilerDeleteUndoItem[] }
   | { kind: "rename"; path: string; fromName: string; toName: string }
   | { kind: "rename-batch"; entries: FilerRenameUndoItem[] }
-  | { kind: "move"; entries: FilerMoveUndoItem[] }
-  | { kind: "hydrus-delete"; fileIds: number[] };
+  | { kind: "move"; entries: FilerMoveUndoItem[] };
 
 export interface FilerUndoState {
   undo: FilerUndoEntry[];
@@ -98,6 +97,14 @@ export function restoreFilerUndoEntry(
   entry: FilerUndoEntry,
 ): FilerUndoState {
   return { undo: capped([...state.undo, entry]), redo: state.redo };
+}
+
+/** Restore an uncompleted redo entry without disturbing successful undo entries. */
+export function restoreFilerRedoEntry(
+  state: FilerUndoState,
+  entry: FilerUndoEntry,
+): FilerUndoState {
+  return { undo: state.undo, redo: capped([...state.redo, entry]) };
 }
 
 /** タブ切り替えなどでスタックを全消去する。 */

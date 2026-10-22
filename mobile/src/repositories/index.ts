@@ -9,6 +9,7 @@ export { tasksRepo, OfflineWriteError } from "./tasks";
 export { projectsRepo } from "./projects";
 export { occurrencesRepo } from "./occurrences";
 export {
+  AgentBindingConflictError,
   CharacterUpdateNotAllowedError,
   conversationsRepo,
   dispatchPendingConversationMessage,
@@ -18,6 +19,7 @@ export {
   getPromotedConversationSessionId,
   uploadLocalSession,
 } from "./conversations";
+export type { ConversationAgentCatalogScope } from "./conversations";
 export {
   timeEntriesRepo,
   buildTimeReportFromEntries,

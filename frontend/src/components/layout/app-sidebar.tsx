@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 /* eslint-disable @next/next/no-img-element */
 
 import { usePathname, useRouter } from "next/navigation";
@@ -115,7 +117,7 @@ function AppSidebarInner() {
       // localStorageが無効でも新規チャットへの遷移は継続する。
     }
     if (!navigateChatSessionInPlace("/chat")) {
-      window.location.href = "/chat";
+      window.location.href = withBasePath("/chat");
     }
   }, []);
 
@@ -149,7 +151,7 @@ function AppSidebarInner() {
             title="新規チャットを開く"
           >
             <img
-              src="/images/ui/brand-orb.png"
+              src={withBasePath("/images/ui/brand-orb.png")}
               alt=""
               className="size-9 shrink-0 rounded-xl object-cover ring-1 ring-sidebar-border"
             />

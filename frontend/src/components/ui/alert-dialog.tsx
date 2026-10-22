@@ -1,5 +1,6 @@
 "use client";
 
+import type { DialogPopupProps } from "@base-ui/react/dialog";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,7 @@ export type AlertDialogProps = {
   confirmLabel?: string;
   cancelLabel?: string;
   destructive?: boolean;
+  finalFocus?: DialogPopupProps["finalFocus"];
   onConfirm: () => void;
   onCancel: () => void;
 };
@@ -33,6 +35,7 @@ export function AlertDialog({
   confirmLabel = "OK",
   cancelLabel = "キャンセル",
   destructive = false,
+  finalFocus,
   onConfirm,
   onCancel,
 }: AlertDialogProps) {
@@ -43,11 +46,11 @@ export function AlertDialog({
         if (!next) onCancel();
       }}
     >
-      <DialogContent showCloseButton={false}>
+      <DialogContent showCloseButton={false} finalFocus={finalFocus}>
         <DialogHeader>
           <DialogTitle>{title ?? "確認"}</DialogTitle>
           {description ? (
-            <DialogDescription className="whitespace-pre-wrap">
+            <DialogDescription className="max-h-[min(50vh,20rem)] overflow-y-auto overscroll-contain break-all pr-2 whitespace-pre-wrap">
               {description}
             </DialogDescription>
           ) : null}

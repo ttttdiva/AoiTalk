@@ -1,0 +1,29 @@
+/* Agent gallery: one layer of image cards, soft tonal surfaces, compact text.
+   Keep the shared light/dark system; limit the new shape and colour to this screen. */
+.workspace {
+  --radius: 0.75rem;
+  --primary: #287d83;
+  --ring: var(--primary);
+  --accent: color-mix(in srgb, var(--primary) 7%, var(--card));
+  --border: color-mix(in srgb, var(--foreground) 10%, transparent);
+}
+
+:global(.dark) .workspace {
+  --primary: #72c6c5;
+  --primary-foreground: #142f33;
+}
+
+.card {
+  border-radius: 1rem;
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--foreground) 5%, transparent);
+  transition: box-shadow 140ms ease;
+}
+
+.card:hover {
+  box-shadow: 0 5px 16px color-mix(in srgb, var(--foreground) 9%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card { transition: none; }
+  .detail, .backdrop { animation: none !important; transition: none !important; }
+}

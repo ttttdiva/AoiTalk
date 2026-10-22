@@ -618,15 +618,20 @@ class AppService:
         user_id: UUID,
         user_role: str | None = None,
         project_id: UUID | None = None,
+        include_archived: bool = False,
     ) -> list[tuple[App, str]]:
         """Resolve permissions for every visible App with a fixed query count.
 
         判定内容は ``permission_for_app`` と同一だが、App 1件ずつ grant /
         binding / Project を引くと App 数に比例してクエリが増えるため、
-        必要な行を先に一括取得して dict 引きで解決する。
+        必要な行を先に一括取得して dict 引きで解決する。既定ではアーカイブ済み
+        Appを除外し、アーカイブ画面など明示的な呼び出しだけが両方を取得する。
         """
         user_role = await _resolve_user_role(session, user_id, user_role)
-        apps = list((await session.scalars(select(App).where(App.archived_at.is_(None)).order_by(App.updated_at.desc()))).all())
+        apps_query = select(App).order_by(App.updated_at.desc())
+        if not include_archived:
+            apps_query = apps_query.where(App.archived_at.is_(None))
+        apps = list((await session.scalars(apps_query)).all())
         if not apps:
             return []
         if project_id is not None and not await self.project_access(

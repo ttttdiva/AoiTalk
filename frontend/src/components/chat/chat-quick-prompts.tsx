@@ -12,6 +12,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useSnippets } from "@/contexts/snippets-context";
 import type { Snippet } from "@/lib/snippets-api";
+import { cn } from "@/lib/utils";
 
 /** The controls needed by the chat composer to render quick prompts. */
 export type ChatQuickPromptsProps = {
@@ -163,11 +164,14 @@ export function ChatQuickPrompts({
       data-testid="chat-quick-prompts"
       data-chat-quick-prompts="true"
       data-quick-prompts="true"
-      className="flex min-w-0 flex-nowrap items-center gap-2 overflow-x-auto"
+      className="contents"
     >
       <div
         data-quick-prompt-strip="true"
-        className="flex min-w-0 flex-1 flex-nowrap gap-2 overflow-x-auto"
+        className={cn(
+          "order-first flex w-full basis-full flex-none min-w-0 flex-nowrap gap-2 overflow-x-auto",
+          quickPrompts.length === 0 && "hidden",
+        )}
       >
         {quickPrompts.map(({ source, sourceIndex }) => (
           <Button

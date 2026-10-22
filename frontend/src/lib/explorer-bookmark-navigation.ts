@@ -13,6 +13,8 @@ import {
 export type ExecuteExplorerBookmarkOptions = {
   closeEditor: () => void;
   navigate: (path: string) => void;
+  /** Resolve and open either a bookmarked file or folder in the Files view. */
+  openTarget?: (path: string, name: string) => void;
   focusFilesRoot: () => void;
   /**
    * Explicit endpoint provenance for this row.  Personal rows must never
@@ -63,6 +65,10 @@ export async function executeExplorerBookmark(
   ) {
     return;
   }
-  options.navigate(rawPath);
+  if (options.openTarget) {
+    options.openTarget(rawPath, item.name);
+  } else {
+    options.navigate(rawPath);
+  }
   options.focusFilesRoot();
 }

@@ -51,6 +51,7 @@ export function getCharacterChangeAvailability(
 export type ConversationExclusiveOperation =
   | "send"
   | "character-update"
+  | "agent-update"
   | "project-update"
   | "background-flush";
 
@@ -110,6 +111,16 @@ export type CharacterSnapshotResolverOptions = {
   strict?: boolean;
 };
 
+export function resolveCharacterProfileAuthScope(
+  currentAuthScope: string | null | undefined,
+  sessionUserId: string | null | undefined,
+): string {
+  const current = String(currentAuthScope ?? "").trim() || "anonymous";
+  if (current !== "anonymous") return current;
+  const sessionOwner = String(sessionUserId ?? "").trim();
+  return sessionOwner ? `auth:${sessionOwner}` : current;
+}
+
 const characterSnapshotCache = new Map<string, CharacterProfileSnapshot>();
 
 function isCompleteCharacterSnapshot(
@@ -141,11 +152,18 @@ async function resolveCharacterSnapshotScope(
 
 export function createCharacterProfileSnapshotResolver(
   characterSlug: string | null | undefined,
-  lookup: CharacterLookup = (slug) => characterApi.getDirectProfile(slug),
+  lookup: CharacterLookup | undefined = undefined,
   options: CharacterSnapshotResolverOptions = {},
 ): () => Promise<CharacterProfileSnapshot | null> {
   const slugAtSendStart = String(characterSlug ?? "").trim();
   const strict = options.strict ?? true;
+  const profileLookup =
+    lookup ??
+    ((slug: string) =>
+      characterApi.getDirectProfile(slug, {
+        authScope: options.authScope,
+        serverIdentity: options.serverIdentity,
+      }));
   let snapshotPromise: Promise<CharacterProfileSnapshot | null> | null = null;
 
   return () => {
@@ -167,7 +185,7 @@ export function createCharacterProfileSnapshotResolver(
             slugAtSendStart,
             options,
           );
-          const resolved = await lookup(slugAtSendStart);
+          const resolved = await profileLookup(slugAtSendStart);
           if (!isCompleteCharacterSnapshot(resolved, slugAtSendStart)) {
             throw new CharacterProfileUnavailableError(slugAtSendStart);
           }
@@ -207,12 +225,17 @@ export function buildDirectReplyPersistedMetadata(
 export function buildRetryableServerDispatchMetadata(
   deliveryError: string,
   fallbackError?: string,
+  options: { serverResultUncertain?: boolean } = {},
 ): Record<string, unknown> {
   return {
     pending: true,
     message_state: "queued",
     delivery_route: "server",
     retryable: true,
+    // POST started but its response was not confirmed. Keep this distinct
+    // from a never-attempted offline queue: local cancellation must not turn
+    // an unknown server execution into a new-message retry.
+    server_result_uncertain: options.serverResultUncertain ?? true,
     delivery_error: deliveryError,
     ...(fallbackError ? { fallback_error: fallbackError } : {}),
   };

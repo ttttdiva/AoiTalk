@@ -259,7 +259,7 @@ describe("PlatformAccountPanel", () => {
 
     rerender(<PlatformAccountPanel characterId="character-2" />);
     expect(screen.queryByText("X account")).not.toBeInTheDocument();
-    expect(screen.getByText("0件のCharacter接続")).toBeInTheDocument();
+    expect(screen.getByText("0件のPersona接続")).toBeInTheDocument();
   });
 
   it("ignores a credential action that completes after switching Characters", async () => {

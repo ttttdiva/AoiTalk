@@ -26,11 +26,22 @@ import {
   type VoiceSessionPhase,
 } from "./use-voice-session";
 import type { VoiceSessionMode } from "@/lib/voice-session-api";
+import {
+  usePipelineVoiceSession,
+  type PipelineAssistantMessage,
+  type PipelineSendResult,
+} from "./use-pipeline-voice-session";
 
 export type VoicePanelProps = UseVoiceSessionOptions & {
   disabled?: boolean;
   className?: string;
   title?: string;
+  assistantMessage?: PipelineAssistantMessage;
+  chatBusy?: boolean;
+  onSendTranscript?: (
+    text: string,
+  ) => PipelineSendResult | Promise<PipelineSendResult>;
+  onStopGeneration?: () => void;
 };
 
 function phaseLabel(phase: VoiceSessionPhase): string {
@@ -57,7 +68,7 @@ function modeLabel(mode: VoiceSessionMode): string {
     case "realtime_character_tts":
       return "Realtime + キャラクター音声";
     case "pipeline":
-      return "Pipeline";
+      return "Local Pipeline";
     case "realtime_native":
     default:
       return "Live Voice";
@@ -69,15 +80,32 @@ export function VoicePanel({
   disabled = false,
   className,
   title,
-  mode = "realtime_native",
+  mode = "pipeline",
+  assistantMessage = null,
+  chatBusy = false,
+  onSendTranscript,
+  onStopGeneration,
   ...options
 }: VoicePanelProps) {
   const [open, setOpen] = useState(false);
   // `mode` remains an initial/default value for callers.  The selector is
   // intentionally local so changing it cannot mutate a running session.
   const [selectedMode, setSelectedMode] = useState<VoiceSessionMode>(mode);
-  const { state, remoteAudioRef, start, stop, interrupt, toggleMute } =
-    useVoiceSession({ ...options, mode: selectedMode });
+  const realtimeSession = useVoiceSession({
+    ...options,
+    mode: selectedMode === "pipeline" ? "realtime_native" : selectedMode,
+  });
+  const pipelineSession = usePipelineVoiceSession({
+    ...options,
+    assistantMessage,
+    chatBusy,
+    onSendTranscript,
+    onStopGeneration,
+  });
+  const session = selectedMode === "pipeline" ? pipelineSession : realtimeSession;
+  const { state, remoteAudioRef, start, stop, interrupt, toggleMute } = session;
+  const canSubmitUtterance =
+    selectedMode === "pipeline" && pipelineSession.canSubmitUtterance;
   const active =
     state.phase === "requesting" ||
     state.phase === "connecting" ||
@@ -124,7 +152,9 @@ export function VoicePanel({
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold">{panelTitle}</div>
                 <div className="text-xs text-muted-foreground">
-                  {phaseLabel(state.phase)} · {state.provider ?? "openai_realtime"}
+                  {phaseLabel(state.phase)} ·{" "}
+                  {state.provider ??
+                    (selectedMode === "pipeline" ? "local_pipeline" : "openai_realtime")}
                 </div>
               </div>
             </div>
@@ -154,6 +184,9 @@ export function VoicePanel({
                 disabled={disabled || active}
                 className="h-9 w-full rounded-md border bg-background px-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
+                <option value="pipeline">
+                  Local Pipeline（Whisper → 通常LLM → キャラクター音声）
+                </option>
                 <option value="realtime_native">Realtime native（OpenAI音声）</option>
                 <option value="realtime_character_tts">
                   Realtime + Character Voice（キャラクター音声）
@@ -211,7 +244,9 @@ export function VoicePanel({
               </div>
             ) : (
               <div className="rounded-lg border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
-                マイクをオンにして話しかけると文字起こしが表示されます。
+                {selectedMode === "pipeline"
+                  ? "開始後に話しかけ、発話を送信すると通常の会話へ記録されます。"
+                  : "マイクをオンにして話しかけると文字起こしが表示されます。"}
               </div>
             )}
 
@@ -268,12 +303,16 @@ export function VoicePanel({
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={interrupt}
+                    onClick={() =>
+                      canSubmitUtterance
+                        ? void pipelineSession.submitUtterance()
+                        : interrupt()
+                    }
                     className="flex-1"
                     disabled={state.phase !== "connected"}
                   >
                     <Square className="mr-1.5 size-3.5" />
-                    中断
+                    {canSubmitUtterance ? "発話を送信" : "中断"}
                   </Button>
                   <Button
                     type="button"

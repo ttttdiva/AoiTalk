@@ -24,7 +24,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import backref, relationship
 
 from ...security.field_crypto import decrypt_text_if_needed
-from .base import Base, _encrypted_json_property
+from .base import Base
 
 
 class User(Base):
@@ -260,88 +260,6 @@ class ScopedMemoryPrincipal(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
-
-
-class _UserIntegrationCredentialMixin:
-    """Shared safe serialization for per-user integration credentials.
-
-    The payload property is application-encrypted by ``field_crypto``.  API
-    callers should only use :meth:`to_safe_dict`; it deliberately never
-    exposes the decrypted payload.
-    """
-
-    def to_safe_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "user_id": str(self.user_id),
-            "configured": bool(self._encrypted_payload),
-            "settings": self.settings_json or {},
-            "enabled": bool(self.enabled),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
-
-class UserHfCredential(_UserIntegrationCredentialMixin, Base):
-    """Per-user Hugging Face account references and encrypted credentials."""
-
-    __tablename__ = "user_hf_credentials"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        unique=True,
-        index=True,
-    )
-    # Store only the field-crypto ciphertext.  The decrypted object is exposed
-    # through ``payload`` for service code and is never serialized by default.
-    _encrypted_payload = Column("encrypted_payload", Text, nullable=True)
-    payload = _encrypted_json_property(
-        "_encrypted_payload", "user_hf_credentials.encrypted_payload"
-    )
-    settings_json = Column(JSON, nullable=False, default=dict, server_default="{}")
-    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
-
-    user = relationship("User", backref="hf_credentials")
-
-
-class UserHydrusCredential(_UserIntegrationCredentialMixin, Base):
-    """Per-user Hydrus Client connection settings and encrypted access key."""
-
-    __tablename__ = "user_hydrus_credentials"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        unique=True,
-        index=True,
-    )
-    _encrypted_payload = Column("encrypted_payload", Text, nullable=True)
-    payload = _encrypted_json_property(
-        "_encrypted_payload", "user_hydrus_credentials.encrypted_payload"
-    )
-    settings_json = Column(JSON, nullable=False, default=dict, server_default="{}")
-    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
-
-    user = relationship("User", backref="hydrus_credentials")
 
 
 class UserXCookieCredential(Base):

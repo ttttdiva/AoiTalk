@@ -1,19 +1,37 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { getDb, schema } from "../db/client";
+import { getDb, getEffectiveSqliteJournalMode, schema } from "../db/client";
+import {
+  isSqliteBusyError,
+  isSqliteDiagnosticsEnabled,
+  logSqliteErrorDiagnostic,
+} from "../db/sqlite-errors";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getToken, getTokenAuthScope } from "../lib/auth";
-import { getConfiguredApiServerFingerprint, isApiConnectionError, isApiHttpError } from "../lib/api-client";
+import { isMobileReadOnlyDiagnosticsEnabled } from "../lib/read-only-diagnostics";
+import { getConfiguredApiServerFingerprint, isApiConnectionError, isApiHttpError, isApiTimeoutError } from "../lib/api-client";
 import { requireCharacterSlug } from "../lib/character-api";
 import { chatApi, type ConversationMessagesResponse } from "../lib/chat-api";
+import { normalizeChatHistoryStatus } from "../lib/chat-session-view";
+import { conversationAgentApi } from "../lib/conversation-agent-api";
 import {
   canAttemptAoiTalkServer,
   isServerKnownUnreachable,
   useNetworkStore,
 } from "../stores/network";
-import type { ConversationMessage, ConversationSession } from "../types/api";
-import { pendingDispatchPayload } from "../features/conversation/pending-dispatch-payload";
+import type {
+  AgentRun,
+  ConversationAgent,
+  ConversationMessage,
+  ConversationSession,
+} from "../types/api";
+import {
+  pendingDispatchPayload,
+  replacePendingDispatchMessage,
+} from "../features/conversation/pending-dispatch-payload";
 import { conversationPerformanceDiagnostics } from "../features/conversation/performance-diagnostics";
-import { randomId } from "./outbox";
+import { hasManualConversationTitle } from "../features/conversation/title";
+import { enqueueOutbox, getOutboxMutationWakeScope, hasPendingOutbox, randomId } from "./outbox";
+import { notifyMutationQueued } from "../sync/task-mutation-wake";
 import { interruptConversationForSend } from "./conversation-interrupt";
 import {
   CONVERSATION_MESSAGE_UPSERT_CHUNK_SIZE,
@@ -24,8 +42,14 @@ type DbSession = typeof schema.conversationSessions.$inferSelect;
 type DbMessage = typeof schema.conversationMessages.$inferSelect;
 type ConversationDispatchPayload = Parameters<typeof chatApi.dispatchMessage>[1];
 type ConversationChangeListener = () => void;
+type ProvisionalReadFence = {
+  token: number;
+  completionAt: string | null;
+};
 
 const conversationChangeListeners = new Set<ConversationChangeListener>();
+const provisionalReadFences = new Map<string, ProvisionalReadFence>();
+let nextProvisionalReadToken = 0;
 
 export function subscribeToConversationChanges(
   listener: ConversationChangeListener,
@@ -89,38 +113,30 @@ export class CharacterUpdateNotAllowedError extends Error {
   }
 }
 
+export class AgentBindingConflictError extends Error {
+  readonly expectedAgentId: string | null;
+  readonly requestedAgentId: string | null;
+
+  constructor(
+    expectedAgentId: string | null,
+    requestedAgentId: string | null,
+    message = "サーバー側のAgent紐付けが変わりました。現在のAgentを確認してから再試行してください。",
+  ) {
+    super(message);
+    this.name = "AgentBindingConflictError";
+    this.expectedAgentId = expectedAgentId;
+    this.requestedAgentId = requestedAgentId;
+  }
+}
+
 /** キャラクター変更が通常セッションに限定される理由を副作用なしで判定する。 */
 export function getCharacterUpdateEligibility(
   session: ConversationSession,
 ): CharacterUpdateEligibility {
-  const characterName = session.character_name || "";
-  const title = session.title || "";
   if (session.is_group_chat) {
     return {
       allowed: false,
       reason: "グループチャットではキャラクターを変更できません。",
-    };
-  }
-  if (characterName.startsWith("trpg_room_") || title.startsWith("[TRPG]")) {
-    return {
-      allowed: false,
-      reason: "TRPG連携セッションではキャラクターを変更できません。",
-    };
-  }
-  if (/^scenario_roleplay:[^:]+:[^:]+$/.test(characterName)) {
-    return {
-      allowed: false,
-      reason: "シナリオRPセッションではキャラクターを変更できません。",
-    };
-  }
-  if (
-    characterName.startsWith("scenario_") ||
-    title.startsWith("[シナリオ]") ||
-    title.startsWith("[執筆]")
-  ) {
-    return {
-      allowed: false,
-      reason: "シナリオ執筆セッションではキャラクターを変更できません。",
     };
   }
   return { allowed: true };
@@ -166,6 +182,13 @@ function storedMessageMetadata(
   if (branchCount !== null) {
     metadata[BRANCH_COUNT_METADATA_KEY] = branchCount;
   }
+  // Sender projection is part of the ordinary message metadata in SQLite so
+  // old databases can retain it without a destructive schema migration.
+  for (const key of ["sender_type", "sender_id", "sender_display_name"] as const) {
+    const value = message[key];
+    if (typeof value === "string" && value.trim()) metadata[key] = value.trim();
+    else if (value === null) metadata[key] = null;
+  }
   return metadata;
 }
 
@@ -175,6 +198,32 @@ function branchCountProjectionMatches(
 ): boolean {
   const projected = normalizedBranchCount(message.branch_count);
   return projected === null || projected === stored;
+}
+
+function senderProjectionMetadata(message: ConversationMessage): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  for (const key of ["sender_type", "sender_id", "sender_display_name"] as const) {
+    const value = message[key];
+    if (typeof value === "string" && value.trim()) metadata[key] = value.trim();
+    else if (value === null) metadata[key] = null;
+  }
+  return metadata;
+}
+
+function senderProjectionMatches(row: DbMessage, message: ConversationMessage): boolean {
+  const incoming = senderProjectionMetadata(message);
+  const stored = publicMessageMetadata(row.messageMetadata);
+  return Object.entries(incoming).every(([key, value]) => stored[key] === value);
+}
+
+function senderProjectionsEqual(
+  left: ConversationMessage,
+  right: ConversationMessage,
+): boolean {
+  for (const key of ["sender_type", "sender_id", "sender_display_name"] as const) {
+    if (right[key] !== undefined && left[key] !== right[key]) return false;
+  }
+  return true;
 }
 
 function valuesEqual(left: unknown, right: unknown): boolean {
@@ -213,7 +262,8 @@ function remoteRevisionMatches(row: DbMessage, message: ConversationMessage): bo
     return (
       row.isActiveBranch === remoteActiveBranch(message) &&
       (row.branchIndex ?? 0) === (message.branch_index ?? 0) &&
-      branchCountProjectionMatches(storedBranchCount(row), message)
+      branchCountProjectionMatches(storedBranchCount(row), message) &&
+      senderProjectionMatches(row, message)
     );
   }
   return (
@@ -221,7 +271,10 @@ function remoteRevisionMatches(row: DbMessage, message: ConversationMessage): bo
     row.sessionId === message.session_id &&
     row.role === message.role &&
     row.content === message.content &&
-    valuesEqual(publicMessageMetadata(row.messageMetadata), message.metadata ?? {}) &&
+    valuesEqual(
+      publicMessageMetadata(row.messageMetadata),
+      { ...(message.metadata ?? {}), ...senderProjectionMetadata(message) },
+    ) &&
     row.tokenCount === (message.token_count ?? null) &&
     row.parentMessageId === (message.parent_message_id ?? null) &&
     (row.branchIndex ?? 0) === (message.branch_index ?? 0) &&
@@ -244,6 +297,7 @@ function conversationMessagesEqual(
     return (
       remoteActiveBranch(left) === remoteActiveBranch(right) &&
       (left.branch_index ?? 0) === (right.branch_index ?? 0) &&
+      senderProjectionsEqual(left, right) &&
       (rightBranchCount === null ||
         normalizedBranchCount(left.branch_count) === rightBranchCount)
     );
@@ -261,6 +315,7 @@ function conversationMessagesEqual(
       normalizedBranchCount(left.branch_count) ===
         normalizedBranchCount(right.branch_count)) &&
     remoteActiveBranch(left) === remoteActiveBranch(right) &&
+    senderProjectionsEqual(left, right) &&
     (left.created_at ?? null) === (right.created_at ?? null) &&
     (left.updated_at ?? null) === (right.updated_at ?? null)
   );
@@ -299,6 +354,7 @@ function toSession(row: DbSession): ConversationSession {
       : undefined;
   return {
     id: row.id,
+    ...(metadata.local_only === true ? { is_local_only: true } : {}),
     user_id: row.userId ?? "",
     character_name: row.characterName ?? "",
     title: row.title ?? "",
@@ -307,7 +363,30 @@ function toSession(row: DbSession): ConversationSession {
     last_activity: row.updatedAt ?? null,
     message_count: Number(metadata.message_count ?? 0),
     is_active: Boolean(metadata.is_active ?? true),
+    is_pinned: Boolean(row.isPinned),
+    pinned_at: row.pinnedAt ?? null,
+    pin_updated_at: row.pinUpdatedAt ?? null,
     is_group_chat: Boolean(row.isGroupChat),
+    agent_id: row.agentId ?? null,
+    agent_display_name:
+      typeof metadata.agent_display_name === "string"
+        ? metadata.agent_display_name
+        : null,
+    agent_state:
+      typeof metadata.agent_state === "string" ? metadata.agent_state : null,
+    latest_revision_id:
+      typeof metadata.latest_revision_id === "string"
+        ? metadata.latest_revision_id
+        : null,
+    agent_character_id:
+      typeof metadata.agent_character_id === "string"
+        ? metadata.agent_character_id
+        : null,
+    agent_binding_pending: isPendingAgentBindingMetadata(metadata),
+    agent_binding_error:
+      typeof metadata.agent_binding_error === "string"
+        ? metadata.agent_binding_error
+        : null,
     app_id: typeof metadata.app_id === "string" ? metadata.app_id : null,
     app_target_id:
       typeof metadata.app_target_id === "string"
@@ -319,10 +398,24 @@ function toSession(row: DbSession): ConversationSession {
       metadata.development_status === "completed"
         ? metadata.development_status
         : null,
+    history_status: normalizeChatHistoryStatus(metadata.history_status),
+    history_completed_at:
+      typeof metadata.history_completed_at === "string"
+        ? metadata.history_completed_at
+        : null,
     last_read_at:
       typeof metadata.last_read_at === "string" ? metadata.last_read_at : null,
     is_unread: metadata.is_unread === true,
     context,
+    private_agent_root: metadata.private_agent_root === true,
+    purpose: typeof metadata.purpose === "string" ? metadata.purpose : null,
+    readonly_binding: metadata.readonly_binding === true,
+    private_agent_root_metadata:
+      metadata.private_agent_root_metadata &&
+      typeof metadata.private_agent_root_metadata === "object" &&
+      !Array.isArray(metadata.private_agent_root_metadata)
+        ? (metadata.private_agent_root_metadata as Record<string, unknown>)
+        : null,
     parent_session_id:
       typeof metadata.parent_session_id === "string"
         ? metadata.parent_session_id
@@ -338,12 +431,13 @@ function toSession(row: DbSession): ConversationSession {
 }
 
 function toMessage(row: DbMessage): ConversationMessage {
+  const metadata = publicMessageMetadata(row.messageMetadata);
   return {
     id: row.id,
     session_id: row.sessionId,
     role: row.role as ConversationMessage["role"],
     content: row.content,
-    metadata: publicMessageMetadata(row.messageMetadata),
+    metadata,
     created_at: row.createdAt ?? null,
     updated_at: row.updatedAt ?? null,
     token_count: row.tokenCount ?? null,
@@ -351,6 +445,13 @@ function toMessage(row: DbMessage): ConversationMessage {
     parent_message_id: row.parentMessageId ?? null,
     branch_index: row.branchIndex ?? 0,
     is_active_branch: row.isActiveBranch ?? true,
+    sender_type:
+      typeof metadata.sender_type === "string" ? metadata.sender_type : null,
+    sender_id: typeof metadata.sender_id === "string" ? metadata.sender_id : null,
+    sender_display_name:
+      typeof metadata.sender_display_name === "string"
+        ? metadata.sender_display_name
+        : null,
   };
 }
 
@@ -365,12 +466,15 @@ function branchGroupKey(message: ConversationMessage): string {
 function buildLocalSession(
   characterName: string,
   projectId?: string | null,
+  userId?: string | null,
+  agent?: Pick<ConversationAgent, "id" | "display_name" | "state" | "latest_revision_id" | "character_id"> | null,
 ): ConversationSession {
   const characterSlug = requireCharacterSlug(characterName);
   const now = new Date().toISOString();
   return {
     id: randomId(),
-    user_id: "",
+    is_local_only: true,
+    user_id: String(userId ?? "").trim(),
     character_name: characterSlug,
     title: "ローカルチャット",
     project_id: projectId ?? null,
@@ -378,7 +482,15 @@ function buildLocalSession(
     last_activity: now,
     message_count: 0,
     is_active: true,
+    is_pinned: false,
+    pinned_at: null,
+    pin_updated_at: null,
     is_group_chat: false,
+    agent_id: agent?.id ?? null,
+    agent_display_name: agent?.display_name ?? null,
+    agent_state: agent?.state ?? null,
+    latest_revision_id: agent?.latest_revision_id ?? null,
+    agent_character_id: agent?.character_id ?? null,
   };
 }
 
@@ -394,6 +506,162 @@ async function canRefreshServer(): Promise<boolean> {
   // serverReachable は直近の失敗で stale になりやすいため、読み取り同期は
   // online + token があれば直接試し、成功したら到達可能状態へ戻す。
   return canAttemptServer();
+}
+
+function normalizeAgentCatalog(items: ConversationAgent[]): ConversationAgent[] {
+  return items.filter((item) => Boolean(item && item.id && item.display_name));
+}
+
+export type ConversationAgentCatalogScope = {
+  sessionId?: string | null;
+  projectId?: string | null;
+};
+
+function normalizedCatalogScope(scope: ConversationAgentCatalogScope = {}): {
+  sessionId: string | null;
+  projectId: string | null;
+  scopeKey: string;
+} {
+  const sessionId = typeof scope.sessionId === "string" && scope.sessionId.trim()
+    ? scope.sessionId.trim()
+    : null;
+  const projectId = typeof scope.projectId === "string" && scope.projectId.trim()
+    ? scope.projectId.trim()
+    : null;
+  // Keep the exact session/project ACL query identity. A project catalog must
+  // never be reused for another project, and a session-scoped response must
+  // never fall back to the project/global catalog.
+  const scopeKey = JSON.stringify({ session_id: sessionId, project_id: projectId });
+  return { sessionId, projectId, scopeKey };
+}
+
+/** Persist the ACL-filtered Agent catalog under the current account/server key. */
+export async function applyRemoteConversationAgents(
+  agents: ConversationAgent[],
+  authScope: string,
+  serverFingerprint: string,
+  scope: ConversationAgentCatalogScope = {},
+  options: { complete?: boolean } = {},
+): Promise<void> {
+  const normalized = normalizeAgentCatalog(agents);
+  if (!authScope || !serverFingerprint) return;
+  const catalogScope = normalizedCatalogScope(scope);
+  const db = getDb();
+  const cachedAt = new Date().toISOString();
+  await runForegroundSqliteWrite(async () => {
+    if (options.complete === true) {
+      await db.delete(schema.conversationAgents).where(and(
+        eq(schema.conversationAgents.authScope, authScope),
+        eq(schema.conversationAgents.serverFingerprint, serverFingerprint),
+        eq(schema.conversationAgents.scopeKey, catalogScope.scopeKey),
+      ));
+    }
+    if (!normalized.length) return;
+    for (const agent of normalized) {
+      await db
+        .insert(schema.conversationAgents)
+        .values({
+          authScope,
+          serverFingerprint,
+          scopeKey: catalogScope.scopeKey,
+          sessionId: catalogScope.sessionId,
+          projectId: catalogScope.projectId,
+          id: agent.id,
+          displayName: agent.display_name,
+          state: agent.state ?? null,
+          latestRevisionId: agent.latest_revision_id ?? null,
+          characterId: agent.character_id ?? null,
+          characterName: agent.character_name ?? null,
+          utilization: agent.utilization ?? null,
+          updatedAt: agent.updated_at ?? cachedAt,
+          cachedAt,
+        })
+        .onConflictDoUpdate({
+          target: [
+            schema.conversationAgents.authScope,
+            schema.conversationAgents.serverFingerprint,
+            schema.conversationAgents.scopeKey,
+            schema.conversationAgents.id,
+          ],
+          set: {
+            displayName: agent.display_name,
+            state: agent.state ?? null,
+            latestRevisionId: agent.latest_revision_id ?? null,
+            characterId: agent.character_id ?? null,
+            characterName: agent.character_name ?? null,
+            utilization: agent.utilization ?? null,
+            updatedAt: agent.updated_at ?? cachedAt,
+            cachedAt,
+          },
+        });
+    }
+  });
+}
+
+async function conversationAgentScope(): Promise<{
+  authScope: string;
+  serverFingerprint: string;
+} | null> {
+  const token = await getToken();
+  if (!token) return null;
+  const serverFingerprint = await getConfiguredApiServerFingerprint();
+  if (!serverFingerprint) return null;
+  return { authScope: getTokenAuthScope(token), serverFingerprint };
+}
+
+export async function listConversationAgentsLocal(
+  catalogRequestScope: ConversationAgentCatalogScope = {},
+): Promise<ConversationAgent[]> {
+  const authScope = await conversationAgentScope();
+  if (!authScope) return [];
+  const catalogScope = normalizedCatalogScope(catalogRequestScope);
+  const rows = await getDb()
+    .select()
+    .from(schema.conversationAgents)
+    .where(and(
+      eq(schema.conversationAgents.authScope, authScope.authScope),
+      eq(schema.conversationAgents.serverFingerprint, authScope.serverFingerprint),
+      eq(schema.conversationAgents.scopeKey, catalogScope.scopeKey),
+    ))
+    .orderBy(asc(schema.conversationAgents.displayName));
+  return rows.map((row) => ({
+    id: row.id,
+    display_name: row.displayName,
+    state: row.state ?? null,
+    latest_revision_id: row.latestRevisionId ?? null,
+    character_id: row.characterId ?? null,
+    character_name: row.characterName ?? null,
+    updated_at: row.updatedAt ?? null,
+    utilization:
+      row.utilization && typeof row.utilization === "object" && !Array.isArray(row.utilization)
+        ? row.utilization as ConversationAgent["utilization"]
+        : null,
+  }));
+}
+
+export async function refreshConversationAgents(
+  catalogRequestScope: ConversationAgentCatalogScope = {},
+): Promise<ConversationAgent[]> {
+  const scope = await conversationAgentScope();
+  if (!scope || !(await canAttemptServer())) return listConversationAgentsLocal(catalogRequestScope);
+  const listWithMeta = conversationAgentApi.listWithMeta;
+  const response = typeof listWithMeta === "function"
+    ? await listWithMeta(catalogRequestScope)
+    : { agents: await conversationAgentApi.list(catalogRequestScope), complete: true };
+  const agents = response.agents;
+  // Never write a response observed under a different auth/server scope.
+  const current = await conversationAgentScope();
+  if (!current || current.authScope !== scope.authScope || current.serverFingerprint !== scope.serverFingerprint) {
+    return listConversationAgentsLocal(catalogRequestScope);
+  }
+  await applyRemoteConversationAgents(
+    agents,
+    scope.authScope,
+    scope.serverFingerprint,
+    catalogRequestScope,
+    { complete: response.complete },
+  );
+  return agents;
 }
 
 async function updateSessionStats(
@@ -425,6 +693,22 @@ function isUserDeletedSession(row: DbSession | undefined): boolean {
   return (row?.sessionMetadata as Record<string, unknown> | null)?.user_deleted === true;
 }
 
+function timestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function newestTimestamp(...values: unknown[]): string | null {
+  let newest: { value: string; time: number } | null = null;
+  for (const value of values) {
+    const time = timestampMs(value);
+    if (time === null || typeof value !== "string") continue;
+    if (!newest || time > newest.time) newest = { value, time };
+  }
+  return newest?.value ?? null;
+}
+
 /** Filter after a remote response, without excluding sessions not cached on this device. */
 export async function excludeUserDeletedSessions<T>(
   items: readonly T[],
@@ -443,34 +727,51 @@ async function deleteConversationSessionOnce(sessionId: string): Promise<void> {
   if (uploadInFlight.has(sessionId) || pendingFlushFlights.has(sessionId)) {
     throw new Error("この会話は同期処理中です。完了後に削除を再試行してください。");
   }
-  const authScope = getTokenAuthScope(await getToken());
+  const token = await getToken();
+  const authScope = getTokenAuthScope(token);
   const row = await runForegroundSqliteWrite(() => getDb().select()
     .from(schema.conversationSessions).where(eq(schema.conversationSessions.id, sessionId)).get());
   if (isUserDeletedSession(row)) return;
-  // A server-only search hit has no local row. It still requires a confirmed server deletion.
-  if (!row || isServerBackedSession(row)) {
-    if (!(await canAttemptServer())) {
-      throw new Error("サーバー上の会話の削除にはログインとネットワーク接続が必要です。");
-    }
-    try {
-      await chatApi.deleteSession(sessionId);
-    } catch (error) {
-      if (isApiConnectionError(error)) {
-        useNetworkStore.getState().setServerReachable(false);
-      }
-      // A retry after HTTP success + SQLite failure may find the server row already gone.
-      if (!isApiHttpError(error) || error.status !== 404) throw error;
-    }
+  // Server-backed conversations are local-first too: hide them immediately and
+  // replay the durable delete through the normal sync outbox. The old path
+  // required a live DELETE response before touching SQLite, so one transient
+  // reachability failure made every item in a bulk delete fail at once.
+  const requiresServerDelete = !row || isServerBackedSession(row);
+  if (requiresServerDelete && !token) {
+    throw new Error("サーバー上の会話を削除するにはログインが必要です。");
   }
-  if (getTokenAuthScope(await getToken()) !== authScope) {
-    throw new Error("認証状態が変更されたため、削除結果を保存できません。");
-  }
+  let queuedDelete = false;
   await runForegroundSqliteWrite(() => {
     const db = getDb();
     const now = new Date().toISOString();
     db.transaction((tx) => {
       const current = tx.select().from(schema.conversationSessions)
         .where(eq(schema.conversationSessions.id, sessionId)).get();
+      if (isUserDeletedSession(current)) return;
+
+      if (requiresServerDelete) {
+        // Delete supersedes pending pin/update mutations for the same session.
+        // Keep the outbox replacement in the same SQLite transaction as the
+        // tombstone so a crash cannot leave only one side durable.
+        tx.delete(schema.outbox).where(and(
+          eq(schema.outbox.authScope, authScope),
+          eq(schema.outbox.tableName, "conversation_sessions"),
+          eq(schema.outbox.entityId, sessionId),
+        )).run();
+        tx.insert(schema.outbox).values({
+          opId: randomId(),
+          createdAt: Date.now(),
+          tableName: "conversation_sessions",
+          action: "delete",
+          entityId: sessionId,
+          payload: "{}",
+          authScope,
+          baseUpdatedAt: null,
+          retryCount: 0,
+          lastError: null,
+        }).run();
+        queuedDelete = true;
+      }
       const patch = {
         deletedAt: now,
         updatedAt: now,
@@ -493,6 +794,7 @@ async function deleteConversationSessionOnce(sessionId: string): Promise<void> {
     });
     notifyConversationChanges();
   });
+  if (queuedDelete) notifyMutationQueued(authScope);
 }
 
 export async function applyRemoteConversationSessions(
@@ -508,26 +810,178 @@ export async function applyRemoteConversationSessions(
       .where(eq(schema.conversationSessions.id, session.id));
     const existing = existingRows.find((row) => row.id === session.id);
     if (isUserDeletedSession(existing)) continue;
+    const existingMetadata =
+      (existing?.sessionMetadata as Record<string, unknown> | null) ?? {};
     const pendingSlug = pendingCharacterSlug(existing);
     const preservePendingCharacter =
       Boolean(pendingSlug) && session.character_name !== pendingSlug;
     const characterName = preservePendingCharacter
       ? pendingSlug!
       : session.character_name;
+    const pendingAgent = pendingAgentBinding(existing);
+    // Older deployments may omit the additive Agent field entirely. Preserve
+    // an already bound session in that case so a hidden/paused Agent is never
+    // silently detached while the catalog is unavailable.
+    const hasRemoteAgentField = Object.prototype.hasOwnProperty.call(
+      session,
+      "agent_id",
+    );
+    const remoteAgentId = hasRemoteAgentField
+      ? session.agent_id ?? null
+      : existing?.agentId ?? null;
+    const preservePendingAgent =
+      pendingAgent !== null &&
+      (!hasRemoteAgentField || remoteAgentId !== pendingAgent.targetAgentId);
+    const agentId = session.is_group_chat
+      ? null
+      : preservePendingAgent
+        ? pendingAgent.targetAgentId
+        : remoteAgentId;
+    const preservePendingPin = await hasPendingOutbox(
+      "conversation_sessions",
+      session.id,
+    );
+    const isPinned = preservePendingPin
+      ? Boolean(existing?.isPinned)
+      : session.is_pinned === true;
+    const pinnedAt = preservePendingPin
+      ? existing?.pinnedAt ?? null
+      : isPinned
+        ? session.pinned_at ?? null
+        : null;
+    const pinUpdatedAt = preservePendingPin
+      ? existing?.pinUpdatedAt ?? null
+      : session.pin_updated_at ?? null;
+    // A list pull can have started before the user opened a row. Compare the
+    // server-owned assistant completion fence rather than last_activity:
+    // user messages also advance last_activity and must not reopen a row.
+    const localLastReadAt =
+      typeof existingMetadata.last_read_at === "string"
+        ? existingMetadata.last_read_at
+        : null;
+    const remoteLastReadAt = session.last_read_at ?? null;
+    const provisionalReadFence = provisionalReadFences.get(session.id);
+    const localReadCompletionAt = newestTimestamp(
+      typeof existingMetadata.history_read_completion_at === "string"
+        ? existingMetadata.history_read_completion_at
+        : null,
+      provisionalReadFence?.completionAt ?? null,
+    );
+    const remoteCompletionAt =
+      typeof session.history_completed_at === "string"
+        ? session.history_completed_at
+        : null;
+    const existingCompletionAt =
+      typeof existingMetadata.history_completed_at === "string"
+        ? existingMetadata.history_completed_at
+        : null;
+    const remoteHistoryIsOlder = Boolean(
+      existingCompletionAt &&
+        (!remoteCompletionAt ||
+          (timestampMs(remoteCompletionAt) ?? -1) <
+            (timestampMs(existingCompletionAt) ?? -1)),
+    );
+    const effectiveCompletionAt = newestTimestamp(
+      existingCompletionAt,
+      remoteCompletionAt,
+    );
+    const localReadSupersedesRemote = Boolean(
+      localReadCompletionAt &&
+        remoteCompletionAt &&
+        (timestampMs(localReadCompletionAt) ?? -1) >=
+          (timestampMs(remoteCompletionAt) ?? Number.MAX_SAFE_INTEGER),
+    );
+    const lastReadAt = newestTimestamp(localLastReadAt, remoteLastReadAt);
+    const isUnread = remoteHistoryIsOlder
+      ? existingMetadata.is_unread === true
+      : localReadSupersedesRemote
+        ? false
+        : session.is_unread === true;
+    const hasRemoteHistoryStatus = Object.prototype.hasOwnProperty.call(
+      session,
+      "history_status",
+    );
+    const remoteHistoryStatus = remoteHistoryIsOlder
+      ? normalizeChatHistoryStatus(existingMetadata.history_status)
+      : hasRemoteHistoryStatus
+        ? normalizeChatHistoryStatus(session.history_status)
+        : normalizeChatHistoryStatus(existingMetadata.history_status);
+    const historyStatus =
+      remoteHistoryIsOlder
+        ? remoteHistoryStatus
+        : localReadSupersedesRemote && remoteHistoryStatus === "ready"
+          ? "idle"
+          : remoteHistoryStatus;
     const remoteMetadata = {
+      ...(session.is_local_only ? { local_only: true } : {}),
       message_count: session.message_count,
       is_active: session.is_active,
       app_id: session.app_id ?? null,
       app_target_id: session.app_target_id ?? null,
       development_status: session.development_status ?? null,
-      last_read_at: session.last_read_at ?? null,
-      is_unread: session.is_unread === true,
+      history_status: historyStatus,
+      history_completed_at: effectiveCompletionAt,
+      history_read_completion_at:
+        typeof existingMetadata.history_read_completion_at === "string"
+          ? existingMetadata.history_read_completion_at
+          : null,
+      last_read_at: lastReadAt,
+      is_unread: isUnread,
       context: session.context ?? null,
+      private_agent_root: session.private_agent_root === true,
+      purpose: session.purpose ?? null,
+      readonly_binding: session.readonly_binding === true,
+      private_agent_root_metadata: session.private_agent_root_metadata ?? null,
       parent_session_id: session.parent_session_id ?? null,
       forked_from_message_id: session.forked_from_message_id ?? null,
       group_character_names: session.group_character_names ?? [],
       participants: session.participants ?? [],
       rp_settings: session.rp_settings ?? {},
+      agent_display_name: session.is_group_chat
+        ? null
+        : preservePendingAgent
+          ? pendingAgent.displayName
+          : Object.prototype.hasOwnProperty.call(session, "agent_display_name")
+            ? session.agent_display_name ?? null
+            : typeof existingMetadata.agent_display_name === "string"
+              ? existingMetadata.agent_display_name
+              : null,
+      agent_state: session.is_group_chat
+        ? null
+        : Object.prototype.hasOwnProperty.call(session, "agent_state")
+          ? session.agent_state ?? null
+          : typeof existingMetadata.agent_state === "string"
+            ? existingMetadata.agent_state
+            : null,
+      latest_revision_id: session.is_group_chat
+        ? null
+        : Object.prototype.hasOwnProperty.call(session, "latest_revision_id")
+          ? session.latest_revision_id ?? null
+          : typeof existingMetadata.latest_revision_id === "string"
+            ? existingMetadata.latest_revision_id
+            : null,
+      agent_character_id: session.is_group_chat
+        ? null
+        : Object.prototype.hasOwnProperty.call(session, "agent_character_id")
+          ? session.agent_character_id ?? null
+          : typeof existingMetadata.agent_character_id === "string"
+            ? existingMetadata.agent_character_id
+            : null,
+      ...(!session.is_group_chat && (preservePendingAgent || session.agent_binding_pending)
+        ? { agent_binding_pending: true }
+        : {}),
+      ...(preservePendingAgent && !session.is_group_chat
+        ? {
+            [PENDING_AGENT_BINDING_KEY]: {
+              target_agent_id: pendingAgent.targetAgentId,
+              expected_agent_id: pendingAgent.expectedAgentId,
+              display_name: pendingAgent.displayName,
+              auth_scope: pendingAgent.authScope,
+              server_fingerprint: pendingAgent.serverFingerprint,
+              ...(pendingAgent.error ? { error: pendingAgent.error } : {}),
+            },
+          }
+        : {}),
       ...(preservePendingCharacter
         ? { [PENDING_CHARACTER_SLUG_KEY]: pendingSlug }
         : {}),
@@ -541,6 +995,10 @@ export async function applyRemoteConversationSessions(
         projectId: session.project_id ?? null,
         title: session.title ?? "",
         isGroupChat: session.is_group_chat ?? false,
+        agentId,
+        isPinned,
+        pinnedAt,
+        pinUpdatedAt,
         sessionMetadata: remoteMetadata,
         createdAt: session.session_start ?? now,
         updatedAt: session.last_activity ?? now,
@@ -556,6 +1014,10 @@ export async function applyRemoteConversationSessions(
           projectId: session.project_id ?? null,
           title: session.title ?? "",
           isGroupChat: session.is_group_chat ?? false,
+          agentId,
+          isPinned,
+          pinnedAt,
+          pinUpdatedAt,
           updatedAt: session.last_activity ?? now,
           deletedAt: null,
           sessionMetadata: remoteMetadata,
@@ -616,10 +1078,245 @@ async function hasLocalOnlyMessages(sessionId: string): Promise<boolean> {
 }
 
 function isServerBackedSession(session: DbSession | undefined): boolean {
-  return Boolean(session?.userId);
+  const metadata = (session?.sessionMetadata as Record<string, unknown> | null) ?? {};
+  return Boolean(session?.userId) && metadata.local_only !== true;
 }
 
 const PENDING_CHARACTER_SLUG_KEY = "pending_character_slug";
+const PENDING_AGENT_BINDING_KEY = "pending_agent_binding";
+
+type PendingAgentBinding = {
+  targetAgentId: string | null;
+  expectedAgentId: string | null;
+  displayName: string | null;
+  authScope: string;
+  serverFingerprint: string;
+  error?: string | null;
+};
+
+function pendingAgentBinding(
+  session: DbSession | undefined,
+): PendingAgentBinding | null {
+  const metadata =
+    (session?.sessionMetadata as Record<string, unknown> | null) ?? {};
+  const raw = metadata[PENDING_AGENT_BINDING_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  const targetAgentId =
+    typeof value.target_agent_id === "string" && value.target_agent_id.trim()
+      ? value.target_agent_id.trim()
+      : null;
+  const expectedAgentId =
+    typeof value.expected_agent_id === "string" && value.expected_agent_id.trim()
+      ? value.expected_agent_id.trim()
+      : null;
+  const authScope = typeof value.auth_scope === "string" ? value.auth_scope : "";
+  const serverFingerprint =
+    typeof value.server_fingerprint === "string" ? value.server_fingerprint : "";
+  if (!authScope || !serverFingerprint) return null;
+  return {
+    targetAgentId,
+    expectedAgentId,
+    displayName:
+      typeof value.display_name === "string" ? value.display_name : null,
+    authScope,
+    serverFingerprint,
+    ...(typeof value.error === "string" ? { error: value.error } : {}),
+  };
+}
+
+function isPendingAgentBindingMetadata(
+  metadata: Record<string, unknown>,
+): boolean {
+  const value = metadata[PENDING_AGENT_BINDING_KEY];
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function withPendingAgentBinding(
+  metadata: Record<string, unknown>,
+  binding: PendingAgentBinding | null,
+): Record<string, unknown> {
+  const next = { ...metadata };
+  if (binding) {
+    next[PENDING_AGENT_BINDING_KEY] = {
+      target_agent_id: binding.targetAgentId,
+      expected_agent_id: binding.expectedAgentId,
+      display_name: binding.displayName,
+      auth_scope: binding.authScope,
+      server_fingerprint: binding.serverFingerprint,
+      ...(binding.error ? { error: binding.error } : {}),
+    };
+  }
+  else delete next[PENDING_AGENT_BINDING_KEY];
+  return next;
+}
+
+function normalizedAgentId(value: string | null | undefined): string | null {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized || null;
+}
+
+function agentBindingConflictFrom(error: unknown): AgentBindingConflictError | null {
+  if (!isApiHttpError(error) || error.status !== 409) return null;
+  return new AgentBindingConflictError(null, null);
+}
+
+async function queuePendingAgentBinding(
+  row: DbSession,
+  targetAgentId: string | null,
+  expectedAgentId: string | null,
+  agent: ConversationAgent | null,
+  scope: { authScope: string; serverFingerprint: string },
+  error?: string | null,
+): Promise<ConversationSession> {
+  const now = new Date().toISOString();
+  const existingMetadata =
+    (row.sessionMetadata as Record<string, unknown> | null) ?? {};
+  const metadata = withPendingAgentBinding(existingMetadata, {
+    targetAgentId,
+    expectedAgentId,
+    displayName: agent?.display_name ?? null,
+    authScope: scope.authScope,
+    serverFingerprint: scope.serverFingerprint,
+    ...(error ? { error } : {}),
+  });
+  await runForegroundSqliteWrite(() => getDb()
+    .update(schema.conversationSessions)
+    .set({
+      agentId: targetAgentId,
+      sessionMetadata: metadata,
+      updatedAt: now,
+    })
+    .where(eq(schema.conversationSessions.id, row.id)));
+  notifyConversationChanges();
+  return toSession({
+    ...row,
+    agentId: targetAgentId,
+    sessionMetadata: metadata,
+    updatedAt: now,
+  });
+}
+
+async function preservePendingAgentBindingError(
+  sessionId: string,
+  pending: PendingAgentBinding,
+  errorMessage: string,
+): Promise<void> {
+  const row = getDb().select().from(schema.conversationSessions)
+    .where(eq(schema.conversationSessions.id, sessionId)).get();
+  if (!row) return;
+  const metadata = withPendingAgentBinding(
+    (row.sessionMetadata as Record<string, unknown> | null) ?? {},
+    { ...pending, error: errorMessage },
+  );
+  await runForegroundSqliteWrite(() => getDb()
+    .update(schema.conversationSessions)
+    .set({ agentId: pending.targetAgentId, sessionMetadata: metadata })
+    .where(eq(schema.conversationSessions.id, sessionId)));
+  notifyConversationChanges();
+}
+
+/** Refresh the canonical binding for display while retaining a pending local
+ * desired target. A 409 must never silently retarget queued payloads. */
+async function refreshCanonicalAgentSessionAfterConflict(
+  row: DbSession,
+  pending: PendingAgentBinding | null,
+  reason: string,
+): Promise<ConversationSession | null> {
+  try {
+    const remote = await chatApi.resumeSession(row.id, { includeMessages: false });
+    if (!Object.prototype.hasOwnProperty.call(remote.session, "agent_id")) {
+      if (pending) await preservePendingAgentBindingError(row.id, pending, reason);
+      return null;
+    }
+    await applyForegroundConversationSessions([remote.session]);
+    if (pending) await preservePendingAgentBindingError(row.id, pending, reason);
+    return remote.session;
+  } catch {
+    if (pending) await preservePendingAgentBindingError(row.id, pending, reason);
+    return null;
+  }
+}
+
+async function adoptCanonicalAgentBinding(
+  sessionId: string,
+): Promise<ConversationSession> {
+  const remote = await chatApi.resumeSession(sessionId, { includeMessages: false });
+  if (!Object.prototype.hasOwnProperty.call(remote.session, "agent_id")) {
+    throw new Error("ServerのAgent bindingを取得できませんでした。接続先を確認して再試行してください。");
+  }
+  await applyForegroundConversationSessions([remote.session]);
+  const row = getDb().select().from(schema.conversationSessions)
+    .where(eq(schema.conversationSessions.id, sessionId)).get();
+  if (!row) return remote.session;
+  const metadata = withPendingAgentBinding(
+    (row.sessionMetadata as Record<string, unknown> | null) ?? {},
+    null,
+  );
+  delete metadata.agent_binding_pending;
+  delete metadata.agent_binding_error;
+  const updatedAt = new Date().toISOString();
+  await runForegroundSqliteWrite(() => getDb()
+    .update(schema.conversationSessions)
+    .set({
+      agentId: remote.session.agent_id ?? null,
+      sessionMetadata: metadata,
+      updatedAt,
+    })
+    .where(eq(schema.conversationSessions.id, sessionId)));
+  notifyConversationChanges();
+  return toSession({ ...row, agentId: remote.session.agent_id ?? null, sessionMetadata: metadata, updatedAt });
+}
+
+async function flushPendingAgentBinding(row: DbSession): Promise<ConversationSession | null> {
+  const pending = pendingAgentBinding(row);
+  if (!pending || !isServerBackedSession(row)) return null;
+  const token = await getToken();
+  const currentScope = {
+    authScope: getTokenAuthScope(token),
+    serverFingerprint: await getConfiguredApiServerFingerprint(),
+  };
+  if (
+    currentScope.authScope !== pending.authScope ||
+    currentScope.serverFingerprint !== pending.serverFingerprint
+  ) {
+    throw new Error("Agent変更を受け付けたアカウントまたは接続先と一致しません。元の接続先で再試行してください。");
+  }
+  if (!(await canAttemptServer())) return null;
+  try {
+    const updated = await conversationAgentApi.bindSession(
+      row.id,
+      pending.targetAgentId,
+      pending.expectedAgentId,
+    );
+    if (normalizedAgentId(updated.agent_id) !== pending.targetAgentId) {
+      throw new AgentBindingConflictError(
+        pending.expectedAgentId,
+        pending.targetAgentId,
+        "ServerのAgent bindingを確認できませんでした。送信を保留しています。",
+      );
+    }
+    await applyForegroundConversationSessions([updated]);
+    return updated;
+  } catch (error) {
+    const conflict = agentBindingConflictFrom(error);
+    if (conflict) {
+      await refreshCanonicalAgentSessionAfterConflict(
+        row,
+        pending,
+        "Server側のAgent bindingが変わりました。保留中の変更と未送信メッセージを確認してください。",
+      );
+      throw new AgentBindingConflictError(
+        pending.expectedAgentId,
+        pending.targetAgentId,
+      );
+    }
+    if (isApiConnectionError(error)) {
+      useNetworkStore.getState().setServerReachable(false);
+    }
+    throw error;
+  }
+}
 
 function pendingCharacterSlug(session: DbSession | undefined): string | null {
   const metadata =
@@ -692,6 +1389,10 @@ const pendingMessageDispatchFlights = new Map<
   string,
   Promise<Awaited<ReturnType<typeof chatApi.dispatchMessage>> | null>
 >();
+const pendingMessageEditFlights = new Map<
+  string,
+  Promise<ConversationMessage>
+>();
 
 async function dispatchPendingConversationMessageOnce(
   sessionId: string,
@@ -700,10 +1401,44 @@ async function dispatchPendingConversationMessageOnce(
   checkRemoteDuplicate: boolean,
   onHandoff?: () => void,
 ): Promise<Awaited<ReturnType<typeof chatApi.dispatchMessage>> | null> {
+  const key = `${sessionId}:${message.id}`;
+  const editFlight = pendingMessageEditFlights.get(key);
+  if (editFlight) await editFlight;
   const current = (
     await conversationsRepo.listMessagesLocal(sessionId)
   ).find((candidate) => candidate.id === message.id);
   if (!current || !Boolean(current.metadata?.pending) || current.metadata?.delivery_route === "direct" || current.metadata?.direct_cloud) return null;
+
+  // A queued input carries the exact Agent binding observed at enqueue time.
+  // If the local session is still unpromoted or has a pending CAS binding,
+  // leave the input queued so reconnect can settle the binding first.
+  const sessionQuery = getDb().select().from(schema.conversationSessions)
+    .where(eq(schema.conversationSessions.id, sessionId)) as unknown as {
+      get?: () => DbSession | undefined;
+    };
+  const sessionRow = sessionQuery.get?.();
+  // A few legacy test/adaptor shims do not expose the additive column yet;
+  // their session rows must retain the pre-Agent dispatch behavior. Real
+  // migrated rows always expose `agentId` (nullable) on the selected record.
+  const hasAgentColumn = Boolean(
+    sessionRow && (
+      Object.prototype.hasOwnProperty.call(sessionRow, "agentId") ||
+      Object.prototype.hasOwnProperty.call(schema.conversationSessions, "agentId")
+    ),
+  );
+  if (sessionRow && hasAgentColumn) {
+    const pendingAgent = pendingAgentBinding(sessionRow);
+    if (!isServerBackedSession(sessionRow) || pendingAgent) {
+      throw new Error("Agentの紐付けをServerへ同期してから送信します。入力は未送信キューに保持されています。");
+    }
+    const expectedAgentId = normalizedAgentId(payload.expected_agent_id);
+    if (normalizedAgentId(sessionRow.agentId) !== expectedAgentId) {
+      throw new AgentBindingConflictError(
+        expectedAgentId,
+        normalizedAgentId(sessionRow.agentId),
+      );
+    }
+  }
 
   const expectedScope = current.metadata?.dispatch_auth_scope;
   const expectedServer = current.metadata?.dispatch_server_fingerprint;
@@ -736,8 +1471,16 @@ async function dispatchPendingConversationMessageOnce(
     await runForegroundSqliteWrite(() => applyRemoteConversationMessages(stoppedMessages));
   }
   onHandoff?.();
+  const currentPayload = pendingDispatchPayload(current, {
+    projectId: payload.project_id,
+    contextProjectHintId: payload.context_project_hint_id,
+    appId: payload.app_id,
+    appTargetId: payload.app_target_id,
+    includeProjectContext: payload.include_project_context,
+    agentMode: payload.agent_mode,
+  });
   const result = await chatApi.dispatchMessage(sessionId, {
-    ...payload,
+    ...currentPayload,
     client_message_id: message.id,
   });
   await conversationsRepo.markPendingMessageQueued(
@@ -808,10 +1551,35 @@ async function promoteLocalSession(
   session: DbSession,
 ): Promise<ConversationSession> {
   const db = getDb();
+  const pending = pendingAgentBinding(session);
+  if (pending) {
+    const token = await getToken();
+    const currentScope = {
+      authScope: getTokenAuthScope(token),
+      serverFingerprint: await getConfiguredApiServerFingerprint(),
+    };
+    if (
+      currentScope.authScope !== pending.authScope ||
+      currentScope.serverFingerprint !== pending.serverFingerprint
+    ) {
+      throw new Error("Agent変更を受け付けたアカウントまたは接続先と一致しません。元の接続先で再試行してください。");
+    }
+  }
   const remote = await chatApi.createSession(
     requireCharacterSlug(session.characterName),
     session.projectId ?? undefined,
+    {
+      clientSessionId: session.id,
+      ...(session.agentId ? { agentId: session.agentId } : {}),
+    },
   );
+  if (normalizedAgentId(remote.agent_id) !== normalizedAgentId(session.agentId)) {
+    throw new AgentBindingConflictError(
+      normalizedAgentId(session.agentId),
+      normalizedAgentId(session.agentId),
+      "Serverが指定したAgent bindingを確認できませんでした。送信を保留しています。",
+    );
+  }
 
   // appendLocalMessage() has already released its foreground slot before
   // promotion starts. Promotion therefore takes a separate foreground slot
@@ -924,7 +1692,10 @@ const uploadInFlight = new Set<string>();
  * サーバー側の既存メッセージ数の続き（createdAt 昇順で決定的）から投入を
  * 再開してオーファンセッションの増殖と重複投入を防ぐ。
  */
-export async function uploadLocalSession(sessionId: string): Promise<string> {
+export async function uploadLocalSession(
+  sessionId: string,
+  options?: { deferPendingDispatch?: boolean },
+): Promise<string> {
   if (sessionDeleteFlights.has(sessionId)) {
     throw new Error("このセッションは削除処理中です。");
   }
@@ -933,13 +1704,16 @@ export async function uploadLocalSession(sessionId: string): Promise<string> {
   }
   uploadInFlight.add(sessionId);
   try {
-    return await uploadLocalSessionOnce(sessionId);
+    return await uploadLocalSessionOnce(sessionId, options);
   } finally {
     uploadInFlight.delete(sessionId);
   }
 }
 
-async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
+async function uploadLocalSessionOnce(
+  sessionId: string,
+  options?: { deferPendingDispatch?: boolean },
+): Promise<string> {
   if (!(await canAttemptServer())) {
     throw new Error(
       "サーバー同期にはログインとネットワーク接続が必要です。",
@@ -956,13 +1730,37 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
   if (!row || row.deletedAt) {
     throw new Error("同期対象のセッションが見つかりません。");
   }
+  const pendingAgent = pendingAgentBinding(row);
+  if (pendingAgent) {
+    const currentScope = {
+      authScope: getTokenAuthScope(await getToken()),
+      serverFingerprint: await getConfiguredApiServerFingerprint(),
+    };
+    if (
+      currentScope.authScope !== pendingAgent.authScope ||
+      currentScope.serverFingerprint !== pendingAgent.serverFingerprint
+    ) {
+      throw new Error("Agent変更を受け付けたアカウントまたは接続先と一致しません。元の接続先で再試行してください。");
+    }
+  }
   if (isServerBackedSession(row)) {
     // 既にサーバー化済み。既存動作を変えないため、そのまま id を返す。
+    if (pendingAgent) await flushPendingAgentBinding(row);
     return sessionId;
   }
 
   const localMessages = await conversationsRepo.listMessagesLocal(row.id);
-  const uploadRows = orderLocalMessageRowsForUpload(localMessages);
+  // A fork continued via Server must import its copied history before the
+  // next input dispatch. Importing that pending input too would make duplicate
+  // detection mark it accepted without ever starting an assistant response.
+  const importMessages = options?.deferPendingDispatch
+    ? localMessages.filter((message) => !message.metadata?.pending)
+    : localMessages;
+  if (localMessages.some((message) => Boolean(message.metadata?.fork_source_message_id))
+    && importMessages.some((message) => message.role === "system" || Boolean(pendingDispatchPayload(message).attachments?.length))) {
+    throw new Error("このフォークには現在サーバー同期できないシステムメッセージまたは添付があります。履歴を省略せず端末内に保持しています。");
+  }
+  const uploadRows = orderLocalMessageRowsForUpload(importMessages);
   const uploads = uploadRows.map(({ role, content }) => ({ role, content }));
 
   const metadata = (row.sessionMetadata as Record<string, unknown> | null) ?? {};
@@ -994,7 +1792,18 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
     const remote = await chatApi.createSession(
       requireCharacterSlug(row.characterName),
       row.projectId ?? undefined,
+      {
+        clientSessionId: row.id,
+        ...(row.agentId ? { agentId: row.agentId } : {}),
+      },
     );
+    if (normalizedAgentId(remote.agent_id) !== normalizedAgentId(row.agentId)) {
+      throw new AgentBindingConflictError(
+        normalizedAgentId(row.agentId),
+        normalizedAgentId(row.agentId),
+        "Serverが指定したAgent bindingを確認できませんでした。同期を保留しています。",
+      );
+    }
     remoteId = remote.id;
     // 付替え・tombstone 前の中間状態マーカーを保存（再開の起点）。
     await runForegroundSqliteWrite(async () => {
@@ -1030,6 +1839,13 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
         client_message_id: clientMessageId,
       });
     }
+  }
+
+  // Keep an edited/fork title through explicit upload and later promotion.
+  // A failed title write leaves the existing resumable upload marker intact.
+  if (row.title?.trim()) {
+    await chatApi.updateTitle(remoteId, row.title.trim());
+    await conversationsRepo.updateTitle(remoteId, row.title.trim(), { syncServer: false });
   }
 
   await runForegroundSqliteWrite(async () => {
@@ -1074,6 +1890,9 @@ async function flushPendingConversationOnce(
     return typeof promotedTo === "string" ? promotedTo : sessionId;
   }
 
+  // Agent binding is a dedicated CAS operation.  It must settle before any
+  // queued dispatch is sent, and never goes through general sync UUID writes.
+  await flushPendingAgentBinding(row);
   await flushPendingCharacterUpdate(row);
 
   const pendingBeforePromotion = await listPendingMessagesForSessionId(row.id);
@@ -1082,15 +1901,24 @@ async function flushPendingConversationOnce(
   let remoteSessionId = row.id;
   let projectId = row.projectId ?? undefined;
   if (!isServerBackedSession(row)) {
-    const promoted = await promoteLocalSession(row);
-    remoteSessionId = promoted.id;
-    projectId = promoted.project_id ?? row.projectId ?? undefined;
+    const localHistory = await conversationsRepo.listMessagesLocal(row.id);
+    const hasForkHistory = localHistory.some((message) => Boolean(message.metadata?.fork_source_message_id));
+    if (hasForkHistory) {
+      // A local fork is already a transcript. The ordinary empty-session
+      // promotion path would lose that transcript on the server.
+      remoteSessionId = await uploadLocalSession(row.id, { deferPendingDispatch: true });
+    } else {
+      const promoted = await promoteLocalSession(row);
+      remoteSessionId = promoted.id;
+      projectId = promoted.project_id ?? row.projectId ?? undefined;
+    }
   }
 
   const pending = await listPendingMessagesForSessionId(remoteSessionId);
   for (const message of pending) {
     const dispatchPayload = pendingDispatchPayload(message, {
       projectId,
+      contextProjectHintId: message.metadata?.context_project_hint_id as string | null | undefined,
       includeProjectContext: Boolean(projectId),
       agentMode: "confirm",
     });
@@ -1106,6 +1934,7 @@ async function flushPendingConversationOnce(
 }
 
 export function flushPendingConversation(sessionId: string): Promise<string> {
+  if (isMobileReadOnlyDiagnosticsEnabled()) return Promise.resolve(sessionId);
   if (sessionDeleteFlights.has(sessionId)) return Promise.resolve(sessionId);
   const existing = pendingFlushFlights.get(sessionId);
   if (existing) return existing;
@@ -1129,11 +1958,13 @@ export async function getPromotedConversationSessionId(
       .where(eq(schema.conversationSessions.id, sessionId))
   )[0];
   const metadata = row?.metadata as Record<string, unknown> | null | undefined;
+  if (metadata?.user_deleted === true) return null;
   const promotedTo = metadata?.promoted_to_session_id;
   return typeof promotedTo === "string" ? promotedTo : null;
 }
 
 export async function flushPendingConversations(): Promise<void> {
+  if (isMobileReadOnlyDiagnosticsEnabled()) return;
   if (!(await canAttemptServer())) return;
 
   const db = getDb();
@@ -1168,7 +1999,7 @@ export async function reconcileConversationSessionsWithServer(
   let changed = false;
   for (const row of rows) {
     if (remoteIds.has(row.id)) continue;
-    if (!row.userId) continue;
+    if (!isServerBackedSession(row)) continue;
     if (await hasLocalOnlyMessages(row.id)) continue;
     await db
       .update(schema.conversationSessions)
@@ -1701,6 +2532,48 @@ async function fetchConversationMessageDelta(
 }
 
 export const conversationsRepo = {
+  async listAgents(options?: {
+    forceRefresh?: boolean;
+    sessionId?: string | null;
+    projectId?: string | null;
+  }): Promise<ConversationAgent[]> {
+    const catalogScope = {
+      sessionId: options?.sessionId ?? null,
+      projectId: options?.projectId ?? null,
+    };
+    const local = await listConversationAgentsLocal(catalogScope);
+    if (!options?.forceRefresh && local.length > 0) return local;
+    if (!(await canAttemptServer())) return local;
+    try {
+      const refreshed = await refreshConversationAgents(catalogScope);
+      useNetworkStore.getState().setServerReachable(true);
+      // A successful empty projection is authoritative for this exact ACL
+      // scope. The repository clears it in applyRemoteConversationAgents;
+      // never resurrect a paused/revoked candidate from an older cache.
+      return refreshed;
+    } catch (error) {
+      if (isApiConnectionError(error) || isApiTimeoutError(error)) {
+        useNetworkStore.getState().setServerReachable(false);
+        return local;
+      }
+      // HTTP/ACL responses are authoritative failures for this scope. Keep
+      // bound session display metadata, but do not offer stale candidates.
+      return [];
+    }
+  },
+
+  async listAgentsLocal(options?: ConversationAgentCatalogScope): Promise<ConversationAgent[]> {
+    return listConversationAgentsLocal(options);
+  },
+
+  async listAgentConversations(agentId: string): Promise<ConversationSession[]> {
+    return conversationAgentApi.listConversations(agentId);
+  },
+
+  async listAgentRuns(agentId: string): Promise<AgentRun[]> {
+    return conversationAgentApi.listRuns(agentId);
+  },
+
   async listSessionsLocal(
     projectId?: string | null,
   ): Promise<ConversationSession[]> {
@@ -1716,7 +2589,11 @@ export const conversationsRepo = {
           isNull(schema.conversationSessions.deletedAt),
         ),
       )
-      .orderBy(desc(schema.conversationSessions.updatedAt));
+      .orderBy(
+        desc(schema.conversationSessions.isPinned),
+        desc(schema.conversationSessions.updatedAt),
+        desc(schema.conversationSessions.createdAt),
+      );
     return rows.map(toSession);
   },
 
@@ -1750,31 +2627,177 @@ export const conversationsRepo = {
   ): Promise<ConversationSession[]> {
     const sessions = await chatApi.listSessions(projectId ?? undefined);
     await applyForegroundConversationSessions(sessions);
-    return excludeUserDeletedSessions(sessions, (session) => session.id);
+    await excludeUserDeletedSessions(sessions, (session) => session.id);
+    return this.listSessionsLocal(projectId);
+  },
+
+  async setSessionPinned(
+    sessionId: string,
+    isPinned: boolean,
+  ): Promise<ConversationSession> {
+    const token = await getToken();
+    if (!token) {
+      throw new Error("ピン留めを同期するにはログインが必要です");
+    }
+    const authScope = getTokenAuthScope(token);
+    let queuedPinScope: string | null = null;
+    const result = await runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const before = (
+        await db
+          .select()
+          .from(schema.conversationSessions)
+          .where(
+            and(
+              eq(schema.conversationSessions.id, sessionId),
+              isNull(schema.conversationSessions.deletedAt),
+            ),
+          )
+      )[0];
+      if (!before) throw new Error("会話が見つかりません");
+      if (!isServerBackedSession(before)) {
+        throw new Error("ローカル専用チャットはサーバー同期後にピン留めできます");
+      }
+      if (Boolean(before.isPinned) === isPinned) return toSession(before);
+
+      const basePinUpdatedAt = before.pinUpdatedAt ?? null;
+      const changedAt = new Date().toISOString();
+      await db
+        .update(schema.conversationSessions)
+        .set({
+          isPinned,
+          pinnedAt: isPinned ? changedAt : null,
+          pinUpdatedAt: changedAt,
+        })
+        .where(eq(schema.conversationSessions.id, sessionId));
+      const opId = await enqueueOutbox({
+        table: "conversation_sessions",
+        action: "update",
+        entityId: sessionId,
+        authScope,
+        payload: { is_pinned: isPinned },
+        baseUpdatedAt: basePinUpdatedAt,
+      });
+      queuedPinScope = await getOutboxMutationWakeScope(opId);
+      const after = (
+        await db
+          .select()
+          .from(schema.conversationSessions)
+          .where(eq(schema.conversationSessions.id, sessionId))
+      )[0];
+      if (!after) throw new Error("ピン状態を保存できませんでした");
+      notifyConversationChanges();
+      return toSession(after);
+    });
+    if (queuedPinScope) notifyMutationQueued(queuedPinScope);
+    return result;
   },
 
   async markSessionRead(sessionId: string): Promise<void> {
     const readAt = new Date().toISOString();
-    const applyReadAt = (timestamp: string) => runForegroundSqliteWrite(async () => {
+    const provisionalToken = ++nextProvisionalReadToken;
+    provisionalReadFences.set(sessionId, {
+      token: provisionalToken,
+      completionAt: null,
+    });
+    let readCompletionFenceCaptured = false;
+    let readCompletionFenceAt: string | null = null;
+    const applyReadAt = (
+      timestamp: string,
+      options: { commitCompletionFence?: boolean } = {},
+    ) => runForegroundSqliteWrite(async () => {
       const db = getDb();
       const rows = await db.select().from(schema.conversationSessions)
         .where(eq(schema.conversationSessions.id, sessionId));
       if (!rows[0]) return;
       const metadata = (rows[0].sessionMetadata as Record<string, unknown> | null) ?? {};
+      const monotonicReadAt = newestTimestamp(metadata.last_read_at, timestamp) ?? timestamp;
+      const currentCompletionAt =
+        typeof metadata.history_completed_at === "string"
+          ? metadata.history_completed_at
+          : null;
+      const observedCompletionAt = currentCompletionAt
+        ?? (typeof metadata.history_read_completion_at === "string"
+          ? metadata.history_read_completion_at
+          : null);
+      if (!readCompletionFenceCaptured) {
+        readCompletionFenceCaptured = true;
+        readCompletionFenceAt = observedCompletionAt;
+        const provisional = provisionalReadFences.get(sessionId);
+        if (provisional?.token === provisionalToken) {
+          provisional.completionAt = observedCompletionAt;
+        }
+      }
+      // The HTTP read response may be slower than a pull that observes a new
+      // assistant completion. In that case the response only acknowledges the
+      // earlier read and must not clear the newer ready projection.
+      const completionAdvancedSinceRead = Boolean(
+        readCompletionFenceCaptured &&
+          currentCompletionAt &&
+          (readCompletionFenceAt === null ||
+            (timestampMs(currentCompletionAt) ?? -1) >
+              (timestampMs(readCompletionFenceAt) ?? -1)),
+      );
+      const confirmedCompletionAt =
+        typeof metadata.history_read_completion_at === "string"
+          ? metadata.history_read_completion_at
+          : null;
+      const canConfirmCompletionFence =
+        options.commitCompletionFence === true &&
+        provisionalReadFences.get(sessionId)?.token === provisionalToken;
+      const nextMetadata = {
+        ...metadata,
+        last_read_at: monotonicReadAt,
+        is_unread: completionAdvancedSinceRead
+          ? metadata.is_unread === true
+          : false,
+        // Only a successful server read confirms this local fence. The
+        // in-memory provisional fence covers the HTTP flight without making
+        // offline/catch paths permanently hide a later server-ready result.
+        history_read_completion_at: canConfirmCompletionFence
+          ? newestTimestamp(confirmedCompletionAt, readCompletionFenceAt)
+          : confirmedCompletionAt,
+        // `ready` is defined as an unread completed assistant response. The
+        // durable read mutation therefore clears that one derived state
+        // optimistically; attention/working remain server-owned states.
+        ...(!completionAdvancedSinceRead && metadata.history_status === "ready"
+          ? { history_status: "idle" }
+          : {}),
+      };
       await db.update(schema.conversationSessions).set({
-        sessionMetadata: { ...metadata, last_read_at: timestamp, is_unread: false },
+        sessionMetadata: nextMetadata,
       }).where(eq(schema.conversationSessions.id, sessionId));
       notifyConversationChanges();
     });
-    await applyReadAt(readAt);
+    try {
+      await applyReadAt(readAt);
+    } catch (error) {
+      if (provisionalReadFences.get(sessionId)?.token === provisionalToken) {
+        provisionalReadFences.delete(sessionId);
+      }
+      throw error;
+    }
 
-    if (!(await canAttemptServer())) return;
+    if (!(await canAttemptServer())) {
+      if (provisionalReadFences.get(sessionId)?.token === provisionalToken) {
+        provisionalReadFences.delete(sessionId);
+      }
+      return;
+    }
     try {
       // HTTP must not occupy the SQLite slot. Re-read current metadata after
       // the response, once the next foreground write can safely begin.
       const response = await chatApi.markSessionRead(sessionId);
-      await applyReadAt(response.last_read_at ?? readAt);
+      await applyReadAt(response.last_read_at ?? readAt, {
+        commitCompletionFence: true,
+      });
+      if (provisionalReadFences.get(sessionId)?.token === provisionalToken) {
+        provisionalReadFences.delete(sessionId);
+      }
     } catch {
+      if (provisionalReadFences.get(sessionId)?.token === provisionalToken) {
+        provisionalReadFences.delete(sessionId);
+      }
       // Keep the local read state; the next sync reconciles it after recovery.
     }
   },
@@ -1906,19 +2929,81 @@ export const conversationsRepo = {
     return row ? toSession(row) : null;
   },
 
+  /** 旧ローカル会話の所有者を、現在の明示ユーザーからだけ補完する。別accountの履歴は推測しない。 */
+  async backfillLocalSessionUserId(
+    sessionId: string,
+    preferredUserId?: string | null,
+  ): Promise<ConversationSession | null> {
+    const userId = String(preferredUserId ?? "").trim();
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const row = (
+        await db
+          .select()
+          .from(schema.conversationSessions)
+          .where(
+            and(
+              eq(schema.conversationSessions.id, sessionId),
+              isNull(schema.conversationSessions.deletedAt),
+            ),
+          )
+      )[0];
+      if (!row) return null;
+      if (String(row.userId ?? "").trim() || !userId) return toSession(row);
+
+      // 所有者補完はサーバー登録ではない。既存metadataも同じ書込枠で保持する。
+      const sessionMetadata = {
+        ...((row.sessionMetadata as Record<string, unknown> | null) ?? {}),
+        local_only: true,
+      };
+      await db
+        .update(schema.conversationSessions)
+        .set({ userId, sessionMetadata })
+        .where(
+          and(
+            eq(schema.conversationSessions.id, sessionId),
+            isNull(schema.conversationSessions.deletedAt),
+            sql`COALESCE(${schema.conversationSessions.userId}, '') = ''`,
+          ),
+        );
+      return toSession({ ...row, userId, sessionMetadata });
+    });
+  },
+
   /** 新規チャット画面を開くための、通信を伴わないセッション作成。 */
   async createLocalSession(
     characterName: string,
     projectId?: string | null,
+    userId?: string | null,
+    agent?: ConversationAgent | null,
   ): Promise<ConversationSession> {
-    const session = buildLocalSession(characterName, projectId);
+    const scope = agent ? await conversationAgentScope() : null;
+    if (agent && !scope) {
+      throw new Error("Agent付きのオフラインChatにはログインが必要です。");
+    }
+    const session = buildLocalSession(characterName, projectId, userId, agent);
     await applyForegroundConversationSessions([session]);
+    if (agent && scope) {
+      const row = getDb().select().from(schema.conversationSessions)
+        .where(eq(schema.conversationSessions.id, session.id)).get();
+      if (row) {
+        return queuePendingAgentBinding(
+          row,
+          agent.id,
+          null,
+          agent,
+          scope,
+        );
+      }
+    }
     return session;
   },
 
   async createSession(
     characterName: string,
     projectId?: string | null,
+    userId?: string | null,
+    agent?: ConversationAgent | null,
   ): Promise<ConversationSession> {
     const characterSlug = requireCharacterSlug(characterName);
     if ((await canAttemptServer()) && !isServerKnownUnreachable()) {
@@ -1926,7 +3011,15 @@ export const conversationsRepo = {
         const session = await chatApi.createSession(
           characterSlug,
           projectId ?? undefined,
+          agent ? { agentId: agent.id } : undefined,
         );
+        if (agent && normalizedAgentId(session.agent_id) !== agent.id) {
+          throw new AgentBindingConflictError(
+            null,
+            agent.id,
+            "Serverが指定したAgent bindingを確認できませんでした。Chat作成を保留しています。",
+          );
+        }
         await applyForegroundConversationSessions([session]);
         return session;
       } catch (error) {
@@ -1934,14 +3027,103 @@ export const conversationsRepo = {
         useNetworkStore.getState().setServerReachable(false);
       }
     }
-    const session = buildLocalSession(characterSlug, projectId);
-    await applyForegroundConversationSessions([
-      {
-        ...session,
-        user_id: "",
-      },
-    ]);
+    const session = buildLocalSession(characterSlug, projectId, userId, agent);
+    await applyForegroundConversationSessions([session]);
     return session;
+  },
+
+  /**
+   * Change the Agent主体 for a session.  Online writes use the dedicated
+   * server CAS endpoint; offline writes remain local with an auth/server
+   * scoped pending marker and are flushed before any queued dispatch.
+   */
+  async bindAgent(
+    sessionId: string,
+    agentId: string | null,
+  ): Promise<ConversationSession> {
+    const targetAgentId = normalizedAgentId(agentId);
+    const db = getDb();
+    const row = (
+      await db
+        .select()
+        .from(schema.conversationSessions)
+        .where(
+          and(
+            eq(schema.conversationSessions.id, sessionId),
+            isNull(schema.conversationSessions.deletedAt),
+          ),
+        )
+    )[0];
+    if (!row) throw new Error("Agent変更対象のセッションが見つかりません。");
+    if (row.isGroupChat) {
+      throw new Error("グループチャットにはprimary Agentを紐付けできません。参加Agentは既存のgroup設定を使用します。");
+    }
+    const pendingBinding = pendingAgentBinding(row);
+    // Coalesce multiple offline changes into one desired target while keeping
+    // the first server observation as the CAS base (B -> offline A -> C must
+    // flush with expected=B, desired=C).
+    const expectedAgentId = pendingBinding
+      ? pendingBinding.expectedAgentId
+      : normalizedAgentId(row.agentId);
+    if (!pendingBinding && expectedAgentId === targetAgentId) return toSession(row);
+
+    const scope = await conversationAgentScope();
+    if (!scope) throw new Error("Agentを選択するにはログインが必要です。");
+    if (
+      pendingBinding &&
+      (pendingBinding.authScope !== scope.authScope ||
+        pendingBinding.serverFingerprint !== scope.serverFingerprint)
+    ) {
+      throw new Error("保留中のAgent変更を受け付けたアカウントまたは接続先に戻ってから変更してください。");
+    }
+    const catalog = await listConversationAgentsLocal({
+      sessionId: isServerBackedSession(row) ? row.id : null,
+      projectId: row.projectId ?? null,
+    });
+    const selected = targetAgentId
+      ? catalog.find((agent) => agent.id === targetAgentId) ?? null
+      : null;
+    if (targetAgentId && !selected) {
+      throw new Error("このAgentは現在の接続先で選択できません。オンラインで一覧を更新してください。");
+    }
+
+    if (isServerBackedSession(row) && (await canAttemptServer())) {
+      try {
+        const updated = await conversationAgentApi.bindSession(
+          sessionId,
+          targetAgentId,
+          expectedAgentId,
+        );
+        await applyForegroundConversationSessions([updated]);
+        return updated;
+      } catch (error) {
+        const conflict = agentBindingConflictFrom(error);
+        if (conflict) {
+          await refreshCanonicalAgentSessionAfterConflict(
+            row,
+            pendingBinding,
+            "Server側のAgent bindingが変わりました。保留中の変更と未送信メッセージを確認してください。",
+          );
+          throw new AgentBindingConflictError(expectedAgentId, targetAgentId);
+        }
+        if (!isApiConnectionError(error)) throw error;
+        useNetworkStore.getState().setServerReachable(false);
+      }
+    }
+
+    return queuePendingAgentBinding(
+      row,
+      targetAgentId,
+      expectedAgentId,
+      selected,
+      scope,
+    );
+  },
+
+  /** Explicit user action to adopt the current server binding and drop a
+   * pending desired Agent. Queued messages retain their own expected snapshot. */
+  async adoptServerAgentBinding(sessionId: string): Promise<ConversationSession> {
+    return adoptCanonicalAgentBinding(sessionId);
   },
 
   async updateCharacter(
@@ -2070,24 +3252,43 @@ export const conversationsRepo = {
         throw new Error("タイトル変更対象のセッションが見つかりません。");
       }
       if (isServerBackedSession(row)) {
-        await chatApi.updateTitle(sessionId, title);
+        await chatApi.updateTitle(sessionId, title, options?.source);
       }
     } else if (options?.syncServer !== false && (await canUseServer())) {
       try {
-        await chatApi.updateTitle(sessionId, title);
-      } catch {
+        await chatApi.updateTitle(sessionId, title, options?.source);
+      } catch (error) {
+        // A server-side manual rename must not become a successful local
+        // generated title merely because this call uses local-first writes.
+        if (options?.source && isApiHttpError(error) && error.status === 409) {
+          throw error;
+        }
         // Fall back to local-first below.
       }
     }
-    await runForegroundSqliteWrite(() => updateSessionStats(sessionId, (session) => ({
-      title,
-      sessionMetadata: {
+    await runForegroundSqliteWrite(() => updateSessionStats(sessionId, (session) => {
+      const metadata = {
         ...((session?.sessionMetadata as Record<string, unknown> | null) ?? {}),
-        ...(options?.source
-          ? { title_generation: { source: options.source } }
-          : {}),
-      },
-    })));
+      };
+      if (options?.source && hasManualConversationTitle(metadata.context)) {
+        throw new Error("手動で設定したタイトルは自動更新できません");
+      }
+      const context = metadata.context && typeof metadata.context === "object" && !Array.isArray(metadata.context)
+        ? metadata.context as Record<string, unknown>
+        : {};
+      // Use the same persisted context contract as server-backed sessions.
+      delete metadata.title_generation;
+      return {
+        title,
+        sessionMetadata: {
+          ...metadata,
+          context: {
+            ...context,
+            title_generation: { source: options?.source ?? "manual" },
+          },
+        },
+      };
+    }));
   },
 
   async saveLocalMessages(
@@ -2117,6 +3318,7 @@ export const conversationsRepo = {
       const db = getDb();
       // Retrying only this atomic unit is safe: a lock/error cannot leave an
       // inserted message without its session count, or increment that count twice.
+      let diagnosticLogged = false;
       for (let attempt = 0; ; attempt += 1) {
         try {
           db.transaction((tx) => {
@@ -2143,8 +3345,17 @@ export const conversationsRepo = {
           });
           break;
         } catch (error) {
-          const busy = /database (?:table )?is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(String(error));
-          if (!busy || attempt >= 5) throw error;
+          // Explicitly opt-in logcat capture for one device reproduction. The
+          // formatter records only error classes/codes/stack frames and the
+          // effective journal mode; it never serializes error.message or SQL.
+          if (!diagnosticLogged && isSqliteDiagnosticsEnabled()) {
+            logSqliteErrorDiagnostic(error, {
+              operation: "append_local_message",
+              journalMode: getEffectiveSqliteJournalMode(),
+            });
+            diagnosticLogged = true;
+          }
+          if (!isSqliteBusyError(error) || attempt >= 5) throw error;
           // Yield the JS thread so another native async connection can finish.
           await new Promise<void>((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
         }
@@ -2226,6 +3437,135 @@ export const conversationsRepo = {
 
   async listPendingMessages(sessionId: string): Promise<ConversationMessage[]> {
     return listPendingMessagesForSessionId(sessionId);
+  },
+
+  async updatePendingLocalMessage(
+    sessionId: string,
+    messageId: string,
+    content: string,
+  ): Promise<ConversationMessage> {
+    const normalized = content.trim();
+    if (!normalized) throw new Error("メッセージ本文を入力してください。");
+    const key = `${sessionId}:${messageId}`;
+    if (pendingMessageDispatchFlights.has(key)) {
+      throw new Error("このメッセージは送信処理中です。完了後にもう一度編集してください。");
+    }
+    const existingEdit = pendingMessageEditFlights.get(key);
+    if (existingEdit) return existingEdit;
+
+    const editFlight = runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const row = (
+        await db
+          .select()
+          .from(schema.conversationMessages)
+          .where(
+            and(
+              eq(schema.conversationMessages.id, messageId),
+              eq(schema.conversationMessages.sessionId, sessionId),
+            ),
+          )
+      )[0];
+      if (!row || row.deletedAt) {
+        throw new Error("編集対象の未送信メッセージが見つかりません。");
+      }
+      const current = toMessage(row);
+      const state = String(current.metadata?.message_state ?? "");
+      if (
+        current.role !== "user" ||
+        (!current.metadata?.pending &&
+          !current.metadata?.persistence_error &&
+          state !== "direct-failed" &&
+          state !== "local-draft")
+      ) {
+        throw new Error("このメッセージは未送信状態ではないため編集できません。");
+      }
+      const now = new Date().toISOString();
+      const metadata = replacePendingDispatchMessage(current, normalized);
+      await db
+        .update(schema.conversationMessages)
+        .set({ content: normalized, messageMetadata: metadata, updatedAt: now })
+        .where(eq(schema.conversationMessages.id, messageId));
+      return {
+        ...current,
+        content: normalized,
+        metadata,
+        updated_at: now,
+      };
+    });
+    pendingMessageEditFlights.set(key, editFlight);
+    try {
+      const updated = await editFlight;
+      notifyConversationChanges();
+      return updated;
+    } finally {
+      if (pendingMessageEditFlights.get(key) === editFlight) {
+        pendingMessageEditFlights.delete(key);
+      }
+    }
+  },
+
+  /**
+   * Remove one input from the server retry queue without deleting the
+   * conversation or its text. Accepted/uncertain server deliveries are kept
+   * protected from this local queue action.
+   */
+  async cancelPendingMessage(
+    sessionId: string,
+    messageId: string,
+    mode: "cancel" | "draft" = "cancel",
+  ): Promise<ConversationMessage> {
+    const key = `${sessionId}:${messageId}`;
+    if (pendingMessageDispatchFlights.has(key) || pendingMessageEditFlights.has(key)) {
+      throw new Error("この入力は送信結果を確認中です。受理状況を確認してから操作してください。");
+    }
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const row = db.select().from(schema.conversationMessages)
+        .where(and(
+          eq(schema.conversationMessages.id, messageId),
+          eq(schema.conversationMessages.sessionId, sessionId),
+        )).get();
+      if (!row || row.deletedAt) throw new Error("未送信メッセージが見つかりません。");
+      const current = toMessage(row);
+      const metadata = current.metadata ?? {};
+      const state = String(metadata.message_state ?? "");
+      const legacyServerResultUncertain =
+        metadata.server_result_uncertain === undefined &&
+        metadata.delivery_route === "server" &&
+        Boolean(metadata.delivery_error) &&
+        (Boolean(metadata.pending) || state === "queued");
+      const acceptedOrUncertain = Boolean(metadata.server_message_id)
+        || state === "dispatched"
+        || metadata.server_result_uncertain === true
+        || legacyServerResultUncertain;
+      if (acceptedOrUncertain) {
+        throw new Error("Serverの受理状況が不明な入力は、未送信キューの取消対象ではありません。");
+      }
+      const queueState = Boolean(metadata.pending)
+        || Boolean(metadata.persistence_error)
+        || state === "direct-failed"
+        || state === "local-draft";
+      if (current.role !== "user" || !queueState) {
+        throw new Error("この入力は未送信キューにありません。");
+      }
+      const nextMetadata: Record<string, unknown> = {
+        ...metadata,
+        pending: false,
+        persistence_error: false,
+        delivery_error: null,
+        direct_error: null,
+        message_state: mode === "draft" ? "local-draft" : "cancelled",
+        ...(mode === "cancel" ? { queue_cancelled: true } : { draft_saved: true }),
+      };
+      const now = new Date().toISOString();
+      db.update(schema.conversationMessages).set({
+        messageMetadata: nextMetadata,
+        updatedAt: now,
+      }).where(eq(schema.conversationMessages.id, messageId)).run();
+      notifyConversationChanges();
+      return { ...current, metadata: nextMetadata, updated_at: now };
+    });
   },
 
   async markPendingMessageQueued(

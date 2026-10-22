@@ -111,7 +111,7 @@ for index_row in apt.get("package_indexes", []):
 
 seen_names: set[str] = set()
 archive_names: set[str] = set()
-selected: list[tuple[str, str, str, str]] = []
+selected: list[tuple[str, str, str, str, str]] = []
 for row in rows:
     if not isinstance(row, dict):
         raise SystemExit("offline APT package row is invalid")
@@ -151,26 +151,35 @@ for row in rows:
         raise SystemExit(f"offline APT archive hash/size mismatch: {name}")
     shutil.copyfile(archive_path, repo / archive_name)
     if phase == "all" or phase in phases:
-        selected.append((name, arch, version, f"{name}:{arch}={version}"))
+        selected.append((name, arch, version, f"{name}:{arch}={version}", archive_name))
 
 if not selected:
     raise SystemExit(f"offline APT package lock has no packages for phase={phase}")
 
 (repo / "archives").mkdir(parents=True, exist_ok=True)
-for archive_name in archive_names:
-    shutil.copyfile(repo / archive_name, repo / "archives" / archive_name)
+for row in rows:
+    name, version = str(row["name"]), str(row["version"])
+    arch = str(row.get("architecture") or "amd64")
+    archive_name = Path(str(row["archive"])).name
+    source_archive = repo / archive_name
+    cache_archive = repo / "archives" / f"{name}_{version.replace(':', '%3a')}_{arch}.deb"
+    if cache_archive.exists():
+        raise SystemExit(f"offline APT cache filename collision: {name}")
+    cache_archive.hardlink_to(source_archive)
 
 # Include every validated package row in the local repository so apt's resolver
-# can only satisfy dependencies from the same immutable closure. The Filename
-# field is rewritten to the copied flat-repository basename.
+# can only satisfy dependencies from the same immutable closure. Apt may
+# resolve transitive dependencies through Packages even when top-level .debs
+# are passed by absolute path, so Filename must also be an absolute local path.
 blocks: list[str] = []
 for row in rows:
     name, version = str(row["name"]), str(row["version"])
     arch = str(row.get("architecture") or "amd64")
     archive_name = Path(str(row["archive"])).name
     record = dict(index_records[(name, version, arch)])
-    record["Filename"] = f"./{archive_name}"
-    record["Size"] = str((repo / archive_name).stat().st_size)
+    cache_name = f"{name}_{version.replace(':', '%3a')}_{arch}.deb"
+    record["Filename"] = str(repo / "archives" / cache_name)
+    record["Size"] = str((repo / "archives" / cache_name).stat().st_size)
     record["SHA256"] = str(row["sha256"]).lower()
     fields = ["Package", "Version", "Architecture", "Multi-Arch", "Essential", "Protected",
               "Depends", "Pre-Depends", "Provides", "Conflicts", "Breaks", "Replaces",
@@ -181,15 +190,16 @@ for row in rows:
 (repo / "archives" / "partial").mkdir(parents=True, exist_ok=True)
 (repo / "sources.list").write_text(f"deb [trusted=yes] file:{repo} ./\n", encoding="utf-8")
 
-for name, arch, version, spec in selected:
-    print(f"{name}\t{arch}\t{version}\t{spec}")
+for name, arch, version, spec, archive_name in selected:
+    print(f"{name}\t{arch}\t{version}\t{spec}\t{archive_name}")
 PY
 
 [[ -s "$selection_file" ]] || die "offline APT phase selection is empty"
 packages=()
 selected_rows=()
-while IFS=$'\t' read -r name arch version spec; do
-    [[ -n "$name" && -n "$arch" && -n "$version" && -n "$spec" ]] || die "offline APT phase selection is malformed"
+while IFS=$'\t' read -r name arch version spec archive_name; do
+    [[ -n "$name" && -n "$arch" && -n "$version" && -n "$spec" && -n "$archive_name" ]] || die "offline APT phase selection is malformed"
+    [[ "$archive_name" != */* && "$archive_name" == *.deb ]] || die "offline APT archive selection is malformed"
     packages+=("$spec")
     selected_rows+=("$name"$'\t'"$arch"$'\t'"$version")
 done < "$selection_file"

@@ -14,46 +14,113 @@ from .registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+_GEMINI_SCHEMA_FIELDS = frozenset(
+    {
+        # These are the fields represented by the deprecated
+        # google.generativeai Schema proto.  Keep this an explicit allowlist:
+        # forwarding arbitrary JSON Schema keywords makes FunctionDeclaration
+        # fail while constructing the provider message.
+        "type",
+        "format",
+        "description",
+        "nullable",
+        "enum",
+        "items",
+        "properties",
+        "required",
+    }
+)
+
+
 def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove schema fields that Gemini does not accept."""
+    """Project JSON Schema into the provider's supported schema subset.
+
+    ``ToolDefinition.to_json_schema`` remains the canonical server-side
+    validation schema.  Gemini receives a separate projection because the
+    ``google.generativeai`` proto only accepts a small subset of JSON Schema.
+    In particular, unknown keywords must be removed rather than passed through
+    to ``FunctionDeclaration`` where they raise a ``ValueError``.
+    """
     if not isinstance(schema, dict):
         return schema
 
+    # Optional/union annotations are emitted as ``anyOf``.  Gemini has no
+    # union schema, so retain the first non-null branch while continuing to
+    # process the surrounding schema fields.  ``oneOf`` gets the same safe,
+    # deterministic projection for schemas supplied by external tools.
+    for union_key in ("anyOf", "oneOf"):
+        options = schema.get(union_key)
+        if not isinstance(options, list):
+            continue
+        selected = next(
+            (
+                option
+                for option in options
+                if isinstance(option, dict) and option.get("type") != "null"
+            ),
+            None,
+        )
+        if selected is None:
+            schema = {
+                key: value
+                for key, value in schema.items()
+                if key not in {"anyOf", "oneOf"}
+            }
+        else:
+            # Branch fields should win over a duplicate outer field (the
+            # historical cleaner used the same precedence), while the outer
+            # description/properties remain available when the branch omits
+            # them.
+            merged = {
+                key: value
+                for key, value in schema.items()
+                if key not in {"anyOf", "oneOf"}
+            }
+            merged.update(selected)
+            schema = merged
+        break
+
     cleaned: Dict[str, Any] = {}
     for key, value in schema.items():
-        if key in (
-            "title",
-            "$schema",
-            "additionalProperties",
-            "default",
-            # The deprecated google.generativeai Schema proto rejects the
-            # standard JSON Schema array-cardinality keywords.  Keep them in
-            # ToolDefinition/OpenAI contracts and remove them only from this
-            # Gemini wire projection.
-            "minItems",
-            "maxItems",
-        ):
+        if key not in _GEMINI_SCHEMA_FIELDS:
+            # This also removes JSON Schema metadata/constraints such as
+            # title, default, additionalProperties, minimum/maximum,
+            # minItems/maxItems, pattern and minLength/maxLength.  They stay
+            # authoritative in the canonical server schema.
             continue
         if key == "properties" and isinstance(value, dict):
             cleaned[key] = {
                 prop_name: _clean_schema_for_gemini(prop_schema)
                 for prop_name, prop_schema in value.items()
+                if isinstance(prop_name, str) and isinstance(prop_schema, dict)
             }
             continue
-        if key == "anyOf" and isinstance(value, list):
-            for option in value:
-                if isinstance(option, dict) and option.get("type") != "null":
-                    cleaned.update(_clean_schema_for_gemini(option))
-                    break
+        if key == "items":
+            if isinstance(value, dict):
+                cleaned[key] = _clean_schema_for_gemini(value)
             continue
-        if isinstance(value, dict):
-            cleaned[key] = _clean_schema_for_gemini(value)
-        elif isinstance(value, list):
-            cleaned[key] = [
-                _clean_schema_for_gemini(item) if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
+        if key == "enum":
+            # The provider proto models enum as repeated strings.  Preserve
+            # valid JSON Schema string enums and omit incompatible values so a
+            # malformed external schema cannot break the whole tool roster.
+            if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                cleaned[key] = list(value)
+            continue
+        if key == "required":
+            if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                cleaned[key] = list(value)
+            continue
+        if key in {"type", "format", "description"}:
+            if isinstance(value, str):
+                cleaned[key] = value
+            continue
+        if key == "nullable":
+            if isinstance(value, bool):
+                cleaned[key] = value
+            continue
+        # All remaining fields are covered by the allowlist above, but do not
+        # forward an unexpected value shape if the SDK adds one later.
+        if isinstance(value, (str, bool)):
             cleaned[key] = value
 
     return cleaned
@@ -109,6 +176,8 @@ class CLIAdapter:
 
     @staticmethod
     def to_prompt_text(tools: List[ToolDefinition]) -> str:
+        if not tools:
+            return ""
         lines = ["利用可能なツール:"]
         for tool_def in tools:
             params_desc = ", ".join(

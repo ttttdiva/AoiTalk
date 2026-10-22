@@ -63,6 +63,14 @@ from ..services.app_release_service import (
     AppReleaseError,
     create_app_release as create_app_release_service,
 )
+from ..services.app_action_contract import validate_action_contract
+from ..services.app_action_runtime_service import (
+    AppActionRuntimeService,
+    run_payload,
+    runtime_action_payload,
+    runtime_release_payload,
+    runtime_target_payload,
+)
 from ..services.app_service import AppAccessError, AppService
 from ..services.app_storage import (
     AppStorageError,
@@ -551,6 +559,32 @@ def build_app_tool_definitions(
     # Keep a lazy request-local principal instead of freezing the constructor
     # context inside every App Tool closure.
     runtime_context = _RuntimeAppContext(context)
+    _action_execution_service: Any | None = None
+
+    def _app_ui_link(app: Any, project_id: str | None) -> dict[str, str]:
+        app_id = str(app.id)
+        query = f"?project_id={project_id}" if project_id else ""
+        name = re.sub(r"[\r\n\[\]]+", " ", str(getattr(app, "name", "App") or "App")).strip()
+        name = name.replace("]]", "")[:120] or "App"
+        return {
+            "ui_url": f"/apps/{app_id}{query}",
+            "api_url": f"/api/apps/{app_id}/runtime{query}",
+            "mention": f"@[[app:{app_id}:{name}]]",
+        }
+
+    def _get_action_execution_service() -> Any:
+        nonlocal _action_execution_service
+        if _action_execution_service is None:
+            from ..services.app_action_runtime_service import (
+                build_app_action_execution_service,
+            )
+
+            _action_execution_service = build_app_action_execution_service(
+                get_database_manager(),
+                config=deployment_config if isinstance(deployment_config, dict) else {},
+                workspace_root=workspace_root,
+            )
+        return _action_execution_service
 
     async def _assert_job_scope(session, job: AppJob) -> None:
         requested_project_id = _ctx_project_id(runtime_context)
@@ -655,6 +689,52 @@ def build_app_tool_definitions(
             if operation_lock is not None:
                 operation_lock.release()
             await session.close()
+
+    async def update_app(
+        name: str = "",
+        description: str = "",
+        visibility: str = "",
+        default_target_key: str = "",
+        app_id: str = "",
+    ) -> dict[str, Any]:
+        """Update the currently selected App as one App-owned mutation.
+
+        Agent turns keep ordinary create/update work on the same server-
+        resolved App.  A caller may pass ``app_id`` only to select an App it
+        already has a current developer grant for; no usage-count or prompt
+        heuristic turns this into a second App.
+        """
+        async with _authorized_app(runtime_context, app_id or None, required="developer") as (session, app, _permission):
+            await _require_development_binding(session, app, runtime_context, workspace_root=workspace_root)
+            changed = False
+            if name.strip():
+                if len(name.strip()) > 255:
+                    raise ValueError("name は255文字以内で指定してください")
+                app.name = name.strip()
+                changed = True
+            if description != "":
+                if len(description) > 100_000:
+                    raise ValueError("description は100000文字以内で指定してください")
+                app.description = description.strip() or None
+                changed = True
+            if visibility:
+                if visibility not in {"private", "shared", "public"}:
+                    raise ValueError("visibility が不正です")
+                app.visibility = visibility
+                changed = True
+            if default_target_key:
+                target = await session.scalar(select(AppTarget).where(
+                    AppTarget.app_id == app.id,
+                    AppTarget.target_key == default_target_key,
+                ).limit(1))
+                if target is None:
+                    raise ValueError("default_target_key が見つかりません")
+                app.default_target_key = default_target_key
+                changed = True
+            if changed:
+                app.updated_at = datetime.utcnow()
+                await session.commit()
+            return app.to_dict()
 
     async def list_apps() -> list[dict[str, Any]]:
         user_id = _ctx_user_id(runtime_context)
@@ -980,6 +1060,27 @@ def build_app_tool_definitions(
                 manifest, _text, manifest_hash = load_app_manifest(get_app_workspace_path(app.id, workspace_root=workspace_root))
             return {"valid": True, "manifest": manifest, "manifest_hash": manifest_hash}
 
+    async def validate_app_runtime_contract(app_id: str = "") -> dict[str, Any]:
+        """Validate declarative UI/Action declarations without executing them."""
+        async with _authorized_app(runtime_context, app_id or None) as (session, app, _permission):
+            project_uuid = _uuid(_ctx_project_id(runtime_context), "project_id") if _ctx_project_id(runtime_context) else None
+            bundle = await _installed_source_bundle(session, app, project_uuid, workspace_root=workspace_root)
+            if bundle is not None:
+                _normalized, manifest_text = _archive_file_text(bundle[3], "aoitalk.app.yaml")
+                manifest = parse_manifest_text(manifest_text)
+                result = validate_action_contract(manifest, strict=False)
+            else:
+                workspace = get_app_workspace_path(app.id, workspace_root=workspace_root)
+                manifest, _manifest_text, _manifest_hash = load_app_manifest(workspace)
+                result = validate_action_contract(manifest, workspace=workspace, strict=False)
+            return {
+                "valid": result.valid,
+                "errors": list(result.errors),
+                "warnings": list(result.warnings),
+                "ui": result.ui,
+                "actions": result.actions,
+            }
+
     async def update_app_manifest(content: str, expected_sha256: str = "", app_id: str = "") -> dict[str, Any]:
         async with _authorized_app(runtime_context, app_id or None, required="developer") as (session, app, _permission):
             async with app_operation_lock(app.id, workspace_root=workspace_root):
@@ -1237,6 +1338,168 @@ def build_app_tool_definitions(
                 raise ValueError(str(exc)) from exc
             await session.commit()
             return release.to_dict()
+
+    async def get_app_runtime(app_id: str = "") -> dict[str, Any]:
+        """Return the same immutable Runtime catalog used by the HTTP API."""
+        async with _authorized_app(runtime_context, app_id or None, required="viewer") as (session, app, _permission):
+            project_uuid = _uuid(_ctx_project_id(runtime_context), "project_id") if _ctx_project_id(runtime_context) else None
+            runtime = AppActionRuntimeService(
+                workspace_root=workspace_root,
+                execution_service=_get_action_execution_service(),
+                execution_config=deployment_config,
+            )
+            catalog = await runtime.get_runtime(
+                session,
+                app.id,
+                user_id=_ctx_user_id(runtime_context),
+                user_role=_ctx_user_role(runtime_context),
+                project_id=project_uuid,
+            )
+            runtime_availability = await runtime.runtime_availability(catalog)
+            return {
+                "app_id": str(catalog.app.id),
+                "release": runtime_release_payload(catalog.release)
+                | {
+                    "source_bundle_sha256": str(catalog.source_artifact.sha256),
+                    "source_bundle_size_bytes": int(catalog.source_artifact.size_bytes or 0),
+                },
+                "target": runtime_target_payload(catalog.target),
+                "ui": catalog.ui,
+                "actions": [
+                    runtime_action_payload(action)
+                    | (runtime_availability.get("actions", {}).get(action.action_id, {}) if isinstance(runtime_availability.get("actions"), dict) else {})
+                    for action in catalog.actions
+                ],
+                "availability": runtime_availability,
+            }
+
+    async def run_app_action(
+        action_id: str,
+        input: dict[str, Any] | None = None,
+        idempotency_key: str = "",
+        app_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist and hand off one Release-bound Action without an LLM turn."""
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key は必須です")
+        async with _authorized_app(runtime_context, app_id or None, required="runner") as (session, app, _permission):
+            project_uuid = _uuid(_ctx_project_id(runtime_context), "project_id") if _ctx_project_id(runtime_context) else None
+            # Agent tools use the same durable RunService path as HTTP.  The
+            # tool receives no command/path/target override; the immutable
+            # Release catalog and server execution target config resolve all
+            # transport details before this call.
+            runtime = AppActionRuntimeService(
+                workspace_root=workspace_root,
+                execution_service=_get_action_execution_service(),
+                execution_config=deployment_config,
+            )
+            run = await runtime.create_run(
+                session,
+                app.id,
+                action_id,
+                input or {},
+                idempotency_key=idempotency_key,
+                user_id=_ctx_user_id(runtime_context),
+                user_role=_ctx_user_role(runtime_context),
+                project_id=project_uuid,
+            )
+            return run_payload(run)
+
+    async def activate_app_release(release_id: str, app_id: str = "") -> dict[str, Any]:
+        """Activate one published Release after immutable catalog validation."""
+        async with _authorized_app(runtime_context, app_id or None, required="maintainer") as (session, app, _permission):
+            runtime = AppActionRuntimeService(
+                workspace_root=workspace_root,
+                execution_service=_get_action_execution_service(),
+                execution_config=deployment_config,
+            )
+            catalog = await runtime.activate_release(
+                session,
+                app.id,
+                release_id,
+                user_id=_ctx_user_id(runtime_context),
+                user_role=_ctx_user_role(runtime_context),
+            )
+            runtime_availability = await runtime.runtime_availability(catalog)
+            await session.commit()
+            return {
+                "app_id": str(catalog.app.id),
+                "release": runtime_release_payload(catalog.release),
+                "target": runtime_target_payload(catalog.target),
+                "ui": catalog.ui,
+                "actions": [
+                    runtime_action_payload(action)
+                    | (runtime_availability.get("actions", {}).get(action.action_id, {}) if isinstance(runtime_availability.get("actions"), dict) else {})
+                    for action in catalog.actions
+                ],
+                "availability": runtime_availability,
+            }
+
+    async def release_and_activate_app(version: str, changelog: str = "", app_id: str = "") -> dict[str, Any]:
+        """Agent release flow: validate → create Release → activate → open URL."""
+        async with _authorized_app(runtime_context, app_id or None, required="maintainer") as (session, app, _permission):
+            await _require_development_binding(session, app, runtime_context, workspace_root=workspace_root)
+            try:
+                release = await create_app_release_service(
+                    session,
+                    app,
+                    version=version,
+                    created_by=_ctx_user_id(runtime_context),
+                    changelog=changelog,
+                    workspace_root=workspace_root,
+                    deployment_config=deployment_config,
+                )
+                await session.commit()
+            except AppReleaseError as exc:
+                await session.rollback()
+                raise ValueError(str(exc)) from exc
+            runtime = AppActionRuntimeService(
+                workspace_root=workspace_root,
+                execution_service=_get_action_execution_service(),
+                execution_config=deployment_config,
+            )
+            catalog = await runtime.activate_release(
+                session,
+                app.id,
+                release.id,
+                user_id=_ctx_user_id(runtime_context),
+                user_role=_ctx_user_role(runtime_context),
+            )
+            runtime_availability = await runtime.runtime_availability(catalog)
+            await session.commit()
+            project_id = _ctx_project_id(runtime_context)
+            query = f"?project_id={project_id}" if project_id else ""
+            return {
+                "release": release.to_dict(),
+                "runtime": {
+                    "app_id": str(catalog.app.id),
+                    "release": runtime_release_payload(catalog.release),
+                    "target": runtime_target_payload(catalog.target),
+                    "ui": catalog.ui,
+                    "actions": [
+                        runtime_action_payload(action)
+                        | (runtime_availability.get("actions", {}).get(action.action_id, {}) if isinstance(runtime_availability.get("actions"), dict) else {})
+                        for action in catalog.actions
+                    ],
+                    "availability": runtime_availability,
+                },
+                # The chat client opens the user-facing Apps UI. Keep the API
+                # endpoint separately available; deployment base paths stay
+                # client-owned.
+                "open_url": f"/apps/{app.id}{query}",
+                **_app_ui_link(app, project_id),
+            }
+
+    async def open_app_runtime(app_id: str = "") -> dict[str, Any]:
+        """Return the user-facing Apps UI link and its runtime API URL."""
+        async with _authorized_app(runtime_context, app_id or None, required="viewer") as (session, app, _permission):
+            project_id = _ctx_project_id(runtime_context)
+            query = f"?project_id={project_id}" if project_id else ""
+            return {
+                "app_id": str(app.id),
+                "url": f"/apps/{app.id}{query}",
+                **_app_ui_link(app, project_id),
+            }
 
     async def export_app_release(release_id: str, app_id: str = "") -> list[dict[str, Any]]:
         async with _authorized_app(runtime_context, app_id or None, required="viewer") as (session, app, _permission):
@@ -1616,6 +1879,7 @@ def build_app_tool_definitions(
     common_app_id = ToolParam("app_id", "string", "App UUID。省略時は選択中App", required=False)
     definitions = [
         _tool("create_app", "永続的なAppを作成し、App workspaceとREADME/Manifestを初期化する", create_app, [ToolParam("name", "string"), ToolParam("slug", "string", required=False, default=""), ToolParam("description", "string", required=False, default="")], risk="medium", side_effect="database", supports_parallel=False),
+        _tool("update_app", "選択中の同じAppの名前・説明・公開設定を更新する", update_app, [ToolParam("name", "string", required=False, default=""), ToolParam("description", "string", required=False, default=""), ToolParam("visibility", "string", enum=["private", "shared", "public"], required=False, default=""), ToolParam("default_target_key", "string", required=False, default=""), common_app_id], risk="medium", side_effect="database", requires_approval=True, supports_parallel=False),
         _tool("list_apps", "権限のあるApp一覧を取得する", list_apps, []),
         _tool("get_app", "AppのメタデータとTargetを取得する", get_app, [common_app_id]),
         _tool("get_app_context", "選択中AppのREADME/Manifestを参照データとして取得する", get_app_context, [common_app_id, ToolParam("target_key", "string", required=False, default="")]),
@@ -1625,6 +1889,7 @@ def build_app_tool_definitions(
         _tool("write_app_file", "App workspace内のファイルを更新しGit checkpointを作成する", write_app_file, [ToolParam("path", "string"), ToolParam("content", "string"), ToolParam("expected_sha256", "string", required=False, default=""), common_app_id], risk="high", side_effect="filesystem", requires_approval=True, supports_parallel=False),
         _tool("delete_app_file", "App workspace内のファイルを削除する", delete_app_file, [ToolParam("path", "string"), common_app_id], risk="high", side_effect="filesystem", requires_approval=True, supports_parallel=False),
         _tool("validate_app_manifest", "App Manifestを検証する", validate_app_manifest, [common_app_id]),
+        _tool("validate_app_runtime_contract", "保存Actionと宣言UIの契約を検証する", validate_app_runtime_contract, [common_app_id]),
         _tool("update_app_manifest", "検証済みManifestを更新しTarget派生データを同期する", update_app_manifest, [ToolParam("content", "string"), ToolParam("expected_sha256", "string", required=False, default=""), common_app_id], risk="high", side_effect="filesystem", requires_approval=True, supports_parallel=False),
         _tool("app_git_status", "App Gitのclean/dirtyとrevisionを取得する", git_status, [common_app_id]),
         _tool("app_git_history", "App Gitのrevision履歴を取得する", git_history, [common_app_id, ToolParam("limit", "integer", required=False, default=20)]),
@@ -1637,6 +1902,11 @@ def build_app_tool_definitions(
         _tool("stop_app_job", "実行中のAppJobをプロセスツリー単位で停止する", stop_app_job, [ToolParam("job_id", "string")], risk="high", side_effect="process", requires_approval=True, supports_parallel=False),
         _tool("read_app_job_logs", "AppJobのログを安全に参照する", read_app_job_logs, [ToolParam("job_id", "string")]),
         _tool("create_app_release", "cleanなApp revisionからReleaseとArtifactを作成する", create_app_release, [ToolParam("version", "string"), ToolParam("changelog", "string", required=False, default=""), common_app_id], risk="high", side_effect="database,filesystem", requires_approval=True, supports_parallel=False),
+        _tool("get_app_runtime", "active Releaseに固定されたUIと保存Actionのカタログを取得する", get_app_runtime, [common_app_id]),
+        _tool("run_app_action", "Release-boundな保存Actionを冪等に実行する（LLMを介さない）", run_app_action, [ToolParam("action_id", "string"), ToolParam("input", "object", required=False, default={}), ToolParam("idempotency_key", "string"), common_app_id], risk="high", side_effect="process,database", requires_approval=True, supports_parallel=False),
+        _tool("activate_app_release", "検証済みの公開ReleaseをAppのactive pointerへ切り替える", activate_app_release, [ToolParam("release_id", "string"), common_app_id], risk="high", side_effect="database", requires_approval=True, supports_parallel=False),
+        _tool("release_and_activate_app", "Manifest検証・Release作成・activate・Apps UIリンク返却を一連で行う", release_and_activate_app, [ToolParam("version", "string"), ToolParam("changelog", "string", required=False, default=""), common_app_id], risk="high", side_effect="database,filesystem,process", requires_approval=True, supports_parallel=False),
+        _tool("open_app_runtime", "active ReleaseのApps UIリンクとRuntime API URLを返す", open_app_runtime, [common_app_id]),
         _tool("export_app_release", "App ReleaseのArtifact情報を取得する", export_app_release, [ToolParam("release_id", "string"), common_app_id]),
         _tool("import_app_source_bundle", "App workspace内のSource Bundleを検証して取り込む", import_app_source_bundle, [ToolParam("source_bundle_path", "string"), common_app_id], risk="high", side_effect="filesystem", requires_approval=True, supports_parallel=False),
         _tool("fork_app", "選択中Appを独立した新AppとしてForkする", fork_app, [ToolParam("name", "string"), ToolParam("slug", "string", required=False, default=""), common_app_id], risk="high", side_effect="database,filesystem", requires_approval=True, supports_parallel=False),
@@ -1645,7 +1915,7 @@ def build_app_tool_definitions(
         _tool("link_app_to_task", "TaskへAppとrelation typeを登録する", link_app_to_task, [ToolParam("task_id", "string"), ToolParam("relation_type", "string", enum=["develops", "fixes", "tests", "releases", "uses", "related"], required=False, default="related"), ToolParam("target_id", "string", required=False, default=""), common_app_id], risk="medium", side_effect="database", supports_parallel=False),
     ]
 
-    bootstrap_names = {"create_app", "list_apps"}
+    bootstrap_names = {"create_app", "update_app", "list_apps"}
     if not include_bootstrap:
         definitions = [item for item in definitions if item.name not in bootstrap_names]
     if not include_development:

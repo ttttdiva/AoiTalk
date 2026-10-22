@@ -409,6 +409,36 @@ class BaseAssistant(ABC):
             current_loop = asyncio.get_running_loop()
             self.web_interface.set_user_input_callback(input_callback, current_loop)
             self.web_interface.set_llm_client_change_callback(self._activate_llm_client)
+            retire_session_cache = getattr(
+                self,
+                "retire_response_model_session",
+                None,
+            )
+            if callable(retire_session_cache) and hasattr(
+                self.web_interface,
+                "set_session_llm_route_change_callback",
+            ):
+                async def _retire_session_cache(session_id):
+                    async def invoke():
+                        return await retire_session_cache(session_id)
+
+                    try:
+                        callback_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        callback_loop = None
+                    if callback_loop is current_loop:
+                        return await invoke()
+                    if current_loop.is_closed() or not current_loop.is_running():
+                        raise RuntimeError("assistant event loop is unavailable")
+                    future = asyncio.run_coroutine_threadsafe(
+                        invoke(),
+                        current_loop,
+                    )
+                    return await asyncio.wrap_future(future)
+
+                self.web_interface.set_session_llm_route_change_callback(
+                    _retire_session_cache
+                )
             self.web_interface.set_llm_client(self.llm_client)
 
             # Set clear chat callback to start new session when user clicks "New Conversation"

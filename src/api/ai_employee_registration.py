@@ -20,7 +20,9 @@ def register_ai_employee_routes(server, require_auth):
     from .agent_automation_routes import create_agent_automation_router
     from .integration_action_routes import create_integration_action_router
     from .integration_credential_routes import create_integration_credential_router
+    from .crowdworks_marketplace_routes import create_crowdworks_marketplace_router
     from .telephony_routes import create_telephony_router
+    from .agent_delegation_routes import create_agent_delegation_routers
 
     services = build_ai_employee_services(server._db_manager, config=server.config)
     server.ai_employee_services = services
@@ -30,6 +32,7 @@ def register_ai_employee_routes(server, require_auth):
     routers = [
         create_agent_action_policy_router(**deps, policy_service=services.action_policy, config=server.config),
         create_integration_action_router(**deps, registry=services.registry),
+        create_crowdworks_marketplace_router(**deps, policy_service=services.action_policy, config=server.config),
         create_integration_credential_router(**deps, vault=services.credential_vault),
         create_telephony_router(**deps, service=services.telephony, config=server.config),
         create_agent_automation_router(
@@ -37,6 +40,7 @@ def register_ai_employee_routes(server, require_auth):
             service=services.automation, db_manager=server._db_manager, config=server.config,
         ),
     ]
+    routers.extend(create_agent_delegation_routers(**deps, config=server.config))
     for router in routers:
         server.app.include_router(router, dependencies=[Depends(_employee_runtime_enabled)])
     shutdown_hooks = getattr(server, "_shutdown_background_tasks", None)

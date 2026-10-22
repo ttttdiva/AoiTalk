@@ -62,50 +62,15 @@ type OgsRequestState = {
   requests: string[];
 };
 
-async function installTaskRoutes(page: Page): Promise<OgsRequestState> {
+async function installTaskRoutes(
+  page: Page,
+  taskDescription = description,
+): Promise<OgsRequestState> {
   await addAuthCookie(page);
   await mockAuthenticatedApis(page);
 
-  await page.addInitScript(() => {
-    const state = window as typeof window & {
-      __aoitalkFakeTwitterLoads?: number;
-      __aoitalkFakeTwitterRelease?: boolean;
-      __aoitalkFakeTwitterHeight?: number;
-    };
-    state.__aoitalkFakeTwitterLoads = 0;
-    state.__aoitalkFakeTwitterRelease = false;
-    state.__aoitalkFakeTwitterHeight = 760;
-    state.twttr = {
-      widgets: {
-        load(container?: HTMLElement) {
-          state.__aoitalkFakeTwitterLoads =
-            (state.__aoitalkFakeTwitterLoads ?? 0) + 1;
-          if (!container) return;
-          const renderFakeTweet = () => {
-            const tweet = container.querySelector("blockquote.twitter-tweet");
-            if (!tweet) return;
-            const iframe = document.createElement("iframe");
-            const height = state.__aoitalkFakeTwitterHeight ?? 760;
-            iframe.setAttribute("data-fake-twitter", "true");
-            iframe.style.display = "block";
-            iframe.style.width = "100%";
-            iframe.style.height = `${height}px`;
-            container.replaceChildren(iframe);
-          };
-          const waitForRelease = () => {
-            if (state.__aoitalkFakeTwitterRelease) {
-              renderFakeTweet();
-              return;
-            }
-            window.setTimeout(waitForRelease, 25);
-          };
-          waitForRelease();
-        },
-      },
-    };
-  });
-
   const ogpState: OgsRequestState = { requests: [] };
+  const taskResponse = { ...task, description: taskDescription };
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     const method = route.request().method();
@@ -132,11 +97,16 @@ async function installTaskRoutes(page: Page): Promise<OgsRequestState> {
       return;
     }
     if (url.pathname === "/api/tasks" && method === "GET") {
-      await route.fulfill({ json: [task] });
+      await route.fulfill({ json: [taskResponse] });
       return;
     }
     if (url.pathname === `/api/tasks/${task.id}` && method === "GET") {
-      await route.fulfill({ json: task });
+      await route.fulfill({ json: taskResponse });
+      return;
+    }
+    if (url.pathname === `/api/tasks/${task.id}` && method === "PATCH") {
+      Object.assign(taskResponse, route.request().postDataJSON());
+      await route.fulfill({ json: taskResponse });
       return;
     }
     if (
@@ -222,103 +192,63 @@ test("task link embeds stay lazy and preserve the reading anchor", async ({
   expect(ogpState.requests).not.toContain(farX);
   expect(ogpState.requests).not.toContain(farNormal);
 
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (window as typeof window & {
-            __aoitalkFakeTwitterLoads?: number;
-          }).__aoitalkFakeTwitterLoads ?? 0,
-      ),
-    )
-    .toBeGreaterThan(0);
-
-  const marker = editor.locator(".cm-line", { hasText: "ANCHOR-MARKER" });
-  await expect(marker).toBeVisible();
-  await marker.evaluate((element) =>
-    element.scrollIntoView({ block: "start", inline: "nearest" }),
-  );
-  const beforeTop = await marker.evaluate(
-    (element) => element.getBoundingClientRect().top,
-  );
-
-  await page.evaluate(() => {
-    (window as typeof window & { __aoitalkFakeTwitterRelease?: boolean }).__aoitalkFakeTwitterRelease = true;
-  });
-  await page.waitForTimeout(300);
-  const afterTop = await marker.evaluate(
-    (element) => element.getBoundingClientRect().top,
-  );
-  expect(Math.abs(afterTop - beforeTop)).toBeLessThanOrEqual(4);
-  await expect
-    .poll(() =>
-      page.evaluate((url) => {
-        const raw = window.sessionStorage.getItem(
-          "aoitalk.linkEmbed.xHeights.v1",
-        );
-        if (!raw) return null;
-        const values = JSON.parse(raw) as Record<string, number>;
-        return values[url] ?? null;
-      }, nearX),
-    )
-    .toBeGreaterThanOrEqual(760);
-
+  const card = editor.locator(".cm-link-embed-x-post").first();
+  await expect(card).toHaveCSS("height", "220px");
+  await expect(card).toContainText("fake tweet");
+  await expect(editor.locator("iframe")).toHaveCount(0);
+  const requestCount = ogpState.requests.filter(url => url === nearX).length;
   await page.reload();
-  const reopenedDialog = page.locator('[data-slot="dialog-content"]');
-  await expect(reopenedDialog).toBeVisible();
-  const reopenedX = reopenedDialog.locator(".cm-link-embed-x-post").first();
-  await expect(reopenedX).toBeVisible();
-  await expect
-    .poll(() => reopenedX.evaluate((element) => parseInt(getComputedStyle(element).minHeight, 10)))
-    .toBeGreaterThanOrEqual(760);
-
-  // Reopen with a smaller actual iframe to verify the cached reservation can
-  // shrink instead of pinning the previous 760px height forever.
-  await page.addInitScript(() => {
-    (window as typeof window & { __aoitalkFakeTwitterHeight?: number }).__aoitalkFakeTwitterHeight = 300;
-  });
-  await page.reload();
-  const shrinkDialog = page.locator('[data-slot="dialog-content"]');
-  await expect(shrinkDialog).toBeVisible();
-  const shrinkX = shrinkDialog.locator(".cm-link-embed-x-post").first();
-  await expect(shrinkX).toBeVisible();
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (window as typeof window & { __aoitalkFakeTwitterLoads?: number })
-            .__aoitalkFakeTwitterLoads ?? 0,
-      ),
-    )
-    .toBeGreaterThan(0);
-  await page.evaluate(() => {
-    (window as typeof window & { __aoitalkFakeTwitterRelease?: boolean }).__aoitalkFakeTwitterRelease = true;
-  });
-  await expect
-    .poll(() => shrinkX.evaluate((element) => parseInt(getComputedStyle(element).minHeight, 10)))
-    .toBeLessThanOrEqual(304);
-
-  await page.evaluate(() => {
-    (window as typeof window & { __aoitalkFakeTwitterRelease?: boolean }).__aoitalkFakeTwitterRelease = true;
-  });
-
-  const farScroller = shrinkDialog.locator(".cm-scroller");
-  await farScroller.evaluate((element) => {
-    element.scrollTop = element.scrollHeight;
-  });
-  await shrinkDialog.evaluate((element) => {
-    element.scrollTop = element.scrollHeight;
-  });
+  const reopened = page.locator('[data-slot="dialog-content"]');
+  await expect(reopened).toBeVisible();
+  const reopenedCard = reopened.locator(".cm-link-embed-x-post").first();
+  await expect(reopenedCard).toContainText("fake tweet");
+  await expect(reopenedCard).toHaveCSS("height", "220px");
+  expect(ogpState.requests.filter(url => url === nearX)).toHaveLength(requestCount);
+  await expect(reopened.locator("iframe")).toHaveCount(0);
+  const farScroller = reopened.locator(".cm-scroller");
+  await farScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await reopened.evaluate(element => { element.scrollTop = element.scrollHeight; });
   await expect.poll(() => ogpState.requests).toContain(farX);
-  // Rendering the far X post reserves its measured height; scroll to the new
-  // bottom once more so the adjacent normal URL enters the near-viewport band.
-  await farScroller.evaluate((element) => {
-    element.scrollTop = element.scrollHeight - element.clientHeight;
-  });
-  await reopenedDialog.evaluate((element) => {
-    element.scrollTop = element.scrollHeight - element.clientHeight;
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
-  await page.waitForTimeout(100);
+  await farScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await reopened.evaluate(element => { element.scrollTop = element.scrollHeight; });
   await expect.poll(() => ogpState.requests).toContain(farNormal);
+});
+
+test("unavailable task previews stay compact after reload and mode changes", async ({ page }) => {
+  const privateUrl = "https://studio.tripo3d.ai/workspace/generate/4259900b-bdd8-41d7-85ea-a59ba0786dfb";
+  await installTaskRoutes(page, privateUrl);
+  let requests = 0;
+  await page.route("**/api/python-proxy/ogp?*", async (route) => {
+    requests += 1;
+    await route.fulfill({ json: { success: false, url: privateUrl } });
+  });
+  // The private destination must never be contacted by this regression test.
+  await page.route("https://studio.tripo3d.ai/**", (route) => route.abort());
+  await page.goto(`/tasks/${task.id}`);
+  const editor = page.locator('[data-slot="dialog-content"] .cm-editor');
+  const card = editor.locator(".cm-link-embed-fallback");
+  await expect(card.getByRole("link", { name: privateUrl, exact: true })).toBeVisible();
+  await expect(card).not.toContainText("リンク情報を取得中...");
+  await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeLessThan(80);
+  await expect.poll(() => requests).toBe(1);
+
+  await page.reload();
+  await expect(card.getByRole("link", { name: privateUrl, exact: true })).toBeVisible();
+  await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeLessThan(80);
+  expect(requests).toBe(1);
+
+  await card.hover();
+  await card.getByTitle("リンクに戻す", { exact: true }).click();
+  const plain = editor.locator(".cm-link-inline");
+  await expect(plain.getByRole("link", { name: privateUrl })).toBeVisible();
+  await plain.hover();
+  await plain.getByTitle("埋め込みで表示", { exact: true }).click();
+  await expect(card).toBeVisible();
+  await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeLessThan(80);
+  expect(requests).toBe(1);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(card.getByRole("link", { name: privateUrl })).toBeVisible();
+  await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeLessThan(80);
+  expect(await card.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
 });

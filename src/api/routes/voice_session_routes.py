@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import base64
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,6 +14,7 @@ from ...services.live_voice_service import (
     LiveVoiceError,
     LiveVoicePermissionError,
 )
+from ...services.mobile_voice_service import MAX_AUDIO_BYTES, MAX_SPEECH_CHARS
 from ...services.voice_sessions.service import VoiceSessionService
 from ..router_helpers import cookie_auth_dependency
 from .live_voice_routes import _http_error, _maybe_await, _read_bounded_body
@@ -33,6 +35,23 @@ class VoiceSessionCreateRequest(BaseModel):
 
 class VoiceSessionWebRtcRequest(BaseModel):
     sdp: str = Field(min_length=1, max_length=MAX_SDP_BODY_BYTES)
+
+
+class VoiceSessionPipelineTranscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    audio_base64: str = Field(
+        min_length=1, max_length=4 * ((MAX_AUDIO_BYTES + 2) // 3)
+    )
+    mime_type: Literal[
+        "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/wav", "audio/webm"
+    ] = "audio/webm"
+
+
+class VoiceSessionPipelineSpeechRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=MAX_SPEECH_CHARS)
 
 
 def register_voice_session_routes(
@@ -120,6 +139,46 @@ def register_voice_session_routes(
             raise _http_error(exc) from exc
         return {"success": True, **dict(result)}
 
+    @app.post("/api/voice-sessions/{voice_session_id}/pipeline/transcriptions")
+    async def transcribe_voice_session_pipeline(
+        voice_session_id: str,
+        payload: VoiceSessionPipelineTranscriptionRequest,
+        request: Request,
+        _: None = Depends(require_auth),
+    ) -> dict[str, Any]:
+        actor = await _actor(request)
+        try:
+            return await runtime.transcribe_pipeline(
+                voice_session_id,
+                actor,
+                audio_base64=payload.audio_base64,
+                mime_type=payload.mime_type,
+            )
+        except LiveVoiceError as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/voice-sessions/{voice_session_id}/pipeline/speech")
+    async def synthesize_voice_session_pipeline(
+        voice_session_id: str,
+        payload: VoiceSessionPipelineSpeechRequest,
+        request: Request,
+        _: None = Depends(require_auth),
+    ) -> dict[str, Any]:
+        actor = await _actor(request)
+        text = payload.text.strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="読み上げる文章が空です。")
+        try:
+            audio = await runtime.synthesize_pipeline(
+                voice_session_id, actor, text=text
+            )
+        except LiveVoiceError as exc:
+            raise _http_error(exc) from exc
+        return {
+            "audio_base64": base64.b64encode(audio).decode("ascii"),
+            "mime_type": "audio/wav",
+        }
+
     @app.post("/api/voice-sessions/{voice_session_id}/interrupt")
     async def interrupt_voice_session_route(
         voice_session_id: str,
@@ -177,4 +236,9 @@ def register_voice_session_routes(
     return runtime
 
 
-__all__ = ["VoiceSessionCreateRequest", "register_voice_session_routes"]
+__all__ = [
+    "VoiceSessionCreateRequest",
+    "VoiceSessionPipelineSpeechRequest",
+    "VoiceSessionPipelineTranscriptionRequest",
+    "register_voice_session_routes",
+]

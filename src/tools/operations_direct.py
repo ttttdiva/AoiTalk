@@ -24,7 +24,7 @@ from ..memory.models.operations import (
     safe_opportunity_title,
     sanitize_source_url,
 )
-from ..services.operations_service import OperationsService
+from ..services.operations_service import OperationsService, create_operations_service
 from ..services.project_context import get_runtime_project_context
 from ..services.turn_context import get_turn_context
 from .core import ToolDefinition, ToolParam, tool
@@ -557,7 +557,7 @@ async def _invoke(service_method: str, **kwargs: Any) -> Any:
     manager = get_database_manager()
     session = await manager.get_session()
     try:
-        return await getattr(OperationsService(), service_method)(session, actor, **kwargs)
+        return await getattr(create_operations_service(), service_method)(session, actor, **kwargs)
     finally:
         close = getattr(session, "close", None)
         if callable(close):
@@ -2798,7 +2798,7 @@ async def media_operations_propose_action(
 
     key_value = _validate_text(idempotency_key, "idempotency_key", 255, required=True)
     result = await _invoke_media_service(
-        OperationsService(),
+        create_operations_service(),
         "create_media_action",
         action_type=action_type,
         platform=platform,

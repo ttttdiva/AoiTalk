@@ -16,6 +16,7 @@ import {
   SelectTrigger,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 interface SettingsPayload {
   settings?: {
@@ -167,6 +168,7 @@ export function SearchSettingsSection() {
         tabIndex={0}
         aria-expanded={expanded}
         aria-controls="search-provider-content"
+        data-settings-target-activation="search-provider"
         onClick={() => setExpanded((value) => !value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
@@ -200,7 +202,14 @@ export function SearchSettingsSection() {
           ) : (
             <>
               <div className="space-y-2">
-                <Label className="text-xs">検索プロバイダ</Label>
+                <div className="inline-flex items-center gap-1">
+                  <Label className="text-xs">検索プロバイダ</Label>
+                  {provider ? (
+                    <HelpPopover label="検索プロバイダ">
+                      {SEARCH_PROVIDER_DESCRIPTIONS[provider] ?? ""}
+                    </HelpPopover>
+                  ) : null}
+                </div>
                 <Select
                   value={provider ?? ""}
                   onValueChange={(value) => {
@@ -220,9 +229,6 @@ export function SearchSettingsSection() {
                   </SelectContent>
                 </Select>
               </div>
-              <p className="max-w-2xl text-xs text-muted-foreground">
-                {provider ? (SEARCH_PROVIDER_DESCRIPTIONS[provider] ?? "") : ""}
-              </p>
               {provider === "openai" && (
                 <form
                   className="space-y-2"

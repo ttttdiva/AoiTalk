@@ -429,7 +429,11 @@ class TelephonyService:
         route_spec = ((profile.get("overrides") or {}).get("employee_operator") or profile.get("default_route")) if profile else None
         token = bind_session_main_route_override(None)
         try:
-            selected = _apply_execution_route(route_spec, resolve_execution_main_route(self.config))
+            selected = _apply_execution_route(
+                route_spec,
+                resolve_execution_main_route(self.config),
+                config=self.config,
+            )
         finally:
             reset_session_main_route_override(token)
         if selected.get("provider") != "openai" or selected.get("model") not in DEFAULT_REALTIME_MODELS:
@@ -603,7 +607,7 @@ class TelephonyService:
         async with self.session() as session:
             call, route, connection = await self._current_call(session, call_id, expected="accepting")
             revision = await session.get(AgentRevision, route.agent_revision_id)
-            conversation = ConversationSession(id=uuid4(), user_id=str(connection.owner_user_id), character_name="AI employee",
+            conversation = ConversationSession(id=uuid4(), user_id=str(connection.owner_user_id), character_name="Agent",
                 title="Telephone reception", project_id=connection.project_id,
                 context={"source": "telephony", "telephony_call_id": str(call.id), "agent_id": str(call.agent_id), "agent_revision_id": str(call.agent_revision_id)})
             session.add(conversation)

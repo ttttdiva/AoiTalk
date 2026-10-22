@@ -62,6 +62,8 @@ _PLATFORM_ATTRIBUTES: tuple[tuple[str, str], ...] = (
     ("patreon", "platform_patreon"),
     ("youtube", "platform_youtube"),
     ("instagram", "platform_instagram"),
+    ("fanza", "platform_fanza"),
+    ("tiktok", "platform_tiktok"),
 )
 
 
@@ -362,6 +364,9 @@ def _normalize_evidence(values: Any) -> list[dict[str, Any]]:
     return result
 
 
+_PUBLICATION_LIMIT_UNSET = object()
+
+
 def _normalize_program_revision(
     *,
     name: Any,
@@ -376,8 +381,11 @@ def _normalize_program_revision(
     default_qa_policy_ref: Any = None,
     experiment_ref: Any = None,
     draft_generation_policy: Any = "human_review",
+    max_publications: Any = None,
 ) -> dict[str, Any]:
-    return {
+    if max_publications is not None and (type(max_publications) is not int or not 0 <= max_publications <= 10000):
+        raise MediaOperationsValidationError("max_publications must be null or an integer between 0 and 10000")
+    content = {
         "name": _required_text(name, "name", 255),
         "objective": _required_text(objective, "objective", 4000),
         "content_type": _required_text(content_type or "article", "content_type", 64),
@@ -391,6 +399,10 @@ def _normalize_program_revision(
         "experiment_ref": _optional_text(experiment_ref, "experiment_ref", 164),
         "draft_generation_policy": _required_text(draft_generation_policy or "human_review", "draft_generation_policy", 64),
     }
+    # Omitted/unlimited policies preserve legacy recipe and idempotency hashes.
+    if max_publications is not None:
+        content["max_publications"] = max_publications
+    return content
 
 
 def _normalize_finding_ids(values: Any) -> list[UUID]:
@@ -580,6 +592,8 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             platform_patreon="patreon" in selected,
             platform_youtube="youtube" in selected,
             platform_instagram="instagram" in selected,
+            platform_fanza="fanza" in selected,
+            platform_tiktok="tiktok" in selected,
             cadence=content["cadence"],
             timezone=content["timezone"],
             schedule_json=dict(content["schedule"]),
@@ -3119,6 +3133,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             default_qa_policy_ref=content["default_qa_policy_ref"],
             experiment_ref=content["experiment_ref"],
             draft_generation_policy=content["draft_generation_policy"],
+            max_publications=content.get("max_publications"),
             content_hash=sha256_json(content),
             idempotency_key=idempotency_key,
             created_by=actor_id,
@@ -3213,6 +3228,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
         default_qa_policy_ref: Any = None,
         experiment_ref: Any = None,
         draft_generation_policy: Any = "human_review",
+        max_publications: Any = None,
         state: Any = "draft",
         enabled: Any = False,
         idempotency_key: Any,
@@ -3247,6 +3263,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             default_qa_policy_ref=default_qa_policy_ref,
             experiment_ref=experiment_ref,
             draft_generation_policy=draft_generation_policy,
+            max_publications=max_publications,
         )
         create_hash = sha256_json(
             {
@@ -3446,6 +3463,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
         default_qa_policy_ref: Any = None,
         experiment_ref: Any = None,
         draft_generation_policy: Any = None,
+        max_publications: Any = _PUBLICATION_LIMIT_UNSET,
         idempotency_key: Any,
     ) -> dict[str, Any]:
         session = self._resolve_session(session)
@@ -3467,6 +3485,8 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             program,
             permission="write",
         )
+        from .media_publication_budget import lock_publication_program
+        await lock_publication_program(session, program.id)
         key = _idempotency_key(idempotency_key)
         latest = await self._scalar(
             session,
@@ -3488,6 +3508,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             default_qa_policy_ref=default_qa_policy_ref if default_qa_policy_ref is not None else getattr(latest, "default_qa_policy_ref", None),
             experiment_ref=experiment_ref if experiment_ref is not None else getattr(latest, "experiment_ref", None),
             draft_generation_policy=draft_generation_policy if draft_generation_policy is not None else getattr(latest, "draft_generation_policy", "human_review"),
+            max_publications=getattr(latest, "max_publications", None) if max_publications is _PUBLICATION_LIMIT_UNSET else max_publications,
         )
         content_hash = sha256_json(content)
 
@@ -3610,6 +3631,196 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             ],
         }
 
+    async def build_generation_context(
+        self,
+        session: Any,
+        actor: Any,
+        content_item_id: UUID | str,
+        *,
+        persona_id: UUID | str,
+    ) -> dict[str, Any]:
+        """Snapshot only this item's scoped research; never grant execution rights.
+
+        The existing editorial brief contains the author's requirements and
+        acceptance checks. Research statements/notes remain attributed data,
+        including edition/use-scope caveats, rather than generator commands.
+        No source is fetched and no verification status is inferred here.
+        """
+
+        item = await self._get_row(session, ContentItem, content_item_id, "content_item_id")
+        await self._assert_entity_access(session, actor, item, permission="read")
+
+        async def scoped(row: Any) -> None:
+            await self._assert_entity_access(session, actor, row, permission="read")
+            if row.project_id != item.project_id or (
+                item.project_id is None and row.owner_user_id != item.owner_user_id
+            ):
+                raise MediaOperationsValidationError("generation research must share ContentItem owner/project scope")
+
+        program = await self._get_row(session, EditorialProgram, item.editorial_program_id, "editorial_program_id")
+        await scoped(program)
+        if program.persona_id != _as_uuid(persona_id, "persona_id"):
+            raise MediaOperationsValidationError("generation research must share the pinned Persona")
+
+        async def run_snapshot(run_id: UUID) -> dict[str, Any]:
+            run = await self._get_row(session, ResearchRun, run_id, "research_run_id")
+            await scoped(run)
+            routine = await self._get_row(session, ResearchRoutine, run.research_routine_id, "research_routine_id")
+            revision = await self._get_row(session, ResearchRoutineRevision, run.research_routine_revision_id, "routine_revision_id")
+            await scoped(routine)
+            await scoped(revision)
+            if (
+                revision.research_routine_id != routine.id
+                or revision.content_hash != run.routine_content_hash
+                or (routine.persona_id is not None and routine.persona_id != program.persona_id)
+            ):
+                raise MediaOperationsValidationError("generation research graph is inconsistent")
+            return {
+                "run_id": str(run.id),
+                "run_hash": run.run_hash,
+                "routine_revision_id": str(revision.id),
+                "routine_version": revision.version,
+                "routine_content_hash": run.routine_content_hash,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "omissions": list(run.omissions_json or []),
+            }
+
+        candidate_ids = _normalize_optional_ids(item.candidate_refs_json or [], "candidate_ids")
+        links = await self._scalars(
+            session, select(ContentItemFinding)
+            .where(ContentItemFinding.content_item_id == item.id)
+            .order_by(ContentItemFinding.ordinal.asc()),
+        )
+        if len(links) > 20:
+            raise MediaOperationsValidationError("too many generation research findings")
+        candidates = []
+        for candidate_id in candidate_ids:
+            candidate = await self._get_row(session, ResearchCandidate, candidate_id, "candidate_id")
+            await scoped(candidate)
+            if not await self._candidate_graph_is_consistent(session, candidate):
+                raise MediaOperationsValidationError("generation research candidate graph is inconsistent")
+            if candidate.status not in {"accepted", "promoted"}:
+                raise MediaOperationsConflictError("generation research candidate is no longer accepted")
+            # The legacy display projection may truncate malformed records.
+            # Validate first so a trailing rights/edition caveat cannot vanish.
+            title = _required_text(candidate.title, "candidate.title", 500)
+            summary_text = _required_text(candidate.summary, "candidate.summary", 8000)
+            reason = _optional_text(candidate.reason, "candidate.reason", 4000)
+            raw_evidence = candidate.evidence_json
+            if not isinstance(raw_evidence, list) or not 1 <= len(raw_evidence) <= 20:
+                raise MediaOperationsValidationError("candidate evidence must contain 1 to 20 items")
+            wire_evidence = []
+            for raw in raw_evidence:
+                if not isinstance(raw, Mapping):
+                    raise MediaOperationsValidationError("invalid candidate evidence")
+                kind = raw.get("evidence_type") or raw.get("type")
+                wire_evidence.append({
+                    "type": kind, "label": raw.get("label"), "note": raw.get("note"),
+                    **({"url": raw.get("source_url") or raw.get("url")} if kind == "url" else {
+                        "sha256": raw.get("artifact_sha256") or raw.get("sha256"),
+                        "mime_type": raw.get("artifact_mime_type") or raw.get("mime_type"),
+                    }),
+                })
+            normalized_evidence = _normalize_evidence(wire_evidence)
+            snapshot = self._candidate_decision_snapshot(candidate)
+            snapshot.update(title=title, summary=summary_text, reason=reason)
+            snapshot["evidence"] = [
+                {key: evidence[key] for key in ("evidence_hash", "label", "note", "provenance")}
+                for evidence in normalized_evidence
+            ]
+            if candidate.source_url:
+                snapshot["source_url"] = _validated_resource_url(candidate.source_url)
+            # Ranking signals are neither verified demand nor our revenue.
+            for field in ("relevance_score", "freshness_score", "expires_at"):
+                snapshot.pop(field, None)
+            snapshot["claim_kind"] = "candidate"
+            snapshot["decision_version"] = int(candidate.decision_version or 0)
+            snapshot["run"] = await run_snapshot(candidate.research_run_id)
+            candidates.append(snapshot)
+
+        findings = []
+        for link in links:
+            await scoped(link)
+            finding = await self._get_row(session, ResearchFinding, link.finding_id, "finding_id")
+            await scoped(finding)
+            evidence_rows = await self._scalars(
+                session,
+                select(ResearchFindingEvidence)
+                .where(ResearchFindingEvidence.finding_id == finding.id)
+                .order_by(ResearchFindingEvidence.ordinal.asc()),
+            )
+            if not evidence_rows:
+                raise MediaOperationsConflictError("ResearchFinding evidence is incomplete")
+            evidence = []
+            for row in evidence_rows:
+                await scoped(row)
+                # Reuse the canonical evidence validator, including safe URLs.
+                wire = {
+                    "type": row.evidence_type, "label": row.label, "note": row.note,
+                    **({"url": row.source_url} if row.evidence_type == "url" else {
+                        "sha256": row.artifact_sha256, "mime_type": row.artifact_mime_type,
+                    }),
+                }
+                normalized = _normalize_evidence([wire])[0]
+                if normalized["evidence_hash"] != row.evidence_hash:
+                    raise MediaOperationsConflictError("ResearchFinding evidence hash mismatch")
+                evidence.append({
+                    "id": str(row.id), "evidence_hash": row.evidence_hash,
+                    "label": row.label, "note": row.note,
+                    "provenance": normalized["provenance"],
+                })
+            findings.append({
+                "finding_id": str(finding.id), "finding_hash": finding.finding_hash,
+                "claim_kind": finding.kind, "statement": finding.statement,
+                "run": await run_snapshot(finding.research_run_id), "evidence": evidence,
+            })
+        context = {
+            "schema_version": "mediaops-generation-context/v1",
+            "content_item_id": str(item.id), "content_item_hash": item.content_hash,
+            "content_item_version": int(item.version or 1),
+            "persona_id": str(program.persona_id),
+            "owner_user_id": str(item.owner_user_id),
+            "project_id": str(item.project_id) if item.project_id else None,
+            "brief": {
+                "title": item.title, "requirements": item.brief,
+                "input_kind": item.input_kind or "research",
+                "created_by": str(item.created_by) if item.created_by else None,
+                "persona_revision_id": str(item.persona_revision_id) if item.persona_revision_id else None,
+                "objective": item.objective, "intended_audience": item.intended_audience,
+                "content_type": item.content_type,
+                "desired_assets": list(item.desired_assets_json or []),
+            },
+            "research": {"candidates": candidates, "findings": findings},
+            "use_policy": "reference_only_no_reuse",
+            "verification": {"rights": "unknown", "acceptance": "not_run", "revenue": "unverified"},
+        }
+        if item.persona_revision_id is not None:
+            pinned = await self._get_row(session, PersonaRevision, item.persona_revision_id, "persona_revision_id")
+            await scoped(pinned)
+            if pinned.persona_id != program.persona_id:
+                raise MediaOperationsValidationError("generation Persona revision belongs to another brand")
+            policy = pinned.research_policy_json or {}
+            if policy.get("schema") == "mediaops-brand-portfolio/v1":
+                from .media_brand_portfolio_service import SOURCE_SHA256
+
+                if policy.get("source_sha256") != SOURCE_SHA256:
+                    raise MediaOperationsConflictError("generation brand original source checksum mismatch")
+                context["brand"] = {
+                    "persona_revision_id": str(pinned.id), "persona_revision_hash": pinned.content_hash,
+                    "display_name": pinned.display_name, "brand_key": policy.get("brand_slug"),
+                    "creative_direction": pinned.creative_direction,
+                    "content_pillars": list(pinned.content_pillars_json or []),
+                    "kpis": list(pinned.kpi_objectives_json or []),
+                    "target": policy.get("target"), "qa": policy.get("qa", []),
+                    "references": policy.get("references", []), "unknowns": policy.get("unknowns", []),
+                    "source": {key: policy.get(key) for key in (
+                        "library_file_id", "source_sha256", "source_paths",
+                        "custom_instructions_sha256", "project_brief_sha256",
+                    )},
+                    "claim_kind": "adopted_design", "qa_status": "not_run",
+                }
+        return {**context, "context_hash": sha256_json(context)}
+
     async def create_content_item(
         self,
         session: Any | None = None,
@@ -3618,6 +3829,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
         editorial_program_id: UUID | str,
         title: Any,
         brief: Any,
+        input_kind: Any = "research",
         finding_ids: Any = None,
         candidate_ids: Any = None,
         persona_revision_id: UUID | str | None = None,
@@ -3652,10 +3864,17 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
         )
         key = _idempotency_key(idempotency_key)
         title_value = _required_text(title, "title", 500)
+        if not isinstance(input_kind, str) or input_kind not in {"research", "user_authored"}:
+            raise MediaOperationsValidationError("input_kind must be research or user_authored")
         brief_value = _required_text(brief, "brief", 8000)
+        if input_kind == "user_authored":
+            # Validate without rewriting the author's exact original text.
+            if len(brief) > 8000:
+                raise MediaOperationsValidationError("brief exceeds maximum length")
+            brief_value = brief
         parsed_finding_ids = _normalize_optional_ids(finding_ids, "finding_ids")
         parsed_candidate_ids = _normalize_optional_ids(candidate_ids, "candidate_ids")
-        if not parsed_finding_ids and not parsed_candidate_ids:
+        if input_kind == "research" and not parsed_finding_ids and not parsed_candidate_ids:
             raise MediaOperationsValidationError(
                 "at least one finding_id or candidate_id is required"
             )
@@ -3669,6 +3888,20 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
         monetization_ref_value = _optional_text(monetization_ref, "monetization_ref", 164)
         experiment_ref_value = _optional_text(experiment_ref, "experiment_ref", 164)
         scheduled_value = _parse_datetime(scheduled_at, "scheduled_at")
+
+        # A retry of an original brief must retain its first immutable pin even
+        # if the Persona acquired a newer revision between requests.
+        if input_kind == "user_authored" and persona_revision_id in (None, ""):
+            prior = await self._scalar(
+                session, select(ContentItem).where(
+                    ContentItem.editorial_program_id == program.id,
+                    ContentItem.idempotency_key == key,
+                ).limit(1),
+            )
+            if prior is not None and prior.input_kind == "user_authored":
+                if prior.persona_revision_id is None:
+                    raise MediaOperationsConflictError("ContentItem immutable Persona revision is missing")
+                persona_revision_id = prior.persona_revision_id
 
         persona_revision = None
         if persona_revision_id not in (None, ""):
@@ -3759,6 +3992,8 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
 
         content_hash = sha256_json(
             {
+                # Preserve legacy research hashes/idempotency on existing rows.
+                **({"input_kind": input_kind} if input_kind == "user_authored" else {}),
                 "editorial_program_id": str(program.id),
                 "title": title_value,
                 "brief": brief_value,
@@ -3818,6 +4053,7 @@ class MediaOperationsResearchService(MediaOperationsSetupService):
             project_id=program.project_id,
             title=title_value,
             brief=brief_value,
+            input_kind=input_kind,
             version=1,
             status="draft",
             persona_revision_id=persona_revision.id if persona_revision is not None else None,

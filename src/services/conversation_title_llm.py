@@ -85,6 +85,12 @@ async def generate_title_with_llm_client(
     if llm_client is None:
         return None
 
+    # A Strata title uses the same native runtime and prompt cache as chat.
+    # Timing out its thread cannot stop the inference. Use the existing local
+    # title fallback rather than enqueueing background work on that runtime.
+    if getattr(llm_client, "_managed_local_runtime", None) == "strata":
+        return None
+
     if callable(getattr(llm_client, "is_runtime_known_unavailable", None)):
         if llm_client.is_runtime_known_unavailable():
             return None

@@ -124,7 +124,7 @@ def _ensure_default_character(
             session.add(
                 Character(
                     id=uuid.uuid4(),
-                    name="案件管理アシスタント",
+                    name="シビュラ",
                     slug="project_manager",
                     character_type="assistant",
                     system_prompt=(
@@ -137,6 +137,7 @@ def _ensure_default_character(
                     fallback_reply="うまく整理できなかった。対象案件か、やりたい操作をもう少し具体的に教えて。",
                     goodbye_reply="また必要になったら呼んで。",
                     recognition_aliases=[
+                        "シビュラ",
                         "案件管理",
                         "案件管理アシスタント",
                         "プロジェクト管理",

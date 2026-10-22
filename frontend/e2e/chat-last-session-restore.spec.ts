@@ -3,6 +3,7 @@ import { SignJWT } from "jose";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { SESSION_COOKIE_NAME } from "../src/lib/session-cookie";
 
 const LAST_SESSION_KEY = "aoitalk_last_session_id";
 
@@ -60,25 +61,6 @@ async function mockCommonApis(page: import("@playwright/test").Page) {
       return;
     }
 
-    if (url.pathname === "/api/conversations/session-scenario/resume") {
-      await route.fulfill({
-        json: {
-          session: {
-            id: "session-scenario",
-            user_id: "user-1",
-            title: "[シナリオ] F02_Unfeart-R",
-            character_name: "scenario_F02_Unfeart-R",
-            message_count: 0,
-            is_active: true,
-            is_group_chat: false,
-            group_character_names: [],
-          },
-          messages: [],
-        },
-      });
-      return;
-    }
-
     if (url.pathname === "/api/conversations/session-normal/resume") {
       await route.fulfill({
         json: {
@@ -107,28 +89,13 @@ test.describe("チャットの最終セッション復元", () => {
     const token = await createSessionToken("user-1");
     await page.context().addCookies([
       {
-        name: "aoitalk_session",
+      name: SESSION_COOKIE_NAME,
         value: token,
         domain: "127.0.0.1",
         path: "/",
       },
     ]);
     await mockCommonApis(page);
-  });
-
-  test("保存済み最終セッションがシナリオの場合は通常チャット入口で復元しない", async ({
-    page,
-  }) => {
-    await page.addInitScript((key) => {
-      localStorage.setItem(key, "session-scenario");
-    }, LAST_SESSION_KEY);
-
-    await page.goto("/chat");
-    await expect(page).toHaveURL(/\/chat$/);
-    await expect(page.getByText("Scenario")).toHaveCount(0);
-    await expect
-      .poll(() => page.evaluate((key) => localStorage.getItem(key), LAST_SESSION_KEY))
-      .toBeNull();
   });
 
   test("保存済み最終セッションが通常チャットの場合は復元する", async ({

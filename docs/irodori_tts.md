@@ -5,12 +5,13 @@
 ## 現在のモデルと vendored runtime
 
 - 既定 checkpoint: `Aratako/Irodori-TTS-v4.1-Small`
-- キャラクター selector: `v4.1-small`（既定） / `v4.1-anime` / `v3-voice-design`
+- キャラクター selector: `v4.1-small`（既定） / `v4-large` / `v4.1-anime` / `v3-voice-design`
+- v4 Large checkpoint: `Aratako/Irodori-TTS-v4-Large`
 - v4.1 Anime checkpoint: `phasefield-audio/Irodori-TTS-v4.1-Anime`
 - v3 VoiceDesign checkpoint: `Aratako/Irodori-TTS-600M-v3-VoiceDesign`
 - codec: `Aratako/Semantic-DACVAE-Japanese-32dim`
 - runtime: `src/vendor/irodori_tts/` に同梱（実行時に `D:/tool/Irodori-TTS` などの外部 checkout は参照しません）
-- vendored の基準 upstream commit: [`8224dafb46d0aba89209a8f905f1cb7e3299d9c1`](https://github.com/Aratako/Irodori-TTS/tree/8224dafb46d0aba89209a8f905f1cb7e3299d9c1)
+- vendored の基準 upstream commit: [`89f9d8fbd4d51ea019867ee1197725ede1df13c5`](https://github.com/Aratako/Irodori-TTS/tree/89f9d8fbd4d51ea019867ee1197725ede1df13c5)
 
 v4.1 は text・参照音声・caption を一つの checkpoint で扱い、duration predictor による出力時間の自動推定、複数参照の順序付き連結、絵文字を含むスタイル制御に対応します。v3 以前を廃止したわけではありません。キャラクターの `voice_parameters.irodori_model` に上記 selector を保存すると、通常読み上げと試聴が同じ checkpoint を使います。`hf_checkpoint` に明示した v2/v3・ローカル checkpoint は selector より優先してそのまま使用でき、`Aratako/Irodori-TTS-600M-v3-VoiceDesign` と従来の `ref_wav` / `ref_latent` も互換経路として残っています。旧設定の `voice_design_checkpoint` は、主 checkpoint が空の場合だけ `hf_checkpoint` に移行されます。
 
@@ -18,6 +19,7 @@ v4.1 は text・参照音声・caption を一つの checkpoint で扱い、durat
 
 - [Irodori-TTS upstream](https://github.com/Aratako/Irodori-TTS)
 - [Irodori-TTS-v4.1-Small model card](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small)
+- [Irodori-TTS-v4-Large model card](https://huggingface.co/Aratako/Irodori-TTS-v4-Large)
 - [Irodori-TTS-v4.1-Anime model card](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime)
 - [Semantic-DACVAE-Japanese-32dim model card](https://huggingface.co/Aratako/Semantic-DACVAE-Japanese-32dim)
 - [DACVAE upstream](https://github.com/facebookresearch/dacvae)
@@ -70,18 +72,17 @@ python -m pip install \
     soundfile tensorboard torch-stoi
 ```
 
-`irodori` extra には DACVAE を含めず、`huggingface-hub`、`transformers`（ModernBERT 対応）、`torch` / `torchaudio`、`torchcodec`、`safetensors`、`soundfile`、`sentencepiece`、`silentcipher` などの Irodori 固有依存だけを含めます。DACVAE と `descript-audiotools` は上記の no-deps + 明示 runtime imports の経路で一度だけ導入します。Windows NVIDIA 環境では PyTorch 2.10.0/cu128 が正常系ですが、Linux/WSL の setup は別方針です。Irodori の合成自体は CPU / CUDA / MPS / XPU に対応しますが、GPU が利用できない場合はアダプターが CPU にフォールバックします。
+`irodori` extra には DACVAE を含めず、`huggingface-hub`、`transformers`（v4 Large の T5Gemma2 に必要な 5.12+）、`torch` / `torchaudio`、`torchcodec`、`safetensors`、`soundfile`、`sentencepiece`、`silentcipher` などの Irodori 固有依存だけを含めます。DACVAE と `descript-audiotools` は上記の no-deps + 明示 runtime imports の経路で一度だけ導入します。Windows NVIDIA 環境では PyTorch 2.10.0/cu128 が正常系ですが、Linux/WSL の setup は別方針です。Irodori の合成自体は CPU / CUDA / MPS / XPU に対応しますが、GPU が利用できない場合はアダプターが CPU にフォールバックします。
 
 ### 公式 upstream と AoiTalk の依存レンジ
 
-公式 upstream の基準 commit [`pyproject.toml`](https://github.com/Aratako/Irodori-TTS/blob/8224dafb46d0aba89209a8f905f1cb7e3299d9c1/pyproject.toml) は、`transformers>=5.12.1,<6` と `sentencepiece<0.2`（metadata 上は `>=0.1.99,<0.2`）を要求します。一方、AoiTalk は Irodori だけでなく MioTTS/yomi と同じ venv で動かすため、`pyproject.toml` の採用レンジを次のようにしています。
+公式 upstream の基準 commit [`pyproject.toml`](https://github.com/Aratako/Irodori-TTS/blob/89f9d8fbd4d51ea019867ee1197725ede1df13c5/pyproject.toml) は、`transformers>=5.12.1,<6` を要求します。AoiTalk の `irodori` extra もこれに合わせ、`transformers>=5.12.1,<6` と `huggingface-hub>=1.5.0,<1.16.3` を使います。v4 Large の T5Gemma2 条件付けはこのレンジが必要です。`sentencepiece` は MioTTS と共有するため `>=0.2.1,<0.3` です。
 
-- `transformers>=4.57.6,<6`（MioTTS/yomi-linter の `<5` 制約も同時に選ぶ場合、resolver が実際に選べる上限は `<5`）
-- `sentencepiece>=0.2.1,<0.3`
+既定のセットアップ経路（`audio` / `irodori` / `yomi-linter`）では ModernBERT 4.x shim は使いません。`miotts` extra の `transformers<5` は別経路であり、同時導入すると resolver が衝突します。
 
-この差分は upstream の v4.1 対応を取り下げるものではなく、既存の MioTTS/yomi 互換性を保つための統合上の選択です。vendored runtime の [`model.py`](../src/vendor/irodori_tts/model.py) には transformers 4.x と v5 checkpoint の差分を吸収する ModernBERT shim があります。`no_init_weights` は `transformers.initialization` からの import を試し、4.x では `transformers.modeling_utils` へフォールバックします。また checkpoint の `rope_parameters.full_attention` / `sliding_attention` にある `rope_theta` を、transformers 4.x の `global_rope_theta` / `local_rope_theta` へ変換します（transformers 5 の native 表現は変更しません）。
+vendored runtime の [`model.py`](../src/vendor/irodori_tts/model.py) は `text_encoder_type='pretrained'` かつ `model_type=t5gemma2` のとき `T5Gemma2TextEncoder` を読みます。`no_init_weights` は `transformers.initialization` から import します。
 
-依存検証の範囲にも注意してください。`.[irodori,miotts,yomi-linter]` 全体の `pip install --dry-run` は、既存の base dependency にある `openai` / `mem0ai` の競合で失敗するため、全 extra の dry-run 成功を Irodori の検証結果とはみなしません。Irodori の確認は `pyproject.toml` の Irodori-specific extras、setup script の no-deps DACVAE + 明示 runtime imports、vendored runtime の import/compile（`tests/test_irodori_vendor.py`）、およびこのページのローカル smoke の範囲で行います。MioTTS/yomi を同時に使う場合は上記の統合レンジを優先し、全 extra の依存解決を合否判定にしないでください。
+依存検証の範囲にも注意してください。`.[irodori,miotts,yomi-linter]` 全体の `pip install --dry-run` は、既存の base dependency にある `openai` / `mem0ai` の競合で失敗するため、全 extra の dry-run 成功を Irodori の検証結果とはみなしません。Irodori の確認は `pyproject.toml` の Irodori-specific extras、setup script の no-deps DACVAE + 明示 runtime imports、vendored runtime の import/compile（`tests/test_irodori_vendor.py`）、およびこのページのローカル smoke の範囲で行います。`miotts` extra を同時に入れる場合の transformers 衝突は既知であり、既定の `irodori` 導入経路の合否判定には使いません。
 
 ## 設定
 
@@ -119,7 +120,7 @@ tts_settings:
 }
 ```
 
-`irodori_model` から具体的な checkpoint への解決はバックエンドが一元管理します。`v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` に解決されます。既存の `hf_checkpoint`、ローカル checkpoint、`voice_design_checkpoint` がある場合は互換性のため selector より優先されます。モデルを Anime / v4.1 Small / v3 VoiceDesign 間で切り替えても、プロセス内の単一 runtime cache が要求された checkpoint をロードし直します。
+`irodori_model` から具体的な checkpoint への解決はバックエンドが一元管理します。`v4-large` は `Aratako/Irodori-TTS-v4-Large`、`v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` に解決されます。既存の `hf_checkpoint`、ローカル checkpoint、`voice_design_checkpoint` がある場合は互換性のため selector より優先されます。モデルを Large / Anime / v4.1 Small / v3 VoiceDesign 間で切り替えても、プロセス内の単一 runtime cache が要求された checkpoint をロードし直します。checkpoint の `flow_parameterization` が `meanflow` のときは、設定の `num_steps` が未指定または既定 40 なら runtime の MeanFlow 既定（4 NFE）を使い、40 以外を明示したときだけその値を渡します。Small など `rf_velocity` は従来どおり 40 です。
 
 既存の v3 VoiceDesign を明示的に使う場合は、checkpoint だけを置き換えます。明示値を既定 v4.1 へ上書きする処理はありません。
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from typing import (
     Annotated,
     Any,
@@ -16,6 +18,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from pydantic import (
@@ -23,6 +26,7 @@ from pydantic import (
     ConfigDict,
     Field,
     model_validator,
+    ValidationError,
 )
 from starlette.formparsers import MultiPartException, MultiPartParser
 
@@ -37,6 +41,8 @@ from ..services.media_credential_vault_service import MediaCredentialVaultServic
 from ..services.media_operations_setup_service import (
     MediaOperationsSetupService,
 )
+from ..services.media_provider_readiness_service import MediaProviderReadinessService
+from ..services.media_platform_oauth_service import MediaPlatformOAuthService
 from .media_operations_routes import (
     PersonaIntakeResponse,
     _actor,
@@ -109,7 +115,7 @@ class PersonaDraftPlatformsFact(
         MediaPlatform
     ] | None = Field(
         default=None,
-        max_length=6,
+        max_length=8,
     )
     evidence: str | None = Field(
         default=None,
@@ -649,7 +655,7 @@ def _credential_upload_openapi(
 _CHARACTER_CONNECTION_OPENAPI = _credential_upload_openapi(
     multipart_required=["platform", "account_ref", "display_name", "connection_type", "file"],
     multipart_properties={
-        "platform": {"type": "string", "enum": ["x", "pixiv", "patreon", "youtube", "instagram", "dlsite"]},
+        "platform": {"type": "string", "enum": [platform.value for platform in MediaPlatform]},
         "account_ref": {"type": "string", "minLength": 1, "maxLength": 255},
         "display_name": {"type": "string", "minLength": 1, "maxLength": 255},
         "connection_type": {"type": "string", "enum": ["cookie_export", "api_token", "oauth"]},
@@ -658,7 +664,7 @@ _CHARACTER_CONNECTION_OPENAPI = _credential_upload_openapi(
     },
     json_required=["platform", "account_ref", "display_name", "connection_type", "package"],
     json_properties={
-        "platform": {"type": "string", "enum": ["x", "pixiv", "patreon", "youtube", "instagram", "dlsite"]},
+        "platform": {"type": "string", "enum": [platform.value for platform in MediaPlatform]},
         "account_ref": {"type": "string", "minLength": 1, "maxLength": 255},
         "display_name": {"type": "string", "minLength": 1, "maxLength": 255},
         "connection_type": {"type": "string", "enum": ["cookie_export", "api_token", "oauth"]},
@@ -689,6 +695,47 @@ _ROTATE_CREDENTIAL_OPENAPI = _credential_upload_openapi(
 )
 
 
+class MediaOAuthMetadataResponse(_SetupResponseModel):
+    platform_account_id: str
+    project_id: str
+    platform: Literal["x", "youtube"]
+    account_ref: str
+    account_revision: int
+    credential_revision: int
+    configured: bool
+    blockers: list[str]
+    required_scopes: list[str]
+    redirect_uri: str | None = None
+    client_ref: str | None = None
+    external_checks: list[str]
+
+
+class MediaOAuthStartRequest(_SetupCommandModel):
+    expected_account_revision: int = Field(ge=1)
+    expected_credential_revision: int = Field(ge=0)
+
+
+class MediaOAuthStartResponse(_SetupResponseModel):
+    authorization_url: str
+    expires_at: str
+    platform_account_id: str
+    project_id: str
+    platform: Literal["x", "youtube"]
+    account_ref: str
+
+
+class MediaOAuthCallbackRequest(_SetupCommandModel):
+    state: str = Field(min_length=32, max_length=500)
+    code: str | None = Field(default=None, min_length=1, max_length=8192)
+    error: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class MediaOAuthCallbackResponse(_SetupResponseModel):
+    status: Literal["connected", "connection_failed", "consent_denied"]
+    platform_account_id: str
+    credential: MediaCredentialResponse | None = None
+
+
 def create_media_operations_setup_router(
     get_db_manager: Callable[[], Any],
     get_user_from_request: Callable[..., Any],
@@ -701,7 +748,13 @@ def create_media_operations_setup_router(
     setup = (
         MediaOperationsSetupService()
     )
+    from .media_brand_portfolio_routes import create_media_brand_portfolio_router
+    router.include_router(create_media_brand_portfolio_router(
+        get_db_manager, get_user_from_request, require_auth_dependency,
+    ))
     credential_vault = MediaCredentialVaultService()
+    provider_readiness = MediaProviderReadinessService()
+    oauth = MediaPlatformOAuthService(vault=credential_vault)
 
     async def current_actor(
         request: Request,
@@ -713,6 +766,44 @@ def create_media_operations_setup_router(
         return _principal_projection(
             user
         )
+
+    @router.get("/platform-accounts/{account_id}/oauth", response_model=MediaOAuthMetadataResponse,
+                operation_id="media_platform_oauth_metadata")
+    async def oauth_metadata(account_id: str, request: Request, _: Any = Depends(require_auth_dependency)):
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(oauth.metadata, session, actor, account_id))
+
+    @router.post("/platform-accounts/{account_id}/oauth/start", response_model=MediaOAuthStartResponse,
+                 operation_id="media_platform_oauth_start")
+    async def oauth_start(account_id: str, payload: MediaOAuthStartRequest, request: Request,
+                          response: Response, _: Any = Depends(require_auth_dependency)):
+        actor = await current_actor(request)
+        response.headers["Cache-Control"] = "no-store"
+        return await _with_session(get_db_manager, lambda session: _invoke(oauth.start, session, actor, account_id,
+            expected_account_revision=payload.expected_account_revision,
+            expected_credential_revision=payload.expected_credential_revision))
+
+    @router.post("/oauth/callback", response_model=MediaOAuthCallbackResponse,
+                 operation_id="media_platform_oauth_callback", openapi_extra={"requestBody": {"required": True,
+                 "content": {"application/json": {"schema": MediaOAuthCallbackRequest.model_json_schema()}}}})
+    async def oauth_callback(request: Request, response: Response, _: Any = Depends(require_auth_dependency)):
+        actor = await current_actor(request)
+        response.headers["Cache-Control"] = "no-store"
+        # Parse privately: default validation errors echo the authorization
+        # code in their input field. This route only returns bounded errors.
+        try:
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > 16 * 1024:
+                    raise ValueError()
+            payload = MediaOAuthCallbackRequest.model_validate(json.loads(body))
+            if (payload.code is None) == (payload.error is None):
+                raise ValueError()
+        except (ValueError, ValidationError):
+            raise HTTPException(status_code=422, detail="OAuth callback is invalid") from None
+        return await _with_session(get_db_manager, lambda session: _invoke(oauth.callback, session, actor,
+            state=payload.state, code=payload.code, error=payload.error))
 
     @router.post(
         "/persona-drafts",
@@ -1182,17 +1273,26 @@ def create_media_operations_setup_router(
         _: Any = Depends(require_auth_dependency),
     ) -> Any:
         actor = await current_actor(request)
-        return await _with_session(
-            get_db_manager,
-            lambda session: _invoke(
+
+        async def verify_and_refresh(session: Any) -> Any:
+            result = await _invoke(
                 credential_vault.verify_credential,
                 session,
                 actor,
                 account_id,
                 expected_revision=payload.expected_revision,
                 idempotency_key=idempotency_key,
-            ),
-        )
+            )
+            if isinstance(result, dict) and result.get("status") == "verified":
+                await _invoke(
+                    provider_readiness.refresh,
+                    session,
+                    actor,
+                    account_id,
+                )
+            return result
+
+        return await _with_session(get_db_manager, verify_and_refresh)
 
     @router.post(
         "/platform-accounts/{account_id}/credential/disable",
@@ -1219,6 +1319,46 @@ def create_media_operations_setup_router(
                 account_id,
                 expected_revision=payload.expected_revision,
                 idempotency_key=idempotency_key,
+            ),
+        )
+
+    @router.get(
+        "/platform-accounts/{account_id}/provider-readiness",
+        operation_id="media_get_provider_readiness",
+    )
+    async def get_provider_readiness(
+        account_id: str,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(
+                provider_readiness.get,
+                session,
+                actor,
+                account_id,
+            ),
+        )
+
+    @router.post(
+        "/platform-accounts/{account_id}/provider-readiness/refresh",
+        operation_id="media_refresh_provider_readiness",
+    )
+    async def refresh_provider_readiness(
+        account_id: str,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(
+                provider_readiness.refresh,
+                session,
+                actor,
+                account_id,
             ),
         )
 

@@ -16,8 +16,10 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatBytes } from "@/lib/utils";
@@ -31,7 +33,9 @@ import { FreeTeamSettingsPanel } from "./free-team-settings-panel";
 import { LlmExternalPrivacySettings } from "./llm-external-privacy-settings";
 import { LlmCloudAdvisorSettings } from "./llm-cloud-advisor-settings";
 import { LlamaCppRuntimePanel } from "./llama-cpp-runtime-panel";
+import { StrataRuntimePanel } from "./strata-runtime-panel";
 import { ManagedLocalRuntimePanel } from "./managed-local-runtime-panel";
+import { EmbeddingRuntimePanel } from "./embedding-runtime-panel";
 import { useLlmModelSection } from "./llm-model-section-state";
 import {
   hasDeploymentMetadata,
@@ -48,10 +52,12 @@ import {
   shouldShowLlamaCppRuntimePanel,
 } from "./llm-model-section-types";
 
+const CUSTOM_MODEL_OPTION = "__custom__";
+
 export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) {
   const [activeSection, setActiveSection] = useState<"base" | "routing" | "agent" | "privacy" | "cloud">("base");
   const {
-    expanded, setExpanded, catalog, provider, model, customModel, loading, refreshing, saving,
+    expanded, setExpanded, catalog, provider, model, customModel, customPickedProvider, setCustomPickedProvider, loading, refreshing, saving,
     pulling, pullInput, setPullInput, task, deletingModel, modelSearch, setModelSearch, setModelPage,
     baseUrl, setBaseUrl, apiKey, setApiKey, reasoningEffort, setReasoningEffort,
     llamaCppDraft, setLlamaCppDraft, llamaCppError,
@@ -72,7 +78,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
     handleProviderSettingsSave, handleLlamaCppSettingsSave, startPull, percent, hasProviderSettings, showConnectionSettings,
     showReasoningEffort, deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings, engineChangeError,
     localRuntimeStatus, localRuntimeTask, localRuntimeLoading, localRuntimePreparing,
-    startLocalRuntimePrepare,
+    startLocalRuntimePrepare, cancelLocalRuntimePrepare,
     agentTeamConfig, setAgentTeamConfig,
     cloudAdvisor, setCloudAdvisor, cloudAdvisorProviderIds,
     saveCloudAdvisorSettings,
@@ -87,6 +93,12 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
     window.addEventListener("settings:open-target", handleTargetOpen);
     return () => window.removeEventListener("settings:open-target", handleTargetOpen);
   }, [setExpanded]);
+
+  // 自由入力欄は「カスタム」選択時、または保存済みcustom IDがある場合だけ出す。
+  const supportsCustomModel = selectedProvider?.supports_custom_model !== false;
+  const customInputVisible = supportsCustomModel
+    && (customPickedProvider === provider || customModel.trim() !== "");
+  const pickerModelId = customModel.trim() || model;
 
   const effectiveProvider = resolveEffectiveProviderId(catalog?.deployment);
   const effectiveModel = resolveEffectiveModelId(catalog?.deployment);
@@ -149,7 +161,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
   const sectionItems = [
     { id: "base" as const, label: "Base Model", description: "Providerとモデル" },
     { id: "routing" as const, label: "Routing", description: "用途別の経路" },
-    { id: "agent" as const, label: "Agent Team", description: "Team構成" },
+    { id: "agent" as const, label: "Execution Team", description: "Team構成" },
     { id: "privacy" as const, label: "Privacy & Advanced", description: "保護とRuntime" },
     { id: "cloud" as const, label: "Cloud Advisor", description: "クラウド相談" },
   ];
@@ -406,22 +418,53 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                   <Label className="text-xs">モデル</Label>
                   <AppSelect
                     aria-label="LLMモデル"
-                    value={model}
-                    onChange={(event) => handleModelChange(event.target.value)}
+                    value={customInputVisible ? CUSTOM_MODEL_OPTION : pickerModelId}
+                    onChange={(event) => {
+                      if (event.target.value === CUSTOM_MODEL_OPTION) {
+                        setCustomPickedProvider(provider);
+                        return;
+                      }
+                      setCustomPickedProvider(null);
+                      handleModelChange(event.target.value);
+                    }}
                     disabled={saving}
                     className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
                   >
+                    {!customInputVisible && pickerModelId && !(selectedProvider?.models ?? []).some((item) => item.id === pickerModelId) && (
+                      <option value={pickerModelId}>{pickerModelId}</option>
+                    )}
                     {(selectedProvider?.models ?? []).map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.label}{modelSourceLabel(item) ? ` (${modelSourceLabel(item)})` : ""}
                       </option>
                     ))}
+                    {supportsCustomModel && <option value={CUSTOM_MODEL_OPTION}>カスタム（モデルIDを入力）</option>}
                   </AppSelect>
                 </div>
               </div>
 
-              {selectedProvider?.selection_kind !== "routing_profile" && <div className={modelTab === "language" ? "space-y-1" : "hidden"}>
-                <Label className="text-xs">カスタムモデルID</Label>
+              {isAdmin && (
+                <div className="flex justify-end">
+                  <Dialog>
+                    <DialogTrigger render={<Button size="sm" variant="outline" />}>
+                      日次予算を設定
+                    </DialogTrigger>
+                    <DialogContent size="4xl" className="max-h-[85vh] overflow-y-auto">
+                      <DialogHeader>
+                        <DialogTitle>日次予算</DialogTitle>
+                        <DialogDescription>組織で共有する停止上限を設定します。Base Modelの選択は保持されます。</DialogDescription>
+                      </DialogHeader>
+                      <FreeTeamSettingsPanel quotaOnly />
+                    </DialogContent>
+                  </Dialog>
+                </div>
+              )}
+
+              {selectedProvider?.selection_kind !== "routing_profile" && customInputVisible && <div className={modelTab === "language" ? "space-y-1" : "hidden"}>
+                <div className="inline-flex items-center gap-1">
+                  <Label className="text-xs">カスタムモデルID</Label>
+                  <HelpPopover label="カスタムモデルID">{providerHint(provider)}</HelpPopover>
+                </div>
                 <Input
                   value={customModel}
                   onChange={(event) => handleCustomModelChange(event.target.value)}
@@ -435,9 +478,6 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                   disabled={saving}
                   className="h-8"
                 />
-                <p className="text-[10px] text-muted-foreground">
-                  {providerHint(provider)}
-                </p>
                 {selectedModel?.source === "cli-suggested" && (
                   <p className="text-[10px] text-amber-600">
                     この候補はCLIから取得した一覧ではありません。必要ならCLI側の最新モデル名をカスタムモデルIDに直接入力してください。
@@ -457,7 +497,17 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                   )}
               </div>}
 
-              {showManagedLocalRuntimePanel && (
+              {managedLocalRuntime === "strata" && (
+                <StrataRuntimePanel
+                  key={`${selectedModelId}:${localRuntimeStatus?.strata ? "ready" : "loading"}`}
+                  status={localRuntimeStatus}
+                  task={localRuntimeTask}
+                  busy={localRuntimeLoading || localRuntimePreparing}
+                  onAction={startLocalRuntimePrepare}
+                  onCancel={cancelLocalRuntimePrepare}
+                />
+              )}
+              {showManagedLocalRuntimePanel && managedLocalRuntime !== "strata" && (
                 <ManagedLocalRuntimePanel
                   status={localRuntimeStatus}
                   task={localRuntimeTask}
@@ -472,10 +522,13 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
               </Tabs>
 
               <div className={activeSection === "privacy" ? "space-y-4" : "hidden"} aria-hidden={activeSection !== "privacy"}>
-                  <div>
+                  <div className="inline-flex items-center gap-1">
                     <h3 className="text-sm font-medium">Privacy & Advanced</h3>
-                    <p className="text-[11px] text-muted-foreground">外部送信の保護、Provider表示、固有Routing、ローカルRuntimeを管理します。</p>
+                    <HelpPopover label="Privacy & Advanced">
+                      外部送信の保護、Provider表示、固有Routing、ローカルRuntimeを管理します。
+                    </HelpPopover>
                   </div>
+                  {isAdmin && activeSection === "privacy" && <EmbeddingRuntimePanel />}
                   <LlmProviderVisibilitySettings
                     providers={catalog?.providers ?? []}
                     globalVisibility={catalog?.provider_visibility}
@@ -492,11 +545,12 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                         aria-label="llama.cpp model root設定"
                         className="space-y-3 rounded-md border border-emerald-500/30 bg-emerald-50/30 p-3 dark:bg-emerald-950/10"
                       >
-                        <div className="space-y-1">
+                        <div className="inline-flex items-center gap-1">
                           <h3 className="text-xs font-semibold">llama.cpp model root</h3>
-                          <p className="text-[10px] text-muted-foreground">
-                            managed modelの保存・検出先です。実行ファイルのruntime rootとは分離されています。
-                          </p>
+                          <HelpPopover label="llama.cpp model root">
+                            <p>managed modelの保存・検出先です。実行ファイルのruntime rootとは分離されています。</p>
+                            <p>空欄で保存するとrepository-localの既定値へ戻ります。環境変数由来の有効値は入力欄へ自動コピーしません。</p>
+                          </HelpPopover>
                         </div>
                         <div className="space-y-1">
                           <Label className="text-xs" htmlFor="llama-cpp-model-root">モデル保存先（任意のdirectory）</Label>
@@ -511,9 +565,6 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                             placeholder="空欄で既定値を使用"
                             disabled={!isAdmin || llamaCppModelRootLoading || llamaCppModelRootSaving || saving}
                           />
-                          <p className="text-[10px] text-muted-foreground">
-                            空欄で保存するとrepository-localの既定値へ戻ります。環境変数由来の有効値は入力欄へ自動コピーしません。
-                          </p>
                         </div>
                         <div className="grid gap-1 text-[10px] text-muted-foreground sm:grid-cols-3">
                           <p>現在: <code className="break-all">{llamaCppModelRootState?.model_root || "未取得"}</code></p>
@@ -560,7 +611,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                     </div>
                   )}
 
-                  {selectedProvider?.selection_kind === "routing_profile" && (
+                  {isAdmin && selectedProvider?.selection_kind === "routing_profile" && (
                     <FreeTeamSettingsPanel />
                   )}
 
@@ -639,6 +690,11 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                 {selectedProvider?.error && (
                   <span className="text-xs text-amber-600">
                     動的取得失敗: {selectedProvider.error}
+                  </span>
+                )}
+                {selectedProvider?.availability?.state === "standby" && (
+                  <span className="text-xs text-muted-foreground" role="status">
+                    {selectedProvider.availability.message || "停止中（送信時に自動起動）"}
                   </span>
                 )}
                 {selectedProvider && !selectedProvider.refreshed && (

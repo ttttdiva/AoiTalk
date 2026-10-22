@@ -24,6 +24,21 @@ from ..chat_attachment_utils import (
     sanitize_chat_attachments,
 )
 from ..conversation_title_events import maybe_generate_and_broadcast_session_title
+from ..post_response_work import (
+    schedule_after_visible_response,
+    schedule_deferred_session_index,
+)
+from ..response_model_cache import (
+    begin_response_model_use,
+    cached_response_model_client,
+    current_response_model_cache_session,
+    end_response_model_use,
+    remember_response_model_client,
+    response_model_cache_key,
+    response_model_cache_session,
+    retire_response_model_session,
+    wrap_response_model_title_work,
+)
 from ...llm.generation_policy import generation_policy_for_profile
 from ...llm.generation_error import empty_response_failure
 from ...services.agent_run_service import (
@@ -133,7 +148,8 @@ class VoiceChatMode(BaseAssistant):
         provider, model = identity
         effort = response_model.get("reasoning_effort") if response_model else None
         # An explicit turn effort must not reuse/mutate the shared active client.
-        cache_key = (*identity, str(effort)) if effort is not None else identity
+        session_id = current_response_model_cache_session()
+        cache_key = response_model_cache_key(session_id, provider, model, effort)
         if effort is None and base_llm_client and self._active_client_matches_response_model(
             base_llm_client,
             provider,
@@ -141,7 +157,7 @@ class VoiceChatMode(BaseAssistant):
         ):
             return base_llm_client
 
-        cached = self._response_model_clients.get(cache_key)
+        cached = cached_response_model_client(self, cache_key)
         if cached is not None:
             return cached
 
@@ -162,8 +178,18 @@ class VoiceChatMode(BaseAssistant):
         )
         if hasattr(client, "set_system_prompt"):
             client.set_system_prompt(system_prompt)
-        self._response_model_clients[cache_key] = client
+        remember_response_model_client(
+            self,
+            cache_key,
+            client,
+            session_id=session_id,
+        )
         return client
+
+    async def retire_response_model_session(self, session_id: str) -> dict[str, int]:
+        """Retire only cached response-model clients owned by one session."""
+
+        return await retire_response_model_session(self, session_id)
 
     def _get_chat_turn_persistence(self, llm_client=None) -> ChatTurnPersistence:
         memory_manager = getattr(llm_client, "memory_manager", None)
@@ -750,6 +776,10 @@ class VoiceChatMode(BaseAssistant):
             cloud_advisor_assessment=cloud_advisor_assessment,
         )
         persisted_message_context_token = None
+        pending_titles: list = []
+        index_memory_manager = None
+        llm_client = None
+        response_model_cache_use = None
         try:
             llm_client = (
                 self.response_handler.llm_client
@@ -761,6 +791,7 @@ class VoiceChatMode(BaseAssistant):
                 attachment_context,
             )
             chat_persistence = self._get_chat_turn_persistence(llm_client)
+            index_memory_manager = chat_persistence.memory_manager
             user_message = None
             search_tool_results: list[dict[str, Any]] = []
             if session_id and not skip_user_persistence:
@@ -874,13 +905,23 @@ class VoiceChatMode(BaseAssistant):
                             ),
                             agent_run_id=agent_run_id,
                         )
-                        await maybe_generate_and_broadcast_session_title(
-                            web_interface=self.web_interface,
-                            session_id=session_id,
-                            chat_persistence=chat_persistence,
-                            config=self.config,
-                            log_prefix="VoiceChatMode",
-                        )
+                        # 題名は画面に本文を出したあとで、このターンのモデルだけを使う。
+                        if llm_client is not None:
+                            pending_titles.append(
+                                wrap_response_model_title_work(
+                                    self,
+                                    llm_client,
+                                    session_id,
+                                    lambda llm_client=llm_client, session_id=session_id, chat_persistence=chat_persistence: maybe_generate_and_broadcast_session_title(
+                                        web_interface=self.web_interface,
+                                        session_id=session_id,
+                                        chat_persistence=chat_persistence,
+                                        config=self.config,
+                                        log_prefix="VoiceChatMode",
+                                        llm_client=llm_client,
+                                    ),
+                                )
+                            )
                     except Exception as e:
                         print(f"[VoiceChatMode] アシスタントメッセージ保存エラー: {e}")
 
@@ -1028,9 +1069,15 @@ class VoiceChatMode(BaseAssistant):
                     if hasattr(self.response_handler, "llm_client")
                     else None
                 )
-                llm_client = self._get_response_model_client(
-                    response_model,
-                    base_llm_client,
+                with response_model_cache_session(session_id):
+                    llm_client = self._get_response_model_client(
+                        response_model,
+                        base_llm_client,
+                    )
+                response_model_cache_use = begin_response_model_use(
+                    self,
+                    llm_client,
+                    session_id=session_id,
                 )
                 reset_turn_generation_metadata(llm_client)
                 original_handler_client = getattr(
@@ -1133,6 +1180,7 @@ class VoiceChatMode(BaseAssistant):
                     llm_client.external_persistence_enabled = bool(
                         user_message or (skip_user_persistence and session_id)
                     )
+                    llm_client._hold_cross_session_index = True
 
                 # ストリーミングコールバック: WebSocket経由でフロントエンドにイベントを配信
                 stream_callback = None
@@ -1286,12 +1334,14 @@ class VoiceChatMode(BaseAssistant):
             if session_id:
                 try:
                     async def _persist_error() -> None:
+                        nonlocal index_memory_manager
                         llm_client = (
                             self.response_handler.llm_client
                             if hasattr(self.response_handler, "llm_client")
                             else None
                         )
                         chat_persistence = self._get_chat_turn_persistence(llm_client)
+                        index_memory_manager = chat_persistence.memory_manager
                         fence_checker = getattr(
                             self.web_interface, "_is_fenced_generation_run", None
                         )
@@ -1358,6 +1408,19 @@ class VoiceChatMode(BaseAssistant):
             except Exception as web_error:
                 print(f"❌ Webインターフェースエラー送信失敗: {web_error}")
         finally:
+            for title_work in pending_titles:
+                schedule_after_visible_response(
+                    title_work,
+                    name="conversation-title",
+                )
+            end_response_model_use(self, response_model_cache_use)
+            schedule_deferred_session_index(index_memory_manager, session_id)
+            schedule_deferred_session_index(
+                getattr(llm_client, "memory_manager", None),
+                session_id,
+            )
+            if llm_client is not None:
+                llm_client._hold_cross_session_index = False
             if persisted_message_context_token is not None:
                 reset_turn_context(persisted_message_context_token)
             reset_turn_context(turn_context_token)

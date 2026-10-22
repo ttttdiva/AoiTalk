@@ -20,10 +20,10 @@ import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 
@@ -281,14 +281,20 @@ def _safe_url(value: Any) -> str | None:
         return None
     if parts.scheme.lower() not in {"http", "https"} or not parts.hostname or parts.username is not None or parts.password is not None:
         return None
-    # Query values are not needed for provenance and can contain signed tokens
-    # even when the parameter name is innocuous.  Drop the entire query.
+    # Preserve only a public YouTube video identifier. Other query values
+    # may contain credentials and are never retained in generic evidence.
+    query = ""
+    host = (parts.hostname or "").lower()
+    if (host == "youtube.com" or host.endswith(".youtube.com")) and parts.path == "/watch":
+        video_ids = [value for key, value in parse_qsl(parts.query) if key == "v"]
+        if len(video_ids) == 1 and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_ids[0]):
+            query = urlencode({"v": video_ids[0]})
     return urlunsplit(
         (
             parts.scheme.lower(),
-            parts.netloc,
+            parts.netloc.lower(),
             parts.path[:1_000],
-            "",
+            query,
             "",
         )
     )
@@ -1278,6 +1284,11 @@ class MediaResearchWorkSource(MediaWorkSource):
                             limit=20,
                             item_limit=255,
                         ),
+                        "follow_accounts": _bounded_text_list(_field(revision, "follow_accounts") or _field(revision, "follow_accounts_json"), limit=50, item_limit=164),
+                        "follow_tags": _bounded_text_list(_field(revision, "follow_tags") or _field(revision, "follow_tags_json"), limit=50, item_limit=120),
+                        "exclusions": _bounded_text_list(_field(revision, "exclusions") or _field(revision, "exclusions_json"), limit=50, item_limit=500),
+                        "freshness_hours": int(_field(revision, "freshness_hours", 168) or 168),
+                        "max_candidates": int(_field(revision, "max_candidates", 20) or 20),
                         "objective": _text(_field(revision, "objective"), 1_000),
                         "operator_assignment_id": operator.get("assignment_id"),
                         "review_policy": _text(_field(revision, "review_policy"), 64),
@@ -1304,6 +1315,23 @@ class MediaGenerationWorkSource(MediaWorkSource):
             except Exception:
                 service = None
         super().__init__(service, **kwargs)
+
+    def _generation_deadline(self, plan: Any, intent: Any, now: Any) -> datetime:
+        """Bound generation work to an Intent or the current discovery."""
+
+        anchor = _field(intent, "created_at") if intent is not None else None
+        if isinstance(anchor, datetime):
+            created = anchor
+        else:
+            try:
+                created = datetime.fromisoformat(str(anchor).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                created = None
+        if created is None:
+            created = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return created.astimezone(timezone.utc) + timedelta(minutes=30)
 
     async def refresh(self, session: Any, claim: Any) -> bool:
         if not self.enabled:
@@ -1340,7 +1368,6 @@ class MediaGenerationWorkSource(MediaWorkSource):
         now: Any = None,
         limit: int = MAX_CANDIDATES,
     ) -> list[WorkCandidate]:
-        del now
         if not self.enabled:
             return []
         method = _callable(self.service, "list_generation_plans")
@@ -1371,13 +1398,57 @@ class MediaGenerationWorkSource(MediaWorkSource):
             intent_status = str(_field(intent, "status", "") or "").strip().lower()
             if status not in {"draft", "submitted", "unavailable"}:
                 continue
-            # A durable intent is authoritative.  Only uncertain intents are
-            # eligible for explicit reconciliation; no generic retry submit.
+            run = _field(plan, "run")
+            run_status = str(_field(run, "status", "") or "").strip().lower()
+            run_outputs = _field(run, "outputs") or []
+            if isinstance(run_outputs, (str, bytes)) or not isinstance(run_outputs, Sequence):
+                run_outputs = []
+            # A completed provider run with an output lacking the managed
+            # preview binding needs a same-run retrieval/import attempt.  The
+            # adapter's reconcile boundary performs only a 73 GET and the
+            # asset service skips Studio once bytes are already managed.
+            asset_import_needed = (
+                run_status in {"succeeded", "complete", "completed", "success"}
+                and bool(run_outputs)
+                and any(not _field(output, "preview_url") for output in run_outputs)
+            )
+            receipt_recovery_needed = (
+                run is None
+                and intent_status in {"pending", "submitted", "uncertain"}
+                and bool(_id(_field(intent, "request_hash")))
+            )
+            # A durable intent is authoritative.  Only uncertain intents or
+            # explicitly unmanaged completed outputs are eligible for
+            # reconciliation.  A missing local Run gets a read-only recovery
+            # lookup by the original intent key; it never falls through to a
+            # provider submit.
             mode = "submit"
-            if intent_status in {"submitted", "pending", "failed", "unavailable"} or status in {"submitted", "unavailable"}:
-                if intent_status != "uncertain":
+            if receipt_recovery_needed:
+                mode = "recover"
+            elif intent_status == "uncertain" and run_status in {
+                "queued",
+                "running",
+                "output_pending",
+            }:
+                # A failed same-Intent GET may leave the last local queued
+                # snapshot in the envelope.  Treat it as bounded recovery,
+                # never as fresh provider progress eligible for 60 polls.
+                mode = "recover"
+            elif run_status in {"queued", "running", "output_pending"} and intent_status in {
+                "submitted",
+                "uncertain",
+            }:
+                if not _id(_field(intent, "request_hash")):
                     continue
                 mode = "reconcile"
+            elif intent_status == "uncertain" or (
+                asset_import_needed and intent_status == "submitted"
+            ):
+                if not _id(_field(intent, "request_hash")):
+                    continue
+                mode = "reconcile"
+            elif intent_status in {"submitted", "pending", "failed", "unavailable"} or status in {"submitted", "unavailable"}:
+                continue
             persona_id = _id(_field(plan, "persona_id"))
             persona_revision_id = _id(_field(plan, "persona_revision_id"))
             if persona_id is None:
@@ -1414,7 +1485,16 @@ class MediaGenerationWorkSource(MediaWorkSource):
             )
             if authority is not None and not bool(authority.get("allowed", authority.get("is_allowed", False))):
                 continue
-            intent_key = "generation:" + _hash_key(plan_id, plan_hash, mode)[:48]
+            # Keep one durable Work item across submit → recovery → reconcile.
+            # The ``submit`` suffix is the historical canonical key used by
+            # already-materialized Work rows; mode is execution metadata, not
+            # a new origin identity.
+            intent_key = "generation:" + _hash_key(plan_id, plan_hash, "submit")[:48]
+            polling_reconcile = mode == "reconcile" and run_status in {
+                "queued",
+                "running",
+                "output_pending",
+            }
             result.append(
                 WorkCandidate(
                     source_type=self.source_type,
@@ -1428,6 +1508,8 @@ class MediaGenerationWorkSource(MediaWorkSource):
                     agent_revision_id=operator["agent_revision_id"],
                     required_capabilities=self.required_capabilities,
                     execution_adapter=self.execution_adapter,
+                    max_attempts=60 if polling_reconcile else 3,
+                    deadline=self._generation_deadline(plan, intent, now),
                     concurrency_key=f"media.generation:{plan_id}",
                     metadata={
                         "payload": {
@@ -1437,6 +1519,7 @@ class MediaGenerationWorkSource(MediaWorkSource):
                             "intent_id": _id(_field(intent, "id")),
                             "intent_request_hash": _id(_field(intent, "request_hash")),
                             "operator_assignment_id": operator.get("assignment_id"),
+                            "asset_import_only": bool(asset_import_needed),
                         }
                     },
                 )
@@ -1449,7 +1532,7 @@ class MediaPublicationWorkSource(MediaWorkSource):
 
     source_type = "media.publication"
     execution_adapter = "media.publication"
-    required_capabilities = ("media",)
+    required_capabilities = ("media", "external_action_propose")
 
     def __init__(self, service: Any | None = None, **kwargs: Any) -> None:
         if service is None:
@@ -1980,3 +2063,4 @@ __all__ = [
     "_safe_evidence",
     "_safe_mapping",
 ]
+

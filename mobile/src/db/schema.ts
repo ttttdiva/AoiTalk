@@ -9,8 +9,9 @@
  * Scope at M1: users / projects / spaces / tasks / task_occurrences /
  * time_entries / conversation_sessions / conversation_messages /
  * project record tables + outbox + sync_state. Richer features
- * (recurrence_rules, comments, tags, scenarios, trpg) are added in later
- * milestones.
+ * (recurrence_rules, comments, tags) are added in later milestones. Story/
+ * TRPG are handled by the Novel Graph Studio product; mobile only links to
+ * them via the browser Gateway and does not cache them locally.
  */
 
 import {
@@ -175,6 +176,11 @@ export const conversationSessions = sqliteTable(
     projectId: text('project_id'),
     title: text('title'),
     isGroupChat: integer('is_group_chat', { mode: 'boolean' }),
+    /** Agent主体のbinding。character_nameとは別の責務。 */
+    agentId: text('agent_id'),
+    isPinned: integer('is_pinned', { mode: 'boolean' }).notNull().default(false),
+    pinnedAt: text('pinned_at'),
+    pinUpdatedAt: text('pin_updated_at'),
     sessionMetadata: text('session_metadata', { mode: 'json' }),
     createdAt: text('created_at'),
     updatedAt: text('updated_at'),
@@ -183,6 +189,45 @@ export const conversationSessions = sqliteTable(
   (t) => ({
     byProject: index('idx_cs_project_id').on(t.projectId),
     byUpdatedAt: index('idx_cs_updated_at').on(t.updatedAt),
+    byPinnedActivity: index('idx_cs_pinned_activity').on(
+      t.isPinned, t.updatedAt,
+    ),
+  }),
+);
+
+// ---------- Conversation Agent catalog (auth/server scoped read cache) ----------
+//
+// This table is intentionally outside general sync.  The server filters the
+// catalog and all Agent-linked projections by ACL; a UUID written through the
+// generic sync path could bypass that validator.  Server fingerprint keeps a
+// cached catalog from one configured AoiTalk server away from another.
+export const conversationAgents = sqliteTable(
+  'conversation_agents',
+  {
+    authScope: text('auth_scope').notNull(),
+    serverFingerprint: text('server_fingerprint').notNull(),
+    /** ACL query scope. Never fall back between session/project scopes. */
+    scopeKey: text('scope_key').notNull().default('global'),
+    sessionId: text('session_id'),
+    projectId: text('project_id'),
+    id: text('id').notNull(),
+    displayName: text('display_name').notNull(),
+    state: text('state'),
+    latestRevisionId: text('latest_revision_id'),
+    characterId: text('character_id'),
+    characterName: text('character_name'),
+    utilization: text('utilization', { mode: 'json' }),
+    updatedAt: text('updated_at'),
+    cachedAt: text('cached_at').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.authScope, t.serverFingerprint, t.scopeKey, t.id] }),
+    byScope: index('idx_conversation_agents_scope').on(
+      t.authScope,
+      t.serverFingerprint,
+      t.scopeKey,
+    ),
+    byUpdatedAt: index('idx_conversation_agents_updated_at').on(t.updatedAt),
   }),
 );
 
@@ -285,449 +330,6 @@ export const recordRows = sqliteTable(
   }),
 );
 
-
-// ---------- scenarios ----------
-export const scenarios = sqliteTable(
-  'scenarios',
-  {
-    id: text('id').primaryKey(),
-    title: text('title').notNull(),
-    scenarioKind: text('scenario_kind'),
-    ruleset: text('ruleset'),
-    description: text('description'),
-    genre: text('genre'),
-    perspective: text('perspective'),
-    setting: text('setting'),
-    openingText: text('opening_text'),
-    gmInstructions: text('gm_instructions'),
-    tags: text('tags', { mode: 'json' }),
-    coverImagePath: text('cover_image_path'),
-    isPublished: integer('is_published', { mode: 'boolean' }),
-    createdBy: text('created_by'),
-    voiceTone: text('voice_tone'),
-    voiceTenseRules: text('voice_tense_rules'),
-    voiceVocabularyRegister: text('voice_vocabulary_register'),
-    voiceBannedExpressions: text('voice_banned_expressions', { mode: 'json' }),
-    voiceExamplePassages: text('voice_example_passages'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    deletedAt: text('deleted_at'),
-  },
-  (t) => ({
-    byUpdatedAt: index('idx_scenarios_updated_at').on(t.updatedAt),
-    byGenre: index('idx_scenarios_genre').on(t.genre),
-  }),
-);
-
-export const scenarioCharacters = sqliteTable(
-  'scenario_characters',
-  {
-    id: text('id').primaryKey(),
-    scenarioId: text('scenario_id').notNull(),
-    characterId: text('character_id'),
-    role: text('role'),
-    name: text('name').notNull(),
-    description: text('description'),
-    personalityOverride: text('personality_override'),
-    appearanceTagsOverride: text('appearance_tags_override'),
-    sortOrder: integer('sort_order'),
-    backstory: text('backstory'),
-    psychology: text('psychology'),
-    speechPatterns: text('speech_patterns'),
-    relationships: text('relationships', { mode: 'json' }),
-    characterArc: text('character_arc'),
-    importance: integer('importance'),
-    exampleDialogues: text('example_dialogues'),
-    trpgRuleset: text('trpg_ruleset'),
-    trpgPcState: text('trpg_pc_state', { mode: 'json' }),
-    deletedAt: text('deleted_at'),
-  },
-  (t) => ({
-    byScenario: index('idx_scenario_characters_scenario_id').on(t.scenarioId),
-  }),
-);
-
-export const scenarioScenes = sqliteTable(
-  'scenario_scenes',
-  {
-    id: text('id').primaryKey(),
-    scenarioId: text('scenario_id').notNull(),
-    episodeId: text('episode_id'),
-    title: text('title').notNull(),
-    description: text('description'),
-    sceneType: text('scene_type'),
-    gmInstructions: text('gm_instructions'),
-    imagePrompt: text('image_prompt'),
-    transitions: text('transitions', { mode: 'json' }),
-    sortOrder: integer('sort_order'),
-    content: text('content'),
-    contentVersions: text('content_versions', { mode: 'json' }),
-    wordCount: integer('word_count'),
-    status: text('status'),
-    stateSnapshot: text('state_snapshot', { mode: 'json' }),
-    deletedAt: text('deleted_at'),
-  },
-  (t) => ({
-    byScenario: index('idx_scenario_scenes_scenario_id').on(t.scenarioId),
-    byEpisode: index('idx_scenario_scenes_episode_id').on(t.episodeId),
-  }),
-);
-
-export const scenarioEpisodes = sqliteTable(
-  'scenario_episodes',
-  {
-    id: text('id').primaryKey(),
-    scenarioId: text('scenario_id').notNull(),
-    title: text('title').notNull(),
-    synopsisSentence: text('synopsis_sentence'),
-    synopsisParagraph: text('synopsis_paragraph'),
-    synopsisFull: text('synopsis_full'),
-    beatSheet: text('beat_sheet', { mode: 'json' }),
-    status: text('status'),
-    sortOrder: integer('sort_order'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    deletedAt: text('deleted_at'),
-  },
-  (t) => ({
-    byScenario: index('idx_scenario_episodes_scenario_id').on(t.scenarioId),
-    byUpdatedAt: index('idx_scenario_episodes_updated_at').on(t.updatedAt),
-  }),
-);
-
-// ---------- Story Studio (canonical, auth-scoped cache) ----------
-//
-// Story is deliberately kept separate from the legacy `scenarios` projection.
-// Every table carries the token-derived auth scope in its primary key so a
-// token/account switch can never make a cached work, episode, or draft visible
-// to another account.  Story mutations are sent directly to /api/story; the
-// local tables are an offline read cache, except for storyLocalDrafts which is
-// durable local-first manuscript state.
-export const storyWorks = sqliteTable(
-  'story_works',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    userId: text('user_id'),
-    title: text('title').notNull(),
-    synopsis: text('synopsis'),
-    plot: text('plot'),
-    styleGuide: text('style_guide'),
-    kind: text('kind').notNull().default('novel'),
-    status: text('status').notNull().default('planning'),
-    targetEpisodeChars: integer('target_episode_chars'),
-    plannedEpisodeCount: integer('planned_episode_count'),
-    startEpisodeId: text('start_episode_id'),
-    uiState: text('ui_state', { mode: 'json' }),
-    modelOverride: text('model_override', { mode: 'json' }),
-    imageSettings: text('image_settings', { mode: 'json' }),
-    resolvedModel: text('resolved_model'),
-    modelLayer: text('model_layer'),
-    episodeCount: integer('episode_count'),
-    charCount: integer('char_count'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    archivedAt: text('archived_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byUpdatedAt: index('idx_story_works_scope_updated').on(
-      t.authScope,
-      t.updatedAt,
-    ),
-    byKind: index('idx_story_works_scope_kind').on(t.authScope, t.kind),
-  }),
-);
-
-export const storyEpisodes = sqliteTable(
-  'story_episodes',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    workId: text('work_id').notNull(),
-    title: text('title').notNull(),
-    plot: text('plot'),
-    summary: text('summary'),
-    summaryLocked: integer('summary_locked', { mode: 'boolean' }),
-    premiseNote: text('premise_note'),
-    status: text('status').notNull().default('unwritten'),
-    targetChars: integer('target_chars'),
-    charCount: integer('char_count'),
-    body: text('body'),
-    bodyEtag: text('body_etag'),
-    mapX: real('map_x'),
-    mapY: real('map_y'),
-    sortHint: real('sort_hint'),
-    currentRevNo: integer('current_rev_no'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    archivedAt: text('archived_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byWork: index('idx_story_episodes_scope_work').on(t.authScope, t.workId),
-    byWorkSort: index('idx_story_episodes_scope_work_sort').on(
-      t.authScope,
-      t.workId,
-      t.sortHint,
-    ),
-  }),
-);
-
-export const storyLinks = sqliteTable(
-  'story_links',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    workId: text('work_id').notNull(),
-    fromEpisodeId: text('from_episode_id').notNull(),
-    toEpisodeId: text('to_episode_id').notNull(),
-    choiceLabel: text('choice_label'),
-    position: real('position'),
-    isPrimary: integer('is_primary', { mode: 'boolean' }),
-    createdAt: text('created_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byWork: index('idx_story_links_scope_work').on(t.authScope, t.workId),
-    byFrom: index('idx_story_links_scope_from').on(
-      t.authScope,
-      t.fromEpisodeId,
-    ),
-  }),
-);
-
-export const storyCharacters = sqliteTable(
-  'story_characters',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    userId: text('user_id'),
-    name: text('name').notNull(),
-    aliases: text('aliases', { mode: 'json' }),
-    summary: text('summary'),
-    description: text('description'),
-    notes: text('notes'),
-    aiMode: text('ai_mode').notNull().default('keyword'),
-    keywords: text('keywords', { mode: 'json' }),
-    imagePath: text('image_path'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    archivedAt: text('archived_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byName: index('idx_story_characters_scope_name').on(t.authScope, t.name),
-  }),
-);
-
-export const storyWorkCharacters = sqliteTable(
-  'story_work_characters',
-  {
-    authScope: text('auth_scope').notNull(),
-    workId: text('work_id').notNull(),
-    characterId: text('character_id').notNull(),
-    roleNote: text('role_note'),
-    position: real('position'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.workId, t.characterId] }),
-    byWork: index('idx_story_work_characters_scope_work').on(
-      t.authScope,
-      t.workId,
-    ),
-  }),
-);
-
-export const storyRulebooks = sqliteTable(
-  'story_rulebooks',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    userId: text('user_id'),
-    name: text('name').notNull(),
-    content: text('content'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-    archivedAt: text('archived_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byName: index('idx_story_rulebooks_scope_name').on(t.authScope, t.name),
-  }),
-);
-
-export const storyWorkRulebooks = sqliteTable(
-  'story_work_rulebooks',
-  {
-    authScope: text('auth_scope').notNull(),
-    workId: text('work_id').notNull(),
-    rulebookId: text('rulebook_id').notNull(),
-    enabled: integer('enabled', { mode: 'boolean' }),
-    position: real('position'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.workId, t.rulebookId] }),
-    byWork: index('idx_story_work_rulebooks_scope_work').on(
-      t.authScope,
-      t.workId,
-    ),
-  }),
-);
-
-export const storyNotes = sqliteTable(
-  'story_notes',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    workId: text('work_id').notNull(),
-    title: text('title').notNull(),
-    content: text('content'),
-    aiMode: text('ai_mode').notNull().default('keyword'),
-    keywords: text('keywords', { mode: 'json' }),
-    position: real('position'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byWork: index('idx_story_notes_scope_work').on(t.authScope, t.workId),
-  }),
-);
-
-export const storyEpisodeRevisions = sqliteTable(
-  'story_episode_revisions',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    episodeId: text('episode_id').notNull(),
-    revNo: integer('rev_no').notNull(),
-    title: text('title'),
-    plot: text('plot'),
-    body: text('body'),
-    message: text('message'),
-    origin: text('origin').notNull(),
-    bodySha256: text('body_sha256').notNull(),
-    charCount: integer('char_count'),
-    createdBy: text('created_by').notNull(),
-    createdAt: text('created_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byEpisodeRev: index('idx_story_revisions_scope_episode_rev').on(
-      t.authScope,
-      t.episodeId,
-      t.revNo,
-    ),
-  }),
-);
-
-export const storyGenerationJobs = sqliteTable(
-  'story_generation_jobs',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    workId: text('work_id').notNull(),
-    kind: text('kind').notNull(),
-    payload: text('payload', { mode: 'json' }),
-    status: text('status').notNull().default('queued'),
-    progress: text('progress', { mode: 'json' }),
-    result: text('result', { mode: 'json' }),
-    error: text('error'),
-    createdAt: text('created_at'),
-    startedAt: text('started_at'),
-    finishedAt: text('finished_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byWorkStatus: index('idx_story_jobs_scope_work_status').on(
-      t.authScope,
-      t.workId,
-      t.status,
-    ),
-  }),
-);
-
-export const storyWritingSessions = sqliteTable(
-  'story_writing_sessions',
-  {
-    authScope: text('auth_scope').notNull(),
-    id: text('id').notNull(),
-    workId: text('work_id').notNull(),
-    episodeId: text('episode_id'),
-    conversationSessionId: text('conversation_session_id'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.id] }),
-    byWork: index('idx_story_writing_sessions_scope_work').on(
-      t.authScope,
-      t.workId,
-    ),
-    byConversation: index('idx_story_writing_sessions_scope_conversation').on(
-      t.authScope,
-      t.conversationSessionId,
-    ),
-  }),
-);
-
-/** Durable manuscript draft; unlike Story cache rows this is local-only. */
-export const storyLocalDrafts = sqliteTable(
-  'story_local_drafts',
-  {
-    authScope: text('auth_scope').notNull(),
-    episodeId: text('episode_id').notNull(),
-    body: text('body').notNull(),
-    expectedEtag: text('expected_etag'),
-    serverSnapshot: text('server_snapshot', { mode: 'json' }),
-    conflictStatus: text('conflict_status').notNull().default('draft'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.episodeId] }),
-    byUpdatedAt: index('idx_story_local_drafts_scope_updated').on(
-      t.authScope,
-      t.updatedAt,
-    ),
-  }),
-);
-
-/**
- * Recovery copy of the pre-Story AsyncStorage writing-session draft.
- *
- * This is separate from manuscript body drafts because the legacy record may
- * have no target episode and can contain arbitrary unknown fields.  The raw
- * JSON is retained so a future migration/UI can recover data that the
- * canonical Story model does not currently understand.
- */
-export const storyLegacyWritingDrafts = sqliteTable(
-  'story_legacy_writing_drafts',
-  {
-    authScope: text('auth_scope').notNull(),
-    legacyKey: text('legacy_key').notNull(),
-    workId: text('work_id').notNull(),
-    targetEpisodeId: text('target_episode_id'),
-    targetSceneId: text('target_scene_id'),
-    prompt: text('prompt'),
-    rawPayload: text('raw_payload', { mode: 'json' }).notNull(),
-    status: text('status').notNull().default('recovered'),
-    createdAt: text('created_at'),
-    updatedAt: text('updated_at'),
-  },
-  (t) => ({
-    pk: primaryKey({ columns: [t.authScope, t.legacyKey] }),
-    byWork: index('idx_story_legacy_writing_drafts_scope_work').on(
-      t.authScope,
-      t.workId,
-    ),
-    byUpdatedAt: index('idx_story_legacy_writing_drafts_scope_updated').on(
-      t.authScope,
-      t.updatedAt,
-    ),
-  }),
-);
 
 // ---------- Apps / Chat context (WS4, auth-scoped read cache) ----------
 //
@@ -1246,6 +848,65 @@ export const outbox = sqliteTable(
     byEntity: index('idx_outbox_entity').on(t.tableName, t.entityId),
     byAuthScope: index('idx_outbox_auth_scope').on(t.authScope),
     byDocsScope: index('idx_outbox_docs_scope').on(t.authScope, t.docsScopeKey),
+    // Promotion keyset scans include legacy NULL auth scopes and must seek
+    // directly by op_id instead of sorting the whole scope on every page.
+    byDocsCursor: index('idx_outbox_docs_cursor').on(t.docsScopeKey, t.opId, t.authScope),
+    byDocsEntity: index('idx_outbox_docs_entity').on(
+      t.authScope, t.docsScopeKey, t.tableName, t.entityId,
+    ),
+  }),
+);
+
+// ---------- outbox resolution journal ----------
+//
+// This is an app-private, durable journal for the explicit resolution flow.
+// It is deliberately independent from `outbox`: adopting the last queued
+// operation must not remove the resolution history.  JSON columns are kept as
+// TEXT so the journal can preserve the exact snapshots captured by the
+// foreground resolver while the public repository only projects safe views.
+export const outboxResolutionRecords = sqliteTable(
+  'outbox_resolution_records',
+  {
+    id: text('id').primaryKey(),
+    revision: integer('revision').notNull().default(1),
+    authScope: text('auth_scope').notNull(),
+    serverFingerprint: text('server_fingerprint').notNull(),
+    credentialIdentityRevision: text('credential_identity_revision').notNull(),
+    kind: text('kind').notNull(),
+    tableName: text('table_name').notNull(),
+    entityId: text('entity_id').notNull(),
+    opId: text('op_id').notNull(),
+    createdAt: integer('created_at').notNull(),
+    state: text('state').notNull(),
+    operationOrigin: text('operation_origin').notNull().default('unrecorded'),
+    targetNamespaceJson: text('target_namespace_json'),
+    operationSnapshotJson: text('operation_snapshot_json').notNull(),
+    localSnapshotJson: text('local_snapshot_json').notNull(),
+    relatedSnapshotJson: text('related_snapshot_json').notNull().default('{}'),
+    membershipSnapshotJson: text('membership_snapshot_json').notNull().default('[]'),
+    cacheSnapshotJson: text('cache_snapshot_json').notNull().default('{}'),
+    guardSnapshotJson: text('guard_snapshot_json').notNull().default('{}'),
+    serverSnapshotJson: text('server_snapshot_json'),
+    viewJson: text('view_json').notNull(),
+    draftJson: text('draft_json'),
+    exportSnapshotJson: text('export_snapshot_json'),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (t) => ({
+    byAuthScope: index('idx_outbox_resolution_auth_scope').on(
+      t.authScope,
+      t.createdAt,
+    ),
+    byOperation: index('idx_outbox_resolution_operation').on(
+      t.authScope,
+      t.opId,
+      t.entityId,
+    ),
+    byState: index('idx_outbox_resolution_state').on(
+      t.authScope,
+      t.state,
+      t.updatedAt,
+    ),
   }),
 );
 
@@ -1476,19 +1137,6 @@ export type ConversationMessage = typeof conversationMessages.$inferSelect;
 export type RecordTable = typeof recordTables.$inferSelect;
 export type RecordField = typeof recordFields.$inferSelect;
 export type RecordRow = typeof recordRows.$inferSelect;
-export type StoryWork = typeof storyWorks.$inferSelect;
-export type StoryEpisode = typeof storyEpisodes.$inferSelect;
-export type StoryLink = typeof storyLinks.$inferSelect;
-export type StoryCharacter = typeof storyCharacters.$inferSelect;
-export type StoryWorkCharacter = typeof storyWorkCharacters.$inferSelect;
-export type StoryRulebook = typeof storyRulebooks.$inferSelect;
-export type StoryWorkRulebook = typeof storyWorkRulebooks.$inferSelect;
-export type StoryNote = typeof storyNotes.$inferSelect;
-export type StoryEpisodeRevision = typeof storyEpisodeRevisions.$inferSelect;
-export type StoryGenerationJob = typeof storyGenerationJobs.$inferSelect;
-export type StoryWritingSession = typeof storyWritingSessions.$inferSelect;
-export type StoryLocalDraft = typeof storyLocalDrafts.$inferSelect;
-export type StoryLegacyWritingDraft = typeof storyLegacyWritingDrafts.$inferSelect;
 export type App = typeof apps.$inferSelect;
 export type AppTarget = typeof appTargets.$inferSelect;
 export type AppContextCache = typeof appContextCache.$inferSelect;
@@ -1501,6 +1149,7 @@ export type AppFileContentCache = typeof appFileContentCache.$inferSelect;
 export type ConversationContextSnapshot =
   typeof conversationContextSnapshots.$inferSelect;
 export type OutboxOp = typeof outbox.$inferSelect;
+export type OutboxResolutionRecord = typeof outboxResolutionRecords.$inferSelect;
 export type SyncState = typeof syncState.$inferSelect;
 export type DocsSyncRun = typeof docsSyncRuns.$inferSelect;
 export type DocsSyncStaging = typeof docsSyncStaging.$inferSelect;

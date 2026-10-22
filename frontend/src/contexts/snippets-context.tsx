@@ -3,11 +3,11 @@
 import {
   createContext,
   useContext,
-  useState,
-  useEffect,
   useCallback,
+  useMemo,
 } from "react";
-import { getSnippets, saveSnippets, type Snippet } from "@/lib/snippets-api";
+import type { Snippet } from "@/lib/snippets-api";
+import { useUserSettings } from "@/contexts/user-settings-context";
 
 interface SnippetsContextType {
   snippets: Snippet[];
@@ -23,26 +23,44 @@ const SnippetsContext = createContext<SnippetsContextType>({
 
 export const useSnippets = () => useContext(SnippetsContext);
 
+/**
+ * Snippets live in the user's settings document. Read them from the enclosing
+ * UserSettingsProvider instead of issuing a second GET /api/users/me/settings
+ * on every app load, and save through the same provider so every settings
+ * consumer sees the persisted snapshot.
+ */
 export function SnippetsProvider({ children }: { children: React.ReactNode }) {
-  const [snippets, setSnippets] = useState<Snippet[]>([]);
+  const { settings, refresh, patch } = useUserSettings();
+  const stored = settings.snippets;
+  const snippets = useMemo<Snippet[]>(
+    () => (Array.isArray(stored) ? (stored as Snippet[]) : []),
+    [stored],
+  );
 
-  const refresh = useCallback(() => {
-    getSnippets()
-      .then(setSnippets)
-      .catch(() => {});
-  }, []);
+  const save = useCallback(
+    async (newSnippets: Snippet[]) => {
+      try {
+        await patch({ snippets: newSnippets });
+      } catch (error) {
+        const status = (error as { status?: unknown } | null)?.status;
+        throw new Error(
+          typeof status === "number"
+            ? `スニペットの保存に失敗しました (${status})`
+            : "スニペットの保存に失敗しました",
+          { cause: error },
+        );
+      }
+    },
+    [patch],
+  );
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  const save = useCallback(async (newSnippets: Snippet[]) => {
-    await saveSnippets(newSnippets);
-    setSnippets(newSnippets);
-  }, []);
+  const value = useMemo(
+    () => ({ snippets, refresh, save }),
+    [snippets, refresh, save],
+  );
 
   return (
-    <SnippetsContext.Provider value={{ snippets, refresh, save }}>
+    <SnippetsContext.Provider value={value}>
       {children}
     </SnippetsContext.Provider>
   );

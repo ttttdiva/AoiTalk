@@ -9,6 +9,7 @@ import {
   type Ref,
 } from "react";
 import { AnimatedBeam } from "@/components/magicui/animated-beam";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { cn } from "@/lib/utils";
 import type { AgentTeamSubagent, AgentTeamTeam } from "./llm-model-section-types";
 
@@ -99,11 +100,16 @@ export function AgentTeamTopologyPreview({
   return (
     <section
       className="space-y-2 rounded border border-border bg-background/35 p-2"
-      aria-label="Agent Team topology preview"
+      aria-label="Execution Team topology preview"
       data-testid="agent-team-topology-preview"
     >
       <div className="flex items-center justify-between gap-2">
-        <div className="text-[10px] font-medium">Topology preview</div>
+        <div className="inline-flex items-center gap-1 text-[10px] font-medium">
+          Topology preview
+          <HelpPopover label="Topology preview">
+            Main → Team → Subagent の読み取り専用プレビューです。有効なTeamだけビームが動きます。
+          </HelpPopover>
+        </div>
         <span className="text-[9px] text-muted-foreground">Read-only</span>
       </div>
       <div

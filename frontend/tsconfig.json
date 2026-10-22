@@ -40,7 +40,13 @@
     ".next-dev/dev/types/**/*.ts",
     "**/*.mts",
     ".next-playwright-debug6/types/**/*.ts",
-    ".next-playwright-debug6/dev/types/**/*.ts"
+    ".next-playwright-debug6/dev/types/**/*.ts",
+    ".next-production-verify/types/**/*.ts",
+    ".next-production-verify/dev/types/**/*.ts",
+    ".next-seethrough-verify/types/**/*.ts",
+    ".next-seethrough-verify/dev/types/**/*.ts",
+    ".next-agent-decart-candidate-20261021/types/**/*.ts",
+    ".next-agent-decart-candidate-20261021/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",

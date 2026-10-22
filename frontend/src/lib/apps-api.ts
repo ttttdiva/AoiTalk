@@ -1,3 +1,6 @@
+import { withBasePath } from "@/lib/base-path";
+import type { components } from "@/lib/api-types.gen";
+
 export type AppPermission = "viewer" | "runner" | "developer" | "maintainer" | "admin";
 
 export type AppArchiveExclusions = {
@@ -8,6 +11,21 @@ export type AppArchiveExclusions = {
 };
 export type AppBindingMode = "development" | "installed";
 export type AppJobType = "build" | "test" | "run" | "package";
+
+/** Shared Web / Native App Runtime wire types generated from FastAPI OpenAPI. */
+export type AppRuntimeNodeKind = components["schemas"]["AppUiNode"]["kind"];
+export type AppRuntimeOption = components["schemas"]["AppUiOption"];
+export type AppRuntimeFormField = components["schemas"]["AppUiField"];
+export type AppRuntimeNode = components["schemas"]["AppUiNode"];
+export type AppRuntimeUi = components["schemas"]["AppUiDocument"];
+export type AppRuntimeAction = components["schemas"]["AppActionDescriptor"];
+export type AppRuntimeRun = components["schemas"]["AppRunView"];
+export type AppRuntimeFile = components["schemas"]["AppRunFileResponse"];
+export type AppRuntimeInputFile = components["schemas"]["AppRunFileUploadResponse"];
+export type AppRuntimeAvailability = components["schemas"]["AppRuntimeAvailability"];
+export type AppRuntimeDeclaration = components["schemas"]["AppRuntimeResponse"];
+export type AppRuntimeActionRunResponse = components["schemas"]["AppActionRunResponse"];
+export type AppRuntimeLogs = components["schemas"]["AppRunLogsResponse"];
 
 export interface AppTarget {
   id: string;
@@ -276,7 +294,16 @@ export interface ProjectAppInput {
   display_alias?: string | null;
 }
 
-const API_PREFIX = "/api/python-proxy";
+export interface ListAppsOptions {
+  includeArchived?: boolean;
+}
+
+export type UpdateAppInput = Partial<CreateAppInput> & {
+  default_target_key?: string | null;
+  archived?: boolean;
+};
+
+const API_PREFIX = withBasePath("/api/python-proxy");
 
 export class AppsApiError extends Error {
   constructor(
@@ -308,10 +335,13 @@ async function appsApiError(response: Response): Promise<AppsApiError> {
 }
 
 export async function appsApiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  const isFormDataBody = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  if (!isFormDataBody && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(`${API_PREFIX}${path}`, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
     ...init,
+    credentials: "include",
+    headers,
   });
   if (!response.ok) {
     throw await appsApiError(response);
@@ -336,18 +366,71 @@ const json = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 });
 
+function appProjectQuery(projectId?: string): string {
+  return projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+}
+
 export const appsApi = {
-  list: (projectId?: string) =>
-    appsApiFetch<{ apps: AppSummary[] }>(
-      `/apps${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
-    ),
+  list: (projectId?: string, options?: ListAppsOptions) => {
+    const query = new URLSearchParams();
+    if (projectId) query.set("project_id", projectId);
+    if (options?.includeArchived) query.set("include_archived", "true");
+    const suffix = query.toString();
+    return appsApiFetch<{ apps: AppSummary[] }>(`/apps${suffix ? `?${suffix}` : ""}`);
+  },
   get: (appId: string, projectId?: string) => appsApiFetch<{ app: AppSummary }>(`/apps/${appId}${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
   create: (input: CreateAppInput) => appsApiFetch<{ app: AppSummary }>("/apps", json(input)),
   importProjectSource: (input: CreateAppInput & { project_id: string; source_path: string }) =>
     appsApiFetch<{ app: AppSummary; imported_files: string[] }>("/apps/import-project-source", json(input)),
-  update: (appId: string, input: Partial<CreateAppInput> & { default_target_key?: string | null }, projectId?: string) =>
+  update: (appId: string, input: UpdateAppInput, projectId?: string) =>
     appsApiFetch<{ app: AppSummary }>(`/apps/${appId}${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`, { ...json(input), method: "PATCH" }),
   getContext: (appId: string, projectId?: string) => appsApiFetch<AppContext>(`/apps/${appId}/context${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
+  /** Release-bound declarative UI and opaque action catalog for normal use. */
+  getRuntime: (appId: string, projectId?: string) =>
+    appsApiFetch<AppRuntimeDeclaration>(`/apps/${encodeURIComponent(appId)}/runtime${appProjectQuery(projectId)}`),
+  listRuntimeRuns: (appId: string, projectId?: string, limit = 20, idempotencyKey?: string) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (projectId) query.set("project_id", projectId);
+    if (idempotencyKey) query.set("idempotency_key", idempotencyKey);
+    return appsApiFetch<{ runs: AppRuntimeRun[] }>(`/apps/${encodeURIComponent(appId)}/runs?${query.toString()}`).then((response) => response.runs || []);
+  },
+  /**
+   * Start one immutable Release action. The request body intentionally contains
+   * only user input; the release, target and command are resolved by the server
+   * from the opaque action id. The idempotency key is sent as a header so a
+   * transport retry can safely reuse the exact same operation.
+   */
+  runRuntimeAction: (
+    appId: string,
+    actionId: string,
+    input: Record<string, unknown>,
+    options: { idempotencyKey: string; projectId?: string },
+  ) => appsApiFetch<AppRuntimeActionRunResponse>(
+    `/apps/${encodeURIComponent(appId)}/actions/${encodeURIComponent(actionId)}/runs${appProjectQuery(options.projectId)}`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": options.idempotencyKey },
+      body: JSON.stringify({ input }),
+    },
+  ),
+  getRuntimeRun: (appId: string, runId: string, projectId?: string) =>
+    appsApiFetch<AppRuntimeActionRunResponse>(`/apps/${encodeURIComponent(appId)}/runs/${encodeURIComponent(runId)}${appProjectQuery(projectId)}`),
+  getRuntimeRunLogs: (appId: string, runId: string, projectId?: string) =>
+    appsApiFetch<AppRuntimeLogs>(`/apps/${encodeURIComponent(appId)}/runs/${encodeURIComponent(runId)}/logs${appProjectQuery(projectId)}`),
+  getRuntimeRunFile: (appId: string, runId: string, fileId: string, projectId?: string) =>
+    appsApiFetch<AppRuntimeFile>(`/apps/${encodeURIComponent(appId)}/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(fileId)}${appProjectQuery(projectId)}`),
+  listRuntimeRunFiles: (appId: string, runId: string, projectId?: string) =>
+    appsApiFetch<AppRuntimeFile[]>(`/apps/${encodeURIComponent(appId)}/runs/${encodeURIComponent(runId)}/files${appProjectQuery(projectId)}`),
+  uploadRuntimeActionFile: (appId: string, actionId: string, file: File, projectId?: string) => {
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    return appsApiFetchFormData<AppRuntimeInputFile>(
+      `/apps/${encodeURIComponent(appId)}/actions/${encodeURIComponent(actionId)}/files${appProjectQuery(projectId)}`,
+      formData,
+    );
+  },
+  activateRelease: (appId: string, releaseId: string) =>
+    appsApiFetch<AppRuntimeDeclaration>(`/apps/${encodeURIComponent(appId)}/releases/${encodeURIComponent(releaseId)}/activate`, { method: "POST" }),
   analyze: (appId: string, input: { expected_manifest_sha256?: string } = {}, projectId?: string) =>
     appsApiFetch<{
       success: boolean;
@@ -388,7 +471,7 @@ export const appsApi = {
    * App一式のzip URL。既定は全階層・除外なしで、GUIで選択された範囲とカテゴリだけをqueryへ載せる。
    * 一括取得なのでバックエンドは runner 以上を要求する。
    */
-  downloadArchive: (appId: string, projectId?: string, exclusions: AppArchiveExclusions = {}, includePaths?: string[] | null) => {
+  downloadArchive: (appId: string, projectId?: string, exclusions: AppArchiveExclusions = {}, includePaths?: string[] | null, latestCommitOnly = false) => {
     const query = new URLSearchParams();
     if (projectId) query.set("project_id", projectId);
     if (includePaths !== undefined && includePaths !== null) query.set("include_paths", JSON.stringify(includePaths));
@@ -396,6 +479,7 @@ export const appsApi = {
     if (exclusions.dependencies) query.set("exclude_dependencies", "true");
     if (exclusions.runtime) query.set("exclude_runtime", "true");
     if (exclusions.credentials) query.set("exclude_credentials", "true");
+    if (latestCommitOnly) query.set("latest_commit_only", "true");
     const suffix = query.toString();
     return `${API_PREFIX}/apps/${encodeURIComponent(appId)}/files/archive${suffix ? `?${suffix}` : ""}`;
   },

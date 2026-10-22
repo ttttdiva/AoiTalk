@@ -364,6 +364,25 @@ function isLikelyChatModel(id: string): boolean {
   return !NON_CHAT_MODEL_PATTERN.test(id);
 }
 
+function isDeprecatedModel(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const seconds = value > 1_000_000_000_000 ? value / 1000 : value;
+    return seconds <= Date.now() / 1000;
+  }
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === "false" || normalized === "0") return false;
+  if (normalized === "true") return true;
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    const seconds = numeric > 1_000_000_000_000 ? numeric / 1000 : numeric;
+    return seconds <= Date.now() / 1000;
+  }
+  const parsedDate = Date.parse(normalized);
+  return Number.isFinite(parsedDate) && parsedDate <= Date.now();
+}
+
 function extractOpenAiCompatibleIds(data: unknown): string[] {
   const record = data as { data?: Array<{ id?: unknown }> } | null;
   const items = Array.isArray(record?.data) ? record.data : [];
@@ -406,29 +425,34 @@ async function fetchDeepInfraModels(
     options,
   );
   const record = data as
+    | Array<Record<string, unknown>>
     | {
         data?: Array<{
           id?: unknown;
           model?: unknown;
+          model_name?: unknown;
           name?: unknown;
           reported_type?: unknown;
           task?: unknown;
           type?: unknown;
           deprecated?: unknown;
+          replaced_by?: unknown;
         }>;
         models?: Array<Record<string, unknown>>;
       }
     | null;
-  const items = Array.isArray(record?.data)
-    ? record.data
-    : Array.isArray(record?.models)
-      ? record.models
-      : [];
+  const items = Array.isArray(record)
+    ? record
+    : Array.isArray(record?.data)
+      ? record.data
+      : Array.isArray(record?.models)
+        ? record.models
+        : [];
   const nonText = /(embedding|image|audio|speech|whisper|moderation|rerank|transcrib)/i;
   const ids: string[] = [];
   for (const item of items) {
-    if (item?.deprecated === true) continue;
-    const id = [item?.id, item?.model, item?.name].find(
+    if (isDeprecatedModel(item?.deprecated)) continue;
+    const id = [item?.id, item?.model, item?.model_name, item?.name].find(
       (value): value is string => typeof value === "string" && value.trim().length > 0,
     );
     if (!id) continue;

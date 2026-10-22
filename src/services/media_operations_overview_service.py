@@ -15,6 +15,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -39,6 +40,7 @@ from ..memory.models.media_operations_metrics import (
     ExperimentResult,
     MetricSnapshot,
     RevenueEvent,
+    RevenueCostRecord,
 )
 from ..memory.models.media_operations_research import (
     ContentItem,
@@ -53,6 +55,7 @@ from ..memory.models.media_operations_setup import PlatformAccount, PlatformAcco
 from ..memory.models.media_provider_capability import MediaProviderCapabilitySnapshot
 from ..memory.models.operations import ExternalAction, ExternalActionAttempt, ExternalActionReceipt
 from .media_operations_content_service import MediaOperationsContentService
+from .media_revenue_costs import COST_INPUT_FIELDS, effective_cost_records, revenue_cost_projection
 from .media_operations_service import (
     MediaOperationsValidationError,
     _as_uuid,
@@ -68,7 +71,7 @@ _MEDIA_ACTION_TYPES = frozenset(
         "media.release_product",
     }
 )
-_PLATFORMS = ("x", "pixiv", "dlsite", "patreon", "youtube", "instagram")
+_PLATFORMS = ("x", "pixiv", "dlsite", "patreon", "youtube", "instagram", "fanza", "tiktok")
 _METRIC_KEYS = frozenset(
     {
         "impressions",
@@ -86,12 +89,77 @@ _METRIC_KEYS = frozenset(
         "click_through_rate",
         "conversion_rate",
         "sample_size",
-        "gross_revenue",
-        "net_revenue",
-        "refunds",
-        "cost",
     }
 )
+
+
+def _revenue_fields(row: Any, cost_record: Any = None) -> dict[str, Any]:
+    """Keep evidence classes and unknown monetary values in read projections."""
+    get = row.get if isinstance(row, Mapping) else lambda key, default=None: getattr(row, key, default)
+    currency = str(get("currency") or "").strip().upper()
+    if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+        currency = None
+    source = get("source")
+    source = source if source in {"manual", "imported", "api"} else "unknown"
+    raw_settlement = get("settlement_at", "__missing")
+    settled = _parse_datetime(raw_settlement) if raw_settlement not in (None, "__missing") else None
+    settlement_status = "settled" if settled else "estimated" if raw_settlement is None else "unknown"
+    authority_source = "provider" if source == "api" else source
+    authority = f"{authority_source}_{'estimate' if settlement_status == 'estimated' else settlement_status}"
+    event_type = get("event_type")
+    if event_type not in {"sale", "refund", "chargeback", "adjustment", "reversal"}:
+        event_type = "unknown"
+    return {
+        "currency": currency, "gross_amount": _revenue_amount(get("gross_amount")),
+        "net_amount": _revenue_amount(get("net_amount")), "event_type": event_type,
+        "source": source, "settlement_at": _iso(settled), "settlement_status": settlement_status,
+        "revenue_authority": authority,
+        **revenue_cost_projection(row, cost_record),
+    }
+
+
+def _revenue_amount(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) and abs(number) <= 1_000_000_000_000 else None
+
+
+def _add_revenue_bucket(collection: dict, dimension: str, value: Any, event: Mapping[str, Any]) -> None:
+    if dimension == "currency":
+        value = event["currency"]
+    rendered = str(value) if value not in (None, "") else "unassigned"
+    # A currency or evidence-class boundary cannot be collapsed by another dimension.
+    key = (rendered, event["currency"], event["revenue_authority"], event["event_type"], event.get("cost_authority", "unknown"))
+    bucket = collection.setdefault(key, {
+        dimension: rendered, "currency": event["currency"], "event_type": event["event_type"],
+        "source": event["source"], "settlement_status": event["settlement_status"],
+        "revenue_authority": event["revenue_authority"], "event_count": 0, "gross": 0.0, "net": 0.0,
+        "cost_authority": event.get("cost_authority", "unknown"),
+        **{name: 0.0 for name in COST_INPUT_FIELDS},
+        "profit_amount": 0.0, "profit_status": "calculated_input_scope",
+        "profit_unavailable_reasons": [], "cost_coverage_complete": True,
+    })
+    bucket["event_count"] += 1
+    for total, amount in (("gross", "gross_amount"), ("net", "net_amount"),
+                          *((name, name) for name in COST_INPUT_FIELDS), ("profit_amount", "profit_amount")):
+        incoming = event.get(amount)
+        if not event["currency"] or incoming is None or bucket[total] is None:
+            bucket[total] = None
+        else:
+            bucket[total] = _revenue_amount(float(Decimal(str(bucket[total])) + Decimal(str(incoming))))
+    bucket["cost_coverage_complete"] = bucket["cost_coverage_complete"] and event.get("cost_coverage_complete") is True
+    status = event.get("profit_status", "unavailable_cost_record")
+    if status != "calculated_input_scope":
+        bucket["profit_unavailable_reasons"] = sorted(set([*bucket["profit_unavailable_reasons"], status]))
+    if bucket["profit_amount"] is None and not bucket["profit_unavailable_reasons"]:
+        bucket["profit_unavailable_reasons"] = ["unavailable_invalid_amount"]
+    if bucket["profit_unavailable_reasons"]:
+        bucket["profit_amount"] = None
+        bucket["profit_status"] = bucket["profit_unavailable_reasons"][0] if len(bucket["profit_unavailable_reasons"]) == 1 else "unavailable_cost_inputs"
 
 
 def _metric_is_effective(row: Any) -> bool:
@@ -1173,6 +1241,9 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
             limit=None,
             order_column=RevenueEvent.event_at,
         )
+        cost_heads = effective_cost_records(await self._rows(
+            session, actor, RevenueCostRecord, project_id=project_uuid, limit=None,
+        ))
         revenue_by_currency: dict[str, dict[str, Any]] = {}
         revenue_by_platform: dict[str, dict[str, Any]] = {}
         revenue_by_account: dict[str, dict[str, Any]] = {}
@@ -1181,25 +1252,8 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
         revenue_count = 0
         evidence_count += 0
 
-        def add_revenue_bucket(
-            collection: dict[str, dict[str, Any]],
-            key: Any,
-            field: str,
-            event: Any,
-        ) -> None:
-            rendered = str(key) if key not in (None, "") else "unassigned"
-            bucket = collection.setdefault(
-                rendered,
-                {
-                    field: rendered,
-                    "event_count": 0,
-                    "gross": 0.0,
-                    "net": 0.0,
-                },
-            )
-            bucket["event_count"] += 1
-            bucket["gross"] = float(bucket["gross"] + float(event.gross_amount or 0))
-            bucket["net"] = float(bucket["net"] + float(event.net_amount or 0))
+        def add_revenue_bucket(collection, key, field, event):
+            _add_revenue_bucket(collection, field, key, _revenue_fields(event, cost_heads.get(str(getattr(event, "id", None)))))
 
         for event in revenues:
             event_at = _parse_datetime(event.event_at)
@@ -2089,6 +2143,7 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
             )
 
         revenue_rows = await rows(RevenueEvent)
+        cost_heads = effective_cost_records(await rows(RevenueCostRecord))
         revenue_items: list[dict[str, Any]] = []
         for row in revenue_rows:
             persona_ref, account_ref = getattr(row, "persona_ref", None), getattr(row, "platform_account_ref", None)
@@ -2118,9 +2173,7 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
                     "publication_ref": ref(publication_ref),
                     "product_ref": ref(product_ref),
                     "platform": getattr(row, "platform", None),
-                    "currency": str(getattr(row, "currency", "")),
-                    "gross_amount": float(getattr(row, "gross_amount", 0) or 0),
-                    "net_amount": float(getattr(row, "net_amount", 0) or 0),
+                    **_revenue_fields(row, cost_heads.get(str(row.id))),
                     "event_at": _iso(_parse_datetime(getattr(row, "event_at", None))),
                 }
             )
@@ -2452,27 +2505,8 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
             "product_ref": {},
         }
 
-        def aggregate_revenue_dimension(
-            dimension: str,
-            value: Any,
-            event: Mapping[str, Any],
-        ) -> None:
-            if value in (None, ""):
-                key = "unassigned"
-            else:
-                key = str(value)
-            bucket = revenue_dimensions[dimension].setdefault(
-                key,
-                {
-                    dimension: key,
-                    "event_count": 0,
-                    "gross": 0.0,
-                    "net": 0.0,
-                },
-            )
-            bucket["event_count"] += 1
-            bucket["gross"] = float(bucket["gross"] + float(event.get("gross_amount") or 0))
-            bucket["net"] = float(bucket["net"] + float(event.get("net_amount") or 0))
+        def aggregate_revenue_dimension(dimension, value, event):
+            _add_revenue_bucket(revenue_dimensions[dimension], dimension, value, event)
 
         for event in revenue_items:
             aggregate_revenue_dimension("currency", event.get("currency"), event)

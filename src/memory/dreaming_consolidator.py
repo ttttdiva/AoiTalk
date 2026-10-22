@@ -5,8 +5,8 @@ reviewable candidate.  Consolidation is a different boundary: it reads old
 conversation turns and may create durable user memory.  This module keeps the
 model call replaceable while making the final acceptance decision entirely
 deterministic.  In particular, assistant text is context only, quotes must be
-verbatim user text, and every accepted operation is corroborated by at least
-two independent conversation sessions.
+verbatim user text, and only exact evidence from independent sessions can
+promote a review candidate to active memory.
 """
 
 from __future__ import annotations
@@ -27,21 +27,40 @@ logger = logging.getLogger(__name__)
 CONSOLIDATION_SYSTEM_PROMPT = """You maintain AoiTalk Dreaming Memory.
 Return only a JSON array. Do not emit Markdown, a code fence, or commentary.
 Only user messages are evidence. Assistant messages are context and must never
-be quoted or used as evidence. Produce only durable, cross-session user facts,
-preferences, constraints, workflows, relationships, or instructions.
+be quoted or used as evidence. Produce only durable user facts, preferences,
+constraints, workflows, relationships, or instructions; one-session explicit
+self-disclosure remains reviewable, while activation requires cross-session
+evidence.
+Project-bound chats may contain personal evidence. Explicit personal
+self-disclosure may become a reviewable User Memory candidate from one session;
+an inferred hobby, interest, or recurring personal activity requires exact
+evidence from at least two independent sessions. Never convert a
+Project/client/repository fact, rule, workflow, or configuration into User
+Memory merely because the same user discussed it repeatedly.
 Never emit delete/delete_all operations, secrets, sensitive personal data,
 temporary observations, project/client/repository facts, or one-turn requests.
-An item is valid only when every exact quote occurs in user messages. An item
-seen in one session is a reviewable candidate; an item corroborated by at
-least two different sessions may be active. Every item must contain:
-operation (upsert), content (starting with 'The user '), memory_type, title,
-confidence, importance, evidence, scope ('user'), and corroborated (derived
-server-side). Return [] when no item is safe.
+An item is valid only when every exact quote occurs in user messages. A safe
+item seen in one session is a reviewable candidate; corroborated items may be
+active. Every item must use this exact schema:
+- operation: "upsert"
+- content: one sentence starting with "The user "
+- memory_type: exactly one of fact, preference, constraint, workflow,
+  relationship, or instruction (use preference for hobbies/interests)
+- title: short string or null
+- confidence: number from 0.0 to 1.0
+- importance: INTEGER from 1 to 10; repeated durable hobbies are normally 7-8
+- evidence: array of objects, each containing session_id, message_id, and an
+  exact quote copied from that session's USER EVIDENCE
+- scope: "user"
+Do not emit a model-supplied corroborated/verified decision; the server derives
+it from exact evidence in distinct sessions. Return [] when no item is safe.
 """
 
 
 CONSOLIDATION_PROMPT = """Consolidate durable user memories from the following turns.
-Existing memories are shown only to avoid restating an identical item.
+Do not restate an active memory without new evidence. When a current user turn
+independently supports an existing candidate, emit the same canonical content
+again so the server can merge the new exact evidence and decide promotion.
 
 Existing memories:
 {existing}
@@ -80,6 +99,22 @@ _SENSITIVE_RE = re.compile(
 )
 _USER_PREFIX_RE = re.compile(r"^(?:the\s+user|user|ユーザー|依頼者)\b", re.IGNORECASE)
 _SPACE_RE = re.compile(r"\s+")
+_ALLOWED_MEMORY_TYPES = {
+    "fact",
+    "preference",
+    "constraint",
+    "workflow",
+    "relationship",
+    "instruction",
+}
+_MEMORY_TYPE_ALIASES = {
+    "hobby": "preference",
+    "interest": "preference",
+    "interests": "preference",
+    "activity": "preference",
+    "personal_activity": "preference",
+    "personal-activity": "preference",
+}
 
 
 @dataclass(frozen=True)
@@ -140,8 +175,37 @@ def _normalise_key(value: str) -> str:
     return re.sub(r"[^0-9a-zぁ-んァ-ン一-龥]+", "", value)
 
 
+def _normalise_memory_type(value: Any) -> str | None:
+    raw = _text(value or "fact").lower().replace(" ", "_")
+    normalized = _MEMORY_TYPE_ALIASES.get(raw, raw)
+    return normalized if normalized in _ALLOWED_MEMORY_TYPES else None
+
+
+def _normalise_importance(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (numeric == numeric and abs(numeric) != float("inf")):
+        return None
+    # Some local models use a 0..1 quality scale despite the explicit schema.
+    # Converting it is safe because activation still requires independent exact
+    # conversation citations and the deterministic minimum threshold below.
+    if 0.0 < numeric < 1.0:
+        numeric *= 10.0
+    rounded = round(numeric)
+    if abs(numeric - rounded) > 1e-6:
+        return None
+    result = int(rounded)
+    return result if 1 <= result <= 10 else None
+
+
 def _stable_digest(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -161,9 +225,7 @@ def _coerce_turn(value: Any) -> DreamingSourceTurn | None:
     if isinstance(value, DreamingSourceTurn):
         return value
     session_id = _text(_value(value, "session_id"))
-    message_id = _text(
-        _value(value, "user_message_id", _value(value, "message_id"))
-    )
+    message_id = _text(_value(value, "user_message_id", _value(value, "message_id")))
     user_text = _text(_value(value, "user_text", _value(value, "content")))
     if not session_id or not message_id or not user_text:
         return None
@@ -171,8 +233,12 @@ def _coerce_turn(value: Any) -> DreamingSourceTurn | None:
         session_id=session_id,
         user_message_id=message_id,
         user_text=user_text,
-        user_created_at=_coerce_datetime(_value(value, "user_created_at", _value(value, "created_at"))),
-        user_updated_at=_coerce_datetime(_value(value, "user_updated_at", _value(value, "updated_at"))),
+        user_created_at=_coerce_datetime(
+            _value(value, "user_created_at", _value(value, "created_at"))
+        ),
+        user_updated_at=_coerce_datetime(
+            _value(value, "user_updated_at", _value(value, "updated_at"))
+        ),
         project_id=_text(_value(value, "project_id")) or None,
         assistant_message_id=_text(_value(value, "assistant_message_id")) or None,
         assistant_text=_text(_value(value, "assistant_text")),
@@ -211,7 +277,7 @@ class DreamingMemoryConsolidator:
         llm_client: Any,
         privacy_context: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Return only validated, corroborated user-memory operations.
+        """Return only validated user-memory candidates and operations.
 
         The method is deliberately side-effect free.  Persistence belongs to
         :class:`DreamingConsolidationService`, which routes every mutation
@@ -256,7 +322,9 @@ class DreamingMemoryConsolidator:
             return []
         self.last_parse_failed = False
         if isinstance(parsed, Mapping):
-            operations = parsed.get("operations", parsed.get("memories", parsed.get("items")))
+            operations = parsed.get(
+                "operations", parsed.get("memories", parsed.get("items"))
+            )
         else:
             operations = parsed
         if not isinstance(operations, list):
@@ -361,8 +429,14 @@ class DreamingMemoryConsolidator:
         existing_lines: list[str] = []
         for memory in existing_memories:
             content = _text(_value(memory, "content"))
-            if content:
-                existing_lines.append(f"- {content[:500]}")
+            if not content:
+                continue
+            memory_id = _text(_value(memory, "id"))
+            status = _text(_value(memory, "status")) or "active"
+            prefix = (
+                f"id={memory_id} status={status}" if memory_id else f"status={status}"
+            )
+            existing_lines.append(f"- {prefix} content={content[:500]}")
         turn_lines: list[str] = []
         for index, turn in enumerate(turns, start=1):
             # Delimiters make it difficult for a provider to mistake context
@@ -370,7 +444,11 @@ class DreamingMemoryConsolidator:
             turn_lines.append(
                 "\n".join(
                     (
-                        f"TURN {index} session={turn.session_id} user_message={turn.user_message_id}",
+                        (
+                            f"TURN {index} session={turn.session_id} "
+                            f"user_message={turn.user_message_id} "
+                            f"project_bound={'yes' if turn.project_id else 'no'}"
+                        ),
                         f"USER EVIDENCE: {turn.user_text}",
                         f"ASSISTANT CONTEXT ONLY: {turn.assistant_text[:800]}",
                     )
@@ -417,10 +495,14 @@ class DreamingMemoryConsolidator:
                 return self._stringify_provider_result(result)
             except Exception as exc:  # pragma: no cover - provider defensive path
                 self.last_call_failed = True
-                logger.warning("Dreaming consolidation LLM failed: %s", type(exc).__name__)
+                logger.warning(
+                    "Dreaming consolidation LLM failed: %s", type(exc).__name__
+                )
                 return None
 
-        callable_client = llm_client if callable(llm_client) else getattr(llm_client, "chat", None)
+        callable_client = (
+            llm_client if callable(llm_client) else getattr(llm_client, "chat", None)
+        )
         if not callable(callable_client):
             self.last_call_failed = True
             return None
@@ -476,7 +558,9 @@ class DreamingMemoryConsolidator:
     ) -> dict[str, Any] | None:
         if not isinstance(item, Mapping):
             return None
-        operation = _text(item.get("operation", item.get("action", item.get("op", "upsert")))).lower()
+        operation = _text(
+            item.get("operation", item.get("action", item.get("op", "upsert")))
+        ).lower()
         if operation not in {"upsert", "update", "replace"}:
             return None  # consolidation has no delete semantics
         scope = _text(item.get("scope", item.get("scope_intent", "user"))).lower()
@@ -489,43 +573,51 @@ class DreamingMemoryConsolidator:
         if not content:
             return None
         if not _USER_PREFIX_RE.search(content):
-            content = f"The user {content[0].lower() + content[1:] if content else content}"
+            content = (
+                f"The user {content[0].lower() + content[1:] if content else content}"
+            )
         if _SECRET_RE.search(content) or _SENSITIVE_RE.search(content):
             return None
-        quote = _text(
-            item.get(
-                "quote",
-                item.get("evidence_quote", item.get("evidence_span", item.get("evidence"))),
-            )
+        raw_quote = item.get(
+            "quote",
+            item.get("evidence_quote", item.get("evidence_span")),
         )
+        quote = _text(raw_quote) if isinstance(raw_quote, str) else ""
         evidence_input = item.get("evidence")
         if not quote and not isinstance(evidence_input, list):
-            return None
-        if _SECRET_RE.search(quote) or _SENSITIVE_RE.search(quote):
             return None
         if str(item.get("sensitivity", "normal")).strip().lower() != "normal":
             return None
         if bool(item.get("transient")) or bool(item.get("is_transient")):
             return None
-        if item.get("expires_at") is not None or _TRANSIENT_RE.search(f"{content}\n{quote}"):
-            return None
-        if _PROJECT_RE.search(f"{content}\n{quote}"):
+        if item.get("expires_at") is not None:
             return None
 
+        memory_type = _normalise_memory_type(item.get("memory_type", "fact"))
+        importance = _normalise_importance(item.get("importance", 0))
         try:
             confidence = float(item.get("confidence", 0.0))
-            importance = int(item.get("importance", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
-        if confidence < 0.8 or importance < 6 or confidence > 1.0 or importance > 10:
+        if (
+            memory_type is None
+            or importance is None
+            or confidence < 0.8
+            or confidence > 1.0
+            or importance < 6
+        ):
             return None
 
-        referenced_ids = item.get("source_message_ids", item.get("evidence_message_ids", []))
+        referenced_ids = item.get(
+            "source_message_ids", item.get("evidence_message_ids", [])
+        )
         if isinstance(referenced_ids, str):
             referenced_ids = [referenced_ids]
         if not isinstance(referenced_ids, Iterable):
             referenced_ids = []
-        referenced = {str(value).strip() for value in referenced_ids if str(value).strip()}
+        referenced = {
+            str(value).strip() for value in referenced_ids if str(value).strip()
+        }
 
         # A quote must be an exact substring of a user message.  We never
         # search assistant_text, even when a model supplies an assistant ID.
@@ -534,37 +626,59 @@ class DreamingMemoryConsolidator:
             if not isinstance(evidence_input, list) or not evidence_input:
                 return None
             for raw_ref in evidence_input:
-                if not isinstance(raw_ref, Mapping):
-                    return None
-                ref_message_id = _text(raw_ref.get("message_id", raw_ref.get("user_message_id")))
-                ref_session_id = _text(raw_ref.get("session_id"))
-                ref_quote = _text(raw_ref.get("quote", raw_ref.get("evidence_quote")))
-                if not ref_message_id or not ref_session_id or not ref_quote:
-                    return None
-                match = next(
-                    (
+                matches: list[DreamingSourceTurn]
+                if isinstance(raw_ref, Mapping):
+                    ref_message_id = _text(
+                        raw_ref.get("message_id", raw_ref.get("user_message_id"))
+                    )
+                    ref_session_id = _text(raw_ref.get("session_id"))
+                    ref_quote = _text(
+                        raw_ref.get("quote", raw_ref.get("evidence_quote"))
+                    )
+                    if not ref_message_id or not ref_session_id or not ref_quote:
+                        return None
+                    matches = [
                         turn
                         for turn in turns
                         if turn.user_message_id == ref_message_id
                         and turn.session_id == ref_session_id
                         and ref_quote in turn.user_text
-                    ),
-                    None,
-                )
-                if match is None:
+                    ]
+                elif isinstance(raw_ref, str):
+                    # Compatibility for local models that emit exact quotes but
+                    # omit their IDs. The server resolves each quote only
+                    # against canonical user messages, never assistant text.
+                    ref_quote = _text(raw_ref)
+                    if not ref_quote:
+                        return None
+                    matches = [turn for turn in turns if ref_quote in turn.user_text]
+                    if referenced:
+                        matches = [
+                            turn
+                            for turn in matches
+                            if turn.user_message_id in referenced
+                        ]
+                else:
+                    return None
+                if not matches:
                     # In particular this rejects assistant IDs and quotes that
                     # only occur in assistant context.
                     return None
-                evidence_refs.append(
-                    {
-                        "type": "conversation",
-                        "session_id": match.session_id,
-                        "message_id": match.user_message_id,
-                        "quote": ref_quote,
-                        "source_at": _iso(match.user_updated_at or match.user_created_at),
-                        "created_at": _iso(match.user_created_at or match.user_updated_at),
-                    }
-                )
+                for match in matches:
+                    evidence_refs.append(
+                        {
+                            "type": "conversation",
+                            "session_id": match.session_id,
+                            "message_id": match.user_message_id,
+                            "quote": ref_quote,
+                            "source_at": _iso(
+                                match.user_updated_at or match.user_created_at
+                            ),
+                            "created_at": _iso(
+                                match.user_created_at or match.user_updated_at
+                            ),
+                        }
+                    )
             matching_turns = [
                 turn
                 for turn in turns
@@ -580,29 +694,68 @@ class DreamingMemoryConsolidator:
         else:
             matching_turns = [turn for turn in turns if quote in turn.user_text]
             if referenced:
-                matching_turns = [turn for turn in matching_turns if turn.user_message_id in referenced]
+                matching_turns = [
+                    turn
+                    for turn in matching_turns
+                    if turn.user_message_id in referenced
+                ]
         if not matching_turns:
             return None
-        # A project-associated turn cannot be silently downgraded into a
-        # cross-project user memory.  Project auto-memory has its own ACL and
-        # candidate path; the history consolidator remains user-only.
-        if any(turn.project_id for turn in matching_turns):
+        evidence_quotes = [
+            _text(ref.get("quote"))
+            for ref in evidence_refs
+            if isinstance(ref, Mapping) and _text(ref.get("quote"))
+        ]
+        validated_text = "\n".join([content, quote, *evidence_quotes])
+        if (
+            _SECRET_RE.search(validated_text)
+            or _SENSITIVE_RE.search(validated_text)
+            or _TRANSIENT_RE.search(validated_text)
+            or _PROJECT_RE.search(validated_text)
+        ):
             return None
         matching_sessions = sorted({turn.session_id for turn in matching_turns})
         corroborated = len(matching_sessions) >= 2
-        # Provider flags can never promote a one-session item, but an explicit
-        # false flag is useful for suppressing a provider's overconfident
-        # multi-session claim during review.
-        if item.get("corroborated") is False or item.get("verified") is False:
-            corroborated = False
+        project_turns = [turn for turn in matching_turns if turn.project_id]
+        if project_turns:
+            # Explicit personal facts may remain review candidates after one
+            # Project conversation. Inferred interests require corroboration.
+            from ..services.dreaming_memory_service import _normalize_candidate
+
+            quote_by_message = {
+                str(ref.get("message_id") or ""): _text(ref.get("quote"))
+                for ref in evidence_refs
+                if isinstance(ref, Mapping)
+            }
+            for turn in project_turns:
+                turn_quote = quote_by_message.get(turn.user_message_id) or quote
+                safe_candidate = _normalize_candidate(
+                    {
+                        "action": "upsert",
+                        "content": content,
+                        "memory_type": memory_type,
+                        "confidence": confidence,
+                        "importance": importance,
+                        "sensitivity": "normal",
+                        "evidence_span": turn_quote,
+                        "scope_intent": "user",
+                        "explicit_evidence": True,
+                    },
+                    user_input=turn.user_text,
+                    source_type="dreaming_auto",
+                    project_id=turn.project_id,
+                    routed_scope="user",
+                    cross_session_corroborated=corroborated,
+                )
+                if safe_candidate is None:
+                    return None
+        # Model-supplied corroborated/verified flags have no authority in either
+        # direction. Exact validated evidence and distinct session IDs alone
+        # determine candidate versus active state.
 
         source_ids = sorted({turn.user_message_id for turn in matching_turns})
         source_created_at = max(
-            (
-                turn.user_created_at
-                for turn in matching_turns
-                if turn.user_created_at
-            ),
+            (turn.user_created_at for turn in matching_turns if turn.user_created_at),
             default=None,
         )
         source_updated_at = max(
@@ -613,9 +766,10 @@ class DreamingMemoryConsolidator:
             ),
             default=None,
         )
-        memory_type = _text(item.get("memory_type", "fact")).lower()[:32] or "fact"
         title = _text(item.get("title"))[:200] or None
-        dedupe_key = _stable_digest({"type": memory_type, "content": _normalise_key(content)})[:128]
+        dedupe_key = _stable_digest(
+            {"type": memory_type, "content": _normalise_key(content)}
+        )[:128]
         operation_id = _stable_digest(
             {
                 "user_id": str(user_id),

@@ -9,6 +9,7 @@ import { runBackgroundSqliteAccess } from "../db/sqlite-write-coordinator";
 const CHANNEL_ID = "aoitalk-task-reminders";
 const STORAGE_KEY = "aoitalk.localNotificationSchedule.v1";
 const DEFAULT_OFFSETS_STORAGE_KEY = "aoitalk.localNotificationDefaultOffsets.v1";
+const REMINDER_NOTIFICATION_IDENTIFIER_PREFIX = "aoitalk-task-reminder:";
 const DEFAULT_REMINDER_OFFSETS = [5];
 const MAX_SCHEDULED_NOTIFICATIONS = 60;
 const SCHEDULE_HORIZON_DAYS = 60;
@@ -124,9 +125,32 @@ async function readDefaultReminderOffsets(): Promise<number[]> {
   }
 }
 
+function isManagedTaskReminderRequest(
+  request: Notifications.NotificationRequest,
+): boolean {
+  return (
+    request.content.data?.kind === "reminder" ||
+    request.identifier.startsWith(REMINDER_NOTIFICATION_IDENTIFIER_PREFIX)
+  );
+}
+
+async function readManagedScheduledNotificationIds(): Promise<string[]> {
+  try {
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    return scheduled
+      .filter(isManagedTaskReminderRequest)
+      .map((request) => request.identifier);
+  } catch {
+    return [];
+  }
+}
+
 async function cancelStoredSchedule(): Promise<void> {
   const stored = await readStoredSchedule();
-  const identifiers = Object.values(stored).flat();
+  const discovered = await readManagedScheduledNotificationIds();
+  const identifiers = [
+    ...new Set([...Object.values(stored).flat(), ...discovered]),
+  ];
   await Promise.allSettled(
     identifiers.map((id) => Notifications.cancelScheduledNotificationAsync(id)),
   );
@@ -207,7 +231,6 @@ export async function sendLocalNotificationTest(): Promise<boolean> {
 function addReminderCandidates(
   candidates: NotificationCandidate[],
   params: {
-    keyPrefix: string;
     taskId: string;
     occurrenceId?: string | null;
     title: string;
@@ -225,7 +248,7 @@ function addReminderCandidates(
   for (const offset of params.offsets) {
     const triggerAt = new Date(anchor.getTime() - offset * 60_000);
     candidates.push({
-      key: `${params.keyPrefix}:reminder:${offset}`,
+      key: `task:${params.taskId}:at:${anchor.getTime()}:reminder:${offset}`,
       taskId: params.taskId,
       occurrenceId: params.occurrenceId,
       title: `Upcoming: ${params.title}`,
@@ -272,7 +295,6 @@ async function collectCandidatesFromSqlite(
     if (isClosedStatus(row.occurrence.status || row.taskStatus)) continue;
 
     addReminderCandidates(candidates, {
-      keyPrefix: `occurrence:${row.occurrence.id}`,
       taskId: row.taskId,
       occurrenceId: row.occurrence.id,
       title: row.taskTitle || "Task",
@@ -297,7 +319,6 @@ async function collectCandidatesFromSqlite(
     if (isClosedStatus(task.status)) continue;
 
     addReminderCandidates(candidates, {
-      keyPrefix: `task:${task.id}`,
       taskId: task.id,
       title: task.title || "Task",
       startAt: parseDate(task.startAt),
@@ -308,13 +329,20 @@ async function collectCandidatesFromSqlite(
     });
   }
 
-  return candidates
+  const upcoming = candidates
     .filter((candidate) => {
       const time = candidate.triggerAt.getTime();
       return time > now && time <= horizon;
     })
-    .sort((a, b) => a.triggerAt.getTime() - b.triggerAt.getTime())
-    .slice(0, MAX_SCHEDULED_NOTIFICATIONS);
+    .sort((a, b) => a.triggerAt.getTime() - b.triggerAt.getTime());
+
+  const deduped = new Map<string, NotificationCandidate>();
+  for (const candidate of upcoming) {
+    if (!deduped.has(candidate.key)) {
+      deduped.set(candidate.key, candidate);
+    }
+  }
+  return [...deduped.values()].slice(0, MAX_SCHEDULED_NOTIFICATIONS);
 }
 
 async function collectCandidates(): Promise<NotificationCandidate[]> {
@@ -336,6 +364,7 @@ async function runRescheduleLocalTaskNotificationsFromCache(): Promise<void> {
   for (const candidate of candidates) {
     try {
       const identifier = await Notifications.scheduleNotificationAsync({
+        identifier: `${REMINDER_NOTIFICATION_IDENTIFIER_PREFIX}${candidate.key}`,
         content: {
           title: candidate.title,
           body: candidate.body,
@@ -352,10 +381,7 @@ async function runRescheduleLocalTaskNotificationsFromCache(): Promise<void> {
           channelId: CHANNEL_ID,
         },
       });
-      scheduled[candidate.key] = [
-        ...(scheduled[candidate.key] ?? []),
-        identifier,
-      ];
+      scheduled[candidate.key] = [identifier];
     } catch {
       // Ignore individual scheduling failures so one bad row does not disable
       // all other local reminders.

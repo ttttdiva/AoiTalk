@@ -40,6 +40,7 @@ export function useTaskPersistence({
   task,
   draftTask,
   activeOccurrenceContext,
+  statusOccurrenceContext,
   editTitle,
   draftTagIds,
   setTask,
@@ -66,6 +67,7 @@ export function useTaskPersistence({
   task: Task | null;
   draftTask?: Partial<Task> | null;
   activeOccurrenceContext: RecurringOccurrenceContext | null;
+  statusOccurrenceContext?: RecurringOccurrenceContext | null;
   editTitle: string;
   draftTagIds: string[];
   setTask: React.Dispatch<React.SetStateAction<Task | null>>;
@@ -75,7 +77,7 @@ export function useTaskPersistence({
   setDraftTagIds: React.Dispatch<React.SetStateAction<string[]>>;
   setCreatedTaskId: React.Dispatch<React.SetStateAction<string | null>>;
   setTags: React.Dispatch<React.SetStateAction<Tag[]>>;
-  setOccurrenceStatusOverride: React.Dispatch<React.SetStateAction<string | null>>;
+  setOccurrenceStatusOverride: (status: string | null) => void;
   setOccurrenceDateOverride: React.Dispatch<
     React.SetStateAction<{ start_at: string | null; end_at: string | null } | null>
   >;
@@ -93,6 +95,10 @@ export function useTaskPersistence({
     (generation: number) => lifecycleGenerationRef.current === generation,
     [lifecycleGenerationRef],
   );
+  const occurrenceContextForStatus =
+    statusOccurrenceContext === undefined
+      ? activeOccurrenceContext
+      : statusOccurrenceContext;
 
   const applyLocalDraftUpdate = useCallback((data: Record<string, unknown>) => {
     setTask((prev) => (prev ? ({ ...prev, ...data } as Task) : prev));
@@ -353,15 +359,15 @@ export function useTaskPersistence({
         const previousTask = task;
         if (
           task?.has_recurrence &&
-          activeOccurrenceContext?.start_at &&
+          occurrenceContextForStatus?.start_at &&
           typeof data.status === "string"
         ) {
           const result = await taskApi.updateOccurrenceStatus(updateTaskId, {
-            occurrence_id: activeOccurrenceContext.occurrence_id ?? null,
-            occurrence_start_at: activeOccurrenceContext.start_at,
-            occurrence_end_at: activeOccurrenceContext.end_at ?? null,
+            occurrence_id: occurrenceContextForStatus.occurrence_id ?? null,
+            occurrence_start_at: occurrenceContextForStatus.start_at,
+            occurrence_end_at: occurrenceContextForStatus.end_at ?? null,
             original_start_at:
-              activeOccurrenceContext.original_start_at ?? null,
+              occurrenceContextForStatus.original_start_at ?? null,
             status: data.status,
           });
           if (!isCurrentLifecycle(lifecycleGeneration)) return null;
@@ -408,9 +414,9 @@ export function useTaskPersistence({
     },
     [
       applyLocalDraftUpdate,
-      activeOccurrenceContext,
       effectiveTaskId,
       isCurrentLifecycle,
+      occurrenceContextForStatus,
       lifecycleGenerationRef,
       onTaskUpdated,
       saveTaskUpdate,

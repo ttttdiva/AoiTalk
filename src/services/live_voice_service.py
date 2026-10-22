@@ -2356,40 +2356,50 @@ class LiveVoiceService:
         policy: Any | None = None,
         mode: Any | None = None,
     ) -> dict[str, Any]:
-        normalized_model = str(model or os.getenv("OPENAI_REALTIME_MODEL") or DEFAULT_REALTIME_MODEL).strip()
-        normalized_voice = str(voice or os.getenv("OPENAI_REALTIME_VOICE") or DEFAULT_REALTIME_VOICE).strip()
-        if (
-            not normalized_model
-            or len(normalized_model) > 160
-            or normalized_model not in self._allowed_models
-        ):
-            raise LiveVoiceError("Unsupported Realtime model", status_code=400)
-        if (
-            not normalized_voice
-            or len(normalized_voice) > 80
-            or normalized_voice not in self._allowed_voices
-        ):
-            raise LiveVoiceError("Unsupported Realtime voice", status_code=400)
-        # The unified call is created only after the browser has produced its
-        # SDP offer, but a missing server credential can be rejected now without
-        # touching the network or allocating a durable ConversationSession.
-        ready_check = getattr(self.provider, "check_ready", None)
-        if ready_check is not None:
-            try:
-                await _maybe_await(ready_check())
-            except LiveVoiceError:
-                raise
-            except Exception as exc:
-                raise LiveVoiceProviderError(
-                    "Live Voice provider is not ready", status_code=503
-                ) from exc
-        normalized_instructions = str(instructions or "").replace("\x00", "").strip()
-        if len(normalized_instructions) > MAX_TRANSCRIPT_CHARS:
-            normalized_instructions = normalized_instructions[:MAX_TRANSCRIPT_CHARS]
         from .voice_sessions.models import VoiceSessionMode
         from .voice_sessions.policy import VoiceSessionPolicyResolver
 
         resolved_policy = policy
+        requested_mode = str(mode or getattr(resolved_policy, "mode", "") or "").strip()
+        pipeline_mode = requested_mode == VoiceSessionMode.PIPELINE.value
+        normalized_instructions = str(instructions or "").replace("\x00", "").strip()
+        if len(normalized_instructions) > MAX_TRANSCRIPT_CHARS:
+            normalized_instructions = normalized_instructions[:MAX_TRANSCRIPT_CHARS]
+
+        if pipeline_mode:
+            speech_cfg = self.config.get("speech_recognition", {}) or {}
+            engine_name = str(speech_cfg.get("current_engine") or "whisper").strip()
+            engine_cfg = (speech_cfg.get("engines", {}) or {}).get(engine_name, {}) or {}
+            engine_model = str(engine_cfg.get("model") or engine_name).strip()
+            normalized_model = f"{engine_name}/{engine_model}"[:160]
+            normalized_voice = str(character_name or "character_tts").strip()[:80]
+        else:
+            normalized_model = str(model or os.getenv("OPENAI_REALTIME_MODEL") or DEFAULT_REALTIME_MODEL).strip()
+            normalized_voice = str(voice or os.getenv("OPENAI_REALTIME_VOICE") or DEFAULT_REALTIME_VOICE).strip()
+            if (
+                not normalized_model
+                or len(normalized_model) > 160
+                or normalized_model not in self._allowed_models
+            ):
+                raise LiveVoiceError("Unsupported Realtime model", status_code=400)
+            if (
+                not normalized_voice
+                or len(normalized_voice) > 80
+                or normalized_voice not in self._allowed_voices
+            ):
+                raise LiveVoiceError("Unsupported Realtime voice", status_code=400)
+            # Provider readiness is irrelevant to the fully local pipeline.
+            ready_check = getattr(self.provider, "check_ready", None)
+            if ready_check is not None:
+                try:
+                    await _maybe_await(ready_check())
+                except LiveVoiceError:
+                    raise
+                except Exception as exc:
+                    raise LiveVoiceProviderError(
+                        "Live Voice provider is not ready", status_code=503
+                    ) from exc
+
         if resolved_policy is None:
             resolved_policy = VoiceSessionPolicyResolver.resolve(
                 config=self.config,
@@ -2402,6 +2412,7 @@ class LiveVoiceService:
                 legacy_instructions=normalized_instructions or None,
             )
         resolved_mode = str(mode or resolved_policy.mode)
+        pipeline_mode = resolved_mode == VoiceSessionMode.PIPELINE.value
         if conversation_session_id:
             conversation_session_id = str(conversation_session_id).strip()
             if not conversation_session_id:
@@ -2437,19 +2448,39 @@ class LiveVoiceService:
             project_id=project_id,
             durable_session=durable,
         )
-        privacy_mode = self._privacy_preflight(
-            actor,
-            session_id=conversation_session_id,
-            project_id=project_id,
-            session_context=session_context,
-            project_metadata=project_metadata,
-        )
+        if pipeline_mode:
+            # The local pipeline makes no provider call. Resolve the effective
+            # privacy label without applying an outbound-provider gate.
+            gateway = OutboundPrivacyGateway(
+                self.config,
+                user_id=actor.user_id,
+                session_id=str(conversation_session_id or ""),
+                session_context=dict(session_context),
+                project_metadata=(
+                    dict(project_metadata)
+                    if isinstance(project_metadata, Mapping)
+                    else ({"project_id": str(project_id)} if project_id else None)
+                ),
+            )
+            privacy_mode = gateway.mode
+        else:
+            privacy_mode = self._privacy_preflight(
+                actor,
+                session_id=conversation_session_id,
+                project_id=project_id,
+                session_context=session_context,
+                project_metadata=project_metadata,
+            )
 
         live_session = LiveVoiceSession(
             id=str(uuid.uuid4()),
             actor=actor,
             conversation_session_id=conversation_session_id,
-            provider=str(getattr(self.provider, "name", LIVE_VOICE_PROVIDER) or LIVE_VOICE_PROVIDER),
+            provider=(
+                "local_pipeline"
+                if pipeline_mode
+                else str(getattr(self.provider, "name", LIVE_VOICE_PROVIDER) or LIVE_VOICE_PROVIDER)
+            ),
             model=normalized_model,
             voice=normalized_voice,
             project_id=project_id,
@@ -2500,7 +2531,10 @@ class LiveVoiceService:
             live_session.agent_run_id = await self._create_agent_run(
                 actor=actor,
                 session=live_session,
-                objective=normalized_instructions or "Live Voice conversation",
+                objective=(
+                    normalized_instructions
+                    or ("Local Pipeline voice conversation" if pipeline_mode else "Live Voice conversation")
+                ),
             )
         except asyncio.CancelledError:
             # Request disconnects must not strand a durable AgentRun or actor

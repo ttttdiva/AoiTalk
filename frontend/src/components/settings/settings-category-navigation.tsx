@@ -23,7 +23,7 @@ export function getVisibleSettingsCategories(isAdmin: boolean): SettingsCategory
 }
 
 export function SettingsCategoryNavigation({
-  activeCategory = "overview",
+  activeCategory = "conversation",
   isAdmin = false,
   onSelect,
 }: {
@@ -34,10 +34,11 @@ export function SettingsCategoryNavigation({
   const categories = getVisibleSettingsCategories(isAdmin);
 
   const groups: Array<{ label: string; ids: SettingsCategoryId[] }> = [
-    { label: "QUICK SETTINGS", ids: ["overview", "account"] },
-    { label: "WORKSPACE", ids: ["conversation", "tts-yomi", "input", "notifications", "knowledge"] },
-    { label: "SYSTEM", ids: ["integrations", "tool-permissions"] },
-    { label: "ORGANIZATION", ids: ["admin", "support"] },
+    { label: "会話と音声", ids: ["conversation", "tts-yomi"] },
+    { label: "表示と操作", ids: ["appearance", "input"] },
+    { label: "通知と連携", ids: ["notifications", "knowledge", "integrations"] },
+    { label: "権限と個人設定", ids: ["tool-permissions", "account"] },
+    { label: "管理", ids: ["admin", "support"] },
   ];
 
   return (

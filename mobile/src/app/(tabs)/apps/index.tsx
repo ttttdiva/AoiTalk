@@ -15,6 +15,7 @@ import {
   Surface,
   Text,
   TextInput,
+  TouchableRipple,
 } from "react-native-paper";
 import { useFocusEffect, useRouter } from "expo-router";
 import { ScreenHeader } from "../../../components/screen-header";
@@ -33,38 +34,43 @@ function permissionLabel(permission: string | null | undefined): string {
   return permission ? `権限: ${permission}` : "権限情報なし";
 }
 
-function AppListItem({ app, onPress }: { app: AppSummary; onPress: () => void }) {
+export function AppListItem({ app, onPress }: { app: AppSummary; onPress: () => void }) {
   return (
     <Surface style={styles.card} elevation={1}>
-      <Button
-        mode="text"
-        contentStyle={styles.cardButtonContent}
+      <TouchableRipple
+        style={styles.cardTouchable}
         onPress={onPress}
         accessibilityRole="button"
         accessibilityLabel={`${app.name}を開く`}
+        rippleColor="rgba(137, 180, 250, 0.16)"
       >
-        <View style={styles.iconCircle}>
-          <Icon source="application-brackets-outline" size={24} color="#89b4fa" />
-        </View>
-        <View style={styles.cardCopy}>
-          <Text style={styles.cardTitle} numberOfLines={1}>
-            {app.name}
-          </Text>
-          <Text style={styles.cardMeta} numberOfLines={1}>
-            {app.slug} · {permissionLabel(app.permission)}
-          </Text>
-          {app.description ? (
-            <Text style={styles.cardDescription} numberOfLines={2}>
-              {app.description}
+        <View testID="app-card-row" style={styles.cardRow}>
+          <View testID="app-card-icon-circle" style={styles.iconCircle}>
+            <Icon source="application-brackets-outline" size={24} color="#89b4fa" />
+          </View>
+          <View testID="app-card-copy" style={styles.cardCopy}>
+            <Text testID="app-card-title" style={styles.cardTitle} numberOfLines={2} allowFontScaling>
+              {app.name}
             </Text>
-          ) : null}
-          {app.related_project_ids && app.related_project_ids.length > 0 ? (
-            <Text style={styles.cardRelated} numberOfLines={1}>
-              Project {app.related_project_ids.length}件
+            <Text testID="app-card-slug" style={styles.cardSlug} numberOfLines={1} allowFontScaling>
+              {app.slug}
             </Text>
-          ) : null}
+            <Text testID="app-card-permission" style={styles.cardMeta} numberOfLines={1} allowFontScaling>
+              {permissionLabel(app.permission)}
+            </Text>
+            {app.description ? (
+              <Text testID="app-card-description" style={styles.cardDescription} numberOfLines={2} allowFontScaling>
+                {app.description}
+              </Text>
+            ) : null}
+            {app.related_project_ids && app.related_project_ids.length > 0 ? (
+              <Text testID="app-card-related" style={styles.cardRelated} numberOfLines={1} allowFontScaling>
+                Project {app.related_project_ids.length}件
+              </Text>
+            ) : null}
+          </View>
         </View>
-      </Button>
+      </TouchableRipple>
     </Surface>
   );
 }
@@ -241,13 +247,15 @@ const styles = StyleSheet.create({
   listContent: { padding: 12, paddingBottom: 100 },
   emptyContent: { flexGrow: 1, justifyContent: "center", padding: 24 },
   card: { backgroundColor: SURFACE, borderRadius: 14, marginBottom: 10 },
-  cardButtonContent: { justifyContent: "flex-start", paddingHorizontal: 12, paddingVertical: 12 },
-  iconCircle: { width: 42, height: 42, borderRadius: 21, backgroundColor: "#313244", justifyContent: "center", alignItems: "center", marginRight: 10 },
-  cardCopy: { flex: 1, alignItems: "flex-start" },
-  cardTitle: { color: TEXT, fontWeight: "700", fontSize: 16 },
-  cardMeta: { color: MUTED, fontSize: 12, marginTop: 3 },
-  cardDescription: { color: "#bac2de", fontSize: 13, marginTop: 5 },
-  cardRelated: { color: "#89b4fa", fontSize: 12, marginTop: 5 },
+  cardTouchable: { alignSelf: "stretch", borderRadius: 14, overflow: "hidden" },
+  cardRow: { minWidth: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 12 },
+  iconCircle: { width: 42, height: 42, flexShrink: 0, borderRadius: 21, backgroundColor: "#313244", justifyContent: "center", alignItems: "center", marginRight: 10 },
+  cardCopy: { flex: 1, minWidth: 0, alignItems: "stretch" },
+  cardTitle: { width: "100%", minWidth: 0, flexShrink: 1, color: TEXT, fontWeight: "700", fontSize: 16 },
+  cardSlug: { width: "100%", minWidth: 0, flexShrink: 1, color: MUTED, fontSize: 12, marginTop: 2 },
+  cardMeta: { width: "100%", minWidth: 0, flexShrink: 1, color: MUTED, fontSize: 12, marginTop: 2 },
+  cardDescription: { width: "100%", minWidth: 0, flexShrink: 1, color: "#bac2de", fontSize: 13, marginTop: 5 },
+  cardRelated: { width: "100%", minWidth: 0, flexShrink: 1, color: "#89b4fa", fontSize: 12, marginTop: 5 },
   empty: { alignItems: "center", gap: 8 },
   emptyTitle: { color: TEXT, fontSize: 18, fontWeight: "700", marginTop: 8 },
   emptyText: { color: MUTED, textAlign: "center", lineHeight: 20 },

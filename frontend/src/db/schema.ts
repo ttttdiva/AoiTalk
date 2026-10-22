@@ -58,6 +58,192 @@ export const users = pgTable("users", {
   ),
 ]);
 
+/**
+ * Short-lived browser login handoff state.  Secrets are represented by
+ * SHA-256 digests; the PKCE verifier remains server-side for the transaction
+ * lifetime and is never put in a redirect URL.
+ */
+export const authHandoffTransactions = pgTable(
+  "auth_handoff_transactions",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    stateHash: varchar("state_hash", { length: 64 }).notNull(),
+    bindingHash: varchar("binding_hash", { length: 64 }).notNull(),
+    codeHash: varchar("code_hash", { length: 64 }),
+    pkceChallenge: varchar("pkce_challenge", { length: 64 }).notNull(),
+    pkceVerifier: varchar("pkce_verifier", { length: 128 }).notNull(),
+    sourceUserId: uuid("source_user_id").references(() => users.id, {
+      onDelete: "cascade",
+    }),
+    sourceSessionVersion: integer("source_session_version"),
+    sourceExpiresAt: timestamp("source_expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    sourceOrigin: varchar("source_origin", { length: 255 }).notNull(),
+    destinationOrigin: varchar("destination_origin", { length: 255 }).notNull(),
+    callbackPath: varchar("callback_path", { length: 512 }).notNull(),
+    returnPath: varchar("return_path", { length: 2048 }).notNull(),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    authorizedAt: timestamp("authorized_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    consumedAt: timestamp("consumed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    unique("uq_auth_handoff_transactions_state_hash").on(table.stateHash),
+    unique("uq_auth_handoff_transactions_code_hash").on(table.codeHash),
+    check(
+      "ck_auth_handoff_transactions_state_hash",
+      sql`length(${table.stateHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_transactions_binding_hash",
+      sql`length(${table.bindingHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_transactions_code_hash",
+      sql`${table.codeHash} is null or length(${table.codeHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_transactions_pkce_challenge",
+      sql`length(${table.pkceChallenge}) = 43`,
+    ),
+    check(
+      "ck_auth_handoff_transactions_source_session_version",
+      sql`${table.sourceSessionVersion} is null or ${table.sourceSessionVersion} > 0`,
+    ),
+    check(
+      "ck_auth_handoff_transactions_return_path",
+      sql`${table.returnPath} like '/%' and ${table.returnPath} not like '//%'`,
+    ),
+    index("ix_auth_handoff_transactions_expires_at").on(table.expiresAt),
+    index("ix_auth_handoff_transactions_source_user_id").on(table.sourceUserId),
+    index("ix_auth_handoff_transactions_binding_hash").on(table.bindingHash),
+  ],
+);
+
+/**
+ * Short-lived browser login handoff state for registered external clients.
+ * Secret inputs, including the recipient's CSRF state, are stored as
+ * SHA-256 digests and bound to the original client request.
+ */
+export const authHandoffClientTransactions = pgTable(
+  "auth_handoff_client_transactions",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    recipientStateHash: varchar("recipient_state_hash", {
+      length: 64,
+    }).notNull(),
+    clientId: varchar("client_id", { length: 64 }).notNull(),
+    registrationHash: varchar("registration_hash", { length: 64 }).notNull(),
+    sourceOrigin: varchar("source_origin", { length: 255 }).notNull(),
+    destinationOrigin: varchar("destination_origin", { length: 255 }).notNull(),
+    callbackPath: varchar("callback_path", { length: 512 }).notNull(),
+    audience: varchar("audience", { length: 255 }).notNull(),
+    pkceChallenge: varchar("pkce_challenge", { length: 43 }).notNull(),
+    codeHash: varchar("code_hash", { length: 64 }),
+    sourceUserId: uuid("source_user_id").references(() => users.id, {
+      onDelete: "cascade",
+    }),
+    sourceSessionVersion: integer("source_session_version"),
+    sourceExpiresAt: timestamp("source_expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    authorizedAt: timestamp("authorized_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    consumedAt: timestamp("consumed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    unique("uq_auth_handoff_client_transactions_request_hash").on(
+      table.requestHash,
+    ),
+    unique("uq_auth_handoff_client_transactions_code_hash").on(
+      table.codeHash,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_request_hash",
+      sql`length(${table.requestHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_recipient_state_hash",
+      sql`length(${table.recipientStateHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_registration_hash",
+      sql`length(${table.registrationHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_code_hash",
+      sql`${table.codeHash} is null or length(${table.codeHash}) = 64`,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_pkce_challenge",
+      sql`length(${table.pkceChallenge}) = 43`,
+    ),
+    check(
+      "ck_auth_handoff_client_transactions_source_session_version",
+      sql`${table.sourceSessionVersion} is null or ${table.sourceSessionVersion} > 0`,
+    ),
+    index("ix_auth_handoff_client_transactions_expires_at").on(table.expiresAt),
+    index("ix_auth_handoff_client_transactions_source_user_id").on(
+      table.sourceUserId,
+    ),
+    index("ix_auth_handoff_client_transactions_client_id_created_at").on(
+      table.clientId,
+      table.createdAt,
+    ),
+  ],
+);
+
+export const authHandoffRateLimits = pgTable(
+  "auth_handoff_rate_limits",
+  {
+    bucket: varchar("bucket", { length: 128 }).primaryKey(),
+    windowStartedAt: timestamp("window_started_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    attempts: integer("attempts").notNull(),
+  },
+  (table) => [
+    check(
+      "ck_auth_handoff_rate_limits_attempts",
+      sql`${table.attempts} > 0`,
+    ),
+  ],
+);
+
 /** Immutable AD objectGUID → local user ownership binding. */
 export const externalIdentityBindings = pgTable(
   "external_identity_bindings",
@@ -98,44 +284,6 @@ export const externalIdentityBindings = pgTable(
   ],
 );
 
-// ─── ユーザー単位の HF / Hydrus 接続情報 ───
-// encryptedPayload は field-crypto の ciphertext のみを保存する。平文の
-// token/API key を Drizzle の insert payload に渡さないよう、サービス層で
-// 暗号化してから書き込む契約とする。
-
-export const userHfCredentials = pgTable("user_hf_credentials", {
-  id: uuid("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  userId: uuid("user_id")
-    .references(() => users.id, { onDelete: "cascade" })
-    .notNull(),
-  encryptedPayload: text("encrypted_payload"),
-  settingsJson: json("settings_json").default({}).notNull(),
-  enabled: boolean("enabled").default(true).notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
-}, (table) => [
-  unique("uq_user_hf_credentials_user").on(table.userId),
-  index("ix_user_hf_credentials_user").on(table.userId),
-]);
-
-export const userHydrusCredentials = pgTable("user_hydrus_credentials", {
-  id: uuid("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  userId: uuid("user_id")
-    .references(() => users.id, { onDelete: "cascade" })
-    .notNull(),
-  encryptedPayload: text("encrypted_payload"),
-  settingsJson: json("settings_json").default({}).notNull(),
-  enabled: boolean("enabled").default(true).notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
-}, (table) => [
-  unique("uq_user_hydrus_credentials_user").on(table.userId),
-  index("ix_user_hydrus_credentials_user").on(table.userId),
-]);
 
 export const enterpriseBootstrapState = pgTable("enterprise_bootstrap_state", {
   id: integer("id").primaryKey(),
@@ -974,9 +1122,16 @@ export const conversationSessions = pgTable("conversation_sessions", {
   context: json("context"),
   currentSummary: text("current_summary"),
   isActive: boolean("is_active"),
+  isPinned: boolean("is_pinned").default(false).notNull(),
+  pinnedAt: timestamp("pinned_at"),
+  pinUpdatedAt: timestamp("pin_updated_at"),
   title: varchar("title").default(""),
   deletedAt: timestamp("deleted_at"),
   projectId: uuid("project_id").references(() => projects.id),
+  // Durable Operations Agent binding. Character/group participant data stays
+  // independent; this is the session's canonical execution identity.
+  agentId: uuid("agent_id"),
+  agentBindingUpdatedAt: timestamp("agent_binding_updated_at"),
   appId: uuid("app_id").references((): AnyPgColumn => apps.id, {
     onDelete: "set null",
   }),
@@ -2206,6 +2361,8 @@ export const externalActionAttempts = pgTable("external_action_attempts", {
   executionKey: varchar("execution_key", { length: 255 }),
   status: varchar("status", { length: 16 }).default("running").notNull(),
   providerAttemptRef: varchar("provider_attempt_ref", { length: 255 }),
+  providerStateCiphertext: text("provider_state_ciphertext"), // server-only encrypted upload checkpoint
+  providerLeaseExpiresAt: timestamp("provider_lease_expires_at"),
   evidenceArtifactIds: json("evidence_artifact_ids").default([]).notNull(),
   resultSummary: text("result_summary"),
   evidenceNote: text("evidence_note"),
@@ -2360,6 +2517,8 @@ export const mediaPersonaRevisions = pgTable("media_persona_revisions", {
   platformPatreon: boolean("platform_patreon").default(false).notNull(),
   platformYoutube: boolean("platform_youtube").default(false).notNull(),
   platformInstagram: boolean("platform_instagram").default(false).notNull(),
+  platformFanza: boolean("platform_fanza").default(false).notNull(),
+  platformTiktok: boolean("platform_tiktok").default(false).notNull(),
   contentPillars: json("content_pillars").default([]).notNull(),
   contentHash: varchar("content_hash", { length: 64 }).notNull(),
   idempotencyKey: varchar("idempotency_key", { length: 255 }),
@@ -2406,7 +2565,7 @@ export const mediaPersonaResources = pgTable("media_persona_resources", {
   ),
   check(
     "ck_media_persona_resources_platform",
-    sql`${table.platform} is null or ${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')`,
+    sql`${table.platform} is null or ${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')`,
   ),
   check(
     "ck_media_persona_resources_provenance_type",
@@ -2542,6 +2701,8 @@ export const mediaPersonaBulkDraftSlots = pgTable("media_persona_bulk_draft_slot
   platformPatreon: boolean("platform_patreon"),
   platformYoutube: boolean("platform_youtube"),
   platformInstagram: boolean("platform_instagram"),
+  platformFanza: boolean("platform_fanza"),
+  platformTiktok: boolean("platform_tiktok"),
   platformsEvidence: text("platforms_evidence"),
   contentPillarsState: varchar("content_pillars_state", { length: 16 }).notNull(),
   contentPillars: json("content_pillars").default([]).notNull(),
@@ -2569,7 +2730,7 @@ export const mediaPersonaBulkDraftSlots = pgTable("media_persona_bulk_draft_slot
   ),
   check(
     "ck_media_persona_bulk_draft_platforms_fact",
-    sql`(${table.platformsState} = 'unknown' and ${table.platformX} is null and ${table.platformPixiv} is null and ${table.platformDlsite} is null and ${table.platformPatreon} is null and ${table.platformYoutube} is null and ${table.platformInstagram} is null and ${table.platformsEvidence} is null) or (${table.platformsState} = 'explicit' and ${table.platformX} is not null and ${table.platformPixiv} is not null and ${table.platformDlsite} is not null and ${table.platformPatreon} is not null and ${table.platformYoutube} is not null and ${table.platformInstagram} is not null) or (${table.platformsState} = 'inferred' and ${table.platformX} is not null and ${table.platformPixiv} is not null and ${table.platformDlsite} is not null and ${table.platformPatreon} is not null and ${table.platformYoutube} is not null and ${table.platformInstagram} is not null and ${table.platformsEvidence} is not null)`,
+    sql`(${table.platformsState} = 'unknown' and ${table.platformX} is null and ${table.platformPixiv} is null and ${table.platformDlsite} is null and ${table.platformPatreon} is null and ${table.platformYoutube} is null and ${table.platformInstagram} is null and ${table.platformFanza} is null and ${table.platformTiktok} is null and ${table.platformsEvidence} is null) or (${table.platformsState} = 'explicit' and ${table.platformX} is not null and ${table.platformPixiv} is not null and ${table.platformDlsite} is not null and ${table.platformPatreon} is not null and ${table.platformYoutube} is not null and ${table.platformInstagram} is not null and ${table.platformFanza} is not null and ${table.platformTiktok} is not null) or (${table.platformsState} = 'inferred' and ${table.platformX} is not null and ${table.platformPixiv} is not null and ${table.platformDlsite} is not null and ${table.platformPatreon} is not null and ${table.platformYoutube} is not null and ${table.platformInstagram} is not null and ${table.platformFanza} is not null and ${table.platformTiktok} is not null and ${table.platformsEvidence} is not null)`,
   ),
   check(
     "ck_media_persona_bulk_draft_pillars_state",
@@ -2611,7 +2772,7 @@ export const mediaPlatformAccounts = pgTable("media_platform_accounts", {
 }, (table) => [
   check(
     "ck_media_platform_accounts_platform",
-    sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')`,
+    sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')`,
   ),
   check("ck_media_platform_accounts_create_hash", sql`length(${table.createHash}) = 64`),
   check("ck_media_platform_accounts_status", sql`${table.status} in ('active', 'paused')`),
@@ -2762,6 +2923,27 @@ export const mediaPlatformCredentials = pgTable("media_platform_credentials", {
   index("ix_media_platform_credentials_status_updated").on(table.status, table.updatedAt),
 ]);
 
+// Server-only one-use OAuth state; encrypted PKCE verifier and configuration binding.
+export const mediaPlatformOAuthRequests = pgTable("media_platform_oauth_requests", {
+  id: uuid("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  ownerUserId: uuid("owner_user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "cascade" }).notNull(),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "cascade" }).notNull(),
+  platformAccountId: uuid("platform_account_id").references(() => mediaPlatformAccounts.id, { onDelete: "cascade" }).notNull(),
+  accountRevisionId: uuid("account_revision_id").notNull(),
+  credentialRevision: integer("credential_revision").notNull(),
+  platform: varchar("platform", { length: 16 }).notNull(),
+  stateDigest: varchar("state_digest", { length: 64 }).unique().notNull(),
+  encryptedRequest: text("encrypted_request").notNull(),
+  status: varchar("status", { length: 16 }).default("pending").notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  createdAt: timestamp("created_at").notNull(),
+}, (table) => [
+  check("ck_media_oauth_platform", sql`${table.platform} in ('x', 'youtube')`),
+  check("ck_media_oauth_status", sql`${table.status} in ('pending', 'exchanging', 'completed', 'failed')`),
+  check("ck_media_oauth_credential_revision", sql`${table.credentialRevision} >= 0`),
+]);
+
 export const mediaPlatformCredentialAuditEvents = pgTable("media_platform_credential_audit_events", {
   id: uuid("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
   credentialId: uuid("credential_id").notNull(),
@@ -2847,7 +3029,7 @@ export const mediaProviderCapabilitySnapshots = pgTable("media_provider_capabili
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").notNull(),
 }, (table) => [
-  check("ck_media_provider_capability_snapshots_provider", sql`${table.provider} in ('x', 'pixiv', 'patreon', 'youtube', 'instagram', 'dlsite')`),
+  check("ck_media_provider_capability_snapshots_provider", sql`${table.provider} in ('x', 'pixiv', 'patreon', 'youtube', 'instagram', 'dlsite', 'fanza', 'tiktok')`),
   check("ck_media_provider_capability_snapshots_operation", sql`${table.operation} in ('identity', 'oauth', 'token', 'cookie', 'text', 'image', 'video', 'schedule', 'edit', 'delete', 'analytics', 'revenue', 'refresh', 'revoke')`),
   check("ck_media_provider_capability_snapshots_status", sql`${table.status} in ('automatable', 'manual', 'unsupported', 'unverified', 'unavailable')`),
   check("ck_media_provider_capability_snapshots_account_eligibility", sql`${table.accountEligibility} in ('unknown', 'eligible', 'ineligible', 'unverified')`),
@@ -2972,6 +3154,8 @@ export const mediaResearchRoutineRevisions = pgTable(
     platformPatreon: boolean("platform_patreon").default(false).notNull(),
     platformYoutube: boolean("platform_youtube").default(false).notNull(),
     platformInstagram: boolean("platform_instagram").default(false).notNull(),
+    platformFanza: boolean("platform_fanza").default(false).notNull(),
+    platformTiktok: boolean("platform_tiktok").default(false).notNull(),
     contentHash: varchar("content_hash", { length: 64 }).notNull(),
     idempotencyKey: varchar("idempotency_key", { length: 255 }),
     createdBy: uuid("created_by").references(() => users.id, {
@@ -3658,7 +3842,7 @@ export const mediaContentVariants = pgTable("media_content_variants", {
 }, (table) => [
   check(
     "ck_media_content_variants_platform",
-    sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')`,
+    sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')`,
   ),
   check(
     "ck_media_content_variants_create_hash",
@@ -3741,7 +3925,7 @@ export const mediaContentVariantRevisions = pgTable(
     ),
     check(
       "ck_media_content_variant_revisions_platform",
-      sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')`,
+      sql`${table.platform} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')`,
     ),
     check(
       "ck_media_content_variant_revisions_content_item_hash",
@@ -4034,7 +4218,7 @@ export const mediaMetricIngestionRuns = pgTable("media_metric_ingestion_runs", {
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").notNull(),
 }, (table) => [
-  check("ck_media_metric_ingestion_runs_provider", sql`${table.provider} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram')`),
+  check("ck_media_metric_ingestion_runs_provider", sql`${table.provider} in ('x', 'pixiv', 'dlsite', 'patreon', 'youtube', 'instagram', 'fanza', 'tiktok')`),
   check("ck_media_metric_ingestion_runs_status", sql`${table.status} in ('pending', 'running', 'succeeded', 'partial', 'failed', 'uncertain')`),
   check("ck_media_metric_ingestion_runs_request_hash", sql`length(${table.requestHash}) = 64`),
   check("ck_media_metric_ingestion_runs_observation_hash", sql`length(${table.observationHash}) = 64`),
@@ -4339,8 +4523,8 @@ export const mediaGenerationWorkspaces = pgTable("media_generation_workspaces", 
   index("ix_media_generation_workspaces_config_hash").on(table.configHash),
   index("ix_media_generation_workspaces_created_at").on(table.createdAt),
   index("ix_media_generation_workspaces_owner_project").on(table.ownerUserId, table.projectId),
-  uniqueIndex("uq_media_generation_workspaces_personal_identity").on(table.ownerUserId, table.externalWorkspaceId).where(sql`${table.projectId} is null`),
-  uniqueIndex("uq_media_generation_workspaces_project_identity").on(table.projectId, table.externalWorkspaceId).where(sql`${table.projectId} is not null`),
+  uniqueIndex("uq_media_generation_workspaces_personal_identity").on(table.ownerUserId, table.externalWorkspaceId).where(sql`${table.projectId} is null and ${table.status} <> 'unavailable'`),
+  uniqueIndex("uq_media_generation_workspaces_project_identity").on(table.projectId, table.externalWorkspaceId).where(sql`${table.projectId} is not null and ${table.status} <> 'unavailable'`),
   uniqueIndex("uq_media_generation_workspaces_personal_idempotency").on(table.ownerUserId, table.idempotencyKey).where(sql`${table.projectId} is null`),
   uniqueIndex("uq_media_generation_workspaces_project_idempotency").on(table.projectId, table.idempotencyKey).where(sql`${table.projectId} is not null`),
 ]);
@@ -4531,11 +4715,12 @@ export const mediaGenerationRunObservations = pgTable("media_generation_run_obse
 
 export const mediaGenerationOutputs = pgTable("media_generation_outputs", {
   id: uuid("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-  generationRunId: uuid("generation_run_id").references(() => mediaGenerationRuns.id, { onDelete: "cascade" }).notNull(),
+  generationRunId: uuid("generation_run_id").references(() => mediaGenerationRuns.id, { onDelete: "cascade" }),
   ownerUserId: uuid("owner_user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
   projectId: uuid("project_id").references(() => projects.id, { onDelete: "cascade" }),
   externalAssetId: varchar("external_asset_id", { length: 164 }).notNull(),
   externalOutputVersion: varchar("external_output_version", { length: 165 }).notNull(),
+  byteBindingState: varchar("byte_binding_state", { length: 16 }).default("external").notNull(),
   sha256: varchar("sha256", { length: 64 }).notNull(),
   mimeType: varchar("mime_type", { length: 255 }).notNull(),
   width: integer("width"),
@@ -4546,6 +4731,7 @@ export const mediaGenerationOutputs = pgTable("media_generation_outputs", {
 }, (table) => [
   check("ck_media_generation_outputs_asset_ref", sql`${table.externalAssetId} like 'ast_%'`),
   check("ck_media_generation_outputs_version_ref", sql`${table.externalOutputVersion} like 'outv_%'`),
+  check("ck_media_generation_outputs_byte_binding_state", sql`${table.byteBindingState} in ('external', 'managed')`),
   check("ck_media_generation_outputs_sha256", sql`length(${table.sha256}) = 64`),
   check("ck_media_generation_outputs_provenance_hash", sql`length(${table.provenanceHash}) = 64`),
   unique("uq_media_generation_outputs_external").on(table.generationRunId, table.externalAssetId, table.externalOutputVersion),
@@ -4653,3 +4839,13 @@ export type ExternalActionReceipt = typeof externalActionReceipts.$inferSelect;
 export type NewExternalActionReceipt = typeof externalActionReceipts.$inferInsert;
 export type OperationEvent = typeof operationEvents.$inferSelect;
 export type NewOperationEvent = typeof operationEvents.$inferInsert;
+export type AuthHandoffTransaction =
+  typeof authHandoffTransactions.$inferSelect;
+export type NewAuthHandoffTransaction =
+  typeof authHandoffTransactions.$inferInsert;
+export type AuthHandoffClientTransaction =
+  typeof authHandoffClientTransactions.$inferSelect;
+export type NewAuthHandoffClientTransaction =
+  typeof authHandoffClientTransactions.$inferInsert;
+export type AuthHandoffRateLimit = typeof authHandoffRateLimits.$inferSelect;
+export type NewAuthHandoffRateLimit = typeof authHandoffRateLimits.$inferInsert;

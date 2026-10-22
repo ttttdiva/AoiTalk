@@ -31,6 +31,7 @@ from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
 from ..services.project_context import (
     ProjectContextResolver,
+    format_minimal_project_context_for_chat_prompt,
     format_project_context_for_chat_prompt,
     get_runtime_project_context,
     project_context_enabled_for_client,
@@ -42,11 +43,6 @@ from .manager_parts.context_building import strip_project_context_bundle
 from ..services.turn_context import (
     AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
     get_turn_context,
-)
-from ..services.story_chat_context import (
-    build_story_chat_context,
-    run_story_chat_context_sync,
-    is_story_workflow_tool_allowed,
 )
 from .prompts import build_unified_instructions
 from .runtime_tool_registry import (
@@ -88,12 +84,12 @@ from .turn_stream_events import (
 )
 from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall, UnifiedToolResult
 from .multimodal import data_url_to_bytes, normalize_image_payloads
-from .conversation_context import persist_usage_sync
+from .conversation_context import persist_usage_sync, project_prompt_cache_key
 from .context_snapshot import (
     capture_context_manifest_before_context_clear,
     component,
     context_manifest_metadata,
-    context_bundle_components,
+    context_bundle_partition_components,
     message_components,
     reconcile_snapshot,
     sanitized_snapshot_series,
@@ -124,9 +120,6 @@ def _gemini_part_is_thought(part: Any) -> bool:
         return bool(getattr(part, "thought", False))
     except Exception:
         return False
-
-
-_GEMINI_STORY_CONTEXT_UNSET = object()
 
 
 def _plain_json_value(value: Any, *, path: str = "arguments") -> Any:
@@ -237,6 +230,28 @@ def _declaration_fingerprints(tools: Any) -> tuple[Any, ...]:
                 )
             )
     return tuple(fingerprints)
+
+
+def _gemini_tool_schema_payloads(tools: Any) -> list[dict[str, Any]]:
+    """Project Gemini declarations into deterministic cache-key schemas."""
+
+    payloads: list[dict[str, Any]] = []
+    for tool in list(tools or []):
+        for declaration in list(getattr(tool, "function_declarations", []) or []):
+            payloads.append(
+                {
+                    "function": {
+                        "name": str(getattr(declaration, "name", "")),
+                        "description": str(
+                            getattr(declaration, "description", "")
+                        ),
+                        "parameters": _fingerprint_declaration_value(
+                            getattr(declaration, "parameters", None)
+                        ),
+                    }
+                }
+            )
+    return payloads
 
 
 def _same_function_declarations(left: Any, right: Any) -> bool:
@@ -363,6 +378,11 @@ class GeminiLLMClient:
         self.generation_policy = DEFAULT_GENERATION_POLICY
         self.current_edit_message_id: Optional[str] = None
         self._current_context_bundle: Optional[ContextBundle] = None
+        self._current_prompt_stable_context: list[tuple[str, str]] = []
+        self._current_prompt_dynamic_context: list[tuple[str, str]] = []
+        self._current_project_cache_revision: str = ""
+        self._current_effective_system_prompt: str = ""
+        self._cache_key: Optional[str] = None
         self._last_context_snapshots: List[Dict[str, Any]] = []
         self._context_request_index = 0
         self._loaded_session_id: Optional[str] = (
@@ -664,9 +684,13 @@ class GeminiLLMClient:
             # Gemini receives function declarations via the API.  Keep the
             # legacy textual tool-call syntax out of its system prompt.
             tool_protocol="native",
+            available_tool_names=(
+                [item.name for item in filtered_registry_for_client(self, self._tool_registry).get_all()]
+                if getattr(self, "_tool_registry", None) is not None else None
+            ),
         )
 
-    def _build_effective_system_prompt(self, story_context=None) -> str:
+    def _build_effective_system_prompt(self) -> str:
         turn = get_turn_context()
         suppress_automatic_context = bool(
             getattr(turn, "suppress_automatic_context", False)
@@ -700,8 +724,6 @@ class GeminiLLMClient:
         override = str(getattr(self, "_system_prompt_override", "") or "").strip()
         if override:
             return override
-        if story_context:
-            return story_context.prompt
         return self._build_system_prompt()
 
     def get_generation_metadata(self) -> Dict[str, Any]:
@@ -766,9 +788,11 @@ class GeminiLLMClient:
         try:
             # Keep ContextManifest traces subject to the same immutable
             # Project Context OFF boundary as the model prompt.
-            rendered_bundle, bundle_parts = context_bundle_components(
-                self._context_bundle_for_turn(
-                    project_context_enabled_for_client(self)
+            stable_bundle, dynamic_bundle, bundle_parts = (
+                context_bundle_partition_components(
+                    self._context_bundle_for_turn(
+                        project_context_enabled_for_client(self)
+                    )
                 )
             )
             normalized_messages: List[Dict[str, Any]] = []
@@ -800,8 +824,17 @@ class GeminiLLMClient:
                 }
             )
 
+            structural_messages = list(normalized_messages)
+            for label, value in (
+                ("Stable Project Context", stable_bundle),
+                ("Current ContextBundle", dynamic_bundle),
+            ):
+                if value:
+                    structural_messages = without_text(
+                        structural_messages, f"[{label}]\n{value.strip()}"
+                    )
             parts = [
-                *message_components(without_text(normalized_messages, rendered_bundle)),
+                *message_components(structural_messages),
                 *bundle_parts,
             ]
             if self._snapshot_has_part_field(latest_message, "inline_data"):
@@ -966,14 +999,11 @@ class GeminiLLMClient:
                 f"keeping estimated snapshot: {exc}"
             )
 
-    def _get_effective_gemini_tools(
-        self,
-        story_context: Any = _GEMINI_STORY_CONTEXT_UNSET,
-    ) -> List[Tool]:
+    def _get_effective_gemini_tools(self) -> List[Tool]:
         # Gemini must consume the same request-local ToolDefinitions as the
         # provider-neutral exposure layer.  Rebuilding declarations from the
         # filtered registry updates delegate roster text and loader enum/schema
-        # when a fixed client switches App/Story context.
+        # when a fixed client switches App context.
         from .tool_exposure import (
             REVIEW_TOOL_ALLOWLIST,
             effective_tool_pack_session,
@@ -983,10 +1013,7 @@ class GeminiLLMClient:
         from .tool_packs import tool_visible_for_session
 
         # Trusted controller turns (notably ``/help``) provide their own
-        # bounded prompt and must not inherit StoryWritingSession context from
-        # a reused provider instance.  Force an explicit ``None`` through the
-        # exposure layer so it cannot re-resolve the current session behind
-        # the caller's back.
+        # bounded prompt.
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
@@ -1002,16 +1029,7 @@ class GeminiLLMClient:
             # declarations.  Keep their historical filtering path; real
             # clients always use the common filtered ToolDefinition registry
             # below so descriptions and schemas are request-local.
-            exposure = resolve_tool_exposure_context(
-                self,
-                story_context=(
-                    None
-                    if story_context is _GEMINI_STORY_CONTEXT_UNSET
-                    else story_context
-                ),
-            )
-            if exposure.story_resolution_failed:
-                return []
+            exposure = resolve_tool_exposure_context(self)
             review_mode = (
                 get_client_generation_policy(self).profile
                 == GenerationProfile.REVIEW
@@ -1026,11 +1044,6 @@ class GeminiLLMClient:
                     name = str(getattr(declaration, "name", ""))
                     if review_mode and name not in REVIEW_TOOL_ALLOWLIST:
                         continue
-                    if exposure.story_context and not is_story_workflow_tool_allowed(
-                        name,
-                        exposure.story_context,
-                    ):
-                        continue
                     if not review_mode and not tool_visible_for_session(
                         session,
                         name,
@@ -1043,25 +1056,7 @@ class GeminiLLMClient:
                     fallback_tools.append(Tool(function_declarations=kept))
             return fallback_tools
 
-        if suppress_automatic_context:
-            effective_registry = filtered_registry_for_client(
-                self,
-                registry,
-                story_context=None,
-            )
-        elif story_context is _GEMINI_STORY_CONTEXT_UNSET or story_context is None:
-            effective_registry = filtered_registry_for_client(
-                self,
-                registry,
-            )
-        else:
-            effective_registry = filtered_registry_for_client(
-                self,
-                registry,
-                # A non-None context was already resolved by the caller; pass
-                # it through so this declaration rebuild stays request-local.
-                story_context=story_context,
-            )
+        effective_registry = filtered_registry_for_client(self, registry)
         all_tools = effective_registry.get_all()
         if not all_tools:
             return []
@@ -1587,37 +1582,7 @@ class GeminiLLMClient:
     ) -> UnifiedToolResult:
         """Execute through the unified router without serializing control flow."""
 
-        suppress_automatic_context = bool(
-            getattr(get_turn_context(), "suppress_automatic_context", False)
-        )
-        story_context = (
-            None if suppress_automatic_context else self._get_story_chat_context_sync()
-        )
-        if story_context and not is_story_workflow_tool_allowed(
-            function_name,
-            story_context,
-        ):
-            call = UnifiedToolCall(
-                tool=function_name,
-                arguments=_plain_json_object(arguments or {}),
-                call_id=call_id,
-            )
-            return UnifiedToolResult(
-                call=call,
-                output=(
-                    f"{function_name} is not available in this scenario "
-                    f"{story_context.mode} session. Continue using the scenario "
-                    "workflow context only."
-                ),
-                success=False,
-                error="tool unavailable in scenario",
-            )
-
-        registry = filtered_registry_for_client(
-            self,
-            self._tool_registry,
-            **({"story_context": None} if suppress_automatic_context else {}),
-        )
+        registry = filtered_registry_for_client(self, self._tool_registry)
         if function_name not in registry:
             call = UnifiedToolCall(
                 tool=function_name,
@@ -1660,25 +1625,8 @@ class GeminiLLMClient:
                 # tools for Help.  Keep the controller boundary fail-closed so
                 # a model/provider cannot smuggle an arbitrary mutation here.
                 return "エラー: AoiTalk Helpターンではツールを実行できません"
-            story_context = (
-                self._get_story_chat_context_sync()
-            )
-            if story_context and not is_story_workflow_tool_allowed(
-                function_name,
-                story_context,
-            ):
-                return (
-                    f"{function_name} is not available in this scenario "
-                    f"{story_context.mode} session. Continue using the scenario "
-                    "workflow context only."
-                )
-
             # 統一レジストリからツール取得・実行
-            registry = filtered_registry_for_client(
-                self,
-                self._tool_registry,
-                **({"story_context": None} if suppress_automatic_context else {}),
-            )
+            registry = filtered_registry_for_client(self, self._tool_registry)
             if function_name not in registry:
                 return f"エラー: 未知の関数 '{function_name}'"
 
@@ -1718,76 +1666,87 @@ class GeminiLLMClient:
             return error_msg
 
     def _build_conversation_context(self, user_input: str) -> List[Dict[str, str]]:
-        """Build conversation context from history for Gemini chat"""
-        messages = []
+        """Build Gemini history with a cache-stable Project prefix."""
 
+        messages: List[Dict[str, Any]] = []
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
-        story_context = (
-            None if suppress_automatic_context else self._get_story_chat_context_sync()
-        )
-        # Scenario workflow sessions use a dedicated system prompt instead of
-        # the globally selected app-header assistant prompt.
-        enhanced_system_prompt = self._build_effective_system_prompt(story_context)
+        enhanced_system_prompt = self._build_effective_system_prompt()
         isolated_override = str(
             getattr(self, "_isolated_system_prompt_override", "") or ""
         ).strip()
         include_project_context = project_context_enabled_for_client(self)
         context_bundle = self._context_bundle_for_turn(include_project_context)
-        context_builder_block = (
-            context_bundle.render_for_prompt()
-            if (
-                not suppress_automatic_context
-                and not isolated_override
-                and not story_context
-                and context_bundle
+
+        stable_block = ""
+        dynamic_block = ""
+        if not suppress_automatic_context and not isolated_override and context_bundle:
+            stable_block, dynamic_block = (
+                context_bundle.render_partitioned_for_prompt()
             )
-            else ""
-        )
-        if context_builder_block:
-            enhanced_system_prompt = (
-                f"{enhanced_system_prompt}\n\n{context_builder_block}"
-            )
+
         project_context = (
             None
             if (
                 suppress_automatic_context
                 or isolated_override
-                or story_context
                 or not include_project_context
             )
             else get_runtime_project_context()
         )
-        if project_context and not context_builder_block:
-            project_block = format_project_context_for_chat_prompt(project_context)
-            if project_block:
-                enhanced_system_prompt = f"{enhanced_system_prompt}\n\n{project_block}"
+        if project_context and not stable_block and context_bundle is None:
+            stable_block = format_minimal_project_context_for_chat_prompt(
+                project_context
+            )
 
-        # TRPG play state injection was removed with the deprecated /play path.
+        stable_context: list[tuple[str, str]] = []
+        dynamic_context: list[tuple[str, str]] = []
+        if stable_block:
+            stable_context.append(("Stable Project Context", stable_block))
+            enhanced_system_prompt = (
+                f"{enhanced_system_prompt}\n\n"
+                f"[Stable Project Context]\n{stable_block}"
+            )
+        if dynamic_block:
+            dynamic_context.append(("Current ContextBundle", dynamic_block))
 
-        # Add enhanced system prompt as the first user message
+        self._current_prompt_stable_context = list(stable_context)
+        self._current_prompt_dynamic_context = list(dynamic_context)
+        self._current_project_cache_revision = str(
+            getattr(context_bundle, "project_cache_revision", "") or ""
+        )
+        self._current_effective_system_prompt = enhanced_system_prompt
+
+        # Gemini's chat API represents the system prefix as an initial user/model
+        # pair.  Keeping Project data only in that pair makes the prefix identical
+        # across conversations while Memory/retrieval stays in the current turn.
         messages.append({"role": "user", "parts": [enhanced_system_prompt]})
         messages.append(
             {"role": "model", "parts": ["了解しました。設定と記憶を理解しました。"]}
         )
 
-        # Add conversation history (last 10 exchanges).  Isolated controller
-        # turns (notably Help) must remain one-turn even if this helper is
-        # called outside ``generate_response`` or a stale client history is
-        # still present.
         if not suppress_automatic_context and self.conversation_history:
-            for msg in self.conversation_history[
-                -20:
-            ]:  # Last 10 exchanges (user + assistant)
+            for msg in self.conversation_history[-20:]:
                 if msg["role"] == "user":
                     messages.append({"role": "user", "parts": [msg["content"]]})
                 elif msg["role"] == "assistant":
                     messages.append({"role": "model", "parts": [msg["content"]]})
 
-        # Add current user input
-        messages.append({"role": "user", "parts": [user_input]})
-
+        current = str(user_input or "")
+        if dynamic_context:
+            blocks = [
+                f"[{label}]\n{value.strip()}"
+                for label, value in dynamic_context
+                if str(value or "").strip()
+            ]
+            current = "\n\n".join(
+                [
+                    *blocks,
+                    "[Current user input]\nCurrent user request:\n" + current,
+                ]
+            )
+        messages.append({"role": "user", "parts": [current]})
         return messages
 
     def _context_bundle_for_turn(
@@ -1812,14 +1771,13 @@ class GeminiLLMClient:
         if not self.current_project_id and not self.current_session_id:
             return None
 
-        if self._get_story_chat_context_sync():
-            return None
-
         resolver = ProjectContextResolver()
         try:
             return self._run_async_sync(
                 resolver.resolve_context(
-                    project_id=self.current_project_id,
+                    project_id=(
+                        self.current_project_id or get_turn_context().project_id
+                    ),
                     session_id=self.current_session_id,
                     user_id=self._get_session_user_id(),
                 )
@@ -1827,16 +1785,6 @@ class GeminiLLMClient:
         except Exception as e:
             print(f"[GeminiLLMClient] Failed to resolve project context: {e}")
             return None
-
-    def _get_story_chat_context_sync(self):
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return None
-        if not self.current_session_id:
-            return None
-        return run_story_chat_context_sync(
-            self._run_async_sync,
-            self.current_session_id,
-        )
 
     def _run_async_sync(self, coro):
         try:
@@ -1852,8 +1800,6 @@ class GeminiLLMClient:
     ) -> Optional[ContextBundle]:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             return None
-        if self._get_story_chat_context_sync():
-            return None
         try:
             try:
                 context_builder = ContextBuilder(manifest_config=self.config)
@@ -1863,7 +1809,9 @@ class GeminiLLMClient:
                 context_builder.build_context(
                     user_id=self._get_session_user_id(),
                     message=user_input,
-                    project_id=self.current_project_id,
+                    project_id=(
+                        self.current_project_id or get_turn_context().project_id
+                    ),
                     task_id=get_turn_context().task_id,
                     session_id=self.current_session_id,
                     project_context=project_context,
@@ -1884,11 +1832,7 @@ class GeminiLLMClient:
             return ""
         return build_tool_hint_context_sync(
             user_input=user_input,
-            registry=filtered_registry_for_client(
-                self,
-                self._tool_registry,
-                **({"story_context": None} if suppress_automatic_context else {}),
-            ),
+            registry=filtered_registry_for_client(self, self._tool_registry),
             policy=get_client_generation_policy(self),
             log_prefix="GeminiLLMClient",
         )
@@ -1922,13 +1866,10 @@ class GeminiLLMClient:
         )
         if suppress_automatic_context:
             raise RuntimeError("Gemini review loop is disabled for isolated Help turns")
-        story_context = (
-            None if suppress_automatic_context else self._get_story_chat_context_sync()
-        )
-        effective_tools = self._get_effective_gemini_tools(story_context)
+        effective_tools = self._get_effective_gemini_tools()
         review_model = self._model_for_effective_tools(
             effective_tools,
-            force_isolated=bool(story_context) or is_review_generation(self),
+            force_isolated=is_review_generation(self),
         )
         chat = review_model.start_chat(history=[])
         latest_message: Any = prompt
@@ -2252,10 +2193,14 @@ class GeminiLLMClient:
                 # Build conversation context (reads conversation_history)
                 context = self._build_conversation_context(user_input)
 
-            model_user_input = user_input
+            model_user_input = (
+                str(context[-1]["parts"][0])
+                if context and context[-1].get("parts")
+                else user_input
+            )
             tool_hint_context = self._build_tool_hint_context(user_input)
             model_user_input = compose_tool_hint_user_message(
-                user_input,
+                model_user_input,
                 tool_hint_context,
             )
             if tool_hint_context:
@@ -2347,13 +2292,43 @@ class GeminiLLMClient:
             )
 
             # モデルルーティング: 有効なら動的モデル選択
-            story_context = (
-                None
-                if suppress_automatic_context
-                else self._get_story_chat_context_sync()
-            )
-            effective_tools = self._get_effective_gemini_tools(story_context)
+            effective_tools = self._get_effective_gemini_tools()
             routed_model = self._get_routed_model(user_input)
+            effective_model_name = str(routed_model or self.model_name)
+            if suppress_automatic_context:
+                self._cache_key = None
+            else:
+                self._cache_key = project_prompt_cache_key(
+                    user_id=self._get_session_user_id(),
+                    session_id=self.current_session_id,
+                    project_id=(
+                        self.current_project_id or get_turn_context().project_id
+                    ),
+                    character=self.character_name,
+                    model=effective_model_name,
+                    system_prompt=(
+                        self._current_effective_system_prompt or self.system_prompt
+                    ),
+                    tool_schemas=_gemini_tool_schema_payloads(effective_tools),
+                    provider="gemini",
+                    stable_context=getattr(
+                        self, "_current_prompt_stable_context", []
+                    ),
+                    context_revision=getattr(
+                        self, "_current_project_cache_revision", ""
+                    ),
+                    branch_fingerprint=str(
+                        getattr(self, "current_edit_message_id", None)
+                        or "default-branch"
+                    ),
+                    summary_version=int(
+                        getattr(self.history_manager, "summary_version", 0) or 0
+                    ),
+                    server_instance=str(
+                        self.session_metadata.get("server_instance")
+                        or "default-instance"
+                    ),
+                )
             if routed_model and routed_model != self.model_name:
                 print(
                     f"[GeminiLLMClient] モデルルーティング: {self.model_name} → {routed_model}"
@@ -2364,7 +2339,7 @@ class GeminiLLMClient:
                     force_isolated=True,
                 )
                 chat = routed_genai_model.start_chat(history=context[:-1])
-            elif story_context or is_review_generation(self):
+            elif is_review_generation(self):
                 purpose_model = self._model_for_effective_tools(
                     effective_tools,
                     force_isolated=True,
@@ -2589,9 +2564,7 @@ class GeminiLLMClient:
                     # the provider-neutral exposure layer remains the sole
                     # capability/ACL authority.
                     try:
-                        refreshed_effective_tools = self._get_effective_gemini_tools(
-                            story_context
-                        )
+                        refreshed_effective_tools = self._get_effective_gemini_tools()
                         round_effective_tools = self._filter_gemini_tools(
                             refreshed_effective_tools,
                             approved_directive.tool,
@@ -3509,6 +3482,10 @@ class GeminiLLMClient:
                 reset_runtime_project_context(project_token)
             capture_context_manifest_before_context_clear(self)
             self._current_context_bundle = None
+            self._current_prompt_stable_context = []
+            self._current_prompt_dynamic_context = []
+            self._current_project_cache_revision = ""
+            self._current_effective_system_prompt = ""
             if isolated_privacy_gateway_active:
                 self._privacy_gateway = isolated_privacy_gateway_previous
 
@@ -3765,12 +3742,12 @@ class GeminiLLMClient:
         if not self.config:
             return default
         configured = self.config.get("llm.gemini.plain_text_max_output_tokens")
-        if configured is None:
-            return default
         try:
-            return max(1, int(configured))
+            limit = max(1, int(configured)) if configured is not None else default
         except (TypeError, ValueError):
-            return default
+            limit = default
+        target = self.config.get("runtime.target_max_output_tokens")
+        return min(limit, max(1, int(target))) if target is not None else limit
 
     def _generate_plain_text(
         self,
@@ -3846,9 +3823,12 @@ class GeminiLLMClient:
                 raise PrivacyError("Gemini plain-text prompt is empty")
             if "generation_config" not in outbound:
                 raise PrivacyError("Gemini generation config is missing")
+            from .generation_budget import record_bounded_model_request
+            budget = record_bounded_model_request(outbound)
             return model.generate_content(
                 outbound_prompt,
                 generation_config=outbound.get("generation_config"),
+                **({"request_options": {"retry": None}} if budget else {}),
             )
 
         response = self._privacy_gateway.execute_sync(

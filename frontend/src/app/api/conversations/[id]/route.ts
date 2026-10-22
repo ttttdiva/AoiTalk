@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { conversationSessions } from "@/db/schema";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql, type SQL } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import {
   canManageWritableConversationSession,
@@ -68,9 +68,29 @@ async function updateConversation(
 
   const updates: {
     title?: string;
+    context?: SQL;
     developmentStatus?: DevelopmentStatus;
+    isPinned?: boolean;
+    pinnedAt?: Date | null;
+    pinUpdatedAt?: Date;
   } = {};
-  if (typeof body.title === "string") updates.title = body.title;
+  if (typeof body.title === "string") {
+    updates.title = body.title;
+    // Rename ownership and text must commit together. Patch the current DB
+    // JSON value instead of replacing unrelated context from the read above.
+    updates.context = sql`
+      jsonb_set(
+        case
+          when jsonb_typeof(${conversationSessions.context}::jsonb) = 'object'
+            then ${conversationSessions.context}::jsonb
+          else '{}'::jsonb
+        end,
+        '{title_generation}',
+        '{"source":"manual"}'::jsonb,
+        true
+      )::json
+    `;
+  }
 
   if (body.development_status !== undefined) {
     if (session.appId == null) {
@@ -89,6 +109,19 @@ async function updateConversation(
       );
     }
     updates.developmentStatus = body.development_status;
+  }
+
+  if (body.is_pinned !== undefined) {
+    if (typeof body.is_pinned !== "boolean") {
+      return NextResponse.json(
+        { detail: "is_pinnedにはtrueまたはfalseを指定してください" },
+        { status: 400 },
+      );
+    }
+    const changedAt = new Date();
+    updates.isPinned = body.is_pinned;
+    updates.pinnedAt = body.is_pinned ? changedAt : null;
+    updates.pinUpdatedAt = changedAt;
   }
 
   if (Object.keys(updates).length === 0) {
@@ -116,7 +149,7 @@ async function updateConversation(
     );
   }
 
-  if (body.development_status === undefined) {
+  if (body.development_status === undefined && body.is_pinned === undefined) {
     return NextResponse.json({ success: true });
   }
 

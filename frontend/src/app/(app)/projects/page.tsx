@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { useProject } from "@/contexts/project-context";
 import { ProjectDashboard } from "@/components/project-dashboard";
+import { ProjectSituationDashboard } from "@/components/projects/project-situation-dashboard";
 import { ProjectInformationPanel } from "@/components/projects/project-information-panel";
 import { ProjectDocsCandidatesPanel } from "@/components/projects/ProjectDocsCandidatesPanel";
 import { ProjectKnowledgeCapturePanel } from "@/components/projects/project-knowledge-capture-panel";
@@ -115,6 +116,7 @@ interface ProjectInfo {
   estimated_hours?: number | null;
   space_id?: string | null;
   is_completed?: boolean;
+  is_participating?: boolean;
   can_write?: boolean;
   knowledge_node_id?: string | null;
   /** API may explicitly mark a reverse pointer stale while it is repaired. */
@@ -1316,12 +1318,12 @@ export default function ProjectsPage() {
   }
 
   return (
-    <div className="flex h-full min-w-0 flex-col overflow-auto bg-background px-4 py-5 lg:px-6">
+    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background px-3 py-3 lg:px-4">
         {/* 右: ダッシュボード / 詳細管理 */}
-        <div className="min-w-0 flex-1 overflow-visible lg:overflow-auto">
+        <div className="min-h-0 min-w-0 flex-1">
           {selectedScope && (selectedProject || selectedSpace) ? (
-            <div className="flex h-full flex-col">
-              <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b border-border pb-4">
+            <div className="flex h-full min-h-0 min-w-0 flex-col">
+              <div className="mb-2 flex shrink-0 flex-wrap items-end justify-between gap-2 border-b border-border pb-2">
                 <div className="min-w-0">
                   <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
                     Projects / {selectedProject ? "Project" : "Space"}
@@ -1342,7 +1344,7 @@ export default function ProjectsPage() {
                 ) : null}
               </div>
               {/* タブヘッダー */}
-              <div className="mb-5 flex flex-wrap items-center gap-1 border-b border-border">
+              <div className="mb-3 flex shrink-0 flex-wrap items-center gap-1 border-b border-border">
                 <button
                   className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
                     rightTab === "dashboard"
@@ -1472,7 +1474,7 @@ export default function ProjectsPage() {
 
               {/* タブコンテンツ */}
               {rightTab === "dashboard" ? (
-                <div className="flex-1 overflow-auto">
+                <div className="min-h-0 min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
                   {selectedSpace ? (
                     <SpaceOverviewPanel
                       space={selectedSpace}
@@ -1483,15 +1485,24 @@ export default function ProjectsPage() {
                       onOpenTags={() => setRightTab("tags")}
                     />
                   ) : selectedProject && !selectedProjectIsInbox ? (
-                    <div className="mx-auto flex min-h-0 w-full max-w-[160rem] flex-col gap-4 pb-8">
-                      <ProjectOverviewPanel
-                        key={`overview-${selectedProject.id}`}
+                    <div className="min-w-0 w-full pb-3">
+                      <ProjectSituationDashboard
                         projectId={selectedProject.id}
-                        canManageSettings={
-                          selectedProject.can_manage_settings === true
-                        }
-                      />
-                      <ProjectDashboard scope={selectedScope} />
+                        projectName={selectedProject.name}
+                        description={selectedProject.description}
+                        canWrite={selectedProjectCanWrite}
+                        taskBrowseOnly={selectedProject.is_participating === false}
+                        canManageSettings={selectedProject.can_manage_settings === true}
+                        onOpenInformation={() => setRightTab("information")}
+                        metrics={<ProjectDashboard key={`tasks-${selectedProject.id}`} scope={selectedScope} compact taskBrowseOnly={selectedProject.is_participating === false} />}
+                      >
+                        <ProjectOverviewPanel
+                          key={`overview-${selectedProject.id}`}
+                          projectId={selectedProject.id}
+                          canManageSettings={selectedProject.can_manage_settings === true}
+                          onOpenMemory={() => setRightTab("memory")}
+                        />
+                      </ProjectSituationDashboard>
                     </div>
                   ) : (
                     <ProjectDashboard scope={selectedScope} />
@@ -1566,10 +1577,12 @@ export default function ProjectsPage() {
                   )}
                 </div>
               ) : rightTab === "members" && selectedProject ? (
-                <ProjectMembersPanel
-                  projectName={selectedProject.name}
-                  controller={projectMembers}
-                />
+                <div className="min-h-0 min-w-0 flex-1 overflow-auto">
+                  <ProjectMembersPanel
+                    projectName={selectedProject.name}
+                    controller={projectMembers}
+                  />
+                </div>
               ) : (
                 <div className="flex-1 overflow-auto">
                   <ProjectDashboard scope={selectedScope} />

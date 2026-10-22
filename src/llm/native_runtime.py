@@ -12,10 +12,12 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from contextlib import contextmanager
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from contextvars import ContextVar
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
@@ -42,6 +44,7 @@ from .agentic_completion import (
     successful_empty_task_search,
 )
 from .context_budget import resolve_context_budget
+from .turn_context_shaping import WithinTurnContextShaper, tools_payload_chars
 from .context_snapshot import (
     component,
     last_role_contains_text,
@@ -53,18 +56,33 @@ from .context_snapshot import (
 )
 from .openrouter_provider_routing import merge_provider_options_into_extra_body
 from .turn_stream_events import thinking_text_from_message
+from .read_stagnation import current_read_stagnation_policy
 from .unified_turn_runtime import (
     RegistryToolRouter,
+    ToolNoProgressGuard,
     UnifiedToolCall,
+    current_tool_no_progress_guard,
     observable_tool_name,
 )
 from .generation_error import (
     GenerationFailure,
+    ModelOutputIncompleteError,
     classify_generation_error,
     empty_response_failure,
 )
-from .generation_cancellation import PlanningInteractionTerminated
+from .provider_terminal import (
+    FAILED_TERMINAL_STATES,
+    protocol_error_terminal,
+    interrupted_terminal,
+    normalize_chat_terminal,
+    normalize_responses_terminal,
+)
+from .generation_cancellation import (
+    AgentDialogueInputPending,
+    PlanningInteractionTerminated,
+)
 from ..services.agent_team_service import ToolFailureCircuitBreaker
+from ..services.provider_failure_metadata import extract_provider_failure
 from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
 from ..services.outbound_privacy_service import (
     EgressDescriptor,
@@ -79,6 +97,126 @@ from .planning_policy import (
 logger = logging.getLogger(__name__)
 
 StreamCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def _attach_dialogue_pending_usage(
+    error: AgentDialogueInputPending,
+    usage_records: Iterable[dict[str, Any]],
+    tool_records: Iterable[Any] = (),
+) -> None:
+    """Carry provider receipts across the durable question control signal.
+
+    ``AgentDialogueInputPending`` intentionally aborts the native runner after
+    the question/Input transaction commits.  The normal ``NativeRunResult``
+    handoff is therefore unavailable, but the provider receipt collected
+    before the tool call remains authoritative.  Keep only normalized usage
+    records on the bounded control exception; prompt/provider payloads never
+    cross this seam.
+    """
+
+    records = [
+        dict(item)
+        for item in usage_records
+        if isinstance(item, dict)
+    ]
+    safe_tool_records: list[dict[str, Any]] = []
+    for item in tool_records:
+        tool_name = str(getattr(item, "tool", "") or "").strip()[:128]
+        if not tool_name:
+            continue
+        successful = bool(getattr(item, "successful", False))
+        safe_tool_records.append(
+            {
+                "tool": tool_name,
+                "tool_call_id": str(getattr(item, "tool_call_id", "") or "")[:128],
+                # Arguments/results may contain user or provider data.  The
+                # terminal audit still retains count/name/status correlation.
+                "arguments": {},
+                "result": "",
+                "successful": successful,
+                "executed": bool(getattr(item, "executed", True)),
+                "synthetic": bool(getattr(item, "synthetic", False)),
+                "error": None if successful else "tool_execution_failed",
+            }
+        )
+    if not records and not safe_tool_records:
+        return
+    try:
+        if records:
+            setattr(error, "_native_usage_records", records)
+        if safe_tool_records:
+            setattr(error, "_native_tool_records", safe_tool_records)
+    except Exception:
+        # The pause signal must remain the authoritative control flow even if
+        # a future exception implementation becomes attribute-restricted.
+        logger.debug("Unable to attach native usage to dialogue pause", exc_info=True)
+
+_NATIVE_TIMING_ID: ContextVar[str | None] = ContextVar(
+    "aoitalk_native_timing_id",
+    default=None,
+)
+
+
+def begin_timing_id() -> Any:
+    """Bind one request id so preparation and provider rounds correlate."""
+
+    current = _NATIVE_TIMING_ID.get()
+    return _NATIVE_TIMING_ID.set(current or uuid.uuid4().hex)
+
+
+def reset_timing_id(token: Any) -> None:
+    _NATIVE_TIMING_ID.reset(token)
+
+
+def _timing_request_stats(value: Any) -> dict[str, int]:
+    """Return bounded input diagnostics without exposing prompt text."""
+
+    try:
+        if isinstance(value, list):
+            input_chars = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+            message_count = len(value)
+        else:
+            input_chars = len(str(value or ""))
+            message_count = 1 if value else 0
+    except Exception:
+        return {}
+    return {
+        "input_chars": max(0, int(input_chars)),
+        "message_count": max(0, int(message_count)),
+    }
+
+
+async def emit_timing_event(
+    callback: StreamCallback | None,
+    stage: str,
+    phase: str,
+    *,
+    started_at: float | None = None,
+    **details: Any,
+) -> None:
+    """Emit the shared load/input/generation/tool timing projection."""
+
+    if callback is None:
+        return
+    payload: dict[str, Any] = {
+        "stage": str(stage),
+        "phase": str(phase),
+        "request_id": _NATIVE_TIMING_ID.get(),
+    }
+    if started_at is not None:
+        payload["elapsed_ms"] = max(
+            0,
+            int(round((time.monotonic() - started_at) * 1000)),
+        )
+    for key, value in details.items():
+        if value is not None:
+            payload[key] = value
+    try:
+        await _emit(callback, "llm_timing", payload)
+    except Exception:
+        # Timing is diagnostic-only and must never turn a successful provider
+        # request into a failed generation.
+        logger.debug("native timing event emission failed", exc_info=True)
 
 
 def _help_turn_is_isolated() -> bool:
@@ -281,7 +419,10 @@ def _normalized_usage(
         "metrics_source",
     ):
         raw_value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
-        if raw_value is not None and normalized.get(key) is not None:
+        if key == "reasoning_tokens" and normalized.get(key):
+            # Reasoning may only be present in nested output details.
+            result[key] = normalized[key]
+        elif raw_value is not None and normalized.get(key) is not None:
             result[key] = normalized[key]
     # normalize_usage が入れ子（prompt_tokens_details 等）からしか拾えない、あるいは
     # 実際に報告されたときだけ追加する課金情報は正規化結果の有無だけで判定する。
@@ -291,10 +432,29 @@ def _normalized_usage(
         "provider_reported_cost_details",
         "resolved_model",
         "tool_invocations",
+        "quota_reservation_id",
+        "billing_scope_id",
     ):
         value = normalized.get(key)
         if value is not None:
             result[key] = value
+    raw_total = (
+        usage.get("total_tokens")
+        if isinstance(usage, dict)
+        else getattr(usage, "total_tokens", None)
+    )
+    for key in ("output_includes_reasoning", "total_tokens_source"):
+        value = normalized.get(key)
+        if value is not None and (
+            key == "output_includes_reasoning"
+            or raw_total is not None
+            or normalized.get("reasoning_tokens") is not None
+        ):
+            result[key] = value
+    if normalized.get("total_tokens") is not None and (
+        raw_total is not None or normalized.get("reasoning_tokens")
+    ):
+        result["total_tokens"] = normalized["total_tokens"]
     return result
 
 
@@ -326,6 +486,11 @@ class ToolExecutionRecord:
     tool: str
     arguments: dict[str, Any]
     result: str
+    tool_call_id: str = ""
+    # Framework-owned execution provenance.  Provider/model output cannot
+    # manufacture an executed/not-executed receipt by echoing JSON.
+    executed: bool = True
+    synthetic: bool = False
 
     @property
     def successful(self) -> bool:
@@ -368,6 +533,14 @@ class NativeRunResult:
     # A failed native turn may carry the same structured failure classification
     # used by ResponseHandler.  Normal successful results keep this ``None``.
     generation_failure: GenerationFailure | None = None
+    # Framework-owned tool outcomes such as an approval wait may stop the
+    # current turn without being a transport generation failure.
+    stopped_reason: str = ""
+    # Content-free terminal receipt, retained even without a stream callback.
+    provider_terminal: dict[str, Any] | None = None
+    # Bounded HTTP status / Retry-After / allowlisted category of the provider
+    # failure that interrupted this run; ``None`` when the exception carried none.
+    provider_failure: dict[str, Any] | None = None
 
 
 def _safe_observed_value(value: Any, *, limit: int = 240) -> str:
@@ -492,6 +665,202 @@ def _new_native_turn_failure_breaker(
     if config is None or not agent_team_v3_delegation_enabled(config):
         return None
     return ToolFailureCircuitBreaker(max_same_failure=2, failed_tool_budget=8)
+
+
+def _observe_read_stagnation(
+    tool: str,
+    arguments: Mapping[str, Any],
+    executed: bool,
+    success: bool,
+    output: Any,
+) -> tuple[str, GenerationFailure | None]:
+    """有効化された実装タスクだけで、読取のみの停滞を通知・停止する。"""
+
+    policy = current_read_stagnation_policy()
+    if policy is None:
+        return "", None
+    return policy.observe(
+        tool_name=tool,
+        arguments=arguments,
+        executed=executed,
+        success=success,
+        output=output,
+    )
+
+
+def _native_not_executed_tool_result(reason: str) -> str:
+    """Return a bounded synthetic result for an unexecuted provider call."""
+
+    return json.dumps(
+        {
+            "success": False,
+            "error_code": "not_executed",
+            "retryable": False,
+            "error": reason,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _native_terminal_skip_reason(reason: str) -> str:
+    normalized = str(reason or "").strip().lower()
+    if normalized == "approval_already_pending":
+        return "Not executed: approval is already pending."
+    if normalized == "planning_not_active":
+        return "Not executed: planning is not active."
+    if normalized == "tool_failure_circuit_open":
+        return "Not executed: tool failure circuit opened."
+    if normalized == "read_stagnation":
+        return "Not executed: reads stopped yielding new information."
+    return "Not executed: the framework stopped this turn."
+
+
+def _native_terminal_skip_message(reason: str) -> str:
+    normalized = str(reason or "").strip().lower()
+    if normalized == "approval_already_pending":
+        return "承認待ちのため未実行です"
+    if normalized == "planning_not_active":
+        return "計画が有効でないため未実行です"
+    if normalized == "tool_failure_circuit_open":
+        return "同じツール失敗の反復停止により未実行です"
+    if normalized == "read_stagnation":
+        return "読取の停滞停止により未実行です"
+    return "処理停止により未実行です"
+
+
+async def _emit_native_not_executed_tool(
+    stream_callback: Optional[StreamCallback],
+    *,
+    tool: str,
+    call_id: str,
+    output: str,
+    reason: str,
+    message: str,
+) -> None:
+    """Emit the terminal-batch receipt without inventing a tool start."""
+
+    await _emit(
+        stream_callback,
+        "tool_end",
+        {
+            "tool": tool,
+            "tool_args": {},
+            "operation_id": call_id,
+            "tool_call_id": call_id,
+            "tool_result": {
+                "tool": tool,
+                "arguments": {},
+                "output": output,
+                "error": reason,
+                "success": False,
+                "executed": False,
+                "synthetic": True,
+                "not_executed_reason": reason,
+                "tool_call_id": call_id,
+            },
+            "message": message,
+            "executed": False,
+            "synthetic": True,
+            "not_executed_reason": reason,
+        },
+    )
+
+
+def _native_approved_skip_reason() -> str:
+    return "Not executed: approved actions start on the next server-controlled round."
+
+
+def _native_approved_skip_message() -> str:
+    return "承認済み操作は次の管理下ラウンドまで未実行です"
+
+
+async def _record_native_chat_skipped_call(
+    *,
+    stream_callback: Optional[StreamCallback],
+    tool_records: list[ToolExecutionRecord],
+    messages: list[dict[str, Any]],
+    registry: ToolRegistry,
+    skipped: Any,
+    reason: str,
+    message: str,
+) -> None:
+    call_id = _tool_call_id(skipped)
+    tool_name = observable_tool_name(registry, _tool_call_name(skipped))
+    output = _native_not_executed_tool_result(reason)
+    tool_records.append(
+        ToolExecutionRecord(
+            tool=tool_name,
+            arguments={},
+            result=output,
+            tool_call_id=call_id,
+            executed=False,
+            synthetic=True,
+        )
+    )
+    messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": output,
+        }
+    )
+    await _emit_native_not_executed_tool(
+        stream_callback,
+        tool=tool_name,
+        call_id=call_id,
+        output=output,
+        reason=reason,
+        message=message,
+    )
+
+
+async def _record_native_responses_skipped_call(
+    *,
+    stream_callback: Optional[StreamCallback],
+    tool_records: list[ToolExecutionRecord],
+    input_items: list[dict[str, Any]],
+    stateless_input_items: list[dict[str, Any]],
+    chat_messages: list[dict[str, Any]],
+    registry: ToolRegistry,
+    skipped: Any,
+    reason: str,
+    message: str,
+) -> None:
+    call_id = _responses_call_id(skipped)
+    tool_name = observable_tool_name(registry, _responses_call_name(skipped))
+    output = _native_not_executed_tool_result(reason)
+    input_item = {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    }
+    input_items.append(input_item)
+    stateless_input_items.append(dict(input_item))
+    chat_messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": output,
+        }
+    )
+    tool_records.append(
+        ToolExecutionRecord(
+            tool=tool_name,
+            arguments={},
+            result=output,
+            tool_call_id=call_id,
+            executed=False,
+            synthetic=True,
+        )
+    )
+    await _emit_native_not_executed_tool(
+        stream_callback,
+        tool=tool_name,
+        call_id=call_id,
+        output=output,
+        reason=reason,
+        message=message,
+    )
 
 
 def _observable_tool_arguments(
@@ -653,6 +1022,24 @@ class AgentTurnRunner:
         except Exception:
             self.context_budget = None
 
+    def _within_turn_context_shaper(self, label: str) -> WithinTurnContextShaper:
+        """Create the per-turn outgoing-context shaper from config and budget."""
+
+        budget_chars = (
+            getattr(self.context_budget, "message_budget_chars", None)
+            if self.context_budget is not None
+            else None
+        )
+        try:
+            return WithinTurnContextShaper.from_config(
+                self.config,
+                message_budget_chars=budget_chars,
+                label=label,
+            )
+        except Exception:  # noqa: BLE001 - shaping must never block a turn
+            logger.warning("within-turn context shaper unavailable", exc_info=True)
+            return WithinTurnContextShaper(enabled=False, label=label)
+
     def _model_egress_descriptor(
         self,
         *,
@@ -676,20 +1063,29 @@ class AgentTurnRunner:
             model=str(model or ""),
         )
 
-    async def _execute_model_request(self, payload: dict[str, Any], **options: Any) -> Any:
-        """Retry a broken connection once at the reviewed request boundary.
+    async def _execute_model_request(
+        self, payload: dict[str, Any], *, allow_connection_retry: bool = True,
+        **options: Any,
+    ) -> Any:
+        """Retry a connection once only before any tool has executed.
 
-        Tool execution is outside this retry, so a failed follow-up cannot
-        replay a committed tool. Keep SDK retries disabled and re-enter the
-        privacy gateway for each attempt. Timeouts and HTTP/API rejections
-        retain their existing failure semantics.
+        A post-tool model request can have an uncertain outcome even though it
+        does not execute the tools itself. Preserve that first interruption;
+        a successful retry must not conceal it from task settlement. SDK
+        retries stay disabled and every allowed send re-enters the gateway.
         """
         for attempt in range(2):
             try:
-                return await self.privacy_gateway.execute(payload, **options)
+                from ..services.free_team_service import openai_credential_identity
+                return await self.privacy_gateway.execute(payload, **options,
+                    credential_identity=openai_credential_identity(self.client, self.config))
             except APIConnectionError as error:
                 cause = error.__cause__
-                retry = attempt == 0 and not isinstance(error, APITimeoutError)
+                retry = (
+                    allow_connection_retry
+                    and attempt == 0
+                    and not isinstance(error, APITimeoutError)
+                )
                 logger.warning(
                     "Native model transport failed: provider=%s model=%s "
                     "exception_type=%s cause_type=%s retry=%s",
@@ -786,6 +1182,7 @@ class AgentTurnRunner:
                     "AoiTalk Help isolated privacy gateway is unavailable"
                 ) from exc
 
+        timing_id_token = begin_timing_id()
         try:
             # AgentTurnRunner is created before the per-turn AgentDefinition is
             # assembled.  Resolve again here so the official model registry sees
@@ -806,6 +1203,7 @@ class AgentTurnRunner:
                     tools_provider=tools_provider,
                 )
         finally:
+            _NATIVE_TIMING_ID.reset(timing_id_token)
             if isolated_privacy_gateway is not None:
                 self.privacy_gateway = isolated_privacy_gateway_previous
             if isolated_state is not None:
@@ -893,8 +1291,15 @@ class AgentTurnRunner:
         current_tool_choice = requested_tool_choice
         final_output = ""
         failure_breaker = _new_native_turn_failure_breaker(self.config)
+        no_progress_guard = (
+            current_tool_no_progress_guard() or ToolNoProgressGuard()
+        )
         hard_stop = False
         authoritative_task_complete = False
+        terminal_generation_failure: GenerationFailure | None = None
+        terminal_reason = ""
+        terminal_status_message = ""
+        context_shaper = self._within_turn_context_shaper("native.chat")
 
         for round_index in range(self.max_tool_rounds + 1):
             # A tool call can load a deferred pack.  Resolve the effective
@@ -963,6 +1368,7 @@ class AgentTurnRunner:
                         tool=approved_directive.tool,
                         arguments=observed_receipt_arguments,
                         result=receipt_output,
+                        tool_call_id=approved_directive.call_id,
                     )
                 )
                 await accept_approved_action_receipt(
@@ -1010,10 +1416,16 @@ class AgentTurnRunner:
                 # block the specialist's direct Docs tools.
                 user_input=plain_user_input,
                 failure_breaker=failure_breaker,
+                no_progress_guard=no_progress_guard,
             )
+            # ``messages`` stays the canonical turn transcript; only the
+            # outgoing copy has older tool results deterministically reduced.
             kwargs = self._build_completion_kwargs(
                 agent=agent,
-                messages=messages,
+                messages=context_shaper.shape_chat_messages(
+                    messages,
+                    reserved_chars=tools_payload_chars(tools_payload),
+                ),
                 tools_payload=tools_payload,
                 tool_choice=current_tool_choice,
             )
@@ -1059,8 +1471,20 @@ class AgentTurnRunner:
                 transport="openai.chat.completions",
                 model=agent.model,
             )
+            generation_started_at = time.monotonic()
+            await emit_timing_event(
+                stream_callback,
+                "generation",
+                "start",
+                model=agent.model,
+                round=round_index,
+                tool_count=len(tools_payload),
+                **_timing_request_stats(kwargs.get("messages")),
+            )
 
             async def send_chat_request(outbound_kwargs: dict[str, Any]) -> Any:
+                from .generation_budget import record_bounded_model_request
+                record_bounded_model_request(outbound_kwargs)
                 # The sender is intentionally nested inside the gateway
                 # transaction.  It can therefore receive only the final
                 # reviewed payload and cannot accidentally send ``kwargs``
@@ -1070,6 +1494,7 @@ class AgentTurnRunner:
             try:
                 response = await self._execute_model_request(
                     kwargs,
+                    allow_connection_retry=not bool(tool_records),
                     provider=self.provider_label,
                     descriptor=descriptor,
                     sender=send_chat_request,
@@ -1078,10 +1503,28 @@ class AgentTurnRunner:
                     model=agent.model,
                 )
             except Exception as error:
+                await emit_timing_event(
+                    stream_callback,
+                    "generation",
+                    "error",
+                    started_at=generation_started_at,
+                    model=agent.model,
+                    round=round_index,
+                    tool_count=len(tools_payload),
+                    error_code=type(error).__name__,
+                    **_timing_request_stats(kwargs.get("messages")),
+                )
                 if not tool_records and not usage_records:
                     raise
-                failure = classify_generation_error(error)
-                await _emit(stream_callback, "stream_end", {"content": ""})
+                failure = replace(
+                    classify_generation_error(error),
+                    user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                )
+                provider_terminal = interrupted_terminal("chat.completions")
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": "", "provider_terminal": provider_terminal},
+                )
                 return NativeRunResult(
                     final_output="",
                     messages=list(messages),
@@ -1089,6 +1532,8 @@ class AgentTurnRunner:
                     usage_records=list(usage_records),
                     context_snapshots=list(context_snapshots),
                     generation_failure=failure,
+                    provider_terminal=provider_terminal,
+                    provider_failure=extract_provider_failure(error),
                 )
             usage = _normalized_usage(
                 getattr(response, "usage", None),
@@ -1102,8 +1547,54 @@ class AgentTurnRunner:
                         request_snapshot,
                         usage.get("input_tokens"),
                     )
+            await emit_timing_event(
+                stream_callback,
+                "generation",
+                "end",
+                started_at=generation_started_at,
+                model=agent.model,
+                round=round_index,
+                tool_count=len(tools_payload),
+                input_tokens=usage.get("input_tokens") if usage else None,
+                output_tokens=usage.get("output_tokens") if usage else None,
+                **_timing_request_stats(kwargs.get("messages")),
+            )
+            provider_terminal = normalize_chat_terminal(response)
             choice = response.choices[0]
             message = choice.message
+            if provider_terminal["state"] == "continuation" and not getattr(message, "tool_calls", None):
+                provider_terminal = protocol_error_terminal(
+                    provider_terminal, reason="missing_tool_calls"
+                )
+            if provider_terminal["state"] in FAILED_TERMINAL_STATES:
+                content = str(self.privacy_gateway.restore_aliases(
+                    str(getattr(message, "content", "") or "")
+                ))
+                failure = classify_generation_error(
+                    ModelOutputIncompleteError(
+                        provider_terminal.get("protocol_error")
+                        or provider_terminal["finish_reason"]
+                        or provider_terminal["state"],
+                        transport="chat.completions",
+                    )
+                )
+                failure = replace(
+                    failure,
+                    user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                )
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": content, "provider_terminal": provider_terminal},
+                )
+                return NativeRunResult(
+                    final_output=content,
+                    messages=[*messages, _assistant_message_payload(message, registry=tool_registry)],
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    provider_terminal=provider_terminal,
+                )
             thinking_text = thinking_text_from_message(message)
             if thinking_text:
                 await _emit(
@@ -1146,13 +1637,20 @@ class AgentTurnRunner:
                         usage_records=list(usage_records),
                         context_snapshots=list(context_snapshots),
                         generation_failure=failure,
+                        provider_terminal=provider_terminal,
                     )
-                    await _emit(stream_callback, "stream_end", {"content": ""})
+                    await _emit(
+                        stream_callback, "stream_end",
+                        {"content": "", "provider_terminal": provider_terminal},
+                    )
                     return partial_result
                 if content:
                     content = str(self.privacy_gateway.restore_aliases(content))
                     await _emit(stream_callback, "stream_token", {"content": content})
-                await _emit(stream_callback, "stream_end", {"content": content})
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": content, "provider_terminal": provider_terminal},
+                )
                 result = NativeRunResult(
                     final_output=content,
                     messages=[
@@ -1162,6 +1660,7 @@ class AgentTurnRunner:
                     tool_calls=list(tool_records),
                     usage_records=list(usage_records),
                     context_snapshots=list(context_snapshots),
+                    provider_terminal=provider_terminal,
                 )
                 return result
 
@@ -1225,12 +1724,31 @@ class AgentTurnRunner:
                         "message": f"{observable_name} を実行しています",
                     },
                 )
-
+                tool_started_at = time.monotonic()
+                await emit_timing_event(
+                    stream_callback,
+                    "tool",
+                    "start",
+                    tool=observable_name,
+                    tool_call_id=call_id,
+                    round=round_index,
+                )
                 execution_success = False
                 execution_error = parse_error or ""
                 audit_args = dict(event_args)
+                tool_ui_message = ""
+                tool_generation_failure: GenerationFailure | None = None
+                tool_turn_terminal = False
+                tool_executed = False
+                tool_synthetic = False
                 if parse_error:
                     result_text = f"Error: invalid JSON arguments: {parse_error}"
+                    if no_progress_guard is not None:
+                        tool_generation_failure = no_progress_guard.observe_failure(
+                            tool_name=observable_name,
+                            arguments={},
+                            error_code="invalid_json",
+                        )
                 elif _simple_task_unexpected_mutation_execution_blocked(
                     plain_user_input,
                     tool_name,
@@ -1275,16 +1793,28 @@ class AgentTurnRunner:
                             args,
                             tool_name=tool_name,
                         )
-                    tool_result = await tool_router.execute_async(
-                        UnifiedToolCall(
-                            tool=tool_name,
-                            arguments=args,
-                            call_id=call_id,
+                    try:
+                        tool_result = await tool_router.execute_async(
+                            UnifiedToolCall(
+                                tool=tool_name,
+                                arguments=args,
+                                call_id=call_id,
+                            )
                         )
-                    )
+                    except AgentDialogueInputPending as exc:
+                        _attach_dialogue_pending_usage(exc, usage_records, tool_records)
+                        raise
                     result_text = tool_result.model_output
                     execution_success = tool_result.success
                     execution_error = tool_result.error or ""
+                    tool_generation_failure = tool_result.generation_failure
+                    tool_ui_message = tool_result.status_message
+                    tool_turn_terminal = tool_result.turn_terminal
+                    tool_executed = tool_result.executed
+                    tool_synthetic = tool_result.synthetic
+                    if tool_turn_terminal:
+                        terminal_reason = tool_result.terminal_reason
+                        terminal_status_message = tool_result.status_message
                     audit_args = _observable_tool_arguments(
                         tool_registry,
                         tool_name,
@@ -1299,11 +1829,28 @@ class AgentTurnRunner:
                     config=self.config,
                     legacy_clip=_clip_text,
                 )
+                stagnation_notice, stagnation_failure = _observe_read_stagnation(
+                    observable_name,
+                    audit_args,
+                    tool_executed,
+                    execution_success,
+                    result_text,
+                )
+                if stagnation_notice:
+                    model_payload = replace(
+                        model_payload,
+                        text=f"{model_payload.text}\n\n{stagnation_notice}",
+                    )
+                if tool_generation_failure is None:
+                    tool_generation_failure = stagnation_failure
                 tool_records.append(
                     ToolExecutionRecord(
                         tool=observable_name,
                         arguments=dict(audit_args),
                         result=result_text,
+                        tool_call_id=call_id,
+                        executed=tool_executed,
+                        synthetic=tool_synthetic,
                     )
                 )
                 if tool_name == "create_task" and _simple_task_request_is_explicit(
@@ -1344,15 +1891,89 @@ class AgentTurnRunner:
                             "arguments": audit_args,
                             "output": result_text,
                             "error": None if execution_success else (execution_error or result_text),
+                            "success": bool(execution_success),
+                            "executed": bool(tool_executed),
+                            "synthetic": bool(tool_synthetic),
                             "mutation_confirmed": bool(
                                 approved_directive is not None and execution_success
                             ),
                             "tool_call_id": call_id,
                         },
-                        "message": "ツール実行が完了しました",
+                        "message": tool_ui_message
+                        or (
+                            "ツール実行が完了しました"
+                            if execution_success
+                            else "ツール実行に失敗しました"
+                        ),
+                        "executed": bool(tool_executed),
+                        "synthetic": bool(tool_synthetic),
                     },
                 )
-
+                await emit_timing_event(
+                    stream_callback,
+                    "tool",
+                    "end",
+                    started_at=tool_started_at,
+                    tool=observable_name,
+                    tool_call_id=call_id,
+                    round=round_index,
+                    success=execution_success,
+                    error_code=execution_error or None,
+                )
+                if tool_generation_failure is not None or tool_turn_terminal:
+                    # The breaker owns this terminal decision. Preserve every
+                    # provider call ID in the same batch as a synthetic receipt
+                    # without executing or retrying the remaining calls.
+                    terminal_generation_failure = tool_generation_failure
+                    if not terminal_reason:
+                        terminal_reason = (
+                            tool_generation_failure.kind
+                            if tool_generation_failure is not None
+                            else "tool_terminal"
+                        )
+                    if not terminal_status_message:
+                        terminal_status_message = (
+                            tool_generation_failure.user_message
+                            if tool_generation_failure is not None
+                            else tool_ui_message
+                            or "ツール実行を停止しました"
+                        )
+                    skip_reason = _native_terminal_skip_reason(terminal_reason)
+                    for skipped in tool_calls[tool_call_index + 1 :]:
+                        skipped_id = _tool_call_id(skipped)
+                        skipped_name = observable_tool_name(
+                            tool_registry,
+                            _tool_call_name(skipped),
+                        )
+                        skipped_result = _native_not_executed_tool_result(
+                            skip_reason
+                        )
+                        tool_records.append(
+                            ToolExecutionRecord(
+                                tool=skipped_name,
+                                arguments={},
+                                result=skipped_result,
+                                tool_call_id=skipped_id,
+                                executed=False,
+                                synthetic=True,
+                            )
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": skipped_id,
+                                "content": skipped_result,
+                            }
+                        )
+                        await _emit_native_not_executed_tool(
+                            stream_callback,
+                            tool=skipped_name,
+                            call_id=skipped_id,
+                            output=skipped_result,
+                            reason=skip_reason,
+                            message=_native_terminal_skip_message(terminal_reason),
+                        )
+                    hard_stop = True
                 if approved_directive is not None:
                     await persist_and_accept_approved_action_result(
                         approved_directive,
@@ -1370,19 +1991,20 @@ class AgentTurnRunner:
                     # call in that same batch is acknowledged as not executed;
                     # the next provider round receives only action[0].
                     for skipped in tool_calls[tool_call_index + 1 :]:
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": _tool_call_id(skipped),
-                                "content": (
-                                    "Not executed: approved actions start on the next "
-                                    "server-controlled round."
-                                ),
-                            }
+                        await _record_native_chat_skipped_call(
+                            stream_callback=stream_callback,
+                            tool_records=tool_records,
+                            messages=messages,
+                            registry=tool_registry,
+                            skipped=skipped,
+                            reason=_native_approved_skip_reason(),
+                            message=_native_approved_skip_message(),
                         )
                     break
 
                 if hard_stop or authoritative_task_complete:
+                    if terminal_generation_failure is not None or terminal_reason:
+                        break
                     for skipped in tool_calls[tool_call_index + 1 :]:
                         messages.append(
                             {
@@ -1400,6 +2022,34 @@ class AgentTurnRunner:
                 current_tool_choice = "auto"
             if hard_stop:
                 break
+
+        if terminal_generation_failure is not None or terminal_reason:
+            terminal_output = str(
+                self.privacy_gateway.restore_aliases(
+                    terminal_generation_failure.user_message
+                    if terminal_generation_failure is not None
+                    else terminal_status_message
+                )
+            )
+            await _emit(
+                stream_callback,
+                "stream_token",
+                {"content": terminal_output},
+            )
+            await _emit(
+                stream_callback,
+                "stream_end",
+                {"content": terminal_output},
+            )
+            return NativeRunResult(
+                final_output=terminal_output,
+                messages=list(messages),
+                tool_calls=list(tool_records),
+                usage_records=list(usage_records),
+                context_snapshots=list(context_snapshots),
+                generation_failure=terminal_generation_failure,
+                stopped_reason=terminal_reason,
+            )
 
         fallback = str(
             self.privacy_gateway.restore_aliases(
@@ -1558,8 +2208,15 @@ class AgentTurnRunner:
         effort = getattr(agent.model_settings.reasoning, "effort", None)
         final_output = ""
         failure_breaker = _new_native_turn_failure_breaker(self.config)
+        no_progress_guard = (
+            current_tool_no_progress_guard() or ToolNoProgressGuard()
+        )
         hard_stop = False
         authoritative_task_complete = False
+        terminal_generation_failure: GenerationFailure | None = None
+        terminal_reason = ""
+        terminal_status_message = ""
+        context_shaper = self._within_turn_context_shaper("native.responses")
 
         def build_request_snapshot(
             request_kwargs: dict[str, Any],
@@ -1728,6 +2385,8 @@ class AgentTurnRunner:
             )
 
             async def send_response_request(outbound_kwargs: dict[str, Any]) -> Any:
+                from .generation_budget import record_bounded_model_request
+                record_bounded_model_request(outbound_kwargs)
                 # Keep the provider sender inside the privacy transaction so
                 # approval/redaction is applied to the exact request sent.
                 return await self.client.responses.create(**outbound_kwargs)
@@ -1735,6 +2394,7 @@ class AgentTurnRunner:
             try:
                 return await self._execute_model_request(
                     request_kwargs,
+                    allow_connection_retry=not bool(tool_records),
                     provider=self.provider_label,
                     descriptor=descriptor,
                     sender=send_response_request,
@@ -1758,6 +2418,7 @@ class AgentTurnRunner:
                 retry_kwargs = _without_reasoning_summary(request_kwargs)
                 return await self._execute_model_request(
                     retry_kwargs,
+                    allow_connection_retry=not bool(tool_records),
                     provider=self.provider_label,
                     descriptor=descriptor,
                     sender=send_response_request,
@@ -1846,6 +2507,7 @@ class AgentTurnRunner:
                         tool=approved_directive.tool,
                         arguments=observed_receipt_arguments,
                         result=receipt_output,
+                        tool_call_id=approved_directive.call_id,
                     )
                 )
                 await accept_approved_action_receipt(
@@ -1888,6 +2550,7 @@ class AgentTurnRunner:
                 config=self.config,
                 user_input=plain_user_input,
                 failure_breaker=failure_breaker,
+                no_progress_guard=no_progress_guard,
             )
             kwargs: dict[str, Any] = {
                 "model": agent.model,
@@ -1908,12 +2571,10 @@ class AgentTurnRunner:
                     # 推論サマリーを受け取り thinking イベントとして配信する。
                     reasoning_kwargs["summary"] = "auto"
                 kwargs["reasoning"] = reasoning_kwargs
-            if self.config and hasattr(self.config, "get"):
-                max_output_tokens = self.config.get(
-                    "runtime.target_max_output_tokens", None
-                )
-                if max_output_tokens:
-                    kwargs["max_output_tokens"] = max(1, int(max_output_tokens))
+            # Only an explicit target limit goes on the wire; none is injected.
+            max_output_tokens = self._configured_max_output_tokens()
+            if max_output_tokens:
+                kwargs["max_output_tokens"] = max_output_tokens
             if self.prompt_cache_key:
                 kwargs["prompt_cache_key"] = self.prompt_cache_key
             if self.prompt_cache_retention:
@@ -1925,6 +2586,15 @@ class AgentTurnRunner:
                 and previous_response_id
             ):
                 kwargs["previous_response_id"] = previous_response_id
+            else:
+                # Stateless requests resend the whole turn.  Send a shaped
+                # copy; ``input_items``/``stateless_input_items`` stay
+                # canonical.  Provider-managed requests carry only new items.
+                kwargs["input"] = context_shaper.shape_responses_input(
+                    input_items,
+                    reserved_chars=len(kwargs.get("instructions") or "")
+                    + tools_payload_chars(tools_payload),
+                )
 
             request_snapshot = safe_build_request_snapshot(
                 kwargs,
@@ -1932,6 +2602,16 @@ class AgentTurnRunner:
             )
             if request_snapshot is not None:
                 context_snapshots.append(request_snapshot)
+            generation_started_at = time.monotonic()
+            await emit_timing_event(
+                stream_callback,
+                "generation",
+                "start",
+                model=agent.model,
+                round=round_index,
+                tool_count=len(tools_payload),
+                **_timing_request_stats(kwargs.get("input")),
+            )
 
             async def _partial_result_after_provider_failure(
                 error: Exception,
@@ -1947,8 +2627,15 @@ class AgentTurnRunner:
 
                 if not tool_records and not usage_records:
                     raise error
-                failure = classify_generation_error(error)
-                await _emit(stream_callback, "stream_end", {"content": ""})
+                failure = replace(
+                    classify_generation_error(error),
+                    user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                )
+                provider_terminal = interrupted_terminal("responses")
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": "", "provider_terminal": provider_terminal},
+                )
                 return NativeRunResult(
                     final_output="",
                     messages=list(chat_messages),
@@ -1956,17 +2643,28 @@ class AgentTurnRunner:
                     usage_records=list(usage_records),
                     context_snapshots=list(context_snapshots),
                     generation_failure=failure,
+                    provider_terminal=provider_terminal,
+                    provider_failure=extract_provider_failure(error),
                 )
 
             try:
                 response = await create_response(kwargs)
             except Exception as first_error:
-                if authoritative_task_complete and tool_records:
-                    # Once a durable deterministic create is proven, a
-                    # provider-managed finalization failure is not a reason
-                    # to spend another request rebuilding context.  Invalidate
-                    # the managed response id for the next turn, then let the
-                    # controller finalize from the receipt.
+                await emit_timing_event(
+                    stream_callback,
+                    "generation",
+                    "error",
+                    started_at=generation_started_at,
+                    model=agent.model,
+                    round=round_index,
+                    tool_count=len(tools_payload),
+                    error_code=type(first_error).__name__,
+                    **_timing_request_stats(kwargs.get("input")),
+                )
+                if tool_records:
+                    # Any executed tool may have side effects. A failed follow-up
+                    # cannot safely replay the canonical tool history, so retain
+                    # its evidence and stop this attempt without a fallback call.
                     if self.conversation_state_mode == "provider-managed":
                         self.conversation_state_mode = "stateless"
                         self.provider_state.reset()
@@ -1981,7 +2679,11 @@ class AgentTurnRunner:
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("previous_response_id", None)
                 retry_kwargs["store"] = False
-                retry_kwargs["input"] = list(stateless_input_items)
+                retry_kwargs["input"] = context_shaper.shape_responses_input(
+                    list(stateless_input_items),
+                    reserved_chars=len(retry_kwargs.get("instructions") or "")
+                    + tools_payload_chars(tools_payload),
+                )
                 request_snapshot = safe_build_request_snapshot(
                     retry_kwargs,
                     request_kind="responses.stateless_retry",
@@ -2005,10 +2707,50 @@ class AgentTurnRunner:
                         request_snapshot,
                         usage.get("input_tokens"),
                     )
+            await emit_timing_event(
+                stream_callback,
+                "generation",
+                "end",
+                started_at=generation_started_at,
+                model=agent.model,
+                round=round_index,
+                tool_count=len(tools_payload),
+                input_tokens=usage.get("input_tokens") if usage else None,
+                output_tokens=usage.get("output_tokens") if usage else None,
+                **_timing_request_stats(kwargs.get("input")),
+            )
+            provider_terminal = normalize_responses_terminal(response)
             output_items = list(_responses_item_get(response, "output") or [])
             function_calls = _responses_function_calls(output_items)
             content = responses_output_text(response, output_items)
             final_output = content
+            if provider_terminal["state"] in {"incomplete", "interrupted"}:
+                content = str(self.privacy_gateway.restore_aliases(content))
+                failure = classify_generation_error(
+                    ModelOutputIncompleteError(
+                        provider_terminal["incomplete_reason"]
+                        or provider_terminal["response_status"]
+                        or provider_terminal["state"],
+                        transport="responses",
+                    )
+                )
+                failure = replace(
+                    failure,
+                    user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                )
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": content, "provider_terminal": provider_terminal},
+                )
+                return NativeRunResult(
+                    final_output=content,
+                    messages=[*chat_messages, {"role": "assistant", "content": content}],
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    provider_terminal=provider_terminal,
+                )
             if approved_directive is not None:
                 if not function_calls:
                     await fail_approved_action(
@@ -2057,13 +2799,20 @@ class AgentTurnRunner:
                         usage_records=list(usage_records),
                         context_snapshots=list(context_snapshots),
                         generation_failure=failure,
+                        provider_terminal=provider_terminal,
                     )
-                    await _emit(stream_callback, "stream_end", {"content": ""})
+                    await _emit(
+                        stream_callback, "stream_end",
+                        {"content": "", "provider_terminal": provider_terminal},
+                    )
                     return partial_result
                 if content:
                     content = str(self.privacy_gateway.restore_aliases(content))
                     await _emit(stream_callback, "stream_token", {"content": content})
-                await _emit(stream_callback, "stream_end", {"content": content})
+                await _emit(
+                    stream_callback, "stream_end",
+                    {"content": content, "provider_terminal": provider_terminal},
+                )
                 if content:
                     chat_messages.append({"role": "assistant", "content": content})
                 return NativeRunResult(
@@ -2072,6 +2821,7 @@ class AgentTurnRunner:
                     tool_calls=list(tool_records),
                     usage_records=list(usage_records),
                     context_snapshots=list(context_snapshots),
+                    provider_terminal=provider_terminal,
                 )
 
             # reasoning item を含む前ラウンドの output をそのまま次の input に引き継ぐ。
@@ -2160,12 +2910,32 @@ class AgentTurnRunner:
                         "message": f"{observable_name} を実行しています",
                     },
                 )
+                tool_started_at = time.monotonic()
+                await emit_timing_event(
+                    stream_callback,
+                    "tool",
+                    "start",
+                    tool=observable_name,
+                    tool_call_id=call_id,
+                    round=round_index,
+                )
 
                 execution_success = False
                 execution_error = parse_error or ""
                 audit_args = dict(event_args)
+                tool_ui_message = ""
+                tool_generation_failure: GenerationFailure | None = None
+                tool_turn_terminal = False
+                tool_executed = False
+                tool_synthetic = False
                 if parse_error:
                     result_text = f"Error: invalid JSON arguments: {parse_error}"
+                    if no_progress_guard is not None:
+                        tool_generation_failure = no_progress_guard.observe_failure(
+                            tool_name=observable_name,
+                            arguments={},
+                            error_code="invalid_json",
+                        )
                 elif _simple_task_unexpected_mutation_execution_blocked(
                     plain_user_input,
                     tool_name,
@@ -2210,16 +2980,28 @@ class AgentTurnRunner:
                             args,
                             tool_name=tool_name,
                         )
-                    tool_result = await tool_router.execute_async(
-                        UnifiedToolCall(
-                            tool=tool_name,
-                            arguments=args,
-                            call_id=call_id,
+                    try:
+                        tool_result = await tool_router.execute_async(
+                            UnifiedToolCall(
+                                tool=tool_name,
+                                arguments=args,
+                                call_id=call_id,
+                            )
                         )
-                    )
+                    except AgentDialogueInputPending as exc:
+                        _attach_dialogue_pending_usage(exc, usage_records, tool_records)
+                        raise
                     result_text = tool_result.model_output
                     execution_success = tool_result.success
                     execution_error = tool_result.error or ""
+                    tool_generation_failure = tool_result.generation_failure
+                    tool_ui_message = tool_result.status_message
+                    tool_turn_terminal = tool_result.turn_terminal
+                    tool_executed = tool_result.executed
+                    tool_synthetic = tool_result.synthetic
+                    if tool_turn_terminal:
+                        terminal_reason = tool_result.terminal_reason
+                        terminal_status_message = tool_result.status_message
                     audit_args = _observable_tool_arguments(
                         tool_registry,
                         tool_name,
@@ -2234,11 +3016,28 @@ class AgentTurnRunner:
                     config=self.config,
                     legacy_clip=_clip_text,
                 )
+                stagnation_notice, stagnation_failure = _observe_read_stagnation(
+                    observable_name,
+                    audit_args,
+                    tool_executed,
+                    execution_success,
+                    result_text,
+                )
+                if stagnation_notice:
+                    model_payload = replace(
+                        model_payload,
+                        text=f"{model_payload.text}\n\n{stagnation_notice}",
+                    )
+                if tool_generation_failure is None:
+                    tool_generation_failure = stagnation_failure
                 tool_records.append(
                     ToolExecutionRecord(
                         tool=observable_name,
                         arguments=dict(audit_args),
                         result=result_text,
+                        tool_call_id=call_id,
+                        executed=tool_executed,
+                        synthetic=tool_synthetic,
                     )
                 )
                 if tool_name == "create_task" and _simple_task_request_is_explicit(
@@ -2290,14 +3089,97 @@ class AgentTurnRunner:
                             "arguments": audit_args,
                             "output": result_text,
                             "error": None if execution_success else (execution_error or result_text),
+                            "success": bool(execution_success),
+                            "executed": bool(tool_executed),
+                            "synthetic": bool(tool_synthetic),
                             "mutation_confirmed": bool(
                                 approved_directive is not None and execution_success
                             ),
                             "tool_call_id": call_id,
                         },
-                        "message": "ツール実行が完了しました",
+                        "message": tool_ui_message
+                        or (
+                            "ツール実行が完了しました"
+                            if execution_success
+                            else "ツール実行に失敗しました"
+                        ),
+                        "executed": bool(tool_executed),
+                        "synthetic": bool(tool_synthetic),
                     },
                 )
+                await emit_timing_event(
+                    stream_callback,
+                    "tool",
+                    "end",
+                    started_at=tool_started_at,
+                    tool=observable_name,
+                    tool_call_id=call_id,
+                    round=round_index,
+                    success=execution_success,
+                    error_code=execution_error or None,
+                )
+
+                if tool_generation_failure is not None or tool_turn_terminal:
+                    # The breaker owns this terminal decision. Preserve every
+                    # Responses call ID in the same batch as a synthetic
+                    # function_call_output without executing the remainder.
+                    terminal_generation_failure = tool_generation_failure
+                    if not terminal_reason:
+                        terminal_reason = (
+                            tool_generation_failure.kind
+                            if tool_generation_failure is not None
+                            else "tool_terminal"
+                        )
+                    if not terminal_status_message:
+                        terminal_status_message = (
+                            tool_generation_failure.user_message
+                            if tool_generation_failure is not None
+                            else tool_ui_message
+                            or "ツール実行を停止しました"
+                        )
+                    skip_reason = _native_terminal_skip_reason(terminal_reason)
+                    for skipped in function_calls[function_call_index + 1 :]:
+                        skipped_id = _responses_call_id(skipped)
+                        skipped_name = observable_tool_name(
+                            tool_registry,
+                            _responses_call_name(skipped),
+                        )
+                        skipped_result = _native_not_executed_tool_result(
+                            skip_reason
+                        )
+                        input_item = {
+                            "type": "function_call_output",
+                            "call_id": skipped_id,
+                            "output": skipped_result,
+                        }
+                        input_items.append(input_item)
+                        stateless_input_items.append(dict(input_item))
+                        chat_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": skipped_id,
+                                "content": skipped_result,
+                            }
+                        )
+                        tool_records.append(
+                            ToolExecutionRecord(
+                                tool=skipped_name,
+                                arguments={},
+                                result=skipped_result,
+                                tool_call_id=skipped_id,
+                                executed=False,
+                                synthetic=True,
+                            )
+                        )
+                        await _emit_native_not_executed_tool(
+                            stream_callback,
+                            tool=skipped_name,
+                            call_id=skipped_id,
+                            output=skipped_result,
+                            reason=skip_reason,
+                            message=_native_terminal_skip_message(terminal_reason),
+                        )
+                    hard_stop = True
 
                 if approved_directive is not None:
                     await persist_and_accept_approved_action_result(
@@ -2312,26 +3194,22 @@ class AgentTurnRunner:
                     and state.phase == PlanningRunPhase.EXECUTING
                 ):
                     for skipped in function_calls[function_call_index + 1 :]:
-                        skipped_output = {
-                            "type": "function_call_output",
-                            "call_id": _responses_call_id(skipped),
-                            "output": (
-                                "Not executed: approved actions start on the next "
-                                "server-controlled round."
-                            ),
-                        }
-                        input_items.append(skipped_output)
-                        stateless_input_items.append(dict(skipped_output))
-                        chat_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": _responses_call_id(skipped),
-                                "content": skipped_output["output"],
-                            }
+                        await _record_native_responses_skipped_call(
+                            stream_callback=stream_callback,
+                            tool_records=tool_records,
+                            input_items=input_items,
+                            stateless_input_items=stateless_input_items,
+                            chat_messages=chat_messages,
+                            registry=tool_registry,
+                            skipped=skipped,
+                            reason=_native_approved_skip_reason(),
+                            message=_native_approved_skip_message(),
                         )
                     break
 
                 if hard_stop or authoritative_task_complete:
+                    if terminal_generation_failure is not None or terminal_reason:
+                        break
                     for skipped in function_calls[function_call_index + 1 :]:
                         skipped_output = {
                             "type": "function_call_output",
@@ -2356,6 +3234,34 @@ class AgentTurnRunner:
                 current_tool_choice = "auto"
             if hard_stop:
                 break
+
+        if terminal_generation_failure is not None or terminal_reason:
+            terminal_output = str(
+                self.privacy_gateway.restore_aliases(
+                    terminal_generation_failure.user_message
+                    if terminal_generation_failure is not None
+                    else terminal_status_message
+                )
+            )
+            await _emit(
+                stream_callback,
+                "stream_token",
+                {"content": terminal_output},
+            )
+            await _emit(
+                stream_callback,
+                "stream_end",
+                {"content": terminal_output},
+            )
+            return NativeRunResult(
+                final_output=terminal_output,
+                messages=list(chat_messages),
+                tool_calls=list(tool_records),
+                usage_records=list(usage_records),
+                context_snapshots=list(context_snapshots),
+                generation_failure=terminal_generation_failure,
+                stopped_reason=terminal_reason,
+            )
 
         fallback = str(
             self.privacy_gateway.restore_aliases(
@@ -2393,17 +3299,17 @@ class AgentTurnRunner:
             kwargs["tools"] = tools_payload
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
-        if self.config and hasattr(self.config, "get"):
-            max_output_tokens = self.config.get(
-                "runtime.target_max_output_tokens", None
+        max_output_tokens = self._configured_max_output_tokens()
+        if max_output_tokens:
+            from ..services.free_team_service import complimentary_model_group
+            token_key = (
+                "max_completion_tokens"
+                if (self.provider_label == "kimi" and agent.model == "kimi-k3") or (
+                    self.provider_label == "openai" and complimentary_model_group(agent.model) is not None
+                ) else "max_tokens"
             )
-            if max_output_tokens:
-                token_key = (
-                    "max_completion_tokens"
-                    if self.provider_label == "kimi" and agent.model == "kimi-k3"
-                    else "max_tokens"
-                )
-                kwargs[token_key] = max(1, int(max_output_tokens))
+            kwargs[token_key] = max_output_tokens
+        if self.config and hasattr(self.config, "get"):
             extra_body = self.config.get("free_team.request_extra_body", None)
             if isinstance(extra_body, dict) and extra_body:
                 kwargs["extra_body"] = dict(extra_body)
@@ -2489,7 +3395,9 @@ class AgentTurnRunner:
                         kwargs.pop(key, None)
         if self.provider_label == "deepinfra":
             reasoning = getattr(getattr(agent, "model_settings", None), "reasoning", None)
-            effort = str(getattr(reasoning, "effort", "") or "").strip().lower()
+            requested_effort = str(
+                getattr(reasoning, "effort", "") or ""
+            ).strip().lower()
             agent_team_effort = str(
                 self.config.get("runtime.agent_team_effective_effort", "")
                 if self.config and hasattr(self.config, "get")
@@ -2501,13 +3409,19 @@ class AgentTurnRunner:
                 and str(self.config.get("runtime.agent_team_effort_policy", "") or "").strip()
             )
             if agent_team_route:
-                effort = agent_team_effort
-            elif not effort and self.config and hasattr(self.config, "get"):
-                effort = str(
-                    self.config.get("deepinfra.reasoning_effort", "high") or "high"
+                requested_effort = agent_team_effort
+            elif not requested_effort and self.config and hasattr(self.config, "get"):
+                requested_effort = str(
+                    self.config.get("deepinfra.reasoning_effort", "") or ""
                 ).strip().lower()
-            if effort and effort not in {"none", "low", "medium", "high"}:
-                effort = "" if agent_team_route else "high"
+            from .deepinfra import resolve_reasoning_effort
+
+            effort = resolve_reasoning_effort(
+                self.config,
+                agent.model,
+                requested_effort,
+                agent_team_route=agent_team_route,
+            )
             if "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs:
                 configured_max = (
                     self.config.get("runtime.target_max_output_tokens", 2048)
@@ -2570,6 +3484,21 @@ class AgentTurnRunner:
                 "thinking",
             ):
                 kwargs.pop(key, None)
+        if self.provider_label == "deepinfra":
+            from .deepinfra import sanitize_chat_payload
+
+            kwargs = sanitize_chat_payload(
+                kwargs,
+                config=self.config,
+                model=agent.model,
+            )
+        from .generation_budget import constrain_model_request_extra_body, current_generation_budget
+        budget = current_generation_budget.get()
+        if max_output_tokens or (budget is not None and budget.max_requests is not None):
+            # SDK extra_body is merged after standard arguments. The bounded
+            # assignment's model/input/tools and output allowance must win on
+            # the serialized wire, before privacy/quota review sees the body.
+            kwargs = constrain_model_request_extra_body(kwargs)
         return kwargs
 
 
@@ -2709,6 +3638,7 @@ def create_async_openai_client(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     default_headers: Optional[dict[str, str]] = None,
+    http_client: Any | None = None,
 ) -> AsyncOpenAI:
     # The privacy gateway owns retry/review semantics for every model
     # request.  Disable the SDK's implicit retries so a reviewed payload is
@@ -2721,6 +3651,10 @@ def create_async_openai_client(
         kwargs["base_url"] = base_url
     if default_headers:
         kwargs["default_headers"] = default_headers
+    if http_client is not None:
+        # Tests and local transport adapters may inject an already configured
+        # async HTTP client.  Production callers keep the SDK-owned transport.
+        kwargs["http_client"] = http_client
     client = AsyncOpenAI(**kwargs)
     diagnostic = _sanitize_transport_diagnostic(
         _environment_proxy_diagnostic(

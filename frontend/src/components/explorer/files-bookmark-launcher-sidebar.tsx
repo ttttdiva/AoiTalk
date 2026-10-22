@@ -52,6 +52,16 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
   explorerAddBookmark,
   explorerAddLauncher,
   explorerErrorMessage,
@@ -62,14 +72,10 @@ import {
   explorerUpdateLauncher,
 } from "@/lib/explorer-api";
 import {
-  readTagBookmarkRecords,
-  removeTagBookmark,
-  renameTagBookmark,
-  reorderTagBookmarks,
-  type HydrusTagBookmark,
-} from "@/lib/hydrus/tag-store";
-import { buildHfPath, isHfPath, parseHfPath } from "@/lib/hf/virtual-path";
-import { requestFilesDownload, requestFilesOpen } from "@/lib/files-sidebar-events";
+  FILES_BOOKMARK_PATH_EVENT,
+  requestFilesDownload,
+  requestFilesOpen,
+} from "@/lib/files-sidebar-events";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useIncrementalSearch } from "@/hooks/use-incremental-search";
@@ -94,7 +100,7 @@ const defaultSelectProjectForPath = async (path: string): Promise<boolean> => {
   return true;
 };
 type SidebarTab = "bookmarks" | "launchers";
-type SidebarItem = ExplorerBookmark | ExplorerLauncher | HydrusTagBookmark;
+type SidebarItem = ExplorerBookmark | ExplorerLauncher;
 
 function isTextInput(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (
@@ -110,7 +116,6 @@ function focusFilesRoot() {
 }
 
 function itemId(item: SidebarItem): string {
-  if ("tag" in item) return item.tag;
   return item.id ?? item.path;
 }
 
@@ -119,19 +124,10 @@ function itemName(item: SidebarItem): string {
 }
 
 function itemPath(item: SidebarItem): string {
-  return "tag" in item ? item.tag : item.path;
+  return item.path;
 }
 
 function parentPath(path: string): string | null {
-  if (isHfPath(path)) {
-    const parsed = parseHfPath(path);
-    if (!parsed || parsed.kind === "root") return "HF";
-    const subPath = parsed.subPath ?? "";
-    if (!subPath) return buildHfPath({ ...parsed, subPath: undefined });
-    const segments = subPath.split("/").filter(Boolean);
-    segments.pop();
-    return buildHfPath({ ...parsed, subPath: segments.join("/") || undefined });
-  }
   const normalized = path.replace(/[\\/]+$/, "");
   const index = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
   return index > 0 ? normalized.slice(0, index) : index === 0 ? normalized.slice(0, 1) : null;
@@ -157,21 +153,19 @@ function workspaceProjectIdFromPath(path: string): string | null {
   return match?.[1] ?? null;
 }
 
-/** Scope roots use slash separators, while HF uses a `|` virtual separator. */
 function pathWithinScope(
   path: string,
   scopeRoot: string,
   sameSpaceProjectIds?: ReadonlySet<string>,
 ): boolean {
   if (!path || !scopeRoot) return false;
-  if (scopeRoot === "HF") return isHfPath(path);
   if (sameSpaceProjectIds && scopeRoot.startsWith("_projects/project_")) {
     const projectId = workspaceProjectIdFromPath(path);
     return projectId !== null && sameSpaceProjectIds.has(projectId);
   }
   if (path.startsWith("aoitalk-record-table:")) {
     // Record tables are virtual Project Files and have no filesystem
-    // extension. Keep them scoped to the owning project; User/HF/Hydrus must
+    // extension. Keep them scoped to the owning project; User views must
     // never expose them as launchers.
     const projectId = path.slice("aoitalk-record-table:".length).split(":", 1)[0];
     const projectRootPrefix = "_projects/project_";
@@ -222,6 +216,14 @@ type OwnedBookmark = {
 type BookmarkCollections = {
   personal: ExplorerBookmark[];
   shared: { spaceId: string; bookmarks: ExplorerBookmark[] } | null;
+};
+
+type BookmarkFolderDialogState = {
+  parentId: string | null;
+  owner: ExplorerBookmarkScope;
+  scopeKey: string;
+  projectId: string | null;
+  bookmarkScopeIdentity: string;
 };
 
 function normalizeBookmarkPath(path: string): string {
@@ -411,14 +413,23 @@ export function FilesBookmarkLauncherSidebar() {
   const [launchers, setLaunchers] = useState<ExplorerLauncher[]>([]);
   const launcherDataIdentityRef = useRef<string | null>(null);
   const [activeTab, setActiveTab] = useState<SidebarTab>("bookmarks");
-  const [hydrusBookmarks, setHydrusBookmarks] = useState<HydrusTagBookmark[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [contextMenu, setContextMenu] = useState<{
     item: SidebarItem | null;
     x: number;
     y: number;
   } | null>(null);
+  const [folderDialog, setFolderDialog] = useState<BookmarkFolderDialogState | null>(null);
+  const [folderDialogName, setFolderDialogName] = useState("");
+  const [folderDialogError, setFolderDialogError] = useState<string | null>(null);
+  const [folderDialogPending, setFolderDialogPending] = useState(false);
+  const folderDialogRequestGenerationRef = useRef(0);
+  const folderDialogInFlightRef = useRef(false);
+  const bookmarkRequestsInFlightRef = useRef(new Set<string>());
+  const persistedBookmarkRequestKeysRef = useRef(new Set<string>());
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [filesDropTargetActive, setFilesDropTargetActive] = useState(false);
+  const [bookmarkDropParentId, setBookmarkDropParentId] = useState<string | null>(null);
   const [quickLauncherOpen, setQuickLauncherOpen] = useState(false);
   const quickLauncherFocusFilesRef = useRef(false);
   const quickLauncherAnchorRef = useRef<HTMLSpanElement>(null);
@@ -437,7 +448,7 @@ export function FilesBookmarkLauncherSidebar() {
   launcherCurrentBookmarkScopeRef.current = bookmarkScope;
   const pathnameIsFiles = pathname === "/filer" || pathname?.startsWith("/filer/") === true;
   const launcherEnabled = (filerTab === "workspace" || filerTab === "user") && !isRemoteWorkspace;
-  const canUseGenericBookmarks = filerTab !== "hydrus" && !isRemoteWorkspace;
+  const canUseGenericBookmarks = !isRemoteWorkspace;
   const sameSpaceProjectIdSet = useMemo(
     () => new Set(spaceProjectIds),
     [spaceProjectIds],
@@ -563,91 +574,6 @@ export function FilesBookmarkLauncherSidebar() {
     };
   }, [reloadLaunchers, scopeKey, userId]);
 
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setHydrusBookmarks(filerTab === "hydrus" ? readTagBookmarkRecords(userId) : []);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [filerTab, userId]);
-
-  useEffect(() => {
-    const onHydrusChanged = (event: Event) => {
-      const detail = (event as CustomEvent<{ userId?: string | null }>).detail;
-      if ((detail?.userId ?? null) !== (userId ?? null)) return;
-      setHydrusBookmarks(readTagBookmarkRecords(userId));
-    };
-    window.addEventListener("hydrus-tag-bookmarks-changed", onHydrusChanged);
-    return () => window.removeEventListener("hydrus-tag-bookmarks-changed", onHydrusChanged);
-  }, [userId]);
-
-  const allOwnedBookmarks = useMemo(() => {
-    const rows: OwnedBookmark[] = [];
-    const seen = new Set<string>();
-    const append = (items: ExplorerBookmark[], owner: ExplorerBookmarkScope) => {
-      for (const item of items) {
-        const ownedItem = withBookmarkOwner(item, owner);
-        const effectiveOwner = resolveBookmarkOwner(ownedItem, owner);
-        const key = `${bookmarkOwnerKey(effectiveOwner)}|${normalizeBookmarkPath(item.path)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        rows.push({ item: ownedItem, owner: effectiveOwner });
-      }
-    };
-    if (bookmarkCollections.shared) {
-      append(
-        bookmarkCollections.shared.bookmarks,
-        { scope: "shared", spaceId: bookmarkCollections.shared.spaceId },
-      );
-    }
-    append(bookmarkCollections.personal, { scope: "personal" });
-    // Legacy snapshots may provide only `bookmarks` with no collections. The
-    // fallback collection above covers that path, but retain a final guard for
-    // malformed bridge payloads so the sidebar never renders an unowned row.
-    if (rows.length === 0 && bookmarks.length > 0) append(bookmarks, bookmarkScope);
-    return rows;
-  }, [bookmarkCollections, bookmarkScope, bookmarks]);
-
-  const visibleOwnedBookmarks = useMemo(
-    () => {
-      if (filerTab === "hydrus") return [];
-      const projected = projectExplorerBookmarks(
-        allOwnedBookmarks.map((row) => row.item),
-        {
-          owner: bookmarkScope,
-          selectedSpaceId: bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : null,
-          selectedProjectId: filesTargetProjectId ?? canonicalScopeProjectId,
-          spaceProjectIds,
-          filerTab,
-          scopeRoot,
-          includePersonalAbsolute: true,
-        },
-      );
-      const visibleItems = new Set(projected);
-      // Preserve the historical empty-folder affordance in User/HF views.
-      if (filerTab === "user" || filerTab === "hf") {
-        for (const row of allOwnedBookmarks) {
-          if (row.owner.scope === "personal" && isExplorerBookmarkFolder(row.item)) {
-            visibleItems.add(row.item);
-          }
-        }
-      }
-      return sortOwnedBookmarks(
-        allOwnedBookmarks.filter((row) => visibleItems.has(row.item)),
-      );
-    },
-    [allOwnedBookmarks, bookmarkScope, canonicalScopeProjectId, filerTab, filesTargetProjectId, scopeRoot, spaceProjectIds],
-  );
-  const bookmarkOwnerMap = useMemo(() => {
-    const byObject = new Map<ExplorerBookmark, ExplorerBookmarkScope>();
-    for (const row of allOwnedBookmarks) {
-      byObject.set(row.item, row.owner);
-    }
-    return { byObject };
-  }, [allOwnedBookmarks]);
-  const visibleBookmarks = filerTab === "hydrus"
-    ? hydrusBookmarks
-    : visibleOwnedBookmarks.map((row) => row.item);
-
   const ownerForTargetPath = useCallback((path: string): ExplorerBookmarkScope | null => {
     const classification = classifyBookmarkTarget(path, {
       owner: bookmarkScope,
@@ -667,6 +593,113 @@ export function FilesBookmarkLauncherSidebar() {
     return null;
   }, [bookmarkScope, canonicalScopeProjectId, filerTab, filesTargetProjectId, scopeRoot, spaceProjectIds]);
 
+  const allOwnedBookmarks = useMemo(() => {
+    const rows: OwnedBookmark[] = [];
+    const seen = new Set<string>();
+    const append = (items: ExplorerBookmark[], owner: ExplorerBookmarkScope) => {
+      for (const item of items) {
+        const ownedItem = withBookmarkOwner(item, owner);
+        const effectiveOwner = resolveBookmarkOwner(ownedItem, owner);
+        const folderId = item.id?.trim();
+        const itemKey = isExplorerBookmarkFolder(item)
+          ? `folder:${folderId || normalizeBookmarkPath(item.path)}`
+          : `bookmark:${normalizeBookmarkPath(item.path)}`;
+        const key = `${bookmarkOwnerKey(effectiveOwner)}|${itemKey}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({ item: ownedItem, owner: effectiveOwner });
+      }
+    };
+    if (bookmarkCollections.shared) {
+      append(
+        bookmarkCollections.shared.bookmarks,
+        { scope: "shared", spaceId: bookmarkCollections.shared.spaceId },
+      );
+    }
+    append(bookmarkCollections.personal, { scope: "personal" });
+    // Legacy snapshots may provide only `bookmarks` with no collections. The
+    // fallback collection above covers that path, but retain a final guard for
+    // malformed bridge payloads so the sidebar never renders an unowned row.
+    if (rows.length === 0 && bookmarks.length > 0) append(bookmarks, bookmarkScope);
+    return rows;
+  }, [bookmarkCollections, bookmarkScope, bookmarks]);
+
+  useEffect(() => {
+    for (const { item, owner } of allOwnedBookmarks) {
+      if (isExplorerBookmarkFolder(item)) continue;
+      persistedBookmarkRequestKeysRef.current.delete(
+        `${bookmarkOwnerKey(owner)}|${normalizeBookmarkPath(item.path)}`,
+      );
+    }
+  }, [allOwnedBookmarks]);
+
+  const ownerForFolderParent = useCallback((parentId: string | null): ExplorerBookmarkScope | null => {
+    const parentRow = parentId
+      ? allOwnedBookmarks.find((row) => row.item.id === parentId)
+      : null;
+    if (parentId && (!parentRow || !isExplorerBookmarkFolder(parentRow.item))) return null;
+    return parentRow?.owner ?? ownerForTargetPath(currentPath) ?? (parentId === null ? bookmarkScope : null);
+  }, [allOwnedBookmarks, bookmarkScope, currentPath, ownerForTargetPath]);
+  const emptyFolderDisplayOwner = useMemo(() => {
+    const owner = ownerForFolderParent(null);
+    if (!owner || isRemoteWorkspace) return null;
+    if (filerTab === "user") {
+      return owner.scope === "personal" ? owner : null;
+    }
+    if (filerTab === "workspace") {
+      if (owner.scope === "shared") {
+        return bookmarkScope.scope === "shared" && ownersMatch(owner, bookmarkScope)
+          ? owner
+          : null;
+      }
+      // Workspace can show personal folders when the selected Files listing
+      // itself is a permitted absolute path. Do not project User Files folders
+      // during a stale tab/path transition.
+      return isAbsolutePath(currentPath) ? owner : null;
+    }
+    return null;
+  }, [bookmarkScope, currentPath, filerTab, isRemoteWorkspace, ownerForFolderParent]);
+
+  const visibleOwnedBookmarks = useMemo(
+    () => {
+      const projected = projectExplorerBookmarks(
+        allOwnedBookmarks.map((row) => row.item),
+        {
+          owner: bookmarkScope,
+          selectedSpaceId: bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : null,
+          selectedProjectId: filesTargetProjectId ?? canonicalScopeProjectId,
+          spaceProjectIds,
+          filerTab,
+          scopeRoot,
+          includePersonalAbsolute: true,
+          includeEmptyFolders: emptyFolderDisplayOwner !== null,
+          emptyFolderOwner: emptyFolderDisplayOwner ?? undefined,
+        },
+      );
+      const visibleItems = new Set(projected);
+      // Preserve the historical empty-folder affordance in the User view.
+      if (filerTab === "user" && !isRemoteWorkspace) {
+        for (const row of allOwnedBookmarks) {
+          if (row.owner.scope === "personal" && isExplorerBookmarkFolder(row.item)) {
+            visibleItems.add(row.item);
+          }
+        }
+      }
+      return sortOwnedBookmarks(
+        allOwnedBookmarks.filter((row) => visibleItems.has(row.item)),
+      );
+    },
+    [allOwnedBookmarks, bookmarkScope, canonicalScopeProjectId, emptyFolderDisplayOwner, filerTab, filesTargetProjectId, isRemoteWorkspace, scopeRoot, spaceProjectIds],
+  );
+  const bookmarkOwnerMap = useMemo(() => {
+    const byObject = new Map<ExplorerBookmark, ExplorerBookmarkScope>();
+    for (const row of allOwnedBookmarks) {
+      byObject.set(row.item, row.owner);
+    }
+    return { byObject };
+  }, [allOwnedBookmarks]);
+  const visibleBookmarks = visibleOwnedBookmarks.map((row) => row.item);
+
   const ownerForBookmark = useCallback((item: ExplorerBookmark): ExplorerBookmarkScope => {
     const mapped = bookmarkOwnerMap.byObject.get(item);
     if (mapped) return mapped;
@@ -675,6 +708,33 @@ export function FilesBookmarkLauncherSidebar() {
     // Legacy snapshots without collection provenance retain the active scope.
     return resolveBookmarkOwner(item, bookmarkScope);
   }, [bookmarkOwnerMap.byObject, bookmarkScope, ownerForTargetPath]);
+
+  const currentFolderProjectId = filesTargetProjectId ?? canonicalScopeProjectId;
+  const folderContextRef = useRef<{
+    scopeKey: string;
+    projectId: string | null;
+    bookmarkScopeIdentity: string;
+    ownerForParent: (parentId: string | null) => ExplorerBookmarkScope | null;
+  } | null>(null);
+  // Keep the current owner boundary available to a submission that resumes
+  // after an async API call, even when the sidebar has rendered a new scope.
+  folderContextRef.current = {
+    scopeKey,
+    projectId: currentFolderProjectId,
+    bookmarkScopeIdentity: currentBookmarkScopeIdentity,
+    ownerForParent: ownerForFolderParent,
+  };
+  const folderDialogContextMatches = useCallback((dialog: BookmarkFolderDialogState) => {
+    const context = folderContextRef.current;
+    if (!context ||
+      context.scopeKey !== dialog.scopeKey ||
+      context.projectId !== dialog.projectId ||
+      context.bookmarkScopeIdentity !== dialog.bookmarkScopeIdentity) {
+      return false;
+    }
+    const owner = context.ownerForParent(dialog.parentId);
+    return owner !== null && ownersMatch(owner, dialog.owner);
+  }, []);
 
   const ownedRowsForOwner = useCallback((owner: ExplorerBookmarkScope) =>
     allOwnedBookmarks.filter((row) => ownersMatch(row.owner, owner)),
@@ -713,12 +773,11 @@ export function FilesBookmarkLauncherSidebar() {
   }, [allOwnedBookmarks, ownerForBookmark]);
 
   const bookmarkTree = useMemo(
-    () => (filerTab === "hydrus" ? [] : buildExplorerBookmarkTree(visibleBookmarks as ExplorerBookmark[])),
-    [filerTab, visibleBookmarks],
+    () => buildExplorerBookmarkTree(visibleBookmarks as ExplorerBookmark[]),
+    [visibleBookmarks],
   );
 
   useEffect(() => {
-    if (filerTab === "hydrus") return;
     setExpandedFolderIds((prev) => {
       const next = new Set(prev);
       let changed = false;
@@ -751,9 +810,7 @@ export function FilesBookmarkLauncherSidebar() {
   );
   const visibleItems = activeTab === "launchers" && launcherEnabled
     ? visibleLaunchers
-    : filerTab === "hydrus"
-      ? visibleBookmarks
-      : bookmarkFlatRows.map((row) => row.node.item);
+    : bookmarkFlatRows.map((row) => row.node.item);
 
   // 共通のインクリメンタル検索へ渡す検索対象。現在実際に選択可能な表示項目だけを
   // 対象にするため、折り畳まれたブックマーク子要素は含まれない。
@@ -800,6 +857,8 @@ export function FilesBookmarkLauncherSidebar() {
 
   const selectTab = useCallback((tab: SidebarTab, focus = true) => {
     if (tab === "launchers" && !launcherEnabled) return;
+    setFilesDropTargetActive(false);
+    setBookmarkDropParentId(null);
     setActiveTab(tab);
     setActiveIndex(0);
     if (focus) window.requestAnimationFrame(() => {
@@ -807,6 +866,15 @@ export function FilesBookmarkLauncherSidebar() {
       (first ?? listRef.current)?.focus();
     });
   }, [launcherEnabled]);
+
+  useEffect(() => {
+    // A tab switch can focus the list container while its scoped API request
+    // is still loading. Move focus to the first row when that list arrives,
+    // but leave focus alone if the user has moved to another control.
+    if (visibleItems.length === 0 || document.activeElement !== listRef.current) return;
+    const first = listRef.current?.querySelector<HTMLElement>('[data-files-sidebar-index="0"]');
+    first?.focus({ preventScroll: true });
+  }, [activeTab, visibleItems.length]);
 
   const toggleFolderExpanded = useCallback((folderKey: string) => {
     setExpandedFolderIds((prev) => {
@@ -825,7 +893,6 @@ export function FilesBookmarkLauncherSidebar() {
     }
     const listingAuthorizesAbsolute = browseData?.is_admin_mode === true;
     if (
-      isHfPath(path) !== (filerTab === "hf") ||
       // Keep the existing client-side UX guard for principals that are not
       // allowed to browse absolute paths. The backend authorization remains
       // authoritative; this does not grant any new filesystem access.
@@ -838,14 +905,16 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
       return false;
     }
-    // Registration is still restricted to the directory currently loaded in
-    // the authorized Files listing (or a directory being dropped from that
-    // listing).  This preserves the existing invalid/stale target guard while
-    // allowing external absolute paths that the backend already authorized.
+    // Registration is still restricted to the currently loaded authorized
+    // Files listing. This preserves the existing invalid/stale target guard
+    // while accepting both files and directories from that listing.
     const normalizedPath = normalizeScopePath(path);
     const listingContainsPath =
       normalizeScopePath(browseData?.current_path ?? "") === normalizedPath ||
-      Boolean(browseData?.directories.some((entry) => normalizeScopePath(entry.path) === normalizedPath));
+      Boolean(
+        browseData?.directories.some((entry) => normalizeScopePath(entry.path) === normalizedPath) ||
+        browseData?.files.some((entry) => normalizeScopePath(entry.path) === normalizedPath),
+      );
     if (!listingContainsPath) {
       reportSidebarGuard("この場所はブックマーク登録の対象外です");
       return false;
@@ -862,89 +931,190 @@ export function FilesBookmarkLauncherSidebar() {
         return false;
       }
     }
-    const fallbackName = path.split(/[\\/|]/).filter(Boolean).pop() || "Folder";
+    const fallbackName = path.split(/[\\/|]/).filter(Boolean).pop() || "Item";
     const duplicate = ownedRowsForOwner(owner).some(
       (row) => normalizeBookmarkPath(row.item.path) === normalizeBookmarkPath(path),
     );
-    if (duplicate) return false;
-    try {
-      if (parentId !== undefined) {
-        assertApiSuccess(
-          await explorerAddBookmark(
-            name?.trim() || fallbackName,
-            path,
-            undefined,
-            { parent_id: parentId },
-            owner,
-          ),
-          "ブックマーク登録",
-        );
-      } else {
-        assertApiSuccess(
-          await explorerAddBookmark(
-            name?.trim() || fallbackName,
-            path,
-            undefined,
-            undefined,
-            owner,
-          ),
-          "ブックマーク登録",
-        );
+    const requestKey = `${bookmarkOwnerKey(owner)}|${normalizeBookmarkPath(path)}`;
+    if (duplicate || bookmarkRequestsInFlightRef.current.has(requestKey)) return false;
+    if (persistedBookmarkRequestKeysRef.current.has(requestKey)) {
+      try {
+        await refreshBookmarksForOwner(owner);
+      } catch (error) {
+        reportSidebarError("ブックマークは登録済みですが一覧更新に失敗しました", error);
       }
-    } catch (error) {
-      reportSidebarError("ブックマーク登録に失敗しました", error);
       return false;
     }
+    bookmarkRequestsInFlightRef.current.add(requestKey);
+    const targetIcon = browseData?.files.some(
+      (entry) => normalizeScopePath(entry.path) === normalizedPath,
+    )
+      ? "📄"
+      : undefined;
     try {
-      await refreshBookmarksForOwner(owner);
-    } catch (error) {
-      reportSidebarError("ブックマークは登録済みですが一覧更新に失敗しました", error);
+      try {
+        if (parentId !== undefined) {
+          assertApiSuccess(
+            await explorerAddBookmark(
+              name?.trim() || fallbackName,
+              path,
+              targetIcon,
+              { parent_id: parentId },
+              owner,
+            ),
+            "ブックマーク登録",
+          );
+        } else {
+          assertApiSuccess(
+            await explorerAddBookmark(
+              name?.trim() || fallbackName,
+              path,
+              targetIcon,
+              undefined,
+              owner,
+            ),
+            "ブックマーク登録",
+          );
+        }
+      } catch (error) {
+        reportSidebarError("ブックマーク登録に失敗しました", error);
+        return false;
+      }
+      persistedBookmarkRequestKeysRef.current.add(requestKey);
+      try {
+        await refreshBookmarksForOwner(owner);
+      } catch (error) {
+        reportSidebarError("ブックマークは登録済みですが一覧更新に失敗しました", error);
+      }
+      return true;
+    } finally {
+      bookmarkRequestsInFlightRef.current.delete(requestKey);
     }
-    return true;
-  }, [allOwnedBookmarks, browseData, canUseGenericBookmarks, filerTab, isAdmin, ownerForTargetPath, ownedRowsForOwner, refreshBookmarksForOwner, scopeReady]);
+  }, [allOwnedBookmarks, browseData, canUseGenericBookmarks, isAdmin, ownerForTargetPath, ownedRowsForOwner, refreshBookmarksForOwner, scopeReady]);
 
-  const createBookmarkFolder = useCallback(async (parentId: string | null) => {
+  useEffect(() => {
+    const handleBookmarkRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{ path?: unknown; name?: unknown }>).detail;
+      if (typeof detail?.path !== "string" || !detail.path) return;
+      const name = typeof detail.name === "string" ? detail.name : undefined;
+      void addBookmark(detail.path, name);
+    };
+    window.addEventListener(FILES_BOOKMARK_PATH_EVENT, handleBookmarkRequest);
+    return () => window.removeEventListener(FILES_BOOKMARK_PATH_EVENT, handleBookmarkRequest);
+  }, [addBookmark]);
+
+  const closeBookmarkFolderDialog = useCallback(() => {
+    folderDialogRequestGenerationRef.current += 1;
+    setFolderDialog(null);
+    setFolderDialogName("");
+    setFolderDialogError(null);
+    setFolderDialogPending(false);
+  }, []);
+
+  const openBookmarkFolderDialog = useCallback((parentId: string | null) => {
     if (!canUseGenericBookmarks) {
       reportSidebarGuard("このFilesタブではブックマーク登録を利用できません");
       return;
     }
-    const nextName = window.prompt("フォルダ名");
-    if (nextName == null || !nextName.trim()) return;
     const parentRow = parentId
       ? allOwnedBookmarks.find((row) => row.item.id === parentId)
       : null;
-    if (parentId && !parentRow) {
+    if (parentId && (!parentRow || !isExplorerBookmarkFolder(parentRow.item))) {
       reportSidebarGuard("ブックマークの親フォルダが見つかりません");
       return;
     }
-    // A root folder has no parent to constrain its owner.  Prefer the loaded
-    // target's classification, but retain the active collection for the brief
-    // initial/transition render where `currentPath` is empty or virtual-root
-    // shaped and therefore cannot be classified independently.
-    const owner =
-      parentRow?.owner ??
-      ownerForTargetPath(currentPath) ??
-      (parentId === null ? bookmarkScope : null);
+    const owner = ownerForFolderParent(parentId);
     if (!owner) {
       reportSidebarGuard("この場所はブックマーク登録の対象外です");
       return;
     }
-    try {
-      assertApiSuccess(
-        await explorerAddBookmark(
-          nextName.trim(),
-          undefined,
-          undefined,
-          { kind: "folder", parent_id: parentId },
-          owner,
-        ),
-        "フォルダ作成",
-      );
-      await refreshBookmarksForOwner(owner);
-    } catch (error) {
-      reportSidebarError("フォルダ作成に失敗しました", error);
+    folderDialogRequestGenerationRef.current += 1;
+    setFolderDialog({
+      parentId,
+      owner,
+      scopeKey,
+      projectId: currentFolderProjectId,
+      bookmarkScopeIdentity: currentBookmarkScopeIdentity,
+    });
+    setFolderDialogName("");
+    setFolderDialogError(null);
+    setFolderDialogPending(folderDialogInFlightRef.current);
+  }, [allOwnedBookmarks, canUseGenericBookmarks, currentBookmarkScopeIdentity, currentFolderProjectId, ownerForFolderParent, scopeKey]);
+
+  const submitBookmarkFolder = useCallback(async () => {
+    const dialog = folderDialog;
+    if (!dialog || folderDialogPending || folderDialogInFlightRef.current) return;
+    if (!canUseGenericBookmarks) {
+      reportSidebarGuard("このFilesタブではブックマーク登録を利用できません");
+      closeBookmarkFolderDialog();
+      return;
     }
-  }, [allOwnedBookmarks, bookmarkScope, canUseGenericBookmarks, currentPath, ownerForTargetPath, refreshBookmarksForOwner]);
+    const nextName = folderDialogName.trim();
+    if (!nextName) {
+      setFolderDialogError("フォルダ名を入力してください");
+      return;
+    }
+    if (!folderDialogContextMatches(dialog)) {
+      reportSidebarGuard("Filesの対象が切り替わったため、フォルダ作成を中止しました");
+      closeBookmarkFolderDialog();
+      return;
+    }
+    const requestGeneration = ++folderDialogRequestGenerationRef.current;
+    // State updates are batched by React. Keep a synchronous lock as well so
+    // two submit events in the same turn cannot issue duplicate writes.
+    folderDialogInFlightRef.current = true;
+    setFolderDialogPending(true);
+    setFolderDialogError(null);
+    try {
+      try {
+        assertApiSuccess(
+          await explorerAddBookmark(
+            nextName,
+            undefined,
+            undefined,
+            { kind: "folder", parent_id: dialog.parentId },
+            dialog.owner,
+          ),
+          "フォルダ作成",
+        );
+      } catch (error) {
+        if (requestGeneration !== folderDialogRequestGenerationRef.current) return;
+        const reason = explorerErrorMessage(error);
+        setFolderDialogError(reason);
+        reportSidebarError("フォルダ作成に失敗しました", error);
+        return;
+      }
+      if (requestGeneration !== folderDialogRequestGenerationRef.current || !folderDialogContextMatches(dialog)) {
+        return;
+      }
+      try {
+        await refreshBookmarksForOwner(dialog.owner);
+      } catch (error) {
+        if (requestGeneration !== folderDialogRequestGenerationRef.current) return;
+        reportSidebarError("フォルダは作成されましたが一覧更新に失敗しました", error);
+        closeBookmarkFolderDialog();
+        return;
+      }
+      if (requestGeneration !== folderDialogRequestGenerationRef.current) return;
+      closeBookmarkFolderDialog();
+    } finally {
+      // Do not clear this in closeBookmarkFolderDialog: an owner change may
+      // close the dialog while the old API/refresh request is still settling.
+      // A newly opened dialog can submit once this request reaches finally.
+      folderDialogInFlightRef.current = false;
+      // The current dialog may have been opened after this request started.
+      // No new request can start while the lock is held, so this clears the
+      // pending state for whichever dialog is visible when the old request
+      // settles.
+      setFolderDialogPending(false);
+    }
+  }, [canUseGenericBookmarks, closeBookmarkFolderDialog, folderDialog, folderDialogName, folderDialogPending, folderDialogContextMatches, refreshBookmarksForOwner]);
+
+  useEffect(() => {
+    if (!folderDialog || (canUseGenericBookmarks && folderDialogContextMatches(folderDialog))) return;
+    reportSidebarGuard("Filesの対象が切り替わったため、フォルダ作成を中止しました");
+    closeBookmarkFolderDialog();
+  }, [canUseGenericBookmarks, closeBookmarkFolderDialog, currentBookmarkScopeIdentity, currentFolderProjectId, folderDialog, folderDialogContextMatches, ownerForFolderParent, scopeKey]);
 
   const moveBookmarkToParent = useCallback(async (bookmarkId: string, parentId: string | null) => {
     const row = allOwnedBookmarks.find((entry) => entry.item.id === bookmarkId);
@@ -1007,9 +1177,7 @@ export function FilesBookmarkLauncherSidebar() {
 
   const removeItem = useCallback(async (item: SidebarItem) => {
     try {
-      if ("tag" in item) {
-        setHydrusBookmarks(removeTagBookmark(item.tag, userId));
-      } else if (activeTab === "bookmarks") {
+      if (activeTab === "bookmarks") {
         const currentRow = currentOwnedBookmarkRow(item as ExplorerBookmark);
         if (!currentRow) {
           reportSidebarGuard("ブックマークの所有者が切り替わったため操作を中止しました");
@@ -1028,6 +1196,9 @@ export function FilesBookmarkLauncherSidebar() {
           if (!window.confirm(message)) return;
         }
         assertApiSuccess(await explorerRemoveBookmark(currentItem.path, owner), "ブックマーク削除");
+        persistedBookmarkRequestKeysRef.current.delete(
+          `${bookmarkOwnerKey(owner)}|${normalizeBookmarkPath(currentItem.path)}`,
+        );
         await refreshBookmarksForOwner(owner);
       } else if (item.id) {
         assertApiSuccess(await explorerRemoveLauncher(item.id, bookmarkScope), "ランチャー削除");
@@ -1036,15 +1207,13 @@ export function FilesBookmarkLauncherSidebar() {
     } catch (error) {
       reportSidebarError("項目の削除に失敗しました", error);
     }
-  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, ownedRowsForOwner, refreshBookmarksForOwner, reloadLaunchers, userId]);
+  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, ownedRowsForOwner, refreshBookmarksForOwner, reloadLaunchers]);
 
   const renameItem = useCallback(async (item: SidebarItem) => {
     const nextName = window.prompt("表示名を変更", itemName(item));
     if (nextName == null || !nextName.trim()) return;
     try {
-      if ("tag" in item) {
-        setHydrusBookmarks(renameTagBookmark(item.tag, nextName, userId));
-      } else if (activeTab === "bookmarks" && item.id) {
+      if (activeTab === "bookmarks" && item.id) {
         const currentRow = currentOwnedBookmarkRow(item as ExplorerBookmark);
         if (!currentRow) {
           reportSidebarGuard("ブックマークの所有者が切り替わったため操作を中止しました");
@@ -1066,13 +1235,13 @@ export function FilesBookmarkLauncherSidebar() {
     } catch (error) {
       reportSidebarError("項目名の変更に失敗しました", error);
     }
-  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, refreshBookmarksForOwner, reloadLaunchers, userId]);
+  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, refreshBookmarksForOwner, reloadLaunchers]);
 
   const reorder = useCallback(async (offset: -1 | 1) => {
     const item = visibleItems[activeIndex];
     if (!item) return;
 
-    if (activeTab === "bookmarks" && !("tag" in item) && filerTab !== "hydrus") {
+    if (activeTab === "bookmarks") {
       const bookmark = item as ExplorerBookmark;
       const owner = ownerForBookmark(bookmark);
       const parentId = bookmark.parent_id ?? null;
@@ -1115,12 +1284,9 @@ export function FilesBookmarkLauncherSidebar() {
     const reordered = [...visibleItems];
     [reordered[activeIndex], reordered[targetIndex]] = [reordered[targetIndex], reordered[activeIndex]];
     try {
-      if ("tag" in item) {
-        const next = reorderTagBookmarks(reordered.map((entry) => itemPath(entry)), userId);
-        setHydrusBookmarks(next);
-      } else if (activeTab === "launchers") {
+      if (activeTab === "launchers") {
         await Promise.all(reordered.map(async (entry, index) => {
-          if ("tag" in entry || !entry.id) return null;
+          if (!entry.id) return null;
           return assertApiSuccess(
             await explorerUpdateLauncher(entry.id, { sort_order: index }, bookmarkScope),
             "ランチャー並び替え",
@@ -1133,13 +1299,19 @@ export function FilesBookmarkLauncherSidebar() {
       return;
     }
     setActiveIndex(targetIndex);
-  }, [activeIndex, activeTab, bookmarkFlatRows, bookmarkScope, filerTab, ownerForBookmark, refreshBookmarksForOwner, reloadLaunchers, userId, visibleItems, visibleOwnedBookmarks]);
+  }, [activeIndex, activeTab, bookmarkFlatRows, bookmarkScope, ownerForBookmark, refreshBookmarksForOwner, reloadLaunchers, visibleItems, visibleOwnedBookmarks]);
 
   const runBookmark = useCallback((bookmark: ExplorerBookmark) => {
     const owner = ownerForBookmark(bookmark);
     void executeExplorerBookmark(bookmark, {
       closeEditor,
       navigate,
+      // Bookmark `icon` is user-editable presentation data.  Every leaf
+      // bookmark must go through the Files resolver so the current
+      // explorer metadata decides whether the target is a file or directory.
+      // Bookmark folders are handled above by `executeItem` and never reach
+      // this callback.
+      openTarget: requestFilesOpen,
       focusFilesRoot,
       owner,
       // Personal external bookmarks are valid local targets even while a
@@ -1172,11 +1344,6 @@ export function FilesBookmarkLauncherSidebar() {
   }, [selectProjectForPath]);
 
   const executeItem = useCallback((item: SidebarItem) => {
-    if ("tag" in item) {
-      window.dispatchEvent(new CustomEvent("hydrus-tag-bookmark-use", { detail: { tag: item.tag, userId: userId ?? null } }));
-      focusFilesRoot();
-      return;
-    }
     if (activeTab === "bookmarks") {
       const bookmark = item as ExplorerBookmark;
       if (isExplorerBookmarkFolder(bookmark)) {
@@ -1187,7 +1354,7 @@ export function FilesBookmarkLauncherSidebar() {
     } else {
       runLauncher(item as ExplorerLauncher);
     }
-  }, [activeTab, runBookmark, runLauncher, toggleFolderExpanded, userId]);
+  }, [activeTab, runBookmark, runLauncher, toggleFolderExpanded]);
 
   const handleQuickLauncherExecute = useCallback((bookmark: ExplorerBookmark) => {
     quickLauncherFocusFilesRef.current = true;
@@ -1310,20 +1477,22 @@ export function FilesBookmarkLauncherSidebar() {
   useEffect(() => {
     if (!pathnameIsFiles) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      const shortcutTarget = event.target instanceof Element ? event.target : document.activeElement;
+      if (shortcutTarget?.closest("[data-daily-capture]")) return;
       const key = event.key.toLowerCase();
       const primary = event.ctrlKey || event.metaKey;
       const inputFocused = isTextInput(event.target);
       // Ctrl+D is claimed by Files even from an editor/input so the browser's
       // Add Bookmark dialog cannot win. The current Files folder remains the
       // registration target while CodeMirror has focus.
-      if (primary && !event.shiftKey && key === "d") {
+      if (primary && !event.altKey && !event.shiftKey && !event.repeat && !event.isComposing && event.keyCode !== 229 && !event.getModifierState("AltGraph") && key === "d") {
         event.preventDefault();
         void addBookmark(currentPath);
         return;
       }
       // Ctrl+Shift+D follows the same no-browser-default rule. When an editor
       // owns focus, its path is the canonical focused-file fallback.
-      if (primary && event.shiftKey && key === "d") {
+      if (primary && !event.altKey && event.shiftKey && !event.repeat && !event.isComposing && event.keyCode !== 229 && !event.getModifierState("AltGraph") && key === "d") {
         event.preventDefault();
         if (!launcherEnabled) {
           reportSidebarGuard("このFilesタブではランチャー登録を利用できません");
@@ -1359,18 +1528,20 @@ export function FilesBookmarkLauncherSidebar() {
         if (!launcherEnabled) return;
         event.preventDefault();
         selectTab("launchers");
-      } else if (event.altKey && key === "a" && filerTab !== "hydrus") {
+      } else if (event.altKey && key === "a") {
         event.preventDefault();
         setQuickLauncherOpen(true);
       }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [addBookmark, addLauncher, browseData?.files, canUseGenericBookmarks, currentPath, editingFilePath, filerTab, focusedItemPath, incrementalSearch, launcherEnabled, pathnameIsFiles, scopeReady, scopeRoot, selectTab]);
+  }, [addBookmark, addLauncher, browseData?.files, canUseGenericBookmarks, currentPath, editingFilePath, focusedItemPath, incrementalSearch, launcherEnabled, pathnameIsFiles, scopeReady, scopeRoot, selectTab]);
 
   const handleDrop = useCallback(async (event: DragEvent<HTMLElement>, parentId?: string | null) => {
     event.preventDefault();
     event.stopPropagation();
+    setFilesDropTargetActive(false);
+    setBookmarkDropParentId(null);
     const types = event.dataTransfer.types;
     const bookmarkId = types.includes(DND_BOOKMARK_MIME)
       ? parseDroppedBookmarkId(event)
@@ -1393,16 +1564,18 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
       return;
     }
-    const directoryPaths = new Set(browseData.directories.map((entry) => entry.path));
-    const filePaths = new Set(browseData.files.map((entry) => entry.path));
-    const allDirectories = paths.every((path) => directoryPaths.has(path));
-    const allFiles = paths.every((path) => filePaths.has(path));
-    if (activeTab === "bookmarks" && allDirectories && canUseGenericBookmarks) {
+    const directoryByPath = new Map(browseData.directories.map((entry) => [entry.path, entry]));
+    const fileByPath = new Map(browseData.files.map((entry) => [entry.path, entry]));
+    const allBookmarkTargets = paths.every(
+      (path) => directoryByPath.has(path) || fileByPath.has(path),
+    );
+    const allFiles = paths.every((path) => fileByPath.has(path));
+    if (activeTab === "bookmarks" && allBookmarkTargets && canUseGenericBookmarks) {
       await Promise.all(
         paths.map((path) =>
           addBookmark(
             path,
-            browseData.directories.find((entry) => entry.path === path)?.name,
+            directoryByPath.get(path)?.name ?? fileByPath.get(path)?.name,
             parentId,
           ),
         ),
@@ -1426,7 +1599,10 @@ export function FilesBookmarkLauncherSidebar() {
 
   return (
     <aside
-      className="flex h-full min-h-0 w-full flex-col rounded-lg border border-sidebar-border bg-sidebar-accent/20 p-2"
+      className={cn(
+        "relative flex h-full min-h-0 w-full flex-col rounded-lg border border-sidebar-border bg-sidebar-accent/20 p-2",
+        filesDropTargetActive && activeTab === "bookmarks" && "border-primary bg-primary/5",
+      )}
       data-shell-region="files-bookmark-launcher-sidebar"
       data-testid="files-bookmark-launcher-sidebar"
       aria-label="Filesブックマークとランチャー"
@@ -1437,8 +1613,21 @@ export function FilesBookmarkLauncherSidebar() {
         if (!types.includes(DND_MIME) && !types.includes(DND_BOOKMARK_MIME)) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = types.includes(DND_BOOKMARK_MIME) ? "move" : "copy";
+        if (types.includes(DND_MIME) && activeTab === "bookmarks" && canUseGenericBookmarks) {
+          setFilesDropTargetActive(true);
+        }
       }}
-      onDrop={(event) => void handleDrop(event)}
+      onDragLeave={(event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+        setFilesDropTargetActive(false);
+        setBookmarkDropParentId(null);
+      }}
+      onDrop={(event) => {
+        setFilesDropTargetActive(false);
+        setBookmarkDropParentId(null);
+        void handleDrop(event);
+      }}
     >
       <DropdownMenu
         open={quickLauncherOpen}
@@ -1493,8 +1682,20 @@ export function FilesBookmarkLauncherSidebar() {
           </button>
         )}
       </div>
-      <div className="min-h-0 flex-1 overflow-auto py-2" ref={listNodeRef} role="listbox" aria-label={activeTab === "bookmarks" ? "ブックマーク一覧" : "ランチャー一覧"} onKeyDown={handleListKeyDown} onContextMenu={onSidebarBackgroundContextMenu} tabIndex={0} data-files-sidebar-list>
-        {activeTab === "bookmarks" && filerTab !== "hydrus"
+      <div
+        className={cn(
+          "relative min-h-0 flex-1 overflow-auto py-2",
+          filesDropTargetActive && activeTab === "bookmarks" && "rounded-md bg-primary/5 ring-2 ring-inset ring-primary",
+        )}
+        ref={listNodeRef}
+        role="listbox"
+        aria-label={activeTab === "bookmarks" ? "ブックマーク一覧" : "ランチャー一覧"}
+        onKeyDown={handleListKeyDown}
+        onContextMenu={onSidebarBackgroundContextMenu}
+        tabIndex={0}
+        data-files-sidebar-list
+      >
+        {activeTab === "bookmarks"
           ? bookmarkFlatRows.map((row, index) => {
             const item = row.node.item;
             const folder = isExplorerBookmarkFolder(item);
@@ -1513,6 +1714,7 @@ export function FilesBookmarkLauncherSidebar() {
                 className={cn(
                   "group flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs hover:bg-sidebar-accent",
                   index === activeIndex && "bg-sidebar-accent/70",
+                  bookmarkDropParentId === item.id && "ring-2 ring-inset ring-primary bg-primary/10",
                 )}
                 style={{ paddingLeft: `${8 + row.depth * 12}px` }}
                 onFocus={() => setActiveIndex(index)}
@@ -1529,6 +1731,12 @@ export function FilesBookmarkLauncherSidebar() {
                   event.preventDefault();
                   event.stopPropagation();
                   event.dataTransfer.dropEffect = types.includes(DND_BOOKMARK_MIME) ? "move" : "copy";
+                  setBookmarkDropParentId(item.id ?? null);
+                }}
+                onDragLeave={(event) => {
+                  const nextTarget = event.relatedTarget;
+                  if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+                  setBookmarkDropParentId(null);
                 }}
                 onDrop={(event) => {
                   if (!folder || !item.id) return;
@@ -1543,7 +1751,9 @@ export function FilesBookmarkLauncherSidebar() {
                 ) : null}
                 {folder
                   ? <Folder className="size-3.5 shrink-0 text-amber-500" />
-                  : <Folder className="size-3.5 shrink-0 text-yellow-500" />}
+                  : item.icon === "📄"
+                    ? <FileIcon className="size-3.5 shrink-0 text-blue-400" />
+                    : <Folder className="size-3.5 shrink-0 text-yellow-500" />}
                 <span className="min-w-0 flex-1 truncate">{itemName(item)}</span>
                 {index === activeIndex && <span className="sr-only">選択中</span>}
               </button>
@@ -1563,19 +1773,28 @@ export function FilesBookmarkLauncherSidebar() {
               onContextMenu={(event) => onItemContextMenu(event, item)}
               title={itemPath(item)}
             >
-              {"tag" in item ? <Bookmark className="size-3.5 shrink-0 text-amber-400" /> : activeTab === "bookmarks" ? <Folder className="size-3.5 shrink-0 text-yellow-500" /> : <FileIcon className="size-3.5 shrink-0 text-blue-400" />}
+              <FileIcon className="size-3.5 shrink-0 text-blue-400" />
               <span className="min-w-0 flex-1 truncate">{itemName(item)}</span>
               {index === activeIndex && <span className="sr-only">選択中</span>}
             </button>
           ))}
         {visibleItems.length === 0 && <p className="px-2 py-4 text-center text-xs text-sidebar-foreground/55">{activeTab === "bookmarks" ? "ブックマークはありません" : "ランチャーはありません"}</p>}
+        {filesDropTargetActive && activeTab === "bookmarks" && (
+          <div
+            className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-md border-2 border-dashed border-primary bg-background/90 px-3 text-center text-sm font-medium text-primary shadow-sm"
+            data-testid="files-bookmark-drop-target"
+            role="status"
+          >
+            フォルダーやファイルをドロップしてお気に入りに追加
+          </div>
+        )}
       </div>
       <div className="flex items-center justify-end gap-0.5 border-t border-sidebar-border pt-1" aria-label="並び替え">
-        {activeTab === "bookmarks" && filerTab !== "hydrus" && canUseGenericBookmarks && (
+        {activeTab === "bookmarks" && canUseGenericBookmarks && (
           <button
             type="button"
             className="mr-auto flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-sidebar-foreground/70 hover:bg-sidebar-accent"
-            onClick={() => void createBookmarkFolder(null)}
+            onClick={() => openBookmarkFolderDialog(null)}
             title="フォルダを作成"
             aria-label="フォルダを作成"
           >
@@ -1587,6 +1806,61 @@ export function FilesBookmarkLauncherSidebar() {
         <button type="button" className="rounded p-1 text-sidebar-foreground/60 hover:bg-sidebar-accent disabled:opacity-30" disabled={activeIndex >= visibleItems.length - 1} onClick={() => void reorder(1)} title="下へ"><ChevronDown className="size-3.5" /></button>
         <span className="ml-1 text-[10px] text-sidebar-foreground/45">↑↓で並び替え</span>
       </div>
+      <Dialog
+        open={folderDialog !== null}
+        onOpenChange={(open) => {
+          if (!open && !folderDialogInFlightRef.current) closeBookmarkFolderDialog();
+        }}
+      >
+        <DialogContent data-testid="files-bookmark-folder-dialog">
+          <DialogHeader>
+            <DialogTitle>ブックマークフォルダを作成</DialogTitle>
+            <DialogDescription>Filesのブックマーク整理用フォルダを作成します。</DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitBookmarkFolder();
+            }}
+            className="space-y-4"
+          >
+            <div className="space-y-1.5">
+              <label htmlFor="files-bookmark-folder-name" className="text-sm font-medium">フォルダ名</label>
+              <Input
+                id="files-bookmark-folder-name"
+                aria-label="フォルダ名"
+                value={folderDialogName}
+                onChange={(event) => {
+                  setFolderDialogName(event.target.value);
+                  if (folderDialogError) setFolderDialogError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    if (!folderDialogInFlightRef.current) closeBookmarkFolderDialog();
+                    return;
+                  }
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                    void submitBookmarkFolder();
+                  }
+                }}
+                aria-invalid={folderDialogError ? "true" : undefined}
+                autoFocus
+                disabled={folderDialogPending}
+              />
+              {folderDialogError && (
+                <p role="alert" className="text-xs text-destructive">{folderDialogError}</p>
+              )}
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={closeBookmarkFolderDialog} disabled={folderDialogPending}>キャンセル</Button>
+              <Button type="submit" disabled={folderDialogPending}>{folderDialogPending ? "作成中…" : "作成"}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
       {contextMenu && (
         <div
           ref={contextMenuRef}
@@ -1606,15 +1880,15 @@ export function FilesBookmarkLauncherSidebar() {
             setContextMenu(null);
           }}
         >
-          {activeTab === "bookmarks" && filerTab !== "hydrus" && canUseGenericBookmarks && (
+          {activeTab === "bookmarks" && canUseGenericBookmarks && (
             <button
               type="button"
               className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent"
               onClick={() => {
-                const parentId = contextMenu.item && !("tag" in contextMenu.item) && isExplorerBookmarkFolder(contextMenu.item as ExplorerBookmark)
+                const parentId = contextMenu.item && isExplorerBookmarkFolder(contextMenu.item as ExplorerBookmark)
                   ? contextMenu.item.id ?? null
                   : null;
-                void createBookmarkFolder(parentId);
+                openBookmarkFolderDialog(parentId);
                 setContextMenu(null);
               }}
             >

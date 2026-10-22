@@ -7,8 +7,9 @@ server.py から移設。ロジックは一切変更していない。
 from ..server_shared import *  # noqa: F401,F403
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager, nullcontext
-from typing import Iterable
-from uuid import NAMESPACE_URL, uuid5
+import threading
+from typing import Iterable, Mapping
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.llm.generation_error import DEFAULT_GENERATION_FAILURE_MESSAGE
 from src.llm.generation_cancellation import (
@@ -36,6 +37,12 @@ from ...services.turn_context import (
 # inside the server can opt into the pre-authentication legacy compatibility
 # path by passing this marker explicitly.
 TRUSTED_LEGACY_MARKER = object()
+
+# A typed human-answer projection is also an internal server capability.  The
+# durable callback hydrator proves the input/message/run/session binding before
+# the dispatch queue installs this marker.  A JSON/WebSocket payload can carry
+# the same field names, but it cannot manufacture this object identity.
+TRUSTED_TYPED_RESUME_MARKER = object()
 
 _CONVERSATION_DISPATCH_RECOVERY_INTERVAL_SECONDS = 5.0
 _CONVERSATION_DISPATCH_RECOVERY_MAX_RETRY_INTERVAL_SECONDS = 60.0
@@ -86,6 +93,26 @@ def _is_transient_conversation_dispatch_error(error: BaseException) -> bool:
         ):
             return True
     return False
+
+
+def _agent_route_failure_code(error: BaseException) -> str | None:
+    """Return a bounded permanent Agent route code from an exception chain."""
+
+    try:
+        from ...services.agent_model_routing import AgentModelRouteError
+    except ImportError:  # pragma: no cover - routing is a backend dependency
+        return None
+    for current in _exception_chain(error):
+        if not isinstance(current, AgentModelRouteError):
+            continue
+        code = str(getattr(current, "code", "") or "").strip().casefold()
+        if (
+            code.startswith("agent_route_")
+            and len(code) <= 96
+            and all(character.isalnum() or character == "_" for character in code)
+        ):
+            return code
+    return None
 
 
 class ConversationMixin:
@@ -288,51 +315,110 @@ class ConversationMixin:
         """Queue one claimed outbox row and settle its lease exactly once."""
         agent_run_id = str(agent_run["id"])
         lease_token = str(delivery["lease_token"])
-        settlement_lock = asyncio.Lock()
-        settlement = {"settled": False}
+        settlement_guard = threading.Lock()
+        settlement = {
+            "settled": False,
+            "in_flight": False,
+            "callback_in_flight": False,
+        }
+        lifecycle: dict[str, Any] = {}
+
+        def claim_settlement() -> str:
+            with settlement_guard:
+                if settlement["settled"]:
+                    return "settled"
+                if settlement["in_flight"]:
+                    return "in_flight"
+                settlement["in_flight"] = True
+                return "claimed"
+
+        def finish_settlement(success: bool) -> None:
+            with settlement_guard:
+                settlement["in_flight"] = False
+                if success:
+                    settlement["settled"] = True
+
+        def settlement_is_done() -> bool:
+            with settlement_guard:
+                return bool(settlement["settled"])
+
+        def settlement_is_in_flight() -> bool:
+            with settlement_guard:
+                return bool(
+                    settlement["in_flight"]
+                    or settlement.get("callback_in_flight")
+                )
 
         async def mark_terminal_delivery() -> bool:
-            async with settlement_lock:
-                if settlement["settled"]:
-                    return True
+            claim = claim_settlement()
+            if claim == "settled":
+                return True
+            if claim == "in_flight":
+                return False
+            try:
                 marked = await agent_run_service.mark_dispatch_delivered(
                     run_id=agent_run_id,
                     lease_token=lease_token,
                 )
-                if marked:
-                    settlement["settled"] = True
+                finish_settlement(bool(marked))
                 return bool(marked)
+            except Exception:
+                finish_settlement(False)
+                raise
 
         async def release_failed_handoff() -> bool:
-            async with settlement_lock:
-                if settlement["settled"]:
-                    return True
+            claim = claim_settlement()
+            if claim == "settled":
+                return True
+            if claim == "in_flight":
+                return False
+            try:
                 released = await agent_run_service.release_dispatch_delivery(
                     run_id=agent_run_id,
                     lease_token=lease_token,
                 )
-                if released:
-                    settlement["settled"] = True
+                finish_settlement(bool(released))
                 return bool(released)
+            except Exception:
+                finish_settlement(False)
+                raise
 
         async def fail_terminal_delivery(error: str) -> bool:
-            async with settlement_lock:
-                if settlement["settled"]:
-                    return True
-                await agent_run_service.fail_run(agent_run_id, error)
+            claim = claim_settlement()
+            if claim == "settled":
+                return True
+            if claim == "in_flight":
+                return False
+            try:
+                failure_result = {"source": "dispatch_callback_failure"}
+                safe_error_code = lifecycle.get("_safe_error_code")
+                if isinstance(safe_error_code, str) and safe_error_code:
+                    failure_result["safe_error_code"] = safe_error_code
+                    await agent_run_service.fail_run(
+                        agent_run_id,
+                        error,
+                        result=failure_result,
+                    )
+                else:
+                    await agent_run_service.fail_run(agent_run_id, error)
                 marked = await agent_run_service.mark_dispatch_delivered(
                     run_id=agent_run_id,
                     lease_token=lease_token,
                 )
-                if marked:
-                    settlement["settled"] = True
+                finish_settlement(bool(marked))
                 return bool(marked)
+            except Exception:
+                finish_settlement(False)
+                raise
 
         async def succeed_terminal_delivery(message: str) -> bool:
             """Complete a handled dispatch before closing its outbox lease."""
-            async with settlement_lock:
-                if settlement["settled"]:
-                    return True
+            claim = claim_settlement()
+            if claim == "settled":
+                return True
+            if claim == "in_flight":
+                return False
+            try:
                 completed = await agent_run_service.complete_run(
                     agent_run_id,
                     message=message,
@@ -344,28 +430,48 @@ class ConversationMixin:
                     run_id=agent_run_id,
                     lease_token=lease_token,
                 )
-                if marked:
-                    settlement["settled"] = True
+                finish_settlement(bool(marked))
                 return bool(marked)
+            except Exception:
+                finish_settlement(False)
+                raise
 
         async def cancel_terminal_delivery() -> bool:
-            async with settlement_lock:
-                if settlement["settled"]:
-                    return True
-                await agent_run_service.cancel_run(
-                    agent_run_id,
-                    message="Conversation generation stopped by user",
-                )
+            claim = claim_settlement()
+            if claim == "settled":
+                return True
+            if claim == "in_flight":
+                return False
+            try:
+                try:
+                    cancelled_run = await agent_run_service.cancel_run(
+                        agent_run_id,
+                        message="Conversation generation stopped by user",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist cancelled dispatch Run: %s",
+                        agent_run_id,
+                    )
+                    finish_settlement(False)
+                    return False
+                if not isinstance(cancelled_run, Mapping) or str(
+                    cancelled_run.get("status") or ""
+                ).casefold() != "cancelled":
+                    finish_settlement(False)
+                    return False
                 marked = await agent_run_service.mark_dispatch_delivered(
                     run_id=agent_run_id,
                     lease_token=lease_token,
                 )
-                if marked:
-                    settlement["settled"] = True
+                finish_settlement(bool(marked))
                 return bool(marked)
+            except Exception:
+                finish_settlement(False)
+                raise
 
         async def renew_active_delivery() -> bool:
-            if settlement["settled"]:
+            if settlement_is_done():
                 return False
             return await agent_run_service.renew_dispatch_delivery(
                 run_id=agent_run_id,
@@ -383,6 +489,55 @@ class ConversationMixin:
             return True
 
         queued_payload = dict(delivery["payload"])
+        hydrate_dialogue_payload = getattr(
+            agent_run_service,
+            "hydrate_agent_dialogue_callback_payload",
+            None,
+        )
+        dialogue_payload_hydrated = False
+        if queued_payload.get("_dialogue_transport") and callable(
+            hydrate_dialogue_payload
+        ):
+            queued_payload = await hydrate_dialogue_payload(
+                run_id=agent_run_id,
+                payload=queued_payload,
+                lease_proof=delivery,
+            )
+            dialogue_payload_hydrated = True
+        hydrate_human_payload = getattr(
+            agent_run_service,
+            "hydrate_agent_dialogue_human_input_payload",
+            None,
+        )
+        human_marker = queued_payload.get("agent_dialogue")
+        if (
+            callable(hydrate_human_payload)
+            and (
+                queued_payload.get("_dialogue_human_input")
+                or queued_payload.get("_dialogue_human_control")
+                or (
+                    isinstance(human_marker, Mapping)
+                    and human_marker.get("root_control_turn") is True
+                )
+            )
+        ):
+            queued_payload = await hydrate_human_payload(
+                run_id=agent_run_id,
+                payload=queued_payload,
+                lease_proof=delivery,
+            )
+            dialogue_payload_hydrated = True
+        # Typed resume fields are meaningful only after the durable dialogue
+        # callback has re-proved their immutable input/message/run binding.
+        # Keep the marker in process memory so a client-supplied JSON boolean
+        # cannot grant the prompt projection or authority of a stored answer.
+        if (
+            dialogue_payload_hydrated
+            and queued_payload.get("typed_resume_answer") is True
+            and isinstance(queued_payload.get("typed_resume_answer_body"), str)
+            and queued_payload.get("typed_resume_answer_id")
+        ):
+            queued_payload["_trusted_typed_resume"] = TRUSTED_TYPED_RESUME_MARKER
         for principal_key in (
             "_sender_user_id",
             "_sender_is_admin",
@@ -434,19 +589,23 @@ class ConversationMixin:
                 recovered_role == "admin"
             )
         queued_payload["_response_started_at_monotonic"] = time.monotonic()
-        lifecycle = {
-            "agent_run_id": agent_run_id,
-            "terminal": mark_terminal_delivery,
-            "terminal_success": succeed_terminal_delivery,
-            "terminal_failure": fail_terminal_delivery,
-            "cancelled": cancel_terminal_delivery,
-            "failure": release_failed_handoff,
-            "heartbeat": renew_active_delivery,
-            "heartbeat_seconds": 20.0,
-            "handed_off": False,
-            "explicit_stop": False,
-            "settlement": settlement,
-        }
+        lifecycle.update(
+            {
+                "agent_run_id": agent_run_id,
+                "terminal": mark_terminal_delivery,
+                "terminal_success": succeed_terminal_delivery,
+                "terminal_failure": fail_terminal_delivery,
+                "cancelled": cancel_terminal_delivery,
+                "failure": release_failed_handoff,
+                "heartbeat": renew_active_delivery,
+                "heartbeat_seconds": 20.0,
+                "handed_off": False,
+                "explicit_stop": False,
+                "settlement": settlement,
+                "_settlement_state": settlement,
+                "_settlement_guard": settlement_guard,
+            }
+        )
         queued_payload["_dispatch_delivery_lifecycle"] = lifecycle
         try:
             accepted = self._queue_user_message(queued_payload)
@@ -458,12 +617,231 @@ class ConversationMixin:
             return False
         return True
 
+    def _agent_dialogue_transport_service(self):
+        """Resolve the narrow provider-free dialogue transport seam lazily."""
+
+        service = getattr(self, "_agent_dialogue_transport_service_instance", None)
+        if service is not None:
+            return service
+        factory = getattr(self, "_agent_dialogue_transport_service_factory", None)
+        if callable(factory):
+            service = factory()
+        else:
+            from ...services.agent_dialogue_transport import AgentDialogueTransport
+            bridge = getattr(self, "_agent_dialogue_dispatch_bridge", None)
+            if bridge is None:
+                bridge_factory = getattr(self, "_conversation_dispatch_service_factory", None)
+                if callable(bridge_factory):
+                    bridge = bridge_factory()
+            if bridge is None:
+                # AgentRunService is the canonical bridge implementation. It
+                # receives the recovery session explicitly at handoff; this
+                # construction only binds the method contract and performs no
+                # database work.
+                from ...services.agent_run_service import AgentRunService
+
+                bridge = AgentRunService(
+                    getattr(self, "_db_manager", None),
+                    config=getattr(self, "config", None),
+                )
+
+            service = AgentDialogueTransport(
+                getattr(self, "_db_manager", None),
+                dispatch_bridge=bridge,
+            )
+        self._agent_dialogue_transport_service_instance = service
+        return service
+
+    async def _recover_agent_dialogue_transports_once(self, *, limit: int = 16) -> int:
+        """Handoff due AgentDialogue Work through the existing recovery tick."""
+
+        try:
+            service = self._agent_dialogue_transport_service()
+            coordinator = getattr(service, "coordinator", None)
+            claim_transport = getattr(coordinator, "claim_transport", None)
+            handoff = getattr(service, "handoff", None)
+            if not callable(claim_transport) or not callable(handoff):
+                return 0
+            claims = await claim_transport(limit=max(1, min(int(limit), 64)))
+        except Exception as exc:
+            # Rolling deployments can start before the dialogue migration is
+            # present. Preserve normal ConversationDispatch recovery and let a
+            # later tick retry the typed lane.
+            lowered = str(exc).casefold()
+            if "no such table" in lowered or "does not exist" in lowered:
+                logger.debug("AgentDialogue transport schema is not installed yet")
+                return 0
+            if _is_transient_conversation_dispatch_error(exc):
+                raise
+            logger.debug("AgentDialogue transport recovery is unavailable", exc_info=True)
+            return 0
+        recovered = 0
+        for claim in claims:
+            try:
+                await handoff(claim)
+                recovered += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                code = str(getattr(exc, "code", "") or "").casefold()
+                if code.endswith("conflict") or code.endswith("invalid") or code in {
+                    "dialogue_not_active",
+                    "dialogue_deadline_expired",
+                    "source_provenance_conflict",
+                    "control_revision_conflict",
+                }:
+                    settle = getattr(coordinator, "settle_transport", None)
+                    if callable(settle):
+                        try:
+                            from ...services.agent_work_runtime import ExecutionOutcome
+
+                            await settle(
+                                claim,
+                                ExecutionOutcome(
+                                    classification="permanent",
+                                    error_code=code or "dialogue_transport_rejected",
+                                    error_message="dialogue transport admission was rejected",
+                                ),
+                                source_ok=True,
+                            )
+                            continue
+                        except Exception:
+                            logger.debug("Failed to settle rejected dialogue transport", exc_info=True)
+                release = getattr(coordinator, "release_transport", None)
+                if callable(release):
+                    try:
+                        await release(claim)
+                    except Exception:
+                        logger.debug("Failed to release dialogue transport claim", exc_info=True)
+                if _is_transient_conversation_dispatch_error(exc):
+                    raise
+                logger.warning("AgentDialogue transport handoff deferred", exc_info=True)
+        reconcile_receipts = getattr(service, "reconcile_terminal_receipts", None)
+        if callable(reconcile_receipts):
+            try:
+                recovered += int(await reconcile_receipts(limit=max(1, min(int(limit), 64))))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if _is_transient_conversation_dispatch_error(exc):
+                    raise
+                logger.debug("AgentDialogue terminal receipt recovery unavailable", exc_info=True)
+        return recovered
+
+    async def _record_agent_dialogue_terminal_callback(self, data: Mapping[str, Any]) -> None:
+        """Publish one typed worker receipt after ordinary Chat callback work."""
+
+        marker = data.get("agent_dialogue") if isinstance(data, Mapping) else None
+        if not isinstance(marker, Mapping) and not data.get("_dialogue_transport"):
+            return
+        marker_role = str((marker or {}).get("role") or "").strip().casefold()
+        marker_kind = str((marker or {}).get("delivery_kind") or "").strip().casefold()
+        if marker_role != "worker" and not (
+            marker_role == "root" and marker_kind == "response"
+        ):
+            # Worker turns emit the normal return receipt. A Root receiver
+            # emits an ACK only for a response Delivery; Root requests/events
+            # must never re-enter the worker return lane.
+            return
+        try:
+            service = self._agent_dialogue_transport_service()
+            callback = getattr(service, "record_worker_terminal", None)
+            if callable(callback):
+                await callback(
+                    run_id=str(data.get("agent_run_id") or "").strip() or None,
+                    delivery_id=str(
+                        (marker or {}).get("delivery_id")
+                        or (marker or {}).get("agent_dialogue_delivery_id")
+                        or data.get("delivery_id")
+                        or ""
+                    ).strip()
+                    or None,
+                    data=data,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Failed to record AgentDialogue terminal receipt", exc_info=True)
+
+    async def _prepare_recovered_project_hint(self, data: dict[str, Any]) -> None:
+        """Validate a REST/dispatch Project hint without scoping the root Chat.
+
+        AoiDots root sessions stay projectless.  The hint is a read-ACL-bound
+        advisory carried by the recovered turn; it must never flow through the
+        ordinary project attach path or mutate ``ConversationSession.project_id``.
+        The direct WebSocket path is handled at its own request boundary.
+        """
+
+        raw_hint = data.get("context_project_hint_id")
+        if raw_hint in (None, ""):
+            return
+        if data.get("project_id") not in (None, ""):
+            raise ValueError("context_project_hint_id cannot be combined with project_id")
+        marker = data.get("agent_dialogue")
+        marker = marker if isinstance(marker, Mapping) else {}
+        receiver_session_id = str(
+            marker.get("receiver_session_id")
+            or marker.get("root_session_id")
+            or ""
+        ).strip()
+        session_id = receiver_session_id or str(data.get("session_id") or "").strip()
+        claimed_session_id = str(data.get("session_id") or "").strip()
+        marker_role = str(marker.get("role") or "").strip().casefold()
+        transport_marker = data.get("_dialogue_transport") is True
+        if transport_marker and marker_role in {"root", "worker"} and not receiver_session_id:
+            raise PermissionError("Recovered dialogue receiver session is missing")
+        if receiver_session_id and claimed_session_id != receiver_session_id:
+            raise PermissionError("Recovered dialogue receiver session mismatch")
+        if marker_role == "root" and marker.get("root_session_id") not in (None, ""):
+            expected_root_session = receiver_session_id or claimed_session_id
+            if str(marker.get("root_session_id")) != expected_root_session:
+                raise PermissionError("Recovered Root receiver session mismatch")
+        sender_user_id = str(data.get("_sender_user_id") or "").strip()
+        if not session_id or not sender_user_id or sender_user_id == "default_user":
+            raise PermissionError("Authenticated user identity is required for project hint")
+        try:
+            session_uuid = UUID(session_id)
+            hint_uuid = UUID(str(raw_hint))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid context_project_hint_id") from exc
+        manager = getattr(self, "_db_manager", None)
+        if manager is None:
+            from ...memory.database import get_database_manager
+
+            manager = get_database_manager()
+        session_value = manager.get_session()
+        db_session = await session_value if hasattr(session_value, "__await__") else session_value
+        try:
+            from ...memory.models import ConversationSession
+
+            root = await db_session.get(ConversationSession, session_uuid)
+            if root is None or root.deleted_at is not None:
+                raise ValueError("Conversation session not found")
+            if str(root.user_id) != sender_user_id:
+                raise PermissionError("Conversation session owner mismatch")
+            if root.project_id is not None:
+                raise ValueError("AoiDots root session must remain projectless")
+        finally:
+            await db_session.close()
+        await self._assert_project_read_access_for_turn(
+            hint_uuid,
+            user_id=sender_user_id,
+            user_role=("admin" if data.get("_sender_is_admin") is True else "user"),
+        )
+        data["project_id"] = None
+        data["_context_project_hint_advisory"] = {
+            "project_id": str(hint_uuid),
+            "root_session_id": str(session_uuid),
+            "validated": True,
+        }
+
     async def _recover_conversation_dispatches_once(
         self,
         agent_run_service=None,
     ) -> int:
+        recovered = await self._recover_agent_dialogue_transports_once()
         if not self.on_user_input:
-            return 0
+            return recovered
         if agent_run_service is None:
             from ...services.agent_run_service import AgentRunService
 
@@ -478,7 +856,6 @@ class ConversationMixin:
                 )
             else:
                 agent_run_service = service_factory()
-        recovered = 0
         purge_delivered = getattr(
             agent_run_service,
             "purge_delivered_dispatches",
@@ -645,6 +1022,52 @@ class ConversationMixin:
         task.add_done_callback(cleanup)
         return True
 
+    async def _active_private_root_for_session(self, session_id: str):
+        """Resolve the canonical active AoiDots root for one session."""
+
+        manager = getattr(self, "_db_manager", None)
+        if manager is None:
+            from ...memory.database import get_database_manager
+
+            manager = get_database_manager()
+        session_value = manager.get_session()
+        db_session = await session_value if hasattr(session_value, "__await__") else session_value
+        try:
+            from ...memory.models import AgentPrivateRoot, ConversationSession
+            from sqlalchemy import select
+
+            if not callable(getattr(db_session, "execute", None)):
+                return None
+            try:
+                session_uuid = UUID(str(session_id))
+            except (TypeError, ValueError):
+                return None
+            if not callable(getattr(db_session, "get", None)):
+                return None
+            try:
+                result = await db_session.execute(
+                    select(AgentPrivateRoot)
+                    .where(
+                        AgentPrivateRoot.session_id == session_uuid,
+                        AgentPrivateRoot.purpose == "aoidots",
+                        AgentPrivateRoot.state == "active",
+                    )
+                    .limit(1)
+                )
+            except Exception as exc:
+                lowered = str(exc).casefold()
+                if "no such table" in lowered or "does not exist" in lowered:
+                    return None
+                raise
+            root = result.scalars().first()
+            if root is not None:
+                conversation = await db_session.get(ConversationSession, session_uuid)
+                if conversation is not None and conversation.project_id is not None:
+                    raise ValueError("AoiDots root session must remain projectless")
+            return root
+        finally:
+            await db_session.close()
+
     async def _attach_project_to_conversation_if_missing(
         self,
         session_id: Optional[str],
@@ -688,6 +1111,16 @@ class ConversationMixin:
                 user_role=user_role,
             )
             return str(parsed_project_id)
+        private_root = await self._active_private_root_for_session(session_id)
+        if private_root is not None:
+            if user_id not in (None, "default_user") and str(private_root.owner_user_id) != str(user_id):
+                raise PermissionError("AoiDots root owner mismatch")
+            if project_id:
+                raise ValueError("AoiDots root session must remain projectless")
+            # A private root can carry only an advisory hint. Returning None
+            # prevents legacy callers from auto-attaching a Project.
+            return None
+
         parsed_project_id = None
         if project_id:
             try:
@@ -727,10 +1160,20 @@ class ConversationMixin:
                 )
 
             if conversation and parsed_project_id and existing_project_id is None:
-                attached = await self._atomically_attach_project_to_conversation(
-                    session_id,
-                    parsed_project_id,
-                )
+                atomic_attach = self._atomically_attach_project_to_conversation
+                try:
+                    attached = await atomic_attach(
+                        session_id,
+                        parsed_project_id,
+                        actor_user_id=user_id,
+                        actor_role=user_role,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc):
+                        raise
+                    # Preserve lightweight test/embedding overrides that
+                    # implement the historical two-argument seam.
+                    attached = await atomic_attach(session_id, parsed_project_id)
                 if not attached:
                     current = await repository.get_session_by_id(
                         session_id, with_messages=False
@@ -841,9 +1284,18 @@ class ConversationMixin:
         self,
         session_id: str,
         project_id: UUID,
+        *,
+        actor_user_id: Optional[str] = None,
+        actor_role: Optional[str] = None,
     ) -> bool:
-        """Attach a project only while the conversation is still unscoped."""
-        from sqlalchemy import and_, update
+        """Attach an explicit Project under the same child-dialogue fence.
+
+        A private AoiDots root is rejected before this mutation.  For an
+        ordinary worker session, an authenticated actor and the session row
+        are passed to the lifecycle helper in this transaction so pending
+        child inputs/deliveries are fenced before commit.
+        """
+        from sqlalchemy import and_, select, update
 
         from ...memory.database import get_database_manager
         from ...memory.models import ConversationSession
@@ -851,6 +1303,28 @@ class ConversationMixin:
         db_session = None
         try:
             db_session = await get_database_manager().get_session()
+            from ...memory.models import AgentPrivateRoot
+
+            try:
+                session_uuid = UUID(str(session_id))
+            except (TypeError, ValueError):
+                session_uuid = None
+            if session_uuid is not None:
+                root_result = await db_session.execute(
+                    select(AgentPrivateRoot)
+                    .where(
+                        AgentPrivateRoot.session_id == session_uuid,
+                        AgentPrivateRoot.purpose == "aoidots",
+                        AgentPrivateRoot.state == "active",
+                    )
+                    .with_for_update()
+                )
+                root_scalars = getattr(root_result, "scalars", None)
+                if callable(root_scalars) and root_scalars().first() is not None:
+                    raise ValueError("AoiDots root session must remain projectless")
+            conversation_row = None
+            if session_uuid is not None and callable(getattr(db_session, "get", None)):
+                conversation_row = await db_session.get(ConversationSession, session_uuid)
             result = await db_session.execute(
                 update(ConversationSession)
                 .where(
@@ -862,6 +1336,27 @@ class ConversationMixin:
                 )
                 .values(project_id=project_id)
             )
+            if (
+                int(getattr(result, "rowcount", 0) or 0) == 1
+                and conversation_row is not None
+                and actor_user_id
+            ):
+                from ...services.agent_root_lifecycle import (
+                    fence_child_dialogues_for_binding_change,
+                )
+
+                await fence_child_dialogues_for_binding_change(
+                    db_session,
+                    conversation_row,
+                    actor_user_id=actor_user_id,
+                    current_binding={
+                        "project_id": str(project_id),
+                        "agent_id": str(getattr(conversation_row, "agent_id", "") or "") or None,
+                        "character_name": getattr(conversation_row, "character_name", None),
+                    },
+                    project_id=project_id,
+                    character_name=getattr(conversation_row, "character_name", None),
+                )
             await db_session.commit()
             return bool(getattr(result, "rowcount", 0))
         except Exception:
@@ -900,9 +1395,22 @@ class ConversationMixin:
         conversation = await repository.get_session_by_id(session_id, with_messages=False)
         if conversation is None:
             raise ValueError("Conversation session not found")
+        private_root = await self._active_private_root_for_session(session_id)
+        if private_root is not None and (
+            getattr(conversation, "app_id", None) is not None
+            or getattr(conversation, "app_target_id", None) is not None
+            or app_id not in (None, "")
+            or app_target_id not in (None, "")
+        ):
+            raise ValueError("AoiDots root App binding must remain empty")
         if not app_id:
             if app_target_id:
                 raise ValueError("app_target_id には app_id が必要です")
+            if getattr(conversation, "app_id", None) is None and getattr(conversation, "app_target_id", None) is None:
+                # Normal dispatch payloads include app_id/app_target_id keys
+                # with null values. Avoid a structural UPDATE for an already
+                # empty context (especially on the private root).
+                return
             await repository.update_session(
                 session_id,
                 touch_activity=False,
@@ -957,6 +1465,14 @@ class ConversationMixin:
                     raise ValueError("App Target not found")
         finally:
             await db_session.close()
+        if (
+            getattr(conversation, "app_id", None) == app_uuid
+            and getattr(conversation, "app_target_id", None) == target_uuid
+        ):
+            # Permission and target validation above still ran; the durable
+            # session mutation is a no-op when the requested context is
+            # already exactly bound.
+            return
         await repository.update_session(
             session_id,
             touch_activity=False,
@@ -969,6 +1485,7 @@ class ConversationMixin:
         lifecycle = lifecycle if isinstance(lifecycle, dict) else None
         try:
             await self._set_dispatch_user_context(data)
+            await self._prepare_recovered_project_hint(data)
             # Re-establish the native capability only after the durable
             # authenticated principal above has been resolved.  The helper
             # no-ops for Personal/non-Windows/disabled/unmapped dispatches;
@@ -978,11 +1495,26 @@ class ConversationMixin:
                 data
             ):
                 await self._handle_user_message(data)
+                await self._record_agent_dialogue_terminal_callback(data)
         except BaseException as exc:
+            route_failure_code = _agent_route_failure_code(exc)
+            if lifecycle and route_failure_code:
+                lifecycle["_safe_error_code"] = route_failure_code
+            # The ordinary callback may already have marked the child Run as
+            # failed (for example a typed input question).  Let the dialogue
+            # transport reconcile that exact terminal Run once; it does not
+            # emit a second generic failure notification.
+            try:
+                await self._record_agent_dialogue_terminal_callback(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("AgentDialogue failure receipt callback deferred", exc_info=True)
             if lifecycle and not lifecycle.get("handed_off"):
                 failure_name = (
                     "terminal_failure"
-                    if isinstance(exc, (PermissionError, ValueError))
+                    if route_failure_code
+                    or isinstance(exc, (PermissionError, ValueError))
                     else "failure"
                 )
                 failure = lifecycle.get(failure_name)
@@ -1375,6 +1907,8 @@ class ConversationMixin:
         edit_message_id: Optional[str],
         response_model: Optional[Dict[str, str]],
         client_message_id: Optional[str],
+        expected_agent_id: Optional[str] = None,
+        expected_agent_provided: bool = False,
         attachments: List[Dict[str, Any]],
         attachment_context: Optional[str],
         media_recognition_metadata: Optional[List[Dict[str, Any]]] = None,
@@ -1398,6 +1932,10 @@ class ConversationMixin:
         verified_project_attachment: bool = False,
         suppress_automatic_context: bool = False,
         strict_project_scope: bool = False,
+        context_project_hint_id: Optional[str] = None,
+        typed_resume_answer: bool = False,
+        typed_resume_answer_body: Optional[str] = None,
+        typed_resume_answer_id: Optional[str] = None,
     ) -> None:
         # Materialize once before creating the async callback.  The dispatch
         # path normally supplies an immutable tuple, but accepting any
@@ -1427,6 +1965,8 @@ class ConversationMixin:
                 "edit_message_id": edit_message_id,
                 "response_model": response_model,
                 "client_message_id": client_message_id,
+                "expected_agent_id": expected_agent_id,
+                "expected_agent_provided": expected_agent_provided,
                 "attachments": attachments,
                 "attachment_context": attachment_context,
                 "media_recognition_metadata": media_recognition_metadata,
@@ -1442,6 +1982,10 @@ class ConversationMixin:
                 "command_capabilities": command_capabilities,
                 "tools_required": tools_required,
             }
+            if context_project_hint_id:
+                callback_kwargs["context_project_hint_id"] = str(
+                    context_project_hint_id
+                )
             if cloud_advisor_origin is not None:
                 callback_kwargs["cloud_advisor_origin"] = cloud_advisor_origin
             if cloud_advisor_assessment is not None:
@@ -1472,6 +2016,15 @@ class ConversationMixin:
                 callback_kwargs["suppress_automatic_context"] = True
             if strict_project_scope:
                 callback_kwargs["strict_project_scope"] = True
+            if typed_resume_answer:
+                callback_kwargs["typed_resume_answer"] = True
+                callback_kwargs["typed_resume_answer_body"] = str(
+                    typed_resume_answer_body or ""
+                )
+                if typed_resume_answer_id:
+                    callback_kwargs["typed_resume_answer_id"] = str(
+                        typed_resume_answer_id
+                    )
             return self.on_user_input(message, **callback_kwargs)
 
         cancellation_handle = register_generation_cancellation(agent_run_id)
@@ -1486,6 +2039,7 @@ class ConversationMixin:
                 or normalized_explicit_references
                 or cloud_advisor_origin is not None
                 or cloud_advisor_assessment is not None
+                or context_project_hint_id is not None
             ):
                 current_turn = get_turn_context()
                 callback_turn_context_token = set_turn_context(
@@ -1525,6 +2079,10 @@ class ConversationMixin:
                     # before TerminalMode binds its own context.
                     suppress_automatic_context=bool(suppress_automatic_context),
                     strict_project_scope=bool(strict_project_scope),
+                    context_project_hint_id=(
+                        context_project_hint_id
+                        or current_turn.context_project_hint_id
+                    ),
                 )
             # Give an immediately-following stop request a chance to cancel the
             # dispatch before user input enters the generation pipeline.  This
@@ -1568,17 +2126,140 @@ class ConversationMixin:
                 "_settlement_attempt",
                 {"made": False},
             )
+            settlement_guard = dispatch_lifecycle.get("_settlement_guard")
+            if settlement_guard is None:
+                # Generic lifecycle callers from older integrations may not
+                # provide the shared lock.  Install one at the boundary so a
+                # second stop cannot race callback task creation.
+                settlement_guard = threading.Lock()
+                dispatch_lifecycle["_settlement_guard"] = settlement_guard
+            settlement_state = dispatch_lifecycle.get("_settlement_state")
+            if not isinstance(settlement_state, dict):
+                settlement_state = {
+                    "settled": bool(settlement_attempt.get("made")),
+                    "in_flight": False,
+                    "callback_in_flight": False,
+                    "callback_claim": None,
+                }
+                dispatch_lifecycle["_settlement_state"] = settlement_state
+            else:
+                settlement_state.setdefault(
+                    "settled", bool(settlement_attempt.get("made"))
+                )
+                settlement_state.setdefault("in_flight", False)
+                settlement_state.setdefault("callback_in_flight", False)
+                settlement_state.setdefault("callback_claim", None)
+            settlement_timeout = max(
+                0.0,
+                float(
+                    getattr(
+                        self,
+                        "_conversation_dispatch_settlement_timeout_seconds",
+                        5.0,
+                    )
+                ),
+            )
 
-            async def settle(name: str) -> None:
-                if settlement_attempt["made"]:
-                    return
-                settlement_attempt["made"] = True
+            def settlement_attempt_made() -> bool:
+                guard = dispatch_lifecycle.get("_settlement_guard")
+                if guard is None:
+                    return bool(settlement_attempt.get("made"))
+                with guard:
+                    return bool(settlement_attempt.get("made"))
+
+            def mark_settlement_attempt_made(claim_token=None) -> bool:
+                with settlement_guard:
+                    current_claim = settlement_state.get("callback_claim")
+                    if claim_token is not None and current_claim is not claim_token:
+                        return False
+                    settlement_attempt["made"] = True
+                    settlement_attempt.pop("in_flight", None)
+                    settlement_state["settled"] = True
+                    settlement_state["callback_in_flight"] = False
+                    settlement_state["callback_claim"] = None
+                    return True
+
+            def claim_settlement_callback() -> tuple[str, object | None]:
+                with settlement_guard:
+                    if settlement_attempt.get("made") or settlement_state.get(
+                        "settled"
+                    ):
+                        return "settled", None
+                    if (
+                        settlement_attempt.get("in_flight")
+                        or settlement_state.get("in_flight")
+                        or settlement_state.get("callback_in_flight")
+                    ):
+                        return "in_flight", None
+                    claim_token = object()
+                    settlement_attempt["in_flight"] = True
+                    settlement_state["callback_in_flight"] = True
+                    settlement_state["callback_claim"] = claim_token
+                    return "claimed", claim_token
+
+            def release_settlement_callback_claim(claim_token=None) -> bool:
+                with settlement_guard:
+                    current_claim = settlement_state.get("callback_claim")
+                    if claim_token is not None and current_claim is not claim_token:
+                        return False
+                    if claim_token is None and current_claim is not None:
+                        return False
+                    settlement_attempt.pop("in_flight", None)
+                    settlement_state["callback_in_flight"] = False
+                    settlement_state["callback_claim"] = None
+                    return True
+
+            def observe_settlement_task(callback_task, claim_token) -> None:
+                def settle_from_done_task(task: asyncio.Task) -> None:
+                    try:
+                        settled = task.result()
+                    except BaseException:
+                        release_settlement_callback_claim(claim_token)
+                        return
+                    if settled is False:
+                        release_settlement_callback_claim(claim_token)
+                    else:
+                        mark_settlement_attempt_made(claim_token)
+
+                callback_task.add_done_callback(settle_from_done_task)
+
+            async def settle(name: str) -> bool | None:
+                claim, claim_token = claim_settlement_callback()
+                if claim == "settled":
+                    mark_settlement_attempt_made()
+                    return True
+                if claim == "in_flight":
+                    return None
                 callback = dispatch_lifecycle.get(name)
                 if not callable(callback):
-                    return
-                settled = await callback()
+                    mark_settlement_attempt_made()
+                    return True
+                callback_coro = None
+                try:
+                    callback_coro = callback()
+                    callback_task = asyncio.create_task(callback_coro)
+                except BaseException:
+                    if callback_coro is not None and hasattr(callback_coro, "close"):
+                        callback_coro.close()
+                    release_settlement_callback_claim(claim_token)
+                    raise
+                observe_settlement_task(callback_task, claim_token)
+                done, _pending = await asyncio.wait(
+                    {callback_task},
+                    timeout=settlement_timeout,
+                )
+                if not done:
+                    return None
+                try:
+                    settled = callback_task.result()
+                except BaseException:
+                    release_settlement_callback_claim(claim_token)
+                    raise
                 if settled is False:
+                    release_settlement_callback_claim(claim_token)
                     raise RuntimeError(f"dispatch lifecycle settlement failed: {name}")
+                mark_settlement_attempt_made(claim_token)
+                return True
 
             async def tracked_callback():
                 callback_task = asyncio.create_task(cancellation_scoped_callback())
@@ -1594,19 +2275,13 @@ class ConversationMixin:
                             return result
                         if callable(heartbeat) and not await heartbeat():
                             callback_task.cancel()
-                            await asyncio.gather(
-                                callback_task,
-                                return_exceptions=True,
-                            )
+                            await asyncio.wait({callback_task}, timeout=settlement_timeout)
                             await settle("failure")
                             raise RuntimeError("durable dispatch lease was lost")
                 except asyncio.CancelledError:
                     if not callback_task.done():
                         callback_task.cancel()
-                        await asyncio.gather(
-                            callback_task,
-                            return_exceptions=True,
-                        )
+                        await asyncio.wait({callback_task}, timeout=settlement_timeout)
                     if dispatch_lifecycle.get("explicit_stop"):
                         await settle("cancelled")
                     else:
@@ -1618,10 +2293,7 @@ class ConversationMixin:
                     else:
                         if not callback_task.done():
                             callback_task.cancel()
-                            await asyncio.gather(
-                                callback_task,
-                                return_exceptions=True,
-                            )
+                            await asyncio.wait({callback_task}, timeout=settlement_timeout)
                         await settle("failure")
                     raise
                 finally:
@@ -1630,8 +2302,10 @@ class ConversationMixin:
                         and not cancellation_handle.worker_started.is_set()
                         and callback_task.cancelled()
                     ):
+                        cancellation_handle.worker_completed.set()
+                        release_generation_cancellation(cancellation_handle)
                         callback_task.get_coro().close()
-                    if not settlement_attempt["made"]:
+                    if not settlement_attempt_made():
                         if dispatch_lifecycle.get("explicit_stop"):
                             await settle("cancelled")
                         else:
@@ -1735,7 +2409,19 @@ class ConversationMixin:
             }
 
         if cancelled_awaitables:
-            await asyncio.gather(*cancelled_awaitables, return_exceptions=True)
+            cancel_wait_timeout = float(
+                getattr(self, "_conversation_cancel_task_wait_timeout_seconds", 1.0)
+            )
+            _done, pending = await asyncio.wait(
+                cancelled_awaitables,
+                timeout=max(0.0, cancel_wait_timeout),
+            )
+            if pending:
+                logger.warning(
+                    "Cancellation tasks did not finish within the bounded stop wait: session=%s pending=%s",
+                    session_id,
+                    len(pending),
+                )
 
         for task in tasks:
             if not isinstance(task, asyncio.Task):
@@ -1750,6 +2436,16 @@ class ConversationMixin:
 
         lifecycle_settlement_failed_run_ids: list[str] = []
         settled_lifecycle_ids: set[int] = set()
+        settlement_wait_timeout = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "_conversation_dispatch_settlement_timeout_seconds",
+                    5.0,
+                )
+            ),
+        )
         for lifecycle_run_id, lifecycle in lifecycle_settlements:
             lifecycle_id = id(lifecycle)
             if lifecycle_id in settled_lifecycle_ids:
@@ -1759,16 +2455,184 @@ class ConversationMixin:
             if not isinstance(settlement_attempt, dict):
                 settlement_attempt = {"made": False}
                 lifecycle["_settlement_attempt"] = settlement_attempt
-            if settlement_attempt.get("made"):
+            settlement_state = lifecycle.get("_settlement_state")
+            settlement_guard = lifecycle.get("_settlement_guard")
+            if settlement_guard is None:
+                settlement_guard = threading.Lock()
+                lifecycle["_settlement_guard"] = settlement_guard
+            if not isinstance(settlement_state, dict):
+                settlement_state = {
+                    "settled": bool(settlement_attempt.get("made")),
+                    "in_flight": False,
+                    "callback_in_flight": False,
+                    "callback_claim": None,
+                }
+                lifecycle["_settlement_state"] = settlement_state
+            else:
+                settlement_state.setdefault(
+                    "settled", bool(settlement_attempt.get("made"))
+                )
+                settlement_state.setdefault("in_flight", False)
+                settlement_state.setdefault("callback_in_flight", False)
+                settlement_state.setdefault("callback_claim", None)
+
+            def claim_settlement_callback(
+                *,
+                _guard=settlement_guard,
+                _attempt=settlement_attempt,
+                _state=settlement_state,
+            ) -> tuple[str, object | None]:
+                with _guard:
+                    if _attempt.get("made") or _state.get(
+                        "settled"
+                    ):
+                        return "settled", None
+                    if (
+                        _attempt.get("in_flight")
+                        or _state.get("in_flight")
+                        or _state.get("callback_in_flight")
+                    ):
+                        return "in_flight", None
+                    claim_token = object()
+                    _attempt["in_flight"] = True
+                    _state["callback_in_flight"] = True
+                    _state["callback_claim"] = claim_token
+                    return "claimed", claim_token
+
+            def mark_settlement_succeeded(
+                claim_token=None,
+                *,
+                _guard=settlement_guard,
+                _attempt=settlement_attempt,
+                _state=settlement_state,
+            ) -> bool:
+                with _guard:
+                    current_claim = _state.get("callback_claim")
+                    if claim_token is not None and current_claim is not claim_token:
+                        return False
+                    _attempt["made"] = True
+                    _attempt.pop("in_flight", None)
+                    _state["settled"] = True
+                    _state["callback_in_flight"] = False
+                    _state["callback_claim"] = None
+                    return True
+
+            def release_settlement_callback(
+                claim_token=None,
+                *,
+                _guard=settlement_guard,
+                _attempt=settlement_attempt,
+                _state=settlement_state,
+            ) -> bool:
+                with _guard:
+                    current_claim = _state.get("callback_claim")
+                    if claim_token is not None and current_claim is not claim_token:
+                        return False
+                    if claim_token is None and current_claim is not None:
+                        return False
+                    _attempt.pop("in_flight", None)
+                    _state["callback_in_flight"] = False
+                    _state["callback_claim"] = None
+                    return True
+
+            def observe_settlement_task(
+                callback_task,
+                claim_token,
+                *,
+                _release=release_settlement_callback,
+                _mark=mark_settlement_succeeded,
+            ) -> None:
+                def settle_from_done_task(
+                    task: asyncio.Task,
+                    *,
+                    release_callback=_release,
+                    mark_success=_mark,
+                ) -> None:
+                    try:
+                        settled = task.result()
+                    except BaseException:
+                        release_callback(claim_token)
+                        return
+                    if settled is False:
+                        release_callback(claim_token)
+                    else:
+                        mark_success(claim_token)
+
+                callback_task.add_done_callback(settle_from_done_task)
+
+            async def wait_for_settlement_completion(
+                *,
+                _loop=asyncio.get_running_loop,
+                _guard=settlement_guard,
+                _attempt=settlement_attempt,
+                _state=settlement_state,
+            ) -> bool:
+                deadline = (
+                    _loop().time() + settlement_wait_timeout
+                )
+                while True:
+                    with _guard:
+                        if _attempt.get("made") or _state.get(
+                            "settled"
+                        ):
+                            return True
+                        still_in_flight = bool(
+                            _attempt.get("in_flight")
+                            or _state.get("in_flight")
+                            or _state.get("callback_in_flight")
+                        )
+                    if not still_in_flight:
+                        return False
+                    remaining = deadline - _loop().time()
+                    if remaining <= 0:
+                        return False
+                    await asyncio.sleep(min(0.01, remaining))
+
+            settlement_claim, claim_token = claim_settlement_callback()
+            if settlement_claim == "settled":
+                mark_settlement_succeeded()
                 continue
-            settlement_attempt["made"] = True
+            if settlement_claim == "in_flight":
+                # Another tracked/manual stop owns the callback. Do not start
+                # a second callback; observe its bounded completion before
+                # deciding whether this stop is unresolved.
+                if not await wait_for_settlement_completion():
+                    lifecycle_settlement_failed_run_ids.append(lifecycle_run_id)
+                continue
             callback = lifecycle.get("cancelled")
             try:
-                if callable(callback) and await callback() is False:
-                    raise RuntimeError(
-                        "dispatch lifecycle settlement failed: cancelled"
+                if callable(callback):
+                    callback_coro = None
+                    try:
+                        callback_coro = callback()
+                        callback_task = asyncio.create_task(callback_coro)
+                    except BaseException:
+                        if callback_coro is not None and hasattr(callback_coro, "close"):
+                            callback_coro.close()
+                        release_settlement_callback(claim_token)
+                        raise
+                    observe_settlement_task(callback_task, claim_token)
+                    callback_done, _callback_pending = await asyncio.wait(
+                        {callback_task},
+                        timeout=settlement_wait_timeout,
                     )
+                    if not callback_done:
+                        lifecycle_settlement_failed_run_ids.append(lifecycle_run_id)
+                        logger.warning(
+                            "Timed out settling cancelled dispatch lifecycle: %s",
+                            lifecycle_run_id,
+                        )
+                        continue
+                    if callback_task.result() is False:
+                        release_settlement_callback(claim_token)
+                        raise RuntimeError(
+                            "dispatch lifecycle settlement failed: cancelled"
+                        )
+                mark_settlement_succeeded(claim_token)
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                release_settlement_callback(claim_token)
                 lifecycle_settlement_failed_run_ids.append(lifecycle_run_id)
                 logger.exception(
                     "Failed to settle cancelled dispatch lifecycle: %s",
@@ -1777,8 +2641,23 @@ class ConversationMixin:
 
         for handle in cancellation_handles.values():
             if not handle.worker_started.is_set():
-                handle.worker_completed.set()
-                release_generation_cancellation(handle)
+                matching_task = next(
+                    (
+                        task
+                        for task in tasks
+                        if str(getattr(task, "_agent_run_id", "") or "").strip()
+                        == handle.run_id
+                    ),
+                    None,
+                )
+                # A local asyncio.Task that is already cancelled before its
+                # callback starts is an explicit no-start acknowledgement.
+                # A cross-thread Future can report cancelled before its
+                # coroutine has entered the target loop, so it remains
+                # pending until the bounded drain/recovery path proves exit.
+                if isinstance(matching_task, asyncio.Task) and matching_task.done() and matching_task.cancelled():
+                    handle.worker_completed.set()
+                    release_generation_cancellation(handle)
 
         self._conversation_steering_queues.pop(key, None)
         distinct_run_ids = list(dict.fromkeys(run_ids))
@@ -1938,8 +2817,8 @@ class ConversationMixin:
                 )
                 self._set_conversation_generation_status(
                     session_id,
-                    running=False,
-                    status="cancelled",
+                    running=True,
+                    status="cancellation_failed",
                     message="停止しましたが、途中の応答を保存できませんでした",
                     active_tool=None,
                     agent_run_id=run_id,
@@ -1950,7 +2829,7 @@ class ConversationMixin:
                         {
                             "session_id": session_id,
                             "agent_run_id": run_id,
-                            "status": "cancelled",
+                            "status": "cancellation_failed",
                             "message": (
                                 "停止しましたが、途中の応答を保存できませんでした"
                             ),
@@ -1984,16 +2863,27 @@ class ConversationMixin:
         agent_run_id = requested_run_id or (
             distinct_run_ids[-1] if distinct_run_ids else None
         )
+        cancellation_status = (
+            "cancellation_pending"
+            if drain_timed_out_run_ids
+            else (
+                "cancellation_failed"
+                if persistence_failed_run_ids
+                else "cancelled"
+            )
+        )
         event_data = {
             "session_id": session_id,
             "agent_run_id": agent_run_id,
-            "status": (
-                "cancellation_pending" if drain_timed_out_run_ids else "cancelled"
-            ),
+            "status": cancellation_status,
             "message": (
                 "停止処理を継続しています"
                 if drain_timed_out_run_ids
-                else "応答生成を停止しました"
+                else (
+                    "停止処理の永続化に失敗しました"
+                    if persistence_failed_run_ids
+                    else "応答生成を停止しました"
+                )
             ),
             "cancelled": cancelled,
             "persistence_failed": bool(persistence_failed_run_ids),

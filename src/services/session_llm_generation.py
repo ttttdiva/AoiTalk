@@ -75,6 +75,32 @@ async def cleanup_ephemeral_llm_client(client: Any) -> None:
         await result
 
 
+async def retire_session_response_model_cache(
+    owner_callback: Any,
+    session_id: str,
+) -> dict[str, int]:
+    """Invoke the assistant-owned session cache retire hook at a route boundary.
+
+    The long-lived client invalidator above intentionally handles only client
+    history markers.  Response-model cache ownership belongs to the active
+    assistant mode, so this adapter keeps the route/service seam async without
+    making this service module inspect or release provider leases itself.
+    """
+
+    if not callable(owner_callback):
+        return {"retired": 0, "deferred": 0, "errors": 0}
+    result = owner_callback(session_id)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, dict):
+        return {"retired": 0, "deferred": 0, "errors": 0}
+    return {
+        "retired": int(result.get("retired") or 0),
+        "deferred": int(result.get("deferred") or 0),
+        "errors": int(result.get("errors") or 0),
+    }
+
+
 def _route_enriched_stream_callback(
     callback: Any,
     *,
@@ -117,6 +143,7 @@ _GENERATION_RESULT_STATE_DEFAULTS: dict[str, Any] = {
     "_last_usage_records": [],
     "_last_usage": {},
     "_last_generation_metrics": None,
+    "_last_memory_selection_observation": None,
     "_last_generation_failure": None,
     "_last_turn_tool_rounds_exhausted": False,
     "_last_turn_tool_loop_failed": False,
@@ -247,26 +274,16 @@ async def _direct_generate_response_async(
 
 async def _record_generation_last_used_route(
     client: Any,
-    config: Any,
-    session_context: dict[str, Any],
+    executed_route: dict[str, Any],
 ) -> None:
     """Preference write: last-used includes the route actually bound for generation."""
     try:
-        from .conversation_session_selection import (
-            read_session_llm_settings,
-            resolve_session_effective_main_route,
-            session_main_route_override_for_binding,
-        )
         from .user_llm_preference_service import (
             has_explicit_last_used_route,
             record_user_last_used_main_route,
         )
 
-        settings = read_session_llm_settings(session_context)
-        route = session_main_route_override_for_binding(settings)
-        if not has_explicit_last_used_route(route):
-            route = resolve_session_effective_main_route(config, settings)
-        if not has_explicit_last_used_route(route):
+        if not has_explicit_last_used_route(executed_route):
             return
         user_id = str(
             getattr(client, "session_user_id", None)
@@ -275,12 +292,31 @@ async def _record_generation_last_used_route(
         ).strip()
         if not user_id:
             return
-        await record_user_last_used_main_route(user_id, route)
+        await record_user_last_used_main_route(user_id, executed_route)
     except Exception:
         logger.debug(
             "Failed to record last-used LLM route after successful generation",
             exc_info=True,
         )
+
+
+def _response_model_main_route(client: Any) -> dict[str, str] | None:
+    """Project the validated turn selection without changing session settings."""
+    selection = getattr(client, "current_response_model", None)
+    if not isinstance(selection, dict):
+        return None
+    provider = str(selection.get("provider") or "").strip().lower()
+    model = str(selection.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    route = {"provider": provider, "model": model, "effort": ""}
+    if selection.get("reasoning_effort") is not None:
+        from ..llm.response_model_effort import validate_response_model_effort
+
+        route["effort"] = validate_response_model_effort(
+            provider, model, selection["reasoning_effort"]
+        )
+    return route
 
 
 def _session_route_uses_managed_llama_cpp(config: Any) -> bool:
@@ -321,26 +357,36 @@ async def run_session_aware_generation(
         bind_session_llm_runtime_from_context,
         build_session_turn_client,
         _client_provider_model,
+        _effective_client_effort,
         resolve_execution_main_route,
         reset_session_llm_runtime,
         session_route_differs_from_client,
     )
-    from .session_llm_runtime_context import session_main_route_override
+    from .session_llm_runtime_context import (
+        bind_session_main_route_override,
+        reset_session_main_route_override,
+        session_main_route_override,
+    )
 
     depth_token = _SESSION_LLM_DISPATCH_DEPTH.set(depth + 1)
     binding = None
+    response_route_token = None
     ephemeral = None
     try:
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
+        agent_execution_binding = getattr(
+            get_turn_context(), "agent_execution_binding", None
+        )
+        agent_turn = agent_execution_binding is not None
         # AoiTalk Help is a Guide-only controller turn.  Refreshing the
         # ConversationSession here would read Project/Story/session settings
         # before the provider's own suppression guards run and could also
         # restore Agent Team state from the prior ordinary turn.
         session_context_available = (
             False
-            if suppress_automatic_context
+            if suppress_automatic_context or agent_turn
             else await refresh_session_chat_llm_context(client)
         )
         session_id = getattr(client, "current_session_id", None)
@@ -350,6 +396,7 @@ async def run_session_aware_generation(
         # refresh seam which did not return a status.
         if (
             not suppress_automatic_context
+            and not agent_turn
             and session_id
             and session_context_available is not False
             and isinstance(session_context, dict)
@@ -361,8 +408,26 @@ async def run_session_aware_generation(
                 config=config,
             )
 
+        response_route = (
+            None
+            if suppress_automatic_context or agent_turn
+            else _response_model_main_route(client)
+        )
+        fixed_deployment = False
+        if response_route is not None:
+            from ..llm.deployment_resolver import resolve_llm_deployment
+
+            deployment = resolve_llm_deployment(config)
+            fixed_deployment = deployment is not None and deployment.fixed
+            if not fixed_deployment:
+                # Keep the session Team/loaded-pack/profile binding, but the
+                # selected response model owns Main for this turn only.
+                response_route_token = bind_session_main_route_override(response_route)
+
         target = client
-        if binding and session_route_differs_from_client(client, config):
+        if (not agent_turn) and (binding or response_route is not None) and session_route_differs_from_client(
+            client, config
+        ):
             try:
                 ephemeral = await asyncio.to_thread(
                     build_session_turn_client,
@@ -384,9 +449,8 @@ async def run_session_aware_generation(
 
         # Resolve the route only after the session context has been bound and
         # the request target has been selected.  The target's provider/model
-        # are the source of truth for the durable run stamp; the resolved route
-        # only supplies a safe fallback for lightweight test/dummy clients and
-        # the effective reasoning effort.
+        # and effective effort are the source of truth for the durable stamp;
+        # the resolved route supplies a fallback for lightweight clients.
         try:
             resolved_route = resolve_execution_main_route(config)
         except Exception:
@@ -404,17 +468,31 @@ async def run_session_aware_generation(
         ).strip()
         session_override = session_main_route_override()
         route_source = (
-            "session_main_route"
+            "agent_revision"
+            if agent_turn
+            else
+            "deployment"
+            if fixed_deployment
+            else "response_model"
+            if response_route_token is not None
+            else "session_main_route"
             if isinstance(session_override, dict)
             and str(session_override.get("provider") or "").strip()
             and str(session_override.get("model") or "").strip()
             else "runtime_main"
         )
-        reasoning_effort = str(
-            resolved_route.get("effort")
-            or resolved_route.get("reasoning_effort")
-            or ""
-        ).strip()
+        effort_getter = getattr(target, "_get_reasoning_effort", None)
+        if callable(effort_getter):
+            # An omitted turn effort may reuse an already-configured client.
+            # Its request getter also authoritatively returns no effort when
+            # the provider/model does not send one.
+            reasoning_effort = str(effort_getter() or "").strip().lower()
+        else:
+            reasoning_effort = _effective_client_effort(target) or str(
+                resolved_route.get("effort")
+                or resolved_route.get("reasoning_effort")
+                or ""
+            ).strip()
 
         if not suppress_automatic_context:
             await _update_current_agent_run_runtime_route(
@@ -438,17 +516,25 @@ async def run_session_aware_generation(
             user_input,
             **generation_kwargs,
         )
-        if not suppress_automatic_context:
+        if not suppress_automatic_context and not agent_turn:
             client.current_assistant_message_id = getattr(
                 target, "current_assistant_message_id", None
             )
         if (
             not suppress_automatic_context
+            and not agent_turn
             and session_id
             and session_context_available is not False
             and isinstance(session_context, dict)
         ):
-            await _record_generation_last_used_route(client, config, session_context)
+            await _record_generation_last_used_route(
+                client,
+                {
+                    "provider": actual_provider,
+                    "model": actual_model,
+                    "effort": reasoning_effort,
+                },
+            )
         return result
     finally:
         if ephemeral is not None and not suppress_automatic_context:
@@ -459,6 +545,8 @@ async def run_session_aware_generation(
             client.current_assistant_message_id = getattr(
                 ephemeral, "current_assistant_message_id", None
             )
+        if response_route_token is not None:
+            reset_session_main_route_override(response_route_token)
         reset_session_llm_runtime(binding)
         _SESSION_LLM_DISPATCH_DEPTH.reset(depth_token)
         if ephemeral is not None:
@@ -468,6 +556,7 @@ async def run_session_aware_generation(
 __all__ = [
     "cleanup_ephemeral_llm_client",
     "invalidate_session_llm_client_cache",
+    "retire_session_response_model_cache",
     "refresh_session_chat_llm_context",
     "run_session_aware_generation",
 ]

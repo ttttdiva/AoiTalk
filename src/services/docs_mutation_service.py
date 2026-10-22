@@ -382,6 +382,7 @@ class DocsMutationService:
         root,
         operations: list[dict],
         allowed: set[UUID],
+        read_reference_ids: set[UUID] | None = None,
     ) -> dict[str, object]:
         """Prelock every existing row an Agent changes or causes to change.
 
@@ -397,7 +398,9 @@ class DocsMutationService:
         structural_roots: set[UUID] = set()
         field_ids: set[UUID] = set()
         tag_ids: set[UUID] = set()
-        reference_ids: set[UUID] = set()
+        # Bounded system organizers may add explicit, read-only edge targets.
+        # They share the same ACL/row/revision fence as inline references.
+        reference_ids: set[UUID] = set(read_reference_ids or ())
         requested_project_ids: set[UUID] = set()
         close_node_ids: set[UUID] = set()
         task_bind_project_ids: dict[str, UUID] = {}

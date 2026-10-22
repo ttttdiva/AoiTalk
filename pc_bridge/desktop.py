@@ -6,10 +6,15 @@ import ctypes as C
 from ctypes import wintypes as W
 from io import BytesIO
 import math
+import json
 import os
 import time
 import threading
 from uuid import uuid4
+from .desktop_identity import control_identity, validate_identity, walk_controls, window_identity, monitor_layout, value_read_only
+
+
+MAX_CONTROL_BYTES = 512_000
 
 
 class MOUSEINPUT(C.Structure):
@@ -72,6 +77,9 @@ class DesktopController:
         self.u.SendInput.argtypes = [W.UINT, C.POINTER(INPUT), C.c_int]
         self.u.SendInput.restype = W.UINT
         self.targets = {}
+        self.target_identities = {}
+        self.observation = None
+        self._input_guard = None
         import pythoncom
         pythoncom.CoInitialize()
 
@@ -106,68 +114,164 @@ class DesktopController:
                     self.u.GetWindowTextW(hwnd, title, len(title))
                     rect = W.RECT()
                     self.u.GetWindowRect(hwnd, C.byref(rect))
-                    result.append({'window_id': int(hwnd), 'title': title.value[:300],
-                                   'rect': [rect.left, rect.top, rect.right, rect.bottom]})
+                    try:
+                        identity = self.window_identity(hwnd)
+                    except RuntimeError:
+                        identity = {'window_id': int(hwnd), 'rect': [rect.left, rect.top, rect.right, rect.bottom]}
+                    result.append({**identity, 'title': title.value[:300]})
             return True
         self.u.EnumWindows(callback_type(collect), 0)
-        return result[:100]
+        return result[:4096]
+
+    def window_identity(self, hwnd):
+        return window_identity(self.u, hwnd)
+
+    @staticmethod
+    def automation():
+        from pywinauto.uia_defines import IUIA
+        return IUIA().iuia
+
+    @staticmethod
+    def wrap(element):
+        from pywinauto.uia_element_info import UIAElementInfo
+        from pywinauto.controls.uiawrapper import UIAWrapper
+        return UIAWrapper(UIAElementInfo(element))
 
     def observe(self, screenshot=True):
         windows = self.windows()
         foreground = int(self.u.GetForegroundWindow() or 0)
-        self.targets = {}
-        controls = {}
-        error = ''
+        owner = self.window_identity(foreground) if foreground else None
+        self.targets, self.target_identities = {}, {}
+        controls, error = {}, ''
+        control_bytes = 0
+        nonce = uuid4().hex
+        coverage = {"scanned_nodes": 0, "truncated": False, "errors": 0}
         try:
-            import pythoncom
-            pythoncom.CoInitialize()
-            try:
-                from pywinauto import Desktop
-                root = Desktop(backend='uia').window(handle=foreground).wrapper_object()
-                queue = [(root, 0)]
-                nonce = uuid4().hex[:10]
-                visited = 0
-                while queue and visited < 250:
-                    self.check_cancelled()
-                    item, depth = queue.pop(0)
-                    visited += 1
-                    try:
-                        info = item.element_info
-                        rect = item.rectangle()
-                        if not item.is_visible() or rect.width() <= 0 or rect.height() <= 0:
-                            continue
-                        label = item.window_text()[:300]
-                        kind = info.control_type
-                        identifier = f'{nonce}_{len(controls)}'
-                        controls[identifier] = {'label': label, 'type': kind,
-                                                'rect': [rect.left, rect.top, rect.right, rect.bottom],
-                                                'enabled': item.is_enabled()}
-                        if kind in ('Edit', 'Document'):
-                            try:
-                                if not info.element.CurrentIsPassword:
-                                    controls[identifier]['value'] = item.iface_value.CurrentValue[:2000]
-                            except Exception:
-                                try:
-                                    if not info.element.CurrentIsPassword:
-                                        controls[identifier]['value'] = item.iface_text.DocumentRange.GetText(2000)
-                                except Exception:
-                                    pass
-                        self.targets[identifier] = item
-                        if depth < 5:
-                            queue.extend((child, depth + 1) for child in item.children()[:70])
-                    except Exception:
+            automation = self.automation()
+            root = automation.ElementFromHandle(foreground)
+            traversal, coverage = walk_controls(root, automation.ControlViewWalker, cancelled=self.check_cancelled)
+            for element, depth in traversal:
+                try:
+                    item = self.wrap(element)
+                    identity = control_identity(item)
+                    rect = identity['rect']
+                    if not item.is_visible() or rect[2] <= rect[0] or rect[3] <= rect[1]:
                         continue
-            finally:
-                pythoncom.CoUninitialize()
+                    key = f'{nonce}:{len(controls)}'
+                    rid = identity['runtime_id']
+                    entry = {'label': identity['name'][:300], 'type': identity['role'],
+                             'rect': rect, 'enabled': item.is_enabled(), 'depth': depth,
+                             'runtime_id': rid, 'automation_id': identity['automation_id'],
+                             'actionable': bool(rid)}
+                    if identity['role'] in ('Edit', 'Document') and not element.CurrentIsPassword:
+                        try:
+                            entry['value'] = item.iface_value.CurrentValue[:2000]
+                            entry['readonly'] = bool(item.iface_value.CurrentIsReadOnly)
+                        except Exception:
+                            try:
+                                entry['value'] = item.iface_text.DocumentRange.GetText(2000)
+                            except Exception:
+                                pass
+                    entry_bytes = len(json.dumps(entry, ensure_ascii=False).encode('utf-8')) + len(key) + 8
+                    if control_bytes + entry_bytes > MAX_CONTROL_BYTES:
+                        coverage['truncated'] = True
+                        coverage['budget'] = 'control_bytes'
+                        break
+                    control_bytes += entry_bytes
+                    coverage['control_bytes'] = control_bytes
+                    controls[key] = entry
+                    self.targets[key], self.target_identities[key] = item, identity
+                except Exception as exc:
+                    self.check_cancelled()
+                    if len(coverage.setdefault('error_types', [])) < 20:
+                        coverage['error_types'].append(type(exc).__name__)
+                    coverage['errors'] += 1
+                    coverage['truncated'] = True
+            counts = {}
+            for identity in self.target_identities.values():
+                rid = tuple(identity['runtime_id'])
+                counts[rid] = counts.get(rid, 0) + 1
+            for key, entry in controls.items():
+                if counts[tuple(entry['runtime_id'])] > 1:
+                    entry['actionable'] = False
+                    self.targets.pop(key, None)
+                    self.target_identities.pop(key, None)
         except Exception as exc:
+            self.check_cancelled()
             error = type(exc).__name__
+            coverage['truncated'] = True
+        if owner:
+            validate_identity(owner, self.window_identity(foreground))
+            if int(self.u.GetForegroundWindow() or 0) != foreground:
+                raise RuntimeError('computer_foreground_changed')
+        self.observation = {'id': nonce, 'owner': owner, 'windows': windows, 'desktop': self.bounds(), 'monitors': monitor_layout(self.u)}
         result = {'windows': windows, 'foreground_window_id': foreground, 'controls': controls,
-                  'desktop': self.bounds(), 'accessibility_error': error}
+                  'desktop': self.bounds(), 'accessibility_error': error,
+                  'observation_id': nonce, 'foreground_identity': owner, 'coverage': coverage}
         if screenshot:
             result.update(self.screenshot())
+            if owner:
+                validate_identity(owner, self.window_identity(foreground))
         return result
 
+    def guard_observation(self, action, params):
+        oid = params.get('observation_id')
+        if not oid and not params.get('target'):
+            return None  # Explicit, unbound legacy single-input calls remain available.
+        snapshot = self.observation
+        if not snapshot or (oid and oid != snapshot['id']):
+            raise RuntimeError('computer_stale_observation')
+        if snapshot.get('monitors') is not None and snapshot['monitors'] != monitor_layout(self.u):
+            raise RuntimeError('computer_monitor_layout_changed')
+        if snapshot['desktop'] != self.bounds():
+            raise RuntimeError('computer_monitor_layout_changed')
+        if action == 'focus':
+            previous = next((w for w in snapshot['windows'] if w['window_id'] == params.get('window_id')), None)
+            if not previous or 'pid' not in previous:
+                raise RuntimeError('computer_stale_window')
+            validate_identity(previous, self.window_identity(previous['window_id']), geometry=False)
+            return previous
+        owner = snapshot['owner']
+        if not owner or int(self.u.GetForegroundWindow() or 0) != owner['window_id']:
+            raise RuntimeError('computer_foreground_changed')
+        validate_identity(owner, self.window_identity(owner['window_id']))
+        return owner
+
+    @staticmethod
+    def uia_point(x, y):
+        from pywinauto.uia_defines import IUIA
+        return IUIA().UIA_dll.tagPOINT(x, y)
+
+    def guard_target(self, target, action):
+        item = self.targets.get(target)
+        old = self.target_identities.get(target)
+        if item is None or not old or not old['runtime_id']:
+            raise RuntimeError('computer_stale_target')
+        if old != control_identity(item) or not item.is_visible() or not item.is_enabled():
+            raise RuntimeError('computer_stale_target')
+        if action == 'type':
+            if old['role'] not in ('Edit', 'Document'):
+                raise RuntimeError('computer_target_not_editable')
+            if value_read_only(item) is True:
+                raise RuntimeError('computer_target_readonly')
+        else:
+            automation = self.automation()
+            r = old['rect']
+            point = self.uia_point((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)
+            hit = automation.ElementFromPoint(point)
+            for _ in range(64):
+                if not hit:
+                    break
+                if automation.CompareElements(item.element_info.element, hit):
+                    return item
+                hit = automation.RawViewWalker.GetParentElement(hit)
+            raise RuntimeError('computer_target_covered')
+        return item
+
     def send(self, events):
+        guard = getattr(self, '_input_guard', None)
+        if guard:
+            guard()
         for start in range(0, len(events), 128):
             batch = events[start:start + 128]
             array = (INPUT * len(batch))(*batch)
@@ -187,10 +291,26 @@ class DesktopController:
             if code is None:
                 raise ValueError('unsupported_key:' + key)
             codes.append(code)
+        self.u.GetKeyboardLayout.argtypes = [W.DWORD]
+        self.u.GetKeyboardLayout.restype = C.c_void_p
+        self.u.MapVirtualKeyExW.argtypes = [W.UINT, W.UINT, C.c_void_p]
+        self.u.MapVirtualKeyExW.restype = W.UINT
+        thread = self.u.GetWindowThreadProcessId(self.u.GetForegroundWindow(), None)
+        layout = self.u.GetKeyboardLayout(thread)
+        extended = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C}
+        downs = [keyboard_input(vk=code, scan=self.u.MapVirtualKeyExW(code, 0, layout),
+                                flags=1 if code in extended else 0) for code in codes]
+        releases = [keyboard_input(vk=event.ki.wVk, scan=event.ki.wScan,
+                                   flags=event.ki.dwFlags | 2) for event in reversed(downs)]
         try:
-            self.send([keyboard_input(vk=code) for code in codes])
-        finally:
-            self.send([keyboard_input(vk=code, flags=2) for code in reversed(codes)])
+            # Apps may use the native scan code to translate accelerator keys;
+            # a VK-only packet can reach KeyDown but fail to invoke Ctrl+A.
+            # One OS input batch prevents another producer splitting the chord.
+            self.send(downs + releases)
+        except Exception:
+            self.send(releases)
+            raise
+
 
     def type_text(self, text):
         if not isinstance(text, str) or len(text) > 16000:
@@ -232,11 +352,10 @@ class DesktopController:
             return self.observe(bool(params.get('screenshot', True)))
         if action == 'windows':
             return {'windows': self.windows()}
+        self.guard_observation(action, params)
         target = params.get('target')
         if target:
-            item = self.targets.get(target)
-            if item is None:
-                raise RuntimeError('computer_stale_target')
+            item = self.guard_target(target, action)
             rect = item.rectangle()
             params = {**params, 'x': (rect.left + rect.right) // 2, 'y': (rect.top + rect.bottom) // 2}
         if action == 'focus':
@@ -277,6 +396,9 @@ class DesktopController:
             if int(self.u.GetForegroundWindow() or 0) != hwnd:
                 raise RuntimeError('window_focus_failed')
         elif action in ('click', 'double_click', 'right_click', 'move', 'drag'):
+            self.guard_observation(action, params)
+            if target:
+                self.guard_target(target, action)
             self.move(params.get('x'), params.get('y'))
             if action == 'drag':
                 x, y = params['x'], params['y']
@@ -301,8 +423,17 @@ class DesktopController:
             if target:
                 # Focus without a click: a preceding CTRL+A selection must
                 # remain selected when the next step types replacement text.
-                self.targets[target].set_focus()
-            self.type_text(params.get('text'))
+                if not item.element_info.element.CurrentHasKeyboardFocus:
+                    item.set_focus()
+                self.guard_target(target, action)
+                if not item.element_info.element.CurrentHasKeyboardFocus:
+                    raise RuntimeError('computer_target_focus_failed')
+            self.guard_observation(action, params)
+            self._input_guard = lambda: self.guard_observation(action, params)
+            try:
+                self.type_text(params.get('text'))
+            finally:
+                self._input_guard = None
         elif action == 'press':
             self.press(params.get('keys'))
         elif action == 'scroll':
@@ -312,5 +443,9 @@ class DesktopController:
             self.mouse(0x0800, 120 * amount)
         else:
             raise ValueError('computer_action_unknown')
+        if action == 'focus' and params.get('observation_id'):
+            previous = next(w for w in self.observation['windows'] if w['window_id'] == params['window_id'])
+            validate_identity(previous, self.window_identity(params['window_id']), geometry=False)
         time.sleep(0.1)
-        return {'action': action, 'performed': True}
+        return {'action': action, 'performed': True, 'execution_status': 'accepted',
+                'verification': {'status': 'unknown'}, 'observation_id': params.get('observation_id')}

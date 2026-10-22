@@ -1,12 +1,15 @@
 import { readLocalTaskContext } from "./local-task-context";
+import { materialApprovalResponse } from "./material-approval";
 import { useProjectStore } from "../../stores/project";
-import { getToken, getTokenAuthScope } from "../../lib/auth";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getToken, getTokenAuthScope, sha256Hex } from "../../lib/auth";
 import { getConfiguredApiServerFingerprint } from "../../lib/api-client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentRun,
   ChatResponseModelOption,
   ChatResponseModelSelection,
+  ConversationAgent,
   ConversationMessage,
   ConversationSession,
   WSMessage,
@@ -17,7 +20,7 @@ import {
   type GenerationSteerResponse,
   type LlmModeResponse,
 } from "../../lib/chat-api";
-import { isApiHttpError } from "../../lib/api-client";
+import { isApiHttpError, isApiTimeoutError } from "../../lib/api-client";
 import { ChatWebSocket } from "../../lib/websocket";
 import {
   generateMobileLlmReply,
@@ -30,6 +33,7 @@ import {
   type MobileLlmSettings,
 } from "../../lib/mobile-llm";
 import {
+  AgentBindingConflictError,
   conversationsRepo,
   dispatchPendingConversationMessage,
   flushPendingConversation,
@@ -42,6 +46,7 @@ import { prepareDirectConversationHandoff } from "./direct-handoff";
 import { appsRepo } from "../../repositories/apps";
 import { isServerKnownUnreachable, useNetworkStore } from "../../stores/network";
 import { deepResearchApi, type DeepResearchJob } from "../../lib/deep-research-api";
+import { randomId } from "../../repositories/outbox";
 import {
   buildCommandRegistry,
   buildConnectionCapability,
@@ -65,6 +70,7 @@ import type {
   SendConversationCommand,
 } from "./models";
 import { appContextCompatibleWithProject } from "./app-context";
+import { useInitialAppContextBinding } from "./use-initial-app-context";
 import { type SkillSlashCommand } from "./chat-commands";
 import {
   getCachedLlmModelCatalog,
@@ -77,6 +83,13 @@ import {
   isLikelyConnectivityFailure,
 } from "./fallback-error";
 import {
+  clearResolvedServerPendingError,
+  SERVER_RESULT_UNCONFIRMED_ERROR,
+  SERVER_RETRY_DEFERRED_ERROR,
+  SERVER_SEND_DEFERRED_ERROR,
+  shouldHoldServerDispatch,
+} from "./server-dispatch-recovery";
+import {
   buildConversationTitlePrompt,
   cleanGeneratedConversationTitle,
   shouldGenerateConversationTitle,
@@ -88,13 +101,15 @@ import {
   finishConversationOperation,
   generateCharacterAwareDirectReply,
   getCharacterChangeAvailability,
+  resolveCharacterProfileAuthScope,
   runExclusiveConversationOperation,
   tryStartConversationOperation,
   type ConversationExclusiveOperation,
 } from "./character-session";
 import { buildReplaceableConversationFallbackTitle } from "./local-title-fallback";
 import { buildResponseModelOptions } from "./response-model-options";
-import { resolveServerModelEffort, snapshotServerModelTarget } from "./server-model-effort";
+import { resolveServerModelEffort } from "./server-model-effort";
+import { isProtectedConversationRoot, resolveConversationDispatchTarget } from "./dispatch-target";
 import {
   attemptPendingRetry,
   findAcceptedRemoteMessage,
@@ -102,7 +117,16 @@ import {
 import {
   buildPendingDispatchMetadata,
   pendingDispatchPayload,
+  replacePendingDispatchMessage,
 } from "./pending-dispatch-payload";
+import {
+  isPendingLocalConversationMessage,
+  resolveMessageResendTarget,
+} from "./message-actions";
+import {
+  SERVER_RESPONSE_REFRESH_DELAYS_MS,
+  startResponseReconciliation,
+} from "./response-reconciliation";
 import {
   cancelledAssistantMessages,
   isAssistantPersistenceEvent,
@@ -132,10 +156,125 @@ import {
   useConversationFocusRecovery,
   useConversationRuntimeFocus,
 } from "./useConversationRuntime";
-import { loadConversationRemoteData } from "./useConversationData";
+import type { ConversationRuntimeFocus } from "./useConversationRuntime";
+import { loadConversationLocalData, loadConversationRemoteData } from "./useConversationData";
 import { useConversationDurableTimeline } from "./useConversationTimeline";
 import { ConversationGenerationEventGate } from "./conversation-generation-events";
 import { ConversationSubmissionQueue, RetainedSubmissionError, conversationMessageIdentity, useSubmissionTimeline } from "./conversation-submissions";
+
+const DEEP_RESEARCH_PENDING_START_STORAGE_PREFIX =
+  "aoitalk:deep-research-pending-start:v1";
+
+class DeepResearchPendingStartPersistenceError extends Error {
+  constructor() {
+    super("Deep Researchの開始要求を端末に保存できませんでした");
+    this.name = "DeepResearchPendingStartPersistenceError";
+  }
+}
+
+type DeepResearchPendingStartStorageAddress = {
+  storageKey: string;
+  queryFingerprint: string;
+};
+
+function deepResearchPendingStartStorageAddress({
+  authScope,
+  serverFingerprint,
+  sessionId,
+  projectId,
+  query,
+}: {
+  authScope: string;
+  serverFingerprint: string;
+  sessionId: string | null;
+  projectId: string | null;
+  query: string;
+}): DeepResearchPendingStartStorageAddress {
+  const scopeFingerprint = sha256Hex(JSON.stringify([
+    authScope,
+    serverFingerprint,
+    sessionId,
+    projectId,
+  ]));
+  const queryFingerprint = sha256Hex(
+    JSON.stringify([scopeFingerprint, query]),
+  );
+  return {
+    storageKey: `${DEEP_RESEARCH_PENDING_START_STORAGE_PREFIX}:${scopeFingerprint}:${queryFingerprint}`,
+    queryFingerprint,
+  };
+}
+
+async function readPendingDeepResearchRequestId(
+  address: DeepResearchPendingStartStorageAddress,
+): Promise<string | null> {
+  try {
+    const raw = await AsyncStorage.getItem(address.storageKey);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      value.queryFingerprint !== address.queryFingerprint ||
+      typeof value.clientRequestId !== "string" ||
+      !value.clientRequestId.trim()
+    ) {
+      throw new DeepResearchPendingStartPersistenceError();
+    }
+    return value.clientRequestId;
+  } catch {
+    throw new DeepResearchPendingStartPersistenceError();
+  }
+}
+
+async function persistPendingDeepResearchRequestId(
+  address: DeepResearchPendingStartStorageAddress,
+  clientRequestId: string,
+): Promise<void> {
+  try {
+    // Persist only opaque request identity and its scoped, one-way query hash.
+    await AsyncStorage.setItem(
+      address.storageKey,
+      JSON.stringify({
+        clientRequestId,
+        queryFingerprint: address.queryFingerprint,
+      }),
+    );
+  } catch {
+    throw new DeepResearchPendingStartPersistenceError();
+  }
+}
+
+async function clearPendingDeepResearchRequestId(
+  address: DeepResearchPendingStartStorageAddress,
+  clientRequestId: string,
+): Promise<void> {
+  try {
+    const raw = await AsyncStorage.getItem(address.storageKey);
+    if (!raw) return;
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (value.queryFingerprint !== address.queryFingerprint) {
+      throw new DeepResearchPendingStartPersistenceError();
+    }
+    if (value.clientRequestId !== clientRequestId) {
+      return;
+    }
+  } catch {
+    throw new DeepResearchPendingStartPersistenceError();
+  }
+  try {
+    await AsyncStorage.removeItem(address.storageKey);
+  } catch {
+    throw new DeepResearchPendingStartPersistenceError();
+  }
+}
+
+function isTerminalDeepResearchStatus(status: DeepResearchJob["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "interrupted"
+  );
+}
 
 type ControllerArgs = {
   sessionId?: string | null;
@@ -145,6 +284,10 @@ type ControllerArgs = {
   selectedProjectId?: string | null;
   onSessionPromoted?: (sessionId: string) => void;
   initialAppContext?: ChatAppContext | null;
+  /** Explicit focus for a root-mounted embedded surface. */
+  runtimeFocus?: ConversationRuntimeFocus | null;
+  /** Embedded fixed-Agent surfaces must not write shared Chat model prefs. */
+  disableLlmPreferencePersistence?: boolean;
 };
 
 /** Direct cloud providers require Internet, unlike a LAN AoiTalk server. */
@@ -152,6 +295,15 @@ export function canDispatchDirectCloud(
   networkOnline: boolean | null | undefined,
 ): boolean {
   return networkOnline !== false;
+}
+
+function serverDispatchResultIsUncertain(error: unknown): boolean {
+  if (error instanceof AgentBindingConflictError) return false;
+  if (isApiTimeoutError(error)) return true;
+  if (!isApiHttpError(error)) return false;
+  // A bounded 4xx rejection means the dispatch was not accepted. Gateway and
+  // server failures may still have started work before the response.
+  return error.status === 408 || error.status === 429 || error.status >= 500;
 }
 
 type BranchSwitchRuntime = {
@@ -242,28 +394,28 @@ function deepResearchToConversationJob(job: DeepResearchJob): ConversationJob {
   };
 }
 
-function nextRefreshTimers(callback: () => void) {
-  const cancels = [1500, 5000, 15000].map((delay) => {
-    const stopTracking = conversationPerformanceDiagnostics.trackActive(
-      "timer",
-      "conversation-refresh",
-    );
-    let active = true;
-    const finish = () => {
-      if (!active) return;
-      active = false;
-      stopTracking();
-    };
-    const timer = setTimeout(() => {
-      finish();
-      callback();
-    }, delay);
-    return () => {
-      clearTimeout(timer);
-      finish();
-    };
-  });
-  return () => cancels.forEach((cancel) => cancel());
+type ConversationRefreshScope = {
+  auth: string;
+  server: string;
+};
+
+type ResponseRefreshOwner = {
+  sourceSessionId: string;
+  remoteSessionId: string;
+  requestId: number;
+  focusEpoch: number;
+  scope: ConversationRefreshScope;
+  authOwner: string;
+};
+
+async function readConversationRefreshScope(): Promise<ConversationRefreshScope> {
+  const [token, server] = await Promise.all([getToken(), getConfiguredApiServerFingerprint()]);
+  return { auth: getTokenAuthScope(token), server };
+}
+
+async function isConversationRefreshScopeCurrent(scope: ConversationRefreshScope): Promise<boolean> {
+  const current = await readConversationRefreshScope();
+  return current.auth === scope.auth && current.server === scope.server;
 }
 
 function conversationMessageSignature(message: ConversationMessage): string {
@@ -280,6 +432,9 @@ function conversationMessageSignature(message: ConversationMessage): string {
     message.parent_message_id,
     message.branch_index,
     message.is_active_branch,
+    message.sender_type,
+    message.sender_id,
+    message.sender_display_name,
   ]);
 }
 
@@ -300,6 +455,7 @@ function conversationSessionSignature(session: ConversationSession): string {
   return JSON.stringify([
     session.id,
     session.user_id,
+    session.is_local_only,
     session.character_name,
     session.title,
     session.session_start,
@@ -308,11 +464,21 @@ function conversationSessionSignature(session: ConversationSession): string {
     session.is_active,
     session.project_id,
     session.is_group_chat,
+    session.agent_id,
+    session.agent_display_name,
+    session.agent_state,
+    session.latest_revision_id,
+    session.agent_binding_pending,
+    session.agent_binding_error,
     session.app_id,
     session.app_target_id,
     session.development_status,
     session.last_read_at,
     session.is_unread,
+    session.private_agent_root,
+    session.purpose,
+    session.readonly_binding,
+    session.private_agent_root_metadata,
   ]);
 }
 
@@ -374,6 +540,7 @@ export function useConversationController(
   stopGeneration: () => Promise<void>;
   sendConversationCommand: (command: SendConversationCommand) => Promise<void>;
   retryPendingMessage: (message: ConversationMessage, route?: "server" | "direct") => Promise<void>;
+  cancelPendingMessage: (message: ConversationMessage, mode?: "cancel" | "draft") => Promise<void>;
   respondPermission: (requestId: string, approved: boolean) => void;
   startDeepResearch: (query: string) => Promise<void>;
   editMessage: (message: ConversationMessage, content: string) => Promise<void>;
@@ -381,7 +548,6 @@ export function useConversationController(
     message: ConversationMessage,
     responseModel?: ChatResponseModelSelection,
   ) => Promise<void>;
-  loadBranches: (messageId: string) => Promise<void>;
   switchBranch: (message: ConversationMessage, nextIndex: number) => Promise<void>;
   changeLlmMode: (mode: string) => void;
   changeResponseTarget: (target: ChatResponseTarget) => void;
@@ -389,6 +555,11 @@ export function useConversationController(
   refreshResponseModelOptions: () => Promise<void>;
   refreshSkillCommands: () => Promise<void>;
   changeCharacter: (slug: string) => Promise<void>;
+  changeAgent: (agentId: string | null) => Promise<void>;
+  adoptServerAgent: () => Promise<void>;
+  agentCatalog: ConversationAgent[];
+  agentCatalogLoading: boolean;
+  refreshAgentCatalog: () => Promise<void>;
   serverGenerationActive: boolean;
   agentRuns: Record<string, AgentRun | null>;
   agentRunErrors: Record<string, boolean>;
@@ -411,6 +582,8 @@ export function useConversationController(
     userRole,
     onSessionPromoted,
     initialAppContext,
+    runtimeFocus,
+    disableLlmPreferencePersistence = false,
   } = args;
   // `online` is Internet-only.  Conversation REST/WebSocket transport uses
   // the physical route so a LAN AoiTalk server remains usable without WAN.
@@ -424,7 +597,10 @@ export function useConversationController(
   const networkServerCheckedAt = useNetworkStore(
     (state) => state.serverCheckedAt,
   );
-  const { isFocused, focusEpoch } = useConversationRuntimeFocus();
+  const authOwner = JSON.stringify([isAuthenticated, userId ?? null]);
+  const authOwnerRef = useRef(authOwner);
+  authOwnerRef.current = authOwner;
+  const { isFocused, focusEpoch } = useConversationRuntimeFocus(runtimeFocus);
   const focusedRef = useRef(isFocused);
   const focusEpochRef = useRef(focusEpoch);
   focusedRef.current = isFocused;
@@ -443,6 +619,7 @@ export function useConversationController(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [runtimeScopeSignal, setRuntimeScopeSignal] = useState(0);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWaiting, setIsWaiting] = useState(false);
   const {
@@ -479,22 +656,47 @@ export function useConversationController(
   const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);
   const [agentRuns, setAgentRuns] = useState<Record<string, AgentRun | null>>({});
   const [agentRunErrors, setAgentRunErrors] = useState<Record<string, boolean>>({});
+  const [agentCatalog, setAgentCatalog] = useState<ConversationAgent[]>([]);
+  const [agentCatalogLoading, setAgentCatalogLoading] = useState(false);
+  const agentCatalogRequestRef = useRef(0);
   const wsRef = useRef<ChatWebSocket>(new ChatWebSocket());
+  const connectionGenerationRef = useRef(0);
   const generationEventGateRef = useRef(new ConversationGenerationEventGate());
   const streamBufferRef = useRef<StreamBuffer | null>(null);
   const jobPollersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
   const jobPollerStopsRef = useRef<Record<string, () => void>>({});
   const jobPollFlightsRef = useRef(new Set<string>());
   const jobPollingLifecycleRef = useRef(0);
+  const pendingDeepResearchStartsRef = useRef(
+    new Map<
+      string,
+      {
+        clientRequestId: string | null;
+        storageAddress: DeepResearchPendingStartStorageAddress | null;
+        promise: Promise<void> | null;
+        jobId?: string;
+      }
+    >(),
+  );
   const mountedRef = useRef(true);
   const activeGenerationSessionRef = useRef(sessionId);
   const generationLifecycleRef = useRef(0);
+  const generationRestoreEpochRef = useRef(0);
   activeGenerationSessionRef.current = sessionId;
+  const onSessionPromotedRef = useRef(onSessionPromoted);
+  onSessionPromotedRef.current = onSessionPromoted;
+  const appBindingRouteKeyRef = useRef("");
+  appBindingRouteKeyRef.current = JSON.stringify([
+    sessionId, userId ?? null, initialAppContext?.appId ?? null,
+    initialAppContext?.appTargetId ?? null, initialAppContext?.projectId ?? null,
+  ]);
   const loadRequestRef = useRef(0);
   const failedCancelledMessageFlightsRef = useRef(
     new Map<string, Promise<ConversationMessage>>(),
   );
   const scheduledRefreshCancelRef = useRef<(() => void) | null>(null);
+  const responseRefreshOwnerRef = useRef<ResponseRefreshOwner | null>(null);
+  const responseRefreshStartRef = useRef(0);
   const terminalRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -504,6 +706,9 @@ export function useConversationController(
   const refreshFlightRef = useRef<{
     sessionId: string | null | undefined;
     requestId: number;
+    focusEpoch: number;
+    authOwner: string;
+    owner?: ResponseRefreshOwner;
     promise: Promise<void>;
   } | null>(null);
   const titleGenerationInFlightRef = useRef(new Set<string>());
@@ -517,9 +722,24 @@ export function useConversationController(
   );
   const responseModelOptionsRef = useRef<ChatResponseModelOption[]>([]);
   const responseTargetRef = useRef<ChatResponseTarget>({ kind: "server" });
-  const appContextAttemptRef = useRef<string | null>(null);
   responseModelOptionsRef.current = responseModelOptions;
   responseTargetRef.current = responseTarget;
+
+  const sessionAgentRequiresServer = (value: ConversationSession | null): boolean =>
+    Boolean(value?.agent_id || value?.agent_binding_pending);
+
+  useEffect(() => {
+    if (!sessionAgentRequiresServer(session)) return;
+    if (responseTargetRef.current.kind !== "direct") return;
+    // Agent-owned sessions always execute through the canonical Server path.
+    // Clear only this session's UI selection; global Direct preferences remain
+    // untouched for Character-only chats.
+    const serverTarget: ChatResponseTarget = { kind: "server" };
+    responseTargetRef.current = serverTarget;
+    setResponseTarget(serverTarget);
+    setEffectiveGeneration(null);
+    setLlmSelectionMessage("Agent付きChatではServerモデルを使用します。");
+  }, [session?.agent_binding_pending, session?.agent_id]);
 
   if (!streamBufferRef.current) {
     streamBufferRef.current = createStreamBuffer({
@@ -556,6 +776,8 @@ export function useConversationController(
       llmPreferenceHydrationRef.current += 1;
       streamBufferRef.current?.flush("unmount");
       scheduledRefreshCancelRef.current?.();
+      responseRefreshOwnerRef.current = null;
+      responseRefreshStartRef.current += 1;
       if (terminalRefreshTimerRef.current) {
         clearTimeout(terminalRefreshTimerRef.current);
         terminalRefreshTimerRef.current = null;
@@ -572,6 +794,8 @@ export function useConversationController(
     return () => {
       scheduledRefreshCancelRef.current?.();
       scheduledRefreshCancelRef.current = null;
+      responseRefreshOwnerRef.current = null;
+      responseRefreshStartRef.current += 1;
       if (terminalRefreshTimerRef.current) {
         clearTimeout(terminalRefreshTimerRef.current);
         terminalRefreshTimerRef.current = null;
@@ -581,7 +805,7 @@ export function useConversationController(
       terminalRefreshCancelFallbackRef.current = false;
       terminalRefreshSequenceRef.current += 1;
     };
-  }, [sessionId]);
+  }, [sessionId, authOwner]);
 
   const sessionKind = useMemo(() => inferSessionKind(session), [session]);
   const effectiveProjectId = session ? session.project_id : selectedProjectId;
@@ -598,7 +822,9 @@ export function useConversationController(
         (message) =>
           message.role === "user" &&
           Boolean(message.metadata?.local_only) &&
-          Boolean(message.metadata?.pending),
+          (Boolean(message.metadata?.pending) ||
+            Boolean(message.metadata?.persistence_error) ||
+            message.metadata?.message_state === "direct-failed"),
       ).length,
     [messages],
   );
@@ -654,6 +880,109 @@ export function useConversationController(
     () => selectVisibleMessages(messages, branchSelections),
     [branchSelections, messages],
   );
+  const agentCatalogScope = useMemo(
+    () => ({
+      // A local/offline session is not yet an ACL-visible server session;
+      // use the project catalog so new offline chats retain first choices.
+      sessionId: session && !session.is_local_only ? session.id : null,
+      projectId: effectiveProjectId ?? null,
+    }),
+    [effectiveProjectId, session?.id, session?.is_local_only],
+  );
+
+  const refreshAgentCatalog = useCallback(async () => {
+    if (!isAuthenticated) {
+      setAgentCatalog([]);
+      return;
+    }
+    // Keep older test/adaptor repository shims compatible while the Agent
+    // catalog capability rolls out independently from core Chat transport.
+    if (typeof conversationsRepo.listAgents !== "function") return;
+    const requestId = ++agentCatalogRequestRef.current;
+    setAgentCatalogLoading(true);
+    try {
+      const acceptedScope = await readConversationRefreshScope();
+      const acceptedKey = JSON.stringify([
+        acceptedScope.auth,
+        acceptedScope.server,
+        agentCatalogScope,
+      ]);
+      const agents = await conversationsRepo.listAgents({
+        forceRefresh: true,
+        ...agentCatalogScope,
+      });
+      const currentScope = await readConversationRefreshScope();
+      const currentKey = JSON.stringify([
+        currentScope.auth,
+        currentScope.server,
+        agentCatalogScope,
+      ]);
+      if (
+        mountedRef.current &&
+        requestId === agentCatalogRequestRef.current &&
+        currentKey === acceptedKey
+      ) {
+        setAgentCatalog(agents);
+      }
+    } finally {
+      if (mountedRef.current) setAgentCatalogLoading(false);
+    }
+  }, [agentCatalogScope, isAuthenticated]);
+
+  useEffect(() => {
+    const requestId = ++agentCatalogRequestRef.current;
+    let active = true;
+    // Clear UI candidates at every auth/server/scope transition. The bound
+    // session display is carried separately by session.agent_display_name.
+    setAgentCatalog([]);
+    if (!isAuthenticated) {
+      setAgentCatalog([]);
+      setAgentCatalogLoading(false);
+      return () => {
+        active = false;
+      };
+    }
+    if (typeof conversationsRepo.listAgents !== "function") {
+      setAgentCatalog([]);
+      setAgentCatalogLoading(false);
+      return () => {
+        active = false;
+      };
+    }
+    setAgentCatalogLoading(true);
+    void (async () => {
+      const acceptedScope = await readConversationRefreshScope();
+      const acceptedKey = JSON.stringify([
+        acceptedScope.auth,
+        acceptedScope.server,
+        agentCatalogScope,
+      ]);
+      const agents = await conversationsRepo.listAgents({
+        ...agentCatalogScope,
+      });
+      const currentScope = await readConversationRefreshScope();
+      const currentKey = JSON.stringify([
+        currentScope.auth,
+        currentScope.server,
+        agentCatalogScope,
+      ]);
+      if (
+        active &&
+        mountedRef.current &&
+        requestId === agentCatalogRequestRef.current &&
+        currentKey === acceptedKey
+      ) {
+        setAgentCatalog(agents);
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        if (active && mountedRef.current) setAgentCatalogLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [agentCatalogScope, authOwner, isAuthenticated, networkServerCheckedAt]);
 
   const loadAgentRun = useCallback(
     (runId: string) => {
@@ -685,18 +1014,21 @@ export function useConversationController(
   );
 
   useEffect(() => {
+    // Completed replies persist only the AgentRun identity. Hydrate a bounded
+    // recent set so the row can derive its Work link from the ACL-scoped run
+    // projection; older/missing runs stay invisible rather than guessed.
     const runIds = [
       ...new Set(
         visibleMessages
           .filter(
             (message) =>
               message.role === "assistant" &&
-              message.metadata?.generation_status === "cancelled",
+              typeof message.metadata?.agent_run_id === "string",
           )
           .map((message) => String(message.metadata?.agent_run_id ?? "").trim())
           .filter(Boolean),
       ),
-    ];
+    ].slice(-64);
     for (const runId of runIds) {
       if (agentRuns[runId] !== undefined) continue;
       loadAgentRun(runId);
@@ -776,7 +1108,7 @@ export function useConversationController(
               targetSession.id,
               generatedTitle,
               "llm",
-              Boolean(targetSession.user_id),
+              Boolean(targetSession.user_id && !targetSession.is_local_only),
             );
             titleApplied = true;
           }
@@ -792,7 +1124,7 @@ export function useConversationController(
                 targetSession.id,
                 fallbackTitle,
                 "fallback",
-                Boolean(targetSession.user_id),
+                Boolean(targetSession.user_id && !targetSession.is_local_only),
               );
             } catch {
               // fallback titleの保存失敗も会話本文の成功を壊さない。
@@ -813,7 +1145,7 @@ export function useConversationController(
       titleMessages: ConversationMessage[],
     ) => {
       if (
-        !targetSession.user_id ||
+        !targetSession.user_id || targetSession.is_local_only ||
         !shouldGenerateConversationTitle(targetSession, titleMessages) ||
         titleGenerationInFlightRef.current.has(targetSession.id)
       ) {
@@ -842,17 +1174,32 @@ export function useConversationController(
     if (!sessionId) return;
     const requestId = ++loadRequestRef.current;
     const isCurrentRequest = () =>
-      mountedRef.current && requestId === loadRequestRef.current;
+      mountedRef.current && requestId === loadRequestRef.current &&
+      activeGenerationSessionRef.current === sessionId && authOwnerRef.current === authOwner;
     setLoading(true);
     setError(null);
     try {
-      const [localSession, localMessages] = await Promise.all([
-        conversationsRepo.getSessionLocal(sessionId),
-        conversationsRepo.listMessagesLocal(sessionId),
-      ]);
+      const scope = await readConversationRefreshScope();
       if (!isCurrentRequest()) return;
+      const isCurrentScope = async () => {
+        if (!(await isConversationRefreshScopeCurrent(scope))) {
+          if (isCurrentRequest()) {
+            setError("接続先またはアカウントが変わりました。会話を再読込してください。");
+            setLoading(false);
+          }
+          return false;
+        }
+        return isCurrentRequest();
+      };
+      const {
+        sessionId: effectiveSessionId, session: localSession, messages: localMessages,
+      } = await loadConversationLocalData(sessionId);
+      if (!(await isCurrentScope())) return;
       setSession(localSession);
       setMessages(localMessages);
+      if (effectiveSessionId !== sessionId) {
+        onSessionPromotedRef.current?.(effectiveSessionId);
+      }
 
       const hasLocalData = Boolean(localSession) || localMessages.length > 0;
       if (hasLocalData || !isAuthenticated) {
@@ -861,18 +1208,19 @@ export function useConversationController(
       if (!isAuthenticated) return;
 
       // Opening a session acknowledges any completed App-agent response.
-      void conversationsRepo.markSessionRead(sessionId);
+      void conversationsRepo.markSessionRead(effectiveSessionId);
 
       // 新規チャットは端末内で先に作る。local-only IDへresumeSessionを投げると、
       // 画面表示直後に不要なサーバー待ちと404を発生させるため、送信時の昇格へ委ねる。
-      if (localSession && !localSession.user_id) return;
+      if (localSession && (!localSession.user_id || localSession.is_local_only)) return;
 
       const refreshRemote = async () => {
         try {
           // resumeはsession metadataだけを回収する。message payloadはSQLiteの
           // cursorを正本にしたfull/delta endpointへ一本化する。
-          const remote = await loadConversationRemoteData(sessionId);
-          if (!isCurrentRequest()) return;
+          if (!(await isCurrentScope())) return;
+          const remote = await loadConversationRemoteData(effectiveSessionId);
+          if (!(await isCurrentScope())) return;
           setSession(remote.session);
           setMessages((current) =>
             areConversationMessagesEqual(current, remote.messages)
@@ -903,36 +1251,54 @@ export function useConversationController(
       if (!isCurrentRequest()) return;
       setError(loadError instanceof Error ? loadError.message : "会話を読み込めませんでした。");
       setLoading(false);
+    } finally {
+      // A scope mismatch may not trigger another route render (server settings
+      // can change independently). Never leave that current view loading.
+      if (isCurrentRequest()) setLoading(false);
     }
-  }, [isAuthenticated, maybeGenerateServerTitle, sessionId]);
+  }, [authOwner, isAuthenticated, maybeGenerateServerTitle, sessionId]);
 
-  const refreshFromServer = useCallback(() => {
-    const requestedSessionId = sessionId;
-    const requestId = loadRequestRef.current;
+  const isCurrentResponseOwner = useCallback((owner: ResponseRefreshOwner) =>
+    mountedRef.current && focusedRef.current &&
+    responseRefreshOwnerRef.current === owner &&
+    focusEpochRef.current === owner.focusEpoch &&
+    loadRequestRef.current === owner.requestId &&
+    activeGenerationSessionRef.current === owner.sourceSessionId &&
+    authOwnerRef.current === owner.authOwner,
+  []);
+
+  const refreshFromServer = useCallback((
+    targetSessionId?: string,
+    owner?: ResponseRefreshOwner,
+  ) => {
+    const requestedSessionId = targetSessionId ?? sessionId;
+    const sourceSessionId = owner?.sourceSessionId ?? sessionId;
+    const requestId = owner?.requestId ?? loadRequestRef.current;
+    const runtimeEpoch = owner?.focusEpoch ?? focusEpochRef.current;
+    const requestedAuthOwner = owner?.authOwner ?? authOwner;
+    const isCurrentRequest = () =>
+      mountedRef.current && focusedRef.current &&
+      requestId === loadRequestRef.current &&
+      focusEpochRef.current === runtimeEpoch &&
+      authOwnerRef.current === requestedAuthOwner &&
+      activeGenerationSessionRef.current === sourceSessionId &&
+      (!owner || isCurrentResponseOwner(owner));
+    if (!isCurrentRequest()) return Promise.resolve();
     const existing = refreshFlightRef.current;
     if (
-      existing &&
-      existing.sessionId === requestedSessionId &&
-      existing.requestId === requestId
-    ) {
-      return existing.promise;
-    }
+      existing && existing.sessionId === requestedSessionId &&
+      existing.requestId === requestId && existing.focusEpoch === runtimeEpoch &&
+      existing.authOwner === requestedAuthOwner && existing.owner === owner
+    ) return existing.promise;
 
     const flight = (async () => {
-      const isCurrentRequest = () =>
-        mountedRef.current &&
-        requestId === loadRequestRef.current &&
-        activeGenerationSessionRef.current === requestedSessionId;
+      const scope = owner?.scope ?? await readConversationRefreshScope();
+      if (!isCurrentRequest() || !(await isConversationRefreshScopeCurrent(scope)) || !isCurrentRequest()) return;
       if (!requestedSessionId || !isAuthenticated) {
         if (requestedSessionId) {
-          const localMessages =
-            await conversationsRepo.listMessagesLocal(requestedSessionId);
-          if (isCurrentRequest()) {
-            setMessages((current) =>
-              areConversationMessagesEqual(current, localMessages)
-                ? current
-                : localMessages,
-            );
+          const localMessages = await conversationsRepo.listMessagesLocal(requestedSessionId);
+          if (await isConversationRefreshScopeCurrent(scope) && isCurrentRequest()) {
+            setMessages((current) => areConversationMessagesEqual(current, localMessages) ? current : localMessages);
           }
         }
         return;
@@ -942,26 +1308,20 @@ export function useConversationController(
           conversationsRepo.refreshMessagesDetailed(requestedSessionId),
           conversationsRepo.getSessionLocal(requestedSessionId),
         ]);
+        if (!(await isConversationRefreshScopeCurrent(scope)) || !isCurrentRequest()) return;
         const localMessages = refreshResult.messages;
-        if (!isCurrentRequest()) return;
-        const messagesChanged = !areConversationMessagesEqual(
-          messagesStateRef.current,
-          localMessages,
-        );
-        const sessionChanged = !areConversationSessionsEqual(
-          sessionStateRef.current,
-          localSession,
-        );
+        const messagesChanged = !areConversationMessagesEqual(messagesStateRef.current, localMessages);
+        const sessionChanged = !areConversationSessionsEqual(sessionStateRef.current, localSession);
         if (messagesChanged) setMessages(localMessages);
         if (sessionChanged) setSession(localSession);
-        if (messagesChanged || sessionChanged) {
-          setLastRefreshAt(new Date().toISOString());
+        if (messagesChanged || sessionChanged) setLastRefreshAt(new Date().toISOString());
+        if (localMessages.some((message) => message.role === "user" && !message.metadata?.local_only) &&
+            !localMessages.some((message) => message.role === "user" && message.metadata?.pending)) {
+          setError((current) => clearResolvedServerPendingError(current));
         }
-        if (localSession) {
-          void maybeGenerateServerTitle(localSession, localMessages);
-        }
+        if (localSession) void maybeGenerateServerTitle(localSession, localMessages);
       } catch (refreshError) {
-        if (isLikelyConnectivityFailure(refreshError)) {
+        if (isCurrentRequest() && await isConversationRefreshScopeCurrent(scope) && isCurrentRequest() && isLikelyConnectivityFailure(refreshError)) {
           useNetworkStore.getState().setServerReachable(false);
         }
         throw refreshError;
@@ -969,21 +1329,14 @@ export function useConversationController(
     })();
     let trackedFlight: Promise<void>;
     trackedFlight = flight.finally(() => {
-      if (refreshFlightRef.current?.promise === trackedFlight) {
-        refreshFlightRef.current = null;
-      }
+      if (refreshFlightRef.current?.promise === trackedFlight) refreshFlightRef.current = null;
     });
     refreshFlightRef.current = {
-      sessionId: requestedSessionId,
-      requestId,
-      promise: trackedFlight,
+      sessionId: requestedSessionId, requestId, focusEpoch: runtimeEpoch,
+      authOwner: requestedAuthOwner, owner, promise: trackedFlight,
     };
     return trackedFlight;
-  }, [
-    isAuthenticated,
-    maybeGenerateServerTitle,
-    sessionId,
-  ]);
+  }, [authOwner, isAuthenticated, isCurrentResponseOwner, maybeGenerateServerTitle, sessionId]);
 
   const upsertServerMessage = useCallback((message: ConversationMessage) => {
     setMessages((current) => {
@@ -1086,17 +1439,30 @@ export function useConversationController(
     setStreamContent("");
   }, [completeServerGeneration, finalizeStream, getGenerationIdentity]);
 
-  const restoreServerGenerationState = useCallback(async () => {
-    if (!sessionId || !isAuthenticated || !session?.user_id) return;
-    const requestedSessionId = sessionId;
+  const restoreServerGenerationState = useCallback(async (targetSessionId?: string, owner?: ResponseRefreshOwner) => {
+    const requestedSessionId = targetSessionId ?? sessionId;
+    if (!requestedSessionId || !isAuthenticated) return;
+    const runtimeEpoch = focusEpochRef.current;
     const requestGeneration = ++generationLifecycleRef.current;
+    const isCurrentRequest = () => mountedRef.current && focusedRef.current &&
+      focusEpochRef.current === runtimeEpoch && authOwnerRef.current === authOwner &&
+      activeGenerationSessionRef.current === requestedSessionId &&
+      generationLifecycleRef.current === requestGeneration &&
+      (!owner || isCurrentResponseOwner(owner));
+    if (!isCurrentRequest()) return;
+    const scope = owner?.scope ?? await readConversationRefreshScope();
+    if (!(await isConversationRefreshScopeCurrent(scope)) || !isCurrentRequest()) return;
+    const requestedSession =
+      requestedSessionId === sessionId
+        ? session
+        : await conversationsRepo.getSessionLocal(requestedSessionId).catch(
+            () => null,
+          );
+    if (!requestedSession?.user_id || requestedSession.is_local_only) return;
+    if (!isCurrentRequest()) return;
     try {
       const status = await chatApi.getGenerationStatus(requestedSessionId);
-      if (
-        !mountedRef.current ||
-        activeGenerationSessionRef.current !== requestedSessionId ||
-        generationLifecycleRef.current !== requestGeneration
-      ) {
+      if (!(await isConversationRefreshScopeCurrent(scope)) || !isCurrentRequest()) {
         return;
       }
       if (!status.running) {
@@ -1117,7 +1483,7 @@ export function useConversationController(
         sessionId: identity.sessionId,
         lifecycleId: identity.lifecycleId,
       });
-      if (!waiting) markServerGenerationStreaming();
+      if (!waiting && !markServerGenerationStreaming()) return;
       setIsWaiting(waiting);
       setIsStreaming(!waiting);
       setActiveTool(status.active_tool ?? null);
@@ -1126,16 +1492,19 @@ export function useConversationController(
       // WebSocketの後続イベントで復元できるため、状態取得失敗は非致命。
     }
   }, [
+    authOwner,
+    isCurrentResponseOwner,
     clearServerGenerationState,
     beginServerGeneration,
     isAuthenticated,
     markServerGenerationStreaming,
-    session?.user_id,
+    session,
     sessionId,
   ]);
 
   const stopGeneration = useCallback(async () => {
     if (!sessionId || !serverGenerationActive) return;
+    generationRestoreEpochRef.current += 1;
     generationLifecycleRef.current += 1;
     const stoppingIdentity = markServerGenerationCancelling();
     if (!stoppingIdentity) return;
@@ -1261,6 +1630,8 @@ export function useConversationController(
   const cancelScheduledRefresh = useCallback(() => {
     scheduledRefreshCancelRef.current?.();
     scheduledRefreshCancelRef.current = null;
+    responseRefreshOwnerRef.current = null;
+    responseRefreshStartRef.current += 1;
     terminalRefreshCancelFallbackRef.current = false;
     terminalRefreshSequenceRef.current += 1;
   }, []);
@@ -1303,25 +1674,51 @@ export function useConversationController(
     [cancelScheduledRefresh, refreshFromServer],
   );
 
-  const scheduleRefresh = useCallback(() => {
-    if (!focusedRef.current) return () => undefined;
+  const scheduleRefresh = useCallback((
+    targetSessionId = sessionId,
+    acceptedScope?: ConversationRefreshScope,
+  ) => {
+    if (!targetSessionId || !sessionId || !focusedRef.current ||
+        activeGenerationSessionRef.current !== sessionId || authOwnerRef.current !== authOwner) return;
     cancelScheduledRefresh();
-    const cancel = nextRefreshTimers(() => {
-      if (!focusedRef.current) return;
-      void refreshFromServer()
-        .catch(() => undefined)
-        .finally(() => setIsWaiting(false));
-    });
-    scheduledRefreshCancelRef.current = cancel;
-    return cancel;
-  }, [cancelScheduledRefresh, refreshFromServer]);
+    const start = responseRefreshStartRef.current;
+    const requestId = loadRequestRef.current;
+    const runtimeEpoch = focusEpochRef.current;
+    void (async () => {
+      const scope = acceptedScope ?? await readConversationRefreshScope();
+      if (responseRefreshStartRef.current !== start) return;
+      const owner: ResponseRefreshOwner = {
+        sourceSessionId: sessionId, remoteSessionId: targetSessionId,
+        requestId, focusEpoch: runtimeEpoch, scope, authOwner,
+      };
+      responseRefreshOwnerRef.current = owner;
+      if (!(await isConversationRefreshScopeCurrent(scope)) || !isCurrentResponseOwner(owner)) return;
+      const restoreEpoch = generationRestoreEpochRef.current;
+      let reconciliationFlight: Promise<void> | null = null;
+      scheduledRefreshCancelRef.current = startResponseReconciliation({
+        isCurrent: () => isCurrentResponseOwner(owner),
+        delays: [0, ...SERVER_RESPONSE_REFRESH_DELAYS_MS],
+        trackTimer: () => conversationPerformanceDiagnostics.trackActive("timer", "conversation-refresh"),
+        refresh: () => {
+          if (reconciliationFlight) return reconciliationFlight;
+          reconciliationFlight = (async () => {
+            await refreshFromServer(owner.remoteSessionId, owner);
+            // Stop cancels generation recovery, not durable-history reads.
+            if (isCurrentResponseOwner(owner) && generationRestoreEpochRef.current === restoreEpoch) {
+              await restoreServerGenerationState(owner.remoteSessionId, owner);
+            }
+          })().finally(() => { reconciliationFlight = null; });
+          return reconciliationFlight;
+        },
+      });
+    })().catch(() => undefined);
+  }, [authOwner, cancelScheduledRefresh, isCurrentResponseOwner, refreshFromServer, restoreServerGenerationState, sessionId]);
 
-  const recoverFocusedRuntime = useCallback((epoch: number) => {
-    void restoreServerGenerationState();
-    if (epoch > 1) {
-      void refreshFromServer().catch(() => undefined);
-    }
-  }, [refreshFromServer, restoreServerGenerationState]);
+  const recoverFocusedRuntime = useCallback(() => {
+    // A promoted route may keep the same navigation focus epoch. Every new
+    // owner needs its own read-only cadence even when no socket reconnects.
+    scheduleRefresh();
+  }, [scheduleRefresh]);
 
   const stopBlurredRuntime = useCallback(() => {
     cancelScheduledRefresh();
@@ -1344,7 +1741,8 @@ export function useConversationController(
   }, [cancelScheduledRefresh]);
 
   useConversationFocusRecovery({
-    enabled: Boolean(sessionId && session?.user_id),
+    enabled: Boolean(!loading && isAuthenticated && sessionId && session?.id === sessionId && session.user_id && !session.is_local_only),
+    recoveryKey: JSON.stringify([sessionId, authOwner]),
     focusEpoch,
     isFocused,
     onRecover: recoverFocusedRuntime,
@@ -1353,6 +1751,7 @@ export function useConversationController(
 
   const persistLlmPreferences = useCallback(
     (patch: Partial<ChatLlmPreferences>) => {
+      if (disableLlmPreferencePersistence) return;
       const scope = llmPreferenceScopeRef.current;
       if (!scope) return;
       const next: ChatLlmPreferences = {
@@ -1370,7 +1769,7 @@ export function useConversationController(
         );
       });
     },
-    [],
+    [disableLlmPreferencePersistence],
   );
 
   const refreshResponseModelOptionsForScope = useCallback(
@@ -1385,7 +1784,10 @@ export function useConversationController(
           : getCachedLlmModelCatalog(scope));
         if (llmPreferenceScopeRef.current !== scope) return;
 
-        const options = buildResponseModelOptions(catalog);
+        const savedTarget = responseTargetRef.current.kind === "server"
+          ? responseTargetRef.current.responseModel
+          : undefined;
+        const options = buildResponseModelOptions(catalog, savedTarget);
         responseModelOptionsRef.current = options;
         setResponseModelOptions(options);
 
@@ -1403,7 +1805,13 @@ export function useConversationController(
           responseTarget: normalized.target,
         });
       } catch {
-        // offline/timeoutでもcache候補を消さない。
+        // offline/timeoutでもcache候補と現在の選択を消さない。次回の
+        // 明示更新で同じIDを再評価できるよう、状態だけ通知する。
+        if (llmPreferenceScopeRef.current === scope) {
+          setLlmSelectionMessage(
+            "モデル一覧を更新できませんでした。現在の選択を保持しています。",
+          );
+        }
       } finally {
         if (llmPreferenceScopeRef.current === scope) {
           setResponseModelOptionsLoading(false);
@@ -1425,16 +1833,25 @@ export function useConversationController(
 
   const changeResponseTarget = useCallback(
     (value: ChatResponseTarget) => {
-      const target = normalizeResponseTarget(value);
+      const normalized = normalizeResponseTarget(value);
+      const blockedDirect = sessionAgentRequiresServer(session) && normalized.kind === "direct";
+      const target = isProtectedConversationRoot(session)
+        ? { kind: "server" } as const
+        : blockedDirect
+        ? { kind: "server" } as const
+        : normalized;
+      if (blockedDirect) {
+        setLlmSelectionMessage("Agent付きChatではServerモデルを使用します。");
+      }
       responseTargetRef.current = target;
       setResponseTarget(target);
       // 次の応答モデルを変更したら、前回生成の実効route表示を一旦外し、
       // 新しい選択をheaderへ戻す。
       setEffectiveGeneration(null);
       setLlmSelectionMessage(null);
-      persistLlmPreferences({ responseTarget: target });
+      if (!blockedDirect) persistLlmPreferences({ responseTarget: target });
     },
-    [persistLlmPreferences],
+    [persistLlmPreferences, session],
   );
 
   const selectedServerEffort = useMemo(
@@ -1503,6 +1920,55 @@ export function useConversationController(
     },
     [pendingMessages, runState, session, sessionId],
   );
+
+  const changeAgent = useCallback(
+    async (agentId: string | null) => {
+      if (!sessionId || !session) {
+        throw new Error("会話セッションの読み込み完了後にAgentを変更できます。");
+      }
+      if (session.is_group_chat) {
+        throw new Error("グループチャットにはprimary Agentを紐付けできません。既存の参加Agentを使用します。");
+      }
+      if (runState !== "idle" || pendingMessages > 0) {
+        throw new Error("未送信メッセージの処理と応答の生成・送信が完了してからAgentを変更してください。");
+      }
+      if (!tryStartConversationOperation(exclusiveOperationRef, "agent-update")) {
+        throw new Error("別の会話操作が完了してからAgentを変更してください。");
+      }
+      try {
+        const updated = await conversationsRepo.bindAgent(sessionId, agentId);
+        if (mountedRef.current) setSession(updated);
+      } catch (error) {
+        // The repository refreshes canonical session metadata on a stale CAS
+        // response. Re-read that local projection before surfacing the
+        // conflict so the header shows the server Agent without retargeting
+        // the queued message snapshot.
+        if (error instanceof AgentBindingConflictError) {
+          const canonical = await conversationsRepo.getSessionLocal(sessionId).catch(() => null);
+          if (
+            canonical &&
+            mountedRef.current &&
+            activeGenerationSessionRef.current === sessionId &&
+            authOwnerRef.current === authOwner
+          ) {
+            setSession(canonical);
+          }
+        }
+        throw error;
+      } finally {
+        finishConversationOperation(exclusiveOperationRef, "agent-update");
+      }
+    },
+    [authOwner, pendingMessages, runState, session, sessionId],
+  );
+
+  const adoptServerAgent = useCallback(async () => {
+    if (!sessionId || !session) {
+      throw new Error("会話セッションの読み込み完了後にServerのAgentを確認できます。");
+    }
+    const updated = await conversationsRepo.adoptServerAgentBinding(sessionId);
+    if (mountedRef.current) setSession(updated);
+  }, [session, sessionId]);
 
   const updateSessionTitle = useCallback(
     async (nextTitle: string) => {
@@ -1574,10 +2040,12 @@ export function useConversationController(
       if (runState !== "idle" || pendingMessages > 0) {
         throw new Error("送信・同期の完了後にAppを選択してください。");
       }
-      if (!context && session.user_id === "") return;
+      if (!context && (!session.user_id || session.is_local_only)) return;
+      const routeKey = appBindingRouteKeyRef.current;
       const updated = await chatRepo.bindAppContext(sessionId, context);
+      if (!mountedRef.current || appBindingRouteKeyRef.current !== routeKey) return;
       if (updated.id !== sessionId) onSessionPromoted?.(updated.id);
-      if (mountedRef.current) setSession(updated);
+      setSession(updated);
     },
     [onSessionPromoted, pendingMessages, runState, session, sessionId],
   );
@@ -1607,13 +2075,67 @@ export function useConversationController(
 
   const forkConversation = useCallback(
     async (fromMessageId: string, title?: string | null): Promise<string> => {
-      if (!sessionId || !isAuthenticated) {
-        throw new Error("フォークにはログインが必要です。");
+      if (!sessionId) {
+        throw new Error("フォーク元の会話が見つかりません。");
       }
-      const forked = await chatRepo.forkSession(sessionId, fromMessageId, title);
+
+      const localMessages = await conversationsRepo.listMessagesLocal(sessionId);
+      const fromIndex = localMessages.findIndex(
+        (message) => message.id === fromMessageId,
+      );
+      if (fromIndex < 0) {
+        throw new Error("フォーク元のメッセージが見つかりません。");
+      }
+
+      const sourceMessage = localMessages[fromIndex];
+      const canUseServerFork =
+        isAuthenticated &&
+        !String(sourceMessage.id).startsWith("temp-") &&
+        !sourceMessage.metadata?.local_only &&
+        !sourceMessage.metadata?.pending;
+      if (canUseServerFork) {
+        const forked = await chatRepo.forkSession(sessionId, fromMessageId, title);
+        return forked.id;
+      }
+
+      const sourceSession =
+        session ?? (await conversationsRepo.getSessionLocal(sessionId));
+      if (!sourceSession) {
+        throw new Error("フォーク元の会話が見つかりません。");
+      }
+
+      const forked = await conversationsRepo.createLocalSession(
+        sourceSession.character_name,
+        sourceSession.project_id ?? null,
+      );
+      const forkTitle =
+        title?.trim() ||
+        (sourceSession.title
+          ? `${sourceSession.title} の分岐`
+          : "分岐したチャット");
+      await conversationsRepo.updateTitle(forked.id, forkTitle, {
+        syncServer: false,
+      });
+
+      for (const source of localMessages.slice(0, fromIndex + 1)) {
+        const metadata: Record<string, unknown> = {
+          ...(source.metadata ?? {}),
+          local_only: true,
+          pending: false,
+          message_state: "persisted",
+        };
+        delete metadata.persistence_error;
+        delete metadata.upload_target_session_id;
+        await conversationsRepo.appendLocalMessage(
+          forked.id,
+          source.role,
+          source.content,
+          metadata,
+        );
+      }
       return forked.id;
     },
-    [isAuthenticated, sessionId],
+    [isAuthenticated, session, sessionId],
   );
 
   const getContextSnapshot = useCallback(
@@ -1635,15 +2157,27 @@ export function useConversationController(
       const sessionId = promotedSubmissionSessionsRef.current.get(sourceSessionId)
         ?? await getPromotedConversationSessionId(sourceSessionId).catch(() => null)
         ?? sourceSessionId;
-      const session = sessionStateRef.current?.id === sessionId
+      let session = sessionStateRef.current?.id === sessionId
         ? sessionStateRef.current : await conversationsRepo.getSessionLocal(sessionId);
+      if (session && !session.user_id) {
+        session =
+          (await conversationsRepo.backfillLocalSessionUserId(
+            session.id,
+            userId,
+          )) ?? session;
+      }
       const history = messagesStateRef.current;
       const cutoff = history.findIndex((message) => conversationMessageIdentity(message) === optimistic.id);
       const messages = cutoff >= 0 ? history.slice(0, cutoff) : history.filter((message) => (message.created_at ?? "") <= (optimistic.created_at ?? ""));
-      const promote = (remoteId: string) => {
+      const promote = async (remoteId: string) => {
+        await assertDirectScope();
         promotedSubmissionSessionsRef.current.set(sourceSessionId, remoteId);
         promoteMessages(sourceSessionId, remoteId);
-        onSessionPromoted?.(remoteId);
+        if (activeGenerationSessionRef.current === sourceSessionId &&
+            mountedRef.current && focusedRef.current && authOwnerRef.current === authOwner) {
+          scheduleRefresh(remoteId, scope);
+          onSessionPromotedRef.current?.(remoteId);
+        }
       };
       // The optimistic identity is persisted before any profile/network lookup.
       let localMessage = await conversationsRepo.appendLocalMessage(sessionId, "user", command.message.trim(), { ...optimistic.metadata, dispatch_auth_scope: scope.auth, dispatch_server_fingerprint: scope.server }, {
@@ -1666,7 +2200,11 @@ export function useConversationController(
         undefined,
         {
           sessionId,
-          authScope: userId ? `auth:${userId}` : isAuthenticated ? undefined : "anonymous",
+          authScope: resolveCharacterProfileAuthScope(
+            scope.auth,
+            session?.user_id,
+          ),
+          serverIdentity: scope.server,
           strict: true,
         },
       );
@@ -1675,7 +2213,19 @@ export function useConversationController(
           projectId: (command.projectId === undefined ? effectiveProjectId : command.projectId) ?? null,
           spaceId: useProjectStore.getState().selectedSpaceId,
         };
-        const requestedTarget = snapshotServerModelTarget(command.target ?? { kind: "server" }, responseModelOptionsRef.current);
+      const selectedTarget = resolveConversationDispatchTarget(
+        session,
+        command.target ?? { kind: "server" },
+        responseModelOptionsRef.current,
+      );
+        const agentRequiresServer = sessionAgentRequiresServer(session);
+        if (agentRequiresServer && command.retryMessageId && selectedTarget.kind === "direct") {
+          reportSendError("Agent付きChatの未送信入力はDirectで再試行できません。Serverへ接続して同じ入力を再送してください。");
+          return;
+        }
+        const requestedTarget = agentRequiresServer && selectedTarget.kind === "direct"
+          ? { kind: "server" as const }
+          : selectedTarget;
       const selectedAppId = command.appId ?? session?.app_id ?? null;
       const selectedAppTargetId =
         command.appTargetId ?? session?.app_target_id ?? null;
@@ -1695,7 +2245,7 @@ export function useConversationController(
         reportSendError("App context付きChatではDirect/端末モデルを利用できません。");
         return;
       }
-      if (appContextSelected && !session?.user_id) {
+      if (appContextSelected && (!session?.user_id || session.is_local_only)) {
         reportSendError("Appを紐付ける前にServerへ接続してください。");
         return;
       }
@@ -1712,10 +2262,15 @@ export function useConversationController(
       let fallbackFromServer = false;
       const serverTransportUnavailable =
         requestedTarget.kind === "server" &&
-        (!networkConnected || isServerKnownUnreachable());
+        shouldHoldServerDispatch({
+          networkConnected,
+          serverKnownUnreachable: isServerKnownUnreachable(),
+          userInitiated: true,
+        });
       const serverKnownUnreachable =
         requestedTarget.kind === "server" &&
         !appContextSelected &&
+        !agentRequiresServer &&
         !requiresServerFeature &&
         serverTransportUnavailable;
       if (requestedTarget.kind === "direct") {
@@ -1731,12 +2286,19 @@ export function useConversationController(
       const dispatchMetadata = buildPendingDispatchMetadata({
         message: text,
         projectId: command.projectId ?? effectiveProjectId,
+        contextProjectHintId: command.contextProjectHintId,
         appId: selectedAppId,
         appTargetId: selectedAppTargetId,
         includeProjectContext:
           command.includeProjectContext ??
           Boolean(command.projectId ?? effectiveProjectId),
         agentMode: command.agentMode ?? "confirm",
+        // `null` is an intentional unbound snapshot. Only an omitted field
+        // inherits the current session binding.
+        expectedAgentId:
+          command.expectedAgentId === undefined
+            ? session?.agent_id ?? null
+            : command.expectedAgentId,
         editMessageId: command.editMessageId,
         responseModel:
           requestedTarget.kind === "server"
@@ -1801,7 +2363,7 @@ export function useConversationController(
           if (!directHandoffPrepared) {
             await prepareDirectConversationHandoff({
               sessionId,
-              canStopServer: Boolean(isAuthenticated && session?.user_id &&
+              canStopServer: Boolean(isAuthenticated && session?.user_id && !session.is_local_only &&
                 networkConnected && !isServerKnownUnreachable()),
               signal,
               assertScope: assertDirectScope,
@@ -1876,7 +2438,7 @@ export function useConversationController(
           ),
           assistantMessage,
         ]);
-        if (assistantMessage.session_id !== sessionId) promote(assistantMessage.session_id);
+        if (assistantMessage.session_id !== sessionId) await promote(assistantMessage.session_id);
         if (session) {
           void maybeGenerateLocalTitle(
             session,
@@ -1962,12 +2524,12 @@ export function useConversationController(
         return;
       }
 
-      // Keep the local pending message, but do not even start a Server
-      // request when the physical path is absent or a recent transport
-      // failure is still inside its retry TTL.  This also protects the
-      // promotion/dispatch path from accidentally probing while offline.
+      // Keep the local pending message when the physical network path is absent.
+      // A user-initiated tap intentionally probes past a stale reachability
+      // failure; an actual transport failure is retained by the dispatch catch
+      // path and the outbox can resume it after reconnect.
       if (serverTransportUnavailable) {
-        reportSendError("AoiTalkサーバーへの接続を確認できるまで送信を保留します。");
+        reportSendError(SERVER_SEND_DEFERRED_ERROR);
         setIsWaiting(false);
         return;
       }
@@ -1980,14 +2542,14 @@ export function useConversationController(
       if (
         isAuthenticated &&
         requestedTarget.kind === "server" &&
-        !session?.user_id
+        (!session?.user_id || session.is_local_only)
       ) {
         try {
           const remoteSessionId = await flushPendingConversation(sessionId);
           if (remoteSessionId === sessionId) {
             throw new Error("ローカルチャットをServerへ接続できませんでした。");
           }
-          promote(remoteSessionId);
+          await promote(remoteSessionId);
         } catch (promotionError) {
           if (isLikelyConnectivityFailure(promotionError)) {
             useNetworkStore.getState().setServerReachable(false);
@@ -1996,7 +2558,7 @@ export function useConversationController(
             await getPromotedConversationSessionId(sessionId).catch(() => null);
           if (promotedSessionId) {
             // 別経路で既に昇格済み。その Server セッションへ切り替える。
-            promote(promotedSessionId);
+            await promote(promotedSessionId);
             setIsWaiting(false);
             return;
           }
@@ -2006,6 +2568,11 @@ export function useConversationController(
             : await getConfiguredFallbackMobileLlmSettings("server").catch(
                 () => null,
               );
+          if (agentRequiresServer) {
+            reportSendError("Agent付きChatはServerへ接続するまで送信を保留します。Directフォールバックは使用しません。");
+            setIsWaiting(false);
+            return;
+          }
           if (fallback && !canDispatchDirectCloud(networkOnline)) {
             await keepServerFallbackPending();
             return;
@@ -2040,6 +2607,11 @@ export function useConversationController(
       }
 
       if (!isAuthenticated) {
+        if (agentRequiresServer) {
+          reportSendError("Agent付きChatはログインしてServerへ接続してから送信してください。");
+          setIsWaiting(false);
+          return;
+        }
         const settings = await getMobileLlmSettings();
         const directMain = isDirectProvider(settings.provider)
           ? settings
@@ -2086,6 +2658,7 @@ export function useConversationController(
         isDirectProvider(settings.provider) &&
         canDispatchDirectCloud(networkOnline) &&
         !appContextSelected &&
+        !agentRequiresServer &&
         !requiresServerRuntime &&
         !forceServer
       ) {
@@ -2118,6 +2691,7 @@ export function useConversationController(
         isDirectProvider(settings.provider) &&
         !canDispatchDirectCloud(networkOnline) &&
         !appContextSelected &&
+        !agentRequiresServer &&
         !requiresServerRuntime &&
         !forceServer
       ) {
@@ -2176,7 +2750,7 @@ export function useConversationController(
               : message,
           ),
         );
-        scheduleRefresh();
+        scheduleRefresh(sessionId, scope);
       } catch (dispatchError) {
         if (dispatchedGeneration) completeServerGeneration(dispatchedGeneration);
         const connectivityFailure = isLikelyConnectivityFailure(dispatchError);
@@ -2224,7 +2798,7 @@ export function useConversationController(
           if (accepted) {
             reportSendError(null);
             setIsWaiting(false);
-            scheduleRefresh();
+            scheduleRefresh(sessionId, scope);
             return;
           }
 
@@ -2244,15 +2818,16 @@ export function useConversationController(
                 : message,
             ),
           );
-          reportSendError(
-            "送信結果を確認できませんでした。接続復旧後に自動確認します。",
-          );
+          reportSendError(SERVER_RESULT_UNCONFIRMED_ERROR);
+          scheduleRefresh(sessionId, scope);
           setIsWaiting(false);
           return;
         }
 
         const failedMetadata =
-          buildRetryableServerDispatchMetadata(dispatchErrorText);
+          buildRetryableServerDispatchMetadata(dispatchErrorText, undefined, {
+            serverResultUncertain: serverDispatchResultIsUncertain(dispatchError),
+          });
         await conversationsRepo.mergeMessageMetadata(
           localMessage.id,
           failedMetadata,
@@ -2274,6 +2849,7 @@ export function useConversationController(
       }
     },
     [
+      authOwner,
       isAuthenticated,
       networkOnline,
       networkConnected,
@@ -2298,11 +2874,24 @@ export function useConversationController(
     if (exclusiveOperationRef.current && exclusiveOperationRef.current !== "send" && exclusiveOperationRef.current !== "background-flush") {
       return Promise.reject(new Error("キャラクターまたはプロジェクトの変更が完了してから送信してください。"));
     }
-    const target = snapshotServerModelTarget(command.target ?? { kind: "server" }, responseModelOptionsRef.current);
+    const requestedTarget = resolveConversationDispatchTarget(
+      sessionStateRef.current,
+      command.target ?? { kind: "server" },
+      responseModelOptionsRef.current,
+    );
+    const agentRequiresServer = sessionAgentRequiresServer(sessionStateRef.current);
+    if (agentRequiresServer && command.retryMessageId && requestedTarget.kind === "direct") {
+      return Promise.reject(new Error("Agent付きChatの未送信入力はDirectで再試行できません。Serverへ接続して同じ入力を再送してください。"));
+    }
+    const target = agentRequiresServer && requestedTarget.kind === "direct"
+      ? { kind: "server" as const }
+      : requestedTarget;
     const id = command.retryMessageId ?? command.submissionId ?? `mobile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const retry = command.retryMessageId ? messagesStateRef.current.find((message) => message.id === id) : undefined;
     if (command.retryMessageId && (!retry || retry.role !== "user" || retry.content.trim() !== text ||
-      (!retry.metadata?.pending && retry.metadata?.message_state !== "direct-failed"))) {
+      (!retry.metadata?.pending &&
+        retry.metadata?.message_state !== "direct-failed" &&
+        retry.metadata?.message_state !== "local-draft"))) {
       return Promise.reject(new Error("この入力は再試行できません。履歴を確認してください。"));
     }
     const now = new Date().toISOString();
@@ -2310,6 +2899,12 @@ export function useConversationController(
       projectId: command.projectId === undefined ? effectiveProjectId : command.projectId,
       appId: command.appId ?? sessionStateRef.current.app_id,
       appTargetId: command.appTargetId ?? sessionStateRef.current.app_target_id,
+      // Preserve explicit null when retrying an unbound session. Nullish
+      // coalescing here would silently retarget the input to a later Agent.
+      expectedAgentId:
+        command.expectedAgentId === undefined
+          ? sessionStateRef.current.agent_id ?? null
+          : command.expectedAgentId,
       submissionId: command.submissionId ?? id,
     };
     const optimistic: ConversationMessage = { ...(retry ?? {}),
@@ -2320,9 +2915,11 @@ export function useConversationController(
         pending: isAuthenticated && target.kind === "server", message_state: "queued",
         delivery_route: target.kind, anonymous_only: !isAuthenticated,
         ...buildPendingDispatchMetadata({ message: text, projectId: snapshot.projectId,
+          contextProjectHintId: snapshot.contextProjectHintId,
           appId: snapshot.appId, appTargetId: snapshot.appTargetId,
           includeProjectContext: snapshot.includeProjectContext ?? Boolean(snapshot.projectId),
           agentMode: snapshot.agentMode ?? "confirm", editMessageId: snapshot.editMessageId,
+          expectedAgentId: snapshot.expectedAgentId ?? null,
           responseModel: target.kind === "server" ? target.responseModel : undefined,
           commandCapabilities: snapshot.commandCapabilities, attachments: snapshot.attachments }),
       },
@@ -2330,11 +2927,12 @@ export function useConversationController(
     const acceptedScope = Promise.all([getToken(), getConfiguredApiServerFingerprint()])
       .then(([token, server]) => ({ auth: getTokenAuthScope(token), server }));
     void acceptedScope.catch(() => undefined);
-    latestSubmissionIdRef.current = id;
-    submitMessage(optimistic);
-    setError(null);
-    setIsWaiting(true);
-    return submissionQueueRef.current.enqueue(id, (signal) => deliverConversationCommand(snapshot, optimistic, signal, acceptedScope))
+    return submissionQueueRef.current.enqueue(id, (signal) => deliverConversationCommand(snapshot, optimistic, signal, acceptedScope), () => {
+      latestSubmissionIdRef.current = id;
+      submitMessage(optimistic);
+      setError(null);
+      setIsWaiting(true);
+    })
       .catch((failure: unknown) => {
         const message = errorTextOf(failure, "送信できませんでした。履歴から再試行してください。");
         setMessages((current) => current.map((item) => item.id === id ? { ...item,
@@ -2343,7 +2941,7 @@ export function useConversationController(
             message_state: item.metadata?.delivery_route === "direct" ? "direct-failed" : "queued" },
         } : item));
         if (latestSubmissionIdRef.current === id) { setError(message); setIsWaiting(false); }
-        throw new RetainedSubmissionError(message);
+        throw RetainedSubmissionError.forFailure(message, failure);
       });
   }, [deliverConversationCommand, effectiveProjectId, isAuthenticated, sessionId, setMessages, submitMessage]);
 
@@ -2355,11 +2953,17 @@ export function useConversationController(
   const retryPendingMessage = useCallback(
     async (message: ConversationMessage, route: "server" | "direct" = "server") => {
       if (!sessionId) return;
+      if (route === "direct" && sessionAgentRequiresServer(sessionStateRef.current)) {
+        setError("Agent付きChatの未送信入力はDirectで再試行できません。Serverへ接続して同じ入力を再送してください。");
+        return;
+      }
       if (route === "server" && message.metadata?.persistence_error) {
         const payload = pendingDispatchPayload(message);
         await sendConversationCommand({ message: message.content, retryMessageId: message.id,
           projectId: payload.project_id, appId: payload.app_id, appTargetId: payload.app_target_id,
+           contextProjectHintId: payload.context_project_hint_id,
           includeProjectContext: payload.include_project_context, agentMode: payload.agent_mode,
+          expectedAgentId: payload.expected_agent_id,
           commandCapabilities: payload.command_capabilities, attachments: payload.attachments,
           target: { kind: "server", responseModel: payload.response_model ?? undefined },
         });
@@ -2377,14 +2981,17 @@ export function useConversationController(
           }
           const payload = pendingDispatchPayload(message, {
             projectId: effectiveProjectId, appId: session?.app_id, appTargetId: session?.app_target_id,
+            contextProjectHintId: message.metadata?.context_project_hint_id as string | null | undefined,
             includeProjectContext: Boolean(effectiveProjectId), agentMode: "confirm",
           });
           await sendConversationCommand({
             message: payload.message, retryMessageId: message.id,
             projectId: payload.project_id ?? null,
+             contextProjectHintId: payload.context_project_hint_id,
             appId: payload.app_id, appTargetId: payload.app_target_id,
             includeProjectContext: payload.include_project_context,
             agentMode: payload.agent_mode, commandCapabilities: payload.command_capabilities,
+            expectedAgentId: payload.expected_agent_id,
             attachments: payload.attachments,
             target: { kind: "direct", selection: { provider: settings.provider, model: settings.model, reasoningEffort: settings.reasoningEffort } },
           });
@@ -2399,8 +3006,15 @@ export function useConversationController(
         setError("サーバーへの再送にはログインが必要です。Directで再試行できます。");
         return;
       }
-      if (!networkConnected || (!networkServerReachable && isServerKnownUnreachable())) {
-        setError("AoiTalkサーバーへの接続を確認できるまで再送を保留します。");
+      if (
+        shouldHoldServerDispatch({
+          networkConnected,
+          serverKnownUnreachable:
+            !networkServerReachable && isServerKnownUnreachable(),
+          userInitiated: true,
+        })
+      ) {
+        setError(SERVER_RETRY_DEFERRED_ERROR);
         return;
       }
       if (
@@ -2428,12 +3042,14 @@ export function useConversationController(
       );
       setRetryingMessageIds((current) => [...current, message.id]);
       try {
+        const retryScope = await readConversationRefreshScope();
         const result = await attemptPendingRetry(() =>
           dispatchPendingConversationMessage(
             sessionId,
             message,
             pendingDispatchPayload(message, {
               projectId: effectiveProjectId,
+              contextProjectHintId: message.metadata?.context_project_hint_id as string | null | undefined,
               appId: session?.app_id,
               appTargetId: session?.app_target_id,
               includeProjectContext: Boolean(effectiveProjectId),
@@ -2446,6 +3062,7 @@ export function useConversationController(
           completeServerGeneration(retryGeneration);
           if (result.connectivityFailure) {
             useNetworkStore.getState().setServerReachable(false);
+            scheduleRefresh(sessionId, retryScope);
           }
           setError(
             errorTextOf(result.error, "未送信メッセージの再送に失敗しました。"),
@@ -2466,6 +3083,7 @@ export function useConversationController(
               : candidate,
           ),
         );
+        scheduleRefresh(sessionId, retryScope);
         try {
           await refreshFromServer();
         } catch (refreshError) {
@@ -2491,6 +3109,7 @@ export function useConversationController(
       beginServerGeneration,
       completeServerGeneration,
       refreshFromServer,
+      scheduleRefresh,
       retryingMessageIds,
       responseTarget,
       sendConversationCommand,
@@ -2501,8 +3120,30 @@ export function useConversationController(
     ],
   );
 
+  const cancelPendingMessage = useCallback(
+    async (message: ConversationMessage, mode: "cancel" | "draft" = "cancel") => {
+      if (!sessionId) return;
+      const updated = await conversationsRepo.cancelPendingMessage(sessionId, message.id, mode);
+      setMessages((current) => current.map((candidate) =>
+        candidate.id === message.id ? updated : candidate,
+      ));
+      if (latestSubmissionIdRef.current === message.id) setIsWaiting(false);
+    },
+    [sessionId, setMessages],
+  );
+
   const respondPermission = useCallback((requestId: string, approved: boolean) => {
-    wsRef.current.sendPermissionResponse(requestId, approved);
+    const request = pendingPermissions.find((entry) => entry.requestId === requestId);
+    if (request?.materialApproval) {
+      const sent = wsRef.current.sendHumanInteractionResponse(requestId, request.materialApproval.sessionId,
+        approved ? request.materialApproval.response : { action: "cancel", revision: request.materialApproval.response.revision });
+      if (!sent) {
+        setActivityMessage("接続を確認してから、もう一度応答してください。");
+        return;
+      }
+    } else {
+      wsRef.current.sendPermissionResponse(requestId, approved);
+    }
     setPendingPermissions((prev) =>
       prev.map((request) =>
         request.requestId === requestId
@@ -2510,7 +3151,7 @@ export function useConversationController(
           : request,
       ),
     );
-  }, []);
+  }, [pendingPermissions]);
 
   const pollDeepResearchJob = useCallback(
     (jobId: string) => {
@@ -2533,6 +3174,20 @@ export function useConversationController(
         jobPollFlightsRef.current.add(flightKey);
         void (async () => {
           const job = await deepResearchApi.getJob(jobId);
+          if (isTerminalDeepResearchStatus(job.status)) {
+            for (const [signature, pending] of
+              pendingDeepResearchStartsRef.current) {
+              if (pending.jobId === job.id) {
+                if (pending.storageAddress && pending.clientRequestId) {
+                  await clearPendingDeepResearchRequestId(
+                    pending.storageAddress,
+                    pending.clientRequestId,
+                  );
+                }
+                pendingDeepResearchStartsRef.current.delete(signature);
+              }
+            }
+          }
           if (!isCurrentSession()) return;
           const next = deepResearchToConversationJob(job);
           setJobs((prev) => prev.map((item) => (item.id === jobId ? next : item)));
@@ -2563,6 +3218,10 @@ export function useConversationController(
                   job_type: "deep_research",
                   message_state: "persisted",
                 },
+                {
+                  id: `deep-research:${job.id}`,
+                  created_at: job.completed_at ?? job.updated_at,
+                },
               );
               if (!isCurrentSession()) return;
               await refreshFromServer().catch(() => undefined);
@@ -2587,35 +3246,162 @@ export function useConversationController(
   );
 
   const startDeepResearch = useCallback(
-    async (query: string) => {
-      if (!query.trim() || !isAuthenticated || !focusedRef.current) return;
+    (query: string): Promise<void> => {
+      const normalizedQuery = query.trim();
+      if (!normalizedQuery || !isAuthenticated || !focusedRef.current) {
+        return Promise.resolve();
+      }
       const requestedSessionId = sessionId;
       const pollingLifecycle = jobPollingLifecycleRef.current;
-      const job = await deepResearchApi.startJob({
-        query: query.trim(),
-        mode: "report",
-        max_iterations: 2,
-        questions_per_iteration: 3,
-        max_results_per_query: 5,
-        // SearXNG is the local authority; Personal deployments retain the
-        // deep client fallback while Enterprise never inherits public egress.
-        engines: ["searxng"],
-        include_local_knowledge: Boolean(effectiveProjectId),
-        ...(requestedSessionId ? { session_id: requestedSessionId } : {}),
+      const signature = JSON.stringify({
+        query: normalizedQuery,
+        session_id: requestedSessionId,
         project_id: effectiveProjectId ?? null,
+        user_id: userId ?? null,
       });
-      if (
-        !mountedRef.current ||
-        activeGenerationSessionRef.current !== requestedSessionId ||
-        jobPollingLifecycleRef.current !== pollingLifecycle
-      ) {
-        return;
+      const currentPending = pendingDeepResearchStartsRef.current.get(
+        signature,
+      );
+      if (currentPending?.promise) {
+        return currentPending.promise;
       }
-      const mapped = deepResearchToConversationJob(job);
-      setJobs((prev) => [mapped, ...prev.filter((item) => item.id !== mapped.id)]);
-      pollDeepResearchJob(job.id);
+      if (currentPending?.jobId) {
+        return Promise.resolve();
+      }
+      const pending = {
+        clientRequestId: currentPending?.clientRequestId ?? null,
+        storageAddress: currentPending?.storageAddress ?? null,
+        promise: null as Promise<void> | null,
+      };
+      pendingDeepResearchStartsRef.current.set(signature, pending);
+      while (pendingDeepResearchStartsRef.current.size > 16) {
+        const stale = [...pendingDeepResearchStartsRef.current].find(
+          ([key, value]) =>
+            key !== signature && value.promise === null && !value.jobId,
+        );
+        if (!stale) break;
+        pendingDeepResearchStartsRef.current.delete(stale[0]);
+      }
+      const flight = (async () => {
+        let clientRequestId = pending.clientRequestId;
+        try {
+          try {
+            const [token, serverFingerprint] = await Promise.all([
+              getToken(),
+              getConfiguredApiServerFingerprint(),
+            ]);
+            const authScope = getTokenAuthScope(token);
+            if (!token || authScope === "anonymous") {
+              throw new DeepResearchPendingStartPersistenceError();
+            }
+            const storageAddress = deepResearchPendingStartStorageAddress({
+              authScope,
+              serverFingerprint,
+              sessionId: requestedSessionId ?? null,
+              projectId: effectiveProjectId ?? null,
+              query: normalizedQuery,
+            });
+            if (
+              pending.storageAddress &&
+              pending.storageAddress.storageKey !== storageAddress.storageKey
+            ) {
+              pending.clientRequestId = null;
+            }
+            pending.storageAddress = storageAddress;
+          } catch {
+            throw new DeepResearchPendingStartPersistenceError();
+          }
+          const storageAddress = pending.storageAddress;
+          clientRequestId = pending.clientRequestId;
+          if (!clientRequestId && storageAddress) {
+            clientRequestId = await readPendingDeepResearchRequestId(
+              storageAddress,
+            );
+          }
+          clientRequestId ??= randomId();
+          pending.clientRequestId = clientRequestId;
+          if (storageAddress) {
+            await persistPendingDeepResearchRequestId(
+              storageAddress,
+              clientRequestId,
+            );
+          }
+          const job = await deepResearchApi.startJob({
+            query: normalizedQuery,
+            client_request_id: clientRequestId,
+            strategy: "imozuru",
+            mode: "report",
+            max_iterations: 2,
+            questions_per_iteration: 3,
+            max_results_per_query: 5,
+            // SearXNG is the local authority; Personal deployments retain the
+            // deep client fallback while Enterprise never inherits public egress.
+            engines: ["searxng"],
+            include_local_knowledge: Boolean(effectiveProjectId),
+            ...(requestedSessionId ? { session_id: requestedSessionId } : {}),
+            project_id: effectiveProjectId ?? null,
+          });
+          const current = pendingDeepResearchStartsRef.current.get(signature);
+          if (current?.clientRequestId === clientRequestId) {
+            if (isTerminalDeepResearchStatus(job.status)) {
+              if (storageAddress) {
+                await clearPendingDeepResearchRequestId(
+                  storageAddress,
+                  clientRequestId,
+                );
+              }
+              pendingDeepResearchStartsRef.current.delete(signature);
+            } else {
+              // Keep the request key until the acknowledged job becomes
+              // terminal so a remounted controller replays the same job.
+              current.promise = null;
+              current.jobId = job.id;
+            }
+          }
+          if (
+            !mountedRef.current ||
+            activeGenerationSessionRef.current !== requestedSessionId ||
+            jobPollingLifecycleRef.current !== pollingLifecycle
+          ) {
+            return;
+          }
+          const mapped = deepResearchToConversationJob(job);
+          setJobs((prev) => [mapped, ...prev.filter((item) => item.id !== mapped.id)]);
+          pollDeepResearchJob(job.id);
+        } catch (error) {
+          const latest = pendingDeepResearchStartsRef.current.get(signature);
+          if (latest?.clientRequestId === clientRequestId) {
+            latest.promise = null;
+            if (error instanceof DeepResearchPendingStartPersistenceError) {
+              if (
+                mountedRef.current &&
+                activeGenerationSessionRef.current === requestedSessionId
+              ) {
+                setError(error.message);
+              }
+              return;
+            }
+            const errorCode =
+              error && typeof error === "object" && "code" in error
+                ? (error as { code?: unknown }).code
+                : null;
+            if (errorCode === "idempotency_conflict" && !latest.jobId) {
+              if (latest.storageAddress && latest.clientRequestId) {
+                await clearPendingDeepResearchRequestId(
+                  latest.storageAddress,
+                  latest.clientRequestId,
+                );
+              }
+              pendingDeepResearchStartsRef.current.delete(signature);
+            }
+          }
+          throw error;
+        }
+      })();
+      pending.promise = flight;
+      return flight;
     },
-    [effectiveProjectId, isAuthenticated, pollDeepResearchJob, sessionId],
+    [effectiveProjectId, isAuthenticated, pollDeepResearchJob, sessionId, userId],
   );
 
   useEffect(() => {
@@ -2629,15 +3415,54 @@ export function useConversationController(
 
   const editMessage = useCallback(
     async (message: ConversationMessage, content: string) => {
-      await sendConversationCommand({
-        message: content,
+      const normalized = content.trim();
+      if (!normalized) throw new Error("メッセージ本文を入力してください。");
+      if (isPendingLocalConversationMessage(message)) {
+        const now = new Date().toISOString();
+        const updated = message.metadata?.persistence_error
+          ? {
+              ...message,
+              content: normalized,
+              metadata: replacePendingDispatchMessage(message, normalized),
+              updated_at: now,
+            }
+          : await conversationsRepo.updatePendingLocalMessage(
+              message.session_id,
+              message.id,
+              normalized,
+            );
+        setMessages((current) =>
+          current.map((candidate) =>
+            candidate.id === message.id ? updated : candidate,
+          ),
+        );
+        setError(null);
+        return;
+      }
+      const payload = pendingDispatchPayload(message, {
         projectId: effectiveProjectId,
+        contextProjectHintId: message.metadata?.context_project_hint_id as string | null | undefined,
+        appId: sessionStateRef.current?.app_id,
+        appTargetId: sessionStateRef.current?.app_target_id,
         includeProjectContext: Boolean(effectiveProjectId),
         agentMode: "confirm",
+      });
+      await sendConversationCommand({
+        message: normalized,
+        projectId: payload.project_id ?? null,
+        contextProjectHintId: payload.context_project_hint_id,
+        appId: payload.app_id,
+        appTargetId: payload.app_target_id,
+        includeProjectContext: payload.include_project_context,
+        agentMode: payload.agent_mode,
+        expectedAgentId: payload.expected_agent_id,
+        commandCapabilities: payload.command_capabilities,
+        attachments: payload.attachments,
         editMessageId: message.id,
+        target: resolveMessageResendTarget(responseTargetRef.current),
       });
     },
-    [effectiveProjectId, sendConversationCommand],
+    [effectiveProjectId, sendConversationCommand, setMessages],
   );
 
   const rerunMessage = useCallback(
@@ -2645,55 +3470,60 @@ export function useConversationController(
       message: ConversationMessage,
       responseModel?: ChatResponseModelSelection,
     ) => {
-      if (message.role === "user") {
-        await sendConversationCommand({
-          message: message.content,
-          projectId: effectiveProjectId,
-          includeProjectContext: Boolean(effectiveProjectId),
-          agentMode: "confirm",
-          editMessageId: message.id,
-          target: { kind: "server", responseModel },
-        }).catch((error: unknown) => {
-          setError(errorTextOf(error, "再生成に失敗しました。履歴から再試行できます。"));
-        });
+      const currentMessages = messagesStateRef.current;
+      const index = currentMessages.findIndex((entry) => entry.id === message.id);
+      const source =
+        message.role === "user"
+          ? currentMessages.find((entry) => entry.id === message.id) ?? message
+          : [...currentMessages]
+              .slice(0, index >= 0 ? index : currentMessages.length)
+              .reverse()
+              .find((entry) => entry.role === "user");
+      if (!source) {
+        setError("再生成元のユーザーメッセージが見つかりませんでした。");
         return;
       }
-      const index = messages.findIndex((entry) => entry.id === message.id);
-      const source = [...messages]
-        .slice(0, index >= 0 ? index : messages.length)
-        .reverse()
-        .find((entry) => entry.role === "user");
-      if (source) {
+
+      const payload = pendingDispatchPayload(source, {
+        projectId: effectiveProjectId,
+        contextProjectHintId: source.metadata?.context_project_hint_id as string | null | undefined,
+        appId: sessionStateRef.current?.app_id,
+        appTargetId: sessionStateRef.current?.app_target_id,
+        includeProjectContext: Boolean(effectiveProjectId),
+        agentMode: "confirm",
+      });
+      try {
         await sendConversationCommand({
           message: source.content,
-          projectId: effectiveProjectId,
-          includeProjectContext: Boolean(effectiveProjectId),
-          agentMode: "confirm",
+          projectId: payload.project_id ?? null,
+          contextProjectHintId: payload.context_project_hint_id,
+          appId: payload.app_id,
+          appTargetId: payload.app_target_id,
+          includeProjectContext: payload.include_project_context,
+          agentMode: payload.agent_mode,
+          expectedAgentId: payload.expected_agent_id,
+          commandCapabilities: payload.command_capabilities,
+          attachments: payload.attachments,
           editMessageId: source.id,
-          target: { kind: "server", responseModel },
-        }).catch((error: unknown) => {
-          setError(errorTextOf(error, "再生成に失敗しました。履歴から再試行できます。"));
+          target: resolveMessageResendTarget(
+            responseTargetRef.current,
+            responseModel,
+          ),
         });
+      } catch (error) {
+        setError(
+          errorTextOf(
+            error,
+            message.role === "user"
+              ? "再送信に失敗しました。履歴から再試行できます。"
+              : "再生成に失敗しました。履歴から再試行できます。",
+          ),
+        );
       }
     },
-    [effectiveProjectId, messages, sendConversationCommand],
+    [effectiveProjectId, sendConversationCommand],
   );
 
-  const loadBranches = useCallback(
-    async (messageId: string) => {
-      if (!sessionId || !isAuthenticated) return;
-      const branches = await conversationsRepo.fetchBranches(sessionId, messageId);
-      if (!branches.length) return;
-      const activeIndex = branches.findIndex((entry) => entry.is_active_branch);
-      const key = groupMessageKey(branches[0]);
-      setBranchSelections((prev) => ({
-        ...prev,
-        [key]: activeIndex >= 0 ? activeIndex : 0,
-      }));
-      await refreshFromServer();
-    },
-    [isAuthenticated, refreshFromServer, sessionId],
-  );
 
   const switchBranch = useCallback(
     async (message: ConversationMessage, nextIndex: number) => {
@@ -2731,52 +3561,137 @@ export function useConversationController(
 
   const flushPendingInBackground = useCallback(
     async (targetSessionId: string): Promise<string | null> => {
+      const scope = await readConversationRefreshScope();
+      const requestId = loadRequestRef.current;
+      const runtimeEpoch = focusEpochRef.current;
+      const isCurrent = () => mountedRef.current && focusedRef.current &&
+        activeGenerationSessionRef.current === targetSessionId &&
+        loadRequestRef.current === requestId && focusEpochRef.current === runtimeEpoch &&
+        authOwnerRef.current === authOwner;
+      if (!isCurrent()) return null;
       const flight = runExclusiveConversationOperation(
         exclusiveOperationRef,
         "background-flush",
         async () => {
-          if (mountedRef.current) setIsWaiting(true);
+          if (isCurrent()) setIsWaiting(true);
           try {
             return await flushPendingConversation(targetSessionId);
           } finally {
-            if (mountedRef.current) setIsWaiting(false);
+            if (isCurrent()) setIsWaiting(false);
           }
         },
       );
       backgroundFlushRef.current = flight;
       try {
         const result = await flight;
-        return result.started ? result.value : null;
+        if (!result.started) return null;
+        const remainingPendingServerMessages = (
+          await conversationsRepo.listMessagesLocal(result.value)
+        ).some(
+          (message) =>
+            message.role === "user" &&
+            Boolean(message.metadata?.pending) &&
+            message.metadata?.delivery_route !== "direct" &&
+            !message.metadata?.direct_cloud,
+        );
+        if (!(await isConversationRefreshScopeCurrent(scope)) || !isCurrent()) return null;
+        if (!remainingPendingServerMessages) {
+          setError((current) => clearResolvedServerPendingError(current));
+        }
+        if (result.value !== targetSessionId) {
+          promotedSubmissionSessionsRef.current.set(targetSessionId, result.value);
+          promoteMessages(targetSessionId, result.value);
+        }
+        scheduleRefresh(result.value, scope);
+        return result.value;
       } finally {
         if (backgroundFlushRef.current === flight) backgroundFlushRef.current = null;
       }
     },
-    [],
+    [authOwner, promoteMessages, scheduleRefresh],
   );
+
+  const recoverConnectedRuntime = useCallback(async (
+    targetSessionId: string,
+    runtimeEpoch: number,
+    connectionGeneration: number,
+  ) => {
+    const isCurrent = () =>
+      mountedRef.current &&
+      focusedRef.current &&
+      focusEpochRef.current === runtimeEpoch &&
+      connectionGenerationRef.current === connectionGeneration &&
+      activeGenerationSessionRef.current === targetSessionId;
+    const restoreEpoch = generationRestoreEpochRef.current;
+    let recoveryScope: ConversationRefreshScope | null = null;
+    const reportRecoveryError = async (error: unknown) => {
+      if (!isCurrent()) return;
+      // A failed flush may be the result of the request's owner/server scope
+      // changing while it was in flight.  Do not surface that old failure on
+      // the newly selected profile; its canonical refresh still runs below.
+      if (recoveryScope) {
+        const sameScope = await isConversationRefreshScopeCurrent(recoveryScope).catch(
+          () => false,
+        );
+        if (!sameScope || !isCurrent()) return;
+      }
+      setError(
+        errorTextOf(
+          error,
+          "未送信メッセージを送信できませんでした。入力は未送信キューに保持されています。",
+        ),
+      );
+    };
+    try {
+      if (!isCurrent()) return;
+      recoveryScope = await readConversationRefreshScope();
+      if (!isCurrent()) return;
+      let effectiveSessionId = targetSessionId;
+      if (pendingMessagesRef.current > 0) {
+        try {
+          effectiveSessionId = (await flushPendingInBackground(targetSessionId)) ?? targetSessionId;
+          if (!isCurrent()) return;
+          if (effectiveSessionId !== targetSessionId) {
+            onSessionPromotedRef.current?.(effectiveSessionId);
+            return;
+          }
+        } catch (flushError) {
+          // The repository deliberately leaves rejected, timed out, or
+          // scope-mismatched inputs pending.  Keep recovery moving so the
+          // current scope can refresh history and generation state.
+          await reportRecoveryError(flushError);
+        }
+      }
+      if (!isCurrent()) return;
+      await refreshFromServer(effectiveSessionId).catch(() => undefined);
+      if (!isCurrent() || generationRestoreEpochRef.current !== restoreEpoch) return;
+      await restoreServerGenerationState(effectiveSessionId);
+    } catch (recoveryError) {
+      await reportRecoveryError(recoveryError);
+    }
+  }, [flushPendingInBackground, refreshFromServer, restoreServerGenerationState]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  useEffect(() => {
-    if (!initialAppContext?.appId || !session || !isAuthenticated) return;
-    const key = `${session.id}:${initialAppContext.appId}:${initialAppContext.appTargetId ?? ""}:${initialAppContext.projectId ?? ""}`;
-    if (
-      session.app_id === initialAppContext.appId &&
-      (session.app_target_id ?? null) === (initialAppContext.appTargetId ?? null)
-    ) {
-      appContextAttemptRef.current = key;
-      return;
-    }
-    if (appContextAttemptRef.current === key) return;
-    appContextAttemptRef.current = key;
-    void bindAppContext(initialAppContext).catch((bindingError) => {
-      appContextAttemptRef.current = null;
+  const retryInitialAppContext = useInitialAppContextBinding({
+    session,
+    context: initialAppContext,
+    enabled: isAuthenticated && runState === "idle" && pendingMessages === 0,
+    bind: bindAppContext,
+    onError: (bindingError) => {
       if (mountedRef.current) {
         setError(errorTextOf(bindingError, "Appコンテキストの設定に失敗しました。"));
       }
-    });
-  }, [bindAppContext, initialAppContext, isAuthenticated, session]);
+    },
+  });
+  const reload = useCallback(async () => {
+    // Keep the current session available while the failed binding retries.
+    // A parallel load of its tombstoned local ID would erase that state.
+    if (retryInitialAppContext()) setError(null);
+    else await load();
+  }, [load, retryInitialAppContext]);
 
   useEffect(() => {
     const requestId = ++llmPreferenceHydrationRef.current;
@@ -2804,7 +3719,9 @@ export function useConversationController(
           : undefined
         : "anonymous";
       const scope = await resolveCurrentChatLlmPreferenceScope(accountScope);
-      const cached = await readChatLlmPreferences(scope);
+      const cached = disableLlmPreferencePersistence
+        ? null
+        : await readChatLlmPreferences(scope);
       if (!isCurrent()) return;
 
       const preferences = cached ?? createDefaultChatLlmPreferences();
@@ -2833,6 +3750,7 @@ export function useConversationController(
       }
     };
   }, [
+    disableLlmPreferencePersistence,
     isAuthenticated,
     refreshResponseModelOptionsForScope,
     userId,
@@ -2846,7 +3764,8 @@ export function useConversationController(
     if (
       !sessionId ||
       !session ||
-      session.user_id ||
+      (session.user_id && !session.is_local_only) ||
+      promotedSubmissionSessionsRef.current.has(sessionId) ||
       !isAuthenticated ||
       !networkConnected ||
       (!networkServerReachable && isServerKnownUnreachable()) ||
@@ -2879,40 +3798,85 @@ export function useConversationController(
   ]);
 
   useEffect(() => {
-    if (!isFocused || !sessionId || !isAuthenticated || !session?.user_id) {
+    if (!isFocused || !sessionId || !isAuthenticated || !session?.user_id || session.is_local_only) {
       setIsConnected(false);
       return;
     }
 
     const ws = wsRef.current;
     const runtimeFocusEpoch = focusEpoch;
+    const connectionGeneration = ++connectionGenerationRef.current;
     const isCurrentRuntime = () =>
       mountedRef.current &&
       focusedRef.current &&
       focusEpochRef.current === runtimeFocusEpoch &&
+      connectionGenerationRef.current === connectionGeneration &&
       activeGenerationSessionRef.current === sessionId;
-    ws.setOnConnectionChange((connected) => {
+    let runtimeScope: ConversationRefreshScope | null = null;
+    const runtimeScopePromise = readConversationRefreshScope()
+      .then((scope) => {
+        if (isCurrentRuntime()) runtimeScope = scope;
+        return scope;
+      })
+      .catch(() => null);
+    const isRuntimeScopeCurrent = async () => {
+      const capturedScope = runtimeScope ?? await runtimeScopePromise;
+      if (!capturedScope || !isCurrentRuntime()) return false;
+      const currentScope = await readConversationRefreshScope().catch(() => null);
+      return Boolean(
+        currentScope &&
+        currentScope.auth === capturedScope.auth &&
+        currentScope.server === capturedScope.server &&
+        isCurrentRuntime(),
+      );
+    };
+    const invalidateStaleRuntime = () => {
       if (!isCurrentRuntime()) return;
-      setIsConnected(connected);
-      if (connected) {
-        if (pendingMessagesRef.current > 0) {
-          void flushPendingInBackground(sessionId)
-            .then((remoteSessionId) => {
-              if (!remoteSessionId) return undefined;
-              if (remoteSessionId === sessionId) {
-                scheduleTerminalRefresh(0);
-                return undefined;
-              }
-              onSessionPromoted?.(remoteSessionId);
-              return undefined;
-            })
-            .catch(() => undefined);
+      connectionGenerationRef.current += 1;
+      ws.disconnect();
+      setIsConnected(false);
+      setRuntimeScopeSignal((value) => value + 1);
+    };
+    ws.setOnConnectionChange((connected) => {
+      void (async () => {
+        if (!(await isRuntimeScopeCurrent())) {
+          invalidateStaleRuntime();
+          return;
         }
-      }
+        if (!isCurrentRuntime()) return;
+        setIsConnected(connected);
+        if (connected) {
+          void recoverConnectedRuntime(sessionId, runtimeFocusEpoch, connectionGeneration);
+        }
+      })().catch(() => {
+        invalidateStaleRuntime();
+      });
     });
     ws.setOnMessage((msg: WSMessage) => {
-      if (!isCurrentRuntime()) return;
-      switch (msg.type) {
+      void (async () => {
+        if (!(await isRuntimeScopeCurrent())) {
+          invalidateStaleRuntime();
+          return;
+        }
+        if (!isCurrentRuntime()) return;
+        switch (msg.type) {
+        case "plan_approval_request": {
+          const data = (msg.data ?? {}) as Record<string, unknown>;
+          const response = materialApprovalResponse(data);
+          const requestId = typeof data.request_id === "string" ? data.request_id : "";
+          const targetSessionId = typeof data.session_id === "string" ? data.session_id : "";
+          if (!requestId || targetSessionId !== sessionId || !response) {
+            setActivityMessage("承認内容を確認できません。手順を再確認してください。");
+            break;
+          }
+          setPendingPermissions((prev) => [{ requestId, toolName: "手順の確認",
+            description: typeof data.plan_text === "string" ? data.plan_text : "この内容で確定しますか？",
+            toolArgs: data.material_action_preview as Record<string, unknown>,
+            materialApproval: { sessionId: targetSessionId, response },
+            receivedAt: new Date().toISOString(), status: "pending" as const },
+            ...prev.filter((request) => request.requestId !== requestId)]);
+          break;
+        }
         case "llm_mode_change":
           // This event describes the server default, not this turn's selection.
           break;
@@ -3149,7 +4113,10 @@ export function useConversationController(
           }
           break;
         }
-      }
+        }
+      })().catch(() => {
+        invalidateStaleRuntime();
+      });
     });
     void ws.connect(sessionId);
     return () => ws.disconnect();
@@ -3160,14 +4127,15 @@ export function useConversationController(
     clearServerGenerationState,
     finalizeStream,
     focusEpoch,
-    flushPendingInBackground,
     getGenerationIdentity,
     isAuthenticated,
     isFocused,
     markServerGenerationCancelling,
     markServerGenerationStreaming,
     onSessionPromoted,
+    recoverConnectedRuntime,
     preserveFailedCancelledMessage,
+    runtimeScopeSignal,
     scheduleTerminalRefresh,
     session?.user_id,
     sessionId,
@@ -3214,16 +4182,16 @@ export function useConversationController(
     skillCommands,
     retryingMessageIds,
     branchSelections,
-    load,
+    load: reload,
     refreshFromServer,
     stopGeneration,
     sendConversationCommand,
     retryPendingMessage,
+    cancelPendingMessage,
     respondPermission,
     startDeepResearch,
     editMessage,
     rerunMessage,
-    loadBranches,
     switchBranch,
     changeLlmMode,
     changeResponseTarget,
@@ -3231,6 +4199,11 @@ export function useConversationController(
     refreshResponseModelOptions,
     refreshSkillCommands,
     changeCharacter,
+    changeAgent,
+    adoptServerAgent,
+    agentCatalog,
+    agentCatalogLoading,
+    refreshAgentCatalog,
     serverGenerationActive,
     agentRuns,
     agentRunErrors,

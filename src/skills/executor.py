@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import logging
+import json
 from typing import Any
 
 from ..tools.core import ToolDefinition, tool
@@ -62,7 +63,21 @@ def _lookup_skill(skill_name: str) -> tuple[Any | None, str | None, str | None]:
 
 def _render_skill(skill: Any, input_text: str) -> str:
     rendered = skill.render_prompt(input_text)
+    rendered = _routine_invocation_prompt(skill, input_text, rendered)
     return f"[スキル: {skill.name}]\n{rendered}"
+
+
+def _routine_invocation_prompt(skill: Any, input_text: str, rendered: str,
+                               overrides: dict[str, Any] | None = None) -> str:
+    from .routine import routine_for
+
+    if routine_for(skill.to_dict()) is None:
+        return rendered
+    arguments = json.dumps({"skill_name": skill.name, "input_text": input_text,
+                            "overrides": overrides or {}}, ensure_ascii=False)
+    return ("保存済みブラウザ手順です。run_skillを次の引数で呼び出し、返却された実行記録で結果を報告してください。"
+            "今回だけの日時等が入力で指定されている場合は、登録parameterをmanage_skill(action='get')で確認してoverridesへ反映してください。"
+            "確定承認・login handoff・unknown後の読取再開はrun_skillが管理します。" + arguments)
 
 
 def _effective_project_id(project_id: str | None) -> str | None:
@@ -110,6 +125,7 @@ def render_skill_snapshot(
         input_text,
         **dict(render_kwargs or {}),
     )
+    rendered = _routine_invocation_prompt(renderer, input_text, rendered, render_kwargs)
     return f"[スキル: {snapshot.name}]\n{rendered}" if include_header else rendered
 
 
@@ -254,6 +270,7 @@ async def invoke_resolved_skill(
             input_text,
             **dict(render_kwargs or {}),
         )
+        rendered = _routine_invocation_prompt(renderer, input_text, rendered, render_kwargs)
     except Exception:
         await _record_actual_usage(
             service=service,
@@ -290,6 +307,7 @@ def _invoke_resolved_skill_sync(
     )
     try:
         rendered = renderer.render_prompt(input_text)
+        rendered = _routine_invocation_prompt(renderer, input_text, rendered)
     except Exception:
         _record_actual_usage_sync(
             service=service,

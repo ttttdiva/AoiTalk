@@ -1,4 +1,8 @@
-import { chatApi, type ConversationSession } from "@/lib/chat-api";
+import {
+  chatApi,
+  createStableClientSessionId,
+  type ConversationSession,
+} from "@/lib/chat-api";
 import {
   fetchNewChatLlmDefaultsAfterLastUsedFlush,
   type SessionLlmSettingsResponse,
@@ -12,11 +16,14 @@ export type CreateRegularNewChatSessionInput = {
   characterName: string;
   projectId?: string;
   userId?: string | null;
+  /** Optional canonical Operations Agent selected for the new session. */
+  agentId?: string | null;
 };
 
 export type CreateRegularNewChatSessionResult = {
   session: ConversationSession;
-  settings: SessionLlmSettingsResponse;
+  /** Agent-bound creation is authoritative on the server and has no human route handoff. */
+  settings: SessionLlmSettingsResponse | null;
 };
 
 function pickExplicitLastUsedRoute(
@@ -34,14 +41,30 @@ function pickExplicitLastUsedRoute(
 
 /**
  * History / Quick Panel の「＋ 新規会話」。
- * last-used を GET /llm/new-chat-defaults から解決し、session-settings handoff が
- * 成功するまで `/chat?s=` へ渡さない。
+ * Character-only Chat は last-used を GET /llm/new-chat-defaults から解決し、
+ * session-settings handoff が成功するまで `/chat?s=` へ渡さない。Agent-bound Chat は
+ * canonical Agent create を正本とし、human route handoff を行わない。
  */
 export async function createRegularNewChatSession({
   characterName,
   projectId,
   userId,
+  agentId,
 }: CreateRegularNewChatSessionInput): Promise<CreateRegularNewChatSessionResult> {
+  const normalizedAgentId = agentId?.trim() || null;
+  if (normalizedAgentId) {
+    const created = await chatApi.createSession(
+      characterName,
+      projectId,
+      undefined,
+      null,
+      undefined,
+      normalizedAgentId,
+      createStableClientSessionId(),
+    );
+    return { session: created.session, settings: null };
+  }
+
   const defaults = await fetchNewChatLlmDefaultsAfterLastUsedFlush(userId);
   const route = pickExplicitLastUsedRoute(
     defaults.last_used_main,

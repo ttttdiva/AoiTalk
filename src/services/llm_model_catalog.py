@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import re
 import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +38,8 @@ from src.llm.openai_compatible_local_profiles import (
     FREETOKEN_DEFAULT_PORT,
     freetoken_model_profile,
     freetoken_model_profiles,
+    strata_model_profile,
+    strata_model_profiles,
     managed_local_runtime_for_model,
     LLAMA_CPP_DEFAULT_CONTEXT_SIZE,
     LLAMA_CPP_DEFAULT_GPU_LAYERS,
@@ -49,6 +53,7 @@ from src.llm.openai_compatible_local_profiles import (
     llama_cpp_reasoning_effort_default,
     llama_cpp_reasoning_effort_metadata,
     llama_cpp_reasoning_effort_options,
+    llama_cpp_thinking_mode,
     llama_cpp_runtime_declared,
     macos_openai_compatible_local_model_options,
     local_server_profile_for_model,
@@ -246,6 +251,12 @@ STATIC_MODEL_CATALOG = {
             "id": "deepseek/deepseek-v4-flash",
             "label": "DeepSeek V4 Flash (OpenRouter)",
         },
+        {
+            "id": "deepseek/deepseek-v4.1-flash-1017",
+            "label": "DeepSeek V4.1 Flash 1017 (OpenRouter)",
+            "context_length": 1048576,
+            "supports_tools": True,
+        },
     ],
     "kimi": [
         {
@@ -337,6 +348,7 @@ STATIC_MODEL_CATALOG = {
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
         {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"},
+        {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
         {"id": "gpt-5.4", "label": "GPT-5.4"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini"},
         {"id": "gpt-5-mini", "label": "GPT-5 mini"},
@@ -347,15 +359,60 @@ STATIC_MODEL_CATALOG = {
             "label": "default",
             "description": "Claude Code の既定モデルを使う alias",
         },
-        {"id": "sonnet", "label": "sonnet", "description": "Claude Code alias"},
-        {"id": "opus", "label": "opus", "description": "Claude Code alias"},
+        {
+            "id": "opus",
+            "label": "opus",
+            "description": "最新Opusを追従する alias（Anthropic APIでは Opus 5.5。Claude Code v2.1.280 以降）",
+        },
+        {
+            "id": "claude-opus-5-5",
+            "label": "Claude Opus 5.5",
+            "description": "Opus 5.5 を明示指定（Claude Code v2.1.280 以降）",
+        },
+        {
+            "id": "sonnet",
+            "label": "sonnet",
+            "description": "最新Sonnetを追従する alias",
+        },
+        {
+            "id": "claude-sonnet-5",
+            "label": "Claude Sonnet 5",
+            "description": "Sonnet 5 を明示指定（Claude Code v2.1.197 以降）",
+        },
         {"id": "haiku", "label": "haiku", "description": "Claude Code alias"},
+        {
+            "id": "fable",
+            "label": "fable",
+            "description": "Fable 5.1（利用可能なアカウントのみ。Claude Code v2.1.257 以降）",
+        },
     ],
     "antigravity-cli": [
         {
             "id": "default",
             "label": "default",
             "description": "Antigravity CLI の既定モデルを使用します。",
+        },
+        # Official CLI slugs, not Gemini API model IDs or display labels.
+        # https://antigravity.google/docs/cli/headless/ (2026-10-15)
+        {
+            "id": "gemini-4-argon-high",
+            "label": "Gemini 4 Argon (High)",
+            "description": "Antigravity CLI 公式モデル候補。実際の利用可否はCLIのバージョンとアカウントに依存します。",
+        },
+        {
+            "id": "gemini-4-argon-medium",
+            "label": "Gemini 4 Argon (Medium)",
+            "description": "Antigravity CLI 公式モデル候補。実際の利用可否はCLIのバージョンとアカウントに依存します。",
+        },
+        {
+            "id": "gemini-3.8-flash-high",
+            "label": "Gemini 3.8 Flash (High)",
+            "description": "Antigravity CLI 公式モデル候補。実際の利用可否はCLIのバージョンとアカウントに依存します。",
+        },
+        {
+            "id": "gemini-3.8-flash-medium",
+            "label": "Gemini 3.8 Flash (Medium)",
+            "description": "Antigravity CLI 公式モデル候補。実際の利用可否はCLIのバージョンとアカウントに依存します。",
         },
         {
             "id": "Gemini 3.5 Flash (High)",
@@ -497,6 +554,21 @@ def _llama_cpp_model_catalog_entries() -> List[Dict[str, Any]]:
     return entries
 
 
+def _strata_model_catalog_entries() -> List[Dict[str, Any]]:
+    return [{
+        "id": profile["id"], "label": profile["label"],
+        "description": profile["description"], "runtime": "strata",
+        "runtime_profile": profile, "supports_reasoning": True,
+        "supports_tools": True, "media": {"image": False, "audio": False},
+        # Strata exposes the shared transport's response modes. Keep this
+        # separate from llama.cpp profile-owned reasoning_effort metadata so
+        # low/medium/xhigh contracts cannot leak into exact Strata selections.
+        "reasoning_effort_options": list(FAST_THINKING_MODE_OPTIONS),
+        "reasoning_effort_default": FAST_THINKING_MODE_OPTIONS[0],
+        "reasoning_effort_kind": "response_mode",
+    } for profile in strata_model_profiles()]
+
+
 def _freetoken_model_catalog_entries() -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     for profile in freetoken_model_profiles():
@@ -609,6 +681,17 @@ REMOTE_MODEL_SOURCES = {"provider-api", "service-api"}
 
 DEFAULT_MODEL_CATALOG_CACHE_PATH = Path("cache") / "llm_model_catalog.json"
 
+# The public DeepInfra model registry is intentionally cached for a short
+# period.  The settings route uses these values to avoid making the anonymous
+# registry request for every metadata read while still picking up newly
+# published models without an app release.
+DEEPINFRA_MODEL_CATALOG_TTL_SECONDS = 15 * 60
+DEEPINFRA_MODEL_CATALOG_RETRY_SECONDS = 30
+DEEPINFRA_MODEL_CATALOG_ERROR = (
+    "DeepInfraのモデル一覧を取得できませんでした。"
+    "前回の候補と現在の選択を保持しています。"
+)
+
 CODEX_REASONING_EFFORT_OPTIONS = ["low", "medium", "high", "xhigh"]
 CODEX_GPT56_SOL_REASONING_EFFORT_OPTIONS = [
     *CODEX_REASONING_EFFORT_OPTIONS,
@@ -616,6 +699,10 @@ CODEX_GPT56_SOL_REASONING_EFFORT_OPTIONS = [
     "ultra",
 ]
 CODEX_GPT56_LUNA_REASONING_EFFORT_OPTIONS = [
+    *CODEX_REASONING_EFFORT_OPTIONS,
+    "max",
+]
+CODEX_GPT6_LUNA_REASONING_EFFORT_OPTIONS = [
     *CODEX_REASONING_EFFORT_OPTIONS,
     "max",
 ]
@@ -638,6 +725,7 @@ OPENAI_CODEX_REASONING_EFFORT_OPTIONS = ["low", "medium", "high", "xhigh"]
 LLM_MODE_LABELS = {
     "fast": "Fast",
     "thinking": "Thinking",
+    "always": "Always thinking",
     "none": "None",
     "minimal": "Minimal",
     "low": "Low",
@@ -746,19 +834,37 @@ def enrich_model_reasoning_options(
     result = []
     for model in models:
         next_model = dict(model)
-        options = reasoning_effort_options_for_model(
-            provider,
-            str(next_model.get("id") or ""),
-        )
+        provider_id = str(provider or "").strip().lower()
+        model_id = str(next_model.get("id") or "")
+        supports_reasoning = next_model.get("supports_reasoning")
+        explicit_options = next_model.get("reasoning_effort_options")
+        if provider_id == "deepinfra" and supports_reasoning is False:
+            options = []
+        elif provider_id == "deepinfra" and isinstance(explicit_options, list):
+            options = [
+                str(option).strip()
+                for option in explicit_options
+                if str(option).strip()
+            ]
+        else:
+            options = reasoning_effort_options_for_model(provider, model_id)
         # Even [] is authoritative: clients must not borrow the currently
         # running model's Fast/Thinking control for a different selection.
         next_model["reasoning_effort_options"] = options
-        next_model["reasoning_effort_default"] = (
-            reasoning_effort_default_for_model(provider, str(next_model.get("id") or ""))
-            or (default_llm_mode_for_options(options) if options else None)
-        )
-        next_model["reasoning_effort_kind"] = llm_mode_kind_for_provider(
-            provider, str(next_model.get("id") or "")
+        if supports_reasoning is False:
+            next_model["reasoning_effort_default"] = None
+        else:
+            existing_default = next_model.get("reasoning_effort_default")
+            next_model["reasoning_effort_default"] = (
+                existing_default
+                if existing_default in options
+                else reasoning_effort_default_for_model(provider, model_id)
+                or (default_llm_mode_for_options(options) if options else None)
+            )
+        next_model["reasoning_effort_kind"] = (
+            "response_mode"
+            if provider_id == "deepinfra" and supports_reasoning is False
+            else llm_mode_kind_for_provider(provider, model_id)
         )
         result.append(next_model)
     return result
@@ -989,10 +1095,70 @@ def cached_provider_updated_at(
     return str(updated_at) if updated_at else None
 
 
+def cached_provider_age_seconds(
+    provider: str,
+    cache: Optional[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[float]:
+    """Return the age of a provider cache entry, or ``None`` when unknown.
+
+    Cache timestamps are persisted as ISO-8601 strings.  Treat malformed
+    timestamps as unknown so callers fail closed and refresh.  A legacy naive
+    timestamp is interpreted as UTC, matching the writer's timezone.
+    """
+
+    raw_updated_at = cached_provider_updated_at(provider, cache)
+    if not raw_updated_at:
+        return None
+    try:
+        updated_at = datetime.fromisoformat(raw_updated_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age = (current - updated_at).total_seconds()
+    # A clock-skewed future timestamp must not make an entry fresh forever.
+    return age if age >= 0 else None
+
+
+def cached_provider_is_fresh(
+    provider: str,
+    cache: Optional[Dict[str, Any]],
+    *,
+    ttl_seconds: float,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Return whether a provider cache entry is usable without refreshing."""
+
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(ttl) or ttl < 0:
+        return False
+    age = cached_provider_age_seconds(provider, cache, now=now)
+    return age is not None and age <= ttl
+
+
+def cached_provider_has_snapshot(
+    provider: str,
+    cache: Optional[Dict[str, Any]],
+) -> bool:
+    """Return whether a cache entry contains a complete model-list snapshot."""
+
+    return isinstance(_cache_entry(cache, provider).get("models"), list)
+
+
 def update_model_catalog_cache(
     cache: Optional[Dict[str, Any]],
     provider: str,
     models: List[Dict[str, Any]],
+    *,
+    allow_empty_remote: bool = False,
 ) -> Dict[str, Any]:
     if provider not in CACHEABLE_REMOTE_PROVIDERS:
         return cache if isinstance(cache, dict) else {}
@@ -1002,7 +1168,9 @@ def update_model_catalog_cache(
         for model in models
         if str(model.get("source") or "") in REMOTE_MODEL_SOURCES
     ]
-    if not remote_models:
+    if not remote_models and not (
+        provider == "deepinfra" and allow_empty_remote
+    ):
         return cache if isinstance(cache, dict) else {}
 
     next_cache = dict(cache or {})
@@ -1017,6 +1185,12 @@ def update_model_catalog_cache(
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "models": dedupe_models(remote_models),
     }
+    if provider == "deepinfra":
+        # An empty successful registry response is meaningful: it supersedes
+        # the previous dynamic snapshot until the next refresh.  Keep the
+        # marker separate from the public model list so an empty list cannot be
+        # confused with a cache miss.
+        providers[provider]["authoritative"] = True
     return next_cache
 
 
@@ -1028,6 +1202,19 @@ def default_fetch_json(
     request = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _connection_refused_error(exc: BaseException) -> bool:
+    """Return whether *exc* proves that the target port has no listener."""
+
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        return isinstance(reason, BaseException) and _connection_refused_error(reason)
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    return isinstance(exc, OSError) and (
+        exc.errno == errno.ECONNREFUSED or getattr(exc, "winerror", None) == 10061
+    )
 
 
 def _loopback_endpoint_unreachable(
@@ -1055,8 +1242,8 @@ def _loopback_endpoint_unreachable(
         connection = socket.create_connection((host, port), timeout=timeout)
         connection.close()
         return False
-    except (OSError, ValueError):
-        return True
+    except (OSError, ValueError) as exc:
+        return _connection_refused_error(exc)
 
 
 def _personal_compose_sglang_endpoint(url: str) -> bool:
@@ -1111,6 +1298,7 @@ def _static_models(provider: str) -> List[Dict[str, Any]]:
             + catalog_items
             + _llama_cpp_model_catalog_entries()
             + _freetoken_model_catalog_entries()
+            + _strata_model_catalog_entries()
         )
 
     models = []
@@ -1243,6 +1431,7 @@ def _deepseek_models(
 
 DEEPINFRA_CHAT_BASE_URL = "https://api.deepinfra.com/v1/openai"
 DEEPINFRA_MODELS_URL = "https://api.deepinfra.com/v1/models"
+DEEPINFRA_RICH_MODELS_URL = "https://api.deepinfra.com/models/list"
 
 
 def _deepinfra_models_url(cfg: Any) -> str:
@@ -1264,6 +1453,18 @@ def _deepinfra_models_url(cfg: Any) -> str:
     ).rstrip("/")
     if chat_base.endswith("/openai"):
         return f"{chat_base[:-len('/openai')]}/models"
+    # The official base is sometimes configured as ``/v1`` rather than the
+    # chat-completions ``/v1/openai`` path.  Keep that supported while still
+    # refusing to invent a list endpoint for an arbitrary proxy.
+    try:
+        parsed = urllib.parse.urlsplit(chat_base)
+        if (
+            (parsed.hostname or "").strip().lower() == "api.deepinfra.com"
+            and parsed.path.rstrip("/").endswith("/v1")
+        ):
+            return f"{chat_base}/models"
+    except ValueError:
+        pass
     # Never send a custom proxy token to the official endpoint.  A custom
     # deployment must opt into its own list endpoint explicitly.
     return ""
@@ -1289,15 +1490,329 @@ def _deepinfra_metadata_text(
 
 
 def _deepinfra_bool(item: Dict[str, Any], metadata: Dict[str, Any], *keys: str) -> Optional[bool]:
+    for container in (item, metadata):
+        for key in keys:
+            value = container.get(key)
+            if value is None:
+                capabilities = container.get("capabilities")
+                if isinstance(capabilities, dict):
+                    value = capabilities.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return bool(value)
+    return None
+
+
+def _deepinfra_string_list(
+    item: Dict[str, Any],
+    metadata: Dict[str, Any],
+    *keys: str,
+) -> Optional[List[str]]:
     for key in keys:
         value = item.get(key)
         if value is None:
             value = metadata.get(key)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return bool(value)
+        if isinstance(value, str):
+            values = [part.strip() for part in re.split(r"[,\s]+", value) if part.strip()]
+            if values:
+                return values
+        elif isinstance(value, (list, tuple, set)):
+            values = [str(part).strip() for part in value if str(part).strip()]
+            if values:
+                return values
     return None
+
+
+def _deepinfra_tags(item: Dict[str, Any], metadata: Dict[str, Any]) -> set[str]:
+    raw_tags = item.get("tags")
+    if raw_tags is None:
+        raw_tags = metadata.get("tags")
+    if isinstance(raw_tags, str):
+        raw_values = re.split(r"[,\s]+", raw_tags)
+    elif isinstance(raw_tags, (list, tuple, set)):
+        raw_values = raw_tags
+    else:
+        raw_values = []
+    return {
+        str(value).strip().casefold()
+        for value in raw_values
+        if str(value).strip()
+    }
+
+
+def _deepinfra_declared_type(
+    item: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> str:
+    values: List[str] = []
+    for key in (
+        "reported_type",
+        "task",
+        "task_type",
+        "type",
+    ):
+        value = item.get(key)
+        if value is None:
+            value = metadata.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, (list, tuple, set)):
+            values.extend(str(part) for part in value if part is not None)
+    return " ".join(values).strip().casefold()
+
+
+def _deepinfra_is_chat_model(
+    item: Dict[str, Any],
+    metadata: Dict[str, Any],
+    tags: set[str],
+    *,
+    model_id: str = "",
+    allow_unknown: bool = False,
+) -> bool:
+    """Return whether provider metadata describes a chat/text model.
+
+    The model ID is deliberately absent from this decision.  DeepInfra's
+    registry includes embeddings, image generation, speech and video models
+    beside chat models, so a name-based allowlist would silently break when a
+    new model family is published.
+    """
+
+    declared_type = _deepinfra_declared_type(item, metadata)
+    non_text_pattern = re.compile(
+        r"(?:embedding|image|audio|speech|video|tts|stt|whisper|moderation|rerank|transcrib)",
+        re.IGNORECASE,
+    )
+    if declared_type and non_text_pattern.search(declared_type):
+        return False
+    if "chat" in tags:
+        return True
+    if declared_type:
+        return any(
+            token in declared_type
+            for token in ("text", "chat", "generation", "causal")
+        )
+    # The official v1 registry has tags for every item.  Unknown records are
+    # fail-closed there so a future non-chat entry cannot become selectable
+    # merely because it happened to contain an ID.  Existing custom proxies
+    # historically returned id-only text models, so retain that compatibility
+    # while still excluding their obvious non-chat slugs.
+    if not allow_unknown:
+        return False
+    return not non_text_pattern.search(str(model_id or ""))
+
+
+def _deepinfra_public_registry_endpoint(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").strip().lower() == "api.deepinfra.com"
+        and parsed.path.rstrip("/") in {"/v1/models", "/models/list"}
+    )
+
+
+def _deepinfra_deprecated(item: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
+    """Interpret the registry's boolean and timestamp deprecation forms.
+
+    ``deprecated=True`` is the only boolean marker that is authoritative.
+    The richer ``/models/list`` feed additionally publishes a Unix timestamp;
+    a plausible timestamp is considered retired only after it has elapsed.
+    Numeric flags such as ``0``/``1`` and arbitrary strings remain untouched.
+    """
+
+    value = item.get("deprecated")
+    if value is None:
+        value = metadata.get("deprecated")
+    if value is True:
+        return True
+    if isinstance(value, bool):
+        return False
+    timestamp: Optional[float] = None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        timestamp = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text and re.fullmatch(r"\d+(?:\.\d+)?", text):
+            try:
+                timestamp = float(text)
+            except (TypeError, ValueError, OverflowError):
+                timestamp = None
+    # Unix timestamps before 2001 are not a meaningful DeepInfra deprecation
+    # date and are likely a boolean-like or malformed provider value.
+    return timestamp is not None and timestamp >= 1_000_000_000 and timestamp <= datetime.now(timezone.utc).timestamp()
+
+
+class _DeepInfraModelsResult(list):
+    """List-compatible DeepInfra result with fetch/shape provenance."""
+
+    def __init__(
+        self,
+        models: Optional[List[Dict[str, Any]]] = None,
+        *,
+        fetched: bool = False,
+        valid_payload: bool = False,
+    ) -> None:
+        super().__init__(models or [])
+        self.fetched = bool(fetched)
+        self.valid_payload = bool(valid_payload)
+
+    @property
+    def success(self) -> bool:
+        return self.fetched and self.valid_payload
+
+
+def _deepinfra_rich_model_items(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "models"):
+            items = data.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _deepinfra_enrich_from_rich_models(
+    models: List[Dict[str, Any]],
+    rich_data: Any,
+) -> None:
+    """Merge metadata-only capabilities from the public rich registry feed."""
+
+    rich_items = _deepinfra_rich_model_items(rich_data)
+    if not rich_items:
+        return
+    by_id = {
+        str(model.get("id") or "").strip(): model
+        for model in models
+        if str(model.get("id") or "").strip()
+    }
+    for item in rich_items:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if _deepinfra_deprecated(item, metadata):
+            continue
+        model_id = str(
+            item.get("id")
+            or item.get("model")
+            or item.get("model_name")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not model_id:
+            continue
+        tags = _deepinfra_tags(item, metadata)
+        if not _deepinfra_is_chat_model(item, metadata, tags):
+            continue
+        existing = by_id.get(model_id)
+        context_length = _normalize_positive_token_limit(
+            item.get("max_tokens")
+            or metadata.get("max_tokens")
+            or item.get("context_length")
+            or metadata.get("context_length")
+        )
+        supports_reasoning = (
+            True
+            if {"reasoning", "reasoning_effort"} & tags
+            else None
+        )
+        reasoning_options = _deepinfra_string_list(
+            item,
+            metadata,
+            "reasoning_effort_options",
+            "reasoning_options",
+            "supported_reasoning_efforts",
+        )
+        if supports_reasoning is None and reasoning_options:
+            supports_reasoning = True
+        supports_tools = (
+            True
+            if {"tools", "tool-calling", "tool_calling"} & tags
+            else None
+        )
+        supports_response_format = (
+            True
+            if {
+                "structured-output",
+                "structured_output",
+                "json",
+                "json-schema",
+                "json_schema",
+            }
+            & tags
+            else None
+        )
+        supports_image = (
+            True
+            if {"vision", "vlm", "multimodal"} & tags
+            else None
+        )
+        if existing is None:
+            extra: Dict[str, Any] = {}
+            if supports_reasoning is not None:
+                extra["supports_reasoning"] = supports_reasoning
+            if supports_tools is not None:
+                extra["supports_tools"] = supports_tools
+            if supports_response_format is not None:
+                extra["supports_response_format"] = supports_response_format
+            if reasoning_options is not None:
+                extra["reasoning_effort_options"] = reasoning_options
+            reasoning_default = item.get("reasoning_effort_default")
+            if reasoning_default is None:
+                reasoning_default = metadata.get("reasoning_effort_default")
+            if isinstance(reasoning_default, str) and reasoning_default.strip():
+                extra["reasoning_effort_default"] = reasoning_default.strip()
+            if context_length is not None:
+                extra["context_length"] = context_length
+                extra["context_window_tokens"] = context_length
+            if supports_image is not None:
+                extra["media"] = {"image": supports_image}
+            description = item.get("description") or metadata.get("description")
+            if isinstance(description, str) and description.strip():
+                extra["description"] = description.strip()
+            replaced_by = item.get("replaced_by") or metadata.get("replaced_by")
+            if isinstance(replaced_by, str) and replaced_by.strip():
+                extra["replaced_by"] = replaced_by.strip()
+            existing = model_option(
+                model_id,
+                item.get("display_name")
+                or item.get("label")
+                or item.get("name")
+                or model_id,
+                source="provider-api",
+                source_label="API取得",
+                **extra,
+            )
+            models.append(existing)
+            by_id[model_id] = existing
+            continue
+        if existing.get("supports_reasoning") is None and supports_reasoning is not None:
+            existing["supports_reasoning"] = supports_reasoning
+        if (
+            "reasoning_effort_options" not in existing
+            and reasoning_options is not None
+        ):
+            existing["reasoning_effort_options"] = reasoning_options
+        if existing.get("supports_tools") is None and supports_tools is not None:
+            existing["supports_tools"] = supports_tools
+        if (
+            existing.get("supports_response_format") is None
+            and supports_response_format is not None
+        ):
+            existing["supports_response_format"] = supports_response_format
+        if context_length is not None and not existing.get("context_length"):
+            existing["context_length"] = context_length
+            existing["context_window_tokens"] = context_length
+        if supports_image is not None:
+            media = existing.get("media")
+            if not isinstance(media, dict):
+                media = {}
+                existing["media"] = media
+            media.setdefault("image", supports_image)
+        replaced_by = item.get("replaced_by") or metadata.get("replaced_by")
+        if isinstance(replaced_by, str) and replaced_by.strip():
+            existing.setdefault("replaced_by", replaced_by.strip())
 
 
 def _deepinfra_models(
@@ -1306,24 +1821,38 @@ def _deepinfra_models(
 ) -> List[Dict[str, Any]]:
     api_key = _config_get(cfg, "deepinfra_api_key") or os.environ.get("DEEPINFRA_TOKEN")
     models_url = _deepinfra_models_url(cfg)
-    if not api_key or not models_url:
-        return []
+    if not models_url:
+        return _DeepInfraModelsResult()
+
+    # The official registry is public and works without credentials.  A
+    # custom endpoint remains opt-in and keeps the existing secret boundary.
+    if not api_key and not _deepinfra_public_registry_endpoint(models_url):
+        return _DeepInfraModelsResult()
+
+    # A token saved for a custom proxy must never be forwarded to the official
+    # DeepInfra host, even when a stale models_url override points there.
+    # The public registry is intentionally anonymous.  Existing credentials
+    # are used only for explicitly configured custom endpoints.
+    send_api_key = bool(api_key) and not _deepinfra_public_registry_endpoint(models_url)
+    headers = {"Authorization": f"Bearer {api_key}"} if send_api_key else {}
 
     data = fetch_json(
         models_url,
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers=headers,
         timeout=5.0,
     )
-    raw_items = data.get("data") if isinstance(data, dict) else None
+    # The public v1 endpoint is a dict whose model array is under data.  The
+    # richer /models/list endpoint is a top-level array, and compatible
+    # providers may wrap either form under models.
+    raw_items = data if isinstance(data, list) else data.get("data") if isinstance(data, dict) else None
     if not isinstance(raw_items, list) and isinstance(data, dict):
         raw_items = data.get("models")
     if not isinstance(raw_items, list):
-        return []
+        return _DeepInfraModelsResult(fetched=True, valid_payload=False)
 
     models: List[Dict[str, Any]] = []
-    non_text_pattern = re.compile(r"(?:embedding|image|audio|speech|whisper|moderation|rerank|transcrib)", re.I)
     for item in raw_items:
-        if not isinstance(item, dict) or item.get("deprecated") is True:
+        if not isinstance(item, dict):
             continue
         model_id = str(
             item.get("id")
@@ -1335,6 +1864,18 @@ def _deepinfra_models(
         if not model_id:
             continue
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if _deepinfra_deprecated(item, metadata):
+            continue
+        tags = _deepinfra_tags(item, metadata)
+        if not _deepinfra_is_chat_model(
+            item,
+            metadata,
+            tags,
+            model_id=model_id,
+            allow_unknown=not _deepinfra_public_registry_endpoint(models_url),
+        ):
+            continue
+
         capability_text = _deepinfra_metadata_text(
             item,
             metadata,
@@ -1342,25 +1883,17 @@ def _deepinfra_models(
             "capabilities",
             "supported_tasks",
         )
-        declared_type = str(
-            item.get("reported_type")
-            or item.get("task")
-            or item.get("task_type")
-            or item.get("type")
-            or metadata.get("reported_type")
-            or metadata.get("task")
-            or metadata.get("type")
-            or ""
-        ).strip().lower()
-        if declared_type and non_text_pattern.search(declared_type):
-            continue
-        if declared_type and not any(token in declared_type for token in ("text", "chat", "generation", "causal")):
-            continue
-
         supports_reasoning = _deepinfra_bool(item, metadata, "supports_reasoning", "reasoning")
-        if supports_reasoning is None and re.search(r"(?:reasoning|think|thinking)", capability_text):
+        reasoning_options = _deepinfra_string_list(
+            item,
+            metadata,
+            "reasoning_effort_options",
+            "reasoning_options",
+            "supported_reasoning_efforts",
+        )
+        if supports_reasoning is None and reasoning_options:
             supports_reasoning = True
-        if supports_reasoning is None and "deepseek" in model_id.lower():
+        if supports_reasoning is None and re.search(r"(?:reasoning|think|thinking)", capability_text):
             supports_reasoning = True
         supports_image = _deepinfra_bool(
             item,
@@ -1386,6 +1919,8 @@ def _deepinfra_models(
         elif re.search(r"(?:audio|speech|whisper|transcrib)", capability_text):
             media["audio"] = True
         supports_tools = _deepinfra_bool(item, metadata, "supports_tools", "tools", "tool_calling")
+        if supports_tools is None and {"tools", "tool-calling", "tool_calling"} & tags:
+            supports_tools = True
         supports_response_format = _deepinfra_bool(
             item,
             metadata,
@@ -1393,16 +1928,62 @@ def _deepinfra_models(
             "structured_output",
             "json_schema",
         )
+        if supports_response_format is None and {
+            "structured-output",
+            "structured_output",
+            "json",
+            "json-schema",
+            "json_schema",
+        } & tags:
+            supports_response_format = True
+        context_length = next(
+            (
+                _normalize_positive_token_limit(value)
+                for value in (
+                    item.get("context_window_tokens"),
+                    item.get("context_length"),
+                    item.get("max_context_length"),
+                    metadata.get("context_window_tokens"),
+                    metadata.get("context_length"),
+                    metadata.get("max_context_length"),
+                    item.get("max_tokens"),
+                    metadata.get("max_tokens"),
+                )
+                if _normalize_positive_token_limit(value) is not None
+            ),
+            None,
+        )
         extra: Dict[str, Any] = {}
         if supports_tools is not None:
             extra["supports_tools"] = supports_tools
         if supports_response_format is not None:
             extra["supports_response_format"] = supports_response_format
+        if reasoning_options is not None:
+            extra["reasoning_effort_options"] = reasoning_options
+        reasoning_default = item.get("reasoning_effort_default")
+        if reasoning_default is None:
+            reasoning_default = metadata.get("reasoning_effort_default")
+        if isinstance(reasoning_default, str) and reasoning_default.strip():
+            extra["reasoning_effort_default"] = reasoning_default.strip()
+        if context_length is not None:
+            extra["context_length"] = context_length
+            extra["context_window_tokens"] = context_length
+        description = item.get("description") or metadata.get("description")
+        if isinstance(description, str) and description.strip():
+            extra["description"] = description.strip()
+        replaced_by = item.get("replaced_by")
+        if replaced_by is None:
+            replaced_by = metadata.get("replaced_by")
+        if isinstance(replaced_by, str) and replaced_by.strip():
+            extra["replaced_by"] = replaced_by.strip()
         models.append(
             model_option(
                 model_id,
-                item.get("display_name") or item.get("label") or item.get("name") or model_id,
-                context_length=item.get("context_length") or item.get("max_context_length") or metadata.get("context_length"),
+                item.get("display_name")
+                or item.get("label")
+                or item.get("name")
+                or metadata.get("display_name")
+                or model_id,
                 supports_reasoning=supports_reasoning,
                 media=media,
                 source="provider-api",
@@ -1410,7 +1991,29 @@ def _deepinfra_models(
                 **extra,
             )
         )
-    return models
+    # v1/models is the stable default and remains the primary availability
+    # source.  Its compact metadata omits tools/structured-output and some
+    # newer model records, so enrich official responses with the public rich
+    # feed when available.  This secondary anonymous request is never made
+    # for a custom proxy endpoint.
+    try:
+        parsed_models_url = urllib.parse.urlsplit(models_url)
+        is_primary_v1 = _deepinfra_public_registry_endpoint(models_url) and (
+            parsed_models_url.path.rstrip("/") == "/v1/models"
+        )
+    except ValueError:
+        is_primary_v1 = False
+    if is_primary_v1 and isinstance(data, dict):
+        try:
+            rich_data = fetch_json(
+                DEEPINFRA_RICH_MODELS_URL,
+                headers={},
+                timeout=5.0,
+            )
+        except Exception:
+            rich_data = None
+        _deepinfra_enrich_from_rich_models(models, rich_data)
+    return _DeepInfraModelsResult(models, fetched=True, valid_payload=True)
 
 
 def _openai_models(
@@ -1541,6 +2144,22 @@ class _ModelDiscoveryResult:
     models: List[Dict[str, Any]]
     state: str
     error: Optional[str] = None
+    # Every endpoint failure was "nothing is listening" (as opposed to a
+    # timeout, HTTP error or malformed reply from a running server).
+    endpoint_offline: bool = False
+
+
+MANAGED_RUNTIME_STANDBY_MESSAGE = "停止中（送信時に自動起動）"
+
+
+def _endpoint_offline_error(exc: BaseException) -> bool:
+    """Return whether a discovery failure means the server is not running.
+
+    A timeout or HTTP status comes from a process that owns the port (for
+    example a model that is still loading) and stays a real discovery error.
+    """
+
+    return _connection_refused_error(exc)
 
 
 def _discovered_openai_compatible_model(
@@ -1553,6 +2172,13 @@ def _discovered_openai_compatible_model(
     because the server returned it from ``/v1/models``.
     """
 
+    # A served ID may belong to either managed local runtime. Keep the
+    # profile-owned metadata attached to the discovery result so a normal
+    # model selection can resolve the same runtime/profile contract as a
+    # static catalog entry. This matters for Strata IQ variants: without it,
+    # an active /models response would temporarily look like an untyped
+    # external model until the next catalog refresh.
+    strata_profile = strata_model_profile(model_id)
     llama_profile = llama_cpp_model_profile(model_id)
     profile = local_server_profile_for_model(model_id) or {}
     server_meta = {
@@ -1561,7 +2187,28 @@ def _discovered_openai_compatible_model(
         if key in {"server", "server_label"}
     }
     profile_metadata: Dict[str, Any] = {}
-    if llama_profile:
+    if strata_profile:
+        profile_metadata = {
+            "runtime": "strata",
+            "runtime_profile": strata_profile,
+            "details": dict(strata_profile),
+        }
+        capabilities = strata_profile.get("capabilities")
+        if isinstance(capabilities, dict):
+            profile_metadata.update(
+                {
+                    "supports_reasoning": bool(capabilities.get("reasoning")),
+                    "supports_tools": bool(capabilities.get("tools")),
+                    "supports_media": bool(
+                        isinstance(capabilities.get("media"), dict)
+                        and any(capabilities["media"].values())
+                    ),
+                }
+            )
+            media = capabilities.get("media")
+            if isinstance(media, dict):
+                profile_metadata["media"] = dict(media)
+    elif llama_profile:
         profile_metadata = {
             "runtime": "llama_cpp",
             "runtime_profile": llama_profile,
@@ -1616,6 +2263,7 @@ def _discover_openai_compatible_local_models(
     seen_ids: set[str] = set()
     successful_response = False
     errors: List[str] = []
+    endpoint_offline = True
     for base_url in openai_compatible_local_discovery_base_urls(cfg):
         models_url = f"{base_url.rstrip('/')}/models"
         if (
@@ -1632,9 +2280,11 @@ def _discover_openai_compatible_local_models(
             )
         except Exception as exc:
             errors.append(type(exc).__name__)
+            endpoint_offline = endpoint_offline and _endpoint_offline_error(exc)
             continue
         if not isinstance(data, dict) or not isinstance(data.get("data"), list):
             errors.append("invalid_response")
+            endpoint_offline = False
             continue
         successful_response = True
         for item in data["data"]:
@@ -1656,6 +2306,7 @@ def _discover_openai_compatible_local_models(
         state="error",
         error="OpenAI互換runtimeのモデル一覧を取得できませんでした"
         + (f" ({', '.join(errors[:3])})" if errors else ""),
+        endpoint_offline=bool(errors) and endpoint_offline,
     )
 
 
@@ -1787,7 +2438,7 @@ def _launchable_llama_cpp_models(
     """
     from src.service_manager import resolve_llama_cpp_runtime
 
-    candidates = {str(profile["id"]) for profile in llama_cpp_model_profiles()}
+    candidates = {str(profile["id"]) for profile in llama_cpp_model_profiles() + strata_model_profiles()}
     saved_model = provider_saved_model("openai_compatible_local", cfg)
     if saved_model:
         candidates.add(saved_model)
@@ -1800,13 +2451,13 @@ def _launchable_llama_cpp_models(
             "openai_compatible_local", cfg, model=model_id
         ).managed_runtime:
             continue
-        resolved = resolve_llama_cpp_runtime(cfg, model=model_id)
-        if not (
-            resolved.get("managed")
-            and resolved.get("auto_start")
-            and resolved.get("state") == "ready"
-        ):
-            continue
+        if strata_model_profile(model_id):
+            if not ManagedLocalRuntimeManager(cfg).status(model_id, "strata").get("prepared"):
+                continue
+        else:
+            resolved = resolve_llama_cpp_runtime(cfg, model=model_id)
+            if not (resolved.get("managed") and resolved.get("auto_start") and resolved.get("state") == "ready"):
+                continue
         launchable.append({
             **option,
             "source": "managed-local",
@@ -1817,7 +2468,132 @@ def _launchable_llama_cpp_models(
     return launchable
 
 
-def _freetoken_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
+def _strata_static_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
+    """Project Strata settings without touching prepared artifact paths.
+
+    The settings catalog is also read while a model is loading.  Static
+    profile/config values are enough for that screen; artifact validation is
+    owned by the explicit runtime status/setup paths.
+    """
+
+    from src.services.strata_runtime import strata_external
+
+    profile = strata_model_profile(model)
+    if profile is None:
+        raise ValueError("未対応のStrata profileです")
+    raw = _config_get(cfg, "openai_compatible_local.strata", {})
+    raw = raw if isinstance(raw, dict) else {}
+    ownership = provider_runtime_ownership(
+        "openai_compatible_local", cfg, model=model
+    )
+    operator_only = strata_external(cfg)
+
+    def _bool_value(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        port = int(raw.get("port", 8080))
+    except (TypeError, ValueError):
+        port = 8080
+    if not 1 <= port <= 65535:
+        port = 8080
+    try:
+        context_size = int(
+            raw.get("context_size", profile.get("default_context_size", 32768))
+        )
+    except (TypeError, ValueError):
+        context_size = int(profile.get("default_context_size", 32768))
+    try:
+        readiness_timeout = float(raw.get("readiness_timeout", 600))
+    except (TypeError, ValueError):
+        readiness_timeout = 600.0
+    host = str(raw.get("host") or "127.0.0.1")
+    vision = str(raw.get("vision") or "none")
+    auto_start = _bool_value(
+        os.getenv("STRATA_AUTO_START", raw.get("auto_start")),
+        True,
+    ) and bool(ownership.managed_runtime)
+    base_url = openai_compatible_local_base_url(cfg, model=model)
+    runtime_state = "unknown" if ownership.managed_runtime else "external"
+    return {
+        "host": host,
+        "port": port,
+        "context_size": context_size,
+        "vision": vision,
+        "vision_enabled": vision != "none",
+        "auto_start": auto_start,
+        "readiness_timeout": readiness_timeout,
+        "runtime": "strata",
+        "server_profile": "strata",
+        "runtime_profile": profile,
+        "base_url": base_url,
+        "process_owner": ownership.process_owner,
+        "managed_runtime": ownership.managed_runtime,
+        "operator_only": operator_only,
+        "ownership": ownership.to_dict(),
+        "runtime_state": runtime_state,
+        "runtime_status": runtime_state,
+        "runtime_installed": None,
+        "model_installed": None,
+        "prepared": None,
+        "prepare_supported": bool(ownership.managed_runtime),
+    }
+
+
+def _strata_catalog_settings(
+    cfg: Any,
+    model: str,
+    *,
+    include_runtime_status: bool = True,
+) -> Dict[str, Any]:
+    if not include_runtime_status:
+        return _strata_static_catalog_settings(cfg, model)
+    from src.services.strata_runtime import strata_settings, strata_prepared_config
+
+    settings = strata_settings(cfg, model=model)
+    ownership = provider_runtime_ownership("openai_compatible_local", cfg, model=model)
+    try:
+        status = ManagedLocalRuntimeManager(cfg).status(model, "strata")
+    except Exception:
+        status = {"status": "unavailable", "prepare_supported": False}
+    profile = strata_model_profile(model)
+    context = settings["context_size"]
+    vision = False
+    if status.get("prepared"):
+        try:
+            prepared = strata_prepared_config(settings)
+            vision = bool(prepared.get("vision"))
+            args = prepared.get("args", [])
+            for flag in ("--max-context", "--ctx-size", "-c", "--context"):
+                if flag in args and args.index(flag) + 1 < len(args):
+                    context = int(args[args.index(flag) + 1])
+                    break
+        except (OSError, ValueError):
+            pass
+    if profile:
+        profile["capabilities"]["media"]["image"] = vision
+    return {
+        **{key: settings[key] for key in ("host", "port", "context_size", "vision", "auto_start", "readiness_timeout")},
+        "runtime": "strata", "server_profile": "strata", "runtime_profile": profile,
+        "base_url": openai_compatible_local_base_url(cfg, model=model),
+        "context_size": context, "vision_enabled": vision,
+        "process_owner": ownership.process_owner, "managed_runtime": ownership.managed_runtime,
+        "ownership": ownership.to_dict(),
+        **{key: status.get(key) for key in ("runtime_installed", "model_installed", "prepared", "prepare_supported")},
+        "runtime_state": status.get("status"), "runtime_status": status.get("status"),
+    }
+
+
+def _freetoken_catalog_settings(
+    cfg: Any,
+    model: str,
+    *,
+    include_runtime_status: bool = True,
+) -> Dict[str, Any]:
     profile = freetoken_model_profile(model)
     selected_model = str((profile or {}).get("id") or model or "").strip()
     ownership = provider_runtime_ownership(
@@ -1840,13 +2616,15 @@ def _freetoken_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
     if not (1 <= port <= 65535):
         port = FREETOKEN_DEFAULT_PORT
 
-    try:
-        status = ManagedLocalRuntimeManager(cfg).status(
-            selected_model,
-            "freetoken",
-        )
-    except Exception:
-        status = {}
+    status = {}
+    if include_runtime_status:
+        try:
+            status = ManagedLocalRuntimeManager(cfg).status(
+                selected_model,
+                "freetoken",
+            )
+        except Exception:
+            status = {}
     runtime_status = str(status.get("status") or "unknown")
     return {
         "runtime": "freetoken",
@@ -1877,17 +2655,34 @@ def _freetoken_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
 def _enrich_freetoken_catalog_models(
     cfg: Any,
     models: List[Dict[str, Any]],
+    *,
+    include_runtime_status: bool = True,
 ) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
     for model in models:
         model_id = str(model.get("id") or "").strip()
+        if strata_model_profile(model_id):
+            settings = _strata_catalog_settings(
+                cfg,
+                model_id,
+                include_runtime_status=include_runtime_status,
+            )
+            enriched.append({**model, **{key: settings[key] for key in (
+                "runtime", "runtime_state", "runtime_status", "process_owner", "managed_runtime", "ownership", "runtime_profile")},
+                "context_length": settings["context_size"],
+                "media": {"image": settings["vision_enabled"], "audio": False}})
+            continue
         if managed_local_runtime_for_model(cfg, model_id) != "freetoken":
             enriched.append(model)
             continue
         if model.get("runtime") == "freetoken" and "runtime_state" in model:
             enriched.append(model)
             continue
-        settings = _freetoken_catalog_settings(cfg, model_id)
+        settings = _freetoken_catalog_settings(
+            cfg,
+            model_id,
+            include_runtime_status=include_runtime_status,
+        )
         next_model = dict(model)
         for key in (
             "runtime",
@@ -1905,17 +2700,56 @@ def _enrich_freetoken_catalog_models(
     return enriched
 
 
+def _verified_cached_local_models(
+    models: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep only models verified by an earlier explicit local discovery."""
+
+    cached: List[Dict[str, Any]] = []
+    for model in models:
+        if str(model.get("source") or "") != "provider-cache":
+            continue
+        next_model = dict(model)
+        model_id = str(next_model.get("id") or "").strip()
+        strata_profile = strata_model_profile(model_id)
+        freetoken_profile = freetoken_model_profile(model_id)
+        llama_profile = llama_cpp_model_profile(model_id)
+        profile = strata_profile or freetoken_profile or llama_profile
+        if profile is not None:
+            next_model.setdefault("runtime_profile", profile)
+            next_model.setdefault("runtime", profile.get("runtime"))
+            capabilities = profile.get("capabilities")
+            if isinstance(capabilities, dict):
+                next_model.setdefault(
+                    "supports_reasoning", bool(capabilities.get("reasoning"))
+                )
+                next_model.setdefault("supports_tools", bool(capabilities.get("tools")))
+                media = capabilities.get("media")
+                if isinstance(media, dict):
+                    next_model.setdefault("media", dict(media))
+        cached.append(next_model)
+    return dedupe_models(cached)
+
+
 def provider_models(
     provider: str,
     cfg: Any,
     *,
     include_remote: bool = False,
     cached_models: Optional[List[Dict[str, Any]]] = None,
+    cached_authoritative: bool = False,
+    remote_state: Optional[Dict[str, str]] = None,
     ollama_model_manager: Any = None,
     ollama_installed_models: Optional[Dict[str, Any]] = None,
     fetch_json: Callable[..., Dict[str, Any]] = default_fetch_json,
+    include_runtime_status: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    models = dedupe_models((cached_models or []) + _static_models(provider))
+    if isinstance(remote_state, dict):
+        remote_state["status"] = "not_requested"
+    if provider == "deepinfra" and cached_authoritative:
+        models = dedupe_models(cached_models or [])
+    else:
+        models = dedupe_models((cached_models or []) + _static_models(provider))
     remote_error = None
 
     if include_remote:
@@ -1929,7 +2763,67 @@ def provider_models(
             elif provider == "deepseek":
                 models = dedupe_models(_deepseek_models(cfg, fetch_json) + models)
             elif provider == "deepinfra":
-                models = dedupe_models(_deepinfra_models(cfg, fetch_json) + models)
+                remote_models = _deepinfra_models(cfg, fetch_json)
+                if (
+                    isinstance(remote_models, _DeepInfraModelsResult)
+                    and not remote_models.fetched
+                ):
+                    if isinstance(remote_state, dict):
+                        remote_state["status"] = "not_fetched"
+                    raise ValueError("deepinfra model list is not configured")
+                if (
+                    isinstance(remote_models, _DeepInfraModelsResult)
+                    and remote_models.fetched
+                    and not remote_models.valid_payload
+                ):
+                    raise ValueError("deepinfra model list payload is invalid")
+                if (
+                    isinstance(remote_models, _DeepInfraModelsResult)
+                    and remote_models.success
+                ):
+                    if isinstance(remote_state, dict):
+                        remote_state["status"] = "success"
+                    # A valid empty response is authoritative too; it clears
+                    # stale IDs until the next successful registry snapshot.
+                    models = dedupe_models(remote_models)
+                    if models and cached_authoritative:
+                        cached_by_id = {
+                            str(item.get("id") or "").strip(): item
+                            for item in (cached_models or [])
+                            if str(item.get("id") or "").strip()
+                        }
+                        for model in models:
+                            cached = cached_by_id.get(model.get("id"))
+                            if not cached:
+                                continue
+                            for key in (
+                                "supports_reasoning",
+                                "supports_tools",
+                                "supports_response_format",
+                                "reasoning_effort_options",
+                                "reasoning_effort_default",
+                                "context_length",
+                                "context_window_tokens",
+                                "description",
+                                "replaced_by",
+                            ):
+                                if model.get(key) is None and cached.get(key) is not None:
+                                    model[key] = cached[key]
+                            cached_media = cached.get("media")
+                            model_media = model.get("media")
+                            if isinstance(cached_media, dict):
+                                merged_media = dict(cached_media)
+                                if isinstance(model_media, dict):
+                                    merged_media.update(model_media)
+                                model["media"] = merged_media
+                elif remote_models:
+                    if isinstance(remote_state, dict):
+                        remote_state["status"] = "success"
+                    # A successful registry response is authoritative.  Do
+                    # not resurrect removed IDs from an older cache/static
+                    # seed; the configured current model is reinserted by the
+                    # catalog builder below when necessary.
+                    models = dedupe_models(remote_models)
             elif provider == "openai":
                 models = dedupe_models(_openai_models(cfg, fetch_json) + models)
             elif provider == "gemini":
@@ -1942,7 +2836,13 @@ def provider_models(
                 )
             # CLI providers intentionally do not reuse generic provider APIs.
         except Exception as exc:
-            remote_error = str(exc)
+            if isinstance(remote_state, dict) and provider == "deepinfra":
+                remote_state["status"] = "error"
+            remote_error = (
+                DEEPINFRA_MODEL_CATALOG_ERROR
+                if provider == "deepinfra"
+                else str(exc)
+            )
 
     if provider == "ollama" and ollama_model_manager is not None:
         try:
@@ -1990,8 +2890,12 @@ def provider_models(
                     )
                 ]
 
-    if provider == "openai_compatible_local":
-        models = _enrich_freetoken_catalog_models(cfg, models)
+    if provider == "openai_compatible_local" and include_runtime_status:
+        models = _enrich_freetoken_catalog_models(
+            cfg,
+            models,
+            include_runtime_status=True,
+        )
 
     media_capabilities = {
         "openai": {"image": True, "audio": False},
@@ -2497,6 +3401,8 @@ def provider_settings(
     provider: str,
     cfg: Any,
     model: Optional[str] = None,
+    *,
+    include_runtime_status: bool = True,
 ) -> Dict[str, Any]:
     if provider == "openai_compatible_local":
         api_key = (
@@ -2515,10 +3421,24 @@ def provider_settings(
             cfg,
             selected_runtime_model,
         )
-        if runtime_identity == "freetoken":
+        if runtime_identity == "strata":
+            if include_runtime_status:
+                runtime_settings = _strata_catalog_settings(
+                    cfg,
+                    model or selected_runtime_model,
+                )
+            else:
+                runtime_settings = _strata_catalog_settings(
+                    cfg,
+                    model or selected_runtime_model,
+                    include_runtime_status=False,
+                )
+            selected_profile = runtime_settings["runtime_profile"]
+        elif runtime_identity == "freetoken":
             runtime_settings = _freetoken_catalog_settings(
                 cfg,
                 selected_runtime_model,
+                include_runtime_status=include_runtime_status,
             )
             selected_profile = freetoken_model_profile(selected_runtime_model)
         else:
@@ -2536,6 +3456,22 @@ def provider_settings(
         # even when its endpoint is owned by an external router.
         runtime_owned = bool(ownership.managed_runtime)
         effort_metadata = llama_cpp_reasoning_effort_metadata(profile=selected_profile)
+        always_thinking = (
+            llama_cpp_thinking_mode(profile=selected_profile) == "always"
+        )
+        response_mode_options = (
+            list(reasoning_effort_options_for_model(
+                "openai_compatible_local",
+                model or selected_runtime_model,
+            ))
+            if runtime_identity == "strata"
+            else []
+        )
+        response_mode = str(
+            _config_get(cfg, "llm_runtime_mode", "") or ""
+        ).strip().lower()
+        if response_mode not in response_mode_options:
+            response_mode = response_mode_options[0] if response_mode_options else ""
         configured_tools = bool(
             _config_get(cfg, "openai_compatible_local.enable_tools", False)
         )
@@ -2573,8 +3509,9 @@ def provider_settings(
             "runtime": runtime_settings["runtime"],
             "runtime_settings": runtime_settings,
             "llama_cpp": (
-                runtime_settings if runtime_identity != "freetoken" else {}
+                runtime_settings if runtime_identity not in {"freetoken", "strata"} else {}
             ),
+            "strata": runtime_settings if runtime_identity == "strata" else {},
             "freetoken": (
                 runtime_settings if runtime_identity == "freetoken" else {}
             ),
@@ -2594,7 +3531,7 @@ def provider_settings(
                         "prepare_supported",
                     )
                 }
-                if runtime_identity == "freetoken"
+                if runtime_identity in {"freetoken", "strata"}
                 else {}
             ),
             # Keep the active selection's MTP projection available both in
@@ -2609,15 +3546,30 @@ def provider_settings(
                 key: runtime_settings.get(key)
                 for key in _MTP_RUNTIME_FIELDS
             },
-            "reasoning_effort": runtime_settings.get("reasoning_effort")
-            if effort_metadata
-            else None,
+            "reasoning_effort": (
+                runtime_settings.get("reasoning_effort")
+                if effort_metadata
+                else ("always" if always_thinking else response_mode or None)
+            ),
             "reasoning_effort_options": list(effort_metadata["options"])
             if effort_metadata
-            else [],
+            else (["always"] if always_thinking else response_mode_options),
             "reasoning_effort_default": effort_metadata["default"]
             if effort_metadata
-            else None,
+            else (
+                "always"
+                if always_thinking
+                else (response_mode_options[0] if response_mode_options else None)
+            ),
+            "reasoning_effort_kind": (
+                "reasoning_effort"
+                if effort_metadata
+                else (
+                    "reasoning_effort"
+                    if always_thinking
+                    else ("response_mode" if response_mode_options else None)
+                )
+            ),
             "reasoning_effort_supports_disable": bool(effort_metadata["supports_disable"])
             if effort_metadata
             else False,
@@ -2769,7 +3721,11 @@ def _is_gpt5_pro_model(model_id: str) -> bool:
     return bool(re.search(r"-pro(?:-|$)", model_id))
 
 
-def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
+def reasoning_effort_options_for_model(
+    provider: str,
+    model: str,
+    config: Any = None,
+) -> List[str]:
     """Return user-selectable effort values for the active provider/model."""
 
     provider_id = str(provider or "").strip().lower()
@@ -2780,6 +3736,8 @@ def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
             return CODEX_GPT56_SOL_REASONING_EFFORT_OPTIONS
         if model_id == "gpt-5.6-luna" or model_id.startswith("gpt-5.6-luna-"):
             return CODEX_GPT56_LUNA_REASONING_EFFORT_OPTIONS
+        if model_id == "gpt-6-luna" or model_id.startswith("gpt-6-luna-"):
+            return CODEX_GPT6_LUNA_REASONING_EFFORT_OPTIONS
         return CODEX_REASONING_EFFORT_OPTIONS
     if provider_id == "claude-cli":
         return CLAUDE_REASONING_EFFORT_OPTIONS
@@ -2816,6 +3774,11 @@ def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
         # for that profile; unknown external ``local-model`` keeps it.
         if _llama_cpp_profile_capability(model, "reasoning") is False:
             return []
+        if llama_cpp_thinking_mode(model) == "always":
+            # The official template always opens a thinking turn.  Keep a
+            # single explicit option so settings/chat clients cannot expose a
+            # generic fast/non-thinking branch for this profile.
+            return ["always"]
         managed_options = llama_cpp_reasoning_effort_options(model)
         return managed_options or FAST_THINKING_MODE_OPTIONS
     if provider_id in {"gemini", "sglang"}:
@@ -2823,15 +3786,26 @@ def reasoning_effort_options_for_model(provider: str, model: str) -> List[str]:
     return []
 
 
-def llm_mode_kind_for_provider(provider: str, model: str) -> str:
+def llm_mode_kind_for_provider(
+    provider: str,
+    model: str,
+    config: Any = None,
+) -> str:
     provider_id = str(provider or "").strip().lower()
     if provider_id in {"codex-cli", "claude-cli"}:
         return "reasoning_effort"
-    if provider_id in {"openai", "deepseek", "deepinfra", "kimi"} and reasoning_effort_options_for_model(provider, model):
+    if provider_id in {
+        "openai",
+        "deepseek",
+        "deepinfra",
+        "kimi",
+    } and reasoning_effort_options_for_model(provider, model, config=config):
         return "reasoning_effort"
     if provider_id == "openai_compatible_local":
         if _llama_cpp_profile_capability(model, "reasoning") is False:
             return "response_mode"
+        if llama_cpp_thinking_mode(model) == "always":
+            return "reasoning_effort"
         if llama_cpp_reasoning_effort_metadata(model=model):
             return "reasoning_effort"
     return "response_mode"
@@ -2851,6 +3825,8 @@ def reasoning_effort_default_for_model(provider: str, model: str) -> Optional[st
     if str(provider or "").strip().lower() == "openai_compatible_local":
         if _llama_cpp_profile_capability(model, "reasoning") is False:
             return None
+        if llama_cpp_thinking_mode(model) == "always":
+            return "always"
         return llama_cpp_reasoning_effort_default(model)
     return None
 
@@ -2866,7 +3842,7 @@ def build_llm_mode_state(
     if deployment is not None:
         provider = deployment.effective_provider
         model = deployment.effective_model
-    options = reasoning_effort_options_for_model(provider, model)
+    options = reasoning_effort_options_for_model(provider, model, config=cfg)
     local_reasoning_disabled = (
         provider.strip().lower() == "openai_compatible_local"
         and _llama_cpp_profile_capability(model, "reasoning") is False
@@ -2874,7 +3850,7 @@ def build_llm_mode_state(
     if not options and not local_reasoning_disabled:
         options = FAST_THINKING_MODE_OPTIONS
 
-    kind = llm_mode_kind_for_provider(provider, model)
+    kind = llm_mode_kind_for_provider(provider, model, config=cfg)
     if provider == "codex-cli":
         current = _config_get(cfg, "codex_cli.reasoning_effort", None)
     elif provider == "claude-cli":
@@ -2982,6 +3958,7 @@ def build_model_catalog(
     cached_catalog: Optional[Dict[str, Any]] = None,
     fetch_json: Callable[..., Dict[str, Any]] = default_fetch_json,
     include_runtime_models: bool = False,
+    include_installed_local_models: bool = False,
 ) -> Dict[str, Any]:
     current_p = _config_get(cfg, "llm_provider", "openai")
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
@@ -3071,6 +4048,7 @@ def build_model_catalog(
             and provider == deployment.effective_provider
         )
         runtime_discovery = runtime_discovery_results.get(provider)
+        remote_state: Dict[str, str] = {}
         if not provider_available:
             # Do not even call provider_models for blocked providers.  This is
             # important for an Enterprise deployment where stale ``sglang``
@@ -3088,6 +4066,7 @@ def build_model_catalog(
             ], None
             should_refresh = False
         else:
+            provider_cache = _cache_entry(cached_catalog, provider)
             models, error = provider_models(
                 provider,
                 cfg,
@@ -3096,9 +4075,15 @@ def build_model_catalog(
                 # request a second time on an explicit catalog refresh.
                 include_remote=should_refresh and runtime_discovery is None,
                 cached_models=cached_provider_models(provider, cached_catalog),
+                cached_authoritative=(
+                    provider == "deepinfra"
+                    and isinstance(provider_cache.get("models"), list)
+                ),
+                remote_state=remote_state,
                 ollama_model_manager=ollama_model_manager,
                 ollama_installed_models=ollama_installed_models,
                 fetch_json=fetch_json,
+                include_runtime_status=False,
             )
             if runtime_discovery is not None and provider in {
                 "openai_compatible_local",
@@ -3126,7 +4111,11 @@ def build_model_catalog(
             chat_models = enrich_openai_model_context_metadata(provider, chat_models)
             chat_models = enrich_model_reasoning_options(provider, chat_models)
             if provider == "openai_compatible_local":
-                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
+                chat_models = _enrich_freetoken_catalog_models(
+                    cfg,
+                    chat_models,
+                    include_runtime_status=include_runtime_models,
+                )
             availability = {"state": "available", "error": None}
         elif not include_runtime_models and provider in {
             "openai_compatible_local",
@@ -3136,8 +4125,38 @@ def build_model_catalog(
             # Settings callers can opt into runtime probing, but the default
             # catalog build remains side-effect-free and preserves the full
             # static/download catalog for configuration screens.
-            chat_models = []
-            availability = {"state": "not_checked", "error": None}
+            if provider == "openai_compatible_local":
+                cached_local_models = _verified_cached_local_models(models)
+                if not include_installed_local_models:
+                    chat_models = cached_local_models
+                else:
+                    # A normal inventory read is authoritative for an
+                    # AoiTalk-managed route, where a provider-cache entry can
+                    # be stale after a model/root switch. An explicit
+                    # operator-owned endpoint has no local disk inventory to
+                    # consult, so retain its verified last-known-good served
+                    # alias while the endpoint is merely slow or offline.
+                    selected_model = provider_saved_model(
+                        "openai_compatible_local",
+                        cfg,
+                    )
+                    ownership = provider_runtime_ownership(
+                        "openai_compatible_local",
+                        cfg,
+                        model=selected_model,
+                    )
+                    chat_models = (
+                        cached_local_models
+                        if not ownership.managed_runtime
+                        else []
+                    )
+            else:
+                chat_models = []
+            availability = (
+                {"state": "available", "error": None}
+                if chat_models
+                else {"state": "not_checked", "error": None}
+            )
         elif provider in runtime_discovery_results:
             discovery = runtime_discovery_results[provider]
             chat_models = discovery.models
@@ -3148,7 +4167,11 @@ def build_model_catalog(
             chat_models = enrich_openai_model_context_metadata(provider, chat_models)
             chat_models = enrich_model_reasoning_options(provider, chat_models)
             if provider == "openai_compatible_local":
-                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
+                chat_models = _enrich_freetoken_catalog_models(
+                    cfg,
+                    chat_models,
+                    include_runtime_status=include_runtime_models,
+                )
         else:
             chat_models, availability = _chat_available_models(
                 provider,
@@ -3161,7 +4184,11 @@ def build_model_catalog(
             chat_models = enrich_openai_model_context_metadata(provider, chat_models)
             chat_models = enrich_model_reasoning_options(provider, chat_models)
             if provider == "openai_compatible_local":
-                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
+                chat_models = _enrich_freetoken_catalog_models(
+                    cfg,
+                    chat_models,
+                    include_runtime_status=include_runtime_models,
+                )
         saved_model = provider_saved_model(provider, cfg) if provider_available else None
         enterprise_model = (
             enterprise_sglang_model(cfg)
@@ -3224,14 +4251,41 @@ def build_model_catalog(
         models = enrich_openai_model_context_metadata(provider, models)
         models = enrich_model_reasoning_options(provider, models)
         if provider == "openai_compatible_local":
-            models = _enrich_freetoken_catalog_models(cfg, models)
-            if include_runtime_models and provider_available and not fixed_provider:
+            models = _enrich_freetoken_catalog_models(
+                cfg,
+                models,
+                include_runtime_status=include_runtime_models,
+            )
+            if (
+                (include_runtime_models or include_installed_local_models)
+                and provider_available
+                and not fixed_provider
+            ):
                 launchable = _launchable_llama_cpp_models(cfg, models)
                 if launchable:
                     # Keep served metadata authoritative for duplicates, while
                     # retaining other installed models for an on-demand switch.
                     chat_models = dedupe_models(chat_models + launchable)
                     availability = {"state": "available", "error": None}
+                    if (
+                        runtime_discovery is not None
+                        and runtime_discovery.state == "error"
+                        and runtime_discovery.endpoint_offline
+                        and any(
+                            item["id"] == configured_provider_model
+                            for item in launchable
+                        )
+                    ):
+                        # The configured model is prepared and auto-started
+                        # on the next turn, so its stopped endpoint is the
+                        # expected idle state rather than a discovery error.
+                        availability = {
+                            "state": "standby",
+                            "error": None,
+                            "message": MANAGED_RUNTIME_STANDBY_MESSAGE,
+                        }
+                        if error == runtime_discovery.error:
+                            error = None
         if provider not in {"openai_compatible_local", "ollama", "sglang"}:
             # Cloud/CLI providers retain the established catalog semantics,
             # including explicitly configured custom models and Agent Team
@@ -3239,7 +4293,12 @@ def build_model_catalog(
             # the strict discovery projection.
             chat_models = [dict(model) for model in models]
             availability = {"state": "catalog", "error": None}
-        settings = provider_settings(provider, cfg, configured_provider_model)
+        settings = provider_settings(
+            provider,
+            cfg,
+            configured_provider_model,
+            include_runtime_status=include_runtime_models,
+        )
         if fixed_provider and deployment is not None:
             settings = dict(settings)
             settings.update(
@@ -3249,6 +4308,16 @@ def build_model_catalog(
                     "enable_tools": deployment.tool_capability,
                 }
             )
+        provider_source = _provider_source(models, should_refresh)
+        if (
+            provider == "deepinfra"
+            and should_refresh
+            and remote_state.get("status") == "success"
+        ):
+            # A successful empty response is still a remote snapshot and must
+            # be distinguishable from a no-fetch/static fallback for cache
+            # persistence.
+            provider_source = "remote"
         provider_payload = {
             "id": provider,
             "label": LLM_PROVIDER_LABELS.get(provider, provider),
@@ -3268,7 +4337,7 @@ def build_model_catalog(
                 provider, ProviderCapabilities()
             ).to_dict(),
             "settings": settings,
-            "source": _provider_source(models, should_refresh),
+            "source": provider_source,
             "refreshed": should_refresh,
             "cached_at": cached_provider_updated_at(provider, cached_catalog),
             "error": error,
@@ -3512,3 +4581,4 @@ def build_engine_options(
     # local/profile models into the chat UI.
 
     return result
+

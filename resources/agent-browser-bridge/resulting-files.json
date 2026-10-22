@@ -1,0 +1,270 @@
+{
+  "files": [
+    {
+      "path": "README.md",
+      "status": "modified",
+      "base_blob_sha": "249b40e941dff494893f2012789292f5262eae35",
+      "bytes": 129327,
+      "sha256": "1cfd79cc6128321c5c8acb2dbe2ad766743681f6158e0295a575a5bdb8ade730"
+    },
+    {
+      "path": "agent-browser.schema.json",
+      "status": "modified",
+      "base_blob_sha": "f67bbef921ff8b20f2463bf6eb2bee08aae7e577",
+      "bytes": 10166,
+      "sha256": "2046d7d747657689ee153cc91bb404738e492af265982e5b63768f139a2c8af3"
+    },
+    {
+      "path": "cli/Cargo.toml",
+      "status": "modified",
+      "base_blob_sha": "ed5d29d7497c081012c0d0f14d0aa74b2fef50e5",
+      "bytes": 2197,
+      "sha256": "b92871c947af51d3fc578916c724f3e2c0823e56adc3da5f9f232d46b0dd0b57"
+    },
+    {
+      "path": "cli/src/bridge_private.rs",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 14770,
+      "sha256": "adace111e2919218197e29aee6c019b8a95be7ac8a8a296f4b059cbdc1b98135"
+    },
+    {
+      "path": "cli/src/commands.rs",
+      "status": "modified",
+      "base_blob_sha": "db5154a71dc23096d96c7229a40c33d2c0568764",
+      "bytes": 266345,
+      "sha256": "46e56626130aa139711754d54aa0b8929287ee44d8074c3545d445297dc93310"
+    },
+    {
+      "path": "cli/src/connection.rs",
+      "status": "modified",
+      "base_blob_sha": "8d5f66ad51239292790caa5fee7ac825c38217e5",
+      "bytes": 65237,
+      "sha256": "b7fb073ae6d689940307b3b1f55108e9c2791a5cab567516a331b2a01f40ff40"
+    },
+    {
+      "path": "cli/src/doctor/launch.rs",
+      "status": "modified",
+      "base_blob_sha": "677e3ba273aa54efba394200e5785e5f29cb3410",
+      "bytes": 5845,
+      "sha256": "5fc8e6a918e8dcbc887dfa944fcc2cb48bc43769253a680cf0cfead0aa295571"
+    },
+    {
+      "path": "cli/src/doctor/webgpu.rs",
+      "status": "modified",
+      "base_blob_sha": "e6185715ddd0773ecd0912d7c9bb1fe27ae390dc",
+      "bytes": 18704,
+      "sha256": "1f6d11088036e12908073afce1eca3b04b32fe07af7482fe67a28725f7032395"
+    },
+    {
+      "path": "cli/src/flags.rs",
+      "status": "modified",
+      "base_blob_sha": "ad96f956f0ed42c01b3240acfd792a89509fc6de",
+      "bytes": 82120,
+      "sha256": "c97cfa4edeb108b3cd6c64fcbe5668b399af7a452bec8754409bf1ff0b61cd35"
+    },
+    {
+      "path": "cli/src/main.rs",
+      "status": "modified",
+      "base_blob_sha": "9878fc189b9a37e670bb01cbaf62526fd9612ee6",
+      "bytes": 119574,
+      "sha256": "5bec4c71d0b77953f677fcd4e3639d620a7786cbe6ae00fad3243c90604f7bc4"
+    },
+    {
+      "path": "cli/src/mcp.rs",
+      "status": "modified",
+      "base_blob_sha": "635644f5822b45b1c94dc3095d995ead4289c975",
+      "bytes": 210083,
+      "sha256": "86ee73f7765ec57bc413e2bcfee2fcdd88f64036d7ca5f0e7f37e6fa159d12b2"
+    },
+    {
+      "path": "cli/src/native/actions.rs",
+      "status": "modified",
+      "base_blob_sha": "7ba21c89981a46e72e515879ddcc633b418ef22c",
+      "bytes": 750306,
+      "sha256": "61329338a502e19117cdfb4e0e38fefdaf4887988f60c8907b22b53662fd4b9b"
+    },
+    {
+      "path": "cli/src/native/bridge_contract_tests.rs",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 47023,
+      "sha256": "1271d5bb4d6d34e12a6ec931095c88f138481f4e15f7d28a3875c11edc8be886"
+    },
+    {
+      "path": "cli/src/native/browser.rs",
+      "status": "modified",
+      "base_blob_sha": "5952b192b1015a82c4ffefbbd634a428fc621e6b",
+      "bytes": 214781,
+      "sha256": "fdf27f6b00e0ca73cddcb2ead64dc14e578a5e599598db5bd19c7d6eeeaf9df7"
+    },
+    {
+      "path": "cli/src/native/cdp/client.rs",
+      "status": "modified",
+      "base_blob_sha": "97885a49abfa60210a9b37c80160eb3d0cdd632b",
+      "bytes": 46867,
+      "sha256": "3a60e86d7cd6210390aeef9762d87a7523e1f03b254bcf1cdcd79ff85a4f3c83"
+    },
+    {
+      "path": "cli/src/native/cdp/mod.rs",
+      "status": "modified",
+      "base_blob_sha": "74da2a8742d6b8130aea7a1eabaf979b333f1099",
+      "bytes": 273,
+      "sha256": "5299ac4dfcfc0158fe93eead5581abaabe9b807b92e1f9893e3fb832d322a42d"
+    },
+    {
+      "path": "cli/src/native/cdp/targets.rs",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 9127,
+      "sha256": "7ac56e04eace61dfc1911fa580a6976e64ac7536118313b8fc9cf29465c16b11"
+    },
+    {
+      "path": "cli/src/native/crowdworks.rs",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 53949,
+      "sha256": "61a2543113017bbfa55eed50b714dde23930ea6a0f76cbb22000752991d42760"
+    },
+    {
+      "path": "cli/src/native/daemon.rs",
+      "status": "modified",
+      "base_blob_sha": "28689d23767316a312f960958b1acce13d877f9f",
+      "bytes": 37608,
+      "sha256": "a46cc7e00d4f7304f9340df7b89d09762f3cf7f62fa303c3d98dbf5344a3ff9b"
+    },
+    {
+      "path": "cli/src/native/element.rs",
+      "status": "modified",
+      "base_blob_sha": "82737ceab9d632cdab22eaef4a7067ad14db9711",
+      "bytes": 116094,
+      "sha256": "5df093b299b6263b14e7e549d7f245c380a95ded84a07c6d17ff82adcb44c574"
+    },
+    {
+      "path": "cli/src/native/interaction.rs",
+      "status": "modified",
+      "base_blob_sha": "0a3093efb62785080b369497864474bdbb375c01",
+      "bytes": 49600,
+      "sha256": "b8b5656debb48edb68a5b89bedc9c6e27a01c94d8b023259711232d4e8377849"
+    },
+    {
+      "path": "cli/src/native/mod.rs",
+      "status": "modified",
+      "base_blob_sha": "abdc7ef6664aa873901b610dfe4643d3d8d9a79d",
+      "bytes": 1138,
+      "sha256": "c616c869947ec28bf20a17002adbf6f8a2cb026a32296a3fb9cd280e8b30a45c"
+    },
+    {
+      "path": "cli/src/native/parity_tests.rs",
+      "status": "modified",
+      "base_blob_sha": "768e55d1031de9aee7c2bbeec55c28f789e00e1c",
+      "bytes": 29896,
+      "sha256": "e5eb755147abd3e977b43a91c3888d992308289aa68ba3ba8993a2d657cd9196"
+    },
+    {
+      "path": "cli/src/native/snapshot.rs",
+      "status": "modified",
+      "base_blob_sha": "80c5de0ab1e665133fd0e84652063ce5d710a140",
+      "bytes": 86859,
+      "sha256": "f5609d6f67aef50a886d678d5588900efb066566c001dec7d6a39bed476e72c7"
+    },
+    {
+      "path": "cli/src/native/tab_binding.rs",
+      "status": "modified",
+      "base_blob_sha": "8d8885655d7452d4fa4b9ac04b7095af43c67416",
+      "bytes": 23034,
+      "sha256": "1b1583f706a757c9cb29f318e9d3f930b9ce7d97d8c6dfd9764099d9ea87cb3d"
+    },
+    {
+      "path": "cli/src/native/test_fixtures/editable-value-projection.json",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 26476,
+      "sha256": "b1f031f5f04c142fed3864a8b7bd3f0dc6b5fdf7c7ad8014288b0fe445022a5e"
+    },
+    {
+      "path": "cli/src/output.rs",
+      "status": "modified",
+      "base_blob_sha": "8c465cb923109a066972f1f7c2f6602c79c3ad02",
+      "bytes": 191618,
+      "sha256": "13e6c5682ae637a034b8ad22113fe7b96f840986410e30cd7d4335f4f9036c79"
+    },
+    {
+      "path": "cli/tests/bridge_helper_cli.rs",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 19980,
+      "sha256": "0f954c8e061924cf2ad0617654e36f4a060ac1ac8b0e203f25bb031381d0eece"
+    },
+    {
+      "path": "docs/public/schema.json",
+      "status": "modified",
+      "base_blob_sha": "a7763017c8b08947ac3ef3a5c05fadd0fda24cf6",
+      "bytes": 10107,
+      "sha256": "fd2d2237aeb197a338db1afc9289a1e51c821e8208e7b7e3c330eb42d356b463"
+    },
+    {
+      "path": "docs/src/app/cdp-mode/page.mdx",
+      "status": "modified",
+      "base_blob_sha": "270863568ceabca4a36c41d851ec1eff4ff3bc70",
+      "bytes": 31179,
+      "sha256": "41c45c8513265f40e17d52c003c7c99f6cd4bd730d62aca25df084e52c2e1e2c"
+    },
+    {
+      "path": "docs/src/app/commands/page.mdx",
+      "status": "modified",
+      "base_blob_sha": "80c58d22ed8c33b8c32ac6fe53d697f18a5760f9",
+      "bytes": 63667,
+      "sha256": "d93b35adf6fbc97413a1fce5f187b5e3396fa16978b219095c6ec801b5f436fc"
+    },
+    {
+      "path": "docs/src/app/configuration/page.mdx",
+      "status": "modified",
+      "base_blob_sha": "8e273fe17b65440cbd2201ff4846ef3f71917c7b",
+      "bytes": 25201,
+      "sha256": "3dcc3706d610d0067bc02528348cb994fb5d5ec8aa0cb2e17d46b45dd98351d9"
+    },
+    {
+      "path": "docs/src/app/sessions/page.mdx",
+      "status": "modified",
+      "base_blob_sha": "dbb453f24476208e9916278fd937019b235ab9ad",
+      "bytes": 12982,
+      "sha256": "186c420c9e2dee4c7dcbacda9093ae1c8b92c8b4826862e5365c17c04c3b5217"
+    },
+    {
+      "path": "skill-data/core/SKILL.md",
+      "status": "modified",
+      "base_blob_sha": "9bfc44ce1a6076482fba7a48f78cf7abf1850624",
+      "bytes": 50043,
+      "sha256": "8e9b9d769c3515d37d37854c727ad905107252b93bcbca0b67903741d52f5257"
+    },
+    {
+      "path": "skill-data/core/references/bridge-helper.md",
+      "status": "added",
+      "base_blob_sha": null,
+      "bytes": 28788,
+      "sha256": "6bced05302f1128da952676686295cc64720754478afb9293cb2bed3785383f5"
+    },
+    {
+      "path": "skill-data/core/references/commands.md",
+      "status": "modified",
+      "base_blob_sha": "6e47f5d45556ed522e7a2be11b7e57252a62b2f5",
+      "bytes": 42225,
+      "sha256": "2d3af4d91da23a628e461b1ac3732ff84a8c992fc8b67fb490c458d0ffbb986d"
+    },
+    {
+      "path": "skill-data/core/references/session-management.md",
+      "status": "modified",
+      "base_blob_sha": "60497920dc7118221efccffe60504d5e43d2cf38",
+      "bytes": 11537,
+      "sha256": "f844ff4127a8c47517ca7862c392c61728e68e2d0f1fd12a210e59ef362ca66d"
+    },
+    {
+      "path": "skill-data/core/references/snapshot-refs.md",
+      "status": "modified",
+      "base_blob_sha": "d25653e9e545cafe96ddbf7ce5518511ce8ee4b6",
+      "bytes": 7766,
+      "sha256": "67f889e884a2f7687c6050a04a21a1adcecaa43145635a47a204d1f2a04341e6"
+    }
+  ]
+}

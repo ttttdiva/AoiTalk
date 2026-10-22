@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -11,9 +13,7 @@ import {
 } from "lucide-react";
 import { useSyncExternalStore, type ReactNode } from "react";
 import { useTheme } from "@/contexts/theme-context";
-import { useUserSettings } from "@/contexts/user-settings-context";
 import { getVisibleAppViewTabs } from "@/lib/app-navigation";
-import { getAppNavigationVisibility } from "@/lib/user-settings";
 import { navigateChatSessionInPlace } from "@/lib/chat-navigation";
 import { NotificationBellPopover } from "./sidebar/notification-panel";
 import { useShellChrome } from "./shell-context";
@@ -63,7 +63,6 @@ function RailButton({
 
 export function GlobalRail() {
   const pathname = usePathname();
-  const { settings } = useUserSettings();
   const { resolvedTheme, setTheme } = useTheme();
   const themeHydrated = useSyncExternalStore(
     subscribeToHydration,
@@ -75,14 +74,13 @@ export function GlobalRail() {
     toggleContextRail,
     workspaceShellRegistrations,
   } = useShellChrome();
-  const visibility = getAppNavigationVisibility(settings);
-  const tabs = getVisibleAppViewTabs(visibility);
+  const tabs = getVisibleAppViewTabs();
   const contextRailAvailable = workspaceShellRegistrations.some(
     (entry) =>
       entry.routeKey === (pathname ?? "/") &&
       entry.contextRail !== undefined &&
       entry.contextRail !== null &&
-      !entry.contextRailPersistent,
+      (!entry.contextRailPersistent || entry.contextRailPresentation !== undefined),
   );
   const displayedTheme = themeHydrated ? resolvedTheme : "light";
 
@@ -93,7 +91,7 @@ export function GlobalRail() {
     } catch {
       // localStorageが無効でも新規チャットへの遷移は継続する。
     }
-    if (!navigateChatSessionInPlace("/chat")) window.location.href = "/chat";
+    if (!navigateChatSessionInPlace("/chat")) window.location.href = withBasePath("/chat");
   };
 
   return (

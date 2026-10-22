@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -25,18 +25,23 @@ import {
   type GenerationRun,
   type GenerationWorkspace,
 } from "@/lib/media-operations-generation-api";
+import { withBasePath } from "@/lib/base-path";
+import { assetInScope, mediaAssetsApi } from "@/lib/media-assets-api";
 import { AppSelect } from "@/components/ui/app-select";
+import type { PersonaWorkspaceScope } from "@/lib/persona-workspace-model";
+import { mediaResearchApi, type ContentItem } from "@/lib/media-operations-research-api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { HelpPopover } from "@/components/ui/help-popover";
+import { GenerationRegistrationPanel } from "./generation-registration-panel";
 
 function newIdempotencyKey(): string {
   if (
@@ -49,6 +54,21 @@ function newIdempotencyKey(): string {
   return `media-generation-${Date.now()}-${Math.random()
     .toString(36)
     .slice(2)}`;
+}
+
+/** Compare a saved Plan with its canonical immutable brief on creation and reload. */
+function scopedPlanInputMatches(plan: GenerationPlan, scope: PersonaWorkspaceScope, items: ContentItem[]): boolean {
+  if (plan.owner_user_id !== scope.ownerUserId || plan.project_id !== scope.projectId || plan.persona_revision_id !== scope.personaRevisionId) return false;
+  if (!plan.content_item_id) return true;
+  const item = items.find(candidate => candidate.id === plan.content_item_id && candidate.owner_user_id === scope.ownerUserId && candidate.project_id === scope.projectId && candidate.persona_revision_id === scope.personaRevisionId);
+  if (!item || (item.input_kind !== "research" && item.input_kind !== "user_authored")) return false;
+  const value = plan.request_spec.research_context;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const saved = value as Record<string, unknown>;
+  if (saved.owner_user_id !== scope.ownerUserId || saved.project_id !== scope.projectId || saved.persona_id !== scope.personaId || saved.content_item_id !== item.id || saved.content_item_hash !== item.content_hash || saved.content_item_version !== item.version) return false;
+  if (!saved.brief || typeof saved.brief !== "object" || Array.isArray(saved.brief)) return false;
+  const brief = saved.brief as Record<string, unknown>;
+  return brief.requirements === item.brief && (item.input_kind === "user_authored" ? brief.input_kind === "user_authored" && brief.persona_revision_id === scope.personaRevisionId : brief.input_kind === undefined || brief.input_kind === "research");
 }
 
 function readableError(error: unknown): string {
@@ -170,25 +190,37 @@ function safeCatalogItem(
   };
 }
 
+const MEDIA_PREVIEW_UUID_RE =
+  "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const MEDIA_PREVIEW_SHA_RE = "[0-9a-f]{64}";
+
 function safeMediaPreviewUrl(value: unknown): string | null {
   if (typeof value !== "string" || !value.trim()) return null;
   const candidate = value.trim();
-  // A preview must be served by the AoiTalk proxy. Never put a provider URL,
-  // signed query, local path, or object URL in a durable/UI authority.
-  if (!candidate.startsWith("/api/python-proxy/")) return null;
+  // Only the backend's immutable preview route and its already-proxied form
+  // are accepted. Never put a provider URL, signed query, local path, or
+  // object URL in a durable/UI authority.
+  const match = candidate.match(
+    new RegExp(
+      `^(/api(?:/python-proxy)?/operations/media/assets/(${MEDIA_PREVIEW_UUID_RE})/preview\\?expected_sha256=(${MEDIA_PREVIEW_SHA_RE}))$`,
+      "u",
+    ),
+  );
+  if (!match) return null;
+  const [, , outputId, sha256] = match;
+  const proxyPath = `/api/python-proxy/operations/media/assets/${outputId}/preview?expected_sha256=${sha256}`;
   if (typeof window === "undefined") return null;
   try {
-    const parsed = new URL(candidate, window.location.origin);
+    const parsed = new URL(proxyPath, window.location.origin);
     if (
       parsed.origin !== window.location.origin ||
       parsed.username ||
       parsed.password ||
-      parsed.search ||
       parsed.hash
     ) {
       return null;
     }
-    return parsed.pathname;
+    return withBasePath(`${parsed.pathname}?${parsed.searchParams.toString()}`);
   } catch {
     return null;
   }
@@ -324,12 +356,17 @@ function OutputRow({
   );
 }
 
-export function MediaGenerationPanel() {
+export function MediaGenerationPanel({ scope, contentItemId, onOutputSelected }: { scope?: PersonaWorkspaceScope; contentItemId?: string; onOutputSelected?: (output: GenerationOutput) => void } = {}) {
   const [workspaces, setWorkspaces] = useState<GenerationWorkspace[]>([]);
   const [recipes, setRecipes] = useState<CreativeRecipe[]>([]);
   const [plans, setPlans] = useState<GenerationPlan[]>([]);
   const [runs, setRuns] = useState<GenerationRun[]>([]);
   const [catalog, setCatalog] = useState<GenerationCatalogItem[]>([]);
+  const [contentItems, setContentItems] = useState<ContentItem[]>([]);
+  const [selectedContentItemId, setSelectedContentItemId] = useState(contentItemId ?? "");
+  const [contentItemsError, setContentItemsError] = useState<unknown>(null);
+  const [contentItemsOffset, setContentItemsOffset] = useState(0);
+  const [contentItemsLoading, setContentItemsLoading] = useState(false);
 
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [selectedRecipeId, setSelectedRecipeId] = useState("");
@@ -341,7 +378,7 @@ export function MediaGenerationPanel() {
   const [negativePrompt, setNegativePrompt] = useState("");
   const [seed, setSeed] = useState("");
   const [modelSelectionId, setModelSelectionId] = useState("");
-  const [personaRevisionId, setPersonaRevisionId] = useState("");
+  const [personaRevisionId, setPersonaRevisionId] = useState(scope?.personaRevisionId ?? "");
   const [sizePresetId, setSizePresetId] = useState("normal_square");
   const [width, setWidth] = useState("");
   const [height, setHeight] = useState("");
@@ -362,18 +399,32 @@ export function MediaGenerationPanel() {
     status: string;
     requestHash?: string | null;
   } | null>(null);
-  const [busy, setBusy] = useState<"plan" | "submit" | "refresh" | "reconcile" | "select" | null>(
+  const [busy, setBusy] = useState<"plan" | "submit" | "refresh" | "reconcile" | "select" | "retire" | null>(
     null,
   );
   const [error, setError] = useState<unknown>(null);
   const [catalogError, setCatalogError] = useState<unknown>(null);
+  const contentItemsRequestRef = useRef(0);
+  const bindingRequestRef = useRef(0);
   const planRequestRef = useRef(0);
   const runRequestRef = useRef(0);
   const catalogRequestRef = useRef(0);
   const createPlanRequestRef = useRef(0);
+  const createPlanLock = useRef(false);
   const submitRequestRef = useRef(0);
   const reconcileRequestRef = useRef(0);
   const selectRequestRef = useRef(0);
+  const selectionContext = useRef({ mounted: false, scopeKey: "", planId: "", runId: "", workspaceId: "" });
+  const scopeKey = scope ? JSON.stringify([scope.ownerUserId, scope.projectId, scope.personaId, scope.personaRevisionId]) : "legacy";
+
+  useLayoutEffect(() => {
+    selectionContext.current = { mounted: true, scopeKey, planId: selectedPlanId, runId: selectedRunId, workspaceId: selectedWorkspaceId };
+    const invalidated = ++selectRequestRef.current;
+    const task = window.setTimeout(() => {
+      if (selectionContext.current.mounted && selectRequestRef.current === invalidated) setBusy(current => current === "select" ? null : current);
+    }, 0);
+    return () => { window.clearTimeout(task); selectionContext.current.mounted = false; selectRequestRef.current += 1; };
+  }, [scopeKey, selectedPlanId, selectedRunId, selectedWorkspaceId]);
 
   const selectedWorkspace = useMemo(
     () =>
@@ -385,48 +436,112 @@ export function MediaGenerationPanel() {
     () => recipes.find((recipe) => recipe.id === selectedRecipeId) ?? null,
     [recipes, selectedRecipeId],
   );
-  const selectedPlan = useMemo(
+
+  const retireWorkspace = async () => {
+    if (!selectedWorkspace || busy !== null || selectedWorkspace.status === "unavailable") return;
+    const pinned = selectedWorkspace;
+    const expectedHash = pinned.config_hash;
+    if (typeof expectedHash !== "string" || !/^[a-f0-9]{64}$/iu.test(expectedHash)) {
+      setError(new Error("制作環境の保存版を確認できません。設定を更新してください。"));
+      return;
+    }
+    const key = scopeKey;
+    const current = () => selectionContext.current.mounted && selectionContext.current.scopeKey === key && selectionContext.current.workspaceId === pinned.id;
+    setBusy("retire"); setError(null);
+    try {
+      const saved = await mediaGenerationApi.retireWorkspace(pinned.id, expectedHash);
+      if (!current()) return;
+      if (saved.id !== pinned.id || saved.owner_user_id !== pinned.owner_user_id || saved.project_id !== pinned.project_id || saved.external_workspace_id !== pinned.external_workspace_id || saved.external_project_id !== pinned.external_project_id || saved.status !== "unavailable") throw new Error("制作環境の無効化結果を確認できません。設定を更新してください。");
+      await loadBindings();
+    } catch (cause) { if (current()) setError(cause); }
+    finally { if (selectionContext.current.mounted && selectionContext.current.scopeKey === key) setBusy(null); }
+  };
+  const selectedPlanRecord = useMemo(
     () => plans.find((plan) => plan.id === selectedPlanId) ?? null,
     [plans, selectedPlanId],
   );
-  const selectedRun = useMemo(
+  const planInputMismatch = Boolean(scope && selectedPlanRecord && (contentItemsError || !scopedPlanInputMatches(selectedPlanRecord, scope, contentItems)));
+  const selectedPlan = planInputMismatch ? null : selectedPlanRecord;
+  const selectedRunRecord = useMemo(
     () => runs.find((run) => run.id === selectedRunId) ?? null,
     [runs, selectedRunId],
   );
+  const selectedRun = planInputMismatch ? null : selectedRunRecord;
+  const verifiedPlanId = selectedPlan?.id ?? "";
   const selectedRevision = selectedRecipe?.current_revision ?? null;
+  const savedResearchContext = selectedPlan?.request_spec.research_context;
+  const researchContext = savedResearchContext && typeof savedResearchContext === "object" && !Array.isArray(savedResearchContext)
+    ? savedResearchContext as Record<string, unknown> : null;
+  const savedBrief = researchContext?.brief;
+  const savedRequirements = savedBrief && typeof savedBrief === "object" && "requirements" in savedBrief && typeof savedBrief.requirements === "string"
+    ? savedBrief.requirements : "";
   const generationKind = normalizeGenerationKind(selectedRevision?.recipe_type);
+  const compatibleContentItems = useMemo(() => contentItems.filter((item) =>
+    item.status !== "archived" &&
+    item.persona_revision_id === (selectedRevision?.persona_revision_id || personaRevisionId.trim()) &&
+    (item.project_id ?? null) === (selectedWorkspace?.project_id ?? null) &&
+    (item.project_id ?? null) === (selectedRecipe?.project_id ?? null) &&
+    (!selectedWorkspace?.owner_user_id || item.owner_user_id === selectedWorkspace.owner_user_id) &&
+    (!selectedRecipe?.owner_user_id || item.owner_user_id === selectedRecipe.owner_user_id)
+  ), [contentItems, selectedRevision, personaRevisionId, selectedWorkspace, selectedRecipe]);
+  const selectedContentItem = compatibleContentItems.find((item) => item.id === selectedContentItemId);
   const resolvedModelSelectionId =
     modelSelectionId.trim() ||
     selectedRevision?.model_selection_id?.trim() ||
     selectedRevision?.image_model_selection_id?.trim() ||
     "";
 
+  const loadContentItems = useCallback(async (offset: number) => {
+    const requestId = ++contentItemsRequestRef.current;
+    setContentItemsLoading(true);
+    setContentItemsError(null);
+    setSelectedContentItemId("");
+    try {
+      const items = await mediaResearchApi.listContentItems(undefined, { limit: 100, offset, ...(scope ? { projectId: scope.projectId } : {}) });
+      if (requestId !== contentItemsRequestRef.current) return;
+      setContentItems(scope ? items.filter(item => item.project_id === scope.projectId && item.owner_user_id === scope.ownerUserId && item.persona_revision_id === scope.personaRevisionId) : items);
+      setSelectedContentItemId(contentItemId ?? "");
+      setContentItemsOffset(offset);
+    } catch (nextError) {
+      if (requestId === contentItemsRequestRef.current) setContentItemsError(nextError);
+    } finally {
+      if (requestId === contentItemsRequestRef.current) setContentItemsLoading(false);
+    }
+  }, [scope, contentItemId]);
+
   const loadBindings = useCallback(async () => {
+    const requestId = ++bindingRequestRef.current;
+    const currentScope = scopeKey;
+    const isCurrent = () => requestId === bindingRequestRef.current && selectionContext.current.mounted && selectionContext.current.scopeKey === currentScope;
     setLoading(true);
     setError(null);
+    void loadContentItems(0);
     try {
       const [nextWorkspaces, nextRecipes] = await Promise.all([
-        mediaGenerationApi.listWorkspaces(),
-        mediaGenerationApi.listRecipes(),
+        mediaGenerationApi.listWorkspaces(scope?.projectId),
+        mediaGenerationApi.listRecipes(scope?.personaId),
       ]);
-      setWorkspaces(nextWorkspaces);
-      setRecipes(nextRecipes);
+      if (!isCurrent()) return;
+      const scopedWorkspaces = scope ? nextWorkspaces.filter(item => item.project_id === scope.projectId && item.owner_user_id === scope.ownerUserId) : nextWorkspaces;
+      const scopedRecipes = scope ? nextRecipes.filter(item => item.persona_id === scope.personaId && item.project_id === scope.projectId && item.owner_user_id === scope.ownerUserId && item.current_revision?.persona_revision_id === scope.personaRevisionId) : nextRecipes;
+      setWorkspaces(scopedWorkspaces);
+      setRecipes(scopedRecipes);
       setSelectedWorkspaceId((current) =>
-        nextWorkspaces.some((item) => item.id === current)
+        scopedWorkspaces.some((item) => item.id === current)
           ? current
-          : nextWorkspaces[0]?.id ?? "",
+          : scope ? "" : scopedWorkspaces[0]?.id ?? "",
       );
       setSelectedRecipeId((current) =>
-        nextRecipes.some((item) => item.id === current)
+        scopedRecipes.some((item) => item.id === current)
           ? current
-          : nextRecipes[0]?.id ?? "",
+          : scope ? "" : scopedRecipes[0]?.id ?? "",
       );
     } catch (nextError) {
-      setError(nextError);
+      if (isCurrent()) setError(nextError);
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }, []);
+  }, [loadContentItems, scope, scopeKey]);
 
   const loadPlans = useCallback(async () => {
     const requestId = ++planRequestRef.current;
@@ -438,28 +553,29 @@ export function MediaGenerationPanel() {
     try {
       const nextPlans = await mediaGenerationApi.listPlans({
         workspaceId: selectedWorkspaceId,
+        ...(scope ? { personaRevisionId: scope.personaRevisionId } : {}),
       });
       if (requestId !== planRequestRef.current) return;
-      setPlans(nextPlans);
+      setPlans(scope ? nextPlans.filter(item => item.project_id === scope.projectId && item.owner_user_id === scope.ownerUserId && item.persona_revision_id === scope.personaRevisionId) : nextPlans);
       setSelectedPlanId((current) =>
-        nextPlans.some((item) => item.id === current)
+        nextPlans.some((item) => item.id === current && (!scope || (item.project_id === scope.projectId && item.owner_user_id === scope.ownerUserId && item.persona_revision_id === scope.personaRevisionId)))
           ? current
-          : nextPlans[0]?.id ?? "",
+          : scope ? "" : nextPlans[0]?.id ?? "",
       );
     } catch (nextError) {
       setError(nextError);
     }
-  }, [selectedWorkspaceId]);
+  }, [selectedWorkspaceId, scope]);
 
   const loadRuns = useCallback(async () => {
     const requestId = ++runRequestRef.current;
-    if (!selectedPlanId) {
+    if (!verifiedPlanId) {
       setRuns([]);
       setSelectedRunId("");
       return;
     }
     try {
-      const nextRuns = await mediaGenerationApi.listRuns(selectedPlanId);
+      const nextRuns = await mediaGenerationApi.listRuns(verifiedPlanId);
       if (requestId !== runRequestRef.current) return;
       setRuns(nextRuns.map(safeRun));
       setSelectedRunId((current) =>
@@ -470,12 +586,20 @@ export function MediaGenerationPanel() {
     } catch (nextError) {
       setError(nextError);
     }
-  }, [selectedPlanId]);
+  }, [verifiedPlanId]);
 
   useEffect(() => {
     const task = window.setTimeout(() => void loadBindings(), 0);
     return () => window.clearTimeout(task);
   }, [loadBindings]);
+
+  useEffect(() => {
+    const task = window.setTimeout(() => setSelectedContentItemId((current) =>
+      compatibleContentItems.some((item) => item.id === current) ? current
+        : contentItemId && compatibleContentItems.some(item => item.id === contentItemId) ? contentItemId : ""
+    ), 0);
+    return () => window.clearTimeout(task);
+  }, [compatibleContentItems, contentItemId]);
 
   useEffect(() => {
     const task = window.setTimeout(() => void loadPlans(), 0);
@@ -575,6 +699,7 @@ export function MediaGenerationPanel() {
 
   const createPlan = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (createPlanLock.current) return;
     const revision = selectedRevision;
     const outputCount = Number(requestedOutputs);
     if (!selectedWorkspaceId || !selectedRecipeId || !revision) {
@@ -582,6 +707,10 @@ export function MediaGenerationPanel() {
       return;
     }
     const pinnedPersonaRevisionId = revision.persona_revision_id || personaRevisionId.trim();
+    if (selectedContentItemId && !selectedContentItem) {
+      setError(new Error("ContentItemとWorkspace・Recipe・Persona revisionのscopeが一致しません"));
+      return;
+    }
     if (!pinnedPersonaRevisionId || !prompt.trim()) {
       setError(new Error("Persona revisionとPromptが必要です"));
       return;
@@ -674,6 +803,7 @@ export function MediaGenerationPanel() {
       }
     }
 
+    createPlanLock.current = true;
     setBusy("plan");
     setError(null);
     const createRequestId = ++createPlanRequestRef.current;
@@ -707,6 +837,7 @@ export function MediaGenerationPanel() {
           persona_revision_id: pinnedPersonaRevisionId,
           creative_recipe_revision_id: revision.id,
           workspace_id: selectedWorkspaceId,
+          ...(selectedContentItem ? { content_item_id: selectedContentItem.id } : {}),
           requested_outputs: outputCount,
           request_spec: requestSpec,
         },
@@ -719,6 +850,14 @@ export function MediaGenerationPanel() {
       ) {
         return;
       }
+      if (scope && (created.owner_user_id !== scope.ownerUserId || created.project_id !== scope.projectId || created.persona_revision_id !== pinnedPersonaRevisionId || created.workspace_id !== selectedWorkspaceId || created.creative_recipe_revision_id !== revision.id || (selectedContentItem && created.content_item_id !== selectedContentItem.id))) {
+        throw new Error("保存された生成計画の人格・Project・制作入力を照合できません。");
+      }
+      if (scope && selectedContentItem?.input_kind === "user_authored") {
+        if (!scopedPlanInputMatches(created, scope, [selectedContentItem])) {
+          throw new Error("生成計画に固定された本人入力の種別・原文・保存hashが一致しません。");
+        }
+      }
       planRequestRef.current += 1;
       setPlans((current) => [created, ...current.filter((item) => item.id !== created.id)]);
       setSelectedPlanId(created.id);
@@ -726,6 +865,7 @@ export function MediaGenerationPanel() {
     } catch (nextError) {
       if (createRequestId === createPlanRequestRef.current) setError(nextError);
     } finally {
+      createPlanLock.current = false;
       if (createRequestId === createPlanRequestRef.current) setBusy(null);
     }
   };
@@ -904,23 +1044,42 @@ export function MediaGenerationPanel() {
   };
 
   const selectOutput = async (output: GenerationOutput) => {
-    if (!selectedRun) return;
+    if (!selectedRun || busy !== null) return;
     const runSnapshot = selectedRun;
+    const scopeSnapshot = scopeKey;
+    const planSnapshot = selectedPlanId;
     const requestId = ++selectRequestRef.current;
+    const stillCurrent = () => requestId === selectRequestRef.current && selectionContext.current.mounted &&
+      selectionContext.current.scopeKey === scopeSnapshot && selectionContext.current.planId === planSnapshot && selectionContext.current.runId === runSnapshot.id;
     setBusy("select");
     setError(null);
     try {
-      await mediaGenerationApi.selectOutput(
+      const selection = await mediaGenerationApi.selectOutput(
         runSnapshot.id,
         output.id,
         newIdempotencyKey(),
       );
-      if (requestId !== selectRequestRef.current || selectedRunId !== runSnapshot.id) return;
+      if (!stillCurrent()) return;
+      if (scope && (selection.owner_user_id !== scope.ownerUserId || selection.project_id !== scope.projectId ||
+        selection.generation_run_id !== runSnapshot.id || selection.generation_output_id !== output.id)) throw new Error("保存された採用記録の所属・Run・Outputが選択した人格と一致しません。");
+      if (scope && onOutputSelected) {
+        const item = contentItems.find(item => item.id === selectedPlan?.content_item_id && item.owner_user_id === scope.ownerUserId && item.project_id === scope.projectId && item.persona_revision_id === scope.personaRevisionId);
+        if (!item || !output.sha256) throw new Error("制作物の保存先briefと保存hashを確認できません。設定を更新してください。");
+        // A candidate selection stores provenance only. Materialize the
+        // verified bytes through the existing registration command before
+        // handing an asset reference to QA. The output key is replay-safe.
+        const asset = await mediaAssetsApi.register({ persona_id: scope.personaId, content_item_id: item.id,
+          expected_content_item_hash: item.content_hash, source_kind: "generation_output", source_id: output.id,
+          expected_sha256: output.sha256 }, `generation-output:${output.id}`);
+        if (!stillCurrent()) return;
+        if (!assetInScope(asset, scope, output.id, output.sha256) || asset.content_item_id !== item.id) throw new Error("制作物の実体保存と人格・briefを照合できません。保存状態を更新してください。");
+      }
       setSelectedOutputId(output.id);
+      onOutputSelected?.(output);
     } catch (nextError) {
-      if (requestId === selectRequestRef.current) setError(nextError);
+      if (stillCurrent()) setError(nextError);
     } finally {
-      if (requestId === selectRequestRef.current) setBusy(null);
+      if (stillCurrent()) setBusy(null);
     }
   };
 
@@ -928,10 +1087,10 @@ export function MediaGenerationPanel() {
     <div className="space-y-4" data-testid="operations-media-generation-panel">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">Creative / Generation</h2>
-          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            Personaのexact revisionとGeneration Studio bindingを固定して、画像・動画Generation Plan・Run・Outputの監査可能な参照だけを扱います。
-          </p>
+          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
+            Creative / Generation
+            <HelpPopover label="Creative / Generation">Personaのexact revisionとGeneration Studio bindingを固定して、画像・動画Generation Plan・Run・Outputの監査可能な参照だけを扱います。</HelpPopover>
+          </h2>
         </div>
         <Button
           type="button"
@@ -946,14 +1105,15 @@ export function MediaGenerationPanel() {
       </div>
 
       <ErrorNotice error={error} />
+      <GenerationRegistrationPanel scope={scope} onSaved={loadBindings} />
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,28rem)]">
         <Card size="sm">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="text-sm">Generation binding</CardTitle>
-            <CardDescription>
-              設定済みWorkspaceとCreative Recipe revisionを選択します。認証情報やprovider内部値は入力・表示しません。
-            </CardDescription>
+            <CardTitle className="inline-flex items-center gap-1 text-sm">
+              Generation binding
+              <HelpPopover label="Generation binding">設定済みWorkspaceとCreative Recipe revisionを選択します。認証情報やprovider内部値は入力・表示しません。</HelpPopover>
+            </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4 pt-1">
             <div className="space-y-1.5">
@@ -968,19 +1128,19 @@ export function MediaGenerationPanel() {
                 <option value="">Workspaceを選択</option>
                 {workspaces.map((workspace) => (
                   <option key={workspace.id} value={workspace.id}>
-                    {workspace.status === "unavailable" ? "利用不可" : "設定済み"} · {opaqueLabel(workspace.external_workspace_id, "wsp_")}
+                    {workspace.status === "unavailable" ? "利用不可" : "設定済み"} · {scope ? `${scope.displayName}の制作環境 · ` : ""}{opaqueLabel(workspace.external_workspace_id, "wsp_")}
                   </option>
                 ))}
               </AppSelect>
               {selectedWorkspace ? (
-                <p className="text-[11px] text-muted-foreground">
+                <div className="space-y-2"><p className="text-[11px] text-muted-foreground">
                   binding: <code>{opaqueLabel(selectedWorkspace.external_workspace_id, "wsp_")}</code>
                   {selectedWorkspace.external_project_id
                     ? ` · ${opaqueLabel(selectedWorkspace.external_project_id, "prj_")}`
                     : ""}
                   {" · "}
                   <StatusPill status={selectedWorkspace.status} />
-                </p>
+                </p><details className="text-xs text-muted-foreground"><summary className="cursor-pointer">制作環境の切り替え</summary><p className="my-2">新しい接続を登録する前に、この接続での新規生成を止めます。保存済み計画・Run・出力は保持します。実行中・結果不明のRunがある場合は停止できません。</p><Button type="button" size="sm" variant="outline" disabled={busy !== null || selectedWorkspace.status === "unavailable"} onClick={() => void retireWorkspace()}>この制作環境を無効にする</Button></details></div>
               ) : null}
             </div>
 
@@ -996,7 +1156,7 @@ export function MediaGenerationPanel() {
                 <option value="">Recipeを選択</option>
                 {recipes.map((recipe) => (
                   <option key={recipe.id} value={recipe.id}>
-                    {recipe.current_revision?.recipe_type ?? "image"} · v{recipe.current_revision?.version ?? "—"}
+                    {recipe.name ? `${recipe.name} · ` : ""}{recipe.current_revision?.recipe_type ?? "image"} · v{recipe.current_revision?.version ?? "—"}
                   </option>
                 ))}
               </AppSelect>
@@ -1025,10 +1185,10 @@ export function MediaGenerationPanel() {
 
         <Card size="sm">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="text-sm">Live {generationKind} catalog</CardTitle>
-            <CardDescription>
-              保存しない読み取り専用catalog。利用できない・未対応の場合はfail-closedで状態だけを表示します。
-            </CardDescription>
+            <CardTitle className="inline-flex items-center gap-1 text-sm">
+              Live {generationKind} catalog
+              <HelpPopover label={`Live ${generationKind} catalog`}>保存しない読み取り専用catalog。利用できない・未対応の場合はfail-closedで状態だけを表示します。</HelpPopover>
+            </CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 pt-1">
             <Button
@@ -1064,11 +1224,34 @@ export function MediaGenerationPanel() {
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(19rem,25rem)]">
         <Card size="sm">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="text-sm">{generationKind} GenerationPlanを作成</CardTitle>
-            <CardDescription>選択中のWorkspaceとRecipe current revisionをPlanに固定します。kindはRecipeから決まり、UIで偽装できません。</CardDescription>
+            <CardTitle className="inline-flex items-center gap-1 text-sm">
+              {generationKind} GenerationPlanを作成
+              <HelpPopover label={`${generationKind} GenerationPlanを作成`}>選択中のWorkspaceとRecipe current revisionをPlanに固定します。kindはRecipeから決まり、UIで偽装できません。</HelpPopover>
+            </CardTitle>
           </CardHeader>
           <CardContent className="pt-1">
             <form className="space-y-3" onSubmit={createPlan} aria-label="GenerationPlan form">
+              <div className="space-y-1.5">
+                <span className="inline-flex items-center gap-1">
+                  <FieldLabel htmlFor="generation-content-item">Editorial ContentItem（任意）</FieldLabel>
+                  <HelpPopover label="Editorial ContentItem">
+                    <p>同じscopeの項目だけを表示します。ページを切り替えると選択を解除します。</p>
+                    <p>選択したbriefを保存版のまま計画に固定します。本人入力の創作依頼は、確認済みの研究として扱いません。</p>
+                  </HelpPopover>
+                </span>
+                <AppSelect id="generation-content-item" aria-label="Generation ContentItem" disabled={contentItemsLoading} value={selectedContentItem?.id ?? ""} onChange={(event) => setSelectedContentItemId(event.target.value)}>
+                  <option value="">制作briefを指定しない</option>
+                  {compatibleContentItems.map((item) => <option key={item.id} value={item.id}>{item.title} · v{item.version}</option>)}
+                </AppSelect>
+                <div className="flex items-center gap-2 text-xs" aria-label="ContentItemページ操作">
+                  <Button type="button" size="sm" variant="outline" aria-label="前のContentItem" disabled={contentItemsLoading || contentItemsOffset === 0} onClick={() => void loadContentItems(contentItemsOffset - 100)}>前の100件</Button>
+                  <span aria-live="polite">ContentItem {Math.floor(contentItemsOffset / 100) + 1}ページ目</span>
+                  <Button type="button" size="sm" variant="outline" aria-label="次のContentItem" disabled={contentItemsLoading || contentItems.length < 100} onClick={() => void loadContentItems(contentItemsOffset + 100)}>次の100件</Button>
+                </div>
+                {selectedContentItem && <p className="text-xs">{selectedContentItem.input_kind === "user_authored" ? "本人入力の創作brief" : selectedContentItem.input_kind === "research" ? "研究から採用したbrief" : "保存済みbrief"}</p>}
+                {selectedContentItem ? <details className="text-xs"><summary>選択したbriefを確認</summary><p className="whitespace-pre-wrap" data-testid="generation-content-brief">{selectedContentItem.brief}</p></details> : null}
+                <ErrorNotice error={contentItemsError} />
+              </div>
               <div className="space-y-1.5">
                 <FieldLabel htmlFor="generation-prompt">Prompt</FieldLabel>
                 <Textarea id="generation-prompt" aria-label="GenerationPlan prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={generationKind === "video" ? "生成したい動画の内容" : "生成したい画像の内容"} rows={3} required />
@@ -1078,9 +1261,11 @@ export function MediaGenerationPanel() {
                 <Textarea id="generation-negative-prompt" aria-label="GenerationPlan negative prompt" value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="避けたい要素" rows={2} />
               </div>
               <div className="space-y-1.5">
-                <FieldLabel htmlFor="generation-persona-revision">Persona revision ID</FieldLabel>
-                <Input id="generation-persona-revision" aria-label="Persona revision ID" value={personaRevisionId || selectedRevision?.persona_revision_id || ""} onChange={(event) => setPersonaRevisionId(event.target.value)} placeholder="Persona revision UUID" required={!selectedRevision?.persona_revision_id} />
-                <p className="text-[10px] text-muted-foreground">RecipeにPersona revisionが含まれない場合は、ここで明示的に固定します。</p>
+                <span className="inline-flex items-center gap-1">
+                  <FieldLabel htmlFor="generation-persona-revision">Persona revision ID</FieldLabel>
+                  <HelpPopover label="Persona revision ID">RecipeにPersona revisionが含まれない場合は、ここで明示的に固定します。</HelpPopover>
+                </span>
+                <Input id="generation-persona-revision" aria-label="Persona revision ID" value={personaRevisionId || selectedRevision?.persona_revision_id || ""} disabled={!!scope} onChange={(event) => setPersonaRevisionId(event.target.value)} placeholder="Persona revision UUID" required={!selectedRevision?.persona_revision_id} />
               </div>
               <div className="grid gap-2 sm:grid-cols-2">
                 <div className="space-y-1.5"><FieldLabel htmlFor="generation-model-selection">{generationKind === "video" ? "Video model selection ID" : "Image model selection ID"}</FieldLabel><Input id="generation-model-selection" aria-label={`${generationKind === "video" ? "Video" : "Image"} model selection ID`} value={modelSelectionId || selectedRevision?.model_selection_id || selectedRevision?.image_model_selection_id || ""} onChange={(event) => setModelSelectionId(event.target.value)} placeholder={generationKind === "video" ? "wsl_…" : "ims_…"} required /></div>
@@ -1110,7 +1295,7 @@ export function MediaGenerationPanel() {
                 <div className="space-y-1.5"><FieldLabel htmlFor="generation-output-count">Requested outputs</FieldLabel><Input id="generation-output-count" aria-label="Requested outputs" type="number" min={1} max={20} value={requestedOutputs} onChange={(event) => setRequestedOutputs(event.target.value)} /></div>
                 <label className="flex items-end gap-2 pb-1.5 text-xs"><Checkbox checked={acceptMeteredGeneration} onCheckedChange={(checked) => setAcceptMeteredGeneration(checked === true)} aria-label="Metered generationを許可" /> Metered generationを許可（Plan hint）</label>
               </div>
-              <Button type="submit" size="sm" disabled={busy !== null || loading || !selectedWorkspaceId || !selectedRecipeId}>
+              <Button type="submit" size="sm" disabled={busy !== null || loading || contentItemsLoading || !selectedWorkspaceId || !selectedRecipeId || selectedWorkspace?.status === "unavailable"}>
                 {busy === "plan" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
                 GenerationPlanを作成
               </Button>
@@ -1119,7 +1304,7 @@ export function MediaGenerationPanel() {
         </Card>
 
         <Card size="sm">
-          <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Plans</CardTitle><CardDescription>{plans.length}件 · immutable request</CardDescription></CardHeader>
+          <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Plans<HelpPopover label="Plans">immutable request</HelpPopover></CardTitle><p className="text-sm text-muted-foreground">{plans.length}件</p></CardHeader>
           <CardContent className="space-y-1.5 pt-1">
             {plans.length ? plans.map((plan) => (
               <button key={plan.id} type="button" className={`group relative w-full rounded-md border-l-2 px-3 py-2.5 text-left transition-colors ${selectedPlanId === plan.id ? "border-primary bg-primary/5" : "border-transparent hover:border-border hover:bg-muted/40"}`} onClick={() => setSelectedPlanId(plan.id)} aria-current={selectedPlanId === plan.id ? "page" : undefined}>
@@ -1134,19 +1319,30 @@ export function MediaGenerationPanel() {
       <Card size="sm">
         <CardHeader className="border-b border-border/70">
           <div className="flex flex-wrap items-start justify-between gap-2">
-            <div><CardTitle className="text-sm">Run / Output</CardTitle><CardDescription>送信は選択中Planのexact revisionに対して一度だけ行い、不確実な結果を自動再送しません。既知Runはrefresh、uncertain intentは明示reconcileだけを使います。</CardDescription></div>
+            <div>
+              <CardTitle className="inline-flex items-center gap-1 text-sm">Run / Output<HelpPopover label="Run / Output">選択中PlanのRun receiptと出力候補を確認するための操作です。</HelpPopover></CardTitle>
+              <p className="mt-1 text-xs text-amber-800 dark:text-amber-200">送信は選択中Planのexact revisionに対して一度だけ行います。結果が不確実な場合は自動再送せず、明示的にreconcileで照合してください。</p>
+            </div>
             <div className="flex flex-wrap items-center justify-end gap-1.5">
               {selectedPlan && Boolean(selectedPlan.request_spec?.accept_metered_generation) ? (
                 <label className="flex items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-200"><Checkbox checked={acknowledgeMeteredGeneration} onCheckedChange={(checked) => setAcknowledgeMeteredGeneration(checked === true)} aria-label="Generation Studio paid generationを承認" /> 有料生成を承認</label>
               ) : null}
-              <Button type="button" size="sm" onClick={() => void submitPlan()} disabled={!selectedPlan || busy !== null || selectedPlan.status !== "draft" || (Boolean(selectedPlan.request_spec?.accept_metered_generation) && !acknowledgeMeteredGeneration)}><Send className="size-3.5" /> {busy === "submit" ? "送信中…" : "このPlanをsubmit"}</Button>
+              <Button type="button" size="sm" onClick={() => void submitPlan()} disabled={!selectedPlan || busy !== null || selectedPlan.status !== "draft" || selectedWorkspace?.status === "unavailable" || (Boolean(selectedPlan.request_spec?.accept_metered_generation) && !acknowledgeMeteredGeneration)}><Send className="size-3.5" /> {busy === "submit" ? "送信中…" : "このPlanをsubmit"}</Button>
               <Button type="button" size="sm" variant="outline" onClick={() => void reconcilePlan()} disabled={!selectedPlan || busy !== null || (submitReceipt?.planId !== selectedPlan?.id && selectedPlan?.status !== "uncertain") || (submitReceipt?.status !== "uncertain" && selectedPlan?.status !== "uncertain")}><RefreshCw className={busy === "reconcile" ? "size-3.5 animate-spin" : "size-3.5"} /> {busy === "reconcile" ? "照合中…" : "uncertainをreconcile"}</Button>
               <Button type="button" size="sm" variant="outline" onClick={() => void refreshRun()} disabled={!selectedRun || busy !== null}><RefreshCw className={busy === "refresh" ? "size-3.5 animate-spin" : "size-3.5"} /> refresh</Button>
             </div>
           </div>
         </CardHeader>
         <CardContent className="space-y-3 pt-1">
+          {planInputMismatch && !contentItemsLoading && <p role="alert" className="rounded-md border border-destructive/30 p-3 text-sm text-destructive">この生成計画の制作brief・種別・保存hashを照合できません。本人のbriefを再取得して、同じ計画の保存状態を確認してください。</p>}
           {selectedPlan ? <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs"><div className="flex flex-wrap items-center gap-2"><span className="font-mono">Plan {selectedPlan.id}</span><StatusPill status={selectedPlan.status} /><span className="rounded border border-border/70 px-1.5 py-0.5" data-generation-kind={normalizeGenerationKind(selectedPlan.generation_kind ?? selectedPlan.request_spec?.generation_kind, generationKind)}>{normalizeGenerationKind(selectedPlan.generation_kind ?? selectedPlan.request_spec?.generation_kind, generationKind)}</span></div><p className="mt-1 text-[11px] text-muted-foreground">Persona revision {selectedPlan.persona_revision_id} · Recipe revision {selectedPlan.creative_recipe_revision_id} · Workspace {opaqueLabel(selectedWorkspace?.external_workspace_id, "wsp_")}</p></div> : <EmptyState>左側でPlanを選択してください。</EmptyState>}
+          {researchContext ? <div className="space-y-1 rounded-md border border-border/70 p-3 text-xs" data-testid="generation-research-context">
+            <p>ContentItem: {selectedPlan?.content_item_id}</p>
+            {typeof savedBrief === "object" && savedBrief !== null && "input_kind" in savedBrief && <p>{savedBrief.input_kind === "user_authored" ? "本人入力の創作briefを固定" : savedBrief.input_kind === "research" ? "研究から採用したbriefを固定" : "保存済みbrief"}</p>}
+            <p>権利: 未確認 · acceptance: 未実行 · revenue: 未検証</p>
+            <p className="break-all font-mono">Context hash: {typeof researchContext.context_hash === "string" ? researchContext.context_hash : "unavailable"}</p>
+            <details><summary>固定したbriefを確認</summary><p className="whitespace-pre-wrap">{savedRequirements}</p></details>
+          </div> : null}
           {submitReceipt && submitReceipt.planId === selectedPlan?.id && !selectedRun ? <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs" data-generation-submit-receipt={submitReceipt.status}><div className="flex flex-wrap items-center gap-2"><AlertTriangle className="size-3.5" /><span className="font-medium">Submit receipt</span><StatusPill status={submitReceipt.status} /></div><p className="mt-1 text-[11px] text-muted-foreground">{submitReceipt.status === "uncertain" ? "結果が不確実です。再送せず、上のuncertainをreconcileで同じintentを照合してください。" : "Runは作成されませんでした。Generation Studioの利用可能状態を確認してから、同じPlanを再送せずに状態を照合してください。"}</p></div> : null}
           {runs.length ? <div className="space-y-1.5"><p className="text-xs font-medium">Runs</p>{runs.map((run) => <button key={run.id} type="button" className={`flex w-full items-center justify-between gap-2 rounded-md border px-3 py-2 text-left ${selectedRunId === run.id ? "border-primary bg-primary/5" : "border-border/70 hover:bg-muted/40"}`} onClick={() => setSelectedRunId(run.id)}><span className="font-mono text-xs">{opaqueLabel(run.external_run_id, "run_")}</span><StatusPill status={run.status} /></button>)}</div> : null}
           {selectedRun ? <div className="space-y-2 rounded-md border border-border/70 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-xs font-medium">Run receipt</p><p className="mt-1 font-mono text-xs">{opaqueLabel(selectedRun.external_run_id, "run_")}</p></div><StatusPill status={selectedRun.status} /></div>{selectedRun.status === "unavailable" ? <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-200">Generation Studio adapterは利用できません。Runはunavailableとして保存され、再送は行いません。</p> : null}{selectedRun.status === "uncertain" ? <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-200">Runの結果が不確実です。refreshは状態照会のみで、再送は行いません。</p> : null}{selectedRun.error_code ? <p className="text-xs text-destructive">error: {selectedRun.error_code}</p> : null}{selectedRun.outputs?.length ? <div className="space-y-1.5"><p className="text-xs font-medium">Outputs（人間が最終選択）</p>{selectedRun.outputs.map((output) => <OutputRow key={output.id} output={output} selected={selectedOutputId === output.id} selecting={busy === "select"} onSelect={() => void selectOutput(output)} />)}</div> : <EmptyState>Outputはまだありません。</EmptyState>}</div> : null}

@@ -416,6 +416,7 @@ async def main() -> None:
     service_cleanup = None
     if not args.skip_services:
         from src.service_manager import (
+            AoiTalkAlreadyRunning,
             get_operator_web_url,
             kill_services,
             start_caddy,
@@ -425,6 +426,13 @@ async def main() -> None:
         try:
             with _startup_timer.phase("startup.services.start"):
                 start_services(config)
+        except AoiTalkAlreadyRunning as exc:
+            startup_console.stage(f"すでに起動しています: {exc.operator_url}")
+            logger.info(
+                "Manual startup reused the healthy existing AoiTalk instance",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
+            return
         except Exception as exc:
             startup_console.error(
                 f"Frontend startup failed: {safe_startup_reason(exc)}"

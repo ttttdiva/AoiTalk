@@ -7,6 +7,19 @@ type Schemas = components["schemas"];
 type OptionalDefaults<T, K extends keyof T> = Omit<T, K> &
   Partial<Pick<T, K>>;
 
+export type MediaCostEntryInput = Schemas["MediaCostEntryCreateRequest"];
+export type MediaCostEntry = Schemas["MediaCostEntryResponse"];
+export type MediaCostEntryHistory = Schemas["MediaCostEntryHistoryResponse"];
+export type MediaCostEntryAllocateInput = Schemas["MediaCostEntryAllocateRequest"];
+
+export type RevenueCostRecordInput = Schemas["RevenueCostRecordCreateRequest"];
+export type RevenueCostRecord = Schemas["RevenueCostRecordResponse"];
+export type RevenueCostRecordHistory = Schemas["RevenueCostRecordHistoryResponse"];
+export type RevenueCostProjection = Partial<Pick<RevenueCostRecord,
+  "fee_amount" | "production_cost_amount" | "human_cost_amount" | "human_minutes" |
+  "profit_amount" | "profit_status" | "cost_authority"
+>> & { cost_record_id?: string | null; cost_revision?: number | null };
+
 export type MediaPlatform = Schemas["MediaPlatform"];
 export type MediaPersonaRevision = Schemas["PersonaRevisionResponse"];
 export type MediaPersona = Schemas["PersonaSummaryResponse"];
@@ -155,17 +168,22 @@ export type CharacterDashboardMetricItem = {
   metrics?: Record<string, number>;
 };
 
-export type CharacterDashboardRevenueItem = {
+export type CharacterDashboardRevenueItem = RevenueCostProjection & {
   id: string;
   persona_ref?: string | null;
   platform_account_ref?: string | null;
   content_ref?: string | null;
   publication_ref?: string | null;
   platform?: string | null;
-  currency: string;
-  gross_amount: number;
-  net_amount: number;
+  currency: string | null;
+  gross_amount: number | null;
+  net_amount: number | null;
   event_at?: string | null;
+  event_type?: string;
+  source?: string;
+  settlement_at?: string | null;
+  settlement_status?: string;
+  revenue_authority?: string;
 };
 
 export type CharacterDashboardExperimentItem = {
@@ -199,6 +217,7 @@ export type MediaCharacterDashboard = {
     last_observed_at: string | null;
   };
   /** Character-scoped child collections (all ACL-filtered by the server). */
+  variants?: CharacterDashboardPage<{ id: string; name?: string | null; title?: string | null }> | null;
   metrics?: CharacterDashboardPage<CharacterDashboardMetricItem> | null;
   revenue?: CharacterDashboardPage<CharacterDashboardRevenueItem> | null;
   experiments?: CharacterDashboardPage<CharacterDashboardExperimentItem> | null;
@@ -319,6 +338,42 @@ function encodeId(id: string): string {
 }
 
 export const mediaOperationsApi = {
+  async listCostEntries(personaRef: string, projectId?: string | null, offset = 0): Promise<MediaCostEntry[]> {
+    const query = new URLSearchParams({ persona_ref: personaRef, limit: "100", offset: String(offset) });
+    if (projectId) query.set("project_id", projectId);
+    return request<MediaCostEntry[]>(`/operations/media/cost-entries?${query}`);
+  },
+
+  async getCostEntryHistory(entryId: string): Promise<MediaCostEntryHistory> {
+    return request<MediaCostEntryHistory>(`/operations/media/cost-entries/${encodeId(entryId)}/history`);
+  },
+
+  async createCostEntry(input: MediaCostEntryInput, idempotencyKey: string): Promise<MediaCostEntry> {
+    return request<MediaCostEntry>("/operations/media/cost-entries", { method: "POST", ...jsonBody(input) }, idempotencyKey);
+  },
+
+  async allocateCostEntry(eventId: string, revisionId: string, input: MediaCostEntryAllocateInput, idempotencyKey: string): Promise<RevenueCostRecord> {
+    return request<RevenueCostRecord>(`/operations/media/revenue-events/${encodeId(eventId)}/cost-entries/${encodeId(revisionId)}/allocate`, { method: "POST", ...jsonBody(input) }, idempotencyKey);
+  },
+
+  async getRevenueCostRecords(eventId: string): Promise<RevenueCostRecordHistory> {
+    return request<RevenueCostRecordHistory>(
+      `/operations/media/revenue-events/${encodeId(eventId)}/cost-records`,
+    );
+  },
+
+  async createRevenueCostRecord(
+    eventId: string,
+    input: RevenueCostRecordInput,
+    idempotencyKey: string,
+  ): Promise<RevenueCostRecord> {
+    return request<RevenueCostRecord>(
+      `/operations/media/revenue-events/${encodeId(eventId)}/cost-records`,
+      { method: "POST", ...jsonBody(input) },
+      idempotencyKey,
+    );
+  },
+
   async getPersonaIntake(
     projectId?: string | null,
   ): Promise<MediaPersonaIntake> {

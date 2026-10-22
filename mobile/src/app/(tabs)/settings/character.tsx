@@ -1,3 +1,5 @@
+import {NativeRigSettings} from '../../../features/characters/rig-settings';
+import { useChatAvatarPreference } from '../../../features/characters/use-chat-avatar-preference';
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import { Alert, Pressable, StyleSheet, View } from "react-native";
 import { useFocusEffect, useRouter } from "expo-router";
@@ -8,6 +10,7 @@ import {
   Icon,
   IconButton,
   Surface,
+  Switch,
   Text,
 } from "react-native-paper";
 import { goBackOrReplace } from "../../../lib/navigation";
@@ -28,7 +31,8 @@ import type { ManagedCharacter } from "../../../types/api";
 
 export default function SettingsCharacterScreen() {
   const router = useRouter();
-  const { isAuthenticated } = useAuth();
+  const avatar = useChatAvatarPreference();
+  const { isAuthenticated, user } = useAuth();
   const [currentSlug, setCurrentSlug] = useState<string | null>(null);
   const [characters, setCharacters] = useState<ManagedCharacter[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -145,6 +149,7 @@ export default function SettingsCharacterScreen() {
     try {
       const session = await createCurrentCharacterSession(undefined, {
         localFirst: true,
+        userId: user?.user_id,
       });
       router.push(`/(tabs)/chat/${session.id}`);
     } catch (error) {
@@ -157,7 +162,7 @@ export default function SettingsCharacterScreen() {
     } finally {
       setStartingChat(false);
     }
-  }, [router]);
+  }, [router, user?.user_id]);
 
   return (
     <ScreenShell
@@ -172,6 +177,24 @@ export default function SettingsCharacterScreen() {
         />
       }
     >
+
+      <Surface style={styles.card} elevation={0}>
+        <View style={styles.sectionHeader}>
+          <View style={styles.sectionCopy}>
+            <Text style={styles.cardTitle}>チャット背景にアバターを表示</Text>
+            <Text style={styles.helperText}>
+              初期設定はOFFです。ONにすると、この端末のチャット背景に薄く表示します。チャット欄の広さは変わりません。
+            </Text>
+          </View>
+          <Switch
+            accessibilityLabel="チャット背景にアバターを表示"
+            value={avatar.enabled}
+            disabled={!avatar.loaded || avatar.saving}
+            onValueChange={(value) => void avatar.update(value)}
+          />
+        </View>
+        {avatar.error ? <Text accessibilityLiveRegion="polite">{avatar.error}</Text> : null}
+      </Surface>
 
       <Surface style={styles.card} elevation={0}>
         <View style={styles.sectionHeader}>
@@ -326,6 +349,7 @@ export default function SettingsCharacterScreen() {
           現在のキャラクターでチャットを開始
         </Button>
       </Surface>
+      {isAuthenticated&&selectedCharacter&&<NativeRigSettings key={selectedCharacter.id+':'+(user?.user_id??'')} characterId={selectedCharacter.id} characterName={selectedCharacter.name}/>}
     </ScreenShell>
   );
 }

@@ -15,7 +15,6 @@ from ..generation_policy import GenerationProfile, get_client_generation_policy
 from ..prompts import build_unified_instructions
 from ..tool_exposure import (
     REVIEW_TOOL_ALLOWLIST,
-    apply_story_pack_auto_load,
     filter_tools_for_client,
     tool_name,
 )
@@ -23,7 +22,6 @@ from ...services.project_context import (
     get_runtime_project_context,
     project_context_enabled_for_client,
 )
-from ...services.story_chat_context import is_story_workflow_tool_allowed
 from ...services.turn_context import (
     AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
     get_turn_context,
@@ -86,6 +84,7 @@ class AgentSetupMixin:
                 else get_user_custom_instructions_sync(self._get_session_user_id())
             ),
             project_agents_instructions=project_agents_instructions,
+            available_tool_names=[self._tool_name(tool) for tool in self._get_effective_tools_for_current_session()] if hasattr(self, "agent") else None,
         )
 
     def _get_current_rp_settings(self) -> Optional[dict]:
@@ -103,10 +102,10 @@ class AgentSetupMixin:
             logger.warning(f"RPステアリング設定の取得に失敗: {e}")
         return None
 
-    def _build_effective_instructions(self, story_chat_context=None) -> str:
+    def _build_effective_instructions(self) -> str:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # Help must win over any stale Project/Story/automation override
-            # left on a long-lived client by the preceding ordinary turn.
+            # Help must win over any stale Project/automation override left
+            # on a long-lived client by the preceding ordinary turn.
             return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         isolated_override = str(
             getattr(self, "_isolated_system_prompt_override", "") or ""
@@ -116,8 +115,6 @@ class AgentSetupMixin:
         override = str(getattr(self, "_system_prompt_override", "") or "").strip()
         if override:
             return override
-        if story_chat_context:
-            return story_chat_context.prompt
         return self._build_instructions()
 
     def _create_character_agent(self) -> Agent:
@@ -144,7 +141,7 @@ class AgentSetupMixin:
 
         return Agent(
             name=character_name,
-            instructions=self._build_effective_instructions(None),
+            instructions=self._build_effective_instructions(),
             tools=base_tools,
             model=self.model_name,
             **agent_kwargs,
@@ -187,27 +184,14 @@ class AgentSetupMixin:
             return None
         return effort
 
-    def _get_effective_tools_for_current_session(self, story_chat_context=None):
+    def _get_effective_tools_for_current_session(self):
         if not getattr(self, "_native_tools_enabled", True):
             return []
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # AoiTalk Help exposes no provider tools and must not resolve the
-            # active Story session just to filter an already-empty surface.
+            # AoiTalk Help exposes no provider tools.
             return []
-        story_chat_context = (
-            story_chat_context or self._get_story_chat_context_sync()
-        )
-        apply_story_pack_auto_load(self, story_chat_context)
-        tools = list(self.agent.tools)
-        if story_chat_context:
-            tools = [
-                tool
-                for tool in tools
-                if is_story_workflow_tool_allowed(
-                    self._tool_name(tool),
-                    story_chat_context,
-                )
-            ]
+        registry = getattr(self, "_tool_registry", None)
+        tools = registry.get_all() if registry is not None else list(self.agent.tools)
         return self._filter_tools_for_generation_purpose(tools)
 
     @staticmethod
@@ -358,13 +342,5 @@ class AgentSetupMixin:
             return []
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             return []
-        story_chat_context = self._get_story_chat_context_sync()
-        apply_story_pack_auto_load(self, story_chat_context)
         names = self._tool_registry.get_names()
-        if story_chat_context:
-            names = [
-                name
-                for name in names
-                if is_story_workflow_tool_allowed(name, story_chat_context)
-            ]
         return self._filter_tools_for_generation_purpose(names)

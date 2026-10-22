@@ -22,7 +22,7 @@ export function retainVisibleSelection(selected: Set<string>, visibleIds: readon
 /**
  * repositoryの削除を順に実行する。SQLite writeを大量に並列化せず、
  * 1件の失敗で後続を打ち切らない。ローカル専用会話はオフラインでも削除可能。
- * サーバー会話はHTTP成功（再試行時の404を含む）とローカル保存の完了が必要。
+ * サーバー会話もローカルtombstone + outboxを原子的に保存し、通信は同期で再生する。
  */
 export async function deleteSelectedSessions(
   sessionIds: readonly string[],

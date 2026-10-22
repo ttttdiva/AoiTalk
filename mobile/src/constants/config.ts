@@ -9,6 +9,39 @@ export const DEFAULT_API_URL: string = __DEV__
   ? process.env.EXPO_PUBLIC_AOITALK_DEV_API_URL?.trim() || PUBLIC_API_URL
   : PUBLIC_API_URL;
 
+/**
+ * Public AoiTalk Gateway contract.  Keep the portal origin and service path
+ * separate: the browser authorization page is rooted at the portal while
+ * AoiTalk API traffic is served below `/at`.
+ */
+export const DEFAULT_PORTAL_URL = "https://az-vnetspace.com/";
+export const DEFAULT_GATEWAY_SERVICE_PATH = "/at";
+export const GATEWAY_CLIENT_ID = "aoitalk-android";
+export const GATEWAY_SERVICE_ID = "at";
+export const GATEWAY_CALLBACK_PATH = "/.gateway/mobile/callback/aoitalk";
+export const GATEWAY_REDIRECT_URI = `${DEFAULT_PORTAL_URL.replace(/\/+$/, "")}${GATEWAY_CALLBACK_PATH}`;
+
+/**
+ * Accept only the verified HTTPS App Link callback carrying an OAuth
+ * response in its fragment. Query parameters are rejected so code/state/iss
+ * cannot be moved onto a URL that a proxy or server log would expose.
+ */
+export function isGatewayCallbackUrl(value: string): boolean {
+  try {
+    const actual = new URL(value);
+    const expected = new URL(GATEWAY_REDIRECT_URI);
+    return actual.protocol === "https:"
+      && actual.origin === expected.origin
+      && actual.pathname === GATEWAY_CALLBACK_PATH
+      && !actual.username
+      && !actual.password
+      && !actual.search
+      && actual.hash.length > 1;
+  } catch {
+    return false;
+  }
+}
+
 // Public GitHub release metadata used by the in-app updater.
 export const UPDATE_CHECK_URL =
   "https://raw.githubusercontent.com/ttttdiva/AoiTalk/main/latest.json";
@@ -20,6 +53,12 @@ export const STORAGE_KEYS = {
   SELECTED_PROJECT_ID: "aoitalk_selected_project_id",
   SELECTED_SPACE_ID: "aoitalk_selected_space_id",
   CURRENT_CHARACTER_SLUG: "aoitalk_default_character_name",
+  // チャット背景アバターは明示的なONだけを復元する（未設定はOFF）。
+  CHAT_AVATAR_ENABLED: "aoitalk_chat_avatar_enabled",
+  // チャット背景アニメーションは端末単位で保存し、未設定時はON。
+  CHAT_WAVE_BACKGROUND_ENABLED: "aoitalk_chat_wave_background_enabled",
+  // 送信前の意図確認は明示的なONだけを復元する（未設定はOFF）。
+  CHAT_INTENT_CONFIRMATION_ENABLED: "aoitalk_chat_intent_confirmation_enabled",
   // メインスロットのプロバイダー選択（"server" | direct各種）。
   CHAT_LLM_PROVIDER: "aoitalk_chat_llm_provider",
   // メインスロットのモデルID（スロット単位）。
@@ -42,6 +81,8 @@ export const STORAGE_KEYS = {
   CHAT_LLM_MODEL_CATALOG_CACHE: "aoitalk_chat_llm_model_catalog_cache",
   // chat composerの候補・選択・未同期mode。server URL + account scope別のsuffixを付ける。
   CHAT_LLM_UI_PREFERENCES_PREFIX: "aoitalk_chat_llm_ui_preferences_v1",
+  // 未送信ChatComposer本文。server/user/conversation scopeをkeyへ含める。
+  CHAT_COMPOSER_DRAFT_PREFIX: "aoitalk_chat_composer_draft_v1",
   // プロバイダー単位の共有プロファイル（APIキー / Base URL）。
   // モデルはスロット単位へ移行したため、ここではモデルを保持しない。
   CHAT_LLM_OPENAI_API_KEY: "aoitalk_chat_llm_openai_api_key",
@@ -73,9 +114,13 @@ export const STORAGE_KEYS = {
   CHAT_LLM_OPENAI_COMPATIBLE_BASE_URL:
     "aoitalk_chat_llm_openai_compatible_base_url",
   NETWORK_ENDPOINT_ROUTING: "aoitalk_network_endpoint_routing",
+  GATEWAY_AUTH: "aoitalk_gateway_auth_v1",
 } as const;
 
 export const API_TIMEOUT = 10000;
+// Deletion includes route selection and signed Gateway identity checks.
+// Keep reads/offline detection fast and bound this explicit mutation once.
+export const FILES_DELETE_TIMEOUT_MS = 30_000;
 export const CHAT_TIMEOUT = 30000;
 // プロバイダーAPIからのモデル一覧取得タイムアウト。
 export const MODEL_LIST_TIMEOUT = 8000;

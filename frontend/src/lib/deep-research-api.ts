@@ -1,4 +1,5 @@
 import type { StructuredApiError } from "@/lib/chat-api";
+import type { components } from "@/lib/api-types.gen";
 
 export type DeepResearchStatus =
   | "queued"
@@ -78,17 +79,25 @@ export type DeepResearchEngine = {
   checked_at?: string | null;
 };
 
-export type StartDeepResearchRequest = {
-  query: string;
-  mode: "quick" | "detailed" | "report";
-  max_iterations: number;
-  questions_per_iteration: number;
-  max_results_per_query: number;
-  engines: string[];
-  include_local_knowledge: boolean;
-  /** Conversation scope is validated by the server before execution. */
-  session_id?: string | null;
-  project_id?: string | null;
+type StartDeepResearchPayload = components["schemas"]["StartDeepResearchPayload"];
+type OptionalizeDefaults<T, K extends keyof T> = Omit<T, K> &
+  Partial<Pick<T, K>>;
+
+/**
+ * FastAPI defaults are required by openapi-typescript even though callers may
+ * omit them. Keep the generated payload as the wire source of truth while
+ * preserving the legacy request shape, including strategy's server default.
+ */
+export type StartDeepResearchRequest = OptionalizeDefaults<
+  StartDeepResearchPayload,
+  | "strategy"
+  | "mode"
+  | "max_iterations"
+  | "questions_per_iteration"
+  | "max_results_per_query"
+  | "include_local_knowledge"
+> & {
+  client_request_id: string;
 };
 
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);

@@ -16,6 +16,8 @@ from ..memory.models.media_operations import Persona, PersonaRevision
 from ..memory.models.media_operations_research import ContentItem, EditorialProgram
 from ..memory.models.media_operations_setup import PlatformAccount, PlatformAccountRevision
 from .media_operations_research_service import MediaOperationsResearchService
+from .media_platform_readiness import platform_payload_blockers, product_rights_blockers
+from .media_output_integrity import generation_output_blockers
 from .media_operations_service import (
     MediaOperationsAuthorizationError, MediaOperationsConflictError,
     MediaOperationsNotFoundError, MediaOperationsValidationError,
@@ -28,6 +30,8 @@ _PAYLOAD_TYPES = {
     "x": {"x_post", "x_thread"},
     "pixiv": {"pixiv_work"},
     "dlsite": {"dlsite_release"},
+    "fanza": {"fanza_release"},
+    "tiktok": {"tiktok_video"},
     "patreon": {"patreon_post"},
     "youtube": {"youtube_video", "youtube_short"},
     "instagram": {"instagram_feed", "instagram_carousel", "instagram_reel"},
@@ -38,6 +42,8 @@ _PAYLOAD_RULES = {
     "x_thread": ({"type", "posts"}, {"scheduled_at", "reply_to"}),
     "pixiv_work": ({"type", "title", "caption", "tags", "media"}, {"ai_generated", "rating", "r18", "r18g", "series_id"}),
     "dlsite_release": ({"type", "title", "description", "category", "age_rating", "price", "sales", "preview_assets", "deliverable_package_ref", "rights_checklist"}, {"thumbnail_assets"}),
+    "fanza_release": ({"type", "title", "description", "category", "age_rating", "price", "sales", "preview_assets", "deliverable_package_ref", "rights_checklist", "storefront", "seller_ref", "ai_generated", "ai_usage", "submission_state"}, {"thumbnail_assets"}),
+    "tiktok_video": ({"type", "caption", "media_asset", "privacy", "music_rights", "ai_disclosure"}, {"cover", "scheduled_at"}),
     "patreon_post": ({"type", "audience", "title", "body"}, {"public_preview", "attachments", "tier_refs", "scheduled_at"}),
     "youtube_video": ({"type", "title", "description", "tags", "media_asset", "visibility"}, {"thumbnail", "captions", "scheduled_at", "audience", "disclosure"}),
     "youtube_short": ({"type", "title", "description", "tags", "media_asset", "visibility"}, {"thumbnail", "captions", "scheduled_at", "audience", "disclosure"}),
@@ -46,16 +52,16 @@ _PAYLOAD_RULES = {
     "instagram_reel": ({"type", "caption", "media"}, {"alt_text", "scheduled_at", "cover"}),
 }
 _BLOCKED_KEYS = frozenset({"provider", "provider_payload", "raw", "raw_payload", "graph", "workflow", "secret", "secrets", "credential", "credentials", "token", "access_token", "cookie", "cookies", "filesystem_path", "path"})
-_TEXT_FIELDS = frozenset({"text", "title", "caption", "description", "body", "public_preview", "alt_text", "category", "age_rating", "rating", "series_id", "reply_to", "audience", "visibility", "disclosure", "scheduled_at", "deliverable_package_ref"})
+_TEXT_FIELDS = frozenset({"text", "title", "caption", "description", "body", "public_preview", "alt_text", "category", "age_rating", "rating", "series_id", "reply_to", "audience", "visibility", "disclosure", "scheduled_at", "deliverable_package_ref", "storefront", "seller_ref", "ai_usage", "submission_state", "privacy", "music_rights"})
 _LIST_TEXT_FIELDS = frozenset({"links", "hashtags", "tags", "tier_refs", "captions"})
-_BOOL_FIELDS = frozenset({"sensitive_content", "ai_generated", "r18", "r18g"})
+_BOOL_FIELDS = frozenset({"sensitive_content", "ai_generated", "r18", "r18g", "ai_disclosure"})
 _REF_FIELDS = frozenset({"media", "attachments", "preview_assets", "thumbnail_assets", "media_asset", "thumbnail", "cover"})
 
 
 def _platform(value: Any) -> str:
     rendered = str(getattr(value, "value", value)).strip().lower()
     if rendered not in CONTENT_VARIANT_PLATFORM_VALUES:
-        raise MediaOperationsValidationError("platform must be one of x, pixiv, dlsite, patreon, youtube, instagram")
+        raise MediaOperationsValidationError("platform must be one of x, pixiv, dlsite, patreon, youtube, instagram, fanza, tiktok")
     return rendered
 
 
@@ -122,15 +128,24 @@ def _normalize_payload(payload: Any, platform: str) -> tuple[dict[str, Any], lis
         raise MediaOperationsValidationError("payload is missing required fields: " + ", ".join(sorted(required - set(data))))
     if set(data) - (required | optional):
         raise MediaOperationsValidationError("payload contains fields not allowed by its typed discriminator")
+    if platform == "x":
+        posts = [data] if kind == "x_post" else data.get("posts", [])
+        if not isinstance(posts, (str, bytes, bytearray)) and isinstance(posts, Sequence):
+            for post in posts:
+                media = post.get("media", []) if isinstance(post, Mapping) else []
+                if not isinstance(media, (str, bytes, bytearray)) and isinstance(media, Sequence) and any(
+                    isinstance(ref, Mapping) and ref.get("alt_text") not in (None, "") for ref in media
+                ):
+                    raise MediaOperationsValidationError("x_api_alt_text_unsupported: asset-reference alt_text cannot be discarded")
     result: dict[str, Any] = {"type": kind}
     refs: list[str] = []
     for key in sorted(set(data) - {"type"}):
         value = data[key]
         if key in _TEXT_FIELDS:
-            if key in {"public_preview", "alt_text", "scheduled_at", "reply_to", "series_id", "rating", "disclosure"} and value is None:
+            if key in optional and value is None:
                 result[key] = None
             elif key in {"caption", "description"} and isinstance(value, str) and not value.strip():
-                if key == "description" and kind == "dlsite_release":
+                if key == "description" and kind in {"dlsite_release", "fanza_release"}:
                     raise MediaOperationsValidationError(f"payload.{key} must not be empty")
                 result[key] = ""
             elif key in {"public_preview", "alt_text", "scheduled_at", "reply_to", "series_id", "rating", "disclosure"} and isinstance(value, str) and not value.strip():
@@ -161,7 +176,7 @@ def _normalize_payload(payload: Any, platform: str) -> tuple[dict[str, Any], lis
                     item["media"] = _ref_list(post["media"], f"payload.posts[{index}].media")
                     refs.extend(ref for ref in item["media"] if ref not in refs)
                 if "alt_text" in post:
-                    item["alt_text"] = _required_text(post["alt_text"], f"payload.posts[{index}].alt_text", 2000)
+                    item["alt_text"] = (None if post["alt_text"] is None else _required_text(post["alt_text"], f"payload.posts[{index}].alt_text", 2000))
                 posts.append(item)
             result[key] = posts
         elif key == "price":
@@ -192,9 +207,54 @@ def _normalize_payload(payload: Any, platform: str) -> tuple[dict[str, Any], lis
         raise MediaOperationsValidationError("instagram_feed and instagram_reel require exactly one media reference")
     if kind in {"youtube_video", "youtube_short"} and len(result.get("media_asset", [])) != 1:
         raise MediaOperationsValidationError("YouTube payload requires exactly one media reference")
+    if kind == "tiktok_video":
+        if len(result["media_asset"]) != 1:
+            raise MediaOperationsValidationError("TikTok requires exactly one video reference")
+        if result["privacy"] not in {"SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE"}:
+            raise MediaOperationsValidationError("TikTok privacy must be explicitly selected")
+        if result["music_rights"] not in {"owned", "licensed", "no_music", "review_required"}:
+            raise MediaOperationsValidationError("TikTok music rights must be declared")
+        if len(result.get("cover", [])) > 1:
+            raise MediaOperationsValidationError("TikTok allows at most one cover reference")
+    if kind == "fanza_release":
+        if result["ai_usage"] not in {"none", "partial", "generated", "unknown"}:
+            raise MediaOperationsValidationError("FANZA AI usage category is required")
+        if result["ai_generated"] != (result["ai_usage"] == "generated"):
+            raise MediaOperationsValidationError("FANZA AI generated flag must agree with AI usage category")
+        if result["storefront"] not in {"doujin", "commercial"}:
+            raise MediaOperationsValidationError("FANZA storefront must distinguish doujin and commercial")
+        if result["submission_state"] not in {"draft", "ready_for_review"}:
+            raise MediaOperationsValidationError("Publication state is recorded by a verified receipt, not a draft payload")
     if kind == "x_post" and len(result.get("media", [])) > 4:
         raise MediaOperationsValidationError("x_post supports at most four media references")
     return result, refs
+
+def canonical_publication_payload(payload: Any, platform: str) -> dict[str, Any]:
+    """Compare typed write semantics while preserving the approved raw hash.
+
+    HTTP response models populate nullable optional text and empty list
+    defaults omitted from immutable revisions. Only those no-value defaults
+    are equivalent; required fields, nonempty values, references and order
+    remain exact. The existing closed normalizer rejects unknown fields first.
+    """
+    normalized, _ = _normalize_payload(payload, platform)
+    _, optional = _PAYLOAD_RULES[normalized["type"]]
+    value = {key: item for key, item in normalized.items()
+             if key not in optional or item is not None}
+    for key in optional & (_REF_FIELDS | _LIST_TEXT_FIELDS):
+        value.setdefault(key, [])
+    # Nullable Pixiv AI/R18 flags are unknown when absent, not false.
+    # X sensitive_content alone has a declared false default in its DTO.
+    if value["type"] == "x_post":
+        value.setdefault("sensitive_content", False)
+    if value["type"] == "x_thread":
+        value["posts"] = [
+            {**{key: item for key, item in post.items() if key != "alt_text" or item is not None},
+             "media": post.get("media", [])}
+            for post in value["posts"]
+        ]
+    return value
+
 
 def _normalize_evidence(values: Any, label: str = "evidence") -> list[dict[str, Any]]:
     if values is None:
@@ -350,6 +410,16 @@ def _assessment_content_hash(assessment: Any, revision: ContentVariantRevision) 
     )
 
 
+def _readiness_assessment_projection(assessment: Any | None) -> dict[str, Any] | None:
+    """Project the existing strict readiness DTO, omitting ledger aliases."""
+    if assessment is None:
+        return None
+    value = assessment.to_safe_dict()
+    value.pop("variant_revision_id", None)
+    value.pop("content_hash", None)
+    return value
+
+
 class MediaOperationsContentService(MediaOperationsResearchService):
     """Append-only ContentVariant/QA/Rights service with shared ACL."""
 
@@ -460,7 +530,8 @@ class MediaOperationsContentService(MediaOperationsResearchService):
         revision = revisions[0]
         qa = await self._latest_assessment(session, QAAssessment, revision.id)
         rights = await self._latest_assessment(session, RightsAssessment, revision.id)
-        reasons: list[str] = []
+        reasons: list[str] = platform_payload_blockers(revision.payload_json)
+        reasons.extend(await generation_output_blockers(session, revision))
         if qa is not None:
             if qa.content_variant_id != variant.id:
                 reasons.append("qa_variant_mismatch")
@@ -479,6 +550,11 @@ class MediaOperationsContentService(MediaOperationsResearchService):
             reasons.append("revision_hash_invalid")
         if revision.platform_account_id is None:
             reasons.append("account_binding_missing")
+        else:
+            account = await self._get_row(session, PlatformAccount, revision.platform_account_id, "platform_account_id")
+            persona_revision = await self._get_row(session, PersonaRevision, revision.persona_revision_id, "persona_revision_id")
+            if account.persona_id is None or account.persona_id != persona_revision.persona_id:
+                reasons.append("persona_account_binding_missing_or_mismatch")
         if qa is None:
             reasons.append("qa_missing")
         elif qa.result != "passed":
@@ -487,7 +563,7 @@ class MediaOperationsContentService(MediaOperationsResearchService):
             reasons.append("rights_missing")
         elif rights.result != "cleared":
             reasons.append(f"rights_{rights.result}")
-        return {"content_variant_id": str(variant.id), "variant_id": str(variant.id), "revision_id": str(revision.id), "revision_hash": revision.content_hash, "ready": not reasons, "publication_allowed": not reasons, "status": "ready" if not reasons else "blocked", "qa_result": qa.result if qa else None, "rights_result": rights.result if rights else None, "blockers": list(reasons), "blocking_reasons": reasons, "qa": qa.to_safe_dict() if qa else None, "rights": rights.to_safe_dict() if rights else None}
+        return {"content_variant_id": str(variant.id), "variant_id": str(variant.id), "revision_id": str(revision.id), "revision_hash": revision.content_hash, "ready": not reasons, "publication_allowed": not reasons, "status": "ready" if not reasons else "blocked", "qa_result": qa.result if qa else None, "rights_result": rights.result if rights else None, "blockers": list(reasons), "blocking_reasons": reasons, "qa": _readiness_assessment_projection(qa), "rights": _readiness_assessment_projection(rights)}
 
     async def _variant_detail(self, session: Any, actor: Any, variant: ContentVariant) -> dict[str, Any]:
         await self._assert_entity_access(session, actor, variant, permission="read")
@@ -642,6 +718,18 @@ class MediaOperationsContentService(MediaOperationsResearchService):
                 raise MediaOperationsValidationError(f"all {kind} checks must pass before {passed_value}")
             if mandatory_failures or any(item["severity"] == "error" for item in normalized_findings):
                 raise MediaOperationsValidationError(f"mandatory {kind} checks/findings must be resolved before {passed_value}")
+        if kind == "rights" and rendered == "cleared":
+            rights_blockers = product_rights_blockers(revision.payload_json)
+            if rights_blockers:
+                raise MediaOperationsValidationError(
+                    "Rights cannot be cleared with unresolved product checks: " + ", ".join(rights_blockers)
+                )
+        if kind == "qa" and rendered == "passed":
+            output_blockers = await generation_output_blockers(session, revision)
+            if output_blockers:
+                raise MediaOperationsValidationError(
+                    "QA cannot pass with invalid generated outputs: " + ", ".join(output_blockers)
+                )
         policy_id, policy_hash = _policy_revision(policy_revision_id, policy_revision_hash, kind)
         payload = {"revision_id": str(revision.id), "revision_hash": revision.content_hash, "policy_revision_id": str(policy_id) if policy_id else None, "policy_revision_hash": policy_hash, "result": rendered, "checks": normalized_checks, "findings": normalized_findings, "evidence": normalized_evidence}
         assessment_hash = sha256_json(payload)

@@ -2,6 +2,7 @@
 
 import re
 from typing import Any, Dict, List, Optional
+from ..services.chat_attachment_limits import MAX_CHAT_ATTACHMENTS
 
 
 PROJECT_ATTACHMENT_CONTEXT_MARKER = "[AoiTalk verified Project attachment]"
@@ -32,6 +33,8 @@ def sanitize_chat_attachments(
 ) -> List[Dict[str, Any]]:
     if not isinstance(attachments, list):
         return []
+    if len(attachments) > MAX_CHAT_ATTACHMENTS:
+        raise ValueError('Chat attachments exceed the 12-file limit')
 
     sanitized: List[Dict[str, Any]] = []
     for item in attachments:

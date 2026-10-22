@@ -281,6 +281,9 @@ class Agent(Base):
     character_id = Column(
         UUID(as_uuid=True), ForeignKey("characters.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    thumbnail_artifact_id = Column(
+        UUID(as_uuid=True), ForeignKey("artifact_versions.id", ondelete="SET NULL"), nullable=True
+    )
     create_hash = Column(String(64), nullable=False, index=True)
     idempotency_key = Column(String(255), nullable=False, unique=True)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -343,6 +346,7 @@ class Agent(Base):
             "slug": self.slug,
             "state": self.state,
             "character_id": _uuid(self.character_id),
+            "thumbnail_artifact_id": _uuid(self.thumbnail_artifact_id),
             "create_hash": self.create_hash,
             "created_by": _uuid(self.created_by),
             "created_by_user_id": _uuid(self.created_by),

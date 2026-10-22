@@ -3,6 +3,7 @@
 import type { ConversationMessage } from "@/lib/chat-api";
 import {
   CHAT_MESSAGES_CACHE_PREFIX,
+  getPersistentStore,
   readCachedSnapshot,
   writeCachedSnapshot,
 } from "@/lib/persistent-cache";
@@ -35,6 +36,11 @@ export function setLastServerTime(
 
 function cacheKey(sessionId: string): string {
   return `${CHAT_MESSAGES_CACHE_PREFIX}${sessionId}`;
+}
+
+export async function clearCachedMessages(sessionId: string): Promise<void> {
+  lastServerTimeBySession.delete(sessionId);
+  await getPersistentStore().delete(cacheKey(sessionId));
 }
 
 export async function readCachedMessages(

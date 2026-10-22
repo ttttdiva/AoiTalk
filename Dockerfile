@@ -20,6 +20,8 @@ FROM enterprise-node-base AS frontend-builder
 
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./frontend/
+# Fixed canonical playback code is a local npm dependency, not an authoring checkout.
+COPY resources/seethrough-rig/runtime/ ./resources/seethrough-rig/runtime/
 WORKDIR /app/frontend
 ARG NPM_INSTALL_MODE=online
 ARG AOITALK_OFFLINE_BUILD=0

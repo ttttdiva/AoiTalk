@@ -1,12 +1,12 @@
 # キャラクター音声と Irodori-TTS v3 / v4.1
 
-キャラクター設定画面の Irodori-TTS 部分は、モデル selector と参照音声資産を管理し、`character.voice_parameters` を合成条件へ渡すための統合です。既定 checkpoint は `Aratako/Irodori-TTS-v4.1-Small` です。追加 selector `v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` を使います。Irodori-TTS v3 VoiceDesign (`Aratako/Irodori-TTS-600M-v3-VoiceDesign`) と既存の v2/v3 checkpoint の互換経路も維持しています。モデル・runtime・依存の詳細は [irodori_tts.md](irodori_tts.md) を参照してください。
+キャラクター設定画面の Irodori-TTS 部分は、モデル selector と参照音声資産を管理し、`character.voice_parameters` を合成条件へ渡すための統合です。既定 checkpoint は `Aratako/Irodori-TTS-v4.1-Small` です。追加 selector `v4-large` は `Aratako/Irodori-TTS-v4-Large`、`v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` を使います。Irodori-TTS v3 VoiceDesign (`Aratako/Irodori-TTS-600M-v3-VoiceDesign`) と既存の v2/v3 checkpoint の互換経路も維持しています。モデル・runtime・依存の詳細は [irodori_tts.md](irodori_tts.md) を参照してください。
 
 ## 依存と実行時互換
 
-公式 Irodori-TTS upstream の基準 [`pyproject.toml`](https://github.com/Aratako/Irodori-TTS/blob/8224dafb46d0aba89209a8f905f1cb7e3299d9c1/pyproject.toml) は `transformers>=5.12.1,<6` / `sentencepiece<0.2`（`>=0.1.99,<0.2`）ですが、AoiTalk は MioTTS/yomi との共存を優先し、`transformers>=4.57.6,<6` / `sentencepiece>=0.2.1,<0.3` を採用しています。MioTTS/yomi-linter も同時に入れる環境では、それらの `<5` 制約との交差で transformers は 4.57.6 以上 5 未満になります。
+公式 Irodori-TTS upstream の基準 [`pyproject.toml`](https://github.com/Aratako/Irodori-TTS/blob/89f9d8fbd4d51ea019867ee1197725ede1df13c5/pyproject.toml) は `transformers>=5.12.1,<6` を要求します。AoiTalk の `irodori` extra もこれに合わせ、`transformers>=5.12.1,<6` と `huggingface-hub>=1.5.0,<1.16.3` を使います。v4 Large の T5Gemma2 条件付けはこのレンジが必要です。`sentencepiece` は MioTTS と共有するため `>=0.2.1,<0.3` です。
 
-v4.1 の ModernBERT checkpoint をこの transformers 4.x 経路でも読むため、vendored [`src/vendor/irodori_tts/model.py`](../src/vendor/irodori_tts/model.py) は `no_init_weights` を 4.x の `transformers.modeling_utils` からも import できるようにし、`rope_parameters` の `full_attention` / `sliding_attention` の `rope_theta` を 4.x の `global_rope_theta` / `local_rope_theta` へ変換します。v3 VoiceDesign を含む既存 checkpoint の互換経路はこの shim の追加後も削除していません。
+既定のセットアップ経路では ModernBERT 4.x shim（`_apply_modernbert_rope_compat`、`rope_theta` 変換）は使いません。vendored [`src/vendor/irodori_tts/model.py`](../src/vendor/irodori_tts/model.py) からも外しています。`miotts` extra の `transformers<5` は別経路であり、同時導入すると resolver が衝突します。この衝突は既定の `irodori` 導入経路の合否判定には使いません。v3 VoiceDesign を含む既存 checkpoint の互換経路は削除していません。
 
 なお、`.[irodori,miotts,yomi-linter]` 全体の `pip install --dry-run` は、既存の `openai` / `mem0ai` 競合で失敗します。したがってこの統合ページでは全 extra の dry-run 成功を前提にせず、Irodori の依存・runtime import（`tests/test_irodori_vendor.py`）と実モデル smoke を個別に確認します。`irodori` extra は DACVAE を含みません。setup.bat/setup.sh が DACVAE 固定 commit `414c20785fc3a28373073ea8ef7a1316eeeaca6e` と `descript-audiotools==0.7.2` を `--no-deps` で導入し、必要な runtime imports を明示 install します。`descript-audiotools` の `protobuf<3.20` と AoiTalk/mem0 の `protobuf>=5.29.6` を衝突させず、既存 protobuf を維持するためです。Hugging Face モデル取得は標準 cache 解決規則に従い、AoiTalk は `HF_HOME` / `HF_HUB_CACHE` を上書きしません。依存の詳細、初回取得/cache、失敗時の切り分けは [irodori_tts.md](irodori_tts.md#公式-upstream-と-aoi-talk-の依存レンジ) を参照してください。
 
@@ -35,7 +35,7 @@ ECC のキャラクター作成・更新 API は次の音声フィールドを�
 | キー | 型 | 意味 |
 | --- | --- | --- |
 | `caption` | string | 声質・感情・話し方の説明。参照音声と併用可能 |
-| `irodori_model` | `v4.1-small` / `v4.1-anime` / `v3-voice-design` | 人間向けモデル選択。未指定は v4.1 Small |
+| `irodori_model` | `v4.1-small` / `v4-large` / `v4.1-anime` / `v3-voice-design` | 人間向けモデル選択。未指定は v4.1 Small |
 | `no_ref` | boolean | 参照を使わないことの明示。caption だけの Voice Design に使用 |
 | `ref_wav` / `ref_latent` | string | 既存互換の単一 waveform / latent パス |
 | `ref_wavs` / `ref_latents` | string[] | 順序付きの複数参照。waveform と latent は混在不可 |

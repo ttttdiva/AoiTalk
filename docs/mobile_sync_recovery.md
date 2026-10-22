@@ -48,3 +48,16 @@ Pixel実機では、Docsのnative SQLite transactionとチャットの既読・�
 通信復帰時、古い一覧応答に含まれない新規タスクを端末が削除扱いにする競合も実機で確認された。サーバーへ作成できても、端末の削除記録によって一覧から消えたままになる。
 
 一覧取得前のID・プロジェクト・更新日時と、取得前／適用時のoutboxを照合し、取得中に作成・変更・移動・送信された行を削除推定から除外する。blockedや失敗中のoutboxも保護する。認証が切り替わった応答は適用せず、旧アカウントの一覧へfallbackしない。安定した既存行の可視性喪失と、本当の削除記録による再出現防止は維持する。`task-list-race.test.ts` は実SQLiteと遅延応答でこの競合を検証する。
+
+## 開発用の同期診断（0.1.240）
+
+通常の設定画面では共通ヘッダーの同期状態を表示する。操作ID、再試行累積回数、版timestamp、保存された変更とサーバー値の比較は通常UIへ出さない。同期処理や保留中のoutboxは変更しない。
+
+診断UIを使う開発者は、開発ビルド用Metroの起動時に `EXPO_PUBLIC_AOITALK_SYNC_DIAGNOSTICS=1` を明示する。設定画面の末尾へ本人の保留操作を読む診断UIが表示される。PowerShellでは `mobile/` で次を実行する。
+
+```powershell
+$env:EXPO_PUBLIC_AOITALK_SYNC_DIAGNOSTICS = "1"
+npm run start -- --clear
+```
+
+診断の読み取りとTask比較はボタンを押した場合だけ実行する。採用、取消、再送は実行しない。通常の開発起動では無効であり、releaseビルドではこの変数が `1` でも表示しない。検証後はMetroを停止して `Remove-Item Env:EXPO_PUBLIC_AOITALK_SYNC_DIAGNOSTICS` で起動用の変数を解除する。

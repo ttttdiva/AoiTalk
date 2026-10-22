@@ -58,6 +58,16 @@ AGENT_WORK_OUTCOME_CLASSES = frozenset(
 )
 AGENT_WORK_ACTOR_KINDS = frozenset({"human", "agent", "service"})
 
+# Numeric usage counters are not secrets even though their names contain "token".
+USAGE_COUNTER_KEYS = frozenset((
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_input_tokens",
+    "total_tokens",
+    "units",
+))
+
 _SAFE_KEY_MARKERS = (
     "secret",
     "token",
@@ -83,6 +93,9 @@ _SENSITIVE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _PATH_RE = re.compile(r"(?:^|[\\/])(?:users?|home|tmp|var|etc|appdata)(?:[\\/]|$)", re.I)
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|/)")
+# Durable metadata keeps the absolute workspace the task was admitted for.
+_STORED_PATH_LIMIT = 4096
 
 
 _SAFE_INTEGRATION_REASON_CODES = frozenset({
@@ -91,14 +104,41 @@ _SAFE_INTEGRATION_REASON_CODES = frozenset({
 })
 
 
-def _safe_text(value: Any, *, limit: int) -> str | None:
-    """Clip text and refuse obvious secret-bearing URL/path values."""
+_EVENT_TYPE_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
+def _event_type_code(value: Any) -> str:
+    """Return a server-owned event type code, never ``None``.
+
+    Event types such as ``api_agent_task.stream_token`` are identifiers, not
+    credential-bearing text; the generic secret-marker filter nulled them and
+    made the required ``event_type`` field fail response validation.
+    """
+
+    text = str(value or "").strip()
+    if _EVENT_TYPE_CODE_RE.match(text):
+        return text
+    return _safe_text(text, limit=80) or "unknown"
+
+
+def _safe_text(value: Any, *, limit: int, keep_paths: bool = False) -> str | None:
+    """Clip text and refuse obvious secret-bearing URL/path values.
+
+    ``keep_paths`` is for durable storage only: an absolute filesystem path is
+    an authority-bearing value (e.g. a task workspace) that must round-trip
+    exactly, so it is neither redacted nor clipped.  A path that cannot be
+    stored whole is dropped rather than truncated, because a clipped path can
+    resolve to a different (parent) directory.  Operator-facing DTOs never use
+    this mode and keep redacting paths.
+    """
 
     if value is None:
         return None
     value = str(value).strip()
     if not value:
         return None
+    if keep_paths and _ABSOLUTE_PATH_RE.match(value) and "://" not in value and value.isprintable():
+        return value if len(value) <= _STORED_PATH_LIMIT else None
     # Exact server-owned reason codes are metadata, not credential material.
     # Prefixes/suffixes and arbitrary credential-bearing text still fail below.
     if value in _SAFE_INTEGRATION_REASON_CODES:
@@ -111,7 +151,7 @@ def _safe_text(value: Any, *, limit: int) -> str | None:
     return value[:limit]
 
 
-def _safe_json(value: Any, *, depth: int = 0) -> Any:
+def _safe_json(value: Any, *, depth: int = 0, keep_paths: bool = False) -> Any:
     """Return a tiny JSON projection suitable for operator-facing DTOs."""
 
     if depth > 3:
@@ -121,11 +161,11 @@ def _safe_json(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return _safe_text(value, limit=512)
+        return _safe_text(value, limit=512, keep_paths=keep_paths)
     if isinstance(value, (list, tuple, set, frozenset)):
         result: list[Any] = []
         for item in list(value)[:64]:
-            projected = _safe_json(item, depth=depth + 1)
+            projected = _safe_json(item, depth=depth + 1, keep_paths=keep_paths)
             if projected is not None:
                 result.append(projected)
         return result
@@ -134,9 +174,14 @@ def _safe_json(value: Any, *, depth: int = 0) -> Any:
         for raw_key, item in list(value.items())[:64]:
             key = str(raw_key)
             lowered = key.casefold()
-            if any(marker in lowered for marker in _SAFE_KEY_MARKERS):
+            numeric_counter = (
+                lowered in USAGE_COUNTER_KEYS
+                and isinstance(item, (int, float))
+                and not isinstance(item, bool)
+            )
+            if not numeric_counter and any(marker in lowered for marker in _SAFE_KEY_MARKERS):
                 continue
-            projected = _safe_json(item, depth=depth + 1)
+            projected = _safe_json(item, depth=depth + 1, keep_paths=keep_paths)
             if projected is not None:
                 result[key[:96]] = projected
         return result
@@ -186,6 +231,15 @@ class AgentWorkItem(Base):
     )
     app_id = Column(
         UUID(as_uuid=True), ForeignKey("apps.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Optional canonical link to the Chat session that originated this work.
+    # It keeps Operations work ACL derivable from the human-readable session
+    # without conflating the human actor with the assigned Agent.
+    conversation_session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("conversation_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     assigned_agent_id = Column(
@@ -261,6 +315,11 @@ class AgentWorkItem(Base):
     runs = relationship(
         "AgentRun",
         foreign_keys="AgentRun.work_item_id",
+        viewonly=True,
+    )
+    conversation_session = relationship(
+        "ConversationSession",
+        foreign_keys=[conversation_session_id],
         viewonly=True,
     )
     parent = relationship(
@@ -395,6 +454,7 @@ class AgentWorkItem(Base):
             "task_id": _id(self.task_id),
             "persona_id": _id(self.persona_id),
             "app_id": _id(self.app_id),
+            "conversation_session_id": _id(self.conversation_session_id),
             "assigned_agent_id": _id(self.assigned_agent_id),
             "agent_revision_id": _id(self.agent_revision_id),
             "required_capabilities": capabilities,
@@ -463,7 +523,7 @@ class AgentWorkItem(Base):
 
     @validates("budget_reservation_json", "metadata_json", "result_summary_json")
     def _validate_json_projection(self, _key: str, value: Any) -> Any:
-        projected = _safe_json(value)
+        projected = _safe_json(value, keep_paths=_key == "metadata_json")
         return projected if projected is not None else ({} if _key != "result_summary_json" else None)
 
     @validates("result_summary", "escalation_reason", "safe_error_code", "blocker_code")
@@ -607,7 +667,7 @@ class AgentWorkEvent(Base):
             "id": _id(self.id),
             "work_item_id": _id(self.work_item_id),
             "sequence": int(self.sequence or 0),
-            "event_type": _safe_text(self.event_type, limit=80),
+            "event_type": _event_type_code(self.event_type),
             "from_state": self.from_state,
             "to_state": self.to_state,
             "status": self.status,

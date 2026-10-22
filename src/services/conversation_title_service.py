@@ -223,6 +223,10 @@ async def ensure_conversation_title(
     session = await repo.get_session_by_id(session_id, with_messages=False)
     if not session:
         return None
+    # Manual ownership wins even for an empty, fallback-shaped, or rejected
+    # title. Text equality cannot tell an explicit rename from an auto title.
+    if _title_generation_source(session) == "manual":
+        return None
 
     if hasattr(repo, "get_active_branch_messages"):
         messages = await repo.get_active_branch_messages(session_id)

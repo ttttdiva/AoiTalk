@@ -34,6 +34,7 @@ import ipaddress
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -45,10 +46,21 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from http.client import HTTPConnection
 from pathlib import Path
 from urllib.parse import unquote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+
+import psutil
+
+from ._gateway_activation import restore_activation_secret as _restore_gateway_activation_secret
+from ._qdrant_server import (
+    managed_qdrant_status,
+    start_managed_qdrant,
+    stop_managed_qdrant,
+)
 
 from src.llm.openai_compatible_local_profiles import (
     EXO_BASE_URL,
@@ -59,7 +71,16 @@ from src.llm.openai_compatible_local_profiles import (
     normalize_openai_compatible_base_url,
     openai_compatible_local_base_url,
 )
+from src.services.strata_runtime import (
+    strata_api_key,
+    strata_settings,
+    strata_base_url,
+    strata_launch_plan,
+    strata_readiness,
+    strata_vision_enabled,
+)
 from src.features import Features
+from src.api.public_base_path import normalize_public_base_path
 from src.utils.startup_timing import get_startup_timer
 from src.utils.startup_console import startup_console
 from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
@@ -69,17 +90,23 @@ _startup_timer = get_startup_timer()
 
 from ._process_utils import (
     _IS_WINDOWS,
+    _OwnedProcessIdentity,
+    _capture_owned_process_tree,
+    _canonical_process_path,
     _child_processes,
     _extract_port_from_netstat_address,
     _is_port_open,
     _kill_existing_on_port,
     _listening_pid_for_netstat_line,
+    _owned_process_identity_matches,
     _openai_compatible_local_processes,
+    _read_owned_process_identity,
     _read_log_tail,
     _remove_tracked_process,
     _service_log_dir,
     _models_log_dir,
     _web_log_dir,
+    _supervised_startup_enabled,
     _track_child_process,
     _wait_for_port,
     _wait_for_port_closed,
@@ -156,6 +183,7 @@ from ._local_llm_servers import (
     _validate_llama_cpp_model_alias,
     _validate_llama_cpp_extra_args,
     _llama_cpp_settings,
+    _set_llama_cpp_startup_state,
     _llama_cpp_selected_model,
     _should_start_llama_cpp as _should_start_llama_cpp_runtime,
     _start_llama_cpp_server,
@@ -187,11 +215,30 @@ _LLAMA_CPP_ENSURE_LOCK = threading.RLock()
 # loaded.  The startup path only needs a listener before it can continue; the
 # request/generation path performs the stricter /v1/models alias check.
 _LLAMA_CPP_STARTUP_LISTENER_TIMEOUT_SECONDS = 10.0
+_LOCAL_PROVIDER_STARTUP_LISTENER_TIMEOUT_SECONDS = 10.0
 _LLAMA_CPP_LEASE_CONDITION = threading.Condition()
+_STRATA_LOAD_LOCK = threading.Lock()
 # endpoint -> {"alias": str, "count": int}
 _LLAMA_CPP_GENERATION_LEASES: dict[str, dict[str, object]] = {}
 _LLAMA_CPP_LEASE_TICKET_SEQ = itertools.count(1)
 _LLAMA_CPP_GENERATION_LEASE_TICKETS: dict[int, "LlamaCppGenerationLeaseTicket"] = {}
+# A client/session can outlive one request.  Keep a separate consumer lease so
+# an engine switch cannot tear down a managed local runtime that another
+# session, group, meeting, or agent still owns.  Generation leases remain
+# request-scoped and are deliberately kept in the legacy map above for
+# compatibility with the existing request lifecycle code/tests.
+_LLAMA_CPP_RUNTIME_CONSUMER_LEASES: dict[str, dict[str, object]] = {}
+_LLAMA_CPP_RUNTIME_CONSUMER_LEASE_TICKETS: dict[
+    int, "ManagedLocalRuntimeConsumerLeaseTicket"
+] = {}
+_LLAMA_CPP_RUNTIME_CONSUMER_LEASE_SEQ = itertools.count(1)
+# endpoint/alias/PID keyed deferred stops created when a committed route
+# switch timed out waiting for active consumers.  Records retain the exact
+# tracked process object so a replacement PID/process can never be killed.
+_LLAMA_CPP_DEFERRED_STOPS: dict[int, dict[str, object]] = {}
+_LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE = False
+_LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN_SEQ = itertools.count(1)
+_LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN: int | None = None
 
 
 class _LlamaCppGenerationLeaseBusy(Exception):
@@ -212,6 +259,28 @@ def _normalize_llama_cpp_lease_endpoint(base_url: str) -> str:
     return normalize_openai_compatible_base_url(str(base_url or "").strip())
 
 
+def _runtime_consumer_lease_conflict(
+    endpoint: str,
+    alias: str,
+    *,
+    consumer: str = "consumer",
+) -> RuntimeError:
+    current_generation_alias, generation_count = _peek_llama_cpp_generation_lease(
+        endpoint
+    )
+    current_consumer_alias, consumer_count = _peek_llama_cpp_runtime_consumer_lease(
+        endpoint
+    )
+    active_alias = current_generation_alias or current_consumer_alias
+    active_count = generation_count + consumer_count
+    return RuntimeError(
+        "managed local runtime is in use by another consumer; "
+        f"endpoint={endpoint!r}, active_alias={active_alias!r}, "
+        f"requested_alias={alias!r}, active_count={active_count}, "
+        f"consumer={consumer!r}"
+    )
+
+
 def _llama_cpp_generation_lease_timeout(
     config: object | None,
     *,
@@ -225,6 +294,8 @@ def _llama_cpp_generation_lease_timeout(
         config,
         selected_model,
     )
+    if managed_runtime == "strata":
+        return float(strata_settings(config, model=selected_model)["readiness_timeout"])
     if managed_runtime == "freetoken":
         settings = _freetoken_settings(
             config,
@@ -262,6 +333,12 @@ def _llama_cpp_generation_lease_identity(
         config,
         selected_model,
     )
+    if managed_runtime == "strata":
+        settings = strata_settings(config, model=selected_model)
+        if not settings["auto_start"]:
+            return None
+        return strata_base_url(config, model=selected_model), selected_model
+
     if managed_runtime == "freetoken":
         if not _should_start_freetoken(
             config,
@@ -324,6 +401,28 @@ def _peek_llama_cpp_generation_lease(endpoint: str) -> tuple[str, int]:
         return str(lease.get("alias") or ""), int(lease.get("count") or 0)
 
 
+def _peek_llama_cpp_runtime_consumer_lease(endpoint: str) -> tuple[str, int]:
+    """Return the alias/count held by non-request local runtime consumers."""
+
+    normalized = _normalize_llama_cpp_lease_endpoint(endpoint)
+    with _LLAMA_CPP_LEASE_CONDITION:
+        lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(normalized)
+        if not lease:
+            return "", 0
+        return str(lease.get("alias") or ""), int(lease.get("count") or 0)
+
+
+def _peek_llama_cpp_lifecycle_lease(endpoint: str) -> tuple[str, int]:
+    """Return all request and consumer leases protecting one endpoint."""
+
+    generation_alias, generation_count = _peek_llama_cpp_generation_lease(endpoint)
+    consumer_alias, consumer_count = _peek_llama_cpp_runtime_consumer_lease(endpoint)
+    return (
+        generation_alias or consumer_alias,
+        generation_count + consumer_count,
+    )
+
+
 def _iter_owned_llama_cpp_lease_endpoints() -> list[str]:
     endpoints: list[str] = []
     seen: set[str] = set()
@@ -371,42 +470,81 @@ def _llama_cpp_endpoints_requiring_lease_drain(
     if identity is not None:
         endpoint, alias = identity
         current_alias, count = _peek_llama_cpp_generation_lease(endpoint)
+        consumer_alias, consumer_count = _peek_llama_cpp_runtime_consumer_lease(
+            endpoint
+        )
+        active_alias = current_alias or consumer_alias
         if force_restart:
             candidates.append(endpoint)
             candidates.extend(owned)
-        elif count > 0 and current_alias != alias:
+        elif (count > 0 or consumer_count > 0) and active_alias != alias:
             candidates.append(endpoint)
     elif force_restart:
         candidates.extend(owned)
     for candidate in candidates:
         _count_alias, count = _peek_llama_cpp_generation_lease(candidate)
-        if count > 0:
+        _consumer_alias, consumer_count = _peek_llama_cpp_runtime_consumer_lease(
+            candidate
+        )
+        if count > 0 or consumer_count > 0:
             _add(candidate)
     return endpoints
+
+
+def _check_local_startup_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Managed local model startup was cancelled")
+
+
+@contextmanager
+def _llama_cpp_startup_lock(cancel_event):
+    if cancel_event is None:
+        with _LLAMA_CPP_ENSURE_LOCK:
+            yield
+        return
+    while True:
+        _check_local_startup_cancelled(cancel_event)
+        if _LLAMA_CPP_ENSURE_LOCK.acquire(timeout=0.1):
+            break
+    try:
+        _check_local_startup_cancelled(cancel_event)
+        yield
+    finally:
+        _LLAMA_CPP_ENSURE_LOCK.release()
 
 
 def _wait_for_llama_cpp_generation_lease_idle(
     endpoint: str,
     timeout_seconds: float,
+    *,
+    cancel_event=None,
 ) -> None:
     normalized = _normalize_llama_cpp_lease_endpoint(endpoint)
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     with _LLAMA_CPP_LEASE_CONDITION:
         while True:
-            lease = _LLAMA_CPP_GENERATION_LEASES.get(normalized)
-            count = int((lease or {}).get("count") or 0)
+            _check_local_startup_cancelled(cancel_event)
+            generation_lease = _LLAMA_CPP_GENERATION_LEASES.get(normalized)
+            consumer_lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(normalized)
+            generation_count = int((generation_lease or {}).get("count") or 0)
+            consumer_count = int((consumer_lease or {}).get("count") or 0)
+            count = generation_count + consumer_count
             if count <= 0:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                current_alias = str((lease or {}).get("alias") or "")
+                current_alias = str(
+                    (generation_lease or {}).get("alias")
+                    or (consumer_lease or {}).get("alias")
+                    or ""
+                )
                 raise RuntimeError(
                     "llama.cppの生成lease待ちがtimeoutしました。"
                     f"endpoint={normalized!r}, 使用中alias={current_alias!r}, "
                     f"使用中count={count}。"
                     "実行中の生成は停止せず、切替を中止しました。"
                 )
-            _LLAMA_CPP_LEASE_CONDITION.wait(timeout=remaining)
+            _LLAMA_CPP_LEASE_CONDITION.wait(timeout=min(remaining, 0.1) if cancel_event is not None else remaining)
 
 
 class LlamaCppGenerationLeaseTicket:
@@ -423,6 +561,234 @@ class LlamaCppGenerationLeaseTicket:
 
     def release(self) -> None:
         _release_llama_cpp_generation_lease_ticket(self)
+
+
+class ManagedLocalRuntimeConsumerLeaseTicket:
+    """Idempotent lease for a client/session that may outlive one request.
+
+    The ticket is intentionally independent from the request generation lease:
+    a session can retain a target client while idle, and a switch must keep
+    that target's managed process alive until the owner explicitly cleans it
+    up.  ``consumer`` is diagnostic metadata only; the endpoint/alias fence is
+    the lifecycle identity.
+    """
+
+    __slots__ = (
+        "endpoint",
+        "alias",
+        "consumer",
+        "ticket_id",
+        "_released",
+        "_holder",
+    )
+
+    def __init__(
+        self,
+        endpoint: str,
+        alias: str,
+        consumer: str,
+        ticket_id: int,
+    ) -> None:
+        self.endpoint = endpoint
+        self.alias = alias
+        self.consumer = consumer
+        self.ticket_id = ticket_id
+        self._released = False
+        self._holder = None
+
+    def release(self) -> None:
+        _release_llama_cpp_runtime_consumer_lease(self)
+
+
+def _register_llama_cpp_runtime_consumer_ticket(
+    holder: object,
+    ticket: ManagedLocalRuntimeConsumerLeaseTicket,
+) -> None:
+    tickets = getattr(holder, "_llama_cpp_runtime_consumer_lease_tickets", None)
+    if not isinstance(tickets, set):
+        tickets = set()
+        setattr(holder, "_llama_cpp_runtime_consumer_lease_tickets", tickets)
+    tickets.add(ticket)
+    ticket._holder = holder
+
+
+def _unregister_llama_cpp_runtime_consumer_ticket(
+    ticket: ManagedLocalRuntimeConsumerLeaseTicket,
+) -> None:
+    holder = ticket._holder
+    ticket._holder = None
+    if holder is None:
+        return
+    tickets = getattr(holder, "_llama_cpp_runtime_consumer_lease_tickets", None)
+    if isinstance(tickets, set):
+        tickets.discard(ticket)
+
+
+def _acquire_llama_cpp_runtime_consumer_lease(
+    endpoint: str,
+    alias: str,
+    *,
+    consumer: str = "consumer",
+    holder: object | None = None,
+) -> ManagedLocalRuntimeConsumerLeaseTicket:
+    """Protect a managed local endpoint for one long-lived consumer.
+
+    The same lifecycle lock used by ensure/stop closes the check-to-acquire
+    race.  A different alias cannot share one endpoint while either a request
+    or another consumer still owns it.
+    """
+
+    normalized = _normalize_llama_cpp_lease_endpoint(endpoint)
+    target_alias = str(alias or "").strip()
+    target_consumer = str(consumer or "consumer").strip() or "consumer"
+    if not normalized or not target_alias:
+        raise ValueError("managed local runtime lease requires endpoint and alias")
+    with _LLAMA_CPP_ENSURE_LOCK:
+        with _LLAMA_CPP_LEASE_CONDITION:
+            generation_alias, generation_count = _peek_llama_cpp_generation_lease(
+                normalized
+            )
+            consumer_alias, consumer_count = _peek_llama_cpp_runtime_consumer_lease(
+                normalized
+            )
+            active_alias = generation_alias or consumer_alias
+            active_count = generation_count + consumer_count
+            if active_count > 0 and active_alias != target_alias:
+                raise _runtime_consumer_lease_conflict(
+                    normalized,
+                    target_alias,
+                    consumer=target_consumer,
+                )
+            ticket_id = next(_LLAMA_CPP_RUNTIME_CONSUMER_LEASE_SEQ)
+            ticket = ManagedLocalRuntimeConsumerLeaseTicket(
+                normalized,
+                target_alias,
+                target_consumer,
+                ticket_id,
+            )
+            lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.setdefault(
+                normalized,
+                {"alias": target_alias, "count": 0, "consumers": {}},
+            )
+            lease["alias"] = target_alias
+            lease["count"] = int(lease.get("count") or 0) + 1
+            consumers = lease.setdefault("consumers", {})
+            if isinstance(consumers, dict):
+                consumers[target_consumer] = int(consumers.get(target_consumer) or 0) + 1
+            _LLAMA_CPP_RUNTIME_CONSUMER_LEASE_TICKETS[ticket_id] = ticket
+            if holder is not None:
+                _register_llama_cpp_runtime_consumer_ticket(holder, ticket)
+            _LLAMA_CPP_LEASE_CONDITION.notify_all()
+            return ticket
+
+
+def _acquire_managed_local_runtime_consumer_for_route(
+    config: object | None,
+    *,
+    provider: str,
+    model: str,
+    consumer: str,
+    holder: object | None = None,
+) -> ManagedLocalRuntimeConsumerLeaseTicket | None:
+    """Acquire a consumer lease from a provider/model route overlay.
+
+    Raw group/meeting/specialist transports often carry a route separate from
+    the persisted Main provider.  Overlay the route before resolving the
+    managed identity so a global cloud setting cannot accidentally make a
+    local meeting target look unowned.
+    """
+
+    if str(provider or "").strip().lower() != "openai_compatible_local":
+        return None
+    model_id = str(model or "").strip()
+    if not model_id:
+        return None
+    candidate = config
+    try:
+        from src.llm.manager import TargetConfig
+
+        candidate = TargetConfig(
+            config,
+            {
+                "llm_provider": "openai_compatible_local",
+                "llm_model": model_id,
+                "openai_compatible_local.model": model_id,
+            },
+        )
+    except Exception:
+        pass
+    identity = _llama_cpp_generation_lease_identity(candidate, model=model_id)
+    if identity is None:
+        return None
+    return _acquire_llama_cpp_runtime_consumer_lease(
+        identity[0],
+        identity[1],
+        consumer=consumer,
+        holder=holder,
+    )
+
+
+def _release_llama_cpp_runtime_consumer_lease(
+    ticket: ManagedLocalRuntimeConsumerLeaseTicket | None,
+) -> None:
+    if ticket is None:
+        return
+    released = False
+    with _LLAMA_CPP_LEASE_CONDITION:
+        if ticket._released:
+            return
+        ticket._released = True
+        _LLAMA_CPP_RUNTIME_CONSUMER_LEASE_TICKETS.pop(ticket.ticket_id, None)
+        _unregister_llama_cpp_runtime_consumer_ticket(ticket)
+        lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(ticket.endpoint)
+        if not lease:
+            _LLAMA_CPP_LEASE_CONDITION.notify_all()
+        else:
+            count = int(lease.get("count") or 0) - 1
+            consumers = lease.get("consumers")
+            if isinstance(consumers, dict):
+                consumer_count = int(consumers.get(ticket.consumer) or 0) - 1
+                if consumer_count <= 0:
+                    consumers.pop(ticket.consumer, None)
+                else:
+                    consumers[ticket.consumer] = consumer_count
+            if count <= 0:
+                _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.pop(ticket.endpoint, None)
+            else:
+                lease["count"] = count
+        _LLAMA_CPP_LEASE_CONDITION.notify_all()
+        released = True
+    if released:
+        _drain_deferred_llama_cpp_stops(non_blocking=True)
+
+
+def _release_llama_cpp_runtime_consumer_leases_for_holder(
+    holder: object | None,
+    *,
+    all: bool = False,
+) -> None:
+    if holder is None:
+        return
+    with _LLAMA_CPP_LEASE_CONDITION:
+        tickets = getattr(holder, "_llama_cpp_runtime_consumer_lease_tickets", None)
+        if not isinstance(tickets, set) or not tickets:
+            return
+        pending = list(tickets)
+    if not all:
+        pending = pending[:1]
+    for ticket in pending:
+        ticket.release()
+
+
+def _reset_llama_cpp_runtime_consumer_leases() -> None:
+    with _LLAMA_CPP_LEASE_CONDITION:
+        for ticket in list(_LLAMA_CPP_RUNTIME_CONSUMER_LEASE_TICKETS.values()):
+            ticket._released = True
+            ticket._holder = None
+        _LLAMA_CPP_RUNTIME_CONSUMER_LEASE_TICKETS.clear()
+        _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.clear()
+        _LLAMA_CPP_DEFERRED_STOPS.clear()
+        _LLAMA_CPP_LEASE_CONDITION.notify_all()
 
 
 def _register_llama_cpp_generation_lease_ticket(
@@ -505,6 +871,7 @@ def _release_llama_cpp_generation_lease_ticket(
 ) -> None:
     if ticket is None:
         return
+    released = False
     with _LLAMA_CPP_LEASE_CONDITION:
         if ticket._released:
             return
@@ -514,13 +881,16 @@ def _release_llama_cpp_generation_lease_ticket(
         lease = _LLAMA_CPP_GENERATION_LEASES.get(ticket.endpoint)
         if not lease:
             _LLAMA_CPP_LEASE_CONDITION.notify_all()
-            return
-        count = int(lease.get("count") or 0) - 1
-        if count <= 0:
-            _LLAMA_CPP_GENERATION_LEASES.pop(ticket.endpoint, None)
         else:
-            lease["count"] = count
+            count = int(lease.get("count") or 0) - 1
+            if count <= 0:
+                _LLAMA_CPP_GENERATION_LEASES.pop(ticket.endpoint, None)
+            else:
+                lease["count"] = count
         _LLAMA_CPP_LEASE_CONDITION.notify_all()
+        released = True
+    if released:
+        _drain_deferred_llama_cpp_stops(non_blocking=True)
 
 
 def _reset_llama_cpp_generation_leases() -> None:
@@ -530,7 +900,11 @@ def _reset_llama_cpp_generation_leases() -> None:
             ticket._holder = None
         _LLAMA_CPP_GENERATION_LEASE_TICKETS.clear()
         _LLAMA_CPP_GENERATION_LEASES.clear()
+        _LLAMA_CPP_DEFERRED_STOPS.clear()
         _LLAMA_CPP_LEASE_CONDITION.notify_all()
+    # Test/setup reset historically covered the whole process-local lifecycle
+    # ledger.  Keep that invariant after adding long-lived consumer leases.
+    _reset_llama_cpp_runtime_consumer_leases()
 
 
 def _release_llama_cpp_generation_lease_for_holder(
@@ -555,18 +929,90 @@ def _stop_owned_openai_compatible_local_servers_if_unleased(endpoint: str) -> No
     normalized = _normalize_llama_cpp_lease_endpoint(endpoint)
     with _LLAMA_CPP_ENSURE_LOCK:
         with _LLAMA_CPP_LEASE_CONDITION:
-            lease = _LLAMA_CPP_GENERATION_LEASES.get(normalized)
-            count = int((lease or {}).get("count") or 0)
+            generation_lease = _LLAMA_CPP_GENERATION_LEASES.get(normalized)
+            consumer_lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(normalized)
+            count = int((generation_lease or {}).get("count") or 0) + int(
+                (consumer_lease or {}).get("count") or 0
+            )
             if count > 0:
                 raise _LlamaCppGenerationLeaseBusy(
                     normalized,
-                    str((lease or {}).get("alias") or ""),
+                    str(
+                        (generation_lease or {}).get("alias")
+                        or (consumer_lease or {}).get("alias")
+                        or ""
+                    ),
                     count,
                 )
-        stop_openai_compatible_local_servers()
+        # This helper is used while replacing one endpoint. Keep the stop
+        # scoped to that endpoint so a different local runtime/consumer cannot
+        # be killed as a side effect of an alias change.
+        processes = _owned_processes_for_scope(endpoint=normalized)
+        if not processes:
+            # Legacy tracked doubles/processes may lack endpoint metadata. A
+            # single such process is still an unambiguous compatibility
+            # target; multiple unannotated processes are left running rather
+            # than guessed across endpoints.
+            unannotated = [
+                process
+                for process in list(_openai_compatible_local_processes)
+                if not str(
+                    getattr(process, "_aoi_local_base_url", None)
+                    or getattr(process, "_aoi_llama_cpp_base_url", "")
+                    or ""
+                ).strip()
+            ]
+            if len(unannotated) == 1:
+                # An unknown worker cannot be mapped to the requested
+                # endpoint. Never use the broad legacy stop while any other
+                # endpoint has an active request/consumer lease.
+                has_other_active_lease = bool(_busy_llama_cpp_generation_leases())
+                if (
+                    len(_openai_compatible_local_processes) == 1
+                    and not has_other_active_lease
+                ):
+                    # Preserve the legacy low-level hook for one unannotated
+                    # tracked worker (the only process that can be identified
+                    # safely in this compatibility shape).
+                    stop_openai_compatible_local_servers()
+                    return
+        for process in processes:
+            _terminate_process_tree(process)
+            _remove_tracked_process(process)
+
+
+_NEXT_PROCESS_TREE_ATTR = "_aoi_next_process_tree"
+_NEXT_CAPTURE_PENDING = object()
+_NEXT_CAPTURE_FAILED = object()
 
 
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    next_tree = getattr(proc, "_aoi_next_process_tree", None)
+    if _IS_WINDOWS and next_tree is not None:
+        if next_tree is _NEXT_CAPTURE_PENDING or next_tree is _NEXT_CAPTURE_FAILED:
+            logger.warning(
+                "Next.js process-tree identity capture is incomplete; cleanup refused"
+            )
+            return
+        if not isinstance(next_tree, tuple) or not _terminate_validated_next_tree(next_tree):
+            logger.warning(
+                "Next.js process-tree identity changed; cleanup refused"
+            )
+        return
+
+    # A Windows llama.cpp launch keeps stdout file-only for CUDA stability and
+    # may have a separate visible PowerShell tail console.  Stop that console
+    # with its worker so an engine switch never leaves an orphan window.
+    companion = getattr(proc, "_aoi_llama_cpp_console_process", None)
+    if companion is not None and companion is not proc:
+        try:
+            setattr(proc, "_aoi_llama_cpp_console_process", None)
+        except Exception:
+            pass
+        try:
+            _terminate_process_tree(companion)
+        finally:
+            _remove_tracked_process(companion)
     try:
         if proc.poll() is not None:
             return
@@ -578,6 +1024,7 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                 capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception:
             pass
@@ -608,6 +1055,167 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+def _record_next_process_tree(
+    proc: subprocess.Popen,
+    *,
+    frontend_dir: Path,
+    next_port: int,
+    frontend_host: str,
+    require_descendants: bool = True,
+) -> None:
+    """Record exact Windows Next identities before and after readiness."""
+    # Unit tests use light-weight Popen doubles.  A real Windows Popen has a
+    # native handle; production capture is mandatory, while doubles keep the
+    # existing startup tests independent of the host process table.
+    if not _IS_WINDOWS or not hasattr(proc, "_handle"):
+        return
+    previous = getattr(proc, _NEXT_PROCESS_TREE_ATTR, None)
+    setattr(proc, _NEXT_PROCESS_TREE_ATTR, _NEXT_CAPTURE_PENDING)
+    try:
+        records = _capture_owned_process_tree(proc)
+        if not records:
+            raise RuntimeError("Next.js frontend process identityを取得できません")
+
+        expected_cwd = _canonical_process_path(frontend_dir)
+        if records[0].cwd != expected_cwd:
+            raise RuntimeError("Next.js frontend launcherのcwdを検証できません")
+
+        if isinstance(previous, tuple) and not _owned_process_identity_matches(
+            previous[0], records[0]
+        ):
+            raise RuntimeError("Next.js frontend launcherのidentityが起動後に変化しました")
+
+        host_marker = str(frontend_host).casefold()
+        port_marker = str(int(next_port))
+        descendants = records[1:]
+        if not descendants:
+            if require_descendants:
+                raise RuntimeError("Next.js frontend descendantを取得できません")
+            setattr(proc, _NEXT_PROCESS_TREE_ATTR, records)
+            return
+        for identity in descendants:
+            if Path(identity.executable).name.casefold() == "conhost.exe":
+                # CREATE_NEW_CONSOLE may add a Windows console host whose cwd
+                # and command line are unrelated to Next.  It is still
+                # recorded and revalidated by exact identity.
+                continue
+            command = " ".join(identity.command_line).casefold()
+            if (
+                identity.cwd != expected_cwd
+                or port_marker not in command
+                or host_marker not in command
+                or not any(token in command for token in ("next", "npm"))
+            ):
+                raise RuntimeError(
+                    "Next.js frontend descendantの実行identityを検証できません"
+                )
+        setattr(proc, _NEXT_PROCESS_TREE_ATTR, records)
+    except BaseException:
+        setattr(proc, _NEXT_PROCESS_TREE_ATTR, _NEXT_CAPTURE_FAILED)
+        raise
+
+
+def _validated_next_tree(
+    records: tuple[_OwnedProcessIdentity, ...],
+) -> dict[int, _OwnedProcessIdentity] | None:
+    """Return live members only when all recorded and current descendants agree."""
+    known_pids = {identity.pid for identity in records}
+    current: dict[int, _OwnedProcessIdentity] = {}
+    for expected in records:
+        observed = _read_owned_process_identity(expected.pid)
+        if observed is None:
+            try:
+                if psutil.pid_exists(expected.pid):
+                    return None
+            except (psutil.Error, OSError):
+                return None
+            continue
+        if not _owned_process_identity_matches(expected, observed):
+            return None
+        if observed.parent_pid != expected.parent_pid:
+            return None
+        current[expected.pid] = observed
+
+    # A tracked process may have spawned a child after the readiness snapshot.
+    # Refuse the whole operation instead of allowing an exact parent kill to
+    # take an unrecorded process with it.
+    for identity in current.values():
+        try:
+            descendants = psutil.Process(identity.pid).children(recursive=True)
+        except (psutil.Error, OSError):
+            return None
+        if any(int(child.pid) not in known_pids for child in descendants):
+            return None
+    return current
+
+
+def _next_identity_depth(
+    identity: _OwnedProcessIdentity,
+    by_pid: dict[int, _OwnedProcessIdentity],
+) -> int:
+    depth = 0
+    parent = identity.parent_pid
+    seen: set[int] = set()
+    while parent in by_pid and parent not in seen:
+        seen.add(parent)
+        depth += 1
+        parent = by_pid[parent].parent_pid
+    return depth
+
+
+def _terminate_exact_next_identity(identity: _OwnedProcessIdentity) -> bool:
+    """Terminate one already-validated PID without tree/name/port selection."""
+    observed = _read_owned_process_identity(identity.pid)
+    if observed is None:
+        try:
+            return not psutil.pid_exists(identity.pid)
+        except (psutil.Error, OSError):
+            return False
+    if not _owned_process_identity_matches(identity, observed):
+        return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(identity.pid), "/F"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        observed = _read_owned_process_identity(identity.pid)
+        if observed is None:
+            try:
+                return not psutil.pid_exists(identity.pid)
+            except (psutil.Error, OSError):
+                return False
+        if not _owned_process_identity_matches(identity, observed):
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _terminate_validated_next_tree(
+    records: tuple[_OwnedProcessIdentity, ...],
+) -> bool:
+    """Clean a validated Next tree using exact leaf-to-root actions."""
+    current = _validated_next_tree(records)
+    if current is None:
+        return False
+    by_pid = {identity.pid: identity for identity in records}
+    live_members = list(current.values())
+    live_members.sort(
+        key=lambda identity: _next_identity_depth(identity, by_pid),
+        reverse=True,
+    )
+    for identity in live_members:
+        if not _terminate_exact_next_identity(identity):
+            return False
+    return _validated_next_tree(records) == {}
+
+
 def stop_openai_compatible_local_servers() -> int:
     """Stop local OpenAI-compatible server processes started by AoiTalk.
 
@@ -625,45 +1233,393 @@ def stop_openai_compatible_local_servers() -> int:
 def _busy_llama_cpp_generation_leases() -> list[tuple[str, str, int]]:
     endpoints = set(_iter_owned_llama_cpp_lease_endpoints())
     endpoints.update(_LLAMA_CPP_GENERATION_LEASES.keys())
+    endpoints.update(_LLAMA_CPP_RUNTIME_CONSUMER_LEASES.keys())
     busy: list[tuple[str, str, int]] = []
     for endpoint in endpoints:
-        lease = _LLAMA_CPP_GENERATION_LEASES.get(endpoint)
-        count = int((lease or {}).get("count") or 0)
+        generation_lease = _LLAMA_CPP_GENERATION_LEASES.get(endpoint)
+        consumer_lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(endpoint)
+        count = int((generation_lease or {}).get("count") or 0) + int(
+            (consumer_lease or {}).get("count") or 0
+        )
         if count > 0:
             busy.append(
-                (endpoint, str((lease or {}).get("alias") or ""), count)
+                (
+                    endpoint,
+                    str(
+                        (generation_lease or {}).get("alias")
+                        or (consumer_lease or {}).get("alias")
+                        or ""
+                    ),
+                    count,
+                )
             )
     return busy
+
+
+def _register_deferred_llama_cpp_stops(processes: list[object]) -> None:
+    """Remember exact owned workers for a committed switch timeout."""
+
+    with _LLAMA_CPP_LEASE_CONDITION:
+        for process in processes:
+            endpoint = _normalize_llama_cpp_lease_endpoint(
+                str(
+                    getattr(process, "_aoi_local_base_url", None)
+                    or getattr(process, "_aoi_llama_cpp_base_url", "")
+                    or ""
+                )
+            )
+            alias = str(
+                getattr(process, "_aoi_local_model_alias", "") or ""
+            ).strip()
+            runtime = str(getattr(process, "_aoi_local_runtime", "") or "").strip()
+            try:
+                pid = int(getattr(process, "pid"))
+            except (TypeError, ValueError):
+                pid = 0
+            if not endpoint or not alias or pid <= 0:
+                continue
+            _LLAMA_CPP_DEFERRED_STOPS[id(process)] = {
+                "process": process,
+                "endpoint": endpoint,
+                "alias": alias,
+                "runtime": runtime,
+                "pid": pid,
+            }
+        _LLAMA_CPP_LEASE_CONDITION.notify_all()
+
+
+def _cancel_deferred_llama_cpp_stops(
+    *,
+    endpoint: str | None = None,
+    alias: str | None = None,
+) -> int:
+    normalized = (
+        _normalize_llama_cpp_lease_endpoint(endpoint)
+        if endpoint
+        else ""
+    )
+    selected_alias = str(alias or "").strip()
+    with _LLAMA_CPP_LEASE_CONDITION:
+        removed = 0
+        for key, record in list(_LLAMA_CPP_DEFERRED_STOPS.items()):
+            if normalized and record.get("endpoint") != normalized:
+                continue
+            if selected_alias and record.get("alias") != selected_alias:
+                continue
+            _LLAMA_CPP_DEFERRED_STOPS.pop(key, None)
+            removed += 1
+        _LLAMA_CPP_LEASE_CONDITION.notify_all()
+        return removed
+
+
+def _deferred_llama_cpp_stop_ready_locked() -> bool:
+    return any(
+        int(
+            (
+                _LLAMA_CPP_GENERATION_LEASES.get(
+                    str(record.get("endpoint") or "")
+                )
+                or {}
+            ).get("count")
+            or 0
+        )
+        + int(
+            (
+                _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(
+                    str(record.get("endpoint") or "")
+                )
+                or {}
+            ).get("count")
+            or 0
+        )
+        <= 0
+        for record in _LLAMA_CPP_DEFERRED_STOPS.values()
+    )
+
+
+def _finish_deferred_llama_cpp_drain_worker(token: int) -> None:
+    """Clear the scheduler state only for the worker that owns ``token``."""
+
+    global _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE
+    global _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN
+    with _LLAMA_CPP_LEASE_CONDITION:
+        if _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN != token:
+            return
+        _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE = False
+        _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN = None
+        _LLAMA_CPP_LEASE_CONDITION.notify_all()
+
+
+def _schedule_deferred_llama_cpp_drain() -> None:
+    """Run one deferred cleanup after a busy lifecycle lock is released."""
+
+    global _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE
+    global _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN
+    with _LLAMA_CPP_LEASE_CONDITION:
+        if _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE:
+            return
+        if not _LLAMA_CPP_DEFERRED_STOPS:
+            return
+        _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE = True
+        worker_token = next(_LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN_SEQ)
+        _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN = worker_token
+
+    def _run() -> None:
+        try:
+            while True:
+                _drain_deferred_llama_cpp_stops()
+                with _LLAMA_CPP_LEASE_CONDITION:
+                    should_finish = (
+                        not _LLAMA_CPP_DEFERRED_STOPS
+                        or not _deferred_llama_cpp_stop_ready_locked()
+                    )
+                    if should_finish:
+                        # Keep the decision and state transition in one
+                        # condition critical section. Otherwise a final
+                        # lease release can observe ACTIVE=True in the gap,
+                        # decline to schedule a successor, and then have
+                        # this worker clear ACTIVE with pending work left.
+                        _finish_deferred_llama_cpp_drain_worker(worker_token)
+                        return
+        finally:
+            _finish_deferred_llama_cpp_drain_worker(worker_token)
+
+    try:
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name="llama-cpp-deferred-stop",
+        ).start()
+    except Exception:
+        with _LLAMA_CPP_LEASE_CONDITION:
+            if _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN == worker_token:
+                _LLAMA_CPP_DEFERRED_DRAIN_WORKER_ACTIVE = False
+                _LLAMA_CPP_DEFERRED_DRAIN_WORKER_TOKEN = None
+        logger.debug("deferred llama.cpp stop scheduling failed", exc_info=True)
+
+
+def _drain_deferred_llama_cpp_stops(*, non_blocking: bool = False) -> int:
+    """Stop pending exact workers after their final lease releases.
+
+    A lease release updates its ledger before entering this function.  The
+    fast path therefore avoids the lifecycle lock when no deferred worker is
+    ready or another lease still protects every pending endpoint.  If the
+    final release races an ensure that is loading another model, release
+    remains non-blocking and a single one-shot cleanup worker drains later.
+    """
+
+    with _LLAMA_CPP_LEASE_CONDITION:
+        if not _LLAMA_CPP_DEFERRED_STOPS:
+            return 0
+        if not _deferred_llama_cpp_stop_ready_locked():
+            return 0
+
+    if non_blocking:
+        acquired = _LLAMA_CPP_ENSURE_LOCK.acquire(blocking=False)
+        if not acquired:
+            _schedule_deferred_llama_cpp_drain()
+            return 0
+    else:
+        _LLAMA_CPP_ENSURE_LOCK.acquire()
+
+    pending: list[object] = []
+    try:
+        with _LLAMA_CPP_LEASE_CONDITION:
+            for key, record in list(_LLAMA_CPP_DEFERRED_STOPS.items()):
+                endpoint = str(record.get("endpoint") or "")
+                generation = _LLAMA_CPP_GENERATION_LEASES.get(endpoint)
+                consumer = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(endpoint)
+                if int((generation or {}).get("count") or 0) + int(
+                    (consumer or {}).get("count") or 0
+                ) > 0:
+                    continue
+                process = record.get("process")
+                if process not in _openai_compatible_local_processes:
+                    _LLAMA_CPP_DEFERRED_STOPS.pop(key, None)
+                    continue
+                try:
+                    pid = int(getattr(process, "pid"))
+                    alive = process.poll() is None
+                except Exception:
+                    pid = 0
+                    alive = False
+                metadata_endpoint = _normalize_llama_cpp_lease_endpoint(
+                    str(
+                        getattr(process, "_aoi_local_base_url", None)
+                        or getattr(process, "_aoi_llama_cpp_base_url", "")
+                        or ""
+                    )
+                )
+                metadata_alias = str(
+                    getattr(process, "_aoi_local_model_alias", "") or ""
+                ).strip()
+                if (
+                    not alive
+                    or pid != int(record.get("pid") or 0)
+                    or metadata_endpoint != endpoint
+                    or metadata_alias != str(record.get("alias") or "")
+                ):
+                    _LLAMA_CPP_DEFERRED_STOPS.pop(key, None)
+                    continue
+                _LLAMA_CPP_DEFERRED_STOPS.pop(key, None)
+                pending.append(process)
+        for process in pending:
+            _terminate_process_tree(process)
+            _remove_tracked_process(process)
+        return len(pending)
+    finally:
+        _LLAMA_CPP_ENSURE_LOCK.release()
+
+
+def _owned_processes_for_scope(
+    *,
+    runtime: str | None = None,
+    model: str | None = None,
+    endpoint: str | None = None,
+) -> list:
+    normalized_endpoint = (
+        _normalize_llama_cpp_lease_endpoint(endpoint)
+        if endpoint
+        else ""
+    )
+    selected_runtime = str(runtime or "").strip()
+    selected_model = str(model or "").strip()
+    result = []
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            continue
+        if selected_runtime and str(getattr(proc, "_aoi_local_runtime", "") or "") != selected_runtime:
+            continue
+        if selected_model and str(getattr(proc, "_aoi_local_model_alias", "") or "") != selected_model:
+            continue
+        recorded = str(
+            getattr(proc, "_aoi_local_base_url", None)
+            or getattr(proc, "_aoi_llama_cpp_base_url", "")
+            or ""
+        )
+        if normalized_endpoint and _normalize_llama_cpp_lease_endpoint(recorded) != normalized_endpoint:
+            continue
+        result.append(proc)
+    return result
 
 
 def stop_owned_openai_compatible_local_servers_respecting_generation_leases(
     *,
     timeout_seconds: float | None = None,
+    runtime: str | None = None,
+    model: str | None = None,
+    endpoint: str | None = None,
+    defer_on_timeout: bool = False,
 ) -> int:
     """Stop owned llama.cpp servers only after generation leases are idle.
 
     Usual operations (global engine switch / compensation) must use this
     helper.  Timeout leaves processes running and raises RuntimeError.
     """
+    scoped = bool(runtime or model or endpoint)
     timeout = (
         _llama_cpp_generation_lease_timeout(None)
         if timeout_seconds is None
         else float(timeout_seconds)
     )
     deadline = time.monotonic() + max(0.0, timeout)
-    # Hold the same lock used by the managed-server ensure path.  Waiting on
-    # the lease condition while holding this lock is intentional: generation
-    # release only needs the condition lock, whereas a new generation must
-    # pass the ensure lock before it can obtain a ticket.  This makes the
-    # idle-check -> process-stop interval one atomic lifecycle boundary.
-    with _LLAMA_CPP_ENSURE_LOCK:
+
+    def _lease_snapshot() -> tuple[list[tuple[str, str, int]], list]:
+        """Read the busy ledger and scoped process set under the condition lock."""
+
+        if not scoped:
+            return _busy_llama_cpp_generation_leases(), []
+        processes = _owned_processes_for_scope(
+            runtime=runtime,
+            model=model,
+            endpoint=endpoint,
+        )
+        endpoints = {
+            _normalize_llama_cpp_lease_endpoint(
+                str(
+                    getattr(proc, "_aoi_local_base_url", None)
+                    or getattr(proc, "_aoi_llama_cpp_base_url", "")
+                    or ""
+                )
+            )
+            for proc in processes
+        }
+        if endpoint:
+            endpoints.add(_normalize_llama_cpp_lease_endpoint(endpoint))
+        # A request lease can outlive process metadata (for example while a
+        # raw transport is racing a restart). Include lease-ledger endpoints
+        # for the requested alias without broadening to other local models.
+        if model:
+            selected_alias = str(model).strip()
+            for candidate, lease in {
+                **_LLAMA_CPP_GENERATION_LEASES,
+                **_LLAMA_CPP_RUNTIME_CONSUMER_LEASES,
+            }.items():
+                if str((lease or {}).get("alias") or "").strip() == selected_alias:
+                    endpoints.add(candidate)
+        busy = []
+        for candidate in endpoints:
+            generation_lease = _LLAMA_CPP_GENERATION_LEASES.get(candidate)
+            consumer_lease = _LLAMA_CPP_RUNTIME_CONSUMER_LEASES.get(candidate)
+            count = int((generation_lease or {}).get("count") or 0) + int(
+                (consumer_lease or {}).get("count") or 0
+            )
+            if count > 0:
+                busy.append(
+                    (
+                        candidate,
+                        str(
+                            (generation_lease or {}).get("alias")
+                            or (consumer_lease or {}).get("alias")
+                            or ""
+                        ),
+                        count,
+                    )
+                )
+        return busy, processes
+
+    # Waiting must release the lifecycle lock.  A lease ticket releases the
+    # condition first and then drains deferred workers under this same lock;
+    # holding it while waiting would deadlock generation->consumer teardown.
+    while True:
         with _LLAMA_CPP_LEASE_CONDITION:
-            while True:
-                busy = _busy_llama_cpp_generation_leases()
-                if not busy:
-                    break
+            busy, processes = _lease_snapshot()
+            if busy:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining > 0:
+                    _LLAMA_CPP_LEASE_CONDITION.wait(timeout=remaining)
+                    continue
+
+        # Re-check after acquiring the lifecycle lock.  This preserves the
+        # idle-check -> process-stop boundary while allowing lease release and
+        # deferred cleanup to make progress during the wait above.
+        with _LLAMA_CPP_ENSURE_LOCK:
+            with _LLAMA_CPP_LEASE_CONDITION:
+                busy, processes = _lease_snapshot()
+                if busy:
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        continue
+                    if defer_on_timeout:
+                        if scoped:
+                            deferred_processes = list(processes)
+                        else:
+                            busy_endpoints = {item[0] for item in busy}
+                            deferred_processes = [
+                                process
+                                for process in list(_openai_compatible_local_processes)
+                                if _normalize_llama_cpp_lease_endpoint(
+                                    str(
+                                        getattr(process, "_aoi_local_base_url", None)
+                                        or getattr(process, "_aoi_llama_cpp_base_url", "")
+                                        or ""
+                                    )
+                                ) in busy_endpoints
+                            ]
+                        _register_deferred_llama_cpp_stops(deferred_processes)
                     endpoint, alias, count = busy[0]
                     raise _LlamaCppGenerationLeaseTimeout(
                         "llama.cppの生成lease待ちがtimeoutしました。"
@@ -671,8 +1627,32 @@ def stop_owned_openai_compatible_local_servers_respecting_generation_leases(
                         f"使用中count={count}。"
                         "実行中の生成は停止せず、切替を中止しました。"
                     )
-                _LLAMA_CPP_LEASE_CONDITION.wait(timeout=remaining)
-        return stop_openai_compatible_local_servers()
+
+            if not scoped:
+                return stop_openai_compatible_local_servers()
+            # The scoped process snapshot was taken while holding the
+            # lifecycle lock, so replacement cannot invalidate it before stop.
+            if not processes:
+                # A scoped stop with no tracked workers is a harmless no-op in
+                # production. Preserve the low-level seam for legacy/test
+                # callers while never broadening a real multi-process stop.
+                if not _openai_compatible_local_processes:
+                    return stop_openai_compatible_local_servers()
+                unannotated = [
+                    process
+                    for process in list(_openai_compatible_local_processes)
+                    if not str(
+                        getattr(process, "_aoi_local_base_url", None)
+                        or getattr(process, "_aoi_llama_cpp_base_url", "")
+                        or ""
+                    ).strip()
+                ]
+                if len(unannotated) == 1 and len(_openai_compatible_local_processes) == 1:
+                    return stop_openai_compatible_local_servers()
+            for proc in processes:
+                _terminate_process_tree(proc)
+                _remove_tracked_process(proc)
+            return len(processes)
 
 
 def _resolve_caddy_binary(project_root: Path) -> str:
@@ -909,6 +1889,7 @@ def _wait_for_llama_cpp_startup_listener(
     *,
     model: str | None = None,
     overrides: dict[str, object] | None = None,
+    cancel_event=None,
 ) -> None:
     """Wait only for a newly launched llama-server listener.
 
@@ -918,6 +1899,7 @@ def _wait_for_llama_cpp_startup_listener(
     responsibility of request-time recovery (or an explicitly strict launch).
     """
 
+    _check_local_startup_cancelled(cancel_event)
     settings = _llama_cpp_settings(
         config,
         model=model,
@@ -951,7 +1933,9 @@ def _wait_for_llama_cpp_startup_listener(
         host,
         port,
         timeout_seconds=_LLAMA_CPP_STARTUP_LISTENER_TIMEOUT_SECONDS,
+        **({"cancel_event": cancel_event} if cancel_event is not None else {}),
     ):
+        _check_local_startup_cancelled(cancel_event)
         return
 
     try:
@@ -979,6 +1963,7 @@ def _wait_for_llama_cpp_readiness(
     *,
     model: str | None = None,
     overrides: dict[str, object] | None = None,
+    cancel_event=None,
 ) -> None:
     settings = _llama_cpp_settings(config, model=model, overrides=overrides, is_windows=_IS_WINDOWS)
     base_url = _llama_cpp_base_url(
@@ -991,6 +1976,7 @@ def _wait_for_llama_cpp_readiness(
     timeout_seconds = float(settings["readiness_timeout"])
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        _check_local_startup_cancelled(cancel_event)
         try:
             if proc.poll() is not None:
                 raise RuntimeError(
@@ -1002,14 +1988,19 @@ def _wait_for_llama_cpp_readiness(
         served_ids = _llama_cpp_model_ids_exact(base_url)
         if not served_ids:
             served_ids = _local_openai_model_ids(base_url)
+        _check_local_startup_cancelled(cancel_event)
         if expected_alias and expected_alias in served_ids:
+            _set_llama_cpp_startup_state(proc, "ready")
             return
         if served_ids and expected_alias not in served_ids:
             raise RuntimeError(
                 "llama-serverは起動しましたが、/v1/modelsのaliasが一致しません。"
                 f"期待={expected_alias!r}, 実際={sorted(served_ids)!r}。"
             )
-        time.sleep(0.25)
+        if cancel_event is not None:
+            cancel_event.wait(0.25)
+        else:
+            time.sleep(0.25)
     raise RuntimeError(
         "llama-serverのreadiness timeoutです。"
         f"{timeout_seconds:g}秒以内に/v1/modelsでalias {expected_alias!r}を確認できませんでした。"
@@ -1076,9 +2067,11 @@ def _ensure_llama_cpp_server(
     model: str | None = None,
     overrides: dict[str, object] | None = None,
     force_restart: bool = False,
+    wait_for_model_ready: bool = True,
     acquire_generation_lease: bool = False,
     lease_holder: object | None = None,
     lease_tickets: list | None = None,
+    cancel_event=None,
 ) -> bool:
     timeout_seconds = _llama_cpp_generation_lease_timeout(
         config,
@@ -1092,6 +2085,7 @@ def _ensure_llama_cpp_server(
         overrides=overrides,
     )
     while True:
+        _check_local_startup_cancelled(cancel_event)
         remaining = max(0.0, deadline - time.monotonic())
         for endpoint in _llama_cpp_endpoints_requiring_lease_drain(
             config,
@@ -1099,9 +2093,12 @@ def _ensure_llama_cpp_server(
             overrides=overrides,
             force_restart=force_restart,
         ):
-            _wait_for_llama_cpp_generation_lease_idle(endpoint, remaining)
+            _wait_for_llama_cpp_generation_lease_idle(
+                endpoint, remaining,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
+            )
             remaining = max(0.0, deadline - time.monotonic())
-        with _LLAMA_CPP_ENSURE_LOCK:
+        with _llama_cpp_startup_lock(cancel_event):
             drain_endpoints = _llama_cpp_endpoints_requiring_lease_drain(
                 config,
                 model=model,
@@ -1123,6 +2120,8 @@ def _ensure_llama_cpp_server(
                     model=model,
                     overrides=overrides,
                     force_restart=force_restart,
+                    wait_for_model_ready=wait_for_model_ready or acquire_generation_lease,
+                    **({"cancel_event": cancel_event} if cancel_event is not None else {}),
                 )
             except _LlamaCppGenerationLeaseBusy:
                 if time.monotonic() >= deadline:
@@ -1153,11 +2152,14 @@ def _ensure_llama_cpp_server_unlocked(
     model: str | None = None,
     overrides: dict[str, object] | None = None,
     force_restart: bool = False,
+    wait_for_model_ready: bool = True,
+    cancel_event=None,
 ) -> bool:
     project_root = Path(__file__).resolve().parents[2]
     proc = None
     started_here = False
     try:
+        _check_local_startup_cancelled(cancel_event)
         _validate_llama_cpp_model_alias(
             config,
             model=model,
@@ -1212,14 +2214,15 @@ def _ensure_llama_cpp_server_unlocked(
             # the alias; startup callers intentionally do not.
             proc = _owned_llama_cpp_process_at(_base_url, expected_alias)
             if proc is not None:
-                if raise_on_launch_error:
+                if raise_on_launch_error and wait_for_model_ready:
                     _wait_for_llama_cpp_readiness(
                         proc,
                         config,
                         model=model,
                         overrides=overrides,
+                        **({"cancel_event": cancel_event} if cancel_event is not None else {}),
                     )
-                    setattr(proc, "_aoi_local_readiness_state", "ready")
+                    _set_llama_cpp_startup_state(proc, "ready")
                     logger.info("llama-serverの起動とalias確認が完了しました")
                 else:
                     logger.warning(
@@ -1245,22 +2248,25 @@ def _ensure_llama_cpp_server_unlocked(
                 # ``force_restart`` also covers a changed port: the old
                 # tracked process must not survive the settings switch.
                 _stop_owned_openai_compatible_local_servers_if_unleased(_base_url)
+        _check_local_startup_cancelled(cancel_event)
         proc = _start_llama_cpp_server(
             project_root,
             config=config,
             model=model,
             overrides=overrides,
             is_windows=_IS_WINDOWS,
+            **({"watch_readiness": True} if not wait_for_model_ready else {}),
         )
         started_here = True
-        if raise_on_launch_error:
+        if raise_on_launch_error and wait_for_model_ready:
             _wait_for_llama_cpp_readiness(
                 proc,
                 config,
                 model=model,
                 overrides=overrides,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             )
-            setattr(proc, "_aoi_local_readiness_state", "ready")
+            _set_llama_cpp_startup_state(proc, "ready")
             logger.info("llama-serverの起動とalias確認が完了しました")
         else:
             _wait_for_llama_cpp_startup_listener(
@@ -1268,6 +2274,7 @@ def _ensure_llama_cpp_server_unlocked(
                 config,
                 model=model,
                 overrides=overrides,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             )
             # This is deliberately a single non-blocking observation.  It can
             # improve diagnostics when a very fast load has already exposed
@@ -1277,7 +2284,7 @@ def _ensure_llama_cpp_server_unlocked(
                 observed_ids = _llama_cpp_model_ids_exact(_base_url)
             except Exception:
                 observed_ids = set()
-            setattr(proc, "_aoi_local_readiness_state", "loading")
+            _set_llama_cpp_startup_state(proc, "loading")
             logger.warning(
                 "llama-server listener起動済み。modelをloading中のため"
                 " AoiTalkはdegraded状態で起動を継続します: alias=%r, endpoint=%s,"
@@ -1356,6 +2363,266 @@ def _validate_freetoken_manual_connection(
         "FreeToken manual接続先が起動していません。"
         f" endpoint={resolved_base_url}"
     )
+
+
+def _owned_loading_local_process_at(
+    base_url: str, *, runtime: str, model_alias: str,
+) -> object | None:
+    """Reuse only a live, exact-target loader started by this process."""
+    endpoint = normalize_openai_compatible_base_url(base_url)
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            continue
+        if (
+            getattr(proc, "_aoi_local_runtime", "") == runtime
+            and getattr(proc, "_aoi_local_model_alias", "") == model_alias
+            and getattr(proc, "_aoi_local_readiness_state", "") == "loading"
+            and normalize_openai_compatible_base_url(
+                str(getattr(proc, "_aoi_local_base_url", "") or "")
+            ) == endpoint
+        ):
+            return proc
+    return None
+
+
+def _observe_local_provider_startup(
+    proc: object, *, runtime: str, base_url: str,
+) -> None:
+    """Bound startup observation; a live pre-listener loader remains owned.
+
+    Strata constructs its engine before binding HTTP. A listener timeout alone
+    therefore cannot distinguish a failed launch from ordinary model loading.
+    Strict request-time readiness still verifies health and the exact model.
+    """
+    host, port = _base_url_host_port(base_url)
+    listener_ready = _wait_for_process_port(
+        proc, host, port,
+        timeout_seconds=_LOCAL_PROVIDER_STARTUP_LISTENER_TIMEOUT_SECONDS,
+    )
+    if proc.poll() is not None:
+        raise RuntimeError(
+            f"{runtime}が起動中に終了しました。"
+            f"{host}:{port}; logs/models/{runtime}.logを確認してください。"
+        )
+    setattr(proc, "_aoi_local_readiness_state", "loading")
+    logger.warning(
+        "%s modelをloading中のためAoiTalkはdegraded状態で起動を継続します:"
+        " endpoint=%s, listener_ready=%s",
+        runtime, base_url, listener_ready,
+    )
+
+
+def _wait_for_strata_model_readiness(
+    proc: object,
+    config: object | None,
+    *,
+    model: str,
+    deadline: float,
+    budget,
+    require_loaded: bool = False,
+    force_restart: bool = False,
+) -> None:
+    while True:
+        readiness = strata_readiness(
+            config,
+            model=model,
+            owned_process=proc,
+        )
+        strict_loaded = bool(
+            require_loaded
+            or (force_restart and readiness.get("process_ready") is True)
+        )
+        if readiness["ready"] or (
+            not strict_loaded and readiness.get("accepting_requests") is True
+        ) or (
+            not strict_loaded and readiness.get("process_ready") is True
+        ):
+            # Lazy wrappers load weights on the first inference. Accept their
+            # verified health/model contract without claiming weights are ready.
+            state = "ready" if readiness["ready"] else "loading"
+            setattr(proc, "_aoi_local_readiness_state", state)
+            return
+        if budget is not None:
+            budget.checkpoint()
+        if proc.poll() is not None:
+            raise RuntimeError("Strataが起動中に終了しました。logs/models/strata.logを確認してください")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Strataのhealth/model readinessがtimeoutしました")
+        time.sleep(0.5)
+
+
+def _strata_load_boundary(proc: object) -> None:
+    path_value = getattr(proc, "_aoi_local_startup_log_path", None)
+    try:
+        offset = Path(str(path_value)).stat().st_size if path_value else 0
+    except (OSError, TypeError, ValueError):
+        offset = 0
+    proc._aoi_local_startup_log_offset = offset
+    proc._aoi_local_startup_started_at = time.monotonic()
+    proc._aoi_local_readiness_state = "loading"
+
+
+def _strata_post_load(
+    config: object | None,
+    endpoint: str,
+    *,
+    deadline: float,
+) -> None:
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    key = strata_api_key(config)
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = Request(
+        f"{base}/load",
+        data=b"{}",
+        headers=headers,
+        method="POST",
+    )
+    timeout = deadline - time.monotonic()
+    if timeout <= 0:
+        raise TimeoutError("Strata model load deadline expired before POST /load")
+    with urlopen(request, timeout=timeout) as response:
+        response.read(64 * 1024)
+
+
+def _strata_start_or_join_loader(
+    proc: object,
+    config: object | None,
+    endpoint: str,
+    model: str,
+    *,
+    deadline: float,
+) -> tuple[threading.Event, dict[str, BaseException]]:
+    with _STRATA_LOAD_LOCK:
+        event = getattr(proc, "_aoi_strata_load_event", None)
+        result = getattr(proc, "_aoi_strata_load_result", None)
+        if isinstance(event, threading.Event) and isinstance(result, dict):
+            return event, result
+        _strata_load_boundary(proc)
+        event = threading.Event()
+        result = {}
+        proc._aoi_strata_load_event = event
+        proc._aoi_strata_load_result = result
+
+        try:
+            load_ticket = _acquire_llama_cpp_generation_lease(
+                endpoint,
+                model,
+                holder=proc,
+            )
+        except BaseException as exc:
+            # Keep the failed loader event attached to this process. A later
+            # generation joins the same failure until an explicit restart or
+            # reload boundary clears it; it must not create a second POST.
+            result["error"] = exc
+            event.set()
+            return event, result
+        proc._aoi_strata_load_lease_ticket = load_ticket
+
+        def run() -> None:
+            try:
+                _strata_post_load(config, endpoint, deadline=deadline)
+            except BaseException as exc:  # preserve loader failure for caller
+                result["error"] = exc
+            finally:
+                load_ticket.release()
+                proc._aoi_strata_load_lease_ticket = None
+                event.set()
+
+        thread = threading.Thread(
+            target=run,
+            daemon=True,
+            name="aoi-strata-load",
+        )
+        proc._aoi_strata_load_thread = thread
+        try:
+            thread.start()
+        except BaseException as exc:
+            result["error"] = exc
+            load_ticket.release()
+            proc._aoi_strata_load_lease_ticket = None
+            proc._aoi_strata_load_thread = None
+            event.set()
+        return event, result
+
+
+def _wait_for_strata_loader(
+    event: threading.Event,
+    result: dict[str, BaseException],
+    *,
+    deadline: float,
+    budget,
+) -> None:
+    while not event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Strata model load timed out")
+        event.wait(min(0.5, remaining))
+        if event.is_set():
+            break
+        if budget is not None:
+            budget.checkpoint()
+    error = result.get("error")
+    if error is not None:
+        raise error
+
+
+def _ensure_strata_model_ready_for_generation(
+    config: object | None,
+    *,
+    model: str,
+    deadline: float,
+    budget,
+) -> None:
+    settings = strata_settings(config, model=model)
+    endpoint = strata_base_url(config, model=model)
+    readiness = strata_readiness(config, model=model)
+    if readiness.get("ready") is True:
+        return
+    proc = _owned_strata_process_at(endpoint)
+    if proc is None:
+        raise RuntimeError("Strataのowned loading processが見つかりません")
+    prepared_config: dict[str, object] = {}
+    try:
+        prepared_value = json.loads(
+            Path(str(settings["config_path"])).read_text(encoding="utf-8-sig")
+        )
+        if isinstance(prepared_value, dict):
+            prepared_config = prepared_value
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    if (
+        not strata_vision_enabled(settings, prepared_config)
+        and getattr(proc, "_aoi_local_startup_log_path", None)
+    ):
+        if getattr(proc, "_aoi_local_readiness_state", "") == "ready":
+            with _STRATA_LOAD_LOCK:
+                proc._aoi_strata_load_event = None
+                proc._aoi_strata_load_result = None
+        event, result = _strata_start_or_join_loader(
+            proc,
+            config,
+            endpoint,
+            model,
+            deadline=deadline,
+        )
+        _wait_for_strata_loader(event, result, deadline=deadline, budget=budget)
+    _wait_for_strata_model_readiness(
+        proc,
+        config,
+        model=model,
+        deadline=deadline,
+        budget=budget,
+        require_loaded=True,
+    )
+    proc._aoi_local_readiness_state = "ready"
+    proc._aoi_strata_load_completed = True
 
 
 def _ensure_freetoken_server(
@@ -1439,11 +2706,30 @@ def _ensure_freetoken_server(
                     is_windows=_IS_WINDOWS,
                 )
                 alias = str(settings.get("model_alias") or "").strip()
+                wait_for_model = (
+                    raise_on_launch_error or force_restart or acquire_generation_lease
+                )
+                loading_proc = None if force_restart else _owned_loading_local_process_at(
+                    base_url, runtime="freetoken", model_alias=alias,
+                )
 
                 if not force_restart and _freetoken_readiness_ready(
                     base_url,
                     alias,
                 ):
+                    if loading_proc is not None:
+                        setattr(loading_proc, "_aoi_local_readiness_state", "ready")
+                    started = False
+                elif loading_proc is not None:
+                    if wait_for_model:
+                        _wait_for_freetoken_readiness(
+                            loading_proc, config, model=selected_model,
+                            is_windows=_IS_WINDOWS,
+                        )
+                        setattr(loading_proc, "_aoi_local_readiness_state", "ready")
+                    # A second caller must not terminate a healthy owned loader
+                    # just because its model is not ready yet. Failure of this
+                    # caller's strict wait likewise leaves that loader owned.
                     started = False
                 else:
                     host, port = _base_url_host_port(base_url)
@@ -1454,11 +2740,35 @@ def _ensure_freetoken_server(
                     )
 
                     if force_restart and _openai_compatible_local_processes:
-                        stop_openai_compatible_local_servers()
+                        # Restart only the owned FreeToken target.  A global
+                        # stop here could kill another local runtime (or a
+                        # session/agent consumer) on a different endpoint.
+                        stop_owned_openai_compatible_local_servers_respecting_generation_leases(
+                            runtime="freetoken",
+                            model=alias,
+                            endpoint=base_url,
+                            timeout_seconds=_llama_cpp_generation_lease_timeout(
+                                config,
+                                model=selected_model,
+                            ),
+                        )
                     elif port_open and not owned_target:
                         raise RuntimeError(
                             "FreeTokenの対象portは外部プロセスが使用中です。"
                             f"{host}:{port} は停止しません。"
+                        )
+                    elif not port_open and any(
+                        getattr(candidate, "_aoi_local_readiness_state", "") == "loading"
+                        for candidate in _owned_processes_for_scope(
+                            endpoint=base_url,
+                        )
+                    ):
+                        # A different alias can be loading before it binds.
+                        # Do not spawn a second server onto its future port or
+                        # stop that owned loader without an explicit restart.
+                        raise RuntimeError(
+                            "FreeTokenの対象endpointでは別モデルが起動中です。"
+                            "起動完了を待つか、明示的に再起動してください。"
                         )
                     elif port_open and owned_target:
                         _stop_owned_openai_compatible_local_servers_if_unleased(
@@ -1472,15 +2782,19 @@ def _ensure_freetoken_server(
                         model=selected_model,
                         is_windows=_IS_WINDOWS,
                     )
-                    _wait_for_freetoken_readiness(
-                        proc,
-                        config,
-                        model=selected_model,
-                        is_windows=_IS_WINDOWS,
-                    )
-                    logger.info(
-                        "FreeTokenの起動とhealth/model確認が完了しました"
-                    )
+                    if wait_for_model:
+                        _wait_for_freetoken_readiness(
+                            proc,
+                            config,
+                            model=selected_model,
+                            is_windows=_IS_WINDOWS,
+                        )
+                        setattr(proc, "_aoi_local_readiness_state", "ready")
+                        logger.info("FreeTokenの起動とhealth/model確認が完了しました")
+                    else:
+                        _observe_local_provider_startup(
+                            proc, runtime="freetoken", base_url=base_url,
+                        )
                     started = True
 
                 if acquire_generation_lease and identity is not None:
@@ -1504,6 +2818,366 @@ def _ensure_freetoken_server(
                 return False
 
 
+def _owned_strata_process_at(base_url: str):
+    """Return the live tracked Strata process, not the legacy boolean probe."""
+    normalized = normalize_openai_compatible_base_url(base_url)
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            continue
+        if getattr(proc, "_aoi_local_runtime", "") != "strata":
+            continue
+        recorded = str(getattr(proc, "_aoi_local_base_url", "") or "")
+        if recorded and normalize_openai_compatible_base_url(recorded) == normalized:
+            return proc
+    return None
+
+
+def _owned_strata_processes_for_model(model: str) -> list:
+    """Return live AoiTalk-owned Strata processes for one model.
+
+    A model may briefly have an old port and a replacement port during a
+    configuration refresh.  Filter by the runtime marker and served model so
+    another managed runtime on a different endpoint is never stopped.
+    """
+
+    selected = str(model or "").strip()
+    processes = []
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            continue
+        if getattr(proc, "_aoi_local_runtime", "") != "strata":
+            continue
+        if str(getattr(proc, "_aoi_local_model_alias", "") or "") != selected:
+            continue
+        processes.append(proc)
+    return processes
+
+
+def stop_strata_server(config: object | None, *, model: str) -> bool:
+    settings = strata_settings(config, model=model)
+    if not settings["auto_start"]:
+        return False
+    endpoint = strata_base_url(config, model=model)
+    with _LLAMA_CPP_ENSURE_LOCK:
+        if _peek_llama_cpp_lifecycle_lease(endpoint)[1]:
+            raise RuntimeError("Strataが応答生成中です。生成終了後に停止してください")
+        proc = _owned_strata_process_at(endpoint)
+        if proc is None or getattr(proc, "_aoi_local_model_alias", "") != model:
+            return False
+        _terminate_process_tree(proc)
+        _remove_tracked_process(proc)
+        return True
+
+
+def validate_strata_setup_safety(config: object | None, *, model: str) -> None:
+    """Reject setup while the same-model Strata runtime is serving or leased."""
+
+    endpoints = {strata_base_url(config, model=model)}
+    with _LLAMA_CPP_ENSURE_LOCK:
+        for proc in _owned_strata_processes_for_model(model):
+            endpoint = str(getattr(proc, "_aoi_local_base_url", "") or "")
+            if endpoint:
+                endpoints.add(endpoint)
+        for endpoint in endpoints:
+            alias, count = _peek_llama_cpp_lifecycle_lease(endpoint)
+            if count > 0:
+                raise RuntimeError(
+                    "Strata setupは応答生成中には実行できません。"
+                    f"使用中alias={alias!r}, count={count}"
+                )
+        owned = _owned_strata_processes_for_model(model)
+        if owned:
+            raise RuntimeError(
+                "Strata runtimeが稼働中です。停止してからsetupを再実行してください"
+            )
+        host, port = _base_url_host_port(strata_base_url(config, model=model))
+        if _is_port_open(host, port, timeout_seconds=0.2):
+            raise RuntimeError(
+                "Strataの対象portを外部プロセスが使用中です。"
+                "稼働中のendpointを停止せずsetupを中止しました"
+            )
+
+
+def _strata_endpoints_requiring_lease_drain(
+    config: object | None,
+    *,
+    model: str,
+    force_restart: bool,
+) -> list[str]:
+    """Return only same-model Strata endpoints whose leases must drain."""
+
+    candidates = {strata_base_url(config, model=model)}
+    if force_restart:
+        candidates.update(
+            str(getattr(proc, "_aoi_local_base_url", "") or "")
+            for proc in _owned_strata_processes_for_model(model)
+        )
+    return [
+        endpoint
+        for endpoint in candidates
+        if endpoint and _peek_llama_cpp_lifecycle_lease(endpoint)[1] > 0
+    ]
+
+
+def _ensure_strata_server(
+    config: object | None,
+    *,
+    model: str,
+    raise_on_launch_error: bool = False,
+    force_restart: bool = False,
+    acquire_generation_lease: bool = False,
+    lease_holder: object | None = None,
+    lease_tickets: list | None = None,
+    wait_for_model_ready: bool = True,
+    deadline: float | None = None,
+) -> bool:
+    from src.llm.generation_budget import current_generation_budget
+
+    budget = current_generation_budget.get()
+    settings = strata_settings(config, model=model)
+    if not settings["auto_start"]:
+        return False
+    prepared_config: dict[str, object] = {}
+    try:
+        prepared_value = json.loads(
+            Path(str(settings["config_path"])).read_text(encoding="utf-8-sig")
+        )
+        if isinstance(prepared_value, dict):
+            prepared_config = prepared_value
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    vision_enabled = strata_vision_enabled(settings, prepared_config)
+    endpoint = strata_base_url(config, model=model)
+    if deadline is None:
+        timeout = float(settings["readiness_timeout"])
+        if budget is not None:
+            remaining = budget.checkpoint()
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+        deadline = time.monotonic() + timeout
+    while True:
+        if budget is not None:
+            budget.checkpoint()
+        # A generation lease protects a process from replacement; it is not
+        # an exclusive inference lock. Reusing the same healthy wrapper must
+        # not wait for an earlier request (including lazy first inference).
+        # Keep probe + ticket acquisition under the lifecycle lock, so a
+        # concurrent stop/restart cannot slip between these operations.
+        if not force_restart:
+            with _LLAMA_CPP_ENSURE_LOCK:
+                active_alias, active_count = _peek_llama_cpp_lifecycle_lease(endpoint)
+                if active_count > 0 and active_alias == model:
+                    loading = _owned_loading_local_process_at(
+                        endpoint, runtime="strata", model_alias=model,
+                    )
+                    readiness = strata_readiness(
+                        config,
+                        model=model,
+                        owned_process=loading,
+                    )
+                    if (
+                        readiness["ready"]
+                        or readiness.get("accepting_requests") is True
+                        or (
+                            not wait_for_model_ready
+                            and readiness.get("process_ready") is True
+                        )
+                    ):
+                        if readiness["ready"] and loading is not None:
+                            setattr(loading, "_aoi_local_readiness_state", "ready")
+                        if budget is not None:
+                            budget.checkpoint()
+                        if acquire_generation_lease:
+                            ticket = _acquire_llama_cpp_generation_lease(
+                                endpoint, model, holder=lease_holder,
+                            )
+                            if lease_tickets is not None:
+                                lease_tickets.append(ticket)
+                        return False
+        remaining = max(0.0, deadline - time.monotonic())
+        for busy in _strata_endpoints_requiring_lease_drain(config, model=model, force_restart=force_restart):
+            _wait_for_llama_cpp_generation_lease_idle(busy, remaining)
+        with _LLAMA_CPP_ENSURE_LOCK:
+            if _strata_endpoints_requiring_lease_drain(config, model=model, force_restart=force_restart):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Strataの起動待ち中にgeneration leaseが解放されませんでした")
+                continue
+            proc = None
+            try:
+                loading_proc = (
+                    _owned_strata_process_at(endpoint)
+                    if force_restart
+                    else _owned_loading_local_process_at(
+                        endpoint, runtime="strata", model_alias=model,
+                    )
+                )
+                readiness = strata_readiness(
+                    config,
+                    model=model,
+                    owned_process=loading_proc,
+                )
+                available = (
+                    readiness["ready"]
+                    or readiness.get("accepting_requests") is True
+                    or (
+                        not wait_for_model_ready
+                        and readiness.get("process_ready") is True
+                    )
+                )
+                started = False
+                wait_for_model = (
+                    wait_for_model_ready
+                    and (raise_on_launch_error or force_restart or acquire_generation_lease)
+                )
+                if (
+                    force_restart
+                    and loading_proc is not None
+                    and readiness.get("process_ready") is True
+                    and readiness["ready"] is False
+                ):
+                    # A fresh lazy process is only process-ready: do not stop
+                    # it for a force restart until its strict loaded-model
+                    # readiness is proven. A timeout leaves this old owner
+                    # untouched and rolls back only a process started here.
+                    _wait_for_strata_model_readiness(
+                        loading_proc,
+                        config,
+                        model=model,
+                        deadline=deadline,
+                        budget=budget,
+                        require_loaded=True,
+                    )
+                    readiness = strata_readiness(
+                        config,
+                        model=model,
+                        owned_process=loading_proc,
+                    )
+                    available = readiness["ready"] or readiness.get(
+                        "accepting_requests"
+                    ) is True
+                if readiness["ready"] and loading_proc is not None:
+                    setattr(loading_proc, "_aoi_local_readiness_state", "ready")
+                if not available and loading_proc is not None:
+                    _wait_for_strata_model_readiness(
+                        loading_proc,
+                        config,
+                        model=model,
+                        deadline=deadline,
+                        budget=budget,
+                        require_loaded=vision_enabled and wait_for_model,
+                        force_restart=force_restart,
+                    )
+                    # Reuse the exact process while weights load. Do not assign
+                    # it to proc: rollback belongs only to this call's launch.
+                    available = True
+                if force_restart or not available:
+                    host, port = _base_url_host_port(endpoint)
+                    owned = _owned_strata_process_at(endpoint)
+                    stale_owned = (
+                        [proc for proc in _owned_strata_processes_for_model(model) if proc is not owned]
+                        if force_restart
+                        else []
+                    )
+                    if _is_port_open(host, port, timeout_seconds=0.5) and not owned:
+                        raise RuntimeError("Strataのportを外部プロセスが使用中です。停止しません")
+                    if owned is None and any(
+                        getattr(candidate, "_aoi_local_readiness_state", "") == "loading"
+                        for candidate in _owned_processes_for_scope(endpoint=endpoint)
+                    ):
+                        raise RuntimeError(
+                            "Strataの対象endpointでは別runtimeが起動中です。停止しません"
+                        )
+                    if budget is not None:
+                        budget.checkpoint()
+                    args, cwd = strata_launch_plan(config, model=model)
+                    if owned is not None:
+                        # Only this endpoint was drained. Never stop an owned
+                        # llama.cpp/FreeToken process on a different port.
+                        if _peek_llama_cpp_lifecycle_lease(endpoint)[1]:
+                            raise RuntimeError("Strataの対象endpointは応答生成中です")
+                        _terminate_process_tree(owned)
+                        _remove_tracked_process(owned)
+                    startup_log_path = Path(__file__).resolve().parents[2] / "logs/models/strata.log"
+                    try:
+                        startup_log_offset = startup_log_path.stat().st_size
+                    except OSError:
+                        startup_log_offset = 0
+                    proc = _start_logged_openai_compatible_process(
+                        args, cwd=cwd,
+                        log_path=startup_log_path,
+                        # Strata is a long-lived lazy runtime: it can outlive
+                        # this backend across a restart.  A parent-owned
+                        # stdout PIPE would then close under the wrapper while
+                        # its first lazy-load progress line is printed, which
+                        # disconnects the generation request before native
+                        # startup.  Keep its output on the stable log file;
+                        # other runtimes retain their existing console policy.
+                        mirror_to_parent_console=False,
+                        create_new_console_on_windows=False,
+                    )
+                    try:
+                        startup_log_offset = min(
+                            startup_log_offset,
+                            startup_log_path.stat().st_size,
+                        )
+                    except OSError:
+                        pass
+                    proc._aoi_local_runtime = "strata"
+                    proc._aoi_local_base_url = endpoint
+                    proc._aoi_local_model_alias = model
+                    proc._aoi_local_startup_log_path = str(startup_log_path)
+                    proc._aoi_local_startup_log_offset = startup_log_offset
+                    proc._aoi_local_startup_started_at = time.monotonic()
+                    proc._aoi_local_readiness_state = "loading"
+                    if wait_for_model or raise_on_launch_error or force_restart or acquire_generation_lease:
+                        _wait_for_strata_model_readiness(
+                            proc,
+                            config,
+                            model=model,
+                            deadline=deadline,
+                            budget=budget,
+                            require_loaded=vision_enabled and wait_for_model,
+                            force_restart=force_restart,
+                        )
+                    else:
+                        _observe_local_provider_startup(
+                            proc, runtime="strata", base_url=endpoint,
+                        )
+                    # A port change can leave the previous AoiTalk-owned Strata
+                    # listener alive.  Stop only same-model Strata processes,
+                    # after the replacement is ready; unrelated llama.cpp or
+                    # FreeToken processes on other ports remain untouched.
+                    for stale in stale_owned:
+                        if _peek_llama_cpp_lifecycle_lease(
+                            str(getattr(stale, "_aoi_local_base_url", ""))
+                        )[1]:
+                            raise RuntimeError("旧Strata endpointは応答生成中です")
+                        _terminate_process_tree(stale)
+                        _remove_tracked_process(stale)
+                    started = True
+                if budget is not None:
+                    budget.checkpoint()
+                if acquire_generation_lease:
+                    ticket = _acquire_llama_cpp_generation_lease(endpoint, model, holder=lease_holder)
+                    if lease_tickets is not None:
+                        lease_tickets.append(ticket)
+                return started
+            except Exception as exc:
+                if proc is not None:
+                    _terminate_process_tree(proc)
+                    _remove_tracked_process(proc)
+                if raise_on_launch_error:
+                    raise
+                logger.warning("Strataの起動を延期します: %s", exc)
+                return False
+
+
 def validate_openai_compatible_local_launch_selection(
     config: object | None,
     *,
@@ -1524,6 +3198,12 @@ def validate_openai_compatible_local_launch_selection(
         config,
         selected_model_id,
     )
+
+    if managed_runtime == "strata":
+        settings = strata_settings(config, model=selected_model_id)
+        if settings["auto_start"]:
+            strata_launch_plan(config, model=selected_model_id)
+        return
 
     if managed_runtime == "freetoken":
         resolved = resolve_freetoken_runtime(
@@ -1662,10 +3342,12 @@ def ensure_openai_compatible_local_server(
     *,
     raise_on_launch_error: bool = False,
     force_restart: bool = False,
+    wait_for_model_ready: bool = True,
     model: str | None = None,
     acquire_generation_lease: bool = False,
     lease_holder: object | None = None,
     lease_tickets: list | None = None,
+    cancel_event=None,
 ) -> bool:
     """Start the selected bundled local OpenAI-compatible server if needed.
 
@@ -1700,6 +3382,51 @@ def ensure_openai_compatible_local_server(
         config,
         selected_model,
     )
+    if managed_runtime == "strata":
+        from src.llm.generation_budget import current_generation_budget
+
+        settings = strata_settings(config, model=selected_model)
+        budget = current_generation_budget.get()
+        timeout = float(settings["readiness_timeout"])
+        if budget is not None:
+            remaining = budget.checkpoint()
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+        deadline = time.monotonic() + timeout
+        tracked_tickets = lease_tickets if lease_tickets is not None else []
+        ticket_start = len(tracked_tickets)
+        try:
+            started = _ensure_strata_server(
+                config,
+                model=selected_model,
+                raise_on_launch_error=raise_on_launch_error,
+                force_restart=force_restart,
+                acquire_generation_lease=acquire_generation_lease,
+                lease_holder=lease_holder,
+                lease_tickets=tracked_tickets,
+                wait_for_model_ready=wait_for_model_ready,
+                deadline=deadline,
+            )
+            if acquire_generation_lease:
+                _ensure_strata_model_ready_for_generation(
+                    config,
+                    model=selected_model,
+                    deadline=deadline,
+                    budget=budget,
+                )
+        except Exception:
+            while len(tracked_tickets) > ticket_start:
+                tracked_tickets.pop().release()
+            if raise_on_launch_error or force_restart:
+                raise
+            if acquire_generation_lease:
+                logger.warning("Strata model load did not reach readiness", exc_info=True)
+                return False
+            raise
+        if lease_tickets is None:
+            while len(tracked_tickets) > ticket_start:
+                tracked_tickets.pop().release()
+        return started
 
     if managed_runtime == "freetoken":
         return _ensure_freetoken_server(
@@ -1753,9 +3480,11 @@ def ensure_openai_compatible_local_server(
             model=model,
             raise_on_launch_error=raise_on_launch_error,
             force_restart=force_restart,
+            wait_for_model_ready=wait_for_model_ready,
             acquire_generation_lease=acquire_generation_lease,
             lease_holder=lease_holder,
             lease_tickets=lease_tickets,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
         )
 
     return False
@@ -1819,6 +3548,338 @@ def _service_port(
     except (TypeError, ValueError):
         port = default
     return port if 1 <= port <= 65535 else default
+
+
+def _listening_tcp_ports_by_pid() -> dict[int, set[int]]:
+    """Return a best-effort snapshot of TCP listeners grouped by process ID."""
+    try:
+        connections = psutil.net_connections(kind="tcp")
+    except (psutil.Error, OSError):
+        return {}
+
+    listeners: dict[int, set[int]] = {}
+    for connection in connections:
+        if connection.status != psutil.CONN_LISTEN or connection.pid is None:
+            continue
+        local_address = connection.laddr
+        port = getattr(local_address, "port", None)
+        if port is None:
+            try:
+                port = local_address[1]
+            except (IndexError, TypeError):
+                continue
+        try:
+            normalized_pid = int(connection.pid)
+            normalized_port = int(port)
+        except (TypeError, ValueError):
+            continue
+        if normalized_pid <= 0 or not 1 <= normalized_port <= 65535:
+            continue
+        listeners.setdefault(normalized_pid, set()).add(normalized_port)
+    return listeners
+
+
+def _looks_like_aoitalk_main_process(process: psutil.Process) -> bool:
+    """Return whether a process is an AoiTalk ``main.py`` runtime owner."""
+    try:
+        command_line = process.cmdline()
+        working_directory = Path(process.cwd())
+    except (psutil.Error, OSError):
+        return False
+
+    has_main_entrypoint = any(
+        Path(str(argument).strip('"')).name.casefold() == "main.py"
+        for argument in command_line
+    )
+    if not has_main_entrypoint:
+        return False
+    return (
+        working_directory / "src" / "service_manager" / "__init__.py"
+    ).is_file()
+
+
+def _aoitalk_main_owner_pid(listener_pid: int) -> int | None:
+    """Find the nearest AoiTalk runtime ancestor that owns a listener."""
+    try:
+        listener = psutil.Process(listener_pid)
+        candidates = [listener, *listener.parents()]
+    except psutil.Error:
+        return None
+
+    for candidate in candidates:
+        if _looks_like_aoitalk_main_process(candidate):
+            return candidate.pid
+    return None
+
+
+class AoiTalkAlreadyRunning(RuntimeError):
+    """Signal that a healthy same-repository AoiTalk instance already owns startup."""
+
+    def __init__(self, operator_url: str) -> None:
+        self.operator_url = str(operator_url)
+        super().__init__(f"AoiTalk はすでに起動しています: {self.operator_url}")
+
+
+def _registered_aoi_talk_deployment_root(project_root: Path) -> Path | None:
+    """Read only the two public path bindings for this repo's Portal release."""
+
+    root = project_root.resolve()
+    registration = root.parent / "85_CaddyGateway" / "config" / "private" / "runtime.env"
+    allowed_keys = {"GATEWAY_AOITALK_ROOT", "GATEWAY_AOITALK_WORKING_DIRECTORY"}
+    bindings: dict[str, str] = {}
+    try:
+        with registration.open(encoding="utf-8-sig") as stream:
+            for line in stream:
+                key, separator, value = line.strip().partition("=")
+                key = key.strip().upper()
+                if not separator or key not in allowed_keys:
+                    continue
+                if key in bindings:
+                    return None
+                value = value.strip()
+                if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+                    value = value[1:-1]
+                bindings[key] = value
+        if set(bindings) != allowed_keys:
+            return None
+        configured_root = Path(bindings["GATEWAY_AOITALK_ROOT"])
+        configured_cwd = Path(bindings["GATEWAY_AOITALK_WORKING_DIRECTORY"])
+        if not configured_root.is_absolute() or not configured_cwd.is_absolute():
+            return None
+        if Path(os.path.abspath(configured_cwd)) != root:
+            return None
+        deployment = Path(os.path.abspath(configured_root))
+        release_base = root / "artifacts" / "releases"
+        relative = deployment.relative_to(release_base)
+        if not relative.parts:
+            return None
+        # Never turn an arbitrary checkout, symlink, or junction into this
+        # repository merely because it exposes a health endpoint.
+        current = root
+        for component in (deployment / "main.py").relative_to(root).parts:
+            current /= component
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                return None
+            if current != deployment / "main.py" and not stat.S_ISDIR(info.st_mode):
+                return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return deployment
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return None
+
+
+def _strict_aoitalk_main_identity(
+    listener_pid: int,
+    project_root: Path,
+) -> tuple[int, float] | None:
+    """Return a stable identity for this repo or its registered Portal release.
+
+    Port ownership is not enough to adopt a process: another checkout, an
+    unrelated service, or a recycled PID must remain protected. Require the
+    listener's AoiTalk ancestor to run this checkout's main script, or the
+    exact registered Portal deployment script from its registered root.
+    """
+
+    owner_pid = _aoitalk_main_owner_pid(listener_pid)
+    if owner_pid is None:
+        return None
+    root = project_root.resolve()
+    expected_script_working_directories = {
+        (root / "main.py").resolve(): {root},
+    }
+    deployment_root = _registered_aoi_talk_deployment_root(root)
+    if deployment_root is not None:
+        deployment_root = deployment_root.resolve()
+        expected_script_working_directories[deployment_root / "main.py"] = {
+            root,
+            deployment_root,
+        }
+    try:
+        process = psutil.Process(owner_pid)
+        if int(process.pid) != int(owner_pid) or not process.is_running():
+            return None
+        if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+            return None
+        created_at = float(process.create_time())
+        if not math.isfinite(created_at) or created_at <= 0:
+            return None
+        working_directory = Path(process.cwd()).resolve()
+        if not any(
+            working_directory in allowed_directories
+            for allowed_directories in expected_script_working_directories.values()
+        ):
+            return None
+        command_line = process.cmdline()
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
+
+    for raw_argument in command_line:
+        argument = str(raw_argument).strip().strip('"')
+        if not argument or argument.startswith("-"):
+            continue
+        candidate = Path(argument)
+        if not candidate.is_absolute():
+            candidate = working_directory / candidate
+        try:
+            expected_working_directories = expected_script_working_directories.get(
+                candidate.resolve(),
+            )
+            if expected_working_directories and working_directory in expected_working_directories:
+                return int(owner_pid), created_at
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def _probe_loopback_http_status(port: int, path: str) -> bool:
+    """Probe one loopback endpoint without reading or logging its response body."""
+    connection: HTTPConnection | None = None
+    try:
+        connection = HTTPConnection("127.0.0.1", int(port), timeout=0.75)
+        connection.request("GET", path, headers={"Connection": "close"})
+        return int(connection.getresponse().status) == 200
+    except Exception:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _frontend_readiness_path() -> str:
+    """Return the canonical unauthenticated Next route for this base path."""
+
+    configured = os.getenv("AOITALK_PUBLIC_BASE_PATH", "").strip()
+    if not configured:
+        configured = os.getenv("NEXT_PUBLIC_BASE_PATH", "").strip()
+    base_path = normalize_public_base_path(configured)
+    return f"{base_path}/login" if base_path else "/login"
+
+
+def _startup_listener_pids(
+    listeners_by_pid: dict[int, set[int]],
+    port: int,
+) -> list[int]:
+    return sorted(pid for pid, ports in listeners_by_pid.items() if port in ports)
+
+
+def _reject_existing_startup_listener(reason: str) -> None:
+    raise RuntimeError(
+        "既存のFastAPI/Next.js listenerを安全にAoiTalkとして識別できないため、"
+        f"起動を中止しました（{reason}）。既存サービスは停止していません。"
+        "既存プロセスを確認するか、別ポートを指定してください。"
+    )
+
+
+def _check_existing_aoi_talk_instance(
+    config: object | None,
+    *,
+    fastapi_port: int,
+    next_port: int,
+) -> str | None:
+    """Guard startup before Qdrant/build/port cleanup touches any service.
+
+    A healthy pair of loopback listeners owned by this exact checkout is an
+    idempotent manual launch.  Every partial, unknown, unrelated, or unhealthy
+    occupancy fails closed so startup cannot kill a service it did not prove.
+    """
+
+    listeners_by_pid = _listening_tcp_ports_by_pid()
+    ports = (int(fastapi_port), int(next_port))
+    listener_pids = {
+        port: _startup_listener_pids(listeners_by_pid, port) for port in ports
+    }
+    port_open: dict[int, bool] = {}
+    for port in ports:
+        try:
+            port_open[port] = _is_port_open(
+                "127.0.0.1", port, timeout_seconds=0.2
+            )
+        except Exception:
+            # A platform probe failure is an unknown occupied state.  Keep
+            # startup fail-closed when listener evidence exists, while still
+            # allowing the normal free-port path to proceed.
+            port_open[port] = False
+    occupied = {
+        port
+        for port in ports
+        if listener_pids[port] or port_open[port]
+    }
+    if not occupied:
+        return None
+    if occupied != set(ports):
+        _reject_existing_startup_listener("部分起動またはlistener競合")
+    if any(len(listener_pids[port]) != 1 for port in ports):
+        _reject_existing_startup_listener("listener所有者が一意ではありません")
+
+    project_root = Path(__file__).resolve().parents[2]
+    identities = {
+        port: _strict_aoitalk_main_identity(listener_pids[port][0], project_root)
+        for port in ports
+    }
+    if any(identity is None for identity in identities.values()):
+        _reject_existing_startup_listener("所有者がこのrepositoryのmain.pyではありません")
+    identity_values = set(identities.values())
+    if len(identity_values) != 1:
+        _reject_existing_startup_listener("FastAPIとNext.jsのmain.py所有者が一致しません")
+
+    if not _probe_loopback_http_status(fastapi_port, "/health"):
+        _reject_existing_startup_listener("FastAPI healthがHTTP 200ではありません")
+    if not _probe_loopback_http_status(next_port, _frontend_readiness_path()):
+        _reject_existing_startup_listener("Next.jsがHTTP 200ではありません")
+
+    if _supervised_startup_enabled():
+        raise RuntimeError(
+            "supervised startupでは稼働中のAoiTalkを引き継げません。"
+            "既存サービスを停止せず、別ポートまたは既存プロセスの終了後に再試行してください。"
+        )
+    return get_operator_web_url(config)
+
+
+def _assert_caddy_takeover_safe(*, caddy_port: int, fastapi_port: int) -> None:
+    """Refuse to replace another live AoiTalk instance's public Caddy entry.
+
+    QA/development instances commonly select alternate FastAPI and Next.js
+    ports.  Reusing the default Caddy port in that topology previously killed
+    the production Caddy process first, then removed the replacement on exit,
+    leaving the mobile application with no reachable API endpoint.  A normal
+    same-port restart remains allowed because it intentionally replaces the
+    existing runtime as one topology.
+    """
+    listeners_by_pid = _listening_tcp_ports_by_pid()
+    caddy_listener_pids = sorted(
+        pid for pid, ports in listeners_by_pid.items() if caddy_port in ports
+    )
+    for listener_pid in caddy_listener_pids:
+        owner_pid = _aoitalk_main_owner_pid(listener_pid)
+        if owner_pid is None:
+            # Preserve the historical cleanup behavior for an unrelated or
+            # orphaned listener that cannot be identified as a live AoiTalk.
+            continue
+        owner_ports = listeners_by_pid.get(owner_pid, set())
+        if not owner_ports or fastapi_port in owner_ports:
+            # No live backend was found (stale runtime), or this is the normal
+            # same-topology restart path.
+            continue
+
+        existing_ports = ", ".join(str(port) for port in sorted(owner_ports))
+        logger.warning(
+            "Refusing Caddy takeover on port %s: AoiTalk owner PID %s listens "
+            "on backend port(s) %s, requested backend port is %s",
+            caddy_port,
+            owner_pid,
+            existing_ports,
+            fastapi_port,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
+        raise RuntimeError(
+            f"Caddyポート {caddy_port} は別のAoiTalk実行中インスタンスが使用しています"
+            f"（既存API: {existing_ports}、今回のAPI: {fastapi_port}）。"
+            "稼働中のモバイル接続を停止しないため起動を中止しました。"
+            "検証用インスタンスでは AOITALK_SKIP_CADDY=true を指定するか、"
+            "AOITALK_CADDY_PORT に別ポートを指定してください。"
+        )
 
 
 def _site_identity(value: object | None) -> str | None:
@@ -2067,6 +4128,12 @@ def _build_frontend_env(project_root: Path) -> dict[str, str]:
     # QA/dev shell's NODE_ENV select development behavior for the canonical
     # artifact or make `next start` run in development mode.
     env["NODE_ENV"] = "production"
+    # run.bat などGatewayを経由しない起動でも、公開経路のproof検証に使う
+    # activation secretをNextにだけ引き継ぐ。
+    logger.info(
+        "Gateway activation secret: %s",
+        _restore_gateway_activation_secret(project_root, env),
+    )
     if not env.get("INTERNAL_API_KEY"):
         value = _read_env_value_from_dotenv(project_root, "INTERNAL_API_KEY")
         if value:
@@ -2539,55 +4606,61 @@ def _start_services(config: object | None = None) -> None:
         config_key="caddy.port",
         default=6002,
     )
+    if not skip_caddy:
+        with _startup_timer.phase("startup.services.caddy.takeover_guard"):
+            _assert_caddy_takeover_safe(
+                caddy_port=caddy_port,
+                fastapi_port=fastapi_port,
+            )
     # 起動できない条件は、稼働中のサービスを止める前に確定させる。
     # 先に kill してから検証で落ちると、既に動いていたサーバーまで巻き添えで
     # 停止したまま復旧されず、Web/API が無人のまま残る。
     #
-    # 本番成果物の自己修復・指紋検証もこの起動経路へ接続する。検証用
-    # `npm run build` は `.next-verify` へ出力されるため、ここでは必ず
-    # `build:production` を使って canonical な `.next` を生成する。
-    # 依存修復は成果物を触らないので、既存サービスを止める前に実行する。
-    frontend_log_path = layout.frontend_log_path()
-    rotate_frontend_log_if_exists(frontend_log_path)
-    with _startup_timer.phase("startup.services.frontend.env_build"):
-        frontend_env = _build_frontend_env(project_root)
-    with _startup_timer.phase("startup.services.frontend.dependencies"):
-        _ensure_frontend_dependencies(project_root, frontend_log_path)
-
-    # `_ensure_frontend_build` は stale な canonical `.next` を作り直す際に
-    # 旧成果物を削除する。稼働中の `next start` がそのディレクトリを
-    # 参照している間に削除しないよう、stale/missing の場合だけ frontend
-    # listener を先に停止し、その後 production build を行う。
-    frontend_port_killed_for_build = False
-    frontend_build_elapsed: float | None = None
     frontend_dir = project_root / "frontend"
     with _startup_timer.phase("startup.services.frontend.rebuild_check"):
-        build_reason, build_fingerprint = _frontend_build_rebuild_reason(frontend_dir)
+        build_reason, _ = _frontend_build_rebuild_reason(frontend_dir)
     if build_reason:
-        startup_console.stage("[BUILD] Web UI を更新しています...")
-        with _startup_timer.phase("startup.services.frontend.port_cleanup_for_build"):
-            _kill_existing_on_port(next_port)
-        frontend_port_killed_for_build = True
-        build_started_at = time.monotonic()
-        with _startup_timer.phase("startup.services.frontend.build"):
-            _ensure_frontend_build(
-                project_root, frontend_log_path, frontend_env,
-                prepared_check=(build_reason, build_fingerprint),
+        raise RuntimeError(
+            "通常起動を中止しました。既存のFrontend production buildが現在のsourceと一致しません。"
+            "通常起動ではnpm ci/buildを実行しません。"
+            "frontendディレクトリで、次のコマンドを別々に実行してください。\n"
+            "  cd frontend\n"
+            "  npm run build:production"
+            f" 詳細: {build_reason}"
+        )
+
+    frontend_log_path = layout.frontend_log_path()
+    rotate_frontend_log_if_exists(frontend_log_path)
+    with _startup_timer.phase("startup.services.frontend.dependencies"):
+        if not _next_bin_path(frontend_dir).exists():
+            raise RuntimeError(
+                "通常起動を中止しました。Frontend依存関係がありません。"
+                "通常起動ではnpm ciを実行しません。"
+                "frontendディレクトリで、次のコマンドを実行してください。\n"
+                "  cd frontend\n"
+                "  npm ci"
             )
-        frontend_build_elapsed = max(0.0, time.monotonic() - build_started_at)
+    with _startup_timer.phase("startup.services.frontend.env_build"):
+        frontend_env = _build_frontend_env(project_root)
     with _startup_timer.phase("startup.services.frontend.artifact_validation"):
-        _validate_frontend_startup_artifacts(project_root)
-    if frontend_build_elapsed is None:
-        frontend_ready_message = "[OK] Web UI"
-    else:
-        frontend_ready_message = f"[OK] Web UI ({frontend_build_elapsed:.1f}s)"
+        try:
+            _validate_frontend_startup_artifacts(project_root)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "通常起動を中止しました。Frontend production artifactがありません。"
+                "通常起動ではbuildを実行しません。"
+                "frontendディレクトリで、次のコマンドを実行してください。\n"
+                "  cd frontend\n"
+                "  npm run build:production"
+                f" 詳細: {exc}"
+            ) from exc
+    frontend_ready_message = "[OK] Web UI (既存production build)"
 
     with _startup_timer.phase("startup.services.port_cleanup"):
         _kill_existing_on_port(fastapi_port)
         if not skip_caddy:
             _kill_existing_on_port(caddy_port)
-            if not frontend_port_killed_for_build:
-                _kill_existing_on_port(next_port)
+            _kill_existing_on_port(next_port)
 
     with _startup_timer.phase("startup.services.next.reuse_probe"):
         frontend_already_running = skip_caddy and _wait_for_port(
@@ -2599,7 +4672,17 @@ def _start_services(config: object | None = None) -> None:
         should_start_mlx_lm = _should_start_mlx_lm_server(config)
         should_start_llama_cpp = _should_start_llama_cpp(config, is_windows=_IS_WINDOWS)
     with _startup_timer.phase("startup.services.provider.ensure"):
-        local_server_launch_started = ensure_openai_compatible_local_server(config)
+        startup_local_model = _openai_compatible_local_model_id(config)
+        startup_managed_runtime = managed_local_runtime_for_model(
+            config, startup_local_model
+        )
+        if startup_managed_runtime in {"strata", "llama_cpp", "freetoken"}:
+            # Managed model acquisition can wait on model loading or a shared
+            # runtime lease. Defer it until an explicit inference request so
+            # unavailable GPU capacity never blocks the Web/API startup.
+            local_server_launch_started = False
+        else:
+            local_server_launch_started = ensure_openai_compatible_local_server(config)
 
     with _startup_timer.phase("startup.services.frontend.env_finalize"):
         frontend_host = _frontend_bind_host()
@@ -2628,9 +4711,21 @@ def _start_services(config: object | None = None) -> None:
                 ],
                 cwd=str(project_root / "frontend"),
                 env=frontend_env,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    if str(frontend_env.get("AOITALK_HEADLESS", "")).strip().lower()
+                    in {"1", "true", "yes", "on"}
+                    else subprocess.CREATE_NEW_CONSOLE
+                ),
             )
             _track_child_process(frontend_proc)
+            _record_next_process_tree(
+                frontend_proc,
+                frontend_dir=project_root / "frontend",
+                next_port=next_port,
+                frontend_host=frontend_host,
+                require_descendants=False,
+            )
 
         with _startup_timer.phase("startup.services.next.socket_poll"):
             if not _wait_for_process_port(
@@ -2643,6 +4738,12 @@ def _start_services(config: object | None = None) -> None:
                     f"Next.js frontend did not start listening on 127.0.0.1:{next_port}.\n"
                     f"frontend.log tail:\n{_read_log_tail(frontend_log_path)}"
                 )
+        _record_next_process_tree(
+            frontend_proc,
+            frontend_dir=project_root / "frontend",
+            next_port=next_port,
+            frontend_host=frontend_host,
+        )
         _startup_timer.mark("startup.services.next.listener_ready")
     else:
         frontend_cmd = (
@@ -2709,16 +4810,63 @@ def _start_services(config: object | None = None) -> None:
 def start_services(config: object | None = None) -> None:
     """Start managed services and roll back every child added on failure."""
     tracked_process_start = len(_child_processes)
+    qdrant_started = False
     try:
+        fastapi_port = _service_port(
+            config,
+            env_names=("AOITALK_WEB_PORT", "AOITALK_FASTAPI_PORT"),
+            config_key="web_interface.port",
+            default=3000,
+        )
+        next_port = _service_port(
+            config,
+            env_names=("AOITALK_NEXT_PORT", "AOITALK_FRONTEND_PORT"),
+            config_key="frontend.port",
+            default=3002,
+        )
+        existing_url = _check_existing_aoi_talk_instance(
+            config,
+            fastapi_port=fastapi_port,
+            next_port=next_port,
+        )
+        if existing_url is not None:
+            raise AoiTalkAlreadyRunning(existing_url)
+        # main.py has already initialized DB/config; index clients start later.
+        # Existing startup may clean these ports, so reject overlap before
+        # creating a Qdrant container or touching any currently running service.
+        reserved_ports = {
+            _service_port(config, env_names=env_names, config_key=key, default=default)
+            for env_names, key, default in (
+                (("AOITALK_WEB_PORT", "AOITALK_FASTAPI_PORT"), "web_interface.port", 3000),
+                (("AOITALK_NEXT_PORT", "AOITALK_FRONTEND_PORT"), "frontend.port", 3002),
+                (("AOITALK_CADDY_PORT",), "caddy.port", 6002),
+            )
+        }
+        qdrant_started = start_managed_qdrant(
+            config, is_windows=_IS_WINDOWS, reserved_ports=reserved_ports,
+        )
         _start_services(config)
-    except Exception:
-        _rollback_tracked_processes(tracked_process_start)
+    except BaseException:
+        try:
+            _rollback_tracked_processes(tracked_process_start)
+        finally:
+            if qdrant_started:
+                stop_managed_qdrant()
         raise
 
 
 def kill_services() -> None:
     """Stop child service processes started by start_services."""
-    for proc in list(_child_processes):
-        _terminate_process_tree(proc)
-    _child_processes.clear()
-    _openai_compatible_local_processes.clear()
+    try:
+        for proc in list(_child_processes):
+            _terminate_process_tree(proc)
+        _child_processes.clear()
+        _openai_compatible_local_processes.clear()
+    finally:
+        stop_managed_qdrant()
+
+
+# Install the default cross-process lifecycle boundary after defining the direct
+# backend. The coordinator and focused backend tests explicitly select direct mode.
+from ._shared_local_runtime import install as _install_shared_local_runtime
+_install_shared_local_runtime(sys.modules[__name__])

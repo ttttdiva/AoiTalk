@@ -273,10 +273,18 @@ def resolve_project_automation_route(
         model = _validate_model(
             _config_get(config, "llm_model", "")
         )
+        reasoning_effort = ""
+        if provider == "openai_compatible_local":
+            from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
+            from ..llm.provider_mode_adapters import resolve_strata_response_mode
+
+            if managed_local_runtime_for_model(config, model) == "strata":
+                reasoning_effort = resolve_strata_response_mode(config)
         return ProjectAutomationRoute(
             provider=provider,
             model=model,
             mode=_MODE_INHERIT,
+            reasoning_effort=reasoning_effort,
         )
 
     provider = _validate_provider(raw.get("provider"))
@@ -296,6 +304,20 @@ def resolve_project_automation_route(
         field="reasoning_effort",
         max_length=64,
     )
+    if provider == "openai_compatible_local" and reasoning_effort:
+        from ..llm.openai_compatible_local_profiles import (
+            managed_local_runtime_for_model,
+        )
+        from ..llm.provider_mode_adapters import resolve_strata_response_mode
+
+        if managed_local_runtime_for_model(config, model) == "strata":
+            try:
+                reasoning_effort = resolve_strata_response_mode(config, reasoning_effort)
+            except ValueError as exc:
+                raise ProjectAutomationRouteError(
+                    str(exc),
+                    code="invalid_reasoning_effort",
+                ) from exc
 
     return ProjectAutomationRoute(
         provider=provider,

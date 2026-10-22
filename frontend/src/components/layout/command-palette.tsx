@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import { defaultFilter } from "cmdk";
 import {
   Command,
   CommandDialog,
@@ -22,6 +23,7 @@ import {
   useDocsCommandContext,
 } from "@/components/docs/hooks/use-docs-command-palette";
 import type { DocsCommandMode } from "@/components/docs/docs-workspace-shared";
+import { useDocsPaletteSearch } from "./use-docs-palette-search";
 
 const COMMANDS = [
   { id: "new-chat", label: "新規会話", icon: Plus, action: "/chat?new=1" },
@@ -49,14 +51,6 @@ type SearchScope = {
   docs: boolean;
 };
 
-type DocsSearchHit = {
-  id: string;
-  title: string;
-  aliases?: string[];
-  node_type?: string;
-  breadcrumb?: string[];
-};
-
 type PendingPaletteAction = {
   event: Event;
   /** イベントを積んだ時点のpathname。画面遷移後は破棄する。 */
@@ -75,6 +69,14 @@ const DEFAULT_SCOPE: SearchScope = {
 
 const SCOPE_STORAGE_KEY = "command-palette-scope";
 
+function filterPaletteItem(value: string, search: string, keywords?: string[]) {
+  // Docs results are already filtered/ranked by the server, including body and
+  // #tag matches. Preserve that order without changing other command filtering.
+  if (value.startsWith("__docs_result__:")) return 1;
+  if (value === "__docs_search_more__") return 0.5;
+  return defaultFilter(value, search, keywords);
+}
+
 function readSearchScope(): SearchScope {
   if (typeof window === "undefined") return DEFAULT_SCOPE;
   try {
@@ -89,10 +91,6 @@ function readSearchScope(): SearchScope {
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [docsSearchResult, setDocsSearchResult] = useState<{
-    query: string;
-    nodes: DocsSearchHit[];
-  }>({ query: "", nodes: [] });
   const [scope, setScope] = useState<SearchScope>(() => readSearchScope());
   const [docsMode, setDocsMode] = useState<DocsCommandMode>({ kind: "root" });
   const [query, setQuery] = useState("");
@@ -116,10 +114,12 @@ export function CommandPalette() {
   const docsContext = useDocsCommandContext();
   const pendingActionRef = useRef<PendingPaletteAction | null>(null);
   const docsSubmode = Boolean(docsContext && docsMode.kind !== "root");
+  const docsSearchResult = useDocsPaletteSearch(query, open && !docsSubmode && scope.docs);
+  const resetDocsSearch = docsSearchResult.reset;
 
   const updateScope = (key: keyof SearchScope, value: boolean) => {
     if (key === "docs") {
-      setDocsSearchResult({ query: "", nodes: [] });
+      resetDocsSearch();
     }
     setScope((prev) => {
       const next = { ...prev, [key]: value };
@@ -139,7 +139,7 @@ export function CommandPalette() {
         setOpen((prev) => {
           setDocsMode({ kind: "root" });
           setQuery("");
-          setDocsSearchResult({ query: "", nodes: [] });
+          resetDocsSearch();
           return !prev;
         });
       }
@@ -150,13 +150,13 @@ export function CommandPalette() {
       };
       setDocsMode(mode);
       setQuery("");
-      setDocsSearchResult({ query: "", nodes: [] });
+      resetDocsSearch();
       setOpen(true);
     };
     const handleGlobalCommandOpen = () => {
       setDocsMode({ kind: "root" });
       setQuery("");
-      setDocsSearchResult({ query: "", nodes: [] });
+      resetDocsSearch();
       setOpen(true);
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -170,7 +170,7 @@ export function CommandPalette() {
       );
       window.removeEventListener("global-command-palette", handleGlobalCommandOpen);
     };
-  }, []);
+  }, [resetDocsSearch]);
 
   useEffect(() => {
     if (!open || !scope.tasks) return;
@@ -179,48 +179,6 @@ export function CommandPalette() {
       .then(setTasks)
       .catch(() => {});
   }, [open, scope.tasks]);
-
-  useEffect(() => {
-    const trimmedQuery = query.trim();
-    if (!open || docsSubmode || !scope.docs || !trimmedQuery) return;
-
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => {
-      const params = new URLSearchParams({
-        q: trimmedQuery,
-        limit: "30",
-      });
-      fetch(`/api/docs/search?${params.toString()}`, {
-        signal: controller.signal,
-      })
-        .then((response) =>
-          response.ok
-            ? (response.json() as Promise<{
-                results?: DocsSearchHit[];
-                nodes?: DocsSearchHit[];
-              }>)
-            : { results: [] },
-        )
-        .then((data) => {
-          if (!controller.signal.aborted) {
-            setDocsSearchResult({
-              query: trimmedQuery,
-              nodes: data.results ?? data.nodes ?? [],
-            });
-          }
-        })
-        .catch(() => {
-          if (!controller.signal.aborted) {
-            setDocsSearchResult({ query: trimmedQuery, nodes: [] });
-          }
-        });
-    }, 80);
-
-    return () => {
-      controller.abort();
-      window.clearTimeout(timer);
-    };
-  }, [docsSubmode, open, query, scope.docs]);
 
   // CommandDialog のclose commit後に、次のrAFで後続ダイアログを開く。
   // 同じtickに同期dispatchすると、close側のfocus復帰と次Dialogのopenが
@@ -290,20 +248,20 @@ export function CommandPalette() {
     setOpen(false);
     setDocsMode({ kind: "root" });
     setQuery("");
-    setDocsSearchResult({ query: "", nodes: [] });
+    resetDocsSearch();
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
     setOpen(nextOpen);
     setDocsMode({ kind: "root" });
     setQuery("");
-    setDocsSearchResult({ query: "", nodes: [] });
+    resetDocsSearch();
   };
 
   const setDocsModeAndResetQuery = (mode: DocsCommandMode) => {
     setDocsMode(mode);
     setQuery("");
-    setDocsSearchResult({ query: "", nodes: [] });
+    resetDocsSearch();
   };
 
   const docsNodes =
@@ -312,7 +270,7 @@ export function CommandPalette() {
       : [];
   const handleQueryChange = (nextQuery: string) => {
     setQuery(nextQuery);
-    setDocsSearchResult({ query: nextQuery.trim(), nodes: [] });
+    resetDocsSearch();
   };
   const inputPlaceholder = docsSubmode
     ? docsMode.kind === "move"
@@ -324,7 +282,7 @@ export function CommandPalette() {
         : docsMode.kind === "view"
           ? "表示形式を検索..."
           : "設定するフィールド値を検索..."
-    : "コマンドを検索...";
+    : "コマンド・Docsを検索...（#タグで絞り込み）";
 
   const queueAfterPaletteClose = (event: Event, targetPathname?: string) => {
     pendingActionRef.current = {
@@ -383,7 +341,7 @@ export function CommandPalette() {
       title="コマンドパレット"
       description="コマンドを検索して実行します"
     >
-      <Command>
+      <Command filter={filterPaletteItem}>
         <CommandInput
           value={query}
           onValueChange={handleQueryChange}
@@ -432,9 +390,14 @@ export function CommandPalette() {
             Docs
           </label>
         </div>
+        {!docsSubmode && scope.docs ? (
+          <p className="px-3 py-1 text-[11px] text-muted-foreground">
+            Docs: 本文・タグ・別名・IDを検索 / #タグ / #&quot;複数語のタグ&quot;
+          </p>
+        ) : null}
         <CommandList>
           <CommandEmpty>
-            {docsNodes.length > 0 ? null : "見つかりません"}
+            {docsNodes.length > 0 || docsSearchResult.loading || docsSearchResult.error ? null : "見つかりません"}
           </CommandEmpty>
           {docsSubmode && docsContext ? (
             <DocsCommandItems
@@ -544,7 +507,7 @@ export function CommandPalette() {
                   {docsNodes.map((node) => (
                     <CommandItem
                       key={node.id}
-                      value={`${node.title}__docs__${node.id}`}
+                      value={`__docs_result__:${node.id}`}
                       keywords={[
                         node.title,
                         node.id,
@@ -565,16 +528,43 @@ export function CommandPalette() {
                       className="items-start"
                     >
                       <FileText className="mt-0.5 size-4 text-muted-foreground" />
-                      <span className="min-w-0 truncate">{node.title}</span>
-                      {node.breadcrumb && node.breadcrumb.length > 0 ? (
-                        <span className="ml-auto max-w-[50%] truncate text-xs text-muted-foreground">
-                          {node.breadcrumb.join(" / ")}
-                        </span>
-                      ) : null}
+                      <span className="min-w-0 flex-1 space-y-1">
+                        <span className="block truncate font-medium">{node.title}</span>
+                        {node.breadcrumb && node.breadcrumb.length > 0 ? (
+                          <span className="block truncate text-xs text-muted-foreground" title={node.breadcrumb.join(" / ")}>
+                            {node.breadcrumb.join(" / ")}
+                          </span>
+                        ) : null}
+                        {node.snippet ? (
+                          <span className="line-clamp-2 text-xs text-muted-foreground">{node.snippet}</span>
+                        ) : null}
+                        {node.tags && node.tags.length > 0 ? (
+                          <span className="flex flex-wrap gap-1">
+                            {node.tags.map((tag) => (
+                              <span key={tag} className="rounded bg-muted px-1 text-[11px] text-muted-foreground">#{tag}</span>
+                            ))}
+                          </span>
+                        ) : null}
+                      </span>
                     </CommandItem>
                   ))}
                 </CommandGroup>
               )}
+              {scope.docs && docsSearchResult.loading ? (
+                <div role="status" className="px-3 py-2 text-xs text-muted-foreground">Docsを検索中...</div>
+              ) : null}
+              {scope.docs && (docsSearchResult.nextCursor || docsSearchResult.error) ? (
+                <CommandGroup>
+                  <CommandItem
+                    value="__docs_search_more__"
+                    keywords={[docsSearchResult.query]}
+                    disabled={docsSearchResult.loading}
+                    onSelect={docsSearchResult.error ? docsSearchResult.retry : docsSearchResult.loadMore}
+                  >
+                    {docsSearchResult.error ? "Docs検索に失敗しました。再試行" : "Docsをさらに表示"}
+                  </CommandItem>
+                </CommandGroup>
+              ) : null}
               {docsContext ? (
                 <DocsCommandItems
                   context={docsContext}

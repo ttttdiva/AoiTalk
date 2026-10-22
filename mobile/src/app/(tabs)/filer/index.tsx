@@ -5,6 +5,7 @@ import {
   Alert,
   BackHandler,
   FlatList,
+  Image,
   Modal,
   Pressable,
   RefreshControl,
@@ -23,7 +24,6 @@ import * as ScreenOrientation from "expo-screen-orientation";
 import {
   ActivityIndicator,
   Button,
-  Chip,
   Dialog,
   Divider,
   IconButton,
@@ -35,6 +35,7 @@ import {
   TextInput,
 } from "react-native-paper";
 import { useFocusEffect, useRouter } from "expo-router";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import {
@@ -75,7 +76,9 @@ import { fileBookmarkRelativePath, normalizeFileBookmarkPath, visibleFileBookmar
 import {
   SOURCE_LABELS,
   SCOPE_LABELS,
+  canPasteClipboardToFilesLocation,
   canRouteClipboardEntries,
+  clipboardMatchesFilesLocation,
   dedupeFileEntries,
   fileEntrySelectionKey,
   fileSelectionCount,
@@ -93,8 +96,10 @@ import {
   resolveFilesOpenKind,
   resolveFilesHomePath,
   isFilesPathWithinRoot,
+  resolveFilesServerRequestPath,
   resolveFilesParentPath,
   reconcileFileSelection,
+  reconcileClipboardForSecurityContext,
   resolveFilesPressAction,
   sortAudioEntries,
   startFileSelection,
@@ -117,10 +122,73 @@ import { FileNameDialog } from "../../../features/files/file-name-dialog";
 import { filesTextEditorParams } from "../../../features/files/files-text-editor-route";
 import {
   FILES_DOCUMENT_PICKER_OPTIONS,
+  createFilesBatchUploadAlert,
+  uploadLocalClipboardFiles,
   uploadPickedFiles,
+  type FilesUploadConflict,
 } from "../../../features/files/file-upload";
 
 type MediaSource = Awaited<ReturnType<typeof filesApi.getMediaSource>>;
+
+type FilesUploadLocation = {
+  source: FilesSource;
+  scope: FilesScope;
+  path: string;
+  destinationPath: string;
+  authScope: string;
+  projectId: string | null | undefined;
+};
+
+type PendingFilesUploadConflict = {
+  conflicts: readonly FilesUploadConflict[];
+  location: FilesUploadLocation;
+  resolve: (decision: "overwrite" | "skip") => void;
+};
+
+type FilesBatchUploadOwner = "picker" | "clipboard";
+
+function filesLoadIdentityKey(
+  authScope: string,
+  source: FilesSource,
+  scope: FilesScope,
+  projectId: string | null | undefined,
+): string {
+  return JSON.stringify([authScope, source, scope, projectId ?? ""]);
+}
+
+function FilesHeaderChip({
+  children,
+  selected,
+  disabled,
+  onPress,
+  testID,
+  variant = "segment",
+}: {
+  children: React.ReactNode;
+  selected?: boolean;
+  disabled?: boolean;
+  onPress: () => void;
+  testID?: string;
+  variant?: "segment" | "scope";
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ disabled, selected }}
+      disabled={disabled}
+      onPress={onPress}
+      hitSlop={6}
+      style={[
+        styles.segmentChip,
+        selected && (variant === "scope" ? styles.scopeChipActive : styles.segmentChipActive),
+        disabled && styles.segmentChipDisabled,
+      ]}
+      testID={testID}
+    >
+      <Text style={styles.segmentChipText}>{children}</Text>
+    </Pressable>
+  );
+}
 
 export default function FilesScreen() {
   return <ManagedFilesScreen />;
@@ -157,11 +225,26 @@ function ManagedFilesScreen() {
   const [histories, setHistories] = useState<HistoryState>(initialHistories);
   const [locationMetas, setLocationMetas] =
     useState<LocationMetaState>(initialLocationMetas);
+  // An empty path is both the initial state and an actual administrator root.
+  // Remember which auth/project location has been loaded so the latter is not
+  // reinterpreted as the former on focus/refresh.
+  const loadedLocationKeysRef = useRef(new Set<string>());
+  // A navigation intent may target an unvisited directory (for example a
+  // bookmark in a newly selected Project). Keep that explicit path separate
+  // from the empty initial state used to request a scope root.
+  const explicitLocationPathsRef = useRef(new Map<string, string>());
+  const handledProjectSelectionRef = useRef<{ projectId: string | null } | null>(null);
+  const previousProjectIdRef = useRef<string | null>(selectedProjectId);
   const [items, setItems] = useState<FilesEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const uploadingRef = useRef(false);
+  const filesBatchUploadLockRef = useRef<FilesBatchUploadOwner | null>(null);
+  const [uploadConflictDialog, setUploadConflictDialog] =
+    useState<PendingFilesUploadConflict | null>(null);
+  const uploadConflictWaiterRef = useRef<PendingFilesUploadConflict | null>(null);
+  const filesScreenMountedRef = useRef(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [searchVisible, setSearchVisible] = useState(false);
@@ -178,6 +261,15 @@ function ManagedFilesScreen() {
   const [viewerSource, setViewerSource] = useState<MediaSource | null>(null);
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState<string | null>(null);
+  const [viewerChromeVisible, setViewerChromeVisible] = useState(true);
+  const [viewerPreloadSources, setViewerPreloadSources] = useState<
+    Record<string, MediaSource>
+  >({});
+  const viewerImageSourceCacheRef = useRef(new Map<string, MediaSource>());
+  const viewerImageSourceFlightRef = useRef(
+    new Map<string, Promise<MediaSource>>(),
+  );
+  const viewerImageReadyRef = useRef(new Set<string>());
   const [videoUri, setVideoUri] = useState<string | null>(null);
   const [videoLoading, setVideoLoading] = useState(false);
   const videoRef = useRef<VideoRef>(null);
@@ -189,6 +281,7 @@ function ManagedFilesScreen() {
   const [renameTarget, setRenameTarget] = useState<FilesEntry | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [transferring, setTransferring] = useState(false);
+  const clipboardTransferRef = useRef(false);
   const [selectedEntries, setSelectedEntries] = useState<FilesEntry[]>([]);
   // React Native dispatches onPress after onLongPress for Pressable.  Keep the
   // long-pressed key so the synthetic press cannot immediately toggle the
@@ -263,6 +356,72 @@ function ManagedFilesScreen() {
     projectId: selectedProjectId,
   };
 
+  const isFilesUploadLocationCurrent = useCallback(
+    (location: FilesUploadLocation) => {
+      const current = activeLocationRef.current;
+      return (
+        filesScreenMountedRef.current &&
+        current.source === location.source &&
+        current.scope === location.scope &&
+        current.path === location.path &&
+        current.authScope === location.authScope &&
+        current.projectId === location.projectId
+      );
+    },
+    [],
+  );
+
+  const settleUploadConflict = useCallback(
+    (decision: "overwrite" | "skip") => {
+      const pending = uploadConflictWaiterRef.current;
+      if (!pending) return;
+      uploadConflictWaiterRef.current = null;
+      setUploadConflictDialog(null);
+      pending.resolve(decision);
+    },
+    [],
+  );
+
+  const confirmFilesUploadConflicts = useCallback(
+    (
+      conflicts: readonly FilesUploadConflict[],
+      location: FilesUploadLocation,
+    ): Promise<"overwrite" | "skip"> => {
+      if (!isFilesUploadLocationCurrent(location)) return Promise.resolve("skip");
+      // A batch owns the only confirmation waiter.  Keep this fail-closed
+      // guard even though both entry points also use the shared batch lock.
+      if (uploadConflictWaiterRef.current) return Promise.resolve("skip");
+      return new Promise((resolve) => {
+        const pending: PendingFilesUploadConflict = {
+          conflicts,
+          location,
+          resolve,
+        };
+        uploadConflictWaiterRef.current = pending;
+        setUploadConflictDialog(pending);
+      });
+    },
+    [isFilesUploadLocationCurrent],
+  );
+
+  useEffect(() => {
+    filesScreenMountedRef.current = true;
+    return () => {
+      filesScreenMountedRef.current = false;
+      settleUploadConflict("skip");
+    };
+  }, [settleUploadConflict]);
+
+  useEffect(() => {
+    const pending = uploadConflictWaiterRef.current;
+    if (pending && !isFilesUploadLocationCurrent(pending.location)) {
+      // Navigation, project selection, scope changes, and auth changes all
+      // invalidate the old destination. Settle the coordinator as skip so an
+      // awaiting upload cannot hang or overwrite a newly selected location.
+      settleUploadConflict("skip");
+    }
+  }, [activeLocationIdentity, isFilesUploadLocationCurrent, settleUploadConflict]);
+
   useEffect(() => {
     // A pending dialog belongs to the directory that opened it.  Close it and
     // invalidate its completion callback when navigation changes that
@@ -282,11 +441,18 @@ function ManagedFilesScreen() {
     setBookmarksVisible(false);
   }, [activeLocationIdentity]);
 
-  // Clipboard entries are transferable only within the same authenticated
-  // source/scope/project context.  A boundary change invalidates them before
-  // the next render can expose a paste action for the new location.
+  // Keep device-local copies while switching Local -> Server or selecting a
+  // destination Project. Account changes still clear every clipboard, while
+  // server workspace entries remain bound to their captured Project.
   useEffect(() => {
-    setClipboard(null);
+    setClipboard((current) =>
+      reconcileClipboardForSecurityContext(current, {
+        authScope,
+        projectId: selectedProjectId,
+        source,
+        scope,
+      }),
+    );
   }, [authScope, selectedProjectId, scope, source]);
 
   // A revalidation can remove an entry that was selected earlier.  Reconcile
@@ -334,6 +500,67 @@ function ManagedFilesScreen() {
     },
     [isAdmin, selectedProjectId, user?.user_id],
   );
+
+  const getFilesLoadIdentityKey = useCallback(
+    (
+      nextSource: FilesSource,
+      nextScope: FilesScope,
+      projectId: string | null | undefined = selectedProjectId,
+    ) => filesLoadIdentityKey(authScope, nextSource, nextScope, projectId),
+    [authScope, selectedProjectId],
+  );
+
+  // ProjectContext can change from another tab/screen.  The Files-local
+  // selector already clears this state in applyProjectSelection; this effect
+  // covers external changes while preserving the admin namespace navigation
+  // where the canonical Project intentionally remains selected.
+  useEffect(() => {
+    const previousProjectId = previousProjectIdRef.current;
+    previousProjectIdRef.current = selectedProjectId;
+    if (previousProjectId === selectedProjectId) return;
+
+    const handled = handledProjectSelectionRef.current;
+    handledProjectSelectionRef.current = null;
+    if (handled?.projectId === selectedProjectId) return;
+
+    const workspaceKey = locationKey("server", "workspace");
+    loadedLocationKeysRef.current.delete(
+      getFilesLoadIdentityKey("server", "workspace", previousProjectId),
+    );
+    loadedLocationKeysRef.current.delete(
+      getFilesLoadIdentityKey("server", "workspace", selectedProjectId),
+    );
+    explicitLocationPathsRef.current.delete(
+      getFilesLoadIdentityKey("server", "workspace", previousProjectId),
+    );
+    explicitLocationPathsRef.current.delete(
+      getFilesLoadIdentityKey("server", "workspace", selectedProjectId),
+    );
+    setPaths((previous) => ({ ...previous, [workspaceKey]: "" }));
+    setHistories((previous) => ({ ...previous, [workspaceKey]: [] }));
+    setLocationMetas((previous) => ({
+      ...previous,
+      [workspaceKey]: { parentPath: null, canGoUp: false, isAdminMode: false },
+    }));
+    setQuery("");
+    setViewerVisible(false);
+    setViewerFile(null);
+  }, [getFilesLoadIdentityKey, selectedProjectId]);
+
+  const locationWasLoaded = loadedLocationKeysRef.current.has(
+    getFilesLoadIdentityKey(source, scope),
+  );
+  const currentLoadIdentityKey = getFilesLoadIdentityKey(source, scope);
+  const hasExplicitLocationPath = explicitLocationPathsRef.current.has(
+    currentLoadIdentityKey,
+  );
+  const pathForCurrentLocationLoad = hasExplicitLocationPath
+    ? explicitLocationPathsRef.current.get(currentLoadIdentityKey)
+    : locationWasLoaded
+      ? activePath
+      : source === "server"
+        ? undefined
+        : activePath || undefined;
 
   // サーバー・ワークスペースの一覧を実際に取得できるか。
   // 管理者はプロジェクト未選択でも管理者ルートを開ける。一般ユーザーは
@@ -422,11 +649,27 @@ function ManagedFilesScreen() {
   );
 
   const setPathForLocation = useCallback(
-    (nextSource: FilesSource, nextScope: FilesScope, path: string) => {
+    (
+      nextSource: FilesSource,
+      nextScope: FilesScope,
+      path: string,
+      options: { explicit?: boolean } = {},
+    ) => {
       const key = locationKey(nextSource, nextScope);
+      const identityKey = filesLoadIdentityKey(
+        authScope,
+        nextSource,
+        nextScope,
+        selectedProjectId,
+      );
+      if (options.explicit === false) {
+        explicitLocationPathsRef.current.delete(identityKey);
+      } else {
+        explicitLocationPathsRef.current.set(identityKey, path);
+      }
       setPaths((prev) => ({ ...prev, [key]: path }));
     },
-    [],
+    [authScope, selectedProjectId],
   );
 
   const locationUnavailableMessage = useCallback(
@@ -455,7 +698,7 @@ function ManagedFilesScreen() {
         displayedRequestKeyRef.current = null;
         setStaleCachedAt(null);
         setItems([]);
-        setPathForLocation(nextSource, nextScope, "");
+        setPathForLocation(nextSource, nextScope, "", { explicit: false });
         setLocationMetas((prev) => ({
           ...prev,
           [locationKey(nextSource, nextScope)]: {
@@ -494,22 +737,23 @@ function ManagedFilesScreen() {
           projectIdOverride !== undefined
             ? projectIdOverride
             : selectedProjectId;
-        if (
-          nextSource === "server" &&
-          nextScope === "workspace" &&
-          requestPath &&
-          serverRootPath &&
-          requestPath !== serverRootPath &&
-          !requestPath.startsWith(`${serverRootPath.replace(/\/+$/, "")}/`)
-        ) {
-          requestPath = serverRootPath;
+        if (nextSource === "server") {
+          requestPath = resolveFilesServerRequestPath({
+            scope: nextScope,
+            requestedPath: requestPath ?? "",
+            serverRootPath,
+            isAdmin,
+          });
         }
 
         const location: FilesLocation = {
           source: nextSource,
           scope: nextScope,
           authScope,
-          path: requestPath || undefined,
+          // Preserve an explicit empty server path.  It is the administrator
+          // workspace root after navigating above a Project/User namespace;
+          // `undefined` means the location has not been initialized yet.
+          path: requestPath === undefined ? undefined : requestPath,
           projectId,
         };
         const requestKey = filesLocationKey(location);
@@ -518,7 +762,12 @@ function ManagedFilesScreen() {
         const cached = filesLocationCache.peek(location);
         if (cached) {
           setItems(cached.items);
-          setPathForLocation(nextSource, nextScope, cached.currentPath);
+          setPathForLocation(nextSource, nextScope, cached.currentPath, {
+            explicit: false,
+          });
+          loadedLocationKeysRef.current.add(
+            getFilesLoadIdentityKey(nextSource, nextScope, projectId),
+          );
           setLocationMetas((prev) => ({
             ...prev,
             [locationKey(nextSource, nextScope)]: {
@@ -548,7 +797,12 @@ function ManagedFilesScreen() {
         displayedRequestKeyRef.current = loaded.resolvedKey;
         const result = loaded.result;
         setItems(result.items);
-        setPathForLocation(nextSource, nextScope, result.currentPath);
+        setPathForLocation(nextSource, nextScope, result.currentPath, {
+          explicit: false,
+        });
+        loadedLocationKeysRef.current.add(
+          getFilesLoadIdentityKey(nextSource, nextScope, projectId),
+        );
         setLocationMetas((prev) => ({
           ...prev,
           [locationKey(nextSource, nextScope)]: {
@@ -594,6 +848,8 @@ function ManagedFilesScreen() {
       authScope,
       isAuthenticated,
       isServerWorkspaceListable,
+      isAdmin,
+      getFilesLoadIdentityKey,
       selectedProjectId,
       setPathForLocation,
     ],
@@ -656,12 +912,12 @@ function ManagedFilesScreen() {
   }, [bookmarkScopeKey, loadBookmarks]);
 
   useEffect(() => {
-    void loadEntries(source, scope, activePath || undefined);
-  }, [activePath, loadEntries, scope, source]);
+    void loadEntries(source, scope, pathForCurrentLocationLoad);
+  }, [activePath, loadEntries, pathForCurrentLocationLoad, scope, source]);
 
   const visibleLocationRef = useRef<() => Promise<void>>(async () => {});
   visibleLocationRef.current = () =>
-    loadEntries(source, scope, activePath || undefined, undefined, {
+    loadEntries(source, scope, pathForCurrentLocationLoad, undefined, {
       revalidate: true,
     });
 
@@ -685,7 +941,7 @@ function ManagedFilesScreen() {
   const onRefresh = async () => {
     setRefreshing(true);
     await Promise.all([
-      loadEntries(source, scope, activePath || undefined, undefined, {
+      loadEntries(source, scope, pathForCurrentLocationLoad, undefined, {
         revalidate: true,
       }),
       loadBookmarks(),
@@ -747,9 +1003,9 @@ function ManagedFilesScreen() {
   };
 
   // ファイラー画面内でプロジェクトを切り替える。旧プロジェクトの現在地・履歴・
-  // クリップボード・検索・編集／プレビュー状態を一切引き継がず、新プロジェクトの
-  // ルートへ移動する。nextProjectId が null の場合、管理者は管理者ルート、
-  // 一般ユーザーはプロジェクト未選択状態になる。
+  // server workspace のクリップボード・検索・プレビュー状態は引き継がない。
+  // local COPY はアップロード先を選ぶための切替なので保持する。nextProjectId が
+  // null の場合、管理者は管理者ルート、一般ユーザーは未選択状態になる。
   const applyProjectSelection = useCallback(
     async (nextProjectId: string | null) => {
       if (
@@ -762,6 +1018,18 @@ function ManagedFilesScreen() {
       }
 
       const workspaceKey = locationKey("server", "workspace");
+      loadedLocationKeysRef.current.delete(
+        getFilesLoadIdentityKey("server", "workspace", selectedProjectId),
+      );
+      loadedLocationKeysRef.current.delete(
+        getFilesLoadIdentityKey("server", "workspace", nextProjectId),
+      );
+      explicitLocationPathsRef.current.delete(
+        getFilesLoadIdentityKey("server", "workspace", selectedProjectId),
+      );
+      explicitLocationPathsRef.current.delete(
+        getFilesLoadIdentityKey("server", "workspace", nextProjectId),
+      );
       // 旧プロジェクトの位置・履歴・親情報をクリアする。
       setPaths((prev) => ({ ...prev, [workspaceKey]: "" }));
       setHistories((prev) => ({ ...prev, [workspaceKey]: [] }));
@@ -769,8 +1037,15 @@ function ManagedFilesScreen() {
         ...prev,
         [workspaceKey]: { parentPath: null, canGoUp: false, isAdminMode: false },
       }));
-      // 旧プロジェクトのクリップボード・検索・編集／プレビュー状態を破棄する。
-      setClipboard(null);
+      // Server workspace の項目はProject境界で破棄し、local COPY は保持する。
+      setClipboard((current) =>
+        reconcileClipboardForSecurityContext(current, {
+          authScope,
+          projectId: nextProjectId,
+          source: "server",
+          scope: "workspace",
+        }),
+      );
       longPressedEntryKeyRef.current = null;
       setSelectedEntries([]);
       setActionTarget(null);
@@ -781,11 +1056,14 @@ function ManagedFilesScreen() {
       // The store updates synchronously, while persistence is asynchronous.
       // Awaiting the canonical setter lets bookmark navigation apply its path
       // only after the target Project selection has been committed.
+      handledProjectSelectionRef.current = { projectId: nextProjectId };
       await setSelectedProjectId(nextProjectId);
       setSource("server");
       setScope("workspace");
     },
     [
+      authScope,
+      getFilesLoadIdentityKey,
       scope,
       selectedProjectId,
       selectedSpaceId,
@@ -815,8 +1093,8 @@ function ManagedFilesScreen() {
     return previousPath;
   }, [activeHistory, activeKey]);
 
-  // 一般ユーザーの境界は維持する。管理者が境界を越えるときは
-  // プロジェクト選択を解除し、パスと表示範囲を同じ遷移で更新する。
+  // 一般ユーザーの境界は維持する。管理者はProjectContextの選択を
+  // canonicalなまま保ち、namespace親を参照してもHomeは元Project rootへ戻す。
   const isWorkspaceNavigationAllowed = useCallback(
     (targetPath: string) => {
       if (source !== "server" || scope !== "workspace") return true;
@@ -826,17 +1104,13 @@ function ManagedFilesScreen() {
   );
 
   const setNavigationPath = (targetPath: string) => {
-    if (source === "server" && scope === "workspace" && isAdmin &&
-        (selectedProjectId || selectedSpaceId) &&
-        !isFilesPathWithinRoot(targetPath, getServerRootPath("workspace"))) {
-      void setSelectedProjectId(null);
-    }
     setPathForLocation(source, scope, targetPath);
   };
 
   const parentPath = resolveFilesParentPath({
     source, scope, currentPath: activePath, isAdmin,
     projectRoot: getServerRootPath("workspace"),
+    scopeRoot: source === "server" ? getServerRootPath(scope) : undefined,
     parentPath: activeMeta.parentPath, canGoUp: activeMeta.canGoUp,
   });
 
@@ -888,6 +1162,7 @@ function ManagedFilesScreen() {
   };
 
   const openMediaViewer = (entry: FilesEntry) => {
+    setViewerChromeVisible(true);
     setViewerFile(entry);
     setViewerVisible(true);
   };
@@ -1150,55 +1425,6 @@ function ManagedFilesScreen() {
       }
     };
   }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    setViewerError(null);
-    setViewerSource(null);
-    setVideoUri(null);
-    if (!viewerFile || !viewerVisible) return;
-
-    const kind = getFilesMediaKind(viewerFile);
-    if (kind === "image") {
-      setViewerLoading(true);
-      void filesApi
-        .getMediaSource(viewerFile, { size: 1280 })
-        .then((sourceValue) => {
-          if (!cancelled) setViewerSource(sourceValue);
-        })
-        .catch((error) => {
-          if (!cancelled) {
-            setViewerError(
-              error instanceof Error ? error.message : "画像を表示できませんでした。",
-            );
-          }
-        })
-        .finally(() => {
-          if (!cancelled) setViewerLoading(false);
-        });
-    } else if (kind === "video") {
-      setVideoLoading(true);
-      void filesApi
-        .getPlayableUri(viewerFile)
-        .then((uri) => {
-          if (!cancelled) setVideoUri(uri);
-        })
-        .catch((error) => {
-          if (!cancelled) {
-            setViewerError(
-              error instanceof Error ? error.message : "動画を表示できませんでした。",
-            );
-          }
-        })
-        .finally(() => {
-          if (!cancelled) setVideoLoading(false);
-        });
-    }
-
-    return () => {
-      cancelled = true;
-    };
-  }, [viewerFile, viewerVisible]);
 
   const handleOpenEntry = async (entry: FilesEntry) => {
     const kind = resolveFilesOpenKind(entry);
@@ -1566,27 +1792,33 @@ function ManagedFilesScreen() {
     return true;
   };
 
-  // クリップボードの項目を現在地に貼り付けできるか。ソース一致だけでなく、
-  // サーバー・ワークスペースでは同一プロジェクト（同一ルート）であることを要求する。
-  const clipboardMatchesCurrent = useCallback(() => {
-    if (!clipboard) return false;
-    if (clipboard.source !== source) return false;
-    if (clipboard.scope !== scope) return false;
-    if (clipboard.authScope !== authScope) return false;
-    if (source === "server" && scope === "workspace") {
-      return (
-        clipboard.scope === "workspace" &&
-        clipboard.projectRoot === getServerRootPath("workspace")
-      );
-    }
-    return true;
-  }, [authScope, clipboard, getServerRootPath, scope, source]);
+  // 同一sourceの既存transferに加え、local COPY -> server uploadだけを許可する。
+  const clipboardMatchesCurrent = useCallback(
+    () =>
+      clipboardMatchesFilesLocation(clipboard, {
+        source,
+        scope,
+        path: activePath,
+        authScope,
+        projectRoot:
+          source === "server" && scope === "workspace"
+            ? getServerRootPath("workspace")
+            : null,
+      }),
+    [activePath, authScope, clipboard, getServerRootPath, scope, source],
+  );
 
   const pasteClipboard = async (
     destinationPath = activePath,
     destinationEntry: FilesEntry | null = null,
   ) => {
-    if (!clipboard || transferring) return;
+    if (
+      !clipboard ||
+      transferring ||
+      clipboardTransferRef.current ||
+      filesBatchUploadLockRef.current ||
+      uploadConflictWaiterRef.current
+    ) return;
     const canWriteDestination = destinationEntry
       ? canMutateEntry(destinationEntry, "write", true)
       : canMutateCurrentPath;
@@ -1596,12 +1828,17 @@ function ManagedFilesScreen() {
     }
     if (!clipboardMatchesCurrent()) {
       let mismatchMessage = "別プロジェクトの項目はここに貼り付けできません。";
-      if (clipboard.source !== source) {
-        mismatchMessage = "ローカルとサーバーをまたいだ貼り付けはできません。";
+      if (clipboard.authScope !== authScope) {
+        mismatchMessage = "別のアカウントの項目はここに貼り付けできません。";
+      } else if (clipboard.source !== source) {
+        mismatchMessage =
+          clipboard.source === "local" &&
+          source === "server" &&
+          clipboard.operation === "move"
+            ? "ローカルからサーバーへの移動には対応していません。コピーを選択してください。"
+            : "この向きのローカル・サーバー間貼り付けには対応していません。";
       } else if (clipboard.scope !== scope) {
         mismatchMessage = "別の領域の項目はここに貼り付けできません。";
-      } else if (clipboard.authScope !== authScope) {
-        mismatchMessage = "別のアカウントの項目はここに貼り付けできません。";
       }
       Alert.alert(
         "Files",
@@ -1609,10 +1846,12 @@ function ManagedFilesScreen() {
       );
       return;
     }
-    if (!canRouteClipboardEntries(clipboard, destinationPath)) {
+    if (!canRouteClipboardEntries(clipboard, destinationPath, source)) {
       Alert.alert(
         "Files",
-        "プロジェクトファイルのコピー・移動は同一プロジェクト内のみ利用できます。",
+        clipboard.source === "local" && source === "server"
+          ? "サーバーへ貼り付けできるのはローカルのファイルだけです。"
+          : "プロジェクトファイルのコピー・移動は同一プロジェクト内のみ利用できます。",
       );
       return;
     }
@@ -1628,18 +1867,77 @@ function ManagedFilesScreen() {
     }
 
     const clipboardAtStart = clipboard;
+    filesBatchUploadLockRef.current = "clipboard";
+    clipboardTransferRef.current = true;
     setTransferring(true);
     const requestLocation = {
       source,
       scope,
       path: activePath,
+      destinationPath,
       authScope,
       projectId: selectedProjectId,
     };
     const succeeded: FilesEntry[] = [];
     const failures: Array<{ entry: FilesEntry; error: unknown }> = [];
     try {
-      // Existing Files APIs are single-entry operations.  Execute them in a
+      if (
+        clipboard.source === "local" &&
+        source === "server" &&
+        clipboard.operation === "copy"
+      ) {
+        const uploadResult = await uploadLocalClipboardFiles(
+          clipboard.entries,
+          destinationPath,
+          (uploadSource, parentPath, asset, uploadOptions) =>
+            uploadOptions?.overwrite === true
+              ? filesApi.upload(uploadSource, parentPath, asset, {
+                  overwrite: true,
+                })
+              : filesApi.upload(uploadSource, parentPath, asset),
+          {
+            confirmConflicts: (conflicts) =>
+              confirmFilesUploadConflicts(conflicts, requestLocation),
+            isCurrent: () => isFilesUploadLocationCurrent(requestLocation),
+          },
+        );
+        const currentLocation = activeLocationRef.current;
+        const sameContext =
+          currentLocation.source === requestLocation.source &&
+          currentLocation.scope === requestLocation.scope &&
+          currentLocation.authScope === requestLocation.authScope &&
+          currentLocation.projectId === requestLocation.projectId;
+
+        // The destination cache belongs to Server, not to the local clipboard
+        // source. Invalidate it even if the user navigates during the upload.
+        filesLocationCache.invalidate({
+          source: requestLocation.source,
+          scope: requestLocation.scope,
+          authScope: requestLocation.authScope,
+          projectId: requestLocation.projectId,
+          path: destinationPath || undefined,
+        });
+        if (
+          sameContext &&
+          (currentLocation.path === requestLocation.path ||
+            currentLocation.path === destinationPath)
+        ) {
+          await loadEntries(
+            requestLocation.source,
+            requestLocation.scope,
+            currentLocation.path,
+            requestLocation.projectId,
+            { revalidate: true },
+          );
+        }
+        const uploadAlert = createFilesBatchUploadAlert(uploadResult);
+        if (uploadAlert) {
+          Alert.alert(uploadAlert.title, uploadAlert.message);
+        }
+        return;
+      }
+
+      // Existing Files APIs are single-entry operations. Execute them in a
       // deterministic sequence and retain explicit partial-failure state.
       for (const entry of clipboard.entries) {
         try {
@@ -1723,6 +2021,10 @@ function ManagedFilesScreen() {
           : "貼り付けに失敗しました。",
       );
     } finally {
+      if (filesBatchUploadLockRef.current === "clipboard") {
+        filesBatchUploadLockRef.current = null;
+      }
+      clipboardTransferRef.current = false;
       setTransferring(false);
     }
   };
@@ -1818,8 +2120,22 @@ function ManagedFilesScreen() {
   };
 
   const uploadFile = async () => {
-    if (!canMutateCurrentPath || uploadingRef.current) return;
+    if (
+      !canMutateCurrentPath ||
+      uploadingRef.current ||
+      filesBatchUploadLockRef.current ||
+      uploadConflictWaiterRef.current
+    ) return;
 
+    const requestLocation = {
+      source,
+      scope,
+      path: activePath,
+      destinationPath: activePath,
+      authScope,
+      projectId: selectedProjectId,
+    };
+    filesBatchUploadLockRef.current = "picker";
     uploadingRef.current = true;
     setUploading(true);
     try {
@@ -1828,27 +2144,52 @@ function ManagedFilesScreen() {
       );
       if (picked.canceled || !picked.assets?.length) return;
 
+      // The picker can remain open while the user changes account, project,
+      // scope, or folder. Never send a selected asset to a new destination.
+      if (!isFilesUploadLocationCurrent(requestLocation)) return;
+
       const result = await uploadPickedFiles(
         picked.assets,
-        (asset) => filesApi.upload(source, activePath, asset),
+        (asset, uploadOptions) =>
+          uploadOptions?.overwrite === true
+            ? filesApi.upload(
+                requestLocation.source,
+                requestLocation.path,
+                asset,
+                { overwrite: true },
+              )
+            : filesApi.upload(
+                requestLocation.source,
+                requestLocation.path,
+                asset,
+              ),
+        {
+          confirmConflicts: (conflicts) =>
+            confirmFilesUploadConflicts(conflicts, requestLocation),
+          isCurrent: () => isFilesUploadLocationCurrent(requestLocation),
+        },
       );
 
-      await loadEntries(source, scope, activePath, undefined, {
-        revalidate: true,
+      filesLocationCache.invalidate({
+        source: requestLocation.source,
+        scope: requestLocation.scope,
+        authScope: requestLocation.authScope,
+        projectId: requestLocation.projectId,
+        path: requestLocation.path || undefined,
       });
-
-      if (result.failures.length > 0) {
-        Alert.alert(
-          result.successCount > 0
-            ? "一部のアップロードに失敗しました"
-            : "アップロードに失敗しました",
-          [
-            "成功: " + result.successCount + "件 / 失敗: " + result.failures.length + "件",
-            ...result.failures.map(
-              (failure) => failure.name + ": " + failure.message,
-            ),
-          ].join("\n"),
+      if (isFilesUploadLocationCurrent(requestLocation)) {
+        await loadEntries(
+          requestLocation.source,
+          requestLocation.scope,
+          requestLocation.path,
+          requestLocation.projectId,
+          { revalidate: true },
         );
+      }
+
+      const uploadAlert = createFilesBatchUploadAlert(result);
+      if (uploadAlert) {
+        Alert.alert(uploadAlert.title, uploadAlert.message);
       }
     } catch (uploadError) {
       Alert.alert(
@@ -1858,6 +2199,9 @@ function ManagedFilesScreen() {
           : "アップロードに失敗しました。",
       );
     } finally {
+      if (filesBatchUploadLockRef.current === "picker") {
+        filesBatchUploadLockRef.current = null;
+      }
       uploadingRef.current = false;
       setUploading(false);
     }
@@ -2012,6 +2356,159 @@ function ManagedFilesScreen() {
     if (next) setViewerFile(next);
   };
 
+  const viewerMediaKey = useCallback(
+    (entry: FilesEntry) => `${entry.source}:${entry.path}`,
+    [],
+  );
+
+  const getViewerImageSource = useCallback(
+    async (entry: FilesEntry): Promise<MediaSource> => {
+      const key = viewerMediaKey(entry);
+      const cached = viewerImageSourceCacheRef.current.get(key);
+      if (cached) return cached;
+
+      const running = viewerImageSourceFlightRef.current.get(key);
+      if (running) return running;
+
+      const flight = filesApi
+        .getMediaSource(entry)
+        .then((sourceValue) => {
+          viewerImageSourceCacheRef.current.set(key, sourceValue);
+          return sourceValue;
+        })
+        .finally(() => {
+          if (viewerImageSourceFlightRef.current.get(key) === flight) {
+            viewerImageSourceFlightRef.current.delete(key);
+          }
+        });
+      viewerImageSourceFlightRef.current.set(key, flight);
+      return flight;
+    },
+    [viewerMediaKey],
+  );
+
+  const preloadViewerImage = useCallback(
+    async (entry: FilesEntry): Promise<MediaSource> => {
+      const key = viewerMediaKey(entry);
+      const uri = await filesApi.getPlayableUri(entry);
+      const sourceValue: MediaSource = { uri };
+      viewerImageSourceCacheRef.current.set(key, sourceValue);
+      return sourceValue;
+    },
+    [viewerMediaKey],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setViewerError(null);
+    setVideoUri(null);
+
+    if (!viewerVisible || !viewerFile) {
+      setViewerLoading(false);
+      setVideoLoading(false);
+      setViewerPreloadSources({});
+      return;
+    }
+
+    const currentKey = viewerMediaKey(viewerFile);
+    const neighbors = [viewableFiles[viewerIndex - 1], viewableFiles[viewerIndex + 1]]
+      .filter((entry): entry is FilesEntry => Boolean(entry))
+      .filter((entry) => getFilesMediaKind(entry) === "image");
+
+    const wantedPreloadKeys = new Set(
+      neighbors.map((entry) => viewerMediaKey(entry)),
+    );
+    setViewerPreloadSources((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).filter(([key]) => wantedPreloadKeys.has(key)),
+      ),
+    );
+
+    for (const entry of neighbors) {
+      const key = viewerMediaKey(entry);
+      void preloadViewerImage(entry)
+        .then((sourceValue) => {
+          if (cancelled) return;
+          setViewerPreloadSources((previous) => ({
+            ...previous,
+            [key]: sourceValue,
+          }));
+        })
+        .catch(() => {
+          // Preload failures must not block the current image. If the user
+          // navigates there, the normal viewer load surfaces the real error.
+        });
+    }
+
+    const kind = getFilesMediaKind(viewerFile);
+    if (kind === "image") {
+      setVideoLoading(false);
+      const cached = viewerImageSourceCacheRef.current.get(currentKey);
+      if (cached) {
+        setViewerSource(cached);
+        setViewerLoading(!viewerImageReadyRef.current.has(currentKey));
+      } else {
+        setViewerSource(null);
+        setViewerLoading(true);
+      }
+
+      void getViewerImageSource(viewerFile)
+        .then((sourceValue) => {
+          if (cancelled) return;
+          setViewerSource(sourceValue);
+          setViewerLoading(!viewerImageReadyRef.current.has(currentKey));
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setViewerLoading(false);
+          setViewerError(
+            error instanceof Error ? error.message : "画像を表示できませんでした。",
+          );
+        });
+    } else if (kind === "video") {
+      setViewerSource(null);
+      setViewerLoading(false);
+      setVideoLoading(true);
+      void filesApi
+        .getPlayableUri(viewerFile)
+        .then((uri) => {
+          if (!cancelled) setVideoUri(uri);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setViewerError(
+              error instanceof Error ? error.message : "動画を表示できませんでした。",
+            );
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setVideoLoading(false);
+        });
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    getViewerImageSource,
+    preloadViewerImage,
+    viewerFile,
+    viewerIndex,
+    viewerMediaKey,
+    viewerVisible,
+    viewableFiles,
+  ]);
+
+  useEffect(() => {
+    if (viewerVisible) return;
+    setViewerSource(null);
+    setViewerPreloadSources({});
+    setViewerLoading(false);
+    setVideoLoading(false);
+    setVideoUri(null);
+    viewerImageReadyRef.current.clear();
+  }, [viewerVisible]);
+
   const handleVideoFullscreenUpdate = async (
     event: VideoFullscreenUpdateEvent,
   ) => {
@@ -2102,18 +2599,34 @@ function ManagedFilesScreen() {
     actionTarget?.type === "directory"
       ? canMutateEntry(actionTarget, "write", true)
       : canMutateCurrentPath;
+  const pasteProjectRoot =
+    source === "server" && scope === "workspace"
+      ? getServerRootPath("workspace")
+      : null;
   const canPasteToActionTarget =
     Boolean(actionTarget) &&
-    clipboardMatchesCurrent() &&
-    Boolean(actionPasteDestination) &&
-    canWritePasteDestination &&
-    canRouteClipboardEntries(clipboard, actionPasteDestination);
-  const canPasteClipboard =
-    Boolean(clipboard) &&
-    clipboardMatchesCurrent() &&
-    Boolean(activePath) &&
-    canMutateCurrentPath &&
-    canRouteClipboardEntries(clipboard, activePath);
+    canPasteClipboardToFilesLocation(
+      clipboard,
+      {
+        source,
+        scope,
+        path: actionPasteDestination || "",
+        authScope,
+        projectRoot: pasteProjectRoot,
+      },
+      canWritePasteDestination,
+    );
+  const canPasteClipboard = canPasteClipboardToFilesLocation(
+    clipboard,
+    {
+      source,
+      scope,
+      path: activePath,
+      authScope,
+      projectRoot: pasteProjectRoot,
+    },
+    canMutateCurrentPath,
+  );
 
   const renderListItem = ({ item }: { item: FilesEntry }) => {
     const selected = selectedEntryKeys.has(fileEntrySelectionKey(item));
@@ -2235,48 +2748,46 @@ function ManagedFilesScreen() {
 
   return (
     <View style={styles.container}>
-      <ScreenHeader title="Files" />
-      <NativeStorageWorkspace>
+      <ScreenHeader title="Files" compact />
+      <NativeStorageWorkspace
+        controls={(storageGear) => (
+          <>
       <Surface style={styles.header} elevation={1}>
         <View style={styles.segmentRow} testID="files-location-switcher">
           {(["local", "server"] as FilesSource[]).map((value) => (
-            <Chip
+            <FilesHeaderChip
               key={value}
-              compact
-              showSelectedCheck={false}
               selected={source === value}
-              style={source === value ? styles.segmentChipActive : styles.segmentChip}
-              textStyle={styles.segmentChipText}
               testID={`files-source-${value}`}
               onPress={() => void changeSource(value)}
             >
               {SOURCE_LABELS[value]}
-            </Chip>
+            </FilesHeaderChip>
           ))}
           {source === "server" ? (
             <View style={styles.scopeSegments}>
               {(["workspace", "user"] as FilesScope[]).map((value) => (
-                <Chip
+                <FilesHeaderChip
                   key={value}
-                  compact
-                  showSelectedCheck={false}
                   selected={scope === value}
-                  style={scope === value ? styles.scopeChipActive : styles.segmentChip}
-                  textStyle={styles.segmentChipText}
+                  variant="scope"
                   disabled={!isAuthenticated}
                   testID={`files-scope-${value}`}
                   onPress={() => void changeScope(value)}
                 >
                   {SCOPE_LABELS[value]}
-                </Chip>
+                </FilesHeaderChip>
               ))}
             </View>
           ) : null}
           {showProjectSelector ? (
-            <ScopeSwitcher variant="inline" projects={projects} projectId={selectedProjectId}
-              onSelectProject={applyProjectSelection} allowAll={isAdmin}
-              allLabel={isAdmin ? "管理者ルート" : "プロジェクトを選択"} />
+            <View style={styles.projectScopeSlot} testID="files-project-scope-slot">
+              <ScopeSwitcher variant="inline" projects={projects} projectId={selectedProjectId}
+                onSelectProject={applyProjectSelection} allowAll={isAdmin}
+                allLabel={isAdmin ? "管理者ルート" : "プロジェクトを選択"} />
+            </View>
           ) : null}
+          {storageGear ? <View style={styles.storageGearSlot}>{storageGear}</View> : null}
         </View>
       </Surface>
 
@@ -2293,7 +2804,6 @@ function ManagedFilesScreen() {
           />
           <Text
             style={styles.selectionCount}
-            numberOfLines={1}
             testID="files-selection-count"
           >
             {fileSelectionCount(selectedEntries)}件選択
@@ -2360,7 +2870,8 @@ function ManagedFilesScreen() {
               <IconButton
                 icon="plus-box-outline"
                 size={22}
-                style={{width:48,height:48,margin:0}}
+                style={{width:40,height:40,margin:0}}
+                hitSlop={4}
                 iconColor="#89b4fa"
                 disabled={!canMutateCurrentPath}
                 onPress={() => setCreateMenuVisible(true)}
@@ -2425,30 +2936,11 @@ function ManagedFilesScreen() {
         </View>
       ) : null}
 
-      <FullScreenModalShell
-        visible={bookmarksVisible}
-        title="ブックマーク"
-        onClose={() => setBookmarksVisible(false)}
-        testID="files-bookmarks-modal"
-      >
-        <Text style={styles.bookmarkPath}>
-          {source === "local" ? "Local" : scope === "workspace" ? selectedProject?.name || "プロジェクト未選択" : "User"}
+      {error ? (
+        <Text accessibilityRole="alert" style={styles.errorBanner}>
+          {error}
         </Text>
-        {bookmarkItems.length === 0 ? (
-          <Text>この領域にはブックマークがありません。</Text>
-        ) : bookmarkItems.map((bookmark) => (
-          <Pressable
-            key={normalizeFileBookmarkPath(bookmark.path)}
-            accessibilityRole="button"
-            accessibilityLabel={`${bookmark.name}: ${fileBookmarkRelativePath(bookmark.path, bookmarkRootPath)}`}
-            style={styles.bookmarkItem}
-            onPress={() => { setBookmarksVisible(false); void navigateBookmark(bookmark); }}
-          >
-            <Text style={styles.bookmarkName}>{bookmark.name}</Text>
-            <Text style={styles.bookmarkPath}>{fileBookmarkRelativePath(bookmark.path, bookmarkRootPath)}</Text>
-          </Pressable>
-        ))}
-      </FullScreenModalShell>
+      ) : null}
 
       {searchVisible ? (
         <View style={styles.searchRow}>
@@ -2468,46 +2960,6 @@ function ManagedFilesScreen() {
           />
         </View>
       ) : null}
-
-      {loading ? (
-        <View style={styles.center}>
-          <ActivityIndicator size="large" color="#7c3aed" />
-        </View>
-      ) : (
-        <FlatList
-          testID="files-list"
-          style={styles.list}
-          key={viewMode}
-          data={filteredItems}
-          keyExtractor={(item) => `${item.source}:${item.path}`}
-          renderItem={viewMode === "grid" ? renderGridItem : renderListItem}
-          numColumns={viewMode === "grid" ? 3 : 1}
-          ItemSeparatorComponent={
-            viewMode === "list" ? () => <Divider style={styles.divider} /> : undefined
-          }
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={onRefresh}
-              tintColor="#7c3aed"
-            />
-          }
-          ListEmptyComponent={
-            <View style={styles.center}>
-              <Text style={styles.emptyText}>
-                {error || "この場所にはまだファイルがありません。"}
-              </Text>
-            </View>
-          }
-          contentContainerStyle={
-            filteredItems.length === 0
-              ? { flexGrow: 1 }
-              : viewMode === "grid"
-                ? styles.gridContent
-                : undefined
-          }
-        />
-      )}
 
       {audioState.track ? (
         <Surface style={styles.audioBar} elevation={3}>
@@ -2563,6 +3015,74 @@ function ManagedFilesScreen() {
           />
         </Surface>
       ) : null}
+          </>
+        )}
+      >
+
+      <FullScreenModalShell
+        visible={bookmarksVisible}
+        title="ブックマーク"
+        onClose={() => setBookmarksVisible(false)}
+        testID="files-bookmarks-modal"
+      >
+        <Text style={styles.bookmarkPath}>
+          {source === "local" ? "Local" : scope === "workspace" ? selectedProject?.name || "プロジェクト未選択" : "User"}
+        </Text>
+        {bookmarkItems.length === 0 ? (
+          <Text>この領域にはブックマークがありません。</Text>
+        ) : bookmarkItems.map((bookmark) => (
+          <Pressable
+            key={normalizeFileBookmarkPath(bookmark.path)}
+            accessibilityRole="button"
+            accessibilityLabel={`${bookmark.name}: ${fileBookmarkRelativePath(bookmark.path, bookmarkRootPath)}`}
+            style={styles.bookmarkItem}
+            onPress={() => { setBookmarksVisible(false); void navigateBookmark(bookmark); }}
+          >
+            <Text style={styles.bookmarkName}>{bookmark.name}</Text>
+            <Text style={styles.bookmarkPath}>{fileBookmarkRelativePath(bookmark.path, bookmarkRootPath)}</Text>
+          </Pressable>
+        ))}
+      </FullScreenModalShell>
+
+      {loading ? (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color="#7c3aed" />
+        </View>
+      ) : (
+        <FlatList
+          testID="files-list"
+          style={styles.list}
+          key={viewMode}
+          data={filteredItems}
+          keyExtractor={(item) => `${item.source}:${item.path}`}
+          renderItem={viewMode === "grid" ? renderGridItem : renderListItem}
+          numColumns={viewMode === "grid" ? 3 : 1}
+          ItemSeparatorComponent={
+            viewMode === "list" ? () => <Divider style={styles.divider} /> : undefined
+          }
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor="#7c3aed"
+            />
+          }
+          ListEmptyComponent={
+            <View style={styles.center}>
+              <Text style={styles.emptyText}>
+                この場所にはまだファイルがありません。
+              </Text>
+            </View>
+          }
+          contentContainerStyle={
+            filteredItems.length === 0
+              ? { flexGrow: 1 }
+              : viewMode === "grid"
+                ? styles.gridContent
+                : undefined
+          }
+        />
+      )}
 
       <Portal>
         <Dialog
@@ -2709,6 +3229,51 @@ function ManagedFilesScreen() {
           </Dialog.Actions>
         </Dialog>
 
+        <Dialog
+          visible={Boolean(uploadConflictDialog)}
+          onDismiss={() => settleUploadConflict("skip")}
+          style={styles.uploadConflictDialog}
+          testID="files-upload-conflict-dialog"
+        >
+          <Dialog.Title style={styles.dialogTitle}>
+            同名ファイルを一括確認
+          </Dialog.Title>
+          <Dialog.Content>
+            <Text style={styles.dialogLabel}>
+              {uploadConflictDialog?.conflicts.length ?? 0}件の同名ファイルが見つかりました。すべて上書きするか、すべてスキップしてください。
+            </Text>
+          </Dialog.Content>
+          <Dialog.ScrollArea style={styles.uploadConflictScrollArea}>
+            <ScrollView contentContainerStyle={styles.uploadConflictList}>
+              {uploadConflictDialog?.conflicts.map((conflict) => (
+                <Text
+                  key={`${conflict.index}:${conflict.name}`}
+                  style={styles.uploadConflictName}
+                  numberOfLines={2}
+                >
+                  {conflict.name}
+                </Text>
+              ))}
+            </ScrollView>
+          </Dialog.ScrollArea>
+          <Dialog.Actions>
+            <Button
+              textColor="#a6adc8"
+              onPress={() => settleUploadConflict("skip")}
+              disabled={!uploadConflictWaiterRef.current}
+            >
+              すべてスキップ
+            </Button>
+            <Button
+              textColor="#f38ba8"
+              onPress={() => settleUploadConflict("overwrite")}
+              disabled={!uploadConflictWaiterRef.current}
+            >
+              すべて上書き
+            </Button>
+          </Dialog.Actions>
+        </Dialog>
+
         <FileNameDialog
           visible={createFileVisible}
           title="テキストファイルを作成"
@@ -2748,29 +3313,35 @@ function ManagedFilesScreen() {
         onRequestClose={() => setViewerVisible(false)}
       >
         <View style={styles.viewerContainer}>
-          <View style={styles.viewerHeader}>
-            <Text style={styles.viewerTitle} numberOfLines={1}>
-              {viewerFile?.name || ""}
-            </Text>
-            <IconButton
-              icon="close"
-              iconColor="#ffffff"
-              onPress={() => setViewerVisible(false)}
-            />
-          </View>
-
           <View style={styles.viewerBody}>
-            {viewerLoading || videoLoading ? (
-              <ActivityIndicator size="large" color="#a78bfa" />
-            ) : viewerError ? (
+            {viewerError ? (
               <Text style={styles.viewerError}>{viewerError}</Text>
-            ) : viewerFile && getFilesMediaKind(viewerFile) === "image" && viewerSource ? (
-              <ZoomableImage
-                source={viewerSource}
-                onError={() => setViewerError("画像を表示できませんでした。")}
-                onSwipeLeft={() => navigateViewer(1)}
-                onSwipeRight={() => navigateViewer(-1)}
-              />
+            ) : viewerFile && getFilesMediaKind(viewerFile) === "image" ? (
+              <>
+                {viewerSource ? (
+                  <ZoomableImage
+                    source={viewerSource}
+                    onLoad={() => {
+                      const key = viewerMediaKey(viewerFile);
+                      viewerImageReadyRef.current.add(key);
+                      setViewerLoading(false);
+                    }}
+                    onError={() => {
+                      setViewerLoading(false);
+                      setViewerError("画像を表示できませんでした。");
+                    }}
+                    onSingleTap={() => setViewerChromeVisible((visible) => !visible)}
+                    onSwipeLeft={() => navigateViewer(1)}
+                    onSwipeRight={() => navigateViewer(-1)}
+                    onSwipeDown={() => setViewerVisible(false)}
+                  />
+                ) : null}
+                {viewerLoading ? (
+                  <View pointerEvents="none" style={styles.viewerLoadingOverlay}>
+                    <ActivityIndicator size="large" color="#a78bfa" />
+                  </View>
+                ) : null}
+              </>
             ) : viewerFile && getFilesMediaKind(viewerFile) === "video" && videoUri ? (
               <Video
                 ref={videoRef}
@@ -2783,28 +3354,71 @@ function ManagedFilesScreen() {
                   void handleVideoFullscreenUpdate(event);
                 }}
               />
+            ) : videoLoading ? (
+              <ActivityIndicator size="large" color="#a78bfa" />
             ) : (
               <Text style={styles.viewerError}>プレビューを表示できません。</Text>
             )}
+
+            <View
+              pointerEvents="none"
+              accessibilityElementsHidden
+              importantForAccessibility="no-hide-descendants"
+              style={styles.viewerPreloadLayer}
+            >
+              {Object.entries(viewerPreloadSources).map(([key, sourceValue]) => (
+                <Image
+                  key={key}
+                  source={sourceValue}
+                  resizeMode="contain"
+                  style={styles.viewerPreloadImage}
+                  onLoad={() => {
+                    viewerImageReadyRef.current.add(key);
+                  }}
+                />
+              ))}
+            </View>
           </View>
 
-          <View style={styles.viewerFooter}>
-            <IconButton
-              icon="chevron-left"
-              iconColor="#ffffff"
-              disabled={viewerIndex <= 0}
-              onPress={() => navigateViewer(-1)}
-            />
-            <Text style={styles.viewerCount}>
-              {viewerIndex >= 0 ? `${viewerIndex + 1} / ${viewableFiles.length}` : ""}
-            </Text>
-            <IconButton
-              icon="chevron-right"
-              iconColor="#ffffff"
-              disabled={viewerIndex < 0 || viewerIndex >= viewableFiles.length - 1}
-              onPress={() => navigateViewer(1)}
-            />
-          </View>
+          {viewerChromeVisible ? (
+            <>
+              <SafeAreaView
+                edges={["top", "left", "right"]}
+                style={styles.viewerHeader}
+              >
+                <Text style={styles.viewerTitle}>
+                  {viewerFile?.name || ""}
+                </Text>
+                <IconButton
+                  icon="close"
+                  iconColor="#ffffff"
+                  style={styles.viewerClose}
+                  onPress={() => setViewerVisible(false)}
+                />
+              </SafeAreaView>
+
+              <SafeAreaView
+                edges={["bottom", "left", "right"]}
+                style={styles.viewerFooter}
+              >
+                <IconButton
+                  icon="chevron-left"
+                  iconColor="#ffffff"
+                  disabled={viewerIndex <= 0}
+                  onPress={() => navigateViewer(-1)}
+                />
+                <Text style={styles.viewerCount}>
+                  {viewerIndex >= 0 ? `${viewerIndex + 1} / ${viewableFiles.length}` : ""}
+                </Text>
+                <IconButton
+                  icon="chevron-right"
+                  iconColor="#ffffff"
+                  disabled={viewerIndex < 0 || viewerIndex >= viewableFiles.length - 1}
+                  onPress={() => navigateViewer(1)}
+                />
+              </SafeAreaView>
+            </>
+          ) : null}
         </View>
       </Modal>
       </NativeStorageWorkspace>
@@ -2816,26 +3430,60 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   header: {
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingVertical: 2,
     backgroundColor: "#1e1e2e",
   },
-  segmentRow: { flexDirection: "row", alignItems: "center", gap: 2, minHeight: 36 },
-  scopeSegments: { flexDirection: "row", gap: 2, marginLeft: 2 },
+  segmentRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 4,
+    minHeight: 36,
+  },
+  storageGearSlot: { marginLeft: "auto" },
+  // 折り返し行の残り幅へ押し込まれると1文字ずつ縦に折り返すため、
+  // 最小幅を確保して入らない場合は行ごと次段へ送り、残り幅を占有させる。
+  projectScopeSlot: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 140,
+    minWidth: 120,
+    height: 36,
+    justifyContent: "center",
+    backgroundColor: "#313244",
+    borderRadius: 14,
+  },
+  scopeSegments: { flexDirection: "row", flexWrap: "wrap", gap: 4, marginLeft: 2 },
   list: { flex: 1, minHeight: 0 },
-  segmentChip: { backgroundColor: "#313244" },
+  segmentChip: {
+    maxWidth: "100%",
+    minHeight: 32,
+    flexShrink: 1,
+    justifyContent: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 16,
+    backgroundColor: "#313244",
+  },
   segmentChipActive: { backgroundColor: "#4c1d95" },
   scopeChipActive: { backgroundColor: "#3b2f5f" },
-  // Paper Chip sets marginLeft/Right internally; marginHorizontal cannot override them.
-  segmentChipText: { color: "#cdd6f4", fontSize: 12, marginLeft: 4, marginRight: 4 },
+  segmentChipDisabled: { opacity: 0.5 },
+  segmentChipText: {
+    color: "#cdd6f4",
+    fontSize: 12,
+    flexShrink: 1,
+    flexWrap: "wrap",
+    textAlign: "center",
+  },
   toolbarRow: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 48,
+    minHeight: 40,
     paddingHorizontal: 4,
     backgroundColor: "#181825",
   },
-  selectionToolbar: { paddingHorizontal: 2 },
-  selectionControl: { width: 48, height: 48, margin: 0 },
+  selectionToolbar: { paddingHorizontal: 2, flexWrap: "wrap", gap: 2 },
+  selectionControl: { width: 40, height: 40, margin: 0 },
   selectionCount: {
     color: "#cdd6f4",
     fontSize: 14,
@@ -2864,6 +3512,12 @@ const styles = StyleSheet.create({
   },
   offlineBannerIcon: { margin: 0 },
   offlineBannerText: { color: "#f9e2af", fontSize: 12, flex: 1 },
+  errorBanner: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#f38ba8",
+    backgroundColor: "#2a1c28",
+  },
   fileItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -2959,6 +3613,10 @@ const styles = StyleSheet.create({
   actionDialog: { backgroundColor: "#1e1e2e", maxHeight: "92%" },
   actionScrollArea: { maxHeight: 390, paddingHorizontal: 0 },
   actionList: { gap: 2, paddingVertical: 4 },
+  uploadConflictDialog: { backgroundColor: "#1e1e2e", maxHeight: "92%" },
+  uploadConflictScrollArea: { maxHeight: 360, paddingHorizontal: 0 },
+  uploadConflictList: { gap: 8, paddingHorizontal: 24, paddingVertical: 8 },
+  uploadConflictName: { color: "#cdd6f4", fontSize: 13, lineHeight: 18 },
   actionButtonContent: { minHeight: 42, justifyContent: "flex-start" },
   actionButtonLabel: { flexGrow: 1, textAlign: "left" },
   dialogTitle: { color: "#cdd6f4" },
@@ -2980,28 +3638,66 @@ const styles = StyleSheet.create({
   audioProgress: { height: 3, borderRadius: 2, marginTop: 5 },
   viewerContainer: { flex: 1, backgroundColor: "#050509" },
   viewerHeader: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 4,
     minHeight: 56,
     paddingTop: 10,
+    paddingBottom: 10,
     paddingHorizontal: 8,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
+    backgroundColor: "rgba(5, 5, 9, 0.72)",
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#313244",
   },
-  viewerTitle: { flex: 1, color: "#ffffff", fontSize: 14, fontWeight: "600" },
+  viewerTitle: {
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+    color: "#ffffff",
+    fontSize: 14,
+    lineHeight: 20,
+    fontWeight: "600",
+    paddingVertical: 4,
+  },
+  viewerClose: { width: 48, height: 48, margin: 0, flexShrink: 0 },
   viewerBody: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    padding: 8,
   },
   viewerVideo: { width: "100%", height: "100%" },
   viewerError: { color: "#fca5a5", fontSize: 14, textAlign: "center" },
+  viewerLoadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(5, 5, 9, 0.32)",
+  },
+  viewerPreloadLayer: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    left: 0,
+    top: 0,
+    opacity: 0.001,
+    overflow: "hidden",
+  },
+  viewerPreloadImage: { width: 1, height: 1 },
   viewerFooter: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 4,
     minHeight: 64,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "rgba(5, 5, 9, 0.72)",
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: "#313244",
   },

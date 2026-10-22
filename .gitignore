@@ -28,6 +28,8 @@ ENV/
 
 # Local scratch
 .local/
+.tmp/
+.cache/
 
 # IDE
 .idea/
@@ -57,6 +59,11 @@ config/miotts_presets/
 data/character_voice_assets/
 data/character_voice_captures/
 data/generated_media/
+# Local agent task records/event logs (Home MCP Gateway delegation)
+data/local_agent_tasks/
+# Persistent local search indexes, manifests, and promotion receipts
+/data/search/
+/data/operations_artifacts/
 
 # OS
 .DS_Store
@@ -123,6 +130,7 @@ artifacts/
 *_credentials.json
 .mcp.json
 /.runtime-secrets/
+/cookies/
 
 # SSL certificates (private keys should never be committed)
 certs/
@@ -156,6 +164,9 @@ aoitalk-mobile.apk
 
 # Skill録画の一時データ
 data/skill_recordings/
+/data/mobile_server_identity-*.json
+/data/mobile_server_identity-*.json.lock
+/data/.mobile_server_identity-*.json.*.tmp
 tests/.artifacts/
 
 # Generated local Edge Native Messaging installation
@@ -164,3 +175,8 @@ tests/.artifacts/
 # Portable PC Bridge local executable and per-PC connection settings
 /AoiTalk-PC-Bridge.exe
 /AoiTalk-PC-Bridge-data/
+/data/pc-bridge-qa/
+/data/browser-profiles/
+# Generated az-vnetspace wiki build output
+/deploy/az-vnetspace-wiki/.site-dist/
+/deploy/az-vnetspace-wiki/.site-build-report.json

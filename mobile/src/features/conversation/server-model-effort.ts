@@ -17,8 +17,10 @@ export function resolveServerModelEffort(
   // Existing persisted catalogs may not contain capability metadata. Known
   // direct-provider models have the same public contract on the server route.
   // An explicit [] is authoritative and must never be replaced by a fallback.
-  const choices = model?.reasoningEffortOptions ?? (model && isDirectMobileLlmProvider(model.provider)
-    ? getDirectReasoningEffortOptions(model.provider, model.model) : []);
+  const choices = model?.supportsReasoning === false
+    ? []
+    : model?.reasoningEffortOptions ?? (model && isDirectMobileLlmProvider(model.provider)
+      ? getDirectReasoningEffortOptions(model.provider, model.model) : []);
   const options = [...new Set(choices.filter((value) => typeof value === "string" && value.length > 0))];
   const preferred = model?.reasoningEffortDefault;
   const defaultValue = preferred && options.includes(preferred) ? preferred

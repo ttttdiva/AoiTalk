@@ -9,9 +9,11 @@ import json
 import math
 import os
 import stat
+import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -164,7 +166,7 @@ class SkillTargetLock:
 
     @staticmethod
     def _lock_handle(handle: Any) -> None:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             handle.seek(0)
@@ -176,7 +178,7 @@ class SkillTargetLock:
 
     @staticmethod
     def _unlock_handle(handle: Any) -> None:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             handle.seek(0)
@@ -190,7 +192,11 @@ class SkillTargetLock:
         limit = _resolve_timeout(timeout)
         deadline = None if math.isinf(limit) else time.monotonic() + limit
         self._cancel_event.clear()
-        self._acquire_local(deadline)
+        if limit == 0:
+            if not self._local.acquire(blocking=False):
+                raise SkillTargetLockTimeout(f"Skill target lock timed out: {self.target_path}")
+        else:
+            self._acquire_local(deadline)
         self._local_acquired = True
         handle = None
         try:
@@ -257,10 +263,10 @@ def skill_target_lock(path: str | os.PathLike[str]) -> SkillTargetLock:
 
 
 @asynccontextmanager
-async def async_skill_target_lock(path: str | os.PathLike[str]):
+async def async_skill_target_lock(path: str | os.PathLike[str], *, timeout: float | None = None):
     """Async wrapper around the same sync/OS lock used by direct writers."""
     lock = skill_target_lock(path)
-    worker = asyncio.create_task(asyncio.to_thread(lock.acquire))
+    worker = asyncio.create_task(asyncio.to_thread(lock.acquire, timeout))
     try:
         await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -421,14 +427,15 @@ def clear_skill_transition_journal(path: str | os.PathLike[str]) -> None:
 
 def publish_skill_text(path: str | os.PathLike[str], text: str) -> None:
     """Direct writer publication: lock, reject in-flight proposal, atomic replace."""
-    with skill_target_lock(path):
+    with skill_target_lock(skill_namespace_lock_key(path)), skill_target_lock(path):
         assert_skill_target_stable(path)
+        assert_skill_aliases_available(path, text)
         atomic_replace_text(path, text)
 
 
 def delete_skill_text(path: str | os.PathLike[str]) -> bool:
     """Direct writer deletion under the same per-target lock."""
-    with skill_target_lock(path):
+    with skill_target_lock(skill_namespace_lock_key(path)), skill_target_lock(path):
         assert_skill_target_stable(path)
         target = Path(path)
         existed = target.exists()
@@ -436,10 +443,50 @@ def delete_skill_text(path: str | os.PathLike[str]) -> bool:
         return existed
 
 
+def skill_namespace_lock_key(path: str | os.PathLike[str]) -> Path:
+    """Reuse the existing cross-process lock for the canonical namespace.
+
+    Lock order is always namespace, then target. This is a lock key, not an
+    additional registry/file format. Project markdown has no alias metadata.
+    """
+    target = Path(path)
+    root = target.parent.parent if target.name == "SKILL.md" else target.parent
+    return root / ".skill-publication-namespace"
+
+
+def assert_skill_aliases_available(path: str | os.PathLike[str], text: str) -> None:
+    """Recheck canonical names AND aliases while the namespace lock is held."""
+    target = Path(path)
+    if target.suffix not in {".yaml", ".yml"}:
+        return
+    import yaml
+
+    def identities(item: Path, content: str) -> set[str]:
+        raw = yaml.safe_load(content)
+        if not isinstance(raw, dict):
+            raise SkillTargetIOError("invalid canonical Skill namespace")
+        aliases = raw.get("aliases", [])
+        name = raw.get("name", item.stem)
+        if not isinstance(name, str) or not isinstance(aliases, list) or any(not isinstance(v, str) for v in aliases):
+            raise SkillTargetIOError("invalid canonical Skill identities")
+        return {unicodedata.normalize("NFKC", value).strip().casefold()
+                for value in [item.stem, name, *aliases] if value.strip()}
+
+    wanted = identities(target, text)
+    for peer in sorted([*target.parent.glob("*.yaml"), *target.parent.glob("*.yml")]):
+        if peer.resolve() == target.resolve():
+            continue
+        content = read_stable_skill_text(peer)
+        if content is not None and wanted & identities(peer, content):
+            raise SkillTargetIOError("Skill canonical name or alias already belongs to another Skill")
+
+
 __all__ = [
     "SkillTargetIOError",
     "SkillTargetLockTimeout",
     "SkillTargetTransitionPending",
+    "assert_skill_aliases_available",
+    "skill_namespace_lock_key",
     "async_skill_target_lock",
     "assert_skill_target_stable",
     "atomic_remove",

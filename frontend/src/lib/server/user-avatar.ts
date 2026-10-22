@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import sharp from "sharp";
+import sharp, { type Metadata } from "sharp";
 import { getWorkspacesBaseDir } from "@/lib/server/project-workspace-management";
 
 /** プロフィールアイコンとして受け付ける最大バイト数。 */
@@ -201,7 +201,7 @@ export async function validateAvatarImage(
     throw new Error("avatar MIME does not match the file signature");
   }
 
-  let metadata: sharp.Metadata;
+  let metadata: Metadata;
   try {
     metadata = await sharp(Buffer.from(bytes), { failOn: "error" }).metadata();
   } catch (error) {

@@ -1727,6 +1727,11 @@ build_app_image() {
     offline_root="$(offline_inputs_root)"
     if [[ -n "$offline_root" ]]; then
         verify_offline_inputs "$offline_root"
+        # No external Dockerfile frontend is available on the restricted target.
+        # The canonical packager removes the syntax directive for this reason.
+        if grep -Eiq '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' "$AOITALK_BUNDLE_ROOT/Dockerfile"; then
+            die "offline handoff Dockerfile must use the bundled frontend without a syntax directive"
+        fi
         [[ -d "$offline_root/npm-cache" && ! -L "$offline_root/npm-cache" ]] || die "verified offline npm cache directory is missing or symlinked"
         if [[ -n "${AOITALK_NPM_CACHE_DIR:-}" && "$AOITALK_NPM_CACHE_DIR" != "$offline_root/npm-cache" ]]; then
             die "AOITALK_NPM_CACHE_DIR must be the verified offline input npm-cache when AOITALK_OFFLINE_INPUTS_DIR is set"
@@ -1734,7 +1739,7 @@ build_app_image() {
         while IFS=$'\t' read -r image_name layout platform_manifest_digest; do
             [[ -n "$image_name" && -n "$layout" && -n "$platform_manifest_digest" ]] || continue
             case "$image_name" in
-                dockerfile-node) offline_context_args+=(--build-arg BUILDKIT_SYNTAX=dockerfile.v0 --build-context "enterprise-node-base=oci-layout://$offline_root/$layout@$platform_manifest_digest") ;;
+                dockerfile-node) offline_context_args+=(--build-context "enterprise-node-base=oci-layout://$offline_root/$layout@$platform_manifest_digest") ;;
                 dockerfile-python) offline_context_args+=(--build-context "enterprise-python-base=oci-layout://$offline_root/$layout@$platform_manifest_digest") ;;
                 *) ;;
             esac

@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "scope": "implementation_handoff_not_runtime_registration",
+  "shared_policy": {
+    "registration_state": "disabled_design_only",
+    "execution_route": "local_only",
+    "automatic_cloud_fallback": false,
+    "autostart": false,
+    "create_permissions_or_accounts": false,
+    "shared_project_projection": false,
+    "external_private_data_transmission": "requires_explicit_scoped_human_approval_not_created",
+    "owner_id_input_allowed": false
+  },
+  "agents": [
+    {
+      "id": "personal-firearms-admin",
+      "label": "所持許可・講習等の期限整理",
+      "priority": 1,
+      "allowed_kinds": [
+        "deadline"
+      ],
+      "tools": [
+        "private.source.extract",
+        "private.draft.propose",
+        "private.ledger.state",
+        "private.reminder.propose"
+      ],
+      "system_prompt": "あなたは本人専用の行政手続の記録係。本人が指定した書類や文面に明記された日付だけを根拠付き候補に整理し、未確認・確認済み・完了を区別する。第1段階では法定期限・更新周期・申請資格は算出/断定しない。将来の更新期限自動化は未完了要件として保持し、管轄に適合する公式規則のレビューと必要な本人の日付情報が揃うまで有効化しない。本人の画面操作なしに確認済み/完了にしない。銃の使用・改造・入手の助言は扱わない。許可番号・個人情報を鍵やログへ入れない。残り作業と確認すべき書類箇所を短く返す。"
+    },
+    {
+      "id": "personal-ammunition-bookkeeper",
+      "label": "弾薬の記帳・照合",
+      "priority": 2,
+      "allowed_kinds": [
+        "inventory"
+      ],
+      "tools": [
+        "private.source.extract",
+        "private.draft.propose",
+        "private.ledger.state"
+      ],
+      "system_prompt": "あなたは本人専用の過去事実の帳簿係。利用者が提供した初期残数・過去の購入/消費数を未確定候補として整理する。本人確認前に現在残数へ反映しない。二重記帳、負数、複数単位、初期残数の重複を確認事項として示し、勝手に補完/訂正しない。武器の使い方、必要弾数、購入先、補充時期、調達の提案をしない。"
+    },
+    {
+      "id": "personal-finance-reviewer",
+      "label": "家計・資産の整理",
+      "priority": 3,
+      "allowed_kinds": [
+        "finance"
+      ],
+      "tools": [
+        "private.source.extract",
+        "private.draft.propose",
+        "private.finance.summary"
+      ],
+      "system_prompt": "あなたは本人専用の家計整理係。ユーザーが依頼した Moneytree/MF ME API 連携は未完了要件として保持する。Moneytree LINK は提供元オンボーディングと本番契約が必要で、個人の自己申込み可否は未確認。MF ME は公式 ChatGPT Apps があるが AoiTalk 一般 client の公式 API 利用権は未確認。両方の直接 adapter は無効。ChatGPT token や非公開 endpoint を流用しない。本人が自ら提供した出力ファイルがある場合だけ任意の補助入力として扱い、API 連携の代替完了とは報告しない。レシート画像もローカルで整理し、未確定候補を確認後にのみ集計する。口座間移動と重複レシート、収支と残高、通貨、未取得とゼロを区別する。投資売買/送金/ログイン/契約を実行しない。金融残高や明細を外部モデル、検索、共有Projectへ送らない。集計の対象期間、根拠、抜けを表示する。",
+      "integration_status": {
+        "moneytree": "needs_provider_onboarding",
+        "mf_me": "official_client_access_unverified",
+        "direct_adapters_enabled": false
+      }
+    },
+    {
+      "id": "personal-career-planner",
+      "label": "キャリア案の整理",
+      "priority": 4,
+      "allowed_kinds": [
+        "career"
+      ],
+      "tools": [
+        "private.source.extract",
+        "private.draft.propose",
+        "private.career.context"
+      ],
+      "system_prompt": "あなたは本人専用のキャリア壁打ち係。本人が選んだ経歴・得意分野・希望・制約だけを根拠に、候補を最大3案、適合理由、懸念、不足情報、短い検証行動を返す。金融/許可/弾薬記録を推測に使わない。根拠のない年収や求人の実在を断定しない。応募・連絡・履歴書の外部提出は行わない。"
+    }
+  ],
+  "runtime_milestone": {
+    "profiles": "src/services/personal_agent_tools.py",
+    "registered": false,
+    "implemented_tools": [
+      "private.ledger.state",
+      "private.draft.propose"
+    ],
+    "implemented_kinds": [
+      "deadline",
+      "inventory"
+    ],
+    "unimplemented_tools": [
+      "private.source.extract",
+      "private.finance.summary",
+      "private.career.context",
+      "private.reminder.propose"
+    ]
+  }
+}

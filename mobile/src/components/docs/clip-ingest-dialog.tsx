@@ -100,6 +100,7 @@ export function ClipIngestDialog({
   targetNodeId,
   sessionId,
   projectId,
+  readOnly = false,
 }: {
   visible: boolean;
   onDismiss: () => void;
@@ -108,6 +109,7 @@ export function ClipIngestDialog({
   targetNodeId?: string | null;
   sessionId?: string | null;
   projectId?: string | null;
+  readOnly?: boolean;
 }) {
   const [source, setSource] = useState("");
   const [status, setStatus] = useState<
@@ -200,7 +202,7 @@ export function ClipIngestDialog({
   };
 
   const submit = async () => {
-    if (inFlightRef.current || !source.trim()) return;
+    if (readOnly || inFlightRef.current || !source.trim()) return;
     inFlightRef.current = true;
     setStatus("running");
     setResult(null);
@@ -224,7 +226,7 @@ export function ClipIngestDialog({
   };
 
   const resumeOperation = async (operationId: string) => {
-    if (inFlightRef.current) return;
+    if (readOnly || inFlightRef.current) return;
     inFlightRef.current = true;
     setRecoveryBusyId(operationId);
     setError("");
@@ -242,7 +244,7 @@ export function ClipIngestDialog({
   };
 
   const restoreRecoveryInput = (row: PendingClipIngestRow) => {
-    if (inFlightRef.current) return;
+    if (readOnly || inFlightRef.current) return;
     setSource(row.source);
     setStatus("idle");
     setResult(null);
@@ -255,7 +257,7 @@ export function ClipIngestDialog({
   };
 
   const syncAndOpenResult = async () => {
-    if (!result || inFlightRef.current) return;
+    if (readOnly || !result || inFlightRef.current) return;
     inFlightRef.current = true;
     setOpeningNode(true);
     setError("");
@@ -284,25 +286,38 @@ export function ClipIngestDialog({
       presentationStyle="fullScreen"
       onRequestClose={dismiss}
     >
-      <SafeAreaView style={styles.safeArea}>
+      <SafeAreaView
+        edges={["top", "right", "bottom", "left"]}
+        style={styles.safeArea}
+      >
         <KeyboardAvoidingView
           style={styles.container}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          <View style={styles.header}>
-            <Button
-              textColor="#a6adc8"
-              disabled={
-                status === "running"
-                || recoveryBusyId !== null
-                || openingNode
-              }
-              onPress={dismiss}
-            >
-              閉じる
-            </Button>
-            <Text variant="titleMedium" style={styles.headerTitle}>クリップ取り込み</Text>
-            <View style={styles.headerSpacer} />
+          <View style={styles.header} testID="clip-ingest-header">
+            <View style={styles.headerMainRow}>
+              <Button
+                textColor="#a6adc8"
+                style={styles.headerClose}
+                contentStyle={styles.headerCloseContent}
+                disabled={
+                  status === "running"
+                  || recoveryBusyId !== null
+                  || openingNode
+                }
+                onPress={dismiss}
+              >
+                閉じる
+              </Button>
+              <Text
+                variant="titleMedium"
+                style={styles.headerTitle}
+                accessibilityRole="header"
+              >
+                クリップ取り込み
+              </Text>
+              <View style={styles.headerSideSpacer} />
+            </View>
           </View>
           <Divider style={styles.divider} />
 
@@ -313,12 +328,18 @@ export function ClipIngestDialog({
             <Text style={styles.description}>
               URL、文章、または両方を貼り付けると、設定済みの取り込み先へ整理して保存します。
             </Text>
+            {readOnly ? (
+              <Text style={styles.helperText}>
+                このDocsスコープの端末投影が未確定のため、取り込みを無効にしています。同期後に再確認してください。
+              </Text>
+            ) : null}
             <TextInput
               accessibilityLabel="取り込むURLまたは文章"
               value={source}
               onChangeText={setSource}
               editable={
-                status !== "running"
+                !readOnly
+                && status !== "running"
                 && recoveryBusyId === null
                 && !openingNode
               }
@@ -364,7 +385,8 @@ export function ClipIngestDialog({
                         mode="outlined"
                         loading={recoveryBusyId === row.id}
                         disabled={
-                          recoveryBusyId !== null
+                          readOnly
+                          || recoveryBusyId !== null
                           || openingNode
                         }
                         onPress={() => {
@@ -537,7 +559,7 @@ export function ClipIngestDialog({
                 icon="tray-arrow-down"
                 buttonColor="#7c3aed"
                 loading={status === "running"}
-                disabled={!source.trim() || status === "running"}
+                disabled={readOnly || !source.trim() || status === "running"}
                 onPress={() => void submit()}
               >
                 {status === "failure" ? "再実行" : status === "running" ? "取り込み中…" : "取り込む"}
@@ -555,13 +577,30 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   header: {
     minHeight: 56,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
     paddingHorizontal: 8,
   },
-  headerTitle: { color: "#cdd6f4", fontWeight: "700" },
-  headerSpacer: { width: 72 },
+  headerMainRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    minHeight: 56,
+  },
+  headerClose: {
+    minWidth: 44,
+    minHeight: 44,
+    flexShrink: 0,
+    margin: 0,
+  },
+  headerCloseContent: { minHeight: 44, paddingHorizontal: 8 },
+  headerTitle: {
+    color: "#cdd6f4",
+    fontWeight: "700",
+    flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
+    textAlign: "center",
+    paddingVertical: 10,
+  },
+  headerSideSpacer: { width: 44, minHeight: 44, flexShrink: 0 },
   divider: { backgroundColor: "#313244" },
   content: { padding: 16, gap: 16 },
   description: { color: "#a6adc8", lineHeight: 20 },

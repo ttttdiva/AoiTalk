@@ -18,6 +18,7 @@ Most importantly, AoiTalk supports both **VOICEROID2** and **Irodori-TTS**.
 
 - **VOICEROID2** — use VOICEROID2 characters as AoiTalk voices
 - **Irodori-TTS** — locally integrated TTS. The default v4.1 Small model is supported alongside per-character choices such as v4.1 Anime and v3 VoiceDesign
+- **Gemini TTS** — Gemini 3.8 Flash TTS / Flash-Lite TTS with per-character voices and speaking styles ([Gemini TTS guide](docs/gemini_tts.md))
 - **Other TTS engines** — VOICEVOX, AivisSpeech, A.I.VOICE, CeVIO, Nijivoice, Azure TTS, gTTS, MioTTS, and more
 - **Speech recognition** — Whisper, Parakeet, Google Speech, Gemini-family ASR, and more
 
@@ -48,7 +49,7 @@ Information does not have to disappear inside chat history. AoiTalk can store an
 
 AoiTalk is not limited to one chat screen. Agents and external services can be combined to carry work forward.
 
-- Agent Team / specialist execution
+- Execution Team / specialist execution
 - Heartbeat / scheduled execution
 - MCP
 - Web search
@@ -88,6 +89,25 @@ AoiTalk supports multiple LLM paths, including cloud APIs and local inference en
 - **Audio / Bot**: `src/audio/`, `src/tts/`, and `src/bot/`.
 
 See [docs/README.md](docs/README.md) for the documentation map and the distinction between current specifications and design records.
+
+## Scope of this repository (41_AoiTalk)
+
+This repository owns speech conversation, task/schedule management, Docs/Files/knowledge
+retrieval, Agents, PC Bridge, and the Web/Native Mobile clients themselves. The features below
+do not live in this repository; each has its own independent app, and AoiTalk's Apps screen only
+links out to them.
+
+| Feature | Canonical app |
+| --- | --- |
+| Hugging Face browsing/sync | `60_huggingface-sync` |
+| Hydrus browsing | `57_Hydrus_App` |
+| Story/Novel Studio, TRPG | `86_Novel-Graph-Studio` |
+| Public gateway / Caddy / Cloudflare / search gate | [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway) |
+
+Local-LLM Hugging Face Hub fetch/cache and URL-ingest model-page capture remain in this
+repository. The `story_*` / `trpg_*` tables in this repository's PostgreSQL are kept, not
+deleted, only as an import source for `86_Novel-Graph-Studio`; this repository's runtime does
+not use them.
 
 ## Setup
 
@@ -130,9 +150,9 @@ The Python packages account for macOS, but parts of `setup.sh` assume Debian / U
 | --- | --- |
 | FastAPI | `3000` |
 | Next.js | `3002` |
-| Caddy | `6002` |
+| Shared gateway (separate repository) | `6002` |
 
-Windows `run.bat` and Linux `run.sh` use different default exposure boundaries. Linux / WSL starts loopback-only with Caddy disabled by default. Public exposure should use an explicit TLS boundary such as `run.sh --public --with-caddy`.
+The personal shared Caddy process, Cloudflare Worker, technical site, and search gate are owned by [`85_CaddyGateway`](https://github.com/ttttdiva/85_CaddyGateway). Windows `run.bat` starts only AoiTalk FastAPI/Next.js and uses `/at` as the default public prefix. Enterprise/Docker distributions continue to use `caddy/Caddyfile.enterprise` from this repository. See [Public gateway boundary](docs/public_gateway.md).
 
 ## Configuration and database
 
@@ -147,17 +167,17 @@ Do not document fixed login passwords in the README. Bootstrap credentials are r
 
 ## Development and verification
 
-`AGENTS.md` is the repository workflow authority. Use targeted verification for the changed scope, then verify GitHub Actions after pushing `main`. User-visible WebUI behavior changes also require the independent browser QA flow in [AI WebUI QA](docs/ai_webui_qa.md).
+Run local targeted verification for the changed scope, then verify the remote commit SHA after pushing `main`. Do not wait for GitHub Actions / CI to finish or require its success for completion. User-visible WebUI behavior changes also require the independent browser QA flow in [AI WebUI QA](docs/ai_webui_qa.md).
 
 ## Distribution
 
 The private development repository and public distribution repository are intentionally separated. `scripts/publish_public.ps1` generates the public tree for `ttttdiva/AoiTalk`.
 
-- Public publishing: [docs/public_publish.md](docs/public_publish.md)
 - Mobile APK / auto-update standard: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
 - Release checklist: [docs/release-checklist.md](docs/release-checklist.md)
-- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-MIT
+The root [LICENSE](LICENSE) (MIT) applies to this repository's contents unless marked otherwise. `resources/seethrough-rig/runtime` is a separate package whose upstream license is unspecified (`UNLICENSED` in package.json); it is not covered by the MIT license and no license grant of any kind is made for it. See `FIRST_PARTY_NOTICE.md` in that directory.
+
+- [Feature terminology and responsibilities](docs/feature_terminology.md)

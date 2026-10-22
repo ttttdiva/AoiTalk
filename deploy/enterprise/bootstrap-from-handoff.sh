@@ -54,34 +54,102 @@ case "$offline_flag" in
     *) die "only --offline-inputs may be supplied as the sixth argument" ;;
 esac
 
-[[ -d /tmp && ! -L /tmp && "$(stat -c '%u' /tmp 2>/dev/null || true)" == 0 ]] || die "/tmp must be a root-owned directory"
-tmp_mode=$((8#$(stat -c '%a' /tmp 2>/dev/null || printf 0)))
-if (( tmp_mode & 01000 )); then
-    :
-elif (( (tmp_mode & 0022) == 0 )); then
-    :
-else
-    die "/tmp must be a root-owned sticky/private directory"
-fi
-tmp="$(mktemp -d /tmp/enterprise-handoff-bootstrap.XXXXXX)"
-cleanup() { rm -rf -- "$tmp"; }
+# Keep the authenticated archives off /tmp: a companion can exceed tmpfs.
+# Do not trust TMPDIR, which may be user-writable or memory-backed.
+[[ "$(id -u)" == 0 ]] || die "the trusted bootstrap must run as root"
+for parent in /var /var/tmp; do
+    [[ -d "$parent" && ! -L "$parent" && "$(stat -c '%u' "$parent")" == 0 ]] || die "$parent must be a root-owned directory"
+    mode=$((8#$(stat -c '%a' "$parent")))
+    if [[ "$parent" == /var/tmp ]] && (( mode & 01000 )); then
+        :
+    else
+        (( (mode & 0022) == 0 )) || die "$parent must be private or sticky"
+    fi
+done
+case "$(stat -f -c '%T' /var/tmp)" in
+    tmpfs|ramfs) die "/var/tmp must use persistent disk-backed storage" ;;
+esac
+umask 077
+tmp="$(mktemp -d /var/tmp/enterprise-handoff-bootstrap.XXXXXX)"
+tmp_identity="$(stat -c '%d:%i' -- "$tmp")"
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if [[ "$tmp" == /var/tmp/enterprise-handoff-bootstrap.* && -d "$tmp" && ! -L "$tmp" && "$(stat -c '%d:%i' -- "$tmp")" == "$tmp_identity" ]]; then
+        rm -rf -- "$tmp"
+    fi
+    exit "$rc"
+}
 trap cleanup EXIT
-cp -- "$zip" "$tmp/handoff.zip"
-[[ "$(sha256sum -- "$tmp/handoff.zip" | awk '{print $1}')" == "${expected_sha,,}" ]] || die "handoff ZIP changed while taking the authenticated snapshot"
+trap 'exit 130' INT
+trap 'exit 143' TERM
+offline_snapshot=""
 if [[ "$offline_flag" == "--offline-inputs" ]]; then
-    current="$(dirname -- "$offline_zip")"
-    while [[ "$current" != "/" ]]; do
-        [[ ! -L "$current" ]] || die "offline companion path contains a symlink ancestor: $current"
-        current="$(dirname -- "$current")"
-    done
-    actual_offline_sha="$(sha256sum -- "$offline_zip" | awk '{print $1}')"
-    [[ "$actual_offline_sha" == "${offline_sha,,}" ]] || die "offline companion ZIP SHA-256 does not match the trusted release capsule"
     offline_name="$(basename -- "$offline_zip")"
-    [[ "$offline_name" =~ ^[A-Za-z0-9_.-]+\.zip$ ]] || die "companion ZIP filename is not canonical"
+    [[ "$offline_name" =~ ^[A-Za-z0-9_.-]+\.zip$ && "$offline_name" != handoff.zip ]] || die "companion ZIP filename is not canonical"
     offline_snapshot="$tmp/$offline_name"
-    cp -- "$offline_zip" "$offline_snapshot"
-    [[ "$(sha256sum -- "$offline_snapshot" | awk '{print $1}')" == "${offline_sha,,}" ]] || die "offline companion ZIP changed while taking the authenticated snapshot"
 fi
+# Pin each input through O_NOFOLLOW directory descriptors. Capacity is checked
+# against full logical sizes before any archive copy, not sparse allocation.
+python3 - "$tmp" "$zip" "$expected_sha" "$offline_zip" "$offline_sha" "$offline_snapshot" <<'PY'
+import hashlib, os, pathlib, stat, sys
+root, handoff, handoff_sha, companion, companion_sha, snapshot = sys.argv[1:]
+
+def open_regular(path):
+    parts = pathlib.PurePosixPath(path).parts
+    if not parts or parts[0] != "/" or any(part in {".", ".."} for part in parts):
+        raise SystemExit("archive path is not absolute and canonical")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(os.fstat(source).st_mode):
+        os.close(source)
+        raise SystemExit("archive must be a regular file")
+    return source
+
+inputs = [(handoff, handoff_sha.lower(), os.path.join(root, "handoff.zip"))]
+if companion:
+    inputs.append((companion, companion_sha.lower(), snapshot))
+opened = []
+try:
+    for source, expected, destination in inputs:
+        fd = open_regular(source)
+        opened.append((fd, os.fstat(fd), expected, destination))
+    required = sum(info.st_size for _, info, _, _ in opened) + 64 * 1024**2
+    capacity = os.statvfs(root)
+    available = capacity.f_bavail * capacity.f_frsize
+    if available < required:
+        raise SystemExit(f"insufficient persistent bootstrap capacity: need {required}, available {available}")
+    for fd, before, expected, destination in opened:
+        target = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        digest = hashlib.sha256()
+        with os.fdopen(target, "wb") as output:
+            while chunk := os.read(fd, 1024 * 1024):
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        after = os.fstat(fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise SystemExit("archive changed while taking the authenticated snapshot")
+        if digest.hexdigest() != expected:
+            raise SystemExit("archive SHA-256 does not match the trusted release capsule")
+        copied = hashlib.sha256()
+        with open(destination, "rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                copied.update(chunk)
+        if copied.hexdigest() != expected:
+            raise SystemExit("authenticated snapshot SHA-256 mismatch")
+finally:
+    for fd, _, _, _ in opened:
+        os.close(fd)
+PY
 python3 - "$tmp/handoff.zip" "$tmp/update-on-server.sh" <<'PY'
 import os, pathlib, re, stat, sys, zipfile
 archive = pathlib.Path(sys.argv[1]); output = pathlib.Path(sys.argv[2])

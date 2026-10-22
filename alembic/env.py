@@ -42,7 +42,7 @@ if all([_pg_host, _pg_port, _pg_user, _pg_password, _pg_db]):
         "sqlalchemy.url",
         # ConfigParser interpolation treats `%` specially; doubling it here
         # makes the value survive until engine_from_config reads the option.
-        f"postgresql://{_safe_user}:{_safe_password}@{_pg_host}:{_pg_port}/{_pg_db}".replace(
+        f"postgresql+psycopg2://{_safe_user}:{_safe_password}@{_pg_host}:{_pg_port}/{_pg_db}".replace(
             "%", "%%"
         ),
     )

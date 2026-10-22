@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, Download, File, Folder, Loader2, MoreHorizontal, RotateCcw, ShieldCheck } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -19,6 +19,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { appsApi, type AppArchiveExclusions, type AppFile } from "@/lib/apps-api";
+import { explorerDownloadResource } from "@/lib/explorer-api";
 
 type ArchiveOption = {
   key: keyof AppArchiveExclusions;
@@ -44,6 +45,7 @@ export type AppArchiveTreeEntry = {
 type ArchiveTreeNode = AppArchiveTreeEntry;
 
 export type MinimumArchivePackage = {
+  sourcePackage: boolean;
   /** Visible files that the client can pass to the archive include_paths contract. */
   requiredSelectablePaths: string[];
   /** Entries the archive endpoint adds independently of include_paths. */
@@ -72,9 +74,10 @@ type ArchiveSettings = {
   /** null means all paths, while [] means an explicit empty selection. */
   includePaths: string[] | null;
   exclusions: AppArchiveExclusions;
+  latestCommitOnly: boolean;
 };
 
-const DEFAULT_SETTINGS: ArchiveSettings = { includePaths: null, exclusions: {} };
+const DEFAULT_SETTINGS: ArchiveSettings = { includePaths: null, exclusions: {}, latestCommitOnly: false };
 const STORAGE_PREFIX = "aoitalk-app-archive-download:";
 const SETTINGS_EVENT = "aoitalk-app-archive-download-settings";
 
@@ -95,7 +98,7 @@ function sanitizeSettings(value: unknown): ArchiveSettings {
   for (const option of ARCHIVE_OPTIONS) {
     if (rawExclusions[option.key] === true) exclusions[option.key] = true;
   }
-  return { includePaths, exclusions };
+  return { includePaths, exclusions, latestCommitOnly: record.latestCommitOnly === true };
 }
 
 function readSettings(key: string): ArchiveSettings {
@@ -149,16 +152,25 @@ const ARCHIVE_PRIVATE_NAMES = new Set([
 ]);
 const ARCHIVE_PRIVATE_SUFFIXES = [".key", ".pem", ".p12", ".pfx", ".secret", ".secrets"];
 
+// Only known workspace-root artifacts are omitted for non-Office apps.
+// Nested names (e.g. src/domain/output) and build/dist may be runtime code.
+const SOURCE_PACKAGE_OMITTED_ROOTS = new Set([
+  ".local", ".github", ".git", "node_modules", "venv", ".venv", "__pycache__",
+  ".next", ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage",
+  "tests", "test", "e2e", "logs", "log", "input", "inputs", "output", "outputs",
+  "ttl", "temp", "tmp", "generated", "cache",
+]);
+
 /**
  * Classify a visible App path for the minimum package shortcut.
  *
  * This mirrors the existing archive categories conservatively.  It never
- * invents a dependency graph: only the declared target entrypoint and the
- * established Office/VBA macro support directories can become required.
+ * invents a dependency graph. Office/VBA keeps its established support
+ * directories; other runtimes retain unknown dependencies conservatively.
  */
 export function classifyMinimumArchivePath(
   value: string,
-  options: { entrypoint?: string | null; officeVba?: boolean } = {},
+  options: { entrypoint?: string | null; officeVba?: boolean; sourcePackage?: boolean } = {},
 ): MinimumArchivePathClassification {
   const normalized = normalizeFilePath(value);
   if (!normalized) return "excluded";
@@ -174,8 +186,8 @@ export function classifyMinimumArchivePath(
 
   if (
     lowerParts.includes(".git")
-    || lowerParts.some((part) => ARCHIVE_DEPENDENCY_PARTS.has(part))
-    || lowerParts.some((part) => ARCHIVE_RUNTIME_PARTS.has(part))
+    || (!options.sourcePackage && lowerParts.some((part) => ARCHIVE_DEPENDENCY_PARTS.has(part)))
+    || (!options.sourcePackage && lowerParts.some((part) => ARCHIVE_RUNTIME_PARTS.has(part)))
     || lowerParts.some((part) => ARCHIVE_CREDENTIAL_PARTS.has(part))
     || ARCHIVE_PRIVATE_NAMES.has(fileName)
     || fileName === "device_list"
@@ -184,11 +196,13 @@ export function classifyMinimumArchivePath(
     || fileName.startsWith(".env.")
     || ARCHIVE_PRIVATE_SUFFIXES.some((suffix) => fileName.endsWith(suffix))
     || fileName.endsWith(".ttl")
-    || lowerDirectoryParts.some((part) => ARCHIVE_GENERATED_PARTS.has(part))
+    || (!options.sourcePackage && lowerDirectoryParts.some((part) => ARCHIVE_GENERATED_PARTS.has(part)))
+    || (options.sourcePackage && SOURCE_PACKAGE_OMITTED_ROOTS.has(lowerDirectoryParts[0]))
   ) {
     return "excluded";
   }
 
+  if (options.sourcePackage) return "required";
   if (options.officeVba && entrypointKey && pathKeyValue === entrypointKey) return "required";
   const configPrefix = macroRootKey === undefined ? null : `${macroRootKey ? `${macroRootKey}/` : ""}config/`;
   const templatesPrefix = macroRootKey === undefined ? null : `${macroRootKey ? `${macroRootKey}/` : ""}templates/`;
@@ -309,15 +323,21 @@ export function resolveMinimumArchivePackage(
   const declaredEntrypoint = normalizeFilePath(input.entrypoint ?? target?.entrypoint);
   const files = visibleFilePaths(input.files);
   const officeVba = isOfficeVbaTarget(target, declaredEntrypoint);
+  // Without a visible declared entrypoint we cannot offer a runnable package.
+  // For other runtimes preserve unknown dependencies rather than guessing an
+  // import graph from filenames. This is a conservative source package.
+  const sourcePackage = !officeVba;
+  const entrypointAvailable = !!declaredEntrypoint && files.some((path) => pathKey(path) === pathKey(declaredEntrypoint));
   const requiredSelectablePaths: string[] = [];
   const excludedPaths: string[] = [];
   for (const path of files) {
-    const classification = classifyMinimumArchivePath(path, { entrypoint: declaredEntrypoint, officeVba });
+    const classification = classifyMinimumArchivePath(path, { entrypoint: declaredEntrypoint, officeVba, sourcePackage });
     if (classification === "excluded") excludedPaths.push(path);
-    else if (officeVba && classification === "required") requiredSelectablePaths.push(path);
+    else if (entrypointAvailable && classification === "required") requiredSelectablePaths.push(path);
   }
   const sortPaths = (paths: string[]) => paths.sort((left, right) => left.localeCompare(right, "ja"));
   return {
+    sourcePackage,
     requiredSelectablePaths: sortPaths(requiredSelectablePaths),
     backendAlwaysIncludedPaths: [],
     excludedPaths: sortPaths(excludedPaths),
@@ -486,6 +506,13 @@ function AppArchiveDownloadDialogState({
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [minimumPreset, setMinimumPreset] = useState(false);
   const [filesRetrying, setFilesRetrying] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const downloadRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => {
+    downloadRequest.current?.abort();
+    downloadRequest.current = null;
+  }, []);
 
   useEffect(() => {
     const handleSettingsChange = () => {
@@ -505,17 +532,19 @@ function AppArchiveDownloadDialogState({
     [files, manifest, target],
   );
   const fileListAvailable = !filesLoading && !filesError;
+  const presetLabel = minimumPackage.sourcePackage ? "動作に必要なファイルを選択" : "マクロの動作に最低限必要なものだけON";
   const minimumPresetAvailable = fileListAvailable && minimumPackage.requiredSelectablePaths.length > 0;
   const selectedCount = ARCHIVE_OPTIONS.filter(({ key: optionKey }) => draft.exclusions[optionKey]).length;
   const downloadUrl = useMemo(
-    () => appsApi.downloadArchive(appId, projectId, settings.exclusions, settings.includePaths ?? undefined),
-    [appId, projectId, settings.exclusions, settings.includePaths],
+    () => appsApi.downloadArchive(appId, projectId, settings.exclusions, settings.includePaths ?? undefined, settings.latestCommitOnly),
+    [appId, projectId, settings.exclusions, settings.includePaths, settings.latestCommitOnly],
   );
-  const scopeSummary = settings.includePaths === null
+  const scopePaths = settings.includePaths === null
     ? "全階層"
     : settings.includePaths.length
       ? settings.includePaths.join(", ")
       : "選択なし";
+  const scopeSummary = settings.latestCommitOnly ? `最新コミットの差分 / ${scopePaths}` : scopePaths;
   const allChecked = fileListAvailable && (filePaths.length === 0 || selectedFiles.size === filePaths.length);
   const allIndeterminate = fileListAvailable && !allChecked && selectedFiles.size > 0;
 
@@ -527,11 +556,12 @@ function AppArchiveDownloadDialogState({
   };
   const saveSettings = () => {
     setSettings(draft);
+    setDownloadError(null);
     try {
       window.localStorage.setItem(key, JSON.stringify(draft));
       window.dispatchEvent(new Event(SETTINGS_EVENT));
     } catch {
-      // Private browsing or a disabled storage must not block downloading.
+      setDownloadError("このブラウザに設定を保存できませんでした。再読込すると元の設定に戻ります。");
     }
     setOpen(false);
   };
@@ -597,9 +627,42 @@ function AppArchiveDownloadDialogState({
     }
   };
 
-  return <div className="flex items-center gap-1">
+  const downloadArchive = async () => {
+    if (downloadRequest.current) return;
+    const controller = new AbortController();
+    downloadRequest.current = controller;
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      await explorerDownloadResource(
+        downloadUrl,
+        `${appName}${settings.latestCommitOnly ? "_latest-commit" : ""}.zip`,
+        {
+          expectedContentType: "application/zip",
+          requireAttachment: true,
+          rejectRedirects: true,
+          signal: controller.signal,
+        },
+      );
+    } catch (error) {
+      if (!controller.signal.aborted) setDownloadError(error instanceof Error ? error.message : "ダウンロードに失敗しました。再試行してください");
+    } finally {
+      if (downloadRequest.current === controller) {
+        downloadRequest.current = null;
+        setDownloading(false);
+      }
+    }
+  };
+
+  return <div className="flex min-w-0 flex-wrap items-center gap-1">
     <a
       href={downloadUrl}
+      onClick={(event) => {
+        event.preventDefault();
+        void downloadArchive();
+      }}
+      aria-disabled={downloading || undefined}
+      aria-busy={downloading || undefined}
       download
       title={`${appName}（${scopeSummary}）をダウンロード`}
       data-slot="button"
@@ -609,8 +672,9 @@ function AppArchiveDownloadDialogState({
         className: compact ? "h-7 px-2 text-[11px]" : "h-8 px-3",
       })}
     >
-      <Download className="size-3.5" /> {label}
+      {downloading ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />} {downloading ? (settings.latestCommitOnly ? "差分ZIPを作成中…" : "ZIPを取得中…") : settings.latestCommitOnly ? `${label}（最新差分）` : label}
     </a>
+    {downloadError && <p role="alert" className="w-full break-words text-xs text-destructive">{downloadError}</p>}
     <Dialog open={open} onOpenChange={(next) => { if (next) openSettings(); else setOpen(false); }}>
       <DropdownMenu>
         <DropdownMenuTrigger render={<Button type="button" size="icon-sm" variant="ghost" aria-label="ダウンロード設定" className={compact ? "size-7" : "size-8"} />}>
@@ -629,6 +693,18 @@ function AppArchiveDownloadDialogState({
         </DialogHeader>
 
         <div data-archive-dialog-body className="flex min-h-0 flex-1 flex-col gap-4 overflow-x-hidden overflow-y-auto px-4 py-4 [@media(max-height:900px)]:gap-2 [@media(max-height:900px)]:py-2">
+          <section className="shrink-0 rounded-lg border p-3">
+            <div className="flex items-start gap-3">
+              <Checkbox id="app-archive-latest-commit" checked={draft.latestCommitOnly}
+                onCheckedChange={(value) => setDraft((current) => ({ ...current, latestCommitOnly: value === true }))}
+                aria-label="最新コミットで差分があるファイルだけダウンロード" className="mt-0.5" />
+              <label htmlFor="app-archive-latest-commit" className="min-w-0 cursor-pointer">
+                <span className="block text-sm font-medium">最新コミットで差分があるファイルだけダウンロード</span>
+                <span className="mt-1 block text-xs leading-5 text-muted-foreground">対象の最新コミットと直前の親コミットを比較します。前回のダウンロード以降の差分ではありません。保存版を選択中はそのコミットが対象です。</span>
+                <span className="mt-1 block text-xs leading-5 text-muted-foreground">追加・変更ファイルと削除一覧をZIPに含めます。初回コミットは全追跡ファイルが対象です。未コミット・未追跡・秘密ファイル・リンク先は含めません。下の範囲・除外設定も適用し、この選択を次回も使います。</span>
+              </label>
+            </div>
+          </section>
           <section className="shrink-0 space-y-2 [@media(max-height:900px)]:space-y-1">
             <div>
               <h3 className="text-sm font-medium">クイック選択</h3>
@@ -641,14 +717,16 @@ function AppArchiveDownloadDialogState({
                 disabled={!minimumPresetAvailable}
                 onCheckedChange={(value) => toggleMinimumPreset(value === true)}
                 className="mt-0.5"
-                aria-label="マクロの動作に最低限必要なものだけON"
+                aria-label={presetLabel}
               />
               <label htmlFor="app-archive-minimum-preset" className="min-w-0 cursor-pointer">
-                <span className="block truncate text-sm font-medium" title="マクロの動作に最低限必要なものだけON">マクロの動作に最低限必要なものだけON</span>
-                <span className="mt-0.5 block text-xs leading-5 text-muted-foreground [@media(max-height:900px)]:hidden">
+                <span className="block truncate text-sm font-medium" title={presetLabel}>{presetLabel}</span>
+                <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
                   {minimumPresetAvailable
-                    ? `${minimumPackage.requiredSelectablePaths.length}件の必要ファイルを選択します。サーバー側の暗黙追加はなく、生成物・credentialは含めません。`
-                    : "Office/VBA Targetのentrypointを確認できると利用できます。"}
+                    ? minimumPackage.sourcePackage
+                      ? `${minimumPackage.requiredSelectablePaths.length}件を選択。既知の不要物・認証情報を除き、依存ファイルは広めに残します。`
+                      : `${minimumPackage.requiredSelectablePaths.length}件の必要ファイルを選択します。サーバー側の暗黙追加はなく、生成物・credentialは含めません。`
+                    : filesLoading ? "ファイル一覧を読み込み中です。" : filesError ? "ファイル一覧を再取得してください。" : "Targetのentrypointがファイル一覧に見つからないため利用できません。"}
                 </span>
               </label>
             </div>
@@ -719,3 +797,4 @@ function AppArchiveDownloadDialogState({
     </Dialog>
   </div>;
 }
+

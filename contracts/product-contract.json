@@ -175,8 +175,58 @@
         ]
       },
       {
+        "id": "tabs.settings.appearance",
+        "path": "(tabs)/settings/appearance",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
         "id": "tabs.settings.profile",
         "path": "(tabs)/settings/profile",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.audio",
+        "path": "(tabs)/settings/audio",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.ai_model",
+        "path": "(tabs)/settings/ai-model",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.custom_instructions",
+        "path": "(tabs)/settings/custom-instructions",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.docs_resync",
+        "path": "(tabs)/settings/docs-resync",
         "kind": "settings",
         "auth_required": true,
         "tab": false,
@@ -295,64 +345,35 @@
         ]
       },
       {
-        "id": "scenario.list",
-        "path": "scenarios",
+        "id": "operations",
+        "path": "operations/index",
         "kind": "workspace",
         "auth_required": true,
         "tab": false,
         "entry_points": [
-          "sidebar.story"
+          "sidebar.operations"
         ]
       },
       {
-        "id": "scenario.work",
-        "path": "scenario/[workId]",
+        "id": "operations.work",
+        "path": "operations/work/[workId]",
         "kind": "detail",
         "auth_required": true,
         "tab": false,
         "entry_points": [
-          "parent.story"
+          "parent.operations"
         ]
       },
       {
-        "id": "scenario.session",
-        "path": "scenario/session",
-        "kind": "detail",
-        "auth_required": true,
+        "id": "native-intent",
+        "path": "+native-intent",
+        "kind": "deep_link",
+        "auth_required": false,
         "tab": false,
         "entry_points": [
-          "parent.story"
-        ]
-      },
-      {
-        "id": "trpg.list",
-        "path": "trpg/index",
-        "kind": "workspace",
-        "auth_required": true,
-        "tab": false,
-        "entry_points": [
-          "sidebar.trpg"
-        ]
-      },
-      {
-        "id": "trpg.room",
-        "path": "trpg/[roomId]",
-        "kind": "detail",
-        "auth_required": true,
-        "tab": false,
-        "entry_points": [
-          "parent.trpg"
-        ]
-      },
-      {
-        "id": "trpg.host",
-        "path": "trpg/host",
-        "kind": "detail",
-        "auth_required": true,
-        "tab": false,
-        "entry_points": [
-          "parent.trpg"
-        ]
+          "system.native_intent"
+        ],
+        "notes": "Expo Router system handler for verified HTTPS Gateway callbacks; accepted callbacks route to the login screen."
       }
     ],
     "entry_points": [
@@ -418,16 +439,6 @@
         "target": "reports"
       },
       {
-        "id": "sidebar.story",
-        "kind": "sidebar",
-        "target": "scenario.list"
-      },
-      {
-        "id": "sidebar.trpg",
-        "kind": "sidebar",
-        "target": "trpg.list"
-      },
-      {
         "id": "parent.chat",
         "kind": "parent",
         "target": "tabs.chat",
@@ -476,16 +487,21 @@
         "from": "sidebar.reports"
       },
       {
-        "id": "parent.story",
-        "kind": "parent",
-        "target": "scenario.list",
-        "from": "sidebar.story"
+        "id": "sidebar.operations",
+        "kind": "sidebar",
+        "target": "operations"
       },
       {
-        "id": "parent.trpg",
+        "id": "parent.operations",
         "kind": "parent",
-        "target": "trpg.list",
-        "from": "sidebar.trpg"
+        "target": "operations",
+        "from": "sidebar.operations"
+      },
+      {
+        "id": "system.native_intent",
+        "kind": "system",
+        "target": "native-intent",
+        "notes": "The +native-intent system handler validates Gateway callback URLs before routing to login."
       }
     ]
   },
@@ -650,11 +666,12 @@
       "mobile": {
         "routes": [
           "tabs.apps",
-          "tabs.settings"
+          "tabs.apps.detail"
         ],
         "entry_points": [
           "settings.apps",
-          "sidebar.apps"
+          "sidebar.apps",
+          "parent.apps"
         ],
         "implementation": "mobile/src/app/(tabs)/apps/index.tsx"
       },
@@ -682,6 +699,136 @@
           "given": "Apps is hidden from the bottom tab bar",
           "when": "the user opens Settings or the Apps shortcut",
           "then": "the Apps index and app detail routes are reachable"
+        }
+      ]
+    },
+    {
+      "id": "apps.runtime",
+      "domain": "apps",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "get_app_runtime",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "activate_app_release",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "create_app_action_run",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "list_app_action_runs",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_app_action_run",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "stop_app_action_run",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "get_app_action_run_logs",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "upload_app_action_input_file",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "list_app_action_run_files",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_app_action_run_file",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "download_app_action_run_file",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.apps",
+          "tabs.apps.detail"
+        ],
+        "entry_points": [
+          "settings.apps",
+          "sidebar.apps",
+          "parent.apps"
+        ],
+        "implementation": "mobile/src/repositories/apps.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "execute"
+      ],
+      "scope": {
+        "kind": "space_project",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "space_parameter": "space_id",
+        "notes": "Release、Target、commandはサーバーが解決し、Action実行は認証済みのオンラインFastAPIとIdempotency-Keyを必要とする"
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "sqlite_cache",
+      "mutation": "direct_online",
+      "acceptance": [
+        {
+          "id": "apps.runtime.declaration",
+          "given": "認証済みユーザーが読み取り可能なAppとProject bindingを開く",
+          "when": "Appsの詳細画面を表示する",
+          "then": "direct FastAPIからRelease固定のUIとopaque Action descriptorを取得し、利用不可のActionは実行できない"
+        },
+        {
+          "id": "apps.runtime.execution",
+          "given": "Actionが利用可能で端末がオンラインである",
+          "when": "ユーザーがIdempotency-Key付きで送信する",
+          "then": "Release-bound runを1件だけ作成または再利用し、status・log・fileを同じscopeで再取得できる"
+        },
+        {
+          "id": "apps.runtime.offline",
+          "given": "端末がオフライン、またはユーザーのProject scopeが変わった",
+          "when": "Appsを更新するかActionを実行する",
+          "then": "cached declaration/runは読み取り専用で表示でき、Actionは無効化され、汎用sync outboxへmutationを追加しない"
         }
       ]
     },
@@ -734,9 +881,15 @@
       "acceptance": [
         {
           "id": "chat.search",
-          "given": "the user has readable conversations in multiple projects",
-          "when": "a non-empty query is submitted",
-          "then": "only readable sessions/messages are returned and the search header remains intact"
+          "given": "the user has readable old and current conversations in multiple projects plus local-only conversations",
+          "when": "a non-empty title or body query is submitted from the sidebar search icon on any panel",
+          "then": "all readable projects are searched regardless of selected scope; successful server results include local matches, offline search uses cached history, and the search header remains intact"
+        },
+        {
+          "id": "chat.search.history_filter",
+          "given": "search results carry the server-owned history_status projection",
+          "when": "the user combines search with one of the four filters all, ready, needs_attention or working",
+          "then": "only results matching the projected value remain; an empty match set shows the empty state, and opening a result keeps the existing read API behavior"
         }
       ]
     },
@@ -806,6 +959,18 @@
           "then": "the message is replayed once and project ACL is rechecked"
         },
         {
+          "id": "chat.sessions.history_filter",
+          "given": "ordinary Chat and App conversations are visible with server-owned history_status values idle, ready, needs_attention or working",
+          "when": "the user opens the history filter from timeline or project view and chooses all, ready, needs_attention or working, then opens a row",
+          "then": "the selected projection value controls the list, all includes idle rows, zero matches show the filter empty state, and opening a row preserves the existing read API/read-at and refresh race semantics"
+        },
+        {
+          "id": "chat.sidebar.actions",
+          "given": "the sidebar shows conversations in timeline or project grouping",
+          "when": "the user long-presses a conversation and performs rename, pin, fork, copy ID, delete or local sync",
+          "then": "long press never navigates; operations use existing persistence and sync semantics, deleting the active conversation closes its route, and whole-branch fork requires complete history with explicit errors for unsupported or empty sessions"
+        },
+        {
           "id": "chat.direct.local_context",
           "given": "the AoiTalk server is unavailable and a valid Direct LLM connection is configured",
           "when": "the user sends with the bundled standard character or an account-and-server-scoped cached character, including after restart",
@@ -816,6 +981,228 @@
           "given": "a Direct reply fails or completes while the AoiTalk server is unavailable",
           "when": "the user retries or server connectivity returns",
           "then": "failed drafts and history remain with a retry reason, and completed Direct messages are never dispatched for server generation"
+        }
+      ]
+    },
+    {
+      "id": "chat.agent_binding",
+      "domain": "chat",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "list_conversation_agents",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "create_session_api_conversations_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "create"
+        },
+        {
+          "operation_id": "create_client_session_api_conversations_client__client_session_id__put",
+          "transport": "fastapi",
+          "method": "PUT",
+          "role": "create"
+        },
+        {
+          "operation_id": "bind_conversation_agent",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.chat",
+          "tabs.chat.detail"
+        ],
+        "entry_points": [
+          "tab.chat",
+          "parent.chat"
+        ],
+        "implementation": "mobile/src/lib/conversation-agent-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "write"
+      ],
+      "scope": {
+        "kind": "conversation",
+        "visibility": "acl_read",
+        "project_parameter": "project_id",
+        "notes": "The catalogue is ACL-filtered. Binding requires server-side session/project write authorization, Agent grant validation and CAS; Agent identity never replaces the human owner or Character presentation."
+      },
+      "offline": {
+        "read": "cache",
+        "mutation": "queue",
+        "reconnect": "replay_outbox"
+      },
+      "persistence": "sqlite_and_outbox",
+      "mutation": "outbox_replay",
+      "acceptance": [
+        {
+          "id": "chat.agent_binding.catalogue",
+          "given": "the authenticated user has a scoped Agent catalogue or a previously cached catalogue",
+          "when": "the Chat Agent selector opens online or offline",
+          "then": "only safe selectable Agent projections are shown, and missing or stale choices are not treated as authorized"
+        },
+        {
+          "id": "chat.agent_binding.cas",
+          "given": "a conversation has a current canonical Agent selection",
+          "when": "the user binds, clears or switches the selection online or from the outbox",
+          "then": "the original session scope, Agent identity and expected binding are replayed and server ACL, revision, busy-run and CAS checks reject stale mutations"
+        },
+        {
+          "id": "chat.agent_binding.dispatch_guard",
+          "given": "a message was queued with an observed Agent binding",
+          "when": "the message is replayed after reconnect",
+          "then": "the explicit expected binding prevents delivery to a different Agent, while omitted and explicit-null legacy semantics remain distinct"
+        }
+      ]
+    },
+    {
+      "id": "chat.aoidots",
+      "domain": "chat",
+      "criticality": "p0",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "bootstrap_api_aoidots_bootstrap_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "read"
+        },
+        {
+          "operation_id": "list_work_api_aoidots_work_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "get_dialogue_api_agent_dialogues__dialogue_id__get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "answer_input_api_agent_dialogues__dialogue_id__inputs__input_id__answer_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "update"
+        },
+        {
+          "operation_id": "control_api_agent_dialogues__dialogue_id__control_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "stop_api_agent_dialogues__dialogue_id__stop_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "resume_api_agent_dialogues__dialogue_id__resume_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
+          "operation_id": "rework_api_agent_dialogues__dialogue_id__rework_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.chat",
+          "operations",
+          "operations.work"
+        ],
+        "entry_points": [
+          "tab.chat",
+          "sidebar.operations",
+          "parent.operations"
+        ],
+        "implementation": "mobile/src/lib/aoidots-api.ts"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read",
+        "write",
+        "execute"
+      ],
+      "scope": {
+        "kind": "personal",
+        "visibility": "owner_only",
+        "notes": "The AoiDots root is a projectless owner-scoped Agent. A project hint supplies context only; child Chat sessions, Task links and Agent execution still require their own server ACL checks."
+      },
+      "offline": {
+        "read": "forbidden",
+        "mutation": "direct_online",
+        "reconnect": "refresh"
+      },
+      "persistence": "server",
+      "mutation": "direct_online",
+      "acceptance": [
+        {
+          "id": "chat.aoidots.consultation",
+          "given": "an authenticated user opens the owner-scoped AoiDots surface",
+          "when": "the user asks for a consultation with optional Project context",
+          "then": "the request uses the private root while the Project hint remains context-only and any worker is represented by a linked ordinary Chat child session"
+        },
+        {
+          "id": "chat.aoidots.delegation",
+          "given": "an eligible Agent and optional assigned Task are available",
+          "when": "the user delegates work from AoiDots",
+          "then": "the worker Chat, AgentRun and WorkItem remain bound to the human owner and server ACL, and only bounded safe references cross the mobile boundary"
+        },
+        {
+          "id": "chat.aoidots.pending_input",
+          "given": "a delegated child asks a pending input question",
+          "when": "the user answers it",
+          "then": "the answer carries a stable client message ID plus expected input and control revisions, and stale compare-and-swap attempts are rejected"
+        },
+        {
+          "id": "chat.aoidots.rework_restart",
+          "given": "a dialogue is running, paused, failed or waiting for input",
+          "when": "the user stops, resumes, reworks or restarts it",
+          "then": "the control revision advances through the canonical AgentDialogue boundary and late deliveries cannot mutate a newer generation"
+        },
+        {
+          "id": "chat.aoidots.human_projection",
+          "given": "a readable work item or pending input is returned",
+          "when": "the Chat or Operations surface renders it",
+          "then": "the client uses canonical title, label, human status, allowed actions, question, choices, input type and answer flags, while raw ledger content and provider data remain excluded"
+        },
+        {
+          "id": "chat.aoidots.multi_session",
+          "given": "the user has more than one AoiDots dialogue",
+          "when": "sessions are refreshed or reopened",
+          "then": "each dialogue keeps its own root, child Chat, Agent, pending input and artifact references without replacing another session"
+        },
+        {
+          "id": "chat.aoidots.parallel",
+          "given": "multiple delegated dialogues run in parallel",
+          "when": "their child messages, work items and receipts settle",
+          "then": "delivery and control CAS remain isolated per dialogue so parallel work can coexist with ordinary Chat sessions"
         }
       ]
     },
@@ -1462,394 +1849,91 @@
       ]
     },
     {
-      "id": "story.work",
-      "domain": "story",
-      "criticality": "p0",
+      "id": "operations.execution",
+      "domain": "operations",
+      "criticality": "p1",
       "transport": "fastapi",
       "operations": [
         {
-          "operation_id": "list_works_api_story_works_get",
+          "operation_id": "operations_get_command_center",
           "transport": "fastapi",
           "method": "GET",
           "role": "read"
         },
         {
-          "operation_id": "get_work_api_story_works__work_id__get",
+          "operation_id": "operations_get_work_execution",
           "transport": "fastapi",
           "method": "GET",
           "role": "read"
         },
         {
-          "operation_id": "create_work_api_story_works_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "create"
-        },
-        {
-          "operation_id": "patch_work_api_story_works__work_id__patch",
-          "transport": "fastapi",
-          "method": "PATCH",
-          "role": "update"
-        },
-        {
-          "operation_id": "list_episodes_api_story_works__work_id__episodes_get",
+          "operation_id": "list_agent_conversations",
           "transport": "fastapi",
           "method": "GET",
           "role": "read"
         },
         {
-          "operation_id": "put_episode_body_api_story_episodes__episode_id__body_put",
-          "transport": "fastapi",
-          "method": "PUT",
-          "role": "update"
-        },
-        {
-          "operation_id": "get_graph_api_story_works__work_id__graph_get",
+          "operation_id": "list_agent_run_history",
           "transport": "fastapi",
           "method": "GET",
           "role": "read"
-        },
-        {
-          "operation_id": "search_work_api_story_works__work_id__search_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "export_work_api_story_works__work_id__export_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "export"
-        },
-        {
-          "operation_id": "split_episode_api_story_episodes__episode_id__split_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "update"
-        },
-        {
-          "operation_id": "regenerate_summary_api_story_episodes__episode_id__summary_regenerate_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "context_preview_api_story_episodes__episode_id__context_preview_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "post_structure_api_story_works__work_id__structure_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "update"
         }
       ],
       "mobile": {
         "routes": [
-          "scenario.list",
-          "scenario.work",
-          "scenario.session"
+          "operations",
+          "operations.work"
         ],
         "entry_points": [
-          "sidebar.story",
-          "parent.story"
+          "sidebar.operations",
+          "parent.operations"
         ],
-        "implementation": "mobile/src/lib/story-api.ts"
+        "implementation": "mobile/src/app/operations/index.tsx"
       },
       "roles": [
         "user",
+        "member",
         "owner",
         "admin"
       ],
       "permissions": [
-        "read",
-        "create",
-        "update"
+        "read"
       ],
       "scope": {
-        "kind": "story_work",
-        "visibility": "owner_only"
+        "kind": "space_project",
+        "visibility": "acl_read"
       },
       "offline": {
-        "read": "cache",
-        "mutation": "queue",
-        "reconnect": "resume"
-      },
-      "persistence": "sqlite_and_outbox",
-      "mutation": "local_first",
-      "acceptance": [
-        {
-          "id": "story.workflows",
-          "given": "a work has local draft and revision data",
-          "when": "the writer edits an episode and reloads",
-          "then": "ETag/local draft/conflict and node/graph navigation are preserved"
-        }
-      ]
-    },
-    {
-      "id": "story.jobs",
-      "domain": "story",
-      "criticality": "p0",
-      "transport": "fastapi",
-      "operations": [
-        {
-          "operation_id": "get_job_api_story_jobs__job_id__get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "cancel_job_api_story_jobs__job_id__cancel_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "resume_job_api_story_jobs__job_id__resume_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        }
-      ],
-      "mobile": {
-        "routes": [
-          "scenario.work",
-          "scenario.session"
-        ],
-        "entry_points": [
-          "parent.story"
-        ],
-        "implementation": "mobile/src/lib/story-api.ts"
-      },
-      "roles": [
-        "user",
-        "owner",
-        "admin"
-      ],
-      "permissions": [
-        "read",
-        "execute"
-      ],
-      "scope": {
-        "kind": "story_work",
-        "visibility": "owner_only"
-      },
-      "offline": {
-        "read": "cache",
+        "read": "forbidden",
         "mutation": "forbidden",
-        "reconnect": "resume"
+        "reconnect": "refresh"
       },
-      "persistence": "sqlite_cache",
+      "persistence": "none",
       "mutation": "none",
       "acceptance": [
         {
-          "id": "story.jobs",
-          "given": "a generation job is running",
-          "when": "the app resumes after interruption",
-          "then": "done/canceled status is mapped consistently and cancel/resume targets the same job"
-        }
-      ]
-    },
-    {
-      "id": "trpg.snapshot",
-      "domain": "trpg",
-      "criticality": "p0",
-      "transport": "fastapi",
-      "operations": [
-        {
-          "operation_id": "get_session_api_trpg_sessions__session_id__get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
+          "id": "operations.execution.sidebar",
+          "given": "an authenticated operator opens the sidebar",
+          "when": "Operations is selected",
+          "then": "attention and running work use vertical cards without a bottom tab or local sync table"
         },
         {
-          "operation_id": "patch_snapshot_api_trpg_sessions__session_id__snapshot_patch",
-          "transport": "fastapi",
-          "method": "PATCH",
-          "role": "update"
+          "id": "operations.execution.tree",
+          "given": "a readable work has parent and child runs",
+          "when": "its execution is opened",
+          "then": "bounded read-only main/subagent/phase/tool status is shown; out-of-scope rows and tool arguments/results are absent"
         },
         {
-          "operation_id": "get_private_state_api_trpg_sessions__session_id__private_state_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
+          "id": "operations.execution.failure",
+          "given": "the server is offline or account/server scope changes",
+          "when": "a read fails or a previous request completes",
+          "then": "no healthy zero-count state or stale cross-scope response is displayed"
         },
         {
-          "operation_id": "end_session_api_trpg_sessions__session_id__end_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "patch_private_state_api_trpg_sessions__session_id__private_state_patch",
-          "transport": "fastapi",
-          "method": "PATCH",
-          "role": "update"
-        },
-        {
-          "operation_id": "list_gm_private_states_api_trpg_sessions__session_id__private_states_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "patch_image_settings_api_trpg_sessions__session_id__image_settings_patch",
-          "transport": "fastapi",
-          "method": "PATCH",
-          "role": "update"
-        },
-        {
-          "operation_id": "generate_session_image_api_trpg_sessions__session_id__images_generate_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        }
-      ],
-      "mobile": {
-        "routes": [
-          "trpg.list",
-          "trpg.room",
-          "trpg.host"
-        ],
-        "entry_points": [
-          "sidebar.trpg",
-          "parent.trpg"
-        ],
-        "implementation": "mobile/src/lib/trpg-api.ts"
-      },
-      "roles": [
-        "user",
-        "gm",
-        "participant",
-        "admin"
-      ],
-      "permissions": [
-        "read",
-        "write"
-      ],
-      "scope": {
-        "kind": "trpg_session",
-        "visibility": "participant"
-      },
-      "offline": {
-        "read": "cache",
-        "mutation": "queue",
-        "reconnect": "resume"
-      },
-      "persistence": "sqlite_and_outbox",
-      "mutation": "outbox_replay",
-      "acceptance": [
-        {
-          "id": "trpg.snapshot",
-          "given": "a session has a current snapshot and private state",
-          "when": "a websocket reconnect or HTTP refresh occurs",
-          "then": "snapshot keys are merged without dropping existing state and private state remains participant-scoped"
-        }
-      ]
-    },
-    {
-      "id": "trpg.play",
-      "domain": "trpg",
-      "criticality": "p0",
-      "transport": "fastapi",
-      "operations": [
-        {
-          "operation_id": "list_sessions_api_trpg_sessions_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "create_session_api_trpg_sessions_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "create"
-        },
-        {
-          "operation_id": "post_action_api_trpg_sessions__session_id__actions_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "roll_dice_api_trpg_sessions__session_id__dice_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "join_session_api_trpg_sessions__session_id__join_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "leave_session_api_trpg_sessions__session_id__leave_post",
-          "transport": "fastapi",
-          "method": "POST",
-          "role": "command"
-        },
-        {
-          "operation_id": "api_list_rulesets_api_trpg_rulesets_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "api_search_rule_references_api_trpg_rulesets__ruleset_key__references_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        },
-        {
-          "operation_id": "api_rule_reference_stats_api_trpg_rulesets__ruleset_key__reference_stats_get",
-          "transport": "fastapi",
-          "method": "GET",
-          "role": "read"
-        }
-      ],
-      "mobile": {
-        "routes": [
-          "trpg.list",
-          "trpg.room",
-          "trpg.host"
-        ],
-        "entry_points": [
-          "sidebar.trpg",
-          "parent.trpg"
-        ],
-        "implementation": "mobile/src/lib/trpg-api.ts"
-      },
-      "roles": [
-        "user",
-        "gm",
-        "participant",
-        "admin"
-      ],
-      "permissions": [
-        "read",
-        "create",
-        "write"
-      ],
-      "scope": {
-        "kind": "trpg_session",
-        "visibility": "participant"
-      },
-      "offline": {
-        "read": "cache",
-        "mutation": "queue",
-        "reconnect": "resume"
-      },
-      "persistence": "sqlite_and_outbox",
-      "mutation": "outbox_replay",
-      "acceptance": [
-        {
-          "id": "trpg.play",
-          "given": "the user joins a room",
-          "when": "an action or dice roll is sent offline then reconnects",
-          "then": "the room scope and event order are preserved"
+          "id": "operations.execution.agent_history",
+          "given": "the user can read an Agent-linked conversation or run",
+          "when": "Agent history is opened",
+          "then": "live ACL-filtered bounded projections are shown; offline reads are forbidden and no Agent identity grants access to a private session"
         }
       ]
     }

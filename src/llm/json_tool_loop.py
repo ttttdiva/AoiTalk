@@ -15,6 +15,7 @@ from ..services.agent_team_service import (
     ToolFailureCircuitBreaker,
     parse_structured_tool_failure,
     tool_failure_family,
+    tool_failure_scope,
 )
 from .unified_turn_runtime import (
     RegistryToolRouter,
@@ -215,9 +216,10 @@ def run_json_tool_loop(
         )
 
         family = tool_failure_family(tool_name)
+        scope = tool_failure_scope(tool_name, arguments)
         if (
             active_failure_breaker is not None
-            and active_failure_breaker.is_open(family)
+            and active_failure_breaker.is_open(family, scope)
         ):
             tool_result = json.dumps(
                 {
@@ -238,7 +240,7 @@ def run_json_tool_loop(
             if active_failure_breaker is not None:
                 failure = parse_structured_tool_failure(tool_result)
                 if failure is not None:
-                    decision = active_failure_breaker.check(family, failure)
+                    decision = active_failure_breaker.check(family, failure, scope=scope)
                     if not decision.allowed:
                         tool_result = json.dumps(
                             {

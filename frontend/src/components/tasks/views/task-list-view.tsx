@@ -47,7 +47,9 @@ import {
 import { TaskRowDatePicker } from "@/components/tasks/task-row-date-picker";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
+import { formatTimerClock, getTrackedTimerSeconds } from "@/lib/task-time";
 import { cn } from "@/lib/utils";
+import { withBasePath } from "@/lib/base-path";
 import type { TaskBrowseScope } from "@/lib/task-browse-scope";
 import { useProject } from "@/contexts/project-context";
 import {
@@ -56,9 +58,12 @@ import {
   getTaskDisplayStartAt,
 } from "@/lib/task-effective-date";
 import {
+  hasEffectiveTaskOccurrence,
+  updateEffectiveTaskOccurrenceStatus,
+} from "@/lib/task-occurrence-status";
+import {
   buildTaskDateUpdate,
   dateButtonColor,
-  formatDuration,
   formatElapsed,
   getTaskDateView,
   getTaskDisplayStatus,
@@ -93,6 +98,11 @@ import {
   SubtaskRow,
 } from "@/components/tasks/task-list-rows";
 import {
+  TaskProposalList,
+} from "@/components/tasks/task-proposal-card";
+import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
+import type { TaskProposal } from "@/lib/task-proposals-api";
+import {
   DEFAULT_TASK_COLUMN_WIDTHS,
   DEFAULT_TASK_COLUMN_VISIBILITY,
   TASK_LIST_COLUMN_MIN_WIDTHS,
@@ -102,20 +112,6 @@ import {
   type TaskListColumn,
   type TaskListColumnVisibility,
 } from "@/components/tasks/hooks/use-task-view-preferences";
-
-function compactDurationLabel(seconds: number): string {
-  const label = formatDuration(seconds).replace(/\s+/g, "");
-  return label || "--";
-}
-
-function compactElapsedLabel(startedAt: string, now: number): string {
-  const [hours, minutes, seconds] = formatElapsed(startedAt, now)
-    .split(":")
-    .map((value) => Number(value));
-  if (hours > 0) return `${hours}h${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return `${seconds}s`;
-}
 
 type RowStatusFocusSession = {
   epoch: number;
@@ -132,6 +128,10 @@ export const TASK_LIST_STATIC_COLUMN_WIDTH =
   TASK_LIST_SELECTION_COLUMN_WIDTH +
   TASK_LIST_EXPAND_COLUMN_WIDTH +
   TASK_LIST_STATUS_COLUMN_WIDTH;
+
+export function taskProposalChatHref(sessionId: string): string {
+  return withBasePath(`/chat?s=${encodeURIComponent(sessionId)}`);
+}
 
 export type TaskListTableLayoutInput = {
   columnWidths: TaskListColumnWidths;
@@ -479,6 +479,7 @@ type TaskListViewProps = {
     occurrenceContext?: RecurringOccurrenceContext | null,
   ) => void;
   browseScope?: TaskBrowseScope | null;
+  onConfirmProposal?: (proposal: TaskProposal) => void;
 };
 
 type TaskListFilterState = {
@@ -529,6 +530,7 @@ export function TaskListView({
   openTask,
   openTaskById,
   browseScope = null,
+  onConfirmProposal,
 }: TaskListViewProps) {
   // Search has two viewport-specific controls. Keep the refs separate so the
   // desktop toolbar cannot overwrite the visible mobile input (Ctrl/Cmd+F
@@ -890,6 +892,40 @@ export function TaskListView({
     }
   }, [pendingRecurringDateChange, scopeReadOnly, tasks]);
 
+  const startTaskTimer = useCallback(
+    async (task: Task) => {
+      const started = await taskApi.startTimer(
+        task.id,
+        task.effective_occurrence_id ?? undefined,
+      );
+      setTasks((prev) =>
+        prev.map((item) =>
+          item.id === task.id ? applyTaskTimerStart(item, started) : item,
+        ),
+      );
+      if (hasEffectiveTaskOccurrence(task)) {
+        try {
+          await updateEffectiveTaskOccurrenceStatus({
+            task,
+            status: "in_progress",
+            applyTaskPatchLocally,
+            refreshTasks: () => fetchData({ notifySidebar: false }),
+          });
+        } catch (err) {
+          // タスク本体はサーバー側で進行中になっているため、戻さず正本を再取得する。
+          console.error("タイマー開始後の発生回ステータス更新失敗:", err);
+          await fetchData({ notifySidebar: false });
+        }
+      }
+      window.dispatchEvent(
+        new CustomEvent("timer-changed", {
+          detail: { activeEntry: started, taskId: task.id },
+        }),
+      );
+    },
+    [applyTaskPatchLocally, fetchData, setTasks],
+  );
+
   // タイマー操作
   const handleTimer = useCallback(
     async (task: Task, e: React.MouseEvent) => {
@@ -901,32 +937,27 @@ export function TaskListView({
       setTimerLoading(task.id);
       try {
         if (task.active_time_entry) {
-          await taskApi.stopTimer(task.active_time_entry.id);
+          const stoppedEntryId = task.active_time_entry.id;
+          const stopped = await taskApi.stopTimer(stoppedEntryId);
           setTasks((prev) =>
             prev.map((item) =>
-              item.id === task.id ? { ...item, active_time_entry: null } : item,
+              item.id === task.id &&
+              item.active_time_entry?.id === stoppedEntryId
+                ? {
+                    ...item,
+                    active_time_entry: null,
+                    total_time_seconds:
+                      getTrackedTimerSeconds(item.total_time_seconds) +
+                      getTrackedTimerSeconds(stopped.duration_seconds),
+                  }
+                : item,
             ),
           );
-          window.dispatchEvent(
-            new CustomEvent("timer-changed", {
-              detail: { activeEntry: null, taskId: task.id },
-            }),
-          );
+          // 一覧は上で更新済み。他の表示は再取得し、遅い停止応答で
+          // 新しく始まったタイマーを一律に消さない。
+          window.dispatchEvent(new CustomEvent("timer-changed"));
         } else {
-          const started = await taskApi.startTimer(
-            task.id,
-            task.effective_occurrence_id ?? undefined,
-          );
-          setTasks((prev) =>
-            prev.map((item) =>
-              item.id === task.id ? applyTaskTimerStart(item, started) : item,
-            ),
-          );
-          window.dispatchEvent(
-            new CustomEvent("timer-changed", {
-              detail: { activeEntry: started },
-            }),
-          );
+          await startTaskTimer(task);
         }
       } catch (err) {
         console.error("タイマー操作失敗:", err);
@@ -934,7 +965,7 @@ export function TaskListView({
         setTimerLoading(null);
       }
     },
-    [isTaskReadOnly, setTasks],
+    [isTaskReadOnly, setTasks, startTaskTimer],
   );
 
   // フォーカス中タスクのタイマー開始
@@ -949,26 +980,13 @@ export function TaskListView({
 
     setTimerLoading(task.id);
     try {
-      const started = await taskApi.startTimer(
-        task.id,
-        task.effective_occurrence_id ?? undefined,
-      );
-      setTasks((prev) =>
-        prev.map((item) =>
-          item.id === task.id ? applyTaskTimerStart(item, started) : item,
-        ),
-      );
-      window.dispatchEvent(
-        new CustomEvent("timer-changed", {
-          detail: { activeEntry: started, taskId: task.id },
-        }),
-      );
+      await startTaskTimer(task);
     } catch (err) {
       console.error("Focused task timer start failed:", err);
     } finally {
       setTimerLoading(null);
     }
-  }, [focusedTaskId, isTaskReadOnly, setTasks, tasks]);
+  }, [focusedTaskId, isTaskReadOnly, startTaskTimer, tasks]);
 
   // 経過時間リアルタイム表示
   const [now, setNow] = useState(() => Date.now());
@@ -1682,6 +1700,29 @@ export function TaskListView({
     projectMap,
   ]);
 
+  const proposalTaskIds = useMemo(
+    () => filteredTasks.map((task) => task.id),
+    [filteredTasks],
+  );
+  const proposalState = useTaskProposals({
+    taskIds: proposalTaskIds,
+    loading: loading || (projectsLoading && projects.length === 0),
+  });
+  const handleProposalConfirm = useCallback(
+    (proposal: TaskProposal) => {
+      if (onConfirmProposal) {
+        onConfirmProposal(proposal);
+        return;
+      }
+      if (typeof window !== "undefined") {
+        window.location.assign(
+          taskProposalChatHref(proposal.session_id),
+        );
+      }
+    },
+    [onConfirmProposal],
+  );
+
   // キーボード移動は、展開された親の直後に表示されるサブタスクも
   // 1 行ずつ辿れるよう、デスクトップの表示順と同じフラットな配列を使う。
   // フィルタ済みの親だけを起点にするため、非表示の親配下のサブタスクや
@@ -1994,6 +2035,19 @@ export function TaskListView({
         タップで開く / チェックで複数選択
       </p>
 
+      <TaskProposalList
+        state={proposalState}
+        getDecisionState={proposalState.getDecisionState}
+        onDecision={proposalState.decide}
+        onConfirm={handleProposalConfirm}
+        onRefresh={proposalState.refresh}
+        decisionDisabled={(proposal) => {
+          const task = tasks.find((item) => item.id === proposal.task_id);
+          return task ? isTaskReadOnly(task) : true;
+        }}
+        className="mx-3 mb-2"
+      />
+
       {/* タスクテーブル */}
       <ScrollArea className="min-h-0 flex-1">
         {(loadError || projectsLoadError) &&
@@ -2232,6 +2286,13 @@ export function TaskListView({
                         );
                     const isExpanded = expandedTasks.has(task.id);
                     const displayStatus = getTaskDisplayStatus(task);
+                    const trackedTimeLabel = formatTimerClock(
+                      getTrackedTimerSeconds(
+                        task.total_time_seconds,
+                        task.active_time_entry?.started_at,
+                        now,
+                      ),
+                    );
                     const wbsMetadata =
                       task.metadata && typeof task.metadata.wbs === "object"
                         ? (task.metadata.wbs as Record<string, unknown>)
@@ -2543,7 +2604,7 @@ export function TaskListView({
                                 }}
                                  className="ao-task-project-select max-w-28 cursor-pointer truncate border-none bg-transparent text-[13px] leading-5 text-muted-foreground outline-none hover:text-foreground"
                               >
-                                {projects.map((p) => (
+                                {(taskReadOnly ? readableProjects : projects).map((p) => (
                                   <option
                                     key={p.id}
                                     value={p.id}
@@ -2749,7 +2810,7 @@ export function TaskListView({
                             {/* タイマー操作 → 実績時間。通常導線として常時表示する。 */}
                             {showTimeColumn && (
                                <td className="h-11 whitespace-nowrap px-1 py-0 text-left text-[13px] leading-5 text-muted-foreground">
-                                <div className="flex min-w-0 items-center gap-1 overflow-hidden">
+                                <div className="flex items-center gap-1">
                                   {!taskReadOnly && (
                                     <Button
                                       variant="ghost"
@@ -2780,29 +2841,11 @@ export function TaskListView({
                                     </Button>
                                   )}
                                   <span
-                                    className="min-w-0 truncate font-mono text-[11px] leading-5 text-foreground/80"
-                                    title={
-                                      (task.total_time_seconds ?? 0) > 0
-                                        ? `実績時間 ${formatDuration(task.total_time_seconds ?? 0)}`
-                                        : "実績時間なし"
-                                    }
+                                    className="shrink-0 whitespace-nowrap font-mono text-[11px] leading-5 tabular-nums text-foreground/80"
+                                    title={`実績時間 ${trackedTimeLabel}`}
                                   >
-                                    {compactDurationLabel(
-                                      task.total_time_seconds ?? 0,
-                                    )}
+                                    {trackedTimeLabel}
                                   </span>
-                                  {task.active_time_entry?.started_at && (
-                                    <span
-                                      className="inline-flex min-w-0 shrink items-center gap-0.5 truncate font-mono text-[10px] leading-5 text-green-600 dark:text-green-400"
-                                      title={`現在の経過時間 ${formatElapsed(task.active_time_entry.started_at, now)}`}
-                                    >
-                                      <span className="size-1.5 rounded-full bg-green-500 shadow-[0_0_6px_rgba(0,191,165,0.7)]" />
-                                      +{compactElapsedLabel(
-                                        task.active_time_entry.started_at,
-                                        now,
-                                      )}
-                                    </span>
-                                  )}
                                 </div>
                               </td>
                             )}
@@ -2839,6 +2882,7 @@ export function TaskListView({
                                showPriorityColumn={showPriorityColumn}
                                showAssigneeColumn={showAssigneeColumn}
                                showTimeColumn={showTimeColumn}
+                               now={now}
                                onStatusChange={handleRowStatusChange}
                                statusFocusEpochRef={rowStatusFocusEpochRef}
                                rowRef={(node) => {

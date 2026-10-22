@@ -195,7 +195,7 @@ class Config:
     }
     
     # TTSエンジン設定
-    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech', 'irodori_tts', 'miotts']
+    TTS_ENGINES = ['voicevox', 'voiceroid', 'cevio', 'aivoice', 'aivisspeech', 'irodori_tts', 'miotts', 'gemini_tts']
     
     # グローバル必須環境変数は持たない。
     # LLM APIキーは llm_provider ごとに validate_config() で確認する。

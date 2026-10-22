@@ -1,0 +1,176 @@
+{
+  "synthetic_only": true,
+  "cases": [
+    {
+      "name": "期限を明記された値のまま候補化。法定期限の主張ではない",
+      "tool": "private.draft.propose",
+      "input": {
+        "evidence_ref": "00000000-0000-4000-8000-000000000001",
+        "proposal": {
+          "kind": "deadline",
+          "data": {
+            "subject_key": "document_a",
+            "due_date": "2027-03-15",
+            "label": "架空書類の確認待ち日付"
+          }
+        },
+        "idempotency_key": "fixture-deadline-1"
+      },
+      "expected_success": {
+        "draft_ref": "00000000-0000-4000-8000-000000000002",
+        "confirmed_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "awaiting_user_review",
+        "effective_ledger_change": false
+      }
+    },
+    {
+      "name": "過去の消費の記帳候補。残数は未変更",
+      "tool": "private.draft.propose",
+      "input": {
+        "evidence_ref": "00000000-0000-4000-8000-000000000001",
+        "proposal": {
+          "kind": "inventory",
+          "data": {
+            "subject_key": "item_a",
+            "entry_type": "consumption",
+            "quantity": 2,
+            "unit": "pcs",
+            "occurred_on": "2026-10-20"
+          }
+        },
+        "idempotency_key": "fixture-inventory-1"
+      },
+      "expected_success": {
+        "draft_ref": "00000000-0000-4000-8000-000000000002",
+        "confirmed_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "awaiting_user_review",
+        "effective_ledger_change": false
+      }
+    },
+    {
+      "name": "合成レシート1件。金額は通貨の最小単位",
+      "tool": "private.draft.propose",
+      "input": {
+        "evidence_ref": "00000000-0000-4000-8000-000000000001",
+        "proposal": {
+          "kind": "finance",
+          "data": {
+            "source_format": "receipt_image",
+            "rows": [
+              {
+                "row_ref": "00000000-0000-4000-8000-000000000003",
+                "occurred_on": "2026-10-20",
+                "kind": "expense",
+                "amount_minor": 1280,
+                "currency": "JPY",
+                "account_alias": "wallet_a",
+                "category": "食費"
+              }
+            ]
+          }
+        },
+        "idempotency_key": "fixture-finance-1"
+      },
+      "expected_success": {
+        "draft_ref": "00000000-0000-4000-8000-000000000002",
+        "confirmed_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "status": "awaiting_user_review",
+        "effective_ledger_change": false
+      }
+    },
+    {
+      "name": "合成キャリア情報。求人検索や応募ではない",
+      "tool": "private.career.context",
+      "input": {
+        "accepted_profile_ref": "00000000-0000-4000-8000-000000000002"
+      },
+      "expected_success": {
+        "profile": {
+          "skills": [
+            "Python",
+            "業務整理"
+          ],
+          "preferences": [
+            "個人開発を継続"
+          ],
+          "constraints": [
+            "週3時間の試行枠"
+          ]
+        },
+        "source_refs": [
+          "00000000-0000-4000-8000-000000000001"
+        ],
+        "needs_review": []
+      }
+    },
+    {
+      "name": "確認済み期限への私的通知候補。まだ予定を作らない",
+      "tool": "private.reminder.propose",
+      "input": {
+        "candidate_entry_id": "00000000-0000-4000-8000-000000000002",
+        "confirmed_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "remind_at": "2027-03-01T09:00:00+09:00",
+        "time_zone": "Asia/Tokyo",
+        "idempotency_key": "fixture-reminder-1"
+      },
+      "expected_success": {
+        "draft_ref": "00000000-0000-4000-8000-000000000003",
+        "status": "awaiting_user_review",
+        "delivery": "owner_private_in_app",
+        "scheduled": false
+      }
+    }
+  ],
+  "career_response_example": {
+    "status": "proposal_not_application",
+    "options": [
+      {
+        "role": "業務自動化の小規模支援",
+        "fit": [
+          "Python",
+          "業務整理"
+        ],
+        "unknowns": [
+          "本人の実績",
+          "希望する働き方"
+        ],
+        "next_step": "過去に改善した作業を1件だけ匿名で整理する"
+      }
+    ],
+    "market_claims_verified": false
+  },
+  "negative_semantic_cases": [
+    {
+      "input_condition": "External model route receives any private source or balance",
+      "expected": "EGRESS_DENIED before prompt/tool-result transmission"
+    },
+    {
+      "input_condition": "Agent requests deadline verification/completion or inventory live append",
+      "expected": "CAPABILITY_DISABLED; tool absent"
+    },
+    {
+      "input_condition": "Draft source says no date, agent invents expiry from cycle",
+      "expected": "EVIDENCE_MISMATCH; no draft materialization"
+    },
+    {
+      "input_condition": "Inventory purchase/consumption quantity is zero",
+      "expected": "SCHEMA_INVALID at semantic validation"
+    },
+    {
+      "input_condition": "Different owner supplies valid-looking source/draft/profile UUID",
+      "expected": "SOURCE_NOT_FOUND/OWNER_SCOPE_DENIED without revealing existence"
+    },
+    {
+      "input_condition": "Receipt duplicates a confirmed imported transaction",
+      "expected": "Candidate remains unresolved; no second expense added"
+    },
+    {
+      "input_condition": "Candidate changes after reminder approval or task is complete",
+      "expected": "STALE_SNAPSHOT; suppress delivery until reviewed"
+    },
+    {
+      "input_condition": "Tool response lost after append",
+      "expected": "Same idempotency key/input replays same result; do not create another draft"
+    }
+  ]
+}

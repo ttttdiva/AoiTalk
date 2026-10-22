@@ -106,13 +106,13 @@ export function FileMetadata({
     };
   }, [entry]);
 
+  if (grid && entry.type === "file") return null;
+
   return (
     <Text style={grid ? styles.gridFileMeta : styles.fileMeta} numberOfLines={1}>
       {entry.type === "directory"
         ? "フォルダー"
-        : grid
-          ? formatSize(size)
-          : `${entry.mimeType || "ファイル"}${size ? ` ・ ${formatSize(size)}` : ""}`}
+        : `${entry.mimeType || "ファイル"}${size ? ` ・ ${formatSize(size)}` : ""}`}
     </Text>
   );
 }

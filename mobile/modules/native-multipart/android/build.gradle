@@ -1,0 +1,27 @@
+apply plugin: 'com.android.library'
+
+group = 'expo.modules.nativemultipart'
+version = '0.1.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useDefaultAndroidSdkVersions()
+useExpoPublishing()
+
+dependencies {
+  // React Native 0.81.5 resolves this version for the Android networking stack.
+  implementation "com.squareup.okhttp3:okhttp:4.9.2"
+}
+
+android {
+  namespace "expo.modules.nativemultipart"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}

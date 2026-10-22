@@ -13,6 +13,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Dict, Optional
+from ..security.http_log_redaction import HttpSecretLogFilter, install_http_log_redaction
 
 
 # Structured marker used by code that has useful diagnostics for the app log
@@ -147,6 +148,7 @@ class LoggingConfig:
         # it on handlers as well ensures propagated child records are filtered
         # without relying on logger-level filter propagation details.
         handler.addFilter(SpotipyRateLimitFilter())
+        handler.addFilter(HttpSecretLogFilter())
         if console:
             handler.addFilter(
                 FileOnlyLogFilter(include_file_only=self.level <= logging.DEBUG)
@@ -193,6 +195,7 @@ class LoggingConfig:
         root_logger.addFilter(SpotipyRateLimitFilter())
 
         self._suppress_noisy_loggers()
+        install_http_log_redaction()
 
     def _create_file_handler(self, file_path: Path, level: int) -> logging.Handler:
         try:

@@ -10,12 +10,17 @@
 本モジュールではなくパッケージ `__init__.py`（ファサード）側に定義している。
 """
 
+import logging
+import math
+import os
 import socket
 import subprocess
 import sys
 import time
-import logging
+from dataclasses import dataclass
 from pathlib import Path
+
+import psutil
 
 from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
@@ -24,6 +29,112 @@ _IS_WINDOWS = sys.platform == "win32"
 _child_processes: list[subprocess.Popen] = []
 _openai_compatible_local_processes: list[subprocess.Popen] = []
 logger = logging.getLogger(__name__)
+
+SUPERVISED_STARTUP_ENV = "AOITALK_SUPERVISED_STARTUP"
+
+
+@dataclass(frozen=True)
+class _OwnedProcessIdentity:
+    """Stable identity captured for one process in an owned launch tree.
+
+    A PID alone can be recycled while a stale launcher is being cleaned up.
+    Keep the immutable launch metadata in memory with the tracked Popen object;
+    it is never persisted or included in user-facing logs.
+    """
+
+    pid: int
+    create_time: float
+    parent_pid: int
+    executable: str
+    cwd: str
+    command_line: tuple[str, ...]
+
+
+def _canonical_process_path(value: object) -> str:
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(text)))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _read_owned_process_identity(pid: int) -> _OwnedProcessIdentity | None:
+    """Read exact process metadata, returning ``None`` on any uncertainty."""
+    try:
+        process = psutil.Process(int(pid))
+        if not process.is_running():
+            return None
+        created = float(process.create_time())
+        if not math.isfinite(created) or created <= 0:
+            return None
+        executable = _canonical_process_path(process.exe())
+        cwd = _canonical_process_path(process.cwd())
+        command_line = tuple(str(value) for value in process.cmdline())
+        parent_pid = int(process.ppid())
+        if int(process.pid) <= 0 or parent_pid < 0 or not executable or not cwd:
+            return None
+        return _OwnedProcessIdentity(
+            pid=int(process.pid),
+            create_time=created,
+            parent_pid=parent_pid,
+            executable=executable,
+            cwd=cwd,
+            command_line=command_line,
+        )
+    except (psutil.Error, OSError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _capture_owned_process_tree(proc: subprocess.Popen) -> tuple[_OwnedProcessIdentity, ...] | None:
+    """Capture the launcher and every current descendant with stable identity."""
+    try:
+        root = psutil.Process(int(proc.pid))
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
+    identities = []
+    for process in processes:
+        identity = _read_owned_process_identity(int(process.pid))
+        if identity is None:
+            return None
+        identities.append(identity)
+    return tuple(identities)
+
+
+def _owned_process_identity_matches(
+    expected: _OwnedProcessIdentity,
+    current: _OwnedProcessIdentity,
+) -> bool:
+    """Compare all reusable identity fields except the mutable parent PID."""
+    return (
+        expected.pid == current.pid
+        and math.isclose(
+            expected.create_time,
+            current.create_time,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        and expected.executable == current.executable
+        and expected.cwd == current.cwd
+        and expected.command_line == current.command_line
+    )
+
+
+def _supervised_startup_enabled() -> bool:
+    """Whether startup is owned by a supervisor that must fail closed.
+
+    Manual/local launch keeps the historical port cleanup behavior.  The
+    supervised launcher cannot know whether an occupied listener is an older
+    managed process or an operator's process, so it must never terminate one.
+    """
+    return os.environ.get(SUPERVISED_STARTUP_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _track_child_process(
@@ -78,8 +189,22 @@ def _listening_pid_for_netstat_line(line: str, port: int) -> str | None:
     return pid if pid.isdigit() and int(pid) > 0 else None
 
 
+def _fail_closed_for_supervised_startup(port: int) -> None:
+    """Refuse an occupied port without ever terminating its listener."""
+    # A listener that accepts localhost connections is enough evidence to
+    # reject startup.  If the race changes between this check and bind(), the
+    # bind itself still fails; neither path invokes a process termination API.
+    if _is_port_open("127.0.0.1", port, timeout_seconds=0.25):
+        raise RuntimeError(
+            f"ポート {port} は既に使用中のため、supervised startupを中止しました"
+        )
+
+
 def _kill_existing_on_port(port: int) -> None:
     """Stop existing listener on the given port before starting services."""
+    if _supervised_startup_enabled():
+        _fail_closed_for_supervised_startup(port)
+        return
     if _IS_WINDOWS:
         result = subprocess.run(
             ["netstat", "-ano"],
@@ -282,19 +407,29 @@ def _wait_for_process_port(
     host: str,
     port: int,
     timeout_seconds: float,
+    *,
+    cancel_event=None,
 ) -> bool:
     """Wait for a stable listener while ensuring its launcher stays alive."""
     deadline = time.monotonic() + timeout_seconds
+    def checkpoint():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Managed local model startup was cancelled")
+
     while time.monotonic() < deadline:
+        checkpoint()
         if proc.poll() is not None:
             return False
         if _is_port_open(host, port, timeout_seconds=0.25):
+            checkpoint()
             stable_until = min(deadline, time.monotonic() + 1.0)
             while time.monotonic() < stable_until:
+                checkpoint()
                 if proc.poll() is not None:
                     return False
                 if not _is_port_open(host, port, timeout_seconds=0.25):
                     break
+                checkpoint()
                 time.sleep(0.1)
             else:
                 return True

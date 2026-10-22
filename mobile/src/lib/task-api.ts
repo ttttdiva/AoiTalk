@@ -5,7 +5,8 @@
 import { Alert } from "react-native";
 
 import { fetchApi, getBaseUrl, isApiHttpError } from "./api-client";
-import { getToken } from "./auth";
+import { sendWithTransportAuth } from "./transport-auth";
+import { nativeMultipartUpload, type NativeMultipartFile } from "./native-multipart";
 import { normalizeTaskStatus } from "./task-status";
 import type {
   ProjectNotificationSetting,
@@ -33,6 +34,33 @@ type IncompleteSubtaskSummary = {
   id: string;
   title: string;
   status: string;
+};
+
+type TaskAssigneeResponse = {
+  id?: unknown;
+  task_id?: unknown;
+  user_id?: unknown;
+  is_primary?: unknown;
+  display_name?: unknown;
+  username?: unknown;
+};
+
+type TaskTagResponse = {
+  id?: unknown;
+  project_id?: unknown;
+  name?: unknown;
+  color?: unknown;
+  created_by?: unknown;
+  created_at?: unknown;
+};
+
+type LegacyTaskAssigneeFields = {
+  assignees?: unknown;
+  assignee_ids?: unknown;
+  primary_assignee_user_id?: unknown;
+  primary_assignee_display_name?: unknown;
+  primary_assignee_username?: unknown;
+  primary_assignee_name?: unknown;
 };
 
 export class TaskCompletionCancelledError extends Error {
@@ -139,13 +167,178 @@ function buildScopeQuery(scope: Scope | string): URLSearchParams {
   return params;
 }
 
-function normalizeTask<T extends { status: string }>(task: T): T {
+function taskAssigneeFromId(
+  taskId: string,
+  userId: string,
+  index: number,
+): Task["assignees"][number] {
+  return {
+    id: `legacy-${taskId}-${userId}`,
+    task_id: taskId,
+    user_id: userId,
+    is_primary: index === 0,
+  };
+}
+
+function normalizeAssignees(
+  task: Record<string, unknown>,
+  taskId: string,
+): {
+  assignees: Task["assignees"];
+  complete: boolean;
+} {
+  const rawAssignees = task.assignees;
+  if (Array.isArray(rawAssignees)) {
+    const normalized: Task["assignees"] = [];
+    for (const [index, item] of rawAssignees.entries()) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return { assignees: [], complete: false };
+      }
+      const candidate = item as TaskAssigneeResponse;
+      if (typeof candidate.user_id !== "string" || !candidate.user_id.trim()) {
+        return { assignees: [], complete: false };
+      }
+      normalized.push({
+        id:
+          typeof candidate.id === "string" && candidate.id.trim()
+            ? candidate.id
+            : `legacy-${taskId}-${candidate.user_id}`,
+        task_id:
+          typeof candidate.task_id === "string" && candidate.task_id.trim()
+            ? candidate.task_id
+            : taskId,
+        user_id: candidate.user_id,
+        is_primary:
+          typeof candidate.is_primary === "boolean"
+            ? candidate.is_primary
+            : index === 0,
+        ...(typeof candidate.display_name === "string"
+          ? { display_name: candidate.display_name }
+          : {}),
+        ...(typeof candidate.username === "string"
+          ? { username: candidate.username }
+          : {}),
+      });
+    }
+    // An explicitly returned collection, including [], is authoritative.
+    return { assignees: normalized, complete: true };
+  }
+
+  const rawAssigneeIds = task.assignee_ids;
+  if (Array.isArray(rawAssigneeIds)) {
+    const ids = rawAssigneeIds.filter(
+      (value): value is string =>
+        typeof value === "string" && Boolean(value.trim()),
+    );
+    if (ids.length !== rawAssigneeIds.length) {
+      return { assignees: [], complete: false };
+    }
+    return {
+      assignees: ids.map((userId, index) =>
+        taskAssigneeFromId(taskId, userId, index),
+      ),
+      complete: true,
+    };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(task, "primary_assignee_user_id")) {
+    const primaryId = task.primary_assignee_user_id;
+    if (typeof primaryId === "string" && primaryId.trim()) {
+      const primary = taskAssigneeFromId(taskId, primaryId, 0);
+      const displayName =
+        typeof task.primary_assignee_display_name === "string"
+          ? task.primary_assignee_display_name
+          : typeof task.primary_assignee_name === "string"
+            ? task.primary_assignee_name
+            : undefined;
+      const username =
+        typeof task.primary_assignee_username === "string"
+          ? task.primary_assignee_username
+          : undefined;
+      return {
+        assignees: [
+          {
+            ...primary,
+            ...(displayName ? { display_name: displayName } : {}),
+            ...(username ? { username } : {}),
+          },
+        ],
+        complete: true,
+      };
+    }
+    // Legacy primary-only responses used null to mean that the task has no
+    // primary assignment.  Unlike an omitted field, that is authoritative.
+    return { assignees: [], complete: true };
+  }
+
+  // `null` and omission are both an incomplete aggregate on old/detail
+  // projections.  Preserve the distinction from an explicit [] so callers
+  // can omit assignee_ids from unrelated updates.
+  return { assignees: [], complete: false };
+}
+
+function normalizeTags(
+  task: Record<string, unknown>,
+): {
+  tags: Task["tags"];
+  complete: boolean;
+} {
+  if (!Array.isArray(task.tags)) {
+    // Older/compact task responses omit tags (or return null).  The
+    // repository must retain its cached aggregate until a full response
+    // arrives instead of interpreting this as an explicit clear.
+    return { tags: [], complete: false };
+  }
+  const normalized: Task["tags"] = [];
+  for (const item of task.tags) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { tags: [], complete: false };
+    }
+    const candidate = item as TaskTagResponse;
+    if (
+      typeof candidate.id !== "string" ||
+      !candidate.id.trim() ||
+      typeof candidate.name !== "string"
+    ) {
+      return { tags: [], complete: false };
+    }
+    normalized.push({
+      id: candidate.id,
+      project_id:
+        typeof candidate.project_id === "string" ? candidate.project_id : "",
+      name: candidate.name,
+      ...(typeof candidate.color === "string"
+        ? { color: candidate.color }
+        : {}),
+      ...(typeof candidate.created_by === "string"
+        ? { created_by: candidate.created_by }
+        : {}),
+      ...(typeof candidate.created_at === "string"
+        ? { created_at: candidate.created_at }
+        : {}),
+    });
+  }
+  return { tags: normalized, complete: true };
+}
+
+export function normalizeTask<T extends { status: string }>(
+  task: T,
+): T &
+  Pick<Task, "assignees" | "assignees_complete" | "tags" | "tags_complete"> {
+  const raw = task as T & LegacyTaskAssigneeFields & Record<string, unknown>;
+  const normalizedAssignees = normalizeAssignees(raw, String(raw.id ?? ""));
+  const normalizedTags = normalizeTags(raw);
   return {
     ...task,
     status: normalizeTaskStatus(task.status),
     auto_close_on_due:
       (task as unknown as Task).auto_close_on_due === true,
-  } as T;
+    assignees: normalizedAssignees.assignees,
+    assignees_complete: normalizedAssignees.complete,
+    tags: normalizedTags.tags,
+    tags_complete: normalizedTags.complete,
+  } as T &
+    Pick<Task, "assignees" | "assignees_complete" | "tags" | "tags_complete">;
 }
 
 function normalizeOccurrence<T extends { status: string }>(occurrence: T): T {
@@ -165,16 +358,16 @@ function normalizePayload(
   };
 }
 
-async function uploadForm<T>(path: string, form: FormData): Promise<T> {
-  const token = await getToken();
+async function uploadFile<T>(path: string, file: NativeMultipartFile): Promise<T> {
   const baseUrl = await getBaseUrl();
-  const res = await fetch(`${baseUrl}${path}`, {
-    method: "POST",
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: form,
-  });
+  const url = `${baseUrl}${path}`;
+  const res = await sendWithTransportAuth(url, { targetBaseUrl: baseUrl }, (headers) =>
+    nativeMultipartUpload({
+      url,
+      headers,
+      file,
+    }),
+  );
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`API Error ${res.status}: ${text.slice(0, 500)}`);
@@ -341,13 +534,11 @@ export const taskApi = {
     taskId: string,
     file: { uri: string; name: string; mimeType?: string | null },
   ): Promise<TaskAttachment> {
-    const form = new FormData();
-    form.append("file", {
+    return uploadFile<TaskAttachment>(`/api/tasks/${taskId}/attachments`, {
       uri: file.uri,
       name: file.name,
-      type: file.mimeType || "application/octet-stream",
-    } as unknown as Blob);
-    return uploadForm<TaskAttachment>(`/api/tasks/${taskId}/attachments`, form);
+      mimeType: file.mimeType || "application/octet-stream",
+    });
   },
 
   async deleteAttachment(taskId: string, attachmentId: string): Promise<void> {

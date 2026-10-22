@@ -1,4 +1,6 @@
+import { AppState } from "react-native";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { scheduleAfterNavigation } from "../lib/after-navigation";
 
 import {
   listRemoteServers,
@@ -19,6 +21,11 @@ export type RemoteTaskScope = {
   spaceId?: string | null;
 };
 
+export type RemoteTaskOptions = {
+  /** Delay the first network request until the current navigation settles. */
+  deferInitialLoad?: boolean;
+};
+
 /**
  * 有効な外部接続先のタスクを現在のプロジェクト/スペース文脈で取得する。
  *
@@ -29,6 +36,7 @@ export type RemoteTaskScope = {
 export function useRemoteTasks(
   enabled: boolean = true,
   scope?: RemoteTaskScope,
+  options?: RemoteTaskOptions,
 ) {
   const [remoteTasks, setRemoteTasks] = useState<RemoteTask[]>([]);
   const [profiles, setProfiles] = useState<RemoteServerProfile[]>([]);
@@ -39,6 +47,7 @@ export function useRemoteTasks(
 
   const projectId = scope?.projectId ?? null;
   const spaceId = scope?.spaceId ?? null;
+  const deferInitialLoad = options?.deferInitialLoad === true;
 
   const reload = useCallback(async () => {
     const generation = ++requestGeneration.current;
@@ -90,8 +99,49 @@ export function useRemoteTasks(
   }, [enabled, projectId, spaceId]);
 
   useEffect(() => {
-    void reload();
-  }, [reload]);
+    let cancelled = false;
+    if (!deferInitialLoad) {
+      void reload();
+      return () => {
+        cancelled = true;
+        requestGeneration.current += 1;
+      };
+    }
+
+    let waitingForActive = AppState.currentState !== "active";
+    let interaction: ReturnType<typeof scheduleAfterNavigation> | null = null;
+    const schedule = () => {
+      if (cancelled || waitingForActive || interaction) return;
+      interaction = scheduleAfterNavigation(() => {
+        interaction = null;
+        if (cancelled || waitingForActive || AppState.currentState !== "active") {
+          waitingForActive = true;
+          return;
+        }
+        void reload();
+      });
+    };
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") {
+        waitingForActive = true;
+        interaction?.cancel();
+        interaction = null;
+        requestGeneration.current += 1;
+        return;
+      }
+      if (waitingForActive) {
+        waitingForActive = false;
+        schedule();
+      }
+    });
+    schedule();
+    return () => {
+      cancelled = true;
+      interaction?.cancel();
+      appStateSubscription.remove();
+      requestGeneration.current += 1;
+    };
+  }, [deferInitialLoad, reload]);
 
   return { remoteTasks, profiles, loading, reload };
 }

@@ -14,13 +14,16 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import sys
+import threading
 import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from ..security.harness_execution_scope import (
+    CommandBackendKind,
     ExternalReadGrant,
     HarnessExecutionScope,
     HarnessExecutionScopeConfigurationError,
@@ -733,14 +736,22 @@ def build_current_turn_enterprise_scope(
     )
 
 
-def build_autonomous_agent_harness_scope(
+def _build_managed_harness_scope(
     *,
     workspace_path: PathLike,
     harness_workspace_root: PathLike,
     resource_limits: ResourceLimits,
     run_id: str,
     audit_id: str,
+    backend_kind: CommandBackendKind = "wsl_bwrap",
     network_capability: NetworkCapability = NetworkCapability.NONE,
+    user_id: str = "agent-harness-system",
+    organization_id: str | None = None,
+    project_ids: tuple[str, ...] = (),
+    app_ids: tuple[str, ...] = (),
+    writable: bool = True,
+    deletable: bool = True,
+    scratch_name: str = ".aoitalk-harness-scratch",
 ) -> HarnessExecutionScope:
     """Issue the least-privilege scope for one autonomous harness checkout.
 
@@ -787,41 +798,189 @@ def build_autonomous_agent_harness_scope(
         raise HarnessExecutionScopeServiceError(
             "autonomous harness checkout cannot be the shared workspace root"
         )
-    scratch = workspace / ".aoitalk-harness-scratch"
+    scratch = workspace / scratch_name
+    # Record whether this issuance creates the scratch directory, so only a
+    # directory this run made itself is ever removed when the run ends.
+    scratch_created = not os.path.lexists(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    if _path_has_any_link_or_reparse(Path(os.path.abspath(scratch))):
-        raise HarnessExecutionScopeServiceError(
-            "autonomous harness scratch contains a symbolic link/reparse point"
+    created_identity = _directory_identity(scratch) if scratch_created else None
+    try:
+        if _path_has_any_link_or_reparse(Path(os.path.abspath(scratch))):
+            raise HarnessExecutionScopeServiceError(
+                "autonomous harness scratch contains a symbolic link/reparse point"
+            )
+        scratch = _canonicalise(scratch)
+        if not _is_within(scratch, workspace):
+            raise HarnessExecutionScopeServiceError(
+                "autonomous harness scratch escaped the checkout"
+            )
+        selected_run_id = _namespace_id(run_id, "run_id", required=True)
+        selected_audit_id = _clean_id(audit_id, "audit_id", required=True)
+        root_identity = "agent-harness:" + hashlib.sha256(
+            _path_key(workspace).encode("utf-8", "surrogatepass")
+        ).hexdigest()[:32]
+        scope = HarnessExecutionScope._issue(
+            user_id=user_id,
+            organization_id=organization_id,
+            project_ids=project_ids,
+            app_ids=app_ids,
+            read_roots=(workspace, scratch),
+            write_roots=(workspace, scratch) if writable else (),
+            delete_roots=((workspace, scratch) if deletable else (scratch,)) if writable else (),
+            command_roots=(workspace, scratch),
+            scratch_roots=(scratch,),
+            external_read_grants=(),
+            network_capability=network_capability,
+            network_allowlist=(),
+            environment_capability_ids=(),
+            secret_capability_ids=(),
+            resource_limits=resource_limits,
+            run_id=selected_run_id,
+            audit_id=selected_audit_id,
+            root_identity=root_identity,
+            backend_kind=backend_kind,
         )
-    scratch = _canonicalise(scratch)
-    if not _is_within(scratch, workspace):
-        raise HarnessExecutionScopeServiceError(
-            "autonomous harness scratch escaped the checkout"
-        )
-    selected_run_id = _namespace_id(run_id, "run_id", required=True)
-    selected_audit_id = _clean_id(audit_id, "audit_id", required=True)
-    root_identity = "agent-harness:" + hashlib.sha256(
-        _path_key(workspace).encode("utf-8", "surrogatepass")
-    ).hexdigest()[:32]
-    return HarnessExecutionScope._issue(
-        user_id="agent-harness-system",
-        organization_id=None,
-        project_ids=(),
-        app_ids=(),
-        read_roots=(workspace, scratch),
-        write_roots=(workspace, scratch),
-        delete_roots=(workspace, scratch),
-        command_roots=(workspace, scratch),
-        scratch_roots=(scratch,),
-        external_read_grants=(),
-        network_capability=network_capability,
-        network_allowlist=(),
-        environment_capability_ids=(),
-        secret_capability_ids=(),
+    except BaseException:
+        # A failed issuance never leaves behind a scratch directory it created.
+        if created_identity is not None:
+            _remove_empty_created_dir(Path(scratch), created_identity)
+        raise
+    if created_identity is not None:
+        with _CREATED_SCRATCH_LOCK:
+            _CREATED_SCRATCH_ROOTS[(str(scope.run_id), _path_key(scratch))] = (
+                scratch,
+                created_identity,
+            )
+    return scope
+
+
+# Scratch directories created by a scope issuance in this process, keyed by
+# (run_id, path key) with the directory identity observed right after creation.
+_CREATED_SCRATCH_ROOTS: dict[tuple[str, str], tuple[Path, tuple[int, int]]] = {}
+_CREATED_SCRATCH_LOCK = threading.Lock()
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return (int(info.st_dev), int(info.st_ino))
+
+
+def _remove_empty_created_dir(path: Path, identity: tuple[int, int]) -> bool:
+    """``rmdir`` the directory only if it is still the one created and empty."""
+
+    if _directory_identity(path) != identity:
+        return False
+    if _path_has_any_link_or_reparse(Path(os.path.abspath(path))):
+        return False
+    try:
+        os.rmdir(path)
+    except OSError:
+        # Non-empty (or concurrently used) directories are kept.
+        return False
+    return True
+
+
+def release_created_scratch_roots(scope: Any) -> tuple[Path, ...]:
+    """Remove the empty scratch directories that this run's scope created.
+
+    Only a directory recorded at creation by this issuance is a candidate. A
+    directory that existed before, has content, was replaced by another
+    directory/link, or belongs to another run is never removed.  ``os.rmdir``
+    itself refuses a non-empty directory, so content written concurrently is
+    kept.  Returns the removed paths.
+    """
+
+    if scope is None:
+        return ()
+    run_id = str(getattr(scope, "run_id", "") or "")
+    removed: list[Path] = []
+    for root in tuple(getattr(scope, "scratch_roots", ()) or ()):
+        key = (run_id, _path_key(Path(root)))
+        with _CREATED_SCRATCH_LOCK:
+            entry = _CREATED_SCRATCH_ROOTS.pop(key, None)
+        if entry is None:
+            continue
+        path, identity = entry
+        if _remove_empty_created_dir(path, identity):
+            removed.append(path)
+    return tuple(removed)
+
+
+def build_autonomous_agent_harness_scope(
+    *,
+    workspace_path: PathLike,
+    harness_workspace_root: PathLike,
+    resource_limits: ResourceLimits,
+    run_id: str,
+    audit_id: str,
+    network_capability: NetworkCapability = NetworkCapability.NONE,
+) -> HarnessExecutionScope:
+    """Issue a system-owned autonomous checkout scope without ambient grants."""
+    return _build_managed_harness_scope(
+        workspace_path=workspace_path,
+        harness_workspace_root=harness_workspace_root,
         resource_limits=resource_limits,
-        run_id=selected_run_id,
-        audit_id=selected_audit_id,
-        root_identity=root_identity,
+        run_id=run_id,
+        audit_id=audit_id,
+        network_capability=network_capability,
+    )
+
+
+def build_agent_work_harness_scope(
+    *,
+    workspace_path: PathLike,
+    harness_workspace_root: PathLike,
+    resource_limits: ResourceLimits,
+    agent_id: str,
+    organization_id: str,
+    project_id: str | None,
+    app_id: str | None,
+    run_id: str,
+    audit_id: str,
+    mode: str,
+    delete_workspace: bool = False,
+    backend_kind: CommandBackendKind = "wsl_bwrap",
+) -> HarnessExecutionScope:
+    """Issue a coordinator-authorized claim scope with no inherited grants.
+
+    The coordinator validates fresh durable authority and the exact source
+    checkout before calling this trusted service. Identity parameters never
+    come from model/tool arguments. All optional limits are finite here.
+    """
+    if mode not in {"workspace_write", "read_only"}:
+        raise HarnessExecutionScopeServiceError("invalid AgentWork execution mode")
+    if not isinstance(resource_limits, ResourceLimits):
+        raise HarnessExecutionScopeServiceError("AgentWork resource_limits must be ResourceLimits")
+    finite_limits = ResourceLimits(
+        timeout_seconds=min(resource_limits.timeout_seconds, 3600),
+        max_processes=min(resource_limits.max_processes, 64),
+        max_output_bytes=min(resource_limits.max_output_bytes, 1024 * 1024),
+        max_disk_bytes=min(resource_limits.max_disk_bytes, 1024 * 1024 * 1024),
+        max_cpu_seconds=min(resource_limits.max_cpu_seconds or 3600, 3600),
+        # The backend bounds virtual address space. Node/V8 reserves much more
+        # than its resident heap during startup, so keep a finite 64 GiB ceiling.
+        max_memory_bytes=min(resource_limits.max_memory_bytes or 64 * 1024**3, 64 * 1024**3),
+        max_background_seconds=min(resource_limits.max_background_seconds or 3600, 3600),
+    )
+    return _build_managed_harness_scope(
+        workspace_path=workspace_path,
+        harness_workspace_root=harness_workspace_root,
+        resource_limits=finite_limits,
+        run_id=run_id,
+        audit_id=audit_id,
+        backend_kind=backend_kind,
+        user_id=_namespace_id(agent_id, "agent_id", required=True),
+        organization_id=_namespace_id(organization_id, "organization_id", required=True),
+        project_ids=(_namespace_id(project_id, "project_id", required=True),) if project_id else (),
+        app_ids=(_namespace_id(app_id, "app_id", required=True),) if app_id else (),
+        writable=mode == "workspace_write",
+        deletable=delete_workspace is True,
+        scratch_name=f".aoitalk-harness-scratch-{_namespace_id(run_id, 'run_id', required=True)}",
     )
 
 
@@ -841,6 +1000,7 @@ class HarnessExecutionScopeService:
     build_autonomous_agent_harness_scope = staticmethod(
         build_autonomous_agent_harness_scope
     )
+    build_agent_work_harness_scope = staticmethod(build_agent_work_harness_scope)
 
 
 __all__ = [
@@ -850,7 +1010,9 @@ __all__ = [
     "MissingTrustedExecutionContext",
     "build_current_turn_enterprise_scope",
     "build_autonomous_agent_harness_scope",
+    "build_agent_work_harness_scope",
     "build_current_turn_scope",
     "build_enterprise_execution_scope",
     "create_current_turn_enterprise_scope",
+    "release_created_scratch_roots",
 ]

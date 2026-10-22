@@ -25,6 +25,8 @@ const notification = {
 };
 
 const candidateDetail = {
+  can_write: true,
+  can_publish: true,
   id: candidateId,
   project_id: projectId,
   status: "needs_user",
@@ -71,22 +73,34 @@ const candidateDetail = {
 
 async function installKnowledgeCaptureRoutes(
   page: Page,
-  options: { detailStatus?: number } = {},
+  options: { detailStatus?: number; draft?: boolean; readOnly?: boolean; canPublish?: boolean } = {},
 ) {
+  const activeNotification = options.draft ? { ...notification, type: "knowledge_capture_draft", payload: { ...notification.payload, question_id: null } } : notification;
+  const detail = options.draft ? {
+    ...candidateDetail, status: "draft_ready", questions: [],
+    draft: { title: "同期の整合性", problem: "関連付けのみの変更が反映されない", resolution: "flush後に関連付けを再取得する", verification: [{ text: "差分同期を確認した" }], evidence_summary: "検証記録 2件" },
+    review_context: { ...candidateDetail.review_context, review_reason: null },
+  } : candidateDetail;
+  detail.can_write = options.readOnly !== true;
+  detail.can_publish = options.canPublish !== false && options.readOnly !== true;
   let notificationActive = true;
   const requestLog: string[] = [];
   let answerRequests = 0;
   let reviewRequests = 0;
   let dismissRequests = 0;
+  let publishRequests = 0;
 
+  await page.route(`**/api/projects/${projectId}/knowledge-capture/settings`, async (route) => {
+    await route.fulfill({ json: { project_id: projectId, mode: "suggest" } });
+  });
   await page.route("**/api/notifications", async (route) => {
     if (route.request().method() !== "GET") return route.fallback();
-    await route.fulfill({ json: notificationActive ? [notification] : [] });
+    await route.fulfill({ json: notificationActive ? [activeNotification] : [] });
   });
   await page.route(`**/api/notifications/${notificationId}`, async (route) => {
     if (route.request().method() !== "GET") return route.fallback();
     requestLog.push("notification");
-    await route.fulfill({ json: notification });
+    await route.fulfill({ json: activeNotification });
   });
   await page.route(
     `**/api/projects/${projectId}/knowledge-capture/candidates/${candidateId}`,
@@ -99,7 +113,7 @@ async function installKnowledgeCaptureRoutes(
         });
         return;
       }
-      await route.fulfill({ json: candidateDetail });
+      await route.fulfill({ json: detail });
     },
   );
   await page.route(`**/api/notifications/${notificationId}/read`, async (route) => {
@@ -107,7 +121,9 @@ async function installKnowledgeCaptureRoutes(
     await route.fulfill({ json: {} });
   });
   await page.route(
-    `**/api/projects/${projectId}/knowledge-capture/candidates/${candidateId}/questions/${questionId}/review`,
+    options.draft
+      ? `**/api/projects/${projectId}/knowledge-capture/candidates/${candidateId}/review`
+      : `**/api/projects/${projectId}/knowledge-capture/candidates/${candidateId}/questions/${questionId}/review`,
     async (route) => {
       reviewRequests += 1;
       await route.fulfill({
@@ -138,8 +154,16 @@ async function installKnowledgeCaptureRoutes(
     },
   );
 
+  await page.route(`**/api/projects/${projectId}/knowledge-capture/candidates/${candidateId}/publish`, async (route) => {
+    publishRequests += 1;
+    expect(route.request().postDataJSON()).toEqual({ expected_candidate_version: 7 });
+    notificationActive = false;
+    await route.fulfill({ json: { ...detail, status: "published", version: 8, questions: [] } });
+  });
+
   return {
     requestLog,
+    get publishRequests() { return publishRequests; },
     get answerRequests() {
       return answerRequests;
     },
@@ -153,6 +177,43 @@ async function installKnowledgeCaptureRoutes(
 }
 
 test.describe("Knowledge Capture review dialog without product DB", () => {
+  test("readonly notification shows the full draft and disables mutation controls", async ({ page }) => {
+    await addAuthCookie(page);
+    await mockAuthenticatedApis(page);
+    const routes = await installKnowledgeCaptureRoutes(page, { draft: true, readOnly: true });
+    await page.goto("/tasks");
+    await page.getByTestId("notification-trigger").click();
+    await page.getByRole("button", { name: notification.title }).click();
+    await expect(page.getByTestId("knowledge-capture-draft-preview")).toContainText("flush後に関連付けを再取得する");
+    await expect(page.getByText(/閲覧のみの権限です/)).toBeVisible();
+    await expect(page.getByTestId("knowledge-capture-review-composer")).toBeDisabled();
+    for (const action of ["publish", "ask-ai", "dismiss"]) {
+      await expect(page.getByTestId(`knowledge-capture-${action}-button`)).toBeDisabled();
+    }
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.getByTestId("knowledge-capture-review-dialog")).toBeHidden();
+    expect(routes.reviewRequests).toBe(0);
+    expect(routes.publishRequests).toBe(0);
+    expect(routes.dismissRequests).toBe(0);
+  });
+
+  test("a writer without management permission can ask but cannot adopt", async ({ page }) => {
+    await addAuthCookie(page);
+    await mockAuthenticatedApis(page);
+    const routes = await installKnowledgeCaptureRoutes(page, { draft: true, canPublish: false });
+    await page.goto("/tasks");
+    await page.getByTestId("notification-trigger").click();
+    await page.getByRole("button", { name: notification.title }).click();
+    await expect(page.getByText(/Docsへの採用・保存にはプロジェクトの管理権限が必要です/)).toBeVisible();
+    await expect(page.getByTestId("knowledge-capture-publish-button")).toBeDisabled();
+    await page.getByTestId("knowledge-capture-review-composer").fill("なぜ保存候補ですか？");
+    await page.getByTestId("knowledge-capture-ask-ai-button").click();
+    await expect(page.getByTestId("knowledge-capture-review-response")).toContainText("保存しない選択もできます。");
+    expect(routes.reviewRequests).toBe(1);
+    expect(routes.publishRequests).toBe(0);
+    await expect(page.getByTestId("knowledge-capture-dismiss-button")).toBeEnabled();
+  });
+
   test("opens in place, keeps Ask-AI non-authoritative, and explicitly dismisses", async ({
     page,
   }) => {
@@ -223,4 +284,32 @@ test.describe("Knowledge Capture review dialog without product DB", () => {
     expect(routes.reviewRequests).toBe(0);
     expect(routes.dismissRequests).toBe(0);
   });
+});
+
+
+test("draft notification supports questions before an explicit adoption on a narrow screen", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await addAuthCookie(page);
+  await mockAuthenticatedApis(page);
+  const routes = await installKnowledgeCaptureRoutes(page, { draft: true });
+  await page.goto("/tasks");
+  const urlBefore = page.url();
+  await page.getByRole("button", { name: /通知を開く/ }).click();
+  await page.getByRole("button", { name: notification.title }).click();
+  await expect(page.getByTestId("knowledge-capture-review-dialog")).toBeVisible();
+  await expect(page.getByTestId("knowledge-capture-draft-preview")).toContainText("flush後に関連付けを再取得する");
+  await expect(page.getByTestId("knowledge-capture-draft-preview")).toContainText("検証記録 2件");
+  await expect(page.getByTestId("knowledge-capture-publish-button")).toBeEnabled();
+  expect(routes.publishRequests).toBe(0);
+  await page.getByTestId("knowledge-capture-review-composer").fill("この補足を踏まえて採用の理由を教えて");
+  await page.getByTestId("knowledge-capture-ask-ai-button").click();
+  await expect(page.getByTestId("knowledge-capture-review-response")).toContainText("保存しない選択もできます");
+  expect(routes.reviewRequests).toBe(1);
+  expect(routes.answerRequests).toBe(0);
+  expect(routes.publishRequests).toBe(0);
+  expect(routes.dismissRequests).toBe(0);
+  await page.getByTestId("knowledge-capture-publish-button").click();
+  await expect(page.getByTestId("knowledge-capture-review-dialog")).toBeHidden();
+  expect(routes.publishRequests).toBe(1);
+  expect(page.url()).toBe(urlBefore);
 });

@@ -3,6 +3,7 @@ import { SignJWT } from "jose";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { SESSION_COOKIE_NAME } from "../src/lib/session-cookie";
 
 function readEnvValue(key: string) {
   const envPath = resolve(process.cwd(), ".env");
@@ -89,7 +90,7 @@ test.describe("タスク一覧の未来タスクフィルタ", () => {
     const token = await createSessionToken("user-1");
     await page.context().addCookies([
       {
-        name: "aoitalk_session",
+      name: SESSION_COOKIE_NAME,
         value: token,
         domain: "127.0.0.1",
         path: "/",

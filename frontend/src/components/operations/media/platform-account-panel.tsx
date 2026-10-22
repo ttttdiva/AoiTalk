@@ -35,11 +35,11 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 const MAX_PACKAGE_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -50,6 +50,8 @@ const PLATFORMS: readonly MediaPlatform[] = [
   "patreon",
   "youtube",
   "instagram",
+  "fanza",
+  "tiktok",
 ];
 
 const CONNECTION_TYPES: readonly {
@@ -117,7 +119,7 @@ function readableError(error: unknown): string {
     error instanceof Error &&
     (error.message.includes("2MB以下") ||
       error.message.includes("接続パッケージファイルを選択") ||
-      error.message.includes("Characterを選択") ||
+      error.message.includes("Personaを選択") ||
       error.message.includes("account refと表示名"))
   ) {
     return error.message;
@@ -129,7 +131,7 @@ function readableError(error: unknown): string {
   ) {
     const status = Number((error as { status?: unknown }).status);
     if (status === 401) return "ログイン状態を確認してください。";
-    if (status === 403) return "このCharacterの接続を操作する権限がありません。";
+    if (status === 403) return "このPersonaの接続を操作する権限がありません。";
     if (status === 404) return "接続または認証情報が見つかりません。";
     if (status === 409) return "状態が更新されています。最新状態を読み込んで再試行してください。";
     if (status === 413) return "ファイルが大きすぎます。2MB以下のファイルを選択してください。";
@@ -453,7 +455,7 @@ export function PlatformAccountPanel({
     const generation = generationRef.current;
     const actionCharacterId = characterId;
     if (!characterId.trim()) {
-      setError(new Error("Characterを選択してください。"));
+      setError(new Error("Personaを選択してください。"));
       return;
     }
     if (!accountRef.trim() || !displayName.trim()) {
@@ -748,17 +750,17 @@ export function PlatformAccountPanel({
       <CardHeader className="border-b border-border/70">
         <CardTitle className="flex items-center gap-2 text-sm">
           <FileKey2 className="size-4" aria-hidden="true" />
-          外部接続と認証情報
+          <span className="inline-flex items-center gap-1">
+            外部接続と認証情報
+            <HelpPopover label="外部接続と認証情報">Personaごとの安全な接続を管理します。認証パッケージは暗号化して保存し、画面には状態だけを表示します。</HelpPopover>
+          </span>
         </CardTitle>
-        <CardDescription>
-          Characterごとの安全な接続を管理します。認証パッケージは暗号化して保存し、画面には状態だけを表示します。
-        </CardDescription>
       </CardHeader>
 
       <CardContent className="space-y-4 pt-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-xs text-muted-foreground">
-            {accounts.length}件のCharacter接続
+            {accounts.length}件のPersona接続
           </p>
           <Button
             type="button"
@@ -884,13 +886,13 @@ export function PlatformAccountPanel({
           </div>
         ) : (
           <p className="rounded-md border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
-            このCharacterに接続はまだありません。
+            このPersonaに接続はまだありません。
           </p>
         )}
 
         <form
           className="space-y-3 rounded-md border border-border/70 p-3"
-          aria-label="Character接続追加フォーム"
+          aria-label="Persona接続追加フォーム"
           onSubmit={createConnection}
         >
           <div className="flex items-center gap-2">

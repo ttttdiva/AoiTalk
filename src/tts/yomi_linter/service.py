@@ -22,6 +22,7 @@ DEFAULT_POLICIES = {
     "aivoice": TTSYomiPolicy.DETECT_ONLY,
     "cevio": TTSYomiPolicy.DETECT_ONLY,
     "nijivoice": TTSYomiPolicy.DETECT_ONLY,
+    "gemini_tts": TTSYomiPolicy.DETECT_ONLY,
 }
 
 

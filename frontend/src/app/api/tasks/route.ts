@@ -77,6 +77,10 @@ import {
   TaskDocsNodeInvariantError,
   TaskProjectAccessInvariantError,
 } from "@/lib/server/task-docs-node-invariant";
+import {
+  currentUserLiveTimerCondition,
+  todayTaskListCondition,
+} from "@/lib/server/home-today-query";
 
 const TASK_LIST_OCCURRENCE_LOOKAHEAD_DAYS = 366;
 
@@ -156,7 +160,12 @@ async function resolveTaskListEffectiveOccurrences(
       : await db
           .select()
           .from(taskOccurrences)
-          .where(inArray(taskOccurrences.taskId, recurrenceTaskIds));
+          .where(
+            and(
+              inArray(taskOccurrences.taskId, recurrenceTaskIds),
+              isNull(taskOccurrences.deletedAt),
+            ),
+          );
 
   const segmentRows =
     recurrenceTaskIds.length === 0
@@ -516,6 +525,7 @@ export async function GET(request: NextRequest) {
   }
 
   const { searchParams } = new URL(request.url);
+  const todaySummaryOnly = searchParams.get("today_summary") === "true";
   let readableProjectIds: string[];
   try {
     readableProjectIds = (await resolveReadScope(user, searchParams)).projectIds;
@@ -539,6 +549,7 @@ export async function GET(request: NextRequest) {
       and(
         inArray(tasks.projectId, readableProjectIds),
         isNull(tasks.deletedAt),
+        todaySummaryOnly ? todayTaskListCondition() : undefined,
       ),
     )
     .orderBy(
@@ -561,6 +572,7 @@ export async function GET(request: NextRequest) {
       id: projects.id,
       name: projects.name,
       projectMetadata: projects.projectMetadata,
+      isCompleted: projects.isCompleted,
     })
     .from(projects)
     .where(and(inArray(projects.id, projectIds), isNull(projects.deletedAt)));
@@ -598,13 +610,7 @@ export async function GET(request: NextRequest) {
   const activeEntriesQuery = db
     .select()
     .from(timeEntries)
-    .where(
-      and(
-        inArray(timeEntries.taskId, taskIds),
-        eq(timeEntries.userId, user.id),
-        isNull(timeEntries.endedAt),
-      ),
-    );
+    .where(currentUserLiveTimerCondition(taskIds, user.id));
 
   // 完了済み time entries の合計（タスクごと）
   const totalTimeRowsQuery = db
@@ -617,7 +623,11 @@ export async function GET(request: NextRequest) {
     })
     .from(timeEntries)
     .where(
-      and(inArray(timeEntries.taskId, taskIds), isNotNull(timeEntries.endedAt)),
+      and(
+        inArray(timeEntries.taskId, taskIds),
+        isNull(timeEntries.deletedAt),
+        isNotNull(timeEntries.endedAt),
+      ),
     )
     .groupBy(timeEntries.taskId);
 
@@ -700,8 +710,10 @@ export async function GET(request: NextRequest) {
 
   const projectColorById = new Map<string, string | null>();
   const projectNameById = new Map<string, string | null>();
+  const projectCompletedById = new Map<string, boolean>();
   for (const project of projectRows) {
     projectNameById.set(project.id, project.name);
+    projectCompletedById.set(project.id, project.isCompleted);
     projectColorById.set(
       project.id,
       extractProjectColor(project.projectMetadata),
@@ -745,6 +757,7 @@ export async function GET(request: NextRequest) {
     }
     base.project_name = projectNameById.get(t.projectId) || null;
     base.project_color = projectColorById.get(t.projectId) || null;
+    base.project_is_completed = projectCompletedById.get(t.projectId) ?? false;
     return base;
   });
 

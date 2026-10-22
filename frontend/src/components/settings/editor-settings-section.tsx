@@ -4,10 +4,10 @@ import { useState } from "react";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -55,39 +55,40 @@ export function EditorSettingsSection() {
 
   return (
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
-      <CardHeader
-        className="cursor-pointer select-none"
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        aria-controls="editor-settings-content"
-        onClick={() => setExpanded((v) => !v)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            setExpanded((v) => !v);
-          }
-        }}
-      >
-        <CardTitle className="flex items-center justify-between text-sm">
-          <span className="flex items-center gap-2">
-            <Link2 className="size-4" />
-            埋め込みカード
-            <span className="text-xs font-normal text-muted-foreground">
-              {DISPLAY_MODE_LABELS[editorLinkDefaultDisplayMode]}
+      <CardHeader className="flex flex-row items-center gap-1 p-0 !px-0">
+        <div
+          className="flex min-w-0 flex-1 cursor-pointer select-none px-3 py-2"
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          aria-controls="editor-settings-content"
+          data-settings-target-activation="editor-settings"
+          onClick={() => setExpanded((v) => !v)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setExpanded((v) => !v);
+            }
+          }}
+        >
+          <CardTitle className="flex items-center justify-between text-sm">
+            <span className="flex items-center gap-2">
+              <Link2 className="size-4" />
+              埋め込みカード
+              <span className="text-xs font-normal text-muted-foreground">
+                {DISPLAY_MODE_LABELS[editorLinkDefaultDisplayMode]}
+              </span>
             </span>
-          </span>
-          {expanded ? (
-            <ChevronUp className="size-4" />
-          ) : (
-            <ChevronDown className="size-4" />
-          )}
-        </CardTitle>
-        {expanded && (
-          <CardDescription>
-            エディタ内で使用するURLカードの既定表示を変更します。
-          </CardDescription>
-        )}
+            {expanded ? (
+              <ChevronUp className="size-4" />
+            ) : (
+              <ChevronDown className="size-4" />
+            )}
+          </CardTitle>
+        </div>
+        <HelpPopover label="埋め込みカード" className="mr-2">
+          エディタ内で使用するURLカードの既定表示を変更します。
+        </HelpPopover>
       </CardHeader>
       {expanded && (
         <CardContent id="editor-settings-content" className="space-y-3">

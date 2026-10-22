@@ -6,7 +6,6 @@ import { format } from "date-fns";
 import {
   Button,
   Chip,
-  IconButton,
   Surface,
   Switch,
   Text,
@@ -21,6 +20,7 @@ import { useProject } from "../../contexts/ProjectContext";
 import { taskApi } from "../../lib/task-api";
 import { TaskQuickViewDialog } from "../../components/task-quick-view-dialog";
 import { ScopeSwitcher } from "../../components/scope-switcher";
+import { ScreenHeader } from "../../components/screen-header";
 import type { Task, TimeEntry } from "../../types/api";
 
 function formatDuration(seconds: number): string {
@@ -210,46 +210,40 @@ export default function ReportTimelineScreen() {
 
   return (
     <View style={styles.container}>
-      <Surface style={styles.header} elevation={1}>
-        <View style={styles.headerRow}>
-          <IconButton
-            icon="arrow-left"
-            iconColor="#cdd6f4"
-            onPress={() => goBackOrReplace(router, '/reports')}
-          />
-          <View style={{ flex: 1 }}>
-            <Text variant="titleLarge" style={styles.headerTitle}>
-              Timeline
-            </Text>
-            <Text style={styles.headerSubtext}>
-              {selectedSpace?.name || selectedProject?.name || "All projects"}
-            </Text>
+      <ScreenHeader
+        title="Timeline"
+        subtitle={selectedSpace?.name || selectedProject?.name || "All projects"}
+        onBack={() => goBackOrReplace(router, "/reports")}
+        right={
+          <View style={styles.headerActions}>
+            <ScopeSwitcher accessibilityLabel="タイムラインの範囲を変更" />
           </View>
-          <ScopeSwitcher accessibilityLabel="タイムラインの範囲を変更" />
-        </View>
-        <View style={styles.rangeRow}>
-          {[7, 30].map((value) => (
-            <Chip
-              key={value}
-              selected={days === value}
-              onPress={() => setDays(value as 7 | 30)}
-              style={[styles.chip, days === value && styles.chipActive]}
-              textStyle={styles.chipText}
-            >
-              {value}d
-            </Chip>
-          ))}
-        </View>
-        <View style={styles.toggleRow}>
-          <Text style={styles.toggleLabel}>予定時間の枠を表示</Text>
-          <Switch
-            value={showScheduleFrames}
-            onValueChange={setShowScheduleFrames}
-          />
-        </View>
-      </Surface>
+        }
+      />
 
-      <ScrollView contentContainerStyle={styles.content}>
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+        <View style={styles.controls}>
+          <View style={styles.rangeRow}>
+            {[7, 30].map((value) => (
+              <Chip
+                key={value}
+                selected={days === value}
+                onPress={() => setDays(value as 7 | 30)}
+                style={[styles.chip, days === value && styles.chipActive]}
+                textStyle={styles.chipText}
+              >
+                {value}d
+              </Chip>
+            ))}
+          </View>
+          <View style={styles.toggleRow}>
+            <Text style={styles.toggleLabel}>予定時間の枠を表示</Text>
+            <Switch
+              value={showScheduleFrames}
+              onValueChange={setShowScheduleFrames}
+            />
+          </View>
+        </View>
         <Surface style={styles.card} elevation={0}>
           <Text style={styles.cardTitle}>Summary</Text>
           <Text style={styles.bodyText}>Entries: {entries.length}</Text>
@@ -371,30 +365,28 @@ export default function ReportTimelineScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  header: {
-    paddingTop: 52,
-    paddingHorizontal: 8,
-    paddingBottom: 16,
-    backgroundColor: "#1e1e2e",
+  scroll: { flex: 1 },
+  headerActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    minWidth: 0,
+    maxWidth: "100%",
   },
-  headerRow: { flexDirection: "row", alignItems: "center" },
-  headerTitle: { color: "#cdd6f4", fontWeight: "bold" },
-  headerSubtext: { color: "#a6adc8", marginTop: 2 },
+  controls: { gap: 8 },
   rangeRow: {
     flexDirection: "row",
     gap: 8,
-    paddingHorizontal: 16,
-    marginTop: 8,
+    flexWrap: "wrap",
   },
   toggleRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
-    marginTop: 10,
+    gap: 12,
   },
-  toggleLabel: { color: "#cdd6f4", fontSize: 13 },
-  chip: { backgroundColor: "#313244" },
+  toggleLabel: { color: "#cdd6f4", fontSize: 13, flex: 1, minWidth: 0 },
+  chip: { backgroundColor: "#313244", minHeight: 44 },
   chipActive: { backgroundColor: "#4c1d95" },
   chipText: { color: "#cdd6f4" },
   content: { padding: 16, gap: 12, paddingBottom: 32 },

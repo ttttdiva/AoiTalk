@@ -2,7 +2,7 @@
 
 import { useEffect, useCallback } from "react";
 
-const RESTART_WAIT_TIMEOUT_MS = 180_000;
+const RESTART_WAIT_TIMEOUT_MS = 300_000;
 const INITIAL_POLL_DELAY_MS = 250;
 const MAX_POLL_DELAY_MS = 5_000;
 const HEALTH_REQUEST_TIMEOUT_MS = 3_000;
@@ -183,7 +183,7 @@ async function runRestartAttempt({ status, retryButton }: RestartOverlay) {
   }
 
   status.textContent =
-    "180秒以内に復帰を確認できませんでした。ページは保持しています。状態を確認して再試行してください。";
+    "300秒以内に復帰を確認できませんでした。ページは保持しています。状態を確認して再試行してください。";
   retryButton.disabled = false;
   retryButton.style.display = "block";
 }

@@ -11,8 +11,9 @@
  */
 
 import * as drizzleOrm from "drizzle-orm";
-import { and, asc, eq, gt, inArray, isNull, like, or } from "drizzle-orm";
-import { getDb, schema } from "../db/client";
+import { and, asc, eq, gt, inArray, isNull, like, or, sql } from "drizzle-orm";
+import type { SQLiteBindParams } from "expo-sqlite";
+import { getDb, getSqlite, schema } from "../db/client";
 import {
   docsSqliteAsyncAvailable,
   encodeDocsBoolean,
@@ -22,7 +23,23 @@ import {
   withDocsExclusiveTransaction,
 } from "../db/docs-sync-async";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
-import { getToken, getTokenAuthScope } from "../lib/auth";
+import { compareDocsVersions } from "./docs-create-ack";
+import {
+  DOCS_MULTIROW_BATCH_SIZE,
+  executeDocsMultiRowBatch,
+  withDocsPreparedWrites,
+} from "../db/docs-prepared-writes";
+import { finalizeDocsSyncRunTx, tryFinalizeUnchangedDocsRunTx } from "./docs-sync-finalize";
+import {
+  getToken,
+  getTokenAuthScope,
+  getTokenSnapshot,
+  readAuthActor,
+} from "../lib/auth";
+import { getConfiguredApiServerFingerprint } from "../lib/api-client";
+import { enqueueAuthScopeExclusive } from "../lib/auth-scope-queue";
+import { resolveDocsCreateScope, resolveDocsParentCreateScope } from "./docs-create-scope";
+import { matchesDocsStoredContent } from "./docs-create-ack";
 import { canonicalizeIngestUrl, isSafeSourceRefUrl } from "../lib/clip-url";
 import type {
   DocsEdge,
@@ -36,12 +53,16 @@ import type {
 } from "../types/api";
 import {
   enqueueOutbox,
+  getOutboxMutationWakeScope,
   randomId,
   recordOutboxServerSnapshot,
+  outboxMutationSnapshotCondition,
   type OutboxConflictReference,
   type OutboxConflictResolutionResult,
   validateOutboxConflictServerScope,
 } from "./outbox";
+import { notifyMutationQueued } from "../sync/task-mutation-wake";
+import { compareDocsOutlineOrder } from "../lib/docs-sibling-order";
 import {
   docsNodeDeletionIds,
   expandProtectedDocsNodeAncestors,
@@ -51,6 +72,7 @@ import {
   forEachDocsPromotionChunk,
   loadDocsDirtyRowsPagedTx,
   loadDocsMembershipSnapshotTx,
+  loadDocsPendingNodeCreatesTx,
   loadDocsQuarantineMembershipSnapshotTx,
   loadDocsQuarantineOutboxSnapshotTx,
   loadDocsScopedOutboxProtectionTx,
@@ -72,6 +94,158 @@ type DbNode = typeof schema.knowledgeNodes.$inferSelect;
 type DbSupertag = typeof schema.knowledgeSupertags.$inferSelect;
 type DbField = typeof schema.knowledgeFields.$inferSelect;
 type DbFieldValue = typeof schema.knowledgeFieldValues.$inferSelect;
+
+/** Identity captured when a UI draft first changes, before a delayed flush. */
+export type DocsMutationGuard = {
+  auth: Awaited<ReturnType<typeof getTokenSnapshot>>;
+  workspaceId: string | null;
+  projectId: string | null;
+};
+
+export type DocsCreateOptions = {
+  /** Reserved by the editor; never replace this identity after native input mounts. */
+  id?: string;
+  guard?: DocsMutationGuard;
+  afterId?: string;
+  expectedParentId?: string | null;
+};
+
+export type DocsReadDegradedReason =
+  | "workspace_projection_unavailable"
+  | "membership_projection_unavailable"
+  | "visibility_query_fallback"
+  | "outbox_projection_unavailable"
+  | "actor_scope_unavailable"
+  | "diagnostic_aggregate_unavailable"
+  | "auth_generation_mismatch"
+  | "auth_generation_unknown"
+  | "read_failed";
+
+type DocsReadDiagnostics = {
+  reasons: Set<DocsReadDegradedReason>;
+};
+
+type DocsReadGeneration = {
+  auth: Awaited<ReturnType<typeof getTokenSnapshot>>;
+  serverFingerprint: string;
+  actorReadable: boolean;
+  actor: { userId: string; serverFingerprint: string } | null;
+};
+
+class DocsReadCancelledError extends Error {
+  constructor() {
+    super("Docsのローカル読込が取消されました");
+    this.name = "AbortError";
+  }
+}
+
+function assertDocsReadActive(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DocsReadCancelledError();
+}
+
+function isDocsReadCancelled(error: unknown): boolean {
+  return error instanceof DocsReadCancelledError;
+}
+
+type DocsReadGenerationStatus = "stable" | "degraded" | "changed" | "unknown";
+
+function markDocsReadDegraded(
+  diagnostics: DocsReadDiagnostics | undefined,
+  reason: DocsReadDegradedReason,
+): void {
+  diagnostics?.reasons.add(reason);
+}
+
+function blockedDocsReadSummary(
+  reason: DocsReadDegradedReason,
+): DocsPagesReadSummary {
+  return {
+    source: "local-cache",
+    pages: [],
+    visibleCount: 0,
+    activeNodeCount: null,
+    activeRootCount: null,
+    localDirtyNodeCount: null,
+    localDirtyRootCount: null,
+    workspaceProjectionCount: null,
+    outboxPendingCount: null,
+    outboxFailedCount: null,
+    actorScopeStatus: "error",
+    aggregateStatus: "error",
+    readStatus: "degraded",
+    readDegradedReasons: [reason],
+    generationStatus: "unknown",
+  };
+}
+
+async function captureDocsReadGeneration(): Promise<DocsReadGeneration> {
+  const [auth, serverFingerprint, actorRead] = await Promise.all([
+    getTokenSnapshot(),
+    getConfiguredApiServerFingerprint(),
+    readAuthActor(),
+  ]);
+  return {
+    auth,
+    serverFingerprint,
+    actorReadable: actorRead.readable,
+    actor: actorRead.actor
+      ? {
+          userId: actorRead.actor.user_id,
+          serverFingerprint: actorRead.actor.serverFingerprint,
+        }
+      : null,
+  };
+}
+
+function compareDocsReadGeneration(
+  start: DocsReadGeneration,
+  end: DocsReadGeneration,
+): DocsReadGenerationStatus {
+  if (start.serverFingerprint !== end.serverFingerprint) return "changed";
+  if (start.auth.token === end.auth.token && start.auth.revision === end.auth.revision) {
+    return "stable";
+  }
+  const startScope = start.auth.token ? getTokenAuthScope(start.auth.token) : null;
+  const endScope = end.auth.token ? getTokenAuthScope(end.auth.token) : null;
+  const sameActor = startScope && endScope
+    ? startScope === endScope
+    : start.actor && end.actor
+      ? start.actor.userId === end.actor.userId
+        && start.actor.serverFingerprint === end.actor.serverFingerprint
+      : !start.auth.token && !end.auth.token && !start.actor && !end.actor
+        ? true
+        : start.actorReadable && end.actorReadable
+          ? false
+          : null;
+  if (sameActor === true) return "degraded";
+  if (sameActor === false) return "changed";
+  return "unknown";
+}
+
+/** Local read result used by the Docs list to distinguish an empty read from a failed read. */
+export type DocsPagesReadSummary = {
+  source: "local-cache";
+  pages: DocsNode[];
+  /** Exact listPages result count: visible root pages only. */
+  visibleCount: number;
+  /** Aggregate of active local node rows; these include non-root children. */
+  activeNodeCount: number | null;
+  activeRootCount: number | null;
+  /** Dirty active local rows, without exposing titles or bodies. */
+  localDirtyNodeCount: number | null;
+  localDirtyRootCount: number | null;
+  /** Current token's workspace projection; null means actor scope is unknown/error. */
+  workspaceProjectionCount: number | null;
+  /** Current token's Docs outbox; pending excludes terminal failed rows. */
+  outboxPendingCount: number | null;
+  outboxFailedCount: number | null;
+  /** Token is resolved independently from a retained previous user identity. */
+  actorScopeStatus: "resolved" | "unknown" | "error";
+  aggregateStatus: "success" | "error";
+  readStatus: "success" | "degraded";
+  readDegradedReasons: DocsReadDegradedReason[];
+  generationStatus: DocsReadGenerationStatus;
+};
 
 async function getSavedDocsWorkspaceIds(): Promise<string[]> {
   const token = await getToken();
@@ -139,21 +313,25 @@ function docsRelationVisible(
 }
 
 /**
- * Resolve the current account's active/readonly entity projection.  Keeping
- * this as a small JS-side filter lets legacy SQLite/test doubles continue to
- * work while the real database enforces composite (library, project) keys.
+ * Resolve the current account's active/readonly entity projection. SQL scope
+ * and candidate predicates avoid materializing unrelated memberships. The
+ * JS-side checks also remain for legacy SQLite/test doubles.
  */
 async function getDocsVisibility(
   tableName: string,
   allowedScopeKeys?: ReadonlySet<string>,
+  allowedEntityKeys?: ReadonlySet<string>,
+  diagnostics?: DocsReadDiagnostics,
 ): Promise<DocsVisibility> {
   let workspaceIds: string[] = [];
   try {
     workspaceIds = await getSavedDocsWorkspaceIds();
   } catch {
+    markDocsReadDegraded(diagnostics, "workspace_projection_unavailable");
     workspaceIds = [];
   }
   if (!schema.docsScopeMembership) {
+    markDocsReadDegraded(diagnostics, "membership_projection_unavailable");
     return {
       membershipAvailable: false,
       entityKeys: new Set(),
@@ -176,32 +354,70 @@ async function getDocsVisibility(
       };
     }
     const db = getDb();
-    const rows = await db
-      .select({
-        entityKey: schema.docsScopeMembership.entityKey,
-        scopeKey: schema.docsScopeMembership.scopeKey,
-      })
-      .from(schema.docsScopeMembership)
-      .where(
-        and(
-          eq(schema.docsScopeMembership.authScope, authScope),
-          eq(schema.docsScopeMembership.tableName, tableName),
-          or(
-            eq(schema.docsScopeMembership.state, "active"),
-            eq(schema.docsScopeMembership.state, "readonly"),
-          ),
-        ),
-      );
+    const membership = schema.docsScopeMembership;
+    const baseCondition = and(
+      eq(membership.authScope, authScope),
+      eq(membership.tableName, tableName),
+      or(eq(membership.state, "active"), eq(membership.state, "readonly")),
+    );
+    const legacyQuery = () => db
+      .select({ entityKey: membership.entityKey, scopeKey: membership.scopeKey })
+      .from(membership)
+      .where(baseCondition);
+    let rows: Array<{ entityKey: string; scopeKey: string; isScopeWitness?: number }>;
+    try {
+      // Empty/unspecified scope sets keep the existing all-scope projection.
+      // JSON binds keep both scope and candidate ID sets below SQLite's
+      // variable limit, without splitting the read across snapshots.
+      const scopeCondition = allowedScopeKeys?.size
+        ? sql`${membership.scopeKey} IN (SELECT value FROM json_each(${JSON.stringify([...allowedScopeKeys])}))`
+        : undefined;
+      const scopedCondition = and(baseCondition, scopeCondition);
+      if (allowedEntityKeys !== undefined) {
+        // Scope witnesses preserve the dirty/legacy-NULL rules even when no
+        // requested entity has membership. Both arms share one snapshot.
+        const scopeWitnesses = allowedScopeKeys?.size
+          ? sql`SELECT '' AS entityKey, scope_candidates.value AS scopeKey, 1 AS isScopeWitness
+              FROM json_each(${JSON.stringify([...allowedScopeKeys])}) AS scope_candidates
+              WHERE EXISTS (
+                SELECT 1 FROM ${membership}
+                WHERE ${baseCondition} AND ${membership.scopeKey} = scope_candidates.value
+              )`
+          : sql`SELECT '' AS entityKey, ${membership.scopeKey} AS scopeKey, 1 AS isScopeWitness
+              FROM ${membership} WHERE ${baseCondition} GROUP BY ${membership.scopeKey}`;
+        // CROSS JOIN keeps candidate IDs on the outside so SQLite can use the
+        // existing auth/table/entity index even before ANALYZE has run.
+        rows = await db.all<{ entityKey: string; scopeKey: string; isScopeWitness: number }>(sql`
+          SELECT ${membership.entityKey} AS entityKey, ${membership.scopeKey} AS scopeKey, 0 AS isScopeWitness
+          FROM json_each(${JSON.stringify([...allowedEntityKeys])}) AS candidate_ids
+          CROSS JOIN ${membership}
+          WHERE ${scopedCondition} AND ${membership.entityKey} = candidate_ids.value
+          UNION ALL ${scopeWitnesses}
+        `);
+      } else {
+        rows = await db
+          .select({ entityKey: membership.entityKey, scopeKey: membership.scopeKey })
+          .from(membership)
+          .where(scopedCondition);
+      }
+    } catch {
+      // Older SQLite/ORM adapters must retain the exact original visibility
+      // calculation, never fall into the broader missing-membership fallback
+      // merely because they cannot execute the optimized query.
+      markDocsReadDegraded(diagnostics, "visibility_query_fallback");
+      rows = await legacyQuery();
+    }
     const activeScopeKeys = new Set(
       rows
         .map((row) => row.scopeKey)
         .filter((scopeKey): scopeKey is string => typeof scopeKey === "string" && scopeKey.length > 0),
     );
+    const entityRows = rows.filter((row) => row.isScopeWitness !== 1);
     const visibleRows = allowedScopeKeys?.size
-      ? rows.filter((row) =>
+      ? entityRows.filter((row) =>
           typeof row.scopeKey === "string" && allowedScopeKeys.has(row.scopeKey),
         )
-      : rows;
+      : entityRows;
     const visibleScopeKeys = allowedScopeKeys?.size
       ? new Set(
           [...activeScopeKeys].filter((scopeKey) => allowedScopeKeys.has(scopeKey)),
@@ -245,6 +461,7 @@ async function getDocsVisibility(
     } catch {
       // Older schemas may have auth_scope/outbox projection absent; retain
       // only null-workspace dirty rows in docsRowVisible below.
+      markDocsReadDegraded(diagnostics, "outbox_projection_unavailable");
     }
     return {
       membershipAvailable: true,
@@ -254,6 +471,7 @@ async function getDocsVisibility(
     };
   } catch {
     // A rolling upgrade may expose the Drizzle symbol before the table exists.
+    markDocsReadDegraded(diagnostics, "membership_projection_unavailable");
     return {
       membershipAvailable: false,
       entityKeys: new Set(),
@@ -394,8 +612,12 @@ async function loadDocsPreservationSets(
   table: string,
   requestedAuthScope?: string,
   requestedScopeKey?: string | null,
+  requestedNodeIds?: readonly string[],
 ): Promise<DocsPreservationSets> {
   const db = getDb();
+  // A small node read-through (including a new local outline row) only
+  // compares these IDs. Keep bulk/relation callers on their existing path.
+  const nodeIds = table === "knowledge_nodes" ? requestedNodeIds : undefined;
   let authScope: string | null = requestedAuthScope ?? null;
   if (requestedAuthScope === undefined) {
     const token = await getToken();
@@ -413,7 +635,9 @@ async function loadDocsPreservationSets(
     // Filter the account in JavaScript after selecting the legacy nullable
     // auth_scope column.  Besides preserving pre-auth rows safely, this keeps
     // old in-memory test doubles (which only understand tableName=) honest.
-    .where(eq(schema.outbox.tableName, table));
+    .where(nodeIds
+      ? and(eq(schema.outbox.tableName, table), inArray(schema.outbox.entityId, [...nodeIds]))
+      : eq(schema.outbox.tableName, table));
   const outbox = new Set(
     outboxRows
       .filter((row) =>
@@ -434,7 +658,9 @@ async function loadDocsPreservationSets(
     const rows = await db
       .select({ id: schema.knowledgeNodes.id })
       .from(schema.knowledgeNodes)
-      .where(eq(schema.knowledgeNodes.dirty, true));
+      .where(nodeIds
+        ? and(eq(schema.knowledgeNodes.dirty, true), inArray(schema.knowledgeNodes.id, [...nodeIds]))
+        : eq(schema.knowledgeNodes.dirty, true));
     for (const row of rows) dirty.add(row.id);
   } else if (table === "knowledge_supertags") {
     const rows = await db
@@ -688,6 +914,7 @@ function remoteDocsNodeValues(n: DocsNode, now: string) {
 
 function remoteDocsNodeUpdateSet(
   values: ReturnType<typeof remoteDocsNodeValues>,
+  canonicalCreatedAt?: string | null,
 ) {
   return {
     workspaceId: values.workspaceId,
@@ -709,6 +936,10 @@ function remoteDocsNodeUpdateSet(
     viewJson: values.viewJson,
     dayDate: values.dayDate,
     sortOrder: values.sortOrder,
+    // Complete the creator on an optimistic local INSERT when its canonical
+    // receipt arrives. Omitted creator metadata must not erase known authors.
+    ...(values.createdBy !== null ? { createdBy: values.createdBy } : {}),
+    ...(typeof canonicalCreatedAt === "string" ? { createdAt: canonicalCreatedAt } : {}),
     updatedBy: values.updatedBy,
     updatedAt: values.updatedAt,
     serverUpdatedAt: values.serverUpdatedAt,
@@ -718,7 +949,7 @@ function remoteDocsNodeUpdateSet(
   };
 }
 
-export async function applyRemoteDocsNodes(
+async function applyRemoteDocsNodesInternal(
   rows: DocsNode[],
   options: { force?: boolean } = {},
 ): Promise<void> {
@@ -733,13 +964,14 @@ export async function applyRemoteDocsNodes(
       const chunk = rows.slice(index, index + DOCS_APPLY_CHUNK_SIZE);
       db.transaction((tx) => {
         for (const node of chunk) {
+          if (node.read_only === true || node.access === "read") docsPermissionEpoch += 1;
           const values = remoteDocsNodeValues(node, now);
           tx
             .insert(schema.knowledgeNodes)
             .values(values)
             .onConflictDoUpdate({
               target: schema.knowledgeNodes.id,
-              set: remoteDocsNodeUpdateSet(values),
+              set: remoteDocsNodeUpdateSet(values, node.created_at),
             })
             .run();
         }
@@ -755,20 +987,295 @@ export async function applyRemoteDocsNodes(
     () =>
       options.force
         ? Promise.resolve(null)
-        : loadDocsPreservationSets("knowledge_nodes"),
+        : loadDocsPreservationSets(
+            "knowledge_nodes",
+            undefined,
+            undefined,
+            rows.length <= DOCS_APPLY_CHUNK_SIZE ? rows.map((node) => node.id) : undefined,
+          ),
     async (n, sets) => {
     if (sets && (await preserveDocsRow(sets, "knowledge_nodes", n.id, n))) {
       return;
     }
     const values = remoteDocsNodeValues(n, now);
+    if (n.read_only === true || n.access === "read") docsPermissionEpoch += 1;
     await db
       .insert(schema.knowledgeNodes)
       .values(values)
       .onConflictDoUpdate({
         target: schema.knowledgeNodes.id,
-        set: remoteDocsNodeUpdateSet(values),
+        set: remoteDocsNodeUpdateSet(values, n.created_at),
       });
+    if (n.read_only === true || n.access === "read") docsPermissionEpoch += 1;
   });
+}
+
+/**
+ * Direct canonical reads share the same SQLite writer as foreground edits.
+ * Keep the staged/native promotion path unchanged, but serialize the small
+ * read-through mirror write so a concurrent exclusive promotion cannot turn
+ * an authorized HTTP 200 into a local "not found" result.
+ */
+export async function applyRemoteDocsNodes(
+  rows: DocsNode[],
+  options: { force?: boolean } = {},
+): Promise<void> {
+  if (options.force) return applyRemoteDocsNodesInternal(rows, options);
+  return runForegroundSqliteWrite(() => applyRemoteDocsNodesInternal(rows, options));
+}
+
+/**
+ * Serialize a canonical Docs read-through and its related projections with
+ * auth transitions.  The callback receives the private writer so a
+ * read-through invoked inside this boundary does not enqueue the same auth
+ * tail again.  Independent callers of the public read-through below still
+ * take the queue normally.
+ */
+let docsPermissionEpoch = 0;
+export function getDocsPermissionReadEpoch(): number { return docsPermissionEpoch; }
+
+export function runDocsAuthProjection<T>(
+  operation: (
+    applyNode: (
+      node: DocsNode,
+      options?: { permissionEpoch?: number; assertCurrent?: () => void },
+    ) => Promise<{ membershipApplied: boolean; access?: string; readOnly?: boolean }>,
+  ) => Promise<T>,
+): Promise<T> {
+  return enqueueAuthScopeExclusive(() =>
+    operation((node, options) => applyRemoteDocsNodeReadThroughInternal(node, options)),
+  );
+}
+
+/**
+ * Apply one ACL-checked canonical node read-through and, when an already
+ * active/readonly scope projection proves the account's access, materialize
+ * the matching node membership.  A missing scope projection stays fail-closed
+ * and is reported to the caller instead of granting a new local scope.
+ */
+async function applyRemoteDocsNodeReadThroughInternal(
+  node: DocsNode,
+  options: { permissionEpoch?: number; assertCurrent?: () => void } = {},
+): Promise<{ membershipApplied: boolean; access?: string; readOnly?: boolean }> {
+  let membershipApplied = false;
+  let effectiveAccess: string | undefined;
+  let effectiveReadOnly: boolean | undefined;
+  const expectedToken = await getTokenSnapshot();
+  await runForegroundSqliteWrite(async () => {
+    options.assertCurrent?.();
+    const queuedToken = await getTokenSnapshot();
+    if (
+      queuedToken.revision !== expectedToken.revision
+      || queuedToken.token !== expectedToken.token
+    ) {
+      return;
+    }
+    const authScope = queuedToken.token ? getTokenAuthScope(queuedToken.token) : null;
+    const scopeId = node.workspace_id;
+    const scopeKey = scopeId
+      ? `${scopeId}|project:${node.project_id ?? ""}`
+      : null;
+    const db = getDb();
+    const preservation = await loadDocsPreservationSets(
+      "knowledge_nodes",
+      authScope ?? undefined,
+      scopeKey,
+    );
+    const protectedRow = preservation.outbox.has(node.id) || preservation.dirty.has(node.id);
+    if (protectedRow) {
+      await preserveDocsRow(preservation, "knowledge_nodes", node.id, node);
+    }
+    const existingRows = await db
+      .select({
+        workspaceId: schema.knowledgeNodes.workspaceId,
+        projectId: schema.knowledgeNodes.projectId,
+        updatedAt: schema.knowledgeNodes.updatedAt,
+        serverUpdatedAt: schema.knowledgeNodes.serverUpdatedAt,
+        archivedAt: schema.knowledgeNodes.archivedAt,
+        access: schema.knowledgeNodes.access,
+        readOnly: schema.knowledgeNodes.readOnly,
+      })
+      .from(schema.knowledgeNodes)
+      .where(eq(schema.knowledgeNodes.id, node.id));
+    const existing = existingRows[0];
+    const sameScope = !existing
+      || (
+        existing.workspaceId === scopeId
+        && (existing.projectId ?? null) === (node.project_id ?? null)
+      );
+    const incomingUpdatedAt = typeof node.updated_at === "string"
+      ? node.updated_at
+      : null;
+    const existingVersion = existing?.serverUpdatedAt ?? existing?.updatedAt ?? null;
+    const incomingOlder = Boolean(
+      existingVersion
+      && (!incomingUpdatedAt || incomingUpdatedAt < existingVersion),
+    );
+    const clearsArchivedWithoutVersion = Boolean(existing?.archivedAt && !incomingUpdatedAt);
+    const archivedVersionWins = Boolean(
+      existing?.archivedAt
+      && incomingUpdatedAt
+      && existingVersion
+      && incomingUpdatedAt <= existingVersion,
+    );
+    const canApplyNode = !protectedRow && sameScope && !incomingOlder && !(
+      existing?.archivedAt
+      && incomingUpdatedAt
+      && existingVersion
+      && incomingUpdatedAt <= existingVersion
+    ) && !clearsArchivedWithoutVersion;
+    // A canonical HTTP 200 without both an authenticated actor and a
+    // workspace cannot establish a local ownership boundary.  Keep the
+    // response read-only in memory and leave both live rows and memberships
+    // untouched until a scoped sync can prove the projection.
+    if (!authScope || !scopeId) return;
+    const canonicalScopeKey = `${scopeId}|project:${node.project_id ?? ""}`;
+    if (
+      !schema.docsScopeMembership
+      || !sameScope
+      || incomingOlder
+      || clearsArchivedWithoutVersion
+      || archivedVersionWins
+    ) return;
+    // A canonical response must carry explicit ACL fields before a root or
+    // child can seed a local visibility projection.  Missing fields stay
+    // fail-closed rather than inheriting a write grant from an arbitrary row.
+    if (typeof node.access !== "string" || typeof node.read_only !== "boolean") return;
+    const memberships = await db
+      .select({
+        entityKey: schema.docsScopeMembership.entityKey,
+        state: schema.docsScopeMembership.state,
+        access: schema.docsScopeMembership.access,
+        readOnly: schema.docsScopeMembership.readOnly,
+        updatedAt: schema.docsScopeMembership.updatedAt,
+      })
+      .from(schema.docsScopeMembership)
+      .where(and(
+        eq(schema.docsScopeMembership.authScope, authScope),
+        eq(schema.docsScopeMembership.scopeKey, canonicalScopeKey),
+        eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+        or(
+          eq(schema.docsScopeMembership.entityKey, node.id),
+          eq(schema.docsScopeMembership.entityKey, node.parent_id ?? node.id),
+        ),
+      ));
+    // Children require the exact parent projection in the same composite
+    // scope.  Root nodes use their explicit canonical ACL fields; never fall
+    // back to an arbitrary membership row for a missing/foreign parent.
+    const malformedParent = node.parent_id === node.id;
+    const inherited = node.parent_id == null
+      ? {
+          state: node.read_only || node.access === "read" ? "readonly" : "active",
+          access: node.access,
+          readOnly: node.read_only,
+        }
+      : malformedParent
+        ? undefined
+        : memberships.find((row) => row.entityKey === node.parent_id
+          && (row.state === "active" || row.state === "readonly"));
+    if (!inherited) {
+      if (canApplyNode) {
+        options.assertCurrent?.();
+        const values = remoteDocsNodeValues(node, new Date().toISOString());
+        db.transaction((tx) => {
+          if (node.read_only === true || node.access === "read") docsPermissionEpoch += 1;
+          tx.insert(schema.knowledgeNodes)
+            .values(values)
+            .onConflictDoUpdate({
+              target: schema.knowledgeNodes.id,
+              set: remoteDocsNodeUpdateSet(values, node.created_at),
+            })
+            .run();
+        });
+      }
+      return;
+    }
+    const inheritedReadOnly = Boolean(
+      inherited.readOnly
+      || inherited.state === "readonly"
+      || inherited.access === "read",
+    );
+    // The process-local projection epoch is independent of wall clocks and
+    // survives repeated readonly projections within the same clock tick.
+    const permissionChangedDuringRead = options.permissionEpoch !== undefined
+      && options.permissionEpoch !== docsPermissionEpoch;
+    const readOnly = inheritedReadOnly || node.read_only === true || node.access === "read"
+      || permissionChangedDuringRead;
+    const access = readOnly
+      ? "read"
+      : node.access ?? inherited.access ?? "write";
+    effectiveAccess = access;
+    effectiveReadOnly = readOnly;
+    const now = new Date().toISOString();
+    const nodeForApply = { ...node, access, read_only: readOnly };
+    const values = remoteDocsNodeValues(nodeForApply, now);
+    options.assertCurrent?.();
+    db.transaction((tx) => {
+      if (readOnly) docsPermissionEpoch += 1;
+      if (canApplyNode) {
+        tx.insert(schema.knowledgeNodes)
+          .values(values)
+          .onConflictDoUpdate({
+            target: schema.knowledgeNodes.id,
+            set: remoteDocsNodeUpdateSet(values, node.created_at),
+          })
+          .run();
+      } else if (protectedRow && existing) {
+        // Fresh canonical ACL is independent of a pending content edit.
+        // Repair/downgrade only permission fields; preserve the draft and CAS.
+        tx.update(schema.knowledgeNodes).set({ source: values.source, access, readOnly })
+          .where(eq(schema.knowledgeNodes.id, node.id)).run();
+      }
+      tx.insert(schema.docsScopeMembership)
+        .values({
+          authScope,
+          scopeKey: canonicalScopeKey,
+          scopeId,
+          projectId: node.project_id ?? null,
+          tableName: "knowledge_nodes",
+          entityKey: node.id,
+          state: readOnly ? "readonly" : "active",
+          access,
+          readOnly,
+          updatedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [
+            schema.docsScopeMembership.authScope,
+            schema.docsScopeMembership.scopeKey,
+            schema.docsScopeMembership.tableName,
+            schema.docsScopeMembership.entityKey,
+          ],
+          set: {
+            scopeId,
+            projectId: node.project_id ?? null,
+            state: readOnly ? "readonly" : "active",
+            access,
+            readOnly,
+            updatedAt: now,
+          },
+        })
+        .run();
+    });
+    const committedToken = await getTokenSnapshot();
+    if (
+      committedToken.revision !== expectedToken.revision
+      || committedToken.token !== expectedToken.token
+    ) return;
+    membershipApplied = true;
+  });
+  return {
+    membershipApplied,
+    ...(effectiveAccess ? { access: effectiveAccess } : {}),
+    ...(effectiveReadOnly !== undefined ? { readOnly: effectiveReadOnly } : {}),
+  };
+}
+
+export async function applyRemoteDocsNodeReadThrough(
+  node: DocsNode,
+  options: { permissionEpoch?: number; assertCurrent?: () => void } = {},
+): Promise<{ membershipApplied: boolean; access?: string; readOnly?: boolean }> {
+  return enqueueAuthScopeExclusive(() => applyRemoteDocsNodeReadThroughInternal(node, options));
 }
 
 function docsTxFirst<T = any>(query: any): T | null {
@@ -944,6 +1451,15 @@ function exactOutboxConflictRow(
       && row.entityId === reference.entityId
       && row.payload === reference.payload
       && (row.baseUpdatedAt ?? null) === (reference.baseUpdatedAt ?? null)
+      && JSON.stringify(row.basePayload ?? null)
+        === JSON.stringify(reference.basePayload ?? null)
+      && JSON.stringify(row.conflictPayload ?? null)
+        === JSON.stringify(reference.conflictPayload ?? null)
+      && Number(row.retryCount ?? 0) === reference.retryCount
+      && (row.lastError ?? null) === reference.lastError
+      && (row.blockedReason ?? null) === reference.blockedReason
+      && reference.blockedReason == null
+      && row.blockedReason == null
       && row.authScope === reference.authScope
       && (row.docsScopeKey ?? null) === (reference.docsScopeKey ?? null)
       && typeof row.lastError === "string"
@@ -1096,17 +1612,9 @@ export async function adoptDocsNodeServerConflict(
         const deleteResult = tx
           .delete(schema.outbox)
           .where(and(
-            eq(schema.outbox.opId, reference.opId),
-            eq(schema.outbox.tableName, reference.tableName),
-            eq(schema.outbox.action, reference.action),
-            eq(schema.outbox.entityId, reference.entityId),
-            eq(schema.outbox.payload, reference.payload),
-            reference.baseUpdatedAt === null
-              ? isNull(schema.outbox.baseUpdatedAt)
-              : eq(schema.outbox.baseUpdatedAt, reference.baseUpdatedAt),
-            eq(schema.outbox.authScope, reference.authScope),
-            eq(schema.outbox.docsScopeKey, docsScopeKey),
-            eq(schema.outbox.lastError, row.lastError),
+            outboxMutationSnapshotCondition(reference.opId, reference),
+            like(schema.outbox.lastError, "conflict:%"),
+            isNull(schema.outbox.blockedReason),
           ))
           .run();
         // Expo SQLite returns a changes count.  Tiny compatibility doubles
@@ -1193,11 +1701,15 @@ export type DocsScopeSetReconcile = {
 };
 
 export type DocsSyncPromotionOptions = {
+  /** Called before native SQL and commit; a cancelled run must roll back. */
+  assertActive?: () => void;
   runId: string;
   authScope: string;
   scopeId?: string;
   projectId?: string | null;
   scopeKey?: string;
+  /** Immutable first-page server boundary of the staged snapshot. */
+  snapshotServerTime?: string | null;
   /**
    * Compatibility input for older callers/tests.  The sync engine omits this
    * property so production promotion streams rows directly from SQLite.
@@ -1231,6 +1743,27 @@ export type DocsSyncPromotionOptions = {
   };
   force?: boolean;
 };
+
+function writableDocsPromotionScope(options: DocsSyncPromotionOptions, scopeKey: string) {
+  return options.scopes?.find((scope) => docsScopeKeyFromEntry(scope) === scopeKey
+    && scope.read_only === false && ["owner", "write"].includes(scope.access ?? ""));
+}
+
+function preservedDocsNodeWritable(
+  options: DocsSyncPromotionOptions,
+  scopeKey: string,
+  payload: Record<string, unknown>,
+  cached: { access?: string | null; readOnly?: boolean | null } | null | undefined,
+): boolean {
+  const scope = writableDocsPromotionScope(options, scopeKey);
+  return Boolean(scope && payload.deleted !== true
+    && payload.workspace_id === scope.workspace_id
+    && (payload.project_id ?? null) === (scope.project_id ?? null)
+    && payload.read_only === false && ["owner", "write"].includes(String(payload.access ?? ""))
+    // Account cache loss does not revoke the explicit canonical ACL of a
+    // scoped pending UPDATE. An existing restrictive row still wins.
+    && (!cached || (cached.readOnly === false && ["owner", "write"].includes(cached.access ?? ""))));
+}
 
 /**
  * Bounded provenance metadata forwarded through Docs outbox.  This is
@@ -1646,6 +2179,7 @@ export async function createClipIngestTree(
   });
 
   let replayNodeId: string | null = null;
+  let queuedClipMutation = false;
 
   // Complete foreground write unit: operation receipt + Docs nodes + outbox.
   // Nothing awaits inside the native transaction, so any failure rolls back
@@ -1782,7 +2316,9 @@ export async function createClipIngestTree(
       }
       if (token) {
         for (const node of nodes) {
-          tx.insert(schema.outbox).values(outboxValues(node)).run();
+          const values = outboxValues(node);
+          tx.insert(schema.outbox).values(values).run();
+          if (values.authScope && values.blockedReason == null) queuedClipMutation = true;
         }
       }
       if (input.operation) {
@@ -1815,6 +2351,11 @@ export async function createClipIngestTree(
       }
     });
   });
+
+  // ClipIngest creates its Docs outbox rows inside the same SQLite
+  // transaction rather than through enqueueOutbox. Wake an in-flight sync
+  // after the transaction commits so the durable rows join its trailing run.
+  if (queuedClipMutation && !replayNodeId) notifyMutationQueued(authScope);
 
   if (replayNodeId) {
     const replayNode = await getNodeRow(replayNodeId);
@@ -1950,12 +2491,14 @@ export async function reconcileDocsNodesWithServer(
   // is waiting for a server-side conflict response.  Keep the row and outbox
   // for recovery, but flip the local ACL guard to read-only first.
   const protectedIdList = [...protectedIds];
+  if (protectedIdList.length) docsPermissionEpoch += 1;
   for (let offset = 0; offset < protectedIdList.length; offset += 500) {
     const ids = protectedIdList.slice(offset, offset + 500);
     await db
       .update(schema.knowledgeNodes)
       .set({ access: "read", readOnly: true })
       .where(inArray(schema.knowledgeNodes.id, ids));
+    docsPermissionEpoch += 1;
   }
   await forEachDocsChunk([...protectedIds], async (id) => {
     if (directlyProtected.has(id)) return;
@@ -2542,6 +3085,12 @@ async function hasToken(): Promise<boolean> {
   return Boolean(await getToken());
 }
 
+/** Wake only the actor stored with the completed, sendable operation. */
+async function notifyQueuedDocsMutation(opId: string): Promise<void> {
+  const authScope = await runForegroundSqliteWrite(() => getOutboxMutationWakeScope(opId));
+  if (authScope) notifyMutationQueued(authScope);
+}
+
 /** 兄弟末尾の次の sort_order を返す（parentId=null はトップレベル）。 */
 async function nextSortOrder(parentId: string | null): Promise<number> {
   const db = getDb();
@@ -2570,6 +3119,25 @@ async function getNodeRow(id: string): Promise<DbNode | null> {
     .from(schema.knowledgeNodes)
     .where(eq(schema.knowledgeNodes.id, id));
   return rows[0] ?? null;
+}
+
+// The Expo Drizzle adapter executes its Promise-shaped reads synchronously.
+// Do not block the JS input/event queue behind a background native SQLite write
+// when preparing a new sibling, taking an edit's CAS snapshot, or reading its result.
+// The in-transaction latest read deliberately keeps the existing atomic unit.
+async function getNodeRowAsync(id: string): Promise<DbNode | null> {
+  const native = typeof getSqlite === "function" ? getSqlite() : undefined;
+  if (typeof native?.getFirstAsync !== "function") return getNodeRow(id);
+  const query = getDb().select().from(schema.knowledgeNodes)
+    .where(eq(schema.knowledgeNodes.id, id)).limit(1).toSQL();
+  const raw = await native.getFirstAsync<Record<string, unknown>>(query.sql, query.params as SQLiteBindParams);
+  if (!raw) return null;
+  const row: Record<string, unknown> = {};
+  for (const [key, column] of Object.entries(drizzleOrm.getTableColumns(schema.knowledgeNodes))) {
+    const value = raw[column.name];
+    row[key] = value === null ? null : column.mapFromDriverValue(value);
+  }
+  return row as DbNode;
 }
 
 function assertDocsWritable(row: DbNode | null): void {
@@ -2683,6 +3251,7 @@ function quarantineDocsScopeTx(
   now: string,
 ): void {
   if (!schema.docsScopeMembership || typeof tx.select !== "function") return;
+  docsPermissionEpoch += 1;
   const scopeKey = docsScopeKeyFromEntry(scope);
   const membershipRows = docsTxRows(
     tx.select()
@@ -2959,6 +3528,14 @@ async function promoteDocsSyncRunCompatibility(
         .from(schema.docsScopeMembership)
         .where(eq(schema.docsScopeMembership.authScope, options.authScope))
     : [];
+  const newerReadonlyNodes = new Set<string>();
+  const rememberNewerReadonly = (rows: typeof membershipRows) => {
+    for (const row of rows) {
+      if (row.tableName === "knowledge_nodes" && row.state !== "deleted"
+        && (row.state !== "active" || row.readOnly || row.access === "read")) newerReadonlyNodes.add(row.entityKey);
+    }
+  };
+  rememberNewerReadonly(membershipRows);
   const membershipByTable = new Map<string, Set<string>>();
   const membershipRefs = new Map<string, number>();
   for (const row of allMembershipRows) {
@@ -3124,6 +3701,7 @@ async function promoteDocsSyncRunCompatibility(
       .run();
   };
   const upsertMembership = (tx: any, table: string, key: string, state = "active") => {
+    if (table === "knowledge_nodes" && newerReadonlyNodes.has(key) && state === "active") state = "readonly";
     if (!schema.docsScopeMembership || !workspaceId) return;
     const scopeMeta = options.scopes?.find(
       (scope) => scope.workspace_id === workspaceId
@@ -3138,8 +3716,8 @@ async function promoteDocsSyncRunCompatibility(
         tableName: table,
         entityKey: key,
         state,
-        access: scopeMeta?.access ?? null,
-        readOnly: scopeMeta?.read_only ?? null,
+        access: state === "readonly" ? "read" : scopeMeta?.access ?? null,
+        readOnly: state === "readonly" ? true : scopeMeta?.read_only ?? null,
         updatedAt: now,
       })
       .onConflictDoUpdate({
@@ -3153,8 +3731,8 @@ async function promoteDocsSyncRunCompatibility(
           scopeId: workspaceId,
           projectId: options.projectId ?? null,
           state,
-          access: scopeMeta?.access ?? null,
-          readOnly: scopeMeta?.read_only ?? null,
+          access: state === "readonly" ? "read" : scopeMeta?.access ?? null,
+          readOnly: state === "readonly" ? true : scopeMeta?.read_only ?? null,
           updatedAt: now,
         },
       })
@@ -3188,11 +3766,19 @@ async function promoteDocsSyncRunCompatibility(
       .run();
   };
   const applyOne = (tx: any, row: DocsSyncStagedRow): void => {
-    const payload = row.payload ?? {};
+    const payload = row.tableName === "knowledge_nodes" && newerReadonlyNodes.has(row.entityKey)
+      ? { ...row.payload, access: "read", read_only: true } : row.payload ?? {};
     const key = row.entityKey || docsCompositeKey(payload);
     if (!key) return;
     if (isProtected(row.tableName, key)) {
-      upsertMembership(tx, row.tableName, key, "blocked");
+      const cached = row.tableName === "knowledge_nodes"
+        ? tx.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, key)).get?.()
+        : null;
+      // Content protection is independent from ACL. A verified owner/write
+      // projection must not become a permission block merely because it is dirty.
+      const state = !row.isTombstone && row.tableName === "knowledge_nodes"
+        && preservedDocsNodeWritable(options, scopeKey, payload, cached) ? "active" : "blocked";
+      upsertMembership(tx, row.tableName, key, state);
       setConflict(tx, row.tableName, key, payload);
       return;
     }
@@ -3222,7 +3808,7 @@ async function promoteDocsSyncRunCompatibility(
     upsertMembership(tx, row.tableName, key);
     if (row.tableName === "knowledge_nodes") {
       const values = remoteDocsNodeValues(payload as unknown as DocsNode, now);
-      txAny(tx, schema.knowledgeNodes).values(values).onConflictDoUpdate({ target: schema.knowledgeNodes.id, set: remoteDocsNodeUpdateSet(values) }).run();
+      txAny(tx, schema.knowledgeNodes).values(values).onConflictDoUpdate({ target: schema.knowledgeNodes.id, set: remoteDocsNodeUpdateSet(values, payload.created_at as string | null) }).run();
     } else if (row.tableName === "knowledge_supertags") {
       txAny(tx, schema.knowledgeSupertags).values({
         id: payload.id,
@@ -3458,6 +4044,7 @@ async function promoteDocsSyncRunCompatibility(
   };
   db.transaction((tx) => {
     // Expo SQLite transactions expose synchronous `.all()` reads.  Refresh
+    docsPermissionEpoch += 1;
     // protection state at the transaction boundary so an outbox/dirty edit
     // created after the preflight snapshot cannot be overwritten by this
     // promotion.  Legacy test doubles may not expose `.all()`; their preflight
@@ -3546,6 +4133,7 @@ async function promoteDocsSyncRunCompatibility(
               ),
             ),
         );
+        rememberNewerReadonly(currentRows);
         const currentAllRows = txSelectAll(
           tx
             .select()
@@ -3591,10 +4179,49 @@ async function promoteDocsSyncRunCompatibility(
       }
     }
     applyStagedRows(tx);
+    const pendingCreates = new Set<string>();
+    const writableScope = writableDocsPromotionScope(options, scopeKey);
+    if (writableScope && schema.docsScopeMembership) {
+      const query = tx.select({ entityId: schema.outbox.entityId }).from(schema.outbox).where(and(
+        eq(schema.outbox.authScope, options.authScope), eq(schema.outbox.docsScopeKey, scopeKey),
+        eq(schema.outbox.tableName, "knowledge_nodes"), eq(schema.outbox.action, "create"),
+      ));
+      for (const op of typeof query.all === "function" ? query.all() : []) {
+        const node = tx.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, op.entityId)).get?.();
+        const membership = tx.select().from(schema.docsScopeMembership).where(and(
+          eq(schema.docsScopeMembership.authScope, options.authScope), eq(schema.docsScopeMembership.scopeKey, scopeKey),
+          eq(schema.docsScopeMembership.tableName, "knowledge_nodes"), eq(schema.docsScopeMembership.entityKey, op.entityId),
+        )).get?.();
+        if (node?.workspaceId === writableScope.workspace_id
+          && (node.projectId ?? null) === (writableScope.project_id ?? null)
+          && node.readOnly === false && ["owner", "write"].includes(node.access ?? "")
+          && membership?.state === "active" && membership.readOnly === false
+          && ["owner", "write"].includes(membership.access ?? "")) pendingCreates.add(op.entityId);
+      }
+      const boundary = Date.parse(options.snapshotServerTime ?? "");
+      if (Number.isFinite(boundary)) {
+        for (const id of staleNodes || []) {
+          const node = tx.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, id)).get?.();
+          const membership = tx.select().from(schema.docsScopeMembership).where(and(
+            eq(schema.docsScopeMembership.authScope, options.authScope), eq(schema.docsScopeMembership.scopeKey, scopeKey),
+            eq(schema.docsScopeMembership.tableName, "knowledge_nodes"), eq(schema.docsScopeMembership.entityKey, id),
+          )).get?.();
+          if (node?.workspaceId === writableScope.workspace_id
+            && (node.projectId ?? null) === (writableScope.project_id ?? null)
+            && node.createdBy === options.authScope.slice("auth:".length)
+            && node.serverUpdatedAt && typeof node.createdAt === "string"
+            && compareDocsVersions(node.createdAt, options.snapshotServerTime!) === 1
+            && node.readOnly === false && ["owner", "write"].includes(node.access ?? "")
+            && membership?.state === "active" && membership.readOnly === false
+            && ["owner", "write"].includes(membership.access ?? "")) pendingCreates.add(id);
+        }
+      }
+    }
     // Backend sends tombstones as an empty list and authoritative_ids on the
     // terminal page.  Reconcile only the requested workspace; never delete a
     // row belonging to another account/scope that happens to share SQLite.
     for (const id of staleNodes || []) {
+      if (pendingCreates.has(id)) continue;
       if (isProtected("knowledge_nodes", id)) {
         blockMembershipTx(tx, "knowledge_nodes", id);
         setConflict(tx, "knowledge_nodes", id, {
@@ -4121,10 +4748,58 @@ async function upsertDocsMembershipAsync(
     table,
     key,
     state,
-    scopeMeta?.access ?? null,
-    sqlBoolean(scopeMeta?.read_only),
+    state === "readonly" ? "read" : scopeMeta?.access ?? null,
+    state === "readonly" ? 1 : sqlBoolean(scopeMeta?.read_only),
     now,
   );
+}
+
+async function upsertDocsMembershipBatchAsync(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  scopeKey: string,
+  workspaceId: string | undefined,
+  table: string,
+  keys: readonly string[],
+  state: string,
+  now: string,
+): Promise<void> {
+  if (!workspaceId || !keys.length) return;
+  const scopeMeta = options.scopes?.find(
+    (scope) => scope.workspace_id === workspaceId
+      && (scope.project_id ?? null) === (options.projectId ?? null),
+  );
+  const insert = `INSERT INTO docs_scope_membership(
+       auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
+       state, access, read_only, updated_at
+     )`;
+  const conflict = `ON CONFLICT(auth_scope, scope_key, table_name, entity_key) DO UPDATE SET
+       scope_id = excluded.scope_id,
+       project_id = excluded.project_id,
+       state = excluded.state,
+       access = excluded.access,
+       read_only = excluded.read_only,
+       updated_at = excluded.updated_at`;
+  for (let offset = 0; offset < keys.length; offset += DOCS_MULTIROW_BATCH_SIZE) {
+    const batch = keys.slice(offset, offset + DOCS_MULTIROW_BATCH_SIZE);
+    await executeDocsMultiRowBatch(
+      tx,
+      insert,
+      conflict,
+      batch.map((key) => [
+        options.authScope,
+        scopeKey,
+        workspaceId,
+        options.projectId ?? null,
+        table,
+        key,
+        state,
+        state === "readonly" ? "read" : scopeMeta?.access ?? null,
+        state === "readonly" ? 1 : sqlBoolean(scopeMeta?.read_only),
+        now,
+      ]),
+    );
+  }
 }
 
 async function removeDocsMembershipAsync(
@@ -4170,8 +4845,11 @@ async function quarantineDocsScopeAsync(
   mode: "revoke" | "downgrade",
   now: string,
   requestedScopeKey?: string,
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const scopeKey = requestedScopeKey ?? docsScopeKeyFromEntry(scope);
+  docsPermissionEpoch += 1;
   const membership = await loadDocsQuarantineMembershipSnapshotTx(
     tx,
     authScope,
@@ -4195,6 +4873,7 @@ async function quarantineDocsScopeAsync(
   for (const id of dirtyRows.fieldValues) dirtyKeys.add(`knowledge_field_values:${id}`);
 
   for (const compound of scopedKeys) {
+    assertActive?.();
     const separator = compound.indexOf(":");
     const table = compound.slice(0, separator);
     const key = compound.slice(separator + 1);
@@ -4234,6 +4913,7 @@ async function quarantineDocsScopeAsync(
     await deleteDocsLiveRowAsync(tx, table, key);
   }
   for (const row of scopedOutboxRows) {
+    assertActive?.();
     await tx.runAsync(
       `UPDATE outbox SET retry_count = 5,
           last_error = ?, blocked_reason = ?, docs_scope_key = ?
@@ -4244,25 +4924,19 @@ async function quarantineDocsScopeAsync(
       row.op_id,
     );
   }
+  docsPermissionEpoch += 1;
 }
 
-async function upsertDocsNodeAsync(
-  tx: DocsSqliteAsyncTransaction,
-  payload: Record<string, unknown>,
-  now: string,
-): Promise<void> {
-  const node = payload as unknown as DocsNode;
-  const values = remoteDocsNodeValues(node, now);
-  await tx.runAsync(
-    `INSERT INTO knowledge_nodes(
+type DocsBatchParams = readonly unknown[];
+
+const DOCS_NODE_INSERT = `INSERT INTO knowledge_nodes(
        id, workspace_id, parent_id, root_page_id, project_id, source, access,
        read_only, system_key, title, aliases, description, body_json, body_text,
        node_type, display_props, query_json, view_json, day_date, sort_order,
        created_by, updated_by, created_at, updated_at, server_updated_at,
        dirty, conflict_payload, archived_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
+     )`;
+const DOCS_NODE_CONFLICT = `ON CONFLICT(id) DO UPDATE SET
        workspace_id = excluded.workspace_id,
        parent_id = excluded.parent_id,
        root_page_id = excluded.root_page_id,
@@ -4282,12 +4956,21 @@ async function upsertDocsNodeAsync(
        view_json = excluded.view_json,
        day_date = excluded.day_date,
        sort_order = excluded.sort_order,
+       created_by = COALESCE(excluded.created_by, knowledge_nodes.created_by),
+       created_at = COALESCE(excluded.created_at, knowledge_nodes.created_at),
        updated_by = excluded.updated_by,
        updated_at = excluded.updated_at,
        server_updated_at = excluded.server_updated_at,
        dirty = excluded.dirty,
        conflict_payload = excluded.conflict_payload,
-       archived_at = excluded.archived_at`,
+       archived_at = excluded.archived_at`;
+
+function docsNodeParams(
+  payload: Record<string, unknown>,
+  now: string,
+): DocsBatchParams {
+  const values = remoteDocsNodeValues(payload as unknown as DocsNode, now);
+  return [
     values.id,
     values.workspaceId,
     values.parentId,
@@ -4310,12 +4993,37 @@ async function upsertDocsNodeAsync(
     values.sortOrder,
     values.createdBy,
     values.updatedBy,
-    values.createdAt,
+    payload.created_at ?? null,
     values.updatedAt,
     values.serverUpdatedAt,
     sqlBoolean(values.dirty),
     sqlJson(values.conflictPayload),
     values.archivedAt,
+  ];
+}
+
+async function upsertDocsNodeBatchAsync(
+  tx: DocsSqliteAsyncTransaction,
+  rows: readonly Record<string, unknown>[],
+  now: string,
+): Promise<void> {
+  await executeDocsMultiRowBatch(
+    tx,
+    DOCS_NODE_INSERT,
+    DOCS_NODE_CONFLICT,
+    rows.map((row) => docsNodeParams(row, now)),
+  );
+}
+
+async function upsertDocsNodeAsync(
+  tx: DocsSqliteAsyncTransaction,
+  payload: Record<string, unknown>,
+  now: string,
+): Promise<void> {
+  await tx.runAsync(
+    `${DOCS_NODE_INSERT} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?) ${DOCS_NODE_CONFLICT}`,
+    ...docsNodeParams(payload, now),
   );
 }
 
@@ -4552,19 +5260,38 @@ async function promoteDocsSyncRunAsync(
   const tableNames = [...DOCS_SCOPE_TABLE_NAMES];
   const scopeKey = options.scopeKey
     ?? `${options.scopeId ?? "personal"}|project:${options.projectId ?? ""}`;
+  const workspaceId = options.scopeId
+    ?? options.authoritative.knowledge_nodes?.scopeId
+    ?? options.authoritative.knowledge_supertags?.scopeId
+    ?? options.authoritative.knowledge_fields?.scopeId;
+  const membershipScopeMeta = options.scopes?.find(
+    (scope) => scope.workspace_id === workspaceId
+      && (scope.project_id ?? null) === (options.projectId ?? null),
+  );
   const authoritativeByTable = await buildDocsAuthoritativeSets(
     options.authoritative,
     tableNames,
+    options.assertActive,
   );
 
-  return withForegroundYieldingDocsExclusiveTransaction(async (tx) => {
+  let permissionsProjected = false;
+  const telemetry = await withForegroundYieldingDocsExclusiveTransaction((rawTx) =>
+    withDocsPreparedWrites(rawTx, async (tx) => {
+    if (await tryFinalizeUnchangedDocsRunTx(tx, options, tableNames)) {
+      return { source: "staging" as const, rowsRead: 0, batches: 0, maxBatchSize: 0 };
+    }
+    docsPermissionEpoch += 1;
     // Everything below, including the protection snapshot, runs on the same
+    permissionsProjected = true;
     // native transaction object.  No Drizzle query is allowed to observe or
     // mutate the promotion while it is in flight.
     const membershipSnapshot = await loadDocsMembershipSnapshotTx(
       tx,
       options.authScope,
       scopeKey,
+      membershipScopeMeta,
+      options.assertActive,
+      { workspace_id: workspaceId, project_id: options.projectId ?? null },
     );
     const outboxProtection = await loadDocsScopedOutboxProtectionTx(
       tx,
@@ -4583,7 +5310,9 @@ async function promoteDocsSyncRunAsync(
     };
 
     const membershipRefs = membershipSnapshot.refs;
+    const newerReadonlyNodes = membershipSnapshot.readonlyNodes;
     const scopedMembership = membershipSnapshot.scoped;
+    const membershipNeedsUpsert = membershipSnapshot.needsUpsert;
     const ensureMembership = (table: string, key: string): void => {
       const scopeBucket = scopedMembership.get(table) ?? new Set<string>();
       if (scopeBucket.has(key)) return;
@@ -4603,16 +5332,13 @@ async function promoteDocsSyncRunAsync(
     };
     const authoritativeIds = (table: string): Set<string> | null =>
       authoritativeByTable.get(table) ?? null;
-    const workspaceId = options.scopeId
-      ?? options.authoritative.knowledge_nodes?.scopeId
-      ?? options.authoritative.knowledge_supertags?.scopeId
-      ?? options.authoritative.knowledge_fields?.scopeId;
 
     const upsertMembership = async (
       table: string,
       key: string,
       state = "active",
     ): Promise<void> => {
+      if (table === "knowledge_nodes" && newerReadonlyNodes.has(key) && state === "active") state = "readonly";
       await upsertDocsMembershipAsync(
         tx,
         options,
@@ -4623,6 +5349,34 @@ async function promoteDocsSyncRunAsync(
         state,
         now,
       );
+    };
+    const upsertMembershipBatch = async (
+      table: string,
+      keys: readonly string[],
+      state = "active",
+    ): Promise<void> => {
+      if (table === "knowledge_nodes" && state === "active" && keys.some((key) => newerReadonlyNodes.has(key))) {
+        const readonly = keys.filter((key) => newerReadonlyNodes.has(key));
+        await upsertMembershipBatch(table, readonly, "readonly");
+        keys = keys.filter((key) => !newerReadonlyNodes.has(key));
+      }
+      const existing = scopedMembership.get(table) ?? new Set<string>();
+      const refresh = membershipNeedsUpsert.get(table) ?? new Set<string>();
+      const keysToWrite = keys.filter((key) => !existing.has(key) || refresh.has(key));
+      await upsertDocsMembershipBatchAsync(
+        tx,
+        options,
+        scopeKey,
+        workspaceId,
+        table,
+        keysToWrite,
+        state,
+        now,
+      );
+      await forEachDocsPromotionChunk(keys, (key) => {
+        ensureMembership(table, key);
+        refresh.delete(key);
+      }, options.assertActive);
     };
     const removeMembershipTx = (table: string, key: string): Promise<void> =>
       removeDocsMembershipAsync(tx, options.authScope, scopeKey, table, key);
@@ -4637,9 +5391,8 @@ async function promoteDocsSyncRunAsync(
     for (const table of tableNames) {
       const ids = authoritativeIds(table);
       if (!ids) continue;
-      await forEachDocsPromotionChunk(ids, (key) => {
-        ensureMembership(table, key);
-      });
+      const keys = [...ids];
+      await upsertMembershipBatch(table, keys);
     }
 
     const stagedTelemetry: DocsSyncPromotionTelemetry = {
@@ -4650,11 +5403,19 @@ async function promoteDocsSyncRunAsync(
     };
 
     const applyOne = async (row: DocsSyncStagedRow): Promise<void> => {
-      const payload = row.payload ?? {};
+      const payload = row.tableName === "knowledge_nodes" && newerReadonlyNodes.has(row.entityKey)
+        ? { ...row.payload, access: "read", read_only: true } : row.payload ?? {};
       const key = row.entityKey || docsCompositeKey(payload);
       if (!key) return;
       if (isProtected(row.tableName, key)) {
-        await upsertMembership(row.tableName, key, "blocked");
+        const cached = row.tableName === "knowledge_nodes"
+          ? await tx.getFirstAsync<{ access: string | null; read_only: number | null }>(
+            "SELECT access, read_only FROM knowledge_nodes WHERE id = ?", key,
+          ) : null;
+        const state = !row.isTombstone && row.tableName === "knowledge_nodes"
+          && preservedDocsNodeWritable(options, scopeKey, payload,
+            cached ? { access: cached.access, readOnly: cached.read_only !== 0 } : null) ? "active" : "blocked";
+        await upsertMembership(row.tableName, key, state);
         await setConflict(row.tableName, key, payload);
         return;
       }
@@ -4719,17 +5480,42 @@ async function promoteDocsSyncRunAsync(
             stagedTelemetry.maxBatchSize,
             rows.length,
           );
+          const normalNodeRows: Record<string, unknown>[] = [];
+          const normalNodeKeys: string[] = [];
           for (const row of rows) {
             const parsed = decodeDocsSqlJson<Record<string, unknown> | null>(
               row.payload_json,
               null,
             );
-            await applyOne({
+            const stagedRow = {
               tableName: row.table_name,
               entityKey: row.entity_key,
               payload: parsed,
               isTombstone: sqliteBoolean(row.is_tombstone),
-            });
+            };
+            const key = stagedRow.entityKey || docsCompositeKey(parsed ?? {});
+            const normalNode =
+              table === "knowledge_nodes"
+              && Boolean(key)
+              && parsed != null
+              && !stagedRow.isTombstone
+              && parsed?.deleted !== true
+              && !isProtected(table, key!);
+            if (normalNode) {
+              normalNodeRows.push(newerReadonlyNodes.has(key!) ? { ...parsed, access: "read", read_only: true } : parsed ?? {});
+              normalNodeKeys.push(key!);
+            } else {
+              await applyOne(stagedRow);
+            }
+          }
+          if (normalNodeRows.length) {
+            // Terminal authoritative IDs already established membership before
+            // staging rows are applied. Legacy/partial responses still need
+            // the row-level membership insertion here.
+            if (!authoritativeIds("knowledge_nodes")) {
+              await upsertMembershipBatch("knowledge_nodes", normalNodeKeys);
+            }
+            await upsertDocsNodeBatchAsync(tx, normalNodeRows, now);
           }
           const nextKey: string | undefined = rows[rows.length - 1]?.entity_key;
           if (typeof nextKey !== "string" || !nextKey.length || nextKey === lastEntityKey) break;
@@ -4739,24 +5525,23 @@ async function promoteDocsSyncRunAsync(
       }
     };
 
-    // The terminal page may carry an authoritative id without a changed row;
-    // persist that membership before reconciliation just like the legacy
-    // promotion path did.
-    for (const table of tableNames) {
-      const ids = authoritativeIds(table);
-      if (!ids) continue;
-      await forEachDocsPromotionChunk(ids, (key) =>
-        upsertMembership(table, key),
-      );
-    }
+    // Authoritative membership, including IDs without a changed row, was
+    // persisted by the batch pass above. Staged rows still handle protected,
+    // tombstone and legacy/partial membership transitions individually.
     await applyStagedRows();
+
+    const writableScope = writableDocsPromotionScope(options, scopeKey);
+    const pendingCreates = writableScope ? await loadDocsPendingNodeCreatesTx(
+      tx, options.authScope, scopeKey, writableScope.workspace_id, writableScope.project_id ?? null,
+      options.snapshotServerTime,
+    ) : new Set<string>();
 
     const nodeAuthoritative = authoritativeIds("knowledge_nodes");
     if (nodeAuthoritative) {
       await forEachDocsPromotionChunk(
         scopedMembership.get("knowledge_nodes") ?? [],
         async (id) => {
-          if (nodeAuthoritative.has(id)) return;
+          if (nodeAuthoritative.has(id) || pendingCreates.has(id)) return;
           if (isProtected("knowledge_nodes", id)) {
             await blockMembershipTx("knowledge_nodes", id);
             await setConflict("knowledge_nodes", id, {
@@ -4775,6 +5560,7 @@ async function promoteDocsSyncRunAsync(
           if (membershipRefs.has(`knowledge_nodes:${id}`)) return;
           await deleteDocsLiveRowAsync(tx, "knowledge_nodes", id);
         },
+        options.assertActive,
       );
     }
 
@@ -4798,6 +5584,7 @@ async function promoteDocsSyncRunAsync(
           if (membershipRefs.has(`knowledge_supertags:${id}`)) return;
           await deleteDocsLiveRowAsync(tx, "knowledge_supertags", id);
         },
+        options.assertActive,
       );
     }
 
@@ -4821,6 +5608,7 @@ async function promoteDocsSyncRunAsync(
           if (membershipRefs.has(`knowledge_fields:${id}`)) return;
           await deleteDocsLiveRowAsync(tx, "knowledge_fields", id);
         },
+        options.assertActive,
       );
     }
 
@@ -4866,6 +5654,7 @@ async function promoteDocsSyncRunAsync(
           () => deleteDocsLiveRowAsync(tx, "knowledge_node_supertags", key),
         );
       },
+      options.assertActive,
     );
     const fieldValueAuth = authoritativeIds("knowledge_field_values");
     await forEachDocsPromotionChunk(
@@ -4880,6 +5669,7 @@ async function promoteDocsSyncRunAsync(
           () => deleteDocsLiveRowAsync(tx, "knowledge_field_values", key),
         );
       },
+      options.assertActive,
     );
     const supertagFieldAuth = authoritativeIds("knowledge_supertag_fields");
     await forEachDocsPromotionChunk(
@@ -4894,6 +5684,7 @@ async function promoteDocsSyncRunAsync(
           () => deleteDocsLiveRowAsync(tx, "knowledge_supertag_fields", key),
         );
       },
+      options.assertActive,
     );
     const placementAuth = authoritativeIds("knowledge_node_placements");
     await forEachDocsPromotionChunk(
@@ -4911,6 +5702,7 @@ async function promoteDocsSyncRunAsync(
           await deleteDocsLiveRowAsync(tx, "knowledge_node_placements", key);
         }
       },
+      options.assertActive,
     );
     const edgeAuth = authoritativeIds("knowledge_edges");
     await forEachDocsPromotionChunk(
@@ -4928,6 +5720,7 @@ async function promoteDocsSyncRunAsync(
           await deleteDocsLiveRowAsync(tx, "knowledge_edges", key);
         }
       },
+      options.assertActive,
     );
 
     if (options.scopeSet) {
@@ -4960,57 +5753,13 @@ async function promoteDocsSyncRunAsync(
       }
     }
 
-    if (options.finalize) {
-      const finalize = options.finalize;
-      const saveSyncState = async (
-        tableName: string,
-        values: { lastPulledAt?: string | null; cursor?: string | null },
-      ): Promise<void> => {
-        const lastPulledAt = values.lastPulledAt ?? null;
-        const cursor = values.cursor ?? null;
-        const updates: string[] = [];
-        const params: unknown[] = [tableName, lastPulledAt, null, cursor];
-        if (values.lastPulledAt !== undefined) {
-          updates.push("last_pulled_at = excluded.last_pulled_at");
-        }
-        if (values.cursor !== undefined) updates.push("cursor = excluded.cursor");
-        await tx.runAsync(
-          `INSERT INTO sync_state(table_name, last_pulled_at, last_pushed_at, cursor)
-             VALUES (?, ?, ?, ?)
-           ON CONFLICT(table_name) DO UPDATE SET ${updates.join(", ")}`,
-          ...params,
-        );
-      };
-      for (const [table, digest] of Object.entries(finalize.digestByTable)) {
-        const key = finalize.digestKeys[table];
-        if (key && digest) await saveSyncState(key, { cursor: digest });
-      }
-      await saveSyncState(finalize.scopeDigestKey, { cursor: finalize.scopeDigest });
-      if (finalize.scopeRevisionKey && finalize.scopeRevision) {
-        await saveSyncState(finalize.scopeRevisionKey, { cursor: finalize.scopeRevision });
-      }
-      await saveSyncState(finalize.lastPulledKey, { lastPulledAt: finalize.serverTime });
-      if (finalize.scopesKey && options.scopes) {
-        await saveSyncState(finalize.scopesKey, { cursor: JSON.stringify(options.scopes) });
-      }
-      if (finalize.workspaceKey && finalize.workspaceId) {
-        await saveSyncState(finalize.workspaceKey, { cursor: finalize.workspaceId });
-      }
-      await tx.runAsync(
-        `UPDATE docs_sync_runs SET state = 'completed', updated_at = ?
-           WHERE run_id = ? AND auth_scope = ?`,
-        finalize.serverTime,
-        options.runId,
-        options.authScope,
-      );
-      await tx.runAsync(
-        "DELETE FROM docs_sync_staging WHERE run_id = ? AND auth_scope = ?",
-        options.runId,
-        options.authScope,
-      );
-    }
+    await finalizeDocsSyncRunTx(tx, options);
     return stagedTelemetry;
-  });
+    }),
+    options.assertActive,
+  );
+  if (permissionsProjected) docsPermissionEpoch += 1;
+  return telemetry;
 }
 
 /** Promote a validated Docs run using native async SQLite in production. */
@@ -5032,6 +5781,7 @@ async function quarantineRevokedDocsScopeCompatibility(
   projectId?: string | null,
   requestedScopeKey?: string,
   mode: "revoke" | "downgrade" = "revoke",
+  assertActive?: () => void,
 ): Promise<void> {
   const db = getDb();
   const scopeKey = requestedScopeKey
@@ -5081,6 +5831,7 @@ async function quarantineRevokedDocsScopeCompatibility(
     })
     .from(schema.outbox)
     .where(eq(schema.outbox.authScope, authScope));
+  assertActive?.();
   // Keep the operation identity, not only a table/entity compound key.  Two
   // project scopes may legitimately share the same UUID; a compound-key set
   // would quarantine the sibling operation when the target scope is revoked.
@@ -5109,6 +5860,7 @@ async function quarantineRevokedDocsScopeCompatibility(
       db.select({ id: schema.knowledgeFields.id }).from(schema.knowledgeFields)
         .where(eq(schema.knowledgeFields.workspaceId, workspaceId)),
     ]);
+    assertActive?.();
     for (const row of nodes) scopedKeys.add(`knowledge_nodes:${row.id}`);
     for (const row of supertags) scopedKeys.add(`knowledge_supertags:${row.id}`);
     for (const row of fields) scopedKeys.add(`knowledge_fields:${row.id}`);
@@ -5123,12 +5875,15 @@ async function quarantineRevokedDocsScopeCompatibility(
     db.select({ nodeId: schema.knowledgeFieldValues.nodeId, fieldId: schema.knowledgeFieldValues.fieldId })
       .from(schema.knowledgeFieldValues).where(eq(schema.knowledgeFieldValues.dirty, true)),
   ]);
+  assertActive?.();
   for (const row of dirtyNodes) dirtyKeys.add(`knowledge_nodes:${row.id}`);
   for (const row of dirtySupertags) dirtyKeys.add(`knowledge_supertags:${row.id}`);
   for (const row of dirtyNodeSupertags) dirtyKeys.add(`knowledge_node_supertags:${row.nodeId}:${row.supertagId}`);
   for (const row of dirtyFieldValues) dirtyKeys.add(`knowledge_field_values:${row.nodeId}:${row.fieldId}`);
   db.transaction((tx) => {
+    assertActive?.();
     // Re-read the revoke protection set at the transaction boundary.  A
+    docsPermissionEpoch += 1;
     // sibling membership or local outbox edit may have been created while the
     // preflight SELECTs above were awaiting; using those stale snapshots could
     // otherwise delete the shared live row or lose the newly queued edit.
@@ -5232,6 +5987,7 @@ async function quarantineRevokedDocsScopeCompatibility(
       }
     }
     for (const compound of scopedKeys) {
+      assertActive?.();
       const separator = compound.indexOf(":");
       const table = compound.slice(0, separator);
       const key = compound.slice(separator + 1);
@@ -5317,6 +6073,7 @@ async function quarantineRevokedDocsScopeCompatibility(
       }
     }
     for (const row of scopedOutboxRows) {
+      assertActive?.();
       tx.update(schema.outbox)
         .set({
           retryCount: 5,
@@ -5341,8 +6098,10 @@ async function quarantineRevokedDocsScopeAsync(
   projectId: string | null | undefined,
   requestedScopeKey: string | undefined,
   mode: "revoke" | "downgrade",
+  assertActive?: () => void,
 ): Promise<void> {
   await withDocsExclusiveTransaction(async (tx) => {
+    assertActive?.();
     await quarantineDocsScopeAsync(
       tx,
       authScope,
@@ -5350,8 +6109,11 @@ async function quarantineRevokedDocsScopeAsync(
       mode,
       new Date().toISOString(),
       requestedScopeKey,
+      assertActive,
     );
+    assertActive?.();
   });
+  docsPermissionEpoch += 1;
 }
 
 export async function quarantineRevokedDocsScope(
@@ -5360,6 +6122,7 @@ export async function quarantineRevokedDocsScope(
   projectId?: string | null,
   requestedScopeKey?: string,
   mode: "revoke" | "downgrade" = "revoke",
+  assertActive?: () => void,
 ): Promise<void> {
   if (docsSqliteAsyncAvailable()) {
     return quarantineRevokedDocsScopeAsync(
@@ -5368,6 +6131,7 @@ export async function quarantineRevokedDocsScope(
       projectId,
       requestedScopeKey,
       mode,
+      assertActive,
     );
   }
   return quarantineRevokedDocsScopeCompatibility(
@@ -5376,6 +6140,7 @@ export async function quarantineRevokedDocsScope(
     projectId,
     requestedScopeKey,
     mode,
+    assertActive,
   );
 }
 
@@ -5408,9 +6173,19 @@ export const docsRepo = {
   },
 
   /** トップレベルページ一覧（parent_id null / archived_at null / 通常ノードのみ）。 */
-  async listPages(): Promise<DocsNode[]> {
+  async listPages(options?: {
+    diagnostics?: DocsReadDiagnostics;
+    signal?: AbortSignal;
+  }): Promise<DocsNode[]> {
+    assertDocsReadActive(options?.signal);
     const db = getDb();
-    const rowVisibility = await getDocsVisibility("knowledge_nodes");
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes",
+      undefined,
+      undefined,
+      options?.diagnostics,
+    );
+    assertDocsReadActive(options?.signal);
     const workspaceIds = rowVisibility.workspaceIds;
     const conditions = [
       isNull(schema.knowledgeNodes.parentId),
@@ -5438,20 +6213,169 @@ export const docsRepo = {
       .select()
       .from(schema.knowledgeNodes)
       .where(and(...conditions));
+    assertDocsReadActive(options?.signal);
     return rows
       .filter((row) => docsRowVisible(row, rowVisibility))
       .map(toNode)
       .sort(sortBySortThenTitle);
   },
 
+  /** Read the same visibility-filtered page list with a non-secret diagnostic count. */
+  async listPagesWithDiagnostics(options?: { signal?: AbortSignal }): Promise<DocsPagesReadSummary> {
+    const signal = options?.signal;
+    assertDocsReadActive(signal);
+    let generationStart: DocsReadGeneration;
+    try {
+      generationStart = await captureDocsReadGeneration();
+      assertDocsReadActive(signal);
+    } catch (error) {
+      if (isDocsReadCancelled(error)) throw error;
+      return blockedDocsReadSummary("auth_generation_unknown");
+    }
+    const readDiagnostics: DocsReadDiagnostics = { reasons: new Set() };
+    let pages = await docsRepo.listPages({ diagnostics: readDiagnostics, signal });
+    assertDocsReadActive(signal);
+    const db = getDb();
+    let workspaceIds: string[] | null = null;
+    let actorScopeStatus: DocsPagesReadSummary["actorScopeStatus"] = "unknown";
+    let aggregateStatus: DocsPagesReadSummary["aggregateStatus"] = "success";
+    try {
+      const token = await getToken();
+      assertDocsReadActive(signal);
+      if (token) {
+        actorScopeStatus = "resolved";
+        workspaceIds = await getSavedDocsWorkspaceIds();
+        assertDocsReadActive(signal);
+      }
+    } catch (error) {
+      if (isDocsReadCancelled(error)) throw error;
+      actorScopeStatus = "error";
+      aggregateStatus = "error";
+      markDocsReadDegraded(readDiagnostics, "workspace_projection_unavailable");
+    }
+
+    let activeNodeCount: number | null = null;
+    let activeRootCount: number | null = null;
+    let localDirtyNodeCount: number | null = null;
+    let localDirtyRootCount: number | null = null;
+    try {
+      const activeRows = await db
+        .select({
+          parentId: schema.knowledgeNodes.parentId,
+          dirty: schema.knowledgeNodes.dirty,
+        })
+        .from(schema.knowledgeNodes)
+        .where(and(
+          eq(schema.knowledgeNodes.nodeType, "node"),
+          isNull(schema.knowledgeNodes.archivedAt),
+        ));
+      assertDocsReadActive(signal);
+      activeNodeCount = activeRows.length;
+      activeRootCount = activeRows.filter((row) => row.parentId == null).length;
+      const dirtyRows = activeRows.filter((row) => row.dirty === true);
+      localDirtyNodeCount = dirtyRows.length;
+      localDirtyRootCount = dirtyRows.filter((row) => row.parentId == null).length;
+    } catch (error) {
+      if (isDocsReadCancelled(error)) throw error;
+      aggregateStatus = "error";
+      markDocsReadDegraded(readDiagnostics, "diagnostic_aggregate_unavailable");
+    }
+    let outboxPendingCount: number | null = null;
+    let outboxFailedCount: number | null = null;
+    if (actorScopeStatus === "resolved") {
+      try {
+        const token = await getToken();
+        assertDocsReadActive(signal);
+        if (!token) {
+          actorScopeStatus = "unknown";
+        } else {
+          const authScope = getTokenAuthScope(token);
+          const rows = await db
+            .select({
+              authScope: schema.outbox.authScope,
+              tableName: schema.outbox.tableName,
+              retryCount: schema.outbox.retryCount,
+              blockedReason: schema.outbox.blockedReason,
+              lastError: schema.outbox.lastError,
+            })
+            .from(schema.outbox)
+            .where(and(
+              eq(schema.outbox.authScope, authScope),
+              like(schema.outbox.tableName, "knowledge_%"),
+            ));
+          assertDocsReadActive(signal);
+          const docsRows = rows.filter((row) => row.authScope === authScope);
+          const failedRows = docsRows.filter((row) =>
+            row.blockedReason != null
+            || row.retryCount >= 5
+            || (row.lastError ?? "").startsWith("conflict:"),
+          );
+          outboxFailedCount = failedRows.length;
+          outboxPendingCount = docsRows.length - failedRows.length;
+        }
+      } catch (error) {
+        if (isDocsReadCancelled(error)) throw error;
+        actorScopeStatus = "error";
+        aggregateStatus = "error";
+        markDocsReadDegraded(readDiagnostics, "actor_scope_unavailable");
+      }
+    }
+    let generationStatus: DocsReadGenerationStatus = "unknown";
+    try {
+      generationStatus = compareDocsReadGeneration(
+        generationStart,
+        await captureDocsReadGeneration(),
+      );
+      assertDocsReadActive(signal);
+    } catch (error) {
+      if (isDocsReadCancelled(error)) throw error;
+      markDocsReadDegraded(readDiagnostics, "auth_generation_unknown");
+    }
+    if (generationStatus === "degraded") {
+      markDocsReadDegraded(readDiagnostics, "auth_generation_mismatch");
+    } else if (generationStatus === "changed" || generationStatus === "unknown") {
+      markDocsReadDegraded(
+        readDiagnostics,
+        generationStatus === "changed" ? "auth_generation_mismatch" : "auth_generation_unknown",
+      );
+      // Do not hand a previous actor's array to the next actor. The SQLite
+      // cache remains intact for a later same-actor read/re-authentication.
+      pages = [];
+      activeNodeCount = null;
+      activeRootCount = null;
+      localDirtyNodeCount = null;
+      localDirtyRootCount = null;
+      workspaceIds = null;
+      outboxPendingCount = null;
+      outboxFailedCount = null;
+      actorScopeStatus = "error";
+    }
+    const readDegradedReasons = [...readDiagnostics.reasons];
+    return {
+      source: "local-cache",
+      pages,
+      visibleCount: pages.length,
+      activeNodeCount,
+      activeRootCount,
+      localDirtyNodeCount,
+      localDirtyRootCount,
+      workspaceProjectionCount: workspaceIds?.length ?? null,
+      outboxPendingCount,
+      outboxFailedCount,
+      actorScopeStatus,
+      aggregateStatus,
+      readStatus: readDegradedReasons.length || aggregateStatus === "error" || actorScopeStatus === "error"
+        ? "degraded"
+        : "success",
+      readDegradedReasons,
+      generationStatus,
+    };
+  },
+
   /** 子ノード一覧（sort_order 昇順、archived を除外）。 */
   async listChildren(parentId: string): Promise<DocsNode[]> {
     const db = getDb();
     const visibility = await getDocsNodeVisibilityCondition();
-    const rowVisibility = await getDocsVisibility(
-      "knowledge_nodes",
-      await getDocsNodeScopeKeys(parentId),
-    );
     const rows = await db
       .select()
       .from(schema.knowledgeNodes)
@@ -5463,6 +6387,14 @@ export const docsRepo = {
         ),
       )
       .orderBy(asc(schema.knowledgeNodes.sortOrder));
+    // Enter uses this read to place the next sibling. Resolve membership only
+    // for the sibling candidates, not every node in a large personal scope.
+    // The shared projection retains scope witnesses and pending-edit guards.
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes",
+      await getDocsNodeScopeKeys(parentId),
+      new Set(rows.map((row) => row.id)),
+    );
     return rows
       .filter((row) => docsRowVisible(row, rowVisibility))
       .map(toNode)
@@ -5475,10 +6407,6 @@ export const docsRepo = {
     const root = await getNodeRow(rootNodeId);
     const pageRootId = root?.rootPageId ?? root?.id ?? rootNodeId;
     const visibility = await getDocsNodeVisibilityCondition();
-    const rowVisibility = await getDocsVisibility(
-      "knowledge_nodes",
-      await getDocsNodeScopeKeys(rootNodeId, root),
-    );
     const rows = await db
       .select()
       .from(schema.knowledgeNodes)
@@ -5491,6 +6419,11 @@ export const docsRepo = {
           visibility as never,
         ),
       );
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes",
+      await getDocsNodeScopeKeys(rootNodeId, root),
+      new Set(rows.map((row) => row.id)),
+    );
     return rows
       .filter((row) => docsRowVisible(row, rowVisibility))
       .map(toNode)
@@ -5507,6 +6440,7 @@ export const docsRepo = {
     const rowVisibility = await getDocsVisibility(
       "knowledge_nodes",
       await getDocsNodeScopeKeys(id, row),
+      new Set([id]),
     );
     if (!docsRowVisible(row, rowVisibility)) return null;
     return toNode(row);
@@ -5538,7 +6472,7 @@ export const docsRepo = {
     const nodeRow = await getNodeRow(nodeId);
     if (!nodeRow) return [];
     const nodeScopeKeys = await getDocsNodeScopeKeys(nodeId, nodeRow);
-    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys);
+    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys, new Set([nodeId]));
     if (!docsRowVisible(nodeRow, nodeVisibility)) return [];
     const db = getDb();
     const visibility = await getDocsVisibility("knowledge_supertags", nodeScopeKeys);
@@ -5659,11 +6593,10 @@ export const docsRepo = {
     const nodeRow = await getNodeRow(nodeId);
     if (!nodeRow) return [];
     const nodeScopeKeys = await getDocsNodeScopeKeys(nodeId, nodeRow);
-    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys);
+    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys, new Set([nodeId]));
     if (!docsRowVisible(nodeRow, nodeVisibility)) return [];
     const db = getDb();
     const visibility = await getDocsNodeVisibilityCondition();
-    const rowVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys);
     const edgeVisibility = await getDocsVisibility("knowledge_edges", nodeScopeKeys);
     const rows = await db
       .select({
@@ -5676,6 +6609,9 @@ export const docsRepo = {
         eq(schema.knowledgeEdges.sourceNodeId, schema.knowledgeNodes.id),
       )
       .where(and(eq(schema.knowledgeEdges.targetNodeId, nodeId), visibility as never));
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes", nodeScopeKeys, new Set(rows.map((row) => row.node.id)),
+    );
     return rows
       .filter((row) =>
         docsRelationVisible(row.edgeId, edgeVisibility),
@@ -5689,11 +6625,10 @@ export const docsRepo = {
     const nodeRow = await getNodeRow(nodeId);
     if (!nodeRow) return [];
     const nodeScopeKeys = await getDocsNodeScopeKeys(nodeId, nodeRow);
-    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys);
+    const nodeVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys, new Set([nodeId]));
     if (!docsRowVisible(nodeRow, nodeVisibility)) return [];
     const db = getDb();
     const visibility = await getDocsNodeVisibilityCondition();
-    const rowVisibility = await getDocsVisibility("knowledge_nodes", nodeScopeKeys);
     const edgeVisibility = await getDocsVisibility("knowledge_edges", nodeScopeKeys);
     const rows = await db
       .select({
@@ -5706,6 +6641,9 @@ export const docsRepo = {
         eq(schema.knowledgeEdges.targetNodeId, schema.knowledgeNodes.id),
       )
       .where(and(eq(schema.knowledgeEdges.sourceNodeId, nodeId), visibility as never));
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes", nodeScopeKeys, new Set(rows.map((row) => row.node.id)),
+    );
     return rows
       .filter((row) => docsRelationVisible(row.edgeId, edgeVisibility))
       .filter((row) => docsRowVisible(row.node, rowVisibility))
@@ -5745,6 +6683,7 @@ export const docsRepo = {
 
   async createNode(input: {
     parentId?: string | null;
+    workspaceId?: string;
     projectId?: string | null;
     title: string;
     description?: string;
@@ -5754,143 +6693,252 @@ export const docsRepo = {
     bodyJson?: Record<string, unknown>;
     bodyText?: string | null;
     sourceRefs?: readonly unknown[];
-  }): Promise<DocsNode> {
-    const db = getDb();
-    const id = randomId();
-    const now = new Date().toISOString();
-    const rawTitle = input.title ?? "";
-    const title = rawTitle.trim().length === 0 ? "" : rawTitle;
-    const parentId = input.parentId ?? null;
-    const parent = parentId ? await getNodeRow(parentId) : null;
-    if (
-      parent
-      && input.projectId !== undefined
-      && (input.projectId ?? null) !== (parent.projectId ?? null)
-    ) {
-      throw new Error("親nodeと作成対象Projectが一致しません");
-    }
-    const projectId = input.projectId !== undefined
-      ? input.projectId ?? null
-      : parent?.projectId ?? null;
-    if (parentId) assertDocsWritable(parent);
-    if (parent?.archivedAt) throw new Error("アーカイブ済みnodeの下には作成できません");
-     if (parent?.systemKey?.trim() === "project_information_root" && projectId == null) {
-      throw new Error("案件情報hub直下にはProject経由でのみ作成できます");
-    }
-    const sortOrder =
-      typeof input.sortOrder === "number"
-        ? input.sortOrder
-        : await nextSortOrder(parentId);
-    // root_page_id はサーバ権威。ローカルは親から推定し、pull で正規化される。
-    let rootPageId: string | null = null;
-    if (parentId) {
-      rootPageId = parent?.rootPageId ?? parent?.id ?? null;
-    }
-    const nodeType = input.nodeType ?? "node";
-    // Empty outline rows are first-class content, but they must carry the
-    // same discriminator that the server validates.  Normalize every local
-    // ``title: ""`` create before applying it to SQLite or enqueueing it so
-    // Enter/createSibling cannot produce a legacy naked empty node.
-    const explicitBlank = nodeType === "node" && title === "";
-    const bodyJson = explicitBlank
-      ? blankParagraphBodyJson(input.bodyJson)
-      : input.bodyJson ?? null;
-    const bodyText = explicitBlank ? "" : input.bodyText ?? null;
-    const sourceRefs = sanitizeClipIngestSourceRefs(input.sourceRefs);
-    const node: DocsNode = {
-      id,
-      workspace_id: parent?.workspaceId ?? null,
-      parent_id: parentId,
-      root_page_id: rootPageId,
-      project_id: projectId,
-      source: parent?.source ?? (projectId ? "project" : "personal"),
-      access: parent?.access ?? "write",
-      read_only: parent?.readOnly ?? false,
-      system_key: null,
-      title,
-      aliases: [],
-      description: input.description ?? null,
-      body_json: bodyJson,
-      body_text: bodyText,
-      node_type: nodeType as DocsNode["node_type"],
-      is_explicit_blank: explicitBlank,
-      display_props: null,
-      query_json: null,
-      view_json: null,
-      day_date: input.dayDate ?? null,
-      sort_order: sortOrder,
-      created_by: null,
-      updated_by: null,
-      created_at: now,
-      updated_at: now,
-      archived_at: null,
-    };
-    await applyRemoteDocsNodes([node]);
-    await db
-      .update(schema.knowledgeNodes)
-      .set({ dirty: true, serverUpdatedAt: null })
-      .where(eq(schema.knowledgeNodes.id, id));
-    if (await hasToken()) {
-      await enqueueOutbox({
-        table: "knowledge_nodes",
-        action: "create",
-        entityId: id,
-        payload: {
-          id,
-          workspace_id: node.workspace_id,
-          parent_id: parentId,
-          project_id: projectId,
-          title: node.title,
-          ...(node.body_text !== null ? { body_text: node.body_text } : {}),
-          description: node.description,
-          node_type: nodeType,
-          day_date: node.day_date,
-          sort_order: sortOrder,
-          ...(node.body_json !== null ? { body_json: node.body_json } : {}),
-          ...(sourceRefs.length ? { source_refs: sourceRefs } : {}),
-        },
+  }, options?: DocsCreateOptions): Promise<DocsNode> {
+    const expected = options?.guard?.auth ?? await getTokenSnapshot();
+    if (!expected.token) throw new Error("ログインしてからDocsを作成してください");
+    const authScope = getTokenAuthScope(expected.token);
+    const result = await runForegroundSqliteWrite(async () => {
+      const current = await getTokenSnapshot();
+      if (current.token !== expected.token || current.revision !== expected.revision) {
+        throw new Error("認証が変わりました。Docsを開き直してから再度お試しください");
+      }
+      const db = getDb();
+      const id = options?.id ?? randomId();
+      const now = new Date().toISOString();
+      const rawTitle = input.title ?? "";
+      const title = rawTitle.trim().length === 0 ? "" : rawTitle;
+      const anchor = options?.afterId ? await getNodeRowAsync(options.afterId) : null;
+      if (options?.afterId && !anchor) throw new Error("基準ノードが見つかりません");
+      if (anchor) resolveDocsParentCreateScope(db, authScope, anchor);
+      if (anchor && options?.expectedParentId !== undefined && anchor.parentId !== options.expectedParentId) {
+        throw new Error("基準行の階層が変わりました。入力内容を保持しているため確認してから再試行してください");
+      }
+      if (options?.guard && anchor && (anchor.workspaceId !== options.guard.workspaceId
+        || (anchor.projectId ?? null) !== options.guard.projectId)) {
+        throw new Error("Docsの保存先が変わりました。開き直してから再度お試しください");
+      }
+      let parentId = anchor?.parentId ?? input.parentId ?? null;
+      let parent = parentId ? await getNodeRowAsync(parentId) : null;
+      if (parentId) assertDocsWritable(parent);
+      const projectId = anchor ? anchor.projectId ?? null
+        : input.projectId !== undefined ? input.projectId ?? null : parent?.projectId ?? null;
+      const scope = parent
+        ? resolveDocsParentCreateScope(db, authScope, parent)
+        : resolveDocsCreateScope(db, authScope, projectId, anchor?.workspaceId ?? input.workspaceId);
+      if (options?.guard && (scope.workspaceId !== options.guard.workspaceId
+        || projectId !== options.guard.projectId)) {
+        throw new Error("Docsの保存先が変わりました。開き直してから再度お試しください");
+      }
+      const existing = options?.id ? await getNodeRowAsync(id) : null;
+      if (existing) {
+        resolveDocsParentCreateScope(db, authScope, existing);
+        const receipt = db.select().from(schema.outbox).where(and(
+          eq(schema.outbox.authScope, authScope), eq(schema.outbox.docsScopeKey, scope.scopeKey),
+          eq(schema.outbox.tableName, "knowledge_nodes"), eq(schema.outbox.entityId, id),
+          eq(schema.outbox.action, "create"),
+        )).get();
+        if (existing.parentId !== parentId || existing.workspaceId !== scope.workspaceId
+          || (existing.projectId ?? null) !== projectId || existing.systemKey
+          || (!receipt && existing.createdBy !== authScope.slice("auth:".length))) {
+          throw new Error("作成する行の識別子が既存のDocsと一致しません");
+        }
+        // A retry after commit must retain subsequent typing and the original outbox.
+        return toNode(existing);
+      }
+      if (input.workspaceId !== undefined && input.workspaceId !== scope.workspaceId) {
+        throw new Error("親nodeと作成対象workspaceが一致しません");
+      }
+      // Project documents belong beneath their canonical information root.
+      if (!parentId && projectId) {
+        const roots = db.select().from(schema.knowledgeNodes).where(and(
+          eq(schema.knowledgeNodes.workspaceId, scope.workspaceId),
+          eq(schema.knowledgeNodes.projectId, projectId),
+          eq(schema.knowledgeNodes.systemKey, `project_information:${projectId}`),
+          isNull(schema.knowledgeNodes.archivedAt),
+        )).all();
+        if (roots.length !== 1) throw new Error("ProjectのDocs保存先を同期してから再度お試しください");
+        parent = roots[0];
+        parentId = parent.id;
+        resolveDocsParentCreateScope(db, authScope, parent);
+      }
+      if (
+        parent
+        && input.projectId !== undefined
+        && (input.projectId ?? null) !== (parent.projectId ?? null)
+      ) {
+        throw new Error("親nodeと作成対象Projectが一致しません");
+      }
+      if (parentId) assertDocsWritable(parent);
+      if (parent?.archivedAt) throw new Error("アーカイブ済みnodeの下には作成できません");
+      if (parent?.systemKey?.trim() === "project_information_root" && projectId == null) {
+        throw new Error("案件情報hub直下にはProject経由でのみ作成できます");
+      }
+      let sortOrder =
+        typeof input.sortOrder === "number"
+          ? input.sortOrder
+          : anchor ? 0 : await nextSortOrder(parentId);
+      let rebalanced: DbNode[] = [];
+      if (anchor) {
+        // All SQLite reads stay behind the writer coordinator. Read one successor,
+        // without decoding every sibling/body or enumerating the entire outbox.
+        const siblingCondition = and(
+          parentId ? eq(schema.knowledgeNodes.parentId, parentId) : isNull(schema.knowledgeNodes.parentId),
+          eq(schema.knowledgeNodes.workspaceId, scope.workspaceId),
+          projectId ? eq(schema.knowledgeNodes.projectId, projectId) : isNull(schema.knowledgeNodes.projectId),
+          isNull(schema.knowledgeNodes.archivedAt),
+          sql`(exists (select 1 from docs_scope_membership m where m.auth_scope = ${authScope}
+            and m.scope_key = ${scope.scopeKey} and m.table_name = 'knowledge_nodes'
+            and m.entity_key = ${schema.knowledgeNodes.id} and m.state in ('active', 'readonly'))
+            or (${schema.knowledgeNodes.dirty} = 1 and exists (select 1 from outbox o
+              where o.auth_scope = ${authScope} and o.docs_scope_key = ${scope.scopeKey}
+              and o.table_name = 'knowledge_nodes' and o.entity_id = ${schema.knowledgeNodes.id}
+              and o.blocked_reason is null)))`,
+        );
+        const currentOrder = anchor.sortOrder ?? 0;
+        const next = db.select({ id: schema.knowledgeNodes.id, sortOrder: schema.knowledgeNodes.sortOrder }).from(schema.knowledgeNodes)
+          .where(and(siblingCondition, sql`${schema.knowledgeNodes.id} <> ${anchor.id}`,
+            sql`${schema.knowledgeNodes.sortOrder} >= ${currentOrder}`))
+          .orderBy(asc(schema.knowledgeNodes.sortOrder)).limit(1).get();
+        sortOrder = next ? currentOrder + ((next.sortOrder ?? currentOrder) - currentOrder) / 2 : currentOrder + 1;
+        if (anchor.sortOrder == null || !Number.isFinite(sortOrder) || sortOrder <= currentOrder
+          || (next && sortOrder >= (next.sortOrder ?? currentOrder))) {
+          rebalanced = db.select().from(schema.knowledgeNodes).where(siblingCondition).all()
+            .sort((a, b) => compareDocsOutlineOrder(toNode(a), toNode(b)));
+          const index = rebalanced.findIndex((row) => row.id === anchor.id);
+          if (index < 0) throw new Error("基準ノードの権限を確認できません");
+          for (const row of rebalanced) {
+            resolveDocsParentCreateScope(db, authScope, row);
+            if (row.systemKey?.trim() === "project_information_root"
+              || (row.systemKey?.trim() ?? "").startsWith("project_information:")) {
+              throw new Error("案件情報の正本行は通常のDocs操作で再配置できません");
+            }
+          }
+          sortOrder = (index + 1) * 1024 + (index + 1 < rebalanced.length ? 512 : 1024);
+        }
+      }
+      // root_page_id はサーバ権威。ローカルは親から推定し、pull で正規化される。
+      let rootPageId: string | null = null;
+      if (parentId) {
+        rootPageId = parent?.rootPageId ?? parent?.id ?? null;
+      }
+      const nodeType = input.nodeType ?? "node";
+      // Empty outline rows are first-class content, but they must carry the
+      // same discriminator that the server validates.  Normalize every local
+      // ``title: ""`` create before applying it to SQLite or enqueueing it so
+      // Enter/createSibling cannot produce a legacy naked empty node.
+      const explicitBlank = nodeType === "node" && title === "";
+      const bodyJson = explicitBlank
+        ? blankParagraphBodyJson(input.bodyJson)
+        : input.bodyJson ?? null;
+      // `body_text` is a title-derived search mirror.  The server writer
+      // computes the same value even when an older caller omits bodyText;
+      // keep the optimistic row and its create payload convergent while
+      // preserving the explicit blank representation.
+      const bodyText = explicitBlank ? "" : title;
+      const sourceRefs = sanitizeClipIngestSourceRefs(input.sourceRefs);
+      const node: DocsNode = {
+        id,
+        workspace_id: scope.workspaceId,
+        parent_id: parentId,
+        root_page_id: rootPageId,
+        project_id: projectId,
+        source: scope.source as DocsNode["source"],
+        access: scope.access as DocsNode["access"],
+        read_only: false,
+        system_key: null,
+        title,
+        aliases: [],
+        description: input.description ?? null,
+        body_json: bodyJson,
+        body_text: bodyText,
+        node_type: nodeType as DocsNode["node_type"],
+        is_explicit_blank: explicitBlank,
+        display_props: null,
+        query_json: null,
+        view_json: null,
+        day_date: input.dayDate ?? null,
+        sort_order: sortOrder,
+        created_by: null,
+        updated_by: null,
+        created_at: now,
+        updated_at: now,
+        archived_at: null,
+      };
+      const committed = await getTokenSnapshot();
+      if (committed.token !== expected.token || committed.revision !== expected.revision) {
+        throw new Error("認証が変わりました。Docsを開き直してから再度お試しください");
+      }
+      // The node, projection and sendable operation are one atomic local write.
+      // A failed enqueue cannot leave an orphaned unsendable note.
+      db.transaction((tx) => {
+        if (anchor) resolveDocsParentCreateScope(tx, authScope, anchor);
+        if (parent) resolveDocsParentCreateScope(tx, authScope, parent);
+        else resolveDocsCreateScope(tx, authScope, projectId, scope.workspaceId);
+        for (const [index, row] of rebalanced.entries()) {
+          resolveDocsParentCreateScope(tx, authScope, row);
+          const order = (index + 1) * 1024;
+          const operations = tx.select().from(schema.outbox).where(and(
+            eq(schema.outbox.authScope, authScope), eq(schema.outbox.docsScopeKey, scope.scopeKey),
+            eq(schema.outbox.tableName, "knowledge_nodes"), eq(schema.outbox.entityId, row.id),
+          )).orderBy(asc(schema.outbox.createdAt)).all();
+          if (operations.some((op) => op.blockedReason || op.conflictPayload || op.retryCount >= 5
+            || op.action === "delete"
+            || (op.lastError ?? "").startsWith("conflict:"))) {
+            throw new Error("順序を変更する行に未解決の同期競合があります。入力内容は保持しています。");
+          }
+          const mergeable = operations[operations.length - 1];
+          tx.update(schema.knowledgeNodes).set({ sortOrder: order, updatedAt: now, dirty: true })
+            .where(eq(schema.knowledgeNodes.id, row.id)).run();
+          if (mergeable && ["create", "update"].includes(mergeable.action)) {
+            tx.update(schema.outbox).set({ payload: JSON.stringify({ ...JSON.parse(mergeable.payload), sort_order: order }) })
+              .where(eq(schema.outbox.opId, mergeable.opId)).run();
+          } else {
+            tx.insert(schema.outbox).values({
+              opId: randomId(), createdAt: Date.now(), tableName: "knowledge_nodes", action: "update",
+              entityId: row.id, authScope, docsScopeKey: scope.scopeKey,
+              payload: JSON.stringify({ sort_order: order }), baseUpdatedAt: row.serverUpdatedAt ?? null,
+              basePayload: toNode(row), retryCount: 0, lastError: null, conflictPayload: null, blockedReason: null,
+            }).run();
+          }
+        }
+        tx.insert(schema.knowledgeNodes).values({
+          ...remoteDocsNodeValues(node, now), dirty: true, serverUpdatedAt: null,
+        }).run();
+        tx.insert(schema.docsScopeMembership).values({
+          authScope, scopeKey: scope.scopeKey, scopeId: scope.workspaceId,
+          projectId, tableName: "knowledge_nodes", entityKey: id,
+          state: "active", access: scope.access, readOnly: false, updatedAt: now,
+        }).run();
+        tx.insert(schema.outbox).values({
+          opId: randomId(), createdAt: Date.now(), tableName: "knowledge_nodes",
+          action: "create", entityId: id, authScope, docsScopeKey: scope.scopeKey,
+          baseUpdatedAt: null, basePayload: null, conflictPayload: null,
+          retryCount: 0, lastError: null, blockedReason: null,
+          payload: JSON.stringify({
+            id,
+            workspace_id: node.workspace_id,
+            parent_id: parentId,
+            project_id: projectId,
+            title: node.title,
+            ...(node.body_text !== null ? { body_text: node.body_text } : {}),
+            description: node.description,
+            node_type: nodeType,
+            day_date: node.day_date,
+            sort_order: sortOrder,
+            ...(node.body_json !== null ? { body_json: node.body_json } : {}),
+            ...(sourceRefs.length ? { source_refs: sourceRefs } : {}),
+          }),
+        }).run();
       });
-    }
-    return node;
+      return node;
+    });
+    notifyMutationQueued(authScope);
+    return result;
   },
 
   /** 現在行と同じ階層の直後へノードを作成する。 */
-  async createSiblingAfter(id: string, title = ""): Promise<DocsNode> {
-    const current = await this.getNode(id);
-    if (!current) throw new Error("基準ノードが見つかりません");
-    const siblings = current.parent_id
-      ? await this.listChildren(current.parent_id)
-      : [];
-    const index = siblings.findIndex((node) => node.id === id);
-    const nextSibling = index >= 0 ? siblings[index + 1] ?? null : null;
-    let currentOrder = current.sort_order ?? Math.max(index, 0);
-    let nextOrder = nextSibling?.sort_order ?? null;
-    let sortOrder =
-      nextOrder === null
-        ? currentOrder + 1
-        : currentOrder + (nextOrder - currentOrder) / 2;
-
-    if (
-      !Number.isFinite(sortOrder) ||
-      sortOrder <= currentOrder ||
-      (nextOrder !== null && sortOrder >= nextOrder)
-    ) {
-      for (let siblingIndex = 0; siblingIndex < siblings.length; siblingIndex += 1) {
-        await this.updateNode(siblings[siblingIndex].id, {
-          sortOrder: (siblingIndex + 1) * 1024,
-        });
-      }
-      currentOrder = (Math.max(index, 0) + 1) * 1024;
-      nextOrder = index >= 0 && index + 1 < siblings.length ? currentOrder + 1024 : null;
-      sortOrder = nextOrder === null ? currentOrder + 1024 : (currentOrder + nextOrder) / 2;
-    }
-
-    return this.createNode({
-      parentId: current.parent_id,
-      projectId: current.project_id,
-      title,
-      sortOrder,
-    });
+  async createSiblingAfter(id: string, title = "", options?: Omit<DocsCreateOptions, "afterId">): Promise<DocsNode> {
+    return this.createNode({ title }, { ...options, afterId: id });
   },
 
   async updateNode(
@@ -5904,10 +6952,20 @@ export const docsRepo = {
       sortOrder?: number;
       projectId?: string | null;
     },
+    guard?: DocsMutationGuard,
   ): Promise<DocsNode> {
     const db = getDb();
-    const before = await getNodeRow(id);
+    const authAtRead = guard ? await getTokenSnapshot() : null;
+    if (guard && (authAtRead?.token !== guard.auth.token || authAtRead?.revision !== guard.auth.revision)) {
+      throw new Error("認証が変わりました。Docsを開き直してから再度お試しください");
+    }
+    const tokenAtRead = guard ? authAtRead!.token : await getToken();
+    const before = await getNodeRowAsync(id);
     assertDocsWritable(before);
+    if (guard && (before?.workspaceId !== guard.workspaceId || (before?.projectId ?? null) !== guard.projectId)) {
+      throw new Error("Docsの保存先が変わりました。開き直してから再度お試しください");
+    }
+    const expectedAuthScope = tokenAtRead ? getTokenAuthScope(tokenAtRead) : null;
     if ("projectId" in patch && (patch.projectId ?? null) !== (before?.projectId ?? null)) {
       // Project ownership is established by dedicated task/Project routes and
       // server-side ACLs.  An offline generic Docs edit must never rebind a
@@ -5958,14 +7016,20 @@ export const docsRepo = {
     if (titleProvided) {
       localSet.title = nextTitle;
       payload.title = nextTitle;
+      // Keep the local cache and the queued mutation in the same state as the
+      // canonical writer.  Previously ordinary title edits only changed
+      // `title`; `body_text` was refreshed only for blank transitions, so a
+      // synced paragraph such as Alpha -> Alpha_edited retained body_text=
+      // Alpha until a later pull.
+      const titleMirror = requestedExplicitBlank ? "" : nextTitle;
+      localSet.bodyText = titleMirror;
+      payload.body_text = titleMirror;
       if (requestedExplicitBlank) {
         const canonicalBody = blankParagraphBodyJson(
           bodyJsonProvided ? patch.bodyJson : before?.bodyJson,
         );
         localSet.bodyJson = canonicalBody;
-        localSet.bodyText = "";
         payload.body_json = canonicalBody;
-        payload.body_text = "";
       } else if (wasExplicitBlank && nextTitle !== "") {
         // Leaving a blank paragraph removes only the marker; retain any
         // unrelated body metadata and mirror the new title in body_text.
@@ -5973,9 +7037,7 @@ export const docsRepo = {
           bodyJsonProvided ? patch.bodyJson : before?.bodyJson,
         );
         localSet.bodyJson = nextBody;
-        localSet.bodyText = patch.bodyText ?? nextTitle;
         payload.body_json = nextBody;
-        payload.body_text = patch.bodyText ?? nextTitle;
       }
     }
     if ("description" in patch && patch.description !== undefined) {
@@ -5986,10 +7048,10 @@ export const docsRepo = {
       localSet.bodyJson = patch.bodyJson as unknown;
       payload.body_json = patch.bodyJson;
     }
-    if ("bodyText" in patch && patch.bodyText !== undefined) {
-      // Explicit blanks always carry an empty body_text mirror, even when a
-      // caller accidentally supplies stale/non-empty body text alongside the
-      // clear operation.
+    if ("bodyText" in patch && patch.bodyText !== undefined && !titleProvided) {
+      // Preserve the legacy bodyText-only contract.  Title edits above still
+      // force the canonical title mirror; this branch is retained for the
+      // existing body-only CAS/integrity paths that do not provide a title.
       const bodyText = requestedExplicitBlank ? "" : patch.bodyText;
       localSet.bodyText = bodyText;
       payload.body_text = bodyText;
@@ -6009,30 +7071,78 @@ export const docsRepo = {
       localSet.projectId = patch.projectId ?? null;
       payload.project_id = patch.projectId ?? null;
     }
-    const tokenAvailable = await hasToken();
+    const tokenAvailable = Boolean(tokenAtRead);
+    let queuedAuthScope: string | null = null;
     // Serialize the complete foreground Docs edit unit with conflict
     // adoption.  Without this coordinator boundary a server-adopt transaction
     // could commit between the live-row update and outbox merge, replacing the
     // newer local value in the live cache while the outbox still held it.
     await runForegroundSqliteWrite(async () => {
+      const currentAuth = guard ? await getTokenSnapshot() : null;
+      if (guard && (currentAuth?.token !== guard.auth.token || currentAuth?.revision !== guard.auth.revision)) {
+        throw new Error("認証が変わりました。Docsを開き直してから再度お試しください");
+      }
+      const currentToken = guard ? currentAuth!.token : await getToken();
+      if ((currentToken ? getTokenAuthScope(currentToken) : null) !== expectedAuthScope) {
+        throw new Error("認証が変わりました。Docsを開き直してから再度お試しください");
+      }
+      const latest = await getNodeRow(id);
+      assertDocsWritable(latest);
+      if (docsScopeKeyForRow(latest) !== docsScopeKeyForRow(before)) {
+        throw new Error("Docsの保存先が変わりました。開き直してから再度お試しください");
+      }
+      const scopeKey = docsScopeKeyForRow(latest);
+      if (expectedAuthScope && scopeKey && schema.docsScopeMembership) {
+        const membership = db.select().from(schema.docsScopeMembership).where(and(
+          eq(schema.docsScopeMembership.authScope, expectedAuthScope),
+          eq(schema.docsScopeMembership.scopeKey, scopeKey),
+          eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+          eq(schema.docsScopeMembership.entityKey, id),
+        )).get();
+        // Canonical read-through preserves dirty content, so its ACL downgrade
+        // may exist only in membership while the live row still looks writable.
+        if (membership && (membership.state !== "active" || membership.readOnly === true
+          || !["owner", "write"].includes(membership.access ?? ""))) {
+          throw new Error("読み取り専用のDocsは編集できません");
+        }
+      }
+      // An ACK may have committed while this edit waited for the writer.
+      // Adopt its version only when the editable baseline is semantically
+      // unchanged; a different remote body must still encounter CAS conflict.
+      const beforeContent = before ? toNode(before) as unknown as Record<string, unknown> : null;
+      const latestContent = latest ? toNode(latest) as unknown as Record<string, unknown> : null;
+      const sameBaseline = beforeContent && latestContent && (
+        matchesDocsStoredContent(beforeContent, latestContent)
+        || (before!.serverUpdatedAt == null && before!.createdBy == null && before!.dirty
+          && latest!.createdBy === expectedAuthScope?.slice("auth:".length)
+          && matchesDocsStoredContent({ ...beforeContent,
+            body_text: beforeContent.body_text ?? beforeContent.title,
+            body_json: beforeContent.body_json ?? {},
+          }, latestContent))
+      );
+      const baseline = sameBaseline ? latest : before;
       await db
         .update(schema.knowledgeNodes)
         .set(localSet)
         .where(eq(schema.knowledgeNodes.id, id));
       if (Object.keys(payload).length && tokenAvailable) {
-        await enqueueOutbox({
+        const opId = await enqueueOutbox({
           table: "knowledge_nodes",
           action: "update",
           entityId: id,
           payload,
-          baseUpdatedAt: before?.serverUpdatedAt ?? null,
-          basePayload: before ? toNode(before) : null,
-          docsScopeKey: docsScopeKeyForRow(before),
+          baseUpdatedAt: baseline?.serverUpdatedAt ?? null,
+          basePayload: baseline ? toNode(baseline) : null,
+          docsScopeKey: docsScopeKeyForRow(baseline),
+          authScope: expectedAuthScope,
         });
+        queuedAuthScope = await getOutboxMutationWakeScope(opId);
       }
     });
-    const after = await getNodeRow(id);
-    return after ? toNode(after) : (await this.getNode(id))!;
+    const after = await getNodeRowAsync(id);
+    const result = after ? toNode(after) : (await this.getNode(id))!;
+    if (queuedAuthScope) notifyMutationQueued(queuedAuthScope);
+    return result;
   },
 
   async moveNode(
@@ -6094,7 +7204,7 @@ export const docsRepo = {
         sort_order: nextSort,
       };
       if (leaveReference) payload.leave_reference = true;
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_nodes",
         action: "update",
         entityId: id,
@@ -6103,6 +7213,7 @@ export const docsRepo = {
         basePayload: before ? toNode(before) : null,
         docsScopeKey: docsScopeKeyForRow(before),
       });
+      await notifyQueuedDocsMutation(opId);
     }
   },
 
@@ -6159,7 +7270,7 @@ export const docsRepo = {
         .set({ parentId: null, sortOrder: nextSort, updatedAt: now, dirty: true })
         .where(eq(schema.knowledgeNodes.id, id));
       if (await hasToken()) {
-        await enqueueOutbox({
+        const opId = await enqueueOutbox({
           table: "knowledge_nodes",
           action: "update",
           entityId: id,
@@ -6168,6 +7279,7 @@ export const docsRepo = {
           basePayload: toNode(before),
           docsScopeKey: docsScopeKeyForRow(before),
         });
+        await notifyQueuedDocsMutation(opId);
       }
       return;
     }
@@ -6221,7 +7333,7 @@ export const docsRepo = {
           .filter((row) => archivedNodeIds.includes(row.id))
           .map((row) => [row.id, row.dirty === true]),
       );
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_nodes",
         action: "delete",
         entityId: id,
@@ -6239,6 +7351,7 @@ export const docsRepo = {
         basePayload: before ? toNode(before) : null,
         docsScopeKey: docsScopeKeyForRow(before),
       });
+      await notifyQueuedDocsMutation(opId);
     }
   },
 
@@ -6286,7 +7399,7 @@ export const docsRepo = {
     }
     if (await hasToken()) {
       const key = opts.supertagId ?? "new";
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_node_supertags",
         action: "create",
         entityId: `${nodeId}:${key}`,
@@ -6299,6 +7412,7 @@ export const docsRepo = {
         basePayload: before ?? null,
         docsScopeKey: docsScopeKeyForRow(node),
       });
+      await notifyQueuedDocsMutation(opId);
     }
   },
 
@@ -6326,7 +7440,7 @@ export const docsRepo = {
         ),
       );
     if (await hasToken()) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_node_supertags",
         action: "delete",
         entityId: `${nodeId}:${supertagId}`,
@@ -6335,6 +7449,7 @@ export const docsRepo = {
         basePayload: before ?? null,
         docsScopeKey: docsScopeKeyForRow(node),
       });
+      await notifyQueuedDocsMutation(opId);
     }
   },
 
@@ -6406,7 +7521,7 @@ export const docsRepo = {
         });
     }
     if (await hasToken()) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_field_values",
         action: "update",
         entityId: `${nodeId}:${fieldId}`,
@@ -6415,6 +7530,7 @@ export const docsRepo = {
         basePayload: before ?? null,
         docsScopeKey: docsScopeKeyForRow(node),
       });
+      await notifyQueuedDocsMutation(opId);
     }
   },
 
@@ -6451,7 +7567,7 @@ export const docsRepo = {
       .set({ dirty: true, serverUpdatedAt: null })
       .where(eq(schema.knowledgeSupertags.id, id));
     if (await hasToken()) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "knowledge_supertags",
         action: "create",
         entityId: id,
@@ -6463,6 +7579,7 @@ export const docsRepo = {
           icon: input.icon ?? null,
         },
       });
+      await notifyQueuedDocsMutation(opId);
     }
     return supertag;
   },

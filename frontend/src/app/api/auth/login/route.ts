@@ -16,6 +16,10 @@ import {
 } from "@/lib/server/login-log";
 import { withLoginThrottle } from "@/lib/server/login-throttle";
 import type { LoginThrottleTransaction } from "@/lib/server/login-throttle";
+import {
+  authResponse,
+  denyGatewayAuthFallback,
+} from "@/lib/server/browser-handoff";
 
 const MAX_USERNAME_LENGTH = 255;
 const MAX_PASSWORD_LENGTH = 1024;
@@ -80,34 +84,37 @@ async function recordFailedLoginAudit({
 function failureResponse(error: unknown): NextResponse {
   if (error instanceof CanonicalAuthError) {
     if (error.code === "account_disabled") {
-      return NextResponse.json({ detail: "Account is inactive" }, { status: 403 });
+      return authResponse(NextResponse.json({ detail: "Account is inactive" }, { status: 403 }));
     }
     if (
       error.code === "credential_source_required" ||
       error.code === "unsupported_credential_source"
     ) {
-      return NextResponse.json({ detail: "Invalid login input" }, { status: 400 });
+      return authResponse(NextResponse.json({ detail: "Invalid login input" }, { status: 400 }));
     }
     if (error.code === "ad_provisioning_conflict") {
-      return NextResponse.json(
+      return authResponse(NextResponse.json(
         { detail: "Authentication account provisioning conflict" },
         { status: 409 },
-      );
+      ));
     }
     if (isUnavailableAuthError(error)) {
-      return NextResponse.json(
+      return authResponse(NextResponse.json(
         { detail: "Authentication service is unavailable" },
         { status: 503 },
-      );
+      ));
     }
   }
-  return NextResponse.json({ detail: "Authentication failed" }, { status: 401 });
+  return authResponse(NextResponse.json({ detail: "Authentication failed" }, { status: 401 }));
 }
 
 export async function POST(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+
   const input = await readLoginInput(request);
   if (!input) {
-    return NextResponse.json({ detail: "Invalid login input" }, { status: 400 });
+    return authResponse(NextResponse.json({ detail: "Invalid login input" }, { status: 400 }));
   }
   const { username, password, credential_source: credentialSource } = input;
 
@@ -118,15 +125,15 @@ export async function POST(request: NextRequest) {
       failureReason: "missing_credentials",
     });
     if (auditUnavailable) {
-      return NextResponse.json(
+      return authResponse(NextResponse.json(
         { detail: "Authentication audit logging is unavailable" },
         { status: 503 },
-      );
+      ));
     }
-    return NextResponse.json(
+    return authResponse(NextResponse.json(
       { detail: "Username and password are required" },
       { status: 400 },
-    );
+    ));
   }
 
   const guarded = await withLoginThrottle(request, username, async (tx) => {
@@ -145,10 +152,10 @@ export async function POST(request: NextRequest) {
         executor: tx,
       });
       if (auditUnavailable) {
-        return NextResponse.json(
+        return authResponse(NextResponse.json(
           { detail: "Authentication audit logging is unavailable" },
           { status: 503 },
-        );
+        ));
       }
       return failureResponse(error);
     }
@@ -162,10 +169,10 @@ export async function POST(request: NextRequest) {
       executor: tx,
     });
     if (!auditRecorded && isEnterpriseProfile()) {
-      return NextResponse.json(
+      return authResponse(NextResponse.json(
         { detail: "Authentication audit logging is unavailable" },
         { status: 503 },
-      );
+      ));
     }
 
     await tx
@@ -179,7 +186,7 @@ export async function POST(request: NextRequest) {
       user.password_reset_required,
       user.session_version,
     );
-    const response = NextResponse.json({
+    const response = authResponse(NextResponse.json({
       authenticated: true,
       user: {
         id: user.id,
@@ -189,7 +196,7 @@ export async function POST(request: NextRequest) {
         password_reset_required: user.password_reset_required,
         auth_source: user.auth_source,
       },
-    });
+    }));
     attachSessionCookie(response, token, protocol === "https");
     return response;
   });
@@ -201,16 +208,24 @@ export async function POST(request: NextRequest) {
     failureReason: "rate_limited",
   });
   if (auditUnavailable) {
-    return NextResponse.json(
+    return authResponse(NextResponse.json(
       { detail: "Authentication audit logging is unavailable" },
       { status: 503 },
-    );
+    ));
   }
-  return NextResponse.json(
+  return authResponse(NextResponse.json(
     { detail: "Too many login attempts. Try again shortly." },
     {
       status: 429,
       headers: { "Retry-After": String(guarded.retryAfter) },
     },
+  ));
+}
+
+export async function GET(request: NextRequest) {
+  const gatewayDenied = denyGatewayAuthFallback(request);
+  if (gatewayDenied) return gatewayDenied;
+  return authResponse(
+    new NextResponse(null, { status: 405, headers: { allow: "POST" } }),
   );
 }

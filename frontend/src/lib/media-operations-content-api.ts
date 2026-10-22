@@ -1,3 +1,4 @@
+import type { components } from "@/lib/api-types.gen";
 import { MediaResearchApiError } from "@/lib/media-operations-research-api";
 
 /**
@@ -11,7 +12,9 @@ export type MediaContentPlatform =
   | "dlsite"
   | "patreon"
   | "youtube"
-  | "instagram";
+  | "instagram"
+  | "fanza"
+  | "tiktok";
 
 export type XContentPayload = {
   type: "x_post";
@@ -71,6 +74,9 @@ export type DlsiteContentPayload = {
   thumbnail_assets?: string[];
 };
 
+export type FanzaContentPayload = components["schemas"]["FanzaContentPayload"];
+export type TikTokContentPayload = components["schemas"]["TikTokContentPayload"];
+
 export type PatreonContentPayload = {
   type: "patreon_post";
   audience: "public" | "paid" | "tier";
@@ -115,6 +121,8 @@ export type PlatformContentPayload =
   | XThreadContentPayload
   | PixivContentPayload
   | DlsiteContentPayload
+  | FanzaContentPayload
+  | TikTokContentPayload
   | PatreonContentPayload
   | YoutubeContentPayload
   | InstagramContentPayload;

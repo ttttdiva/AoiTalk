@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("GetOrCreateDataKey", "Status")]
+    [ValidateSet("GetOrCreateDataKey", "GetExistingDataKey", "Status")]
     [string]$Action = "GetOrCreateDataKey",
     [string]$KeyPath = ""
 )
@@ -41,6 +41,25 @@ function New-RandomBytes([int]$Length) {
     return $bytes
 }
 
+function Get-ExistingDataKey([string]$Path) {
+    Add-Type -AssemblyName System.Security
+    $entropy = [System.Text.Encoding]::UTF8.GetBytes("AoiTalk.FieldCrypto.v1")
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Existing field crypto key is unavailable"
+    }
+    $protected = [Convert]::FromBase64String((Get-Content -Raw -LiteralPath $Path).Trim())
+    $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $protected,
+        $entropy,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    if ($plain.Length -ne 32) {
+        throw "Existing field crypto key is invalid"
+    }
+    [Convert]::ToBase64String($plain)
+}
+
 function Get-OrCreateDataKey([string]$Path) {
     Add-Type -AssemblyName System.Security
     $entropy = [System.Text.Encoding]::UTF8.GetBytes("AoiTalk.FieldCrypto.v1")
@@ -51,13 +70,7 @@ function Get-OrCreateDataKey([string]$Path) {
     }
 
     if (Test-Path -LiteralPath $Path) {
-        $protected = [Convert]::FromBase64String((Get-Content -Raw -LiteralPath $Path).Trim())
-        $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $protected,
-            $entropy,
-            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-        )
-        [Convert]::ToBase64String($plain)
+        Get-ExistingDataKey $Path
         return
     }
 
@@ -81,6 +94,11 @@ if ($Action -eq "Status") {
         KeyPath = $KeyPath
         Exists = (Test-Path -LiteralPath $KeyPath)
     } | ConvertTo-Json -Compress
+    exit 0
+}
+
+if ($Action -eq "GetExistingDataKey") {
+    Get-ExistingDataKey $KeyPath
     exit 0
 }
 

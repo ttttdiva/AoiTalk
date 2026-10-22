@@ -246,7 +246,9 @@ export async function lockAndAssertGenericDocsMutationAllowed(
       .from(users)
       .where(eq(users.id, actor.id))
       .limit(1)
-      .for("update");
+      // Role reads serialize ACL decisions with account changes while still
+      // allowing knowledge_revisions.created_by's FK KEY SHARE check.
+      .for("no key update");
     const [project] = await transaction
       .select({ id: projects.id, ownerId: projects.ownerId, deletedAt: projects.deletedAt })
       .from(projects)

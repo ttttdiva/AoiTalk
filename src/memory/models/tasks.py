@@ -979,7 +979,8 @@ class TimeEntry(Base):
             "ix_time_entries_active_user",
             "user_id",
             unique=True,
-            postgresql_where=text("ended_at IS NULL"),
+            postgresql_where=text("ended_at IS NULL AND deleted_at IS NULL"),
+            sqlite_where=text("ended_at IS NULL AND deleted_at IS NULL"),
         ),
     )
 

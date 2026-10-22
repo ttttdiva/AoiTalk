@@ -38,8 +38,10 @@ import type {
   Task as ApiTask,
   TaskAssignee,
   TaskAttachment,
+  Tag,
 } from "../types/api";
-import { enqueueOutbox, randomId } from "./outbox";
+import { enqueueOutbox, getOutboxMutationWakeScope, randomId } from "./outbox";
+import { notifyMutationQueued } from "../sync/task-mutation-wake";
 
 type DbTask = typeof schema.tasks.$inferSelect;
 const CACHED_TAGS_KEY = "mobile_cached_tags";
@@ -265,20 +267,36 @@ export function resetTaskFullFetchThrottle(): void {
 
 function taskMetadataWithCachedTags(
   task: Record<string, unknown>,
+  existingMetadata?: unknown,
 ): Record<string, unknown> {
-  const metadata =
+  const responseMetadata =
     task.metadata &&
     typeof task.metadata === "object" &&
     !Array.isArray(task.metadata)
       ? (task.metadata as Record<string, unknown>)
+      : null;
+  const previousMetadata =
+    existingMetadata &&
+    typeof existingMetadata === "object" &&
+    !Array.isArray(existingMetadata)
+      ? (existingMetadata as Record<string, unknown>)
       : {};
+  const metadata = responseMetadata ?? previousMetadata;
   const withAutoClose = metadataWithAutoClose(
     metadata,
     task.auto_close_on_due,
   );
+  const hasAuthoritativeTags =
+    task.tags_complete === true ||
+    (task.tags_complete === undefined &&
+      Object.prototype.hasOwnProperty.call(task, "tags") &&
+      Array.isArray(task.tags));
+  const cachedTags = hasAuthoritativeTags
+    ? task.tags
+    : cachedTaskTags(existingMetadata);
   return {
     ...withAutoClose,
-    [CACHED_TAGS_KEY]: Array.isArray(task.tags) ? task.tags : [],
+    [CACHED_TAGS_KEY]: Array.isArray(cachedTags) ? cachedTags : [],
   };
 }
 
@@ -469,7 +487,7 @@ function buildTaskCreatePayload(
   };
 }
 
-function toApiShape(
+export function toApiShape(
   row: DbTask,
   projectName?: string | null,
   projectColor?: string | null,
@@ -504,8 +522,13 @@ function toApiShape(
     deleted_at: row.deletedAt ?? null,
     metadata,
     assignees: [],
+    // SQLite task rows intentionally do not duplicate the assignee aggregate.
+    // A detail snapshot can fill it later, but an empty local array alone must
+    // never be treated as an explicit server-side clear.
+    assignees_complete: false,
     recurrence_rule: null,
     tags: cachedTaskTags(metadata),
+    tags_complete: false,
     sort_order: row.sortOrder ?? undefined,
   } as unknown as ApiTask;
 }
@@ -572,7 +595,7 @@ export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
       // the local value is already at least as fresh as this payload.
       continue;
     }
-    const taskMetadata = taskMetadataWithCachedTags(anyT);
+    const taskMetadata = taskMetadataWithCachedTags(anyT, existing?.taskMetadata);
     const insertValues: Record<string, unknown> = {
       id: t.id,
       projectId: (anyT.project_id as string) ?? "",
@@ -898,6 +921,12 @@ function buildLocalTask(
       : nextStatus === "closed"
         ? now
         : null;
+  const assigneeIds = Array.isArray(data.assignee_ids)
+    ? data.assignee_ids.filter(
+        (value): value is string =>
+          typeof value === "string" && Boolean(value.trim()),
+      )
+    : [];
   return {
     id,
     project_id: String(data.project_id ?? ""),
@@ -921,8 +950,15 @@ function buildLocalTask(
     created_at: now,
     updated_at: now,
     metadata: taskMetadata,
-    assignees: [],
+    assignees: assigneeIds.map((userId, index) => ({
+      id: `local-${id}-${userId}`,
+      task_id: id,
+      user_id: userId,
+      is_primary: index === 0,
+    })),
+    assignees_complete: Array.isArray(data.assignee_ids),
     tags: cachedTaskTags(taskMetadata),
+    tags_complete: Array.isArray(data.tag_ids),
     sort_order:
       typeof data.sort_order === "number" ? data.sort_order : undefined,
   };
@@ -1184,14 +1220,47 @@ export function mergeTaskSnapshotAggregates(
   snapshot: ApiTask | undefined,
 ): ApiTask {
   if (!snapshot) return local;
+  const localAssignees = Array.isArray(local.assignees) ? local.assignees : [];
+  const snapshotAssignees = Array.isArray(snapshot.assignees)
+    ? snapshot.assignees
+    : [];
+  const localAssigneesComplete =
+    local.assignees_complete === true ||
+    (local.assignees_complete === undefined && localAssignees.length > 0);
+  const snapshotAssigneesComplete =
+    snapshot.assignees_complete === true ||
+    (snapshot.assignees_complete === undefined && snapshotAssignees.length > 0);
+  const localTags = Array.isArray(local.tags) ? local.tags : [];
+  const snapshotTags = Array.isArray(snapshot.tags) ? snapshot.tags : [];
+  const localTagsComplete =
+    local.tags_complete === true ||
+    (local.tags_complete === undefined && localTags.length > 0);
+  const snapshotTagsComplete =
+    snapshot.tags_complete === true ||
+    (snapshot.tags_complete === undefined && snapshotTags.length > 0);
   return {
     ...local,
     comments: local.comments ?? snapshot.comments,
     subtasks: local.subtasks ?? snapshot.subtasks,
     assignees:
-      local.assignees && local.assignees.length > 0
-        ? local.assignees
-        : (snapshot.assignees ?? local.assignees),
+      localAssigneesComplete
+        ? localAssignees
+        : snapshotAssigneesComplete
+          ? snapshotAssignees
+          : localAssignees,
+    assignees_complete:
+      localAssigneesComplete || snapshotAssigneesComplete
+        ? true
+        : local.assignees_complete ?? snapshot.assignees_complete,
+    tags: localTagsComplete
+      ? localTags
+      : snapshotTagsComplete
+        ? snapshotTags
+        : localTags,
+    tags_complete:
+      localTagsComplete || snapshotTagsComplete
+        ? true
+        : local.tags_complete ?? snapshot.tags_complete,
   };
 }
 
@@ -1201,24 +1270,43 @@ export function mergeTaskUpdateAggregates(
   data: Record<string, unknown>,
 ): ApiTask {
   const merged = mergeTaskSnapshotAggregates(local, snapshot);
-  if (!Array.isArray(data.assignee_ids)) return merged;
-  const previousByUserId = new Map(
-    (snapshot?.assignees ?? []).map((assignee) => [
-      assignee.user_id,
-      assignee,
-    ]),
-  );
-  const assignees = data.assignee_ids
-    .filter((value): value is string => typeof value === "string")
-    .filter((value, index, values) => values.indexOf(value) === index)
-    .map<TaskAssignee>((userId, index) => ({
-      ...(previousByUserId.get(userId) ?? {}),
-      id: previousByUserId.get(userId)?.id ?? `local-${local.id}-${userId}`,
-      task_id: local.id,
-      user_id: userId,
-      is_primary: index === 0,
-    }));
-  return { ...merged, assignees };
+  let next = merged;
+  if (Array.isArray(data.assignee_ids)) {
+    const previousByUserId = new Map(
+      (snapshot?.assignees ?? []).map((assignee) => [
+        assignee.user_id,
+        assignee,
+      ]),
+    );
+    const assignees = data.assignee_ids
+      .filter((value): value is string => typeof value === "string")
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .map<TaskAssignee>((userId, index) => ({
+        ...(previousByUserId.get(userId) ?? {}),
+        id: previousByUserId.get(userId)?.id ?? `local-${local.id}-${userId}`,
+        task_id: local.id,
+        user_id: userId,
+        is_primary: index === 0,
+      }));
+    next = { ...next, assignees, assignees_complete: true };
+  }
+  if (Array.isArray(data.tag_ids)) {
+    const previousById = new Map(
+      (snapshot?.tags ?? []).map((tag) => [tag.id, tag]),
+    );
+    const tags = data.tag_ids
+      .filter((value): value is string => typeof value === "string")
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .map<Tag>((tagId) =>
+        previousById.get(tagId) ?? {
+          id: tagId,
+          project_id: local.project_id,
+          name: tagId,
+        },
+      );
+    next = { ...next, tags, tags_complete: true };
+  }
+  return next;
 }
 
 export const tasksRepo = {
@@ -1501,18 +1589,21 @@ export const tasksRepo = {
       metadata: localMetadata,
       task_metadata: localMetadata,
     });
+    let wakeScope: string | null = null;
     await runForegroundSqliteWrite(async () => {
       await applyRemoteTasks([local]);
       if (hasToken) {
-        await enqueueOutbox({
+        const opId = await enqueueOutbox({
           table: "tasks",
           action: "create",
           entityId: local.id,
           ...authScopeOption(authScope),
           payload: buildTaskCreatePayload(createData),
         });
+        wakeScope = await getOutboxMutationWakeScope(opId);
       }
     });
+    notifyMutationQueued(wakeScope);
     return local;
   },
 
@@ -1530,11 +1621,22 @@ export const tasksRepo = {
           taskId,
           canonicalTaskMutationPayload(data),
         );
-        await runForegroundSqliteWrite(async () => {
-          await applyRemoteTasks([updated]);
-          writeTaskSnapshot(updated);
+        const updatedWithAggregates = await runForegroundSqliteWrite(async () => {
+          const previousSnapshot = readTaskSnapshot(taskId)?.task;
+          const mergedUpdated = mergeTaskUpdateAggregates(
+            updated,
+            previousSnapshot,
+            data,
+          );
+          // PATCH responses are compact on older API versions and may omit
+          // comments/subtasks or the assignee aggregate.  Keep those detail
+          // fields from the last full GET while honoring an explicit [] from
+          // a current response as an authoritative clear.
+          await applyRemoteTasks([mergedUpdated]);
+          writeTaskSnapshot(mergedUpdated);
+          return mergedUpdated;
         });
-        return updated;
+        return updatedWithAggregates;
       } catch (error) {
         if (
           error instanceof TaskCompletionCancelledError ||
@@ -1549,6 +1651,7 @@ export const tasksRepo = {
       shouldQueue = hasToken;
     }
 
+    let wakeScope: string | null = null;
     const merged = await runForegroundSqliteWrite(async () => {
       const db = getDb();
       const before = (
@@ -1591,7 +1694,7 @@ export const tasksRepo = {
         .set(localPatch)
         .where(eq(schema.tasks.id, taskId));
       if (shouldQueue) {
-        await enqueueOutbox({
+        const opId = await enqueueOutbox({
           table: "tasks",
           action: "update",
           entityId: taskId,
@@ -1599,6 +1702,7 @@ export const tasksRepo = {
           payload: canonicalTaskMutationPayload(data),
           baseUpdatedAt: before?.updatedAt ?? null,
         });
+        wakeScope = await getOutboxMutationWakeScope(opId);
       }
       const after = (
         await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
@@ -1615,6 +1719,7 @@ export const tasksRepo = {
       writeTaskSnapshot(mergedLocal);
       return mergedLocal;
     });
+    notifyMutationQueued(wakeScope);
     void rescheduleLocalTaskNotificationsFromCache();
     return merged;
   },
@@ -1659,7 +1764,7 @@ export const tasksRepo = {
     if (!before) {
       throw new Error("復元対象のローカルタスクが見つかりません");
     }
-    await enqueueOutbox({
+    const opId = await enqueueOutbox({
       table: "tasks",
       action: "restore",
       entityId: taskId,
@@ -1669,12 +1774,16 @@ export const tasksRepo = {
         : {},
       baseUpdatedAt: before.updatedAt ?? null,
     });
+    const wakeScope = await runForegroundSqliteWrite(() =>
+      getOutboxMutationWakeScope(opId),
+    );
     const rows = await db
       .select()
       .from(schema.tasks)
       .where(eq(schema.tasks.id, taskId));
     const local = rows[0] ? toApiShape(rows[0] as DbTask) : null;
     if (!local) throw new Error("復元されたタスクを取得できませんでした");
+    notifyMutationQueued(wakeScope);
     // Keep the local tombstone until the explicit restore is acknowledged by
     // the server; a rejected/expired outbox operation must not look live.
     return local;
@@ -1725,7 +1834,7 @@ export const tasksRepo = {
         .where(and(eq(schema.tasks.id, taskId), isNull(schema.tasks.deletedAt)));
     }
     if (shouldQueue) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "tasks",
         action: "reorder",
         entityId: `reorder:${projectId ?? "all"}`,
@@ -1735,6 +1844,10 @@ export const tasksRepo = {
           task_ids: uniqueTaskIds,
         },
       });
+      const wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      notifyMutationQueued(wakeScope);
     }
   },
 
@@ -1763,7 +1876,7 @@ export const tasksRepo = {
     const now = nowServerNaiveIso();
     await applyTaskTombstones([{ id: taskId, deleted_at: now }]);
     if (shouldQueue) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "tasks",
         action: "delete",
         entityId: taskId,
@@ -1771,6 +1884,10 @@ export const tasksRepo = {
         payload: {},
         baseUpdatedAt: before?.updatedAt ?? null,
       });
+      const wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      notifyMutationQueued(wakeScope);
     }
     void rescheduleLocalTaskNotificationsFromCache();
   },

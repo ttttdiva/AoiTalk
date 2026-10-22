@@ -15,6 +15,7 @@ from ...tts.manager import TTSManager
 from .audio_transport import VoiceAudioTransportManager
 from .generation import GenerationPhase, VoiceGenerationState
 from .models import VoiceSessionPolicy
+from ...aoirig.visemes import TimedSpeech, validate_visemes
 
 logger = logging.getLogger(__name__)
 
@@ -415,13 +416,19 @@ class CharacterTTSOutput:
             token = self._interrupt_token
             try:
                 await self._ensure_tts_ready()
+                timed = getattr(type(self._tts), "synthesize_with_timing", None)
+                synthesize = self._tts.synthesize_with_timing if callable(timed) else self._tts.synthesize
                 self._active_synthesis = asyncio.create_task(
-                    self._tts.synthesize(
+                    synthesize(
                         utterance.text,
                         character_name=self.character_name,
                     )
                 )
                 audio = await self._active_synthesis
+                visemes = []
+                if isinstance(audio, TimedSpeech):
+                    visemes = validate_visemes(audio.visemes)
+                    audio = audio.audio
             except asyncio.CancelledError:
                 continue
             except Exception:
@@ -453,6 +460,7 @@ class CharacterTTSOutput:
                     segment_id=utterance.id,
                     mime_type="audio/wav",
                     audio=audio,
+                    **({"visemes": visemes} if visemes else {}),
                 )
             except Exception:
                 logger.exception("Character TTS audio transport enqueue failed")

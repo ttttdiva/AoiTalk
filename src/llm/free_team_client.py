@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+from contextlib import nullcontext
 import inspect
 import json
 import time
@@ -17,6 +18,7 @@ from ..services.free_team_service import (
     finalize_route_lease,
     free_team_profile,
     main_route_intent,
+    CLI_PROVIDERS,
 )
 from ..services.turn_context import (
     AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
@@ -24,6 +26,7 @@ from ..services.turn_context import (
 )
 from .context_snapshot import validate_context_manifest_metadata
 from .provider_capabilities import ProviderCapabilities
+from .generation_cancellation import cli_lease_termination_scope
 
 
 StreamCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
@@ -135,6 +138,21 @@ def _target_generation_metadata(target: Any) -> dict[str, Any]:
     return metadata
 
 
+def _resolve_target_method(target: Any, method_name: str) -> Callable[..., Any]:
+    """履歴非保存APIの未対応を、provider実行前に判定する。"""
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        if method_name in {
+            "generate_plain_text_async",
+            "generate_memory_extraction_async",
+        }:
+            raise AttributeError(
+                f"無料Team候補が履歴非保存APIに対応していません: {method_name}"
+            )
+        method = getattr(target, "generate_response_async")
+    return method
+
+
 async def _call_target_method(
     target: Any,
     method_name: str,
@@ -147,16 +165,7 @@ async def _call_target_method(
     TypeErrorを避け、tool副作用を観測できるかも同時に返す。
     """
 
-    method = getattr(target, method_name, None)
-    if not callable(method):
-        if method_name in {
-            "generate_plain_text_async",
-            "generate_memory_extraction_async",
-        }:
-            raise AttributeError(
-                f"無料Team候補が履歴非保存APIに対応していません: {method_name}"
-            )
-        method = getattr(target, "generate_response_async")
+    method = _resolve_target_method(target, method_name)
     parameters = inspect.signature(method).parameters
     accepts_kwargs = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -487,7 +496,7 @@ class FreeTeamRoutingClient:
         steering_callback: Optional[SteeringCallback] = None,
         system_prompt: str | None = None,
     ) -> str:
-        from .manager import create_llm_client_for_target
+        from .manager import TargetConfig, create_llm_client_for_target
 
         isolated_controller_turn = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
@@ -596,12 +605,15 @@ class FreeTeamRoutingClient:
                 required_capabilities=required,
                 excluded_candidate_ids=excluded,
                 fallback_count=fallback_count,
+                config=self.config,
+                meter_per_request=True,
             )
             excluded.add(lease.candidate_id)
             target: Any = None
             side_effect_started = False
             side_effect_observable = False
             provider_request_started = False
+            termination_receipt = None
 
             async def monitored_callback(event_type: str, data: Dict[str, Any]) -> None:
                 nonlocal side_effect_started
@@ -630,6 +642,11 @@ class FreeTeamRoutingClient:
                     **lease.provider_options,
                     "max_output_tokens": lease.max_output_tokens,
                 }
+                if str(lease.provider or "").strip().lower() == "openrouter":
+                    # OpenRouter Free Team leases must retain the complimentary
+                    # provider guard. Ordinary OpenRouter target clients do not
+                    # receive this marker or its zero-price request policy.
+                    target_provider_options["_free_team_openrouter_request"] = True
                 if isolated_controller_turn:
                     # Help is a server-grounded, tool-free controller turn.
                     # Disable tools before constructing the routed target so
@@ -655,8 +672,23 @@ class FreeTeamRoutingClient:
                 if self._lightweight_ephemeral_client:
                     target_provider_options["lightweight_client"] = True
 
+                target_config = self.config
+                # ``create_llm_client_for_target`` projects the selected
+                # candidate onto an ordinary provider config. Preserve the
+                # credential's complimentary contract across that projection
+                # so the OpenAI egress guard cannot mistake a Free Team lease
+                # for an ordinary paid request.
+                if (
+                    str(getattr(lease, "billing_mode", "paid") or "paid").strip().lower()
+                    == "complimentary"
+                    and str(lease.provider or "").strip().lower() == "openai"
+                ):
+                    target_config = TargetConfig(
+                        self.config,
+                        {"openai.billing_mode": "complimentary"},
+                    )
                 target = create_llm_client_for_target(
-                    self.config,
+                    target_config,
                     provider=lease.provider,
                     model=lease.model,
                     effort=lease.effort,
@@ -664,6 +696,10 @@ class FreeTeamRoutingClient:
                     api_key=lease.api_key,
                     provider_options=target_provider_options,
                 )
+                # Missing history-free APIs prove this request was never
+                # sent. Detect them before marking the provider as started;
+                # exceptions inside an available method still retain holds.
+                _resolve_target_method(target, method_name)
                 self._sync_to_target(target)
                 if not tools_required:
                     disable_target_tools(target)
@@ -685,10 +721,11 @@ class FreeTeamRoutingClient:
                         "max_tokens": lease.max_output_tokens,
                     }
                 provider_request_started = True
-                response = await asyncio.wait_for(
-                    _call_target_method(target, method_name, prompt, **kwargs),
-                    timeout=max(1, lease.timeout_seconds),
-                )
+                with (cli_lease_termination_scope(lease) if lease.provider in CLI_PROVIDERS else nullcontext(None)) as termination_receipt:
+                    response = await asyncio.wait_for(
+                        _call_target_method(target, method_name, prompt, **kwargs),
+                        timeout=max(1, lease.timeout_seconds),
+                    )
                 latency_ms = (time.perf_counter() - started) * 1000
                 usage = _usage_from_client(target)
                 await finalize_route_lease(
@@ -696,6 +733,7 @@ class FreeTeamRoutingClient:
                     actual_usage=usage,
                     success=True,
                     latency_ms=latency_ms,
+                    termination_receipt=termination_receipt,
                 )
                 if not isolated_controller_turn:
                     self._sync_from_target(target)
@@ -731,6 +769,7 @@ class FreeTeamRoutingClient:
                         success=False,
                         consume_reserved_on_failure=provider_request_started,
                         error_class="cancelled",
+                        termination_receipt=termination_receipt,
                         latency_ms=(time.perf_counter() - started) * 1000,
                     )
                 )
@@ -747,8 +786,9 @@ class FreeTeamRoutingClient:
                 await finalize_route_lease(
                     lease,
                     success=False,
-                    consume_reserved_on_failure=error_class == "timeout",
+                    consume_reserved_on_failure=provider_request_started,
                     error_class=error_class,
+                    termination_receipt=termination_receipt,
                     latency_ms=(time.perf_counter() - started) * 1000,
                 )
                 retryable = error_class in {"429", "402", "5xx", "timeout", "connection"}

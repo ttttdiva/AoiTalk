@@ -72,6 +72,7 @@ from ..memory.models.apps import (
     AppTarget,
     TaskAppLink,
 )
+from .app_action_contract import validate_action_contract
 from .app_storage import (
     AppStorageError,
     normalize_app_relative_path,
@@ -96,6 +97,8 @@ MANIFEST_TOP_LEVEL_KEYS = {
     "description",
     "overview",
     "targets",
+    "ui",
+    "actions",
 }
 
 #: 既知の target キー。``input_label`` 系は import / 業務分析サービスが書く。
@@ -769,6 +772,18 @@ def validate_manifest(
     normalized["name"] = str(name).strip() if isinstance(name, str) else ""
     normalized["description"] = str(description or "")
     normalized["targets"] = normalized_targets
+    action_contract = validate_action_contract(
+        normalized,
+        workspace=workspace,
+        strict=mode is ValidationMode.STRICT,
+    )
+    errors.extend(action_contract.errors)
+    warnings.extend(action_contract.warnings)
+    if action_contract.ui is not None:
+        normalized["ui"] = action_contract.ui
+    elif "ui" in normalized:
+        normalized.pop("ui", None)
+    normalized["actions"] = action_contract.actions
     return ManifestValidationResult(
         manifest=normalized,
         errors=tuple(errors),

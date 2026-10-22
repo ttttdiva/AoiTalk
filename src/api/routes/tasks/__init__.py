@@ -10,6 +10,7 @@ from .notifications_routes import register_notification_routes
 from .occurrences_time_routes import register_occurrence_time_routes
 from .spaces_routes import register_space_routes
 from .tags_reorder_routes import register_tag_reorder_routes
+from .task_proposal_routes import register_task_proposal_routes
 from .tasks_routes import register_task_routes
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "register_occurrence_time_routes",
     "register_space_routes",
     "register_tag_reorder_routes",
+    "register_task_proposal_routes",
     "register_task_routes",
 ]

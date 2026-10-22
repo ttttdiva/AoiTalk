@@ -27,6 +27,9 @@ import type {
 import { resolveMainContextSnapshot } from "@/lib/chat-api";
 import { normalizeVoiceRms } from "@/lib/voice-level";
 import { useContextRailVoice } from "@/hooks/use-context-rail-voice";
+import { CharacterAnimation } from "@/components/aoirig/character-animation";
+import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
+import { useChatReaction } from '@/components/aoirig/use-chat-reaction';
 
 type RailTab = "context" | "execution";
 
@@ -198,6 +201,10 @@ export function ChatContextRail({
   contextBinding?: ContextSnapshotBinding | null;
   persistent?: boolean;
 }) {
+  const runtime = useOptionalRuntimeContext();
+  const character = runtime ? runtime.currentCharacter : currentSession?.character_name;
+  const lastTurn = messages?.filter(message=>message.role==='user'||message.role==='assistant').at(-1);
+  useChatReaction({session:sessionId??'new-chat',generation:generationKey,live:Boolean(generationLive),last:lastTurn},character);
   const [activeTab, setActiveTab] = useState<RailTab>(generationLive ? "execution" : "context");
   // A persisted run id is useful history, but does not mean work is active.
   // Keep the badge tied to the page-owned generation state.
@@ -268,6 +275,7 @@ export function ChatContextRail({
       </div>
 
       <VoiceStatus enabled />
+      <CharacterAnimation character={character} state={generationLive ? "thinking" : lastTurn?.role==='user' ? 'listening' : "idle"} />
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="flex shrink-0 border-b border-border-subtle px-2" role="tablist" aria-label="Context Rail表示切替">

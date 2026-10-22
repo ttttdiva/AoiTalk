@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
-from .embedding import BgeM3Embedding
+from .embedding import EmbeddingGemma2Embedding
 from .qdrant_client import QdrantManager, SearchResult
 from .reranker import BgeReranker, RerankResult
 from .config import SearchConfig
@@ -29,7 +29,7 @@ class Retriever:
     def __init__(
         self,
         qdrant: QdrantManager,
-        embedding: BgeM3Embedding,
+        embedding: EmbeddingGemma2Embedding,
         reranker: BgeReranker,
         search_config: SearchConfig
     ):

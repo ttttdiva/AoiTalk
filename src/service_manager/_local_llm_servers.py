@@ -45,6 +45,7 @@ from src.llm.openai_compatible_local_profiles import (
     llama_cpp_mtp_metadata,
     llama_cpp_mmproj_metadata,
     llama_cpp_reasoning_effort_metadata,
+    llama_cpp_thinking_mode,
     llama_cpp_profile_legacy_kind,
     MLX_LM_BASE_URL,
     managed_local_runtime_for_model,
@@ -54,10 +55,15 @@ from src.llm.openai_compatible_local_profiles import (
     openai_compatible_local_base_url,
 )
 from src.llm.deployment_resolver import resolve_llm_deployment
-from src.services.local_llm_runtime_manager import ManagedLocalRuntimeManager
+from src.services.local_llm_runtime_manager import (
+    ManagedLocalRuntimeManager,
+    llama_cpp_required_commit,
+    recover_llama_cpp_profile_executable,
+)
 from src.services.local_llm_paths import (
     canonicalize_llama_cpp_model_root_override,
     default_llama_cpp_model_root,
+    llama_cpp_executable_setting,
     llama_cpp_model_discovery_roots,
     local_llm_storage_root,
     repository_root,
@@ -297,6 +303,7 @@ _PROFILE_RUNTIME_SETTING_KEYS = (
     "reasoning_effort",
     "mtp_enabled",
     "auto_start",
+    "readiness_timeout",
 )
 
 
@@ -553,6 +560,11 @@ def _restore_llama_cpp_profile_runtime(
     for field in _PROFILE_RUNTIME_SETTING_KEYS:
         if field in override_keys:
             continue
+        if field == "readiness_timeout" and (
+            "readiness_timeout_seconds" in override_keys
+            or raw.get("readiness_timeout_seconds") not in (None, "")
+        ):
+            continue
         if raw.get(field) not in (None, ""):
             continue
         value = saved.get(field)
@@ -669,6 +681,8 @@ def _llama_cpp_settings(
             "reasoning_effort",
             "mtp_enabled",
             "auto_start",
+            "readiness_timeout",
+            "readiness_timeout_seconds",
         ):
             if key not in override_keys:
                 raw.pop(key, None)
@@ -768,12 +782,7 @@ def _llama_cpp_settings(
             return False
         return default
 
-    executable = _text(
-        "executable",
-        "LLAMA_CPP_EXECUTABLE",
-        "LLAMA_SERVER_EXE",
-        default="",
-    )
+    executable, _executable_source = llama_cpp_executable_setting(raw.get("executable"))
     if (
         not executable
         and model_profile
@@ -788,6 +797,9 @@ def _llama_cpp_settings(
     model_path_env_names = ["LLAMA_CPP_MODEL_PATH"]
     if llama_cpp_profile_legacy_kind(model_profile) == "muse":
         model_path_env_names.append("MUSE_GLIMMER_MODEL_PATH")
+    model_path_from_environment = any(
+        str(os.getenv(name) or "").strip() for name in model_path_env_names
+    )
     model_path = _text(
         "model_path",
         *model_path_env_names,
@@ -833,6 +845,48 @@ def _llama_cpp_settings(
         )
     except ValueError:
         persisted_model_root = None
+
+    # Registered-profile paths written under the repository-local managed
+    # root are legacy managed state, not a durable operator override.  When an
+    # external canonical root is configured, do not let that stale absolute
+    # path silently keep loading weights from the checkout drive.  Arbitrary
+    # external configured paths and explicit request/environment paths remain
+    # authoritative.
+    explicit_model_path = bool(
+        model_path_from_environment
+        or (overrides is not None and "model_path" in overrides)
+    )
+    if (
+        model_profile
+        and str(model_path or "").strip()
+        and not explicit_model_path
+        and model_root_resolution.source in {
+            "environment",
+            "persisted",
+            "legacy_config",
+        }
+    ):
+        configured_path_profile = llama_cpp_model_profile(model_path=model_path)
+        configured_profile_id = str(
+            configured_path_profile.get("id") if configured_path_profile else ""
+        ).strip().casefold()
+        selected_profile_id = str(model_profile.get("id") or "").strip().casefold()
+        try:
+            configured_path = Path(str(model_path)).expanduser().resolve(strict=False)
+            repository_managed_root = default_llama_cpp_model_root().resolve(strict=False)
+            path_is_repository_managed = (
+                configured_path == repository_managed_root
+                or repository_managed_root in configured_path.parents
+            )
+        except (OSError, RuntimeError, ValueError):
+            path_is_repository_managed = False
+        if (
+            configured_profile_id
+            and configured_profile_id == selected_profile_id
+            and path_is_repository_managed
+        ):
+            model_path = ""
+
     if not str(model_path or "").strip() and model_profile:
         try:
             discovered = _discover_llama_cpp_model_path(
@@ -902,7 +956,10 @@ def _llama_cpp_settings(
         "readiness_timeout",
         "readiness_timeout_seconds",
         "LLAMA_CPP_READINESS_TIMEOUT",
-        default=LLAMA_CPP_DEFAULT_READINESS_TIMEOUT,
+        default=float(
+            model_profile.get("default_readiness_timeout", LLAMA_CPP_DEFAULT_READINESS_TIMEOUT)
+            if model_profile else LLAMA_CPP_DEFAULT_READINESS_TIMEOUT
+        ),
     )
     env_extra_args = os.getenv("LLAMA_CPP_EXTRA_ARGS")
     extra_args: object = (
@@ -910,12 +967,25 @@ def _llama_cpp_settings(
         if env_extra_args is not None and env_extra_args.strip()
         else raw.get("extra_args")
     )
-    if extra_args is None or extra_args == "":
-        extra_args = (
-            list(model_profile.get("default_args") or [])
-            if model_profile
-            else ""
+    profile_default_args = (
+        list(model_profile.get("default_args") or [])
+        if model_profile
+        else []
+    )
+    if (
+        extra_args is None
+        or extra_args == ""
+        or (
+            isinstance(extra_args, (list, tuple))
+            and not extra_args
+            and profile_default_args
         )
+    ):
+        # An empty list is how the settings UI serializes an unset extra-args
+        # field.  Preserve trusted profile defaults (for example LFM2.5's
+        # ``--parallel 1``) instead of treating that serialization as an
+        # explicit request to remove them.
+        extra_args = profile_default_args if profile_default_args else ""
     if isinstance(extra_args, str):
         try:
             extra_args = shlex.split(
@@ -927,6 +997,20 @@ def _llama_cpp_settings(
     if not isinstance(extra_args, (list, tuple)):
         raise RuntimeError("llama.cpp extra_args は配列または文字列で指定してください")
     normalized_extra_args = [str(item) for item in extra_args if str(item).strip()]
+    default_parallel = None
+    if model_profile and model_profile.get("default_parallel") not in (None, ""):
+        raw_parallel = model_profile.get("default_parallel")
+        if isinstance(raw_parallel, bool):
+            raise RuntimeError("trusted llama.cpp profile has invalid default_parallel")
+        try:
+            parsed_parallel = int(raw_parallel)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "trusted llama.cpp profile has invalid default_parallel"
+            ) from exc
+        if parsed_parallel <= 0:
+            raise RuntimeError("trusted llama.cpp profile has invalid default_parallel")
+        default_parallel = parsed_parallel
     effort_metadata = llama_cpp_reasoning_effort_metadata(profile=model_profile)
     configured_effort = str(raw.get("reasoning_effort") or "").strip().lower()
     reasoning_effort = (
@@ -977,6 +1061,7 @@ def _llama_cpp_settings(
         "context_size": context_size,
         "gpu_layers": gpu_layers,
         "extra_args": normalized_extra_args,
+        "default_parallel": default_parallel,
         "auto_start": _bool("auto_start", "LLAMA_CPP_AUTO_START", default=True),
         "readiness_timeout": timeout,
         "reasoning_effort": reasoning_effort,
@@ -2409,6 +2494,33 @@ def _resolve_llama_cpp_mtp(
                 "variant_model_path": "",
                 "mode": mode,
             }
+        if bool(metadata.get("embedded_in_primary")):
+            primary_path = Path(str(base_model_path or "")).expanduser()
+            if not _llama_cpp_regular_non_symlink_file(primary_path):
+                return {
+                    "supported": True,
+                    "available": False,
+                    "status": "unavailable",
+                    "reason": (
+                        base_reason
+                        or "MTP layersを内蔵したprimary GGUFを解決できません。"
+                    ),
+                    "artifact_path": "",
+                    "variant_model_path": "",
+                    "mode": mode,
+                }
+            return {
+                "supported": True,
+                "available": True,
+                "status": "ready",
+                "reason": (
+                    base_reason
+                    or "primary GGUFに内蔵されたMTP/NextNを利用できます。"
+                ),
+                "artifact_path": "",
+                "variant_model_path": "",
+                "mode": mode,
+            }
         variant_path, missing = _resolve_llama_cpp_mtp_embedded_variant(
             model_profile,
             base_model_path=base_model_path,
@@ -3667,13 +3779,7 @@ def _validate_llama_cpp_version(
     model_label: str = "llama.cpp",
     required_commit: str | None = None,
 ) -> str | None:
-    """Reject a profile's known-old llama.cpp build while remaining portable.
-
-    Release binaries do not all expose a uniform version string.  We parse
-    build IDs when present and only warn when an installation cannot report a
-    build; an explicitly old ``bNNNNN`` is always rejected with an actionable
-    message.
-    """
+    """Reject failed version probes and unverified profile build/commit requirements."""
 
     if minimum_build is None and muse:
         minimum_build = _LLAMA_CPP_MIN_MUSE_BUILD
@@ -3707,6 +3813,13 @@ def _validate_llama_cpp_version(
             f"{model_label}向けllama.cppのバージョンを確認できませんでした。"
             f"{requirement}のllama-serverを用意してください。"
         ) from exc
+
+    if getattr(result, "returncode", 0) != 0:
+        raise RuntimeError(
+            f"{model_label}向けllama-server --versionが失敗しました"
+            f"（exit={result.returncode}、executable={executable}）。"
+            "出力にbuild番号があっても起動を拒否します。"
+        )
 
     if required_commit_text:
         commit_match = re.search(
@@ -3781,15 +3894,17 @@ def _resolve_llama_cpp_profile_launch_executable(
     remain fail-closed so operators do not silently switch binaries.
     """
 
-    configured = str(settings.get("executable") or "").strip()
+    configured, executable_source = llama_cpp_executable_setting(settings.get("executable"))
     minimum_build = _llama_cpp_effective_minimum_build(model_profile)
     managed_runtime_manager = None
-    if model_profile and not (
-        os.getenv("LLAMA_CPP_EXECUTABLE") or os.getenv("LLAMA_SERVER_EXE")
-    ):
+    if model_profile and executable_source != "environment":
         managed_runtime_manager = ManagedLocalRuntimeManager(config)
     required_commit = ""
     if model_profile:
+        if managed_runtime_manager is None:
+            # An explicit executable still has to satisfy the selected
+            # distribution (e.g. PrismML PQ2_0), not merely its build floor.
+            required_commit = str(llama_cpp_required_commit(dict(model_profile)) or "")
         if managed_runtime_manager is not None:
             required_commit_resolver = getattr(
                 managed_runtime_manager,
@@ -3812,15 +3927,18 @@ def _resolve_llama_cpp_profile_launch_executable(
     )
 
     def validate(executable: str) -> None:
-        _validate_llama_cpp_version(
-            executable,
-            muse=False,
-            minimum_build=(
-                int(minimum_build) if minimum_build is not None else None
-            ),
-            model_label=model_label,
-            required_commit=required_commit or None,
-        )
+        try:
+            _validate_llama_cpp_version(
+                executable,
+                muse=False,
+                minimum_build=(
+                    int(minimum_build) if minimum_build is not None else None
+                ),
+                model_label=model_label,
+                required_commit=required_commit or None,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} executable={executable}") from exc
 
     executable = ""
     try:
@@ -3834,8 +3952,7 @@ def _resolve_llama_cpp_profile_launch_executable(
         # Environment variables are explicit operator choices and must never
         # be shadowed by an automatically selected managed binary.
         if (
-            os.getenv("LLAMA_CPP_EXECUTABLE")
-            or os.getenv("LLAMA_SERVER_EXE")
+            executable_source == "environment"
             or not configured
             or model_profile is None
         ):
@@ -3843,44 +3960,14 @@ def _resolve_llama_cpp_profile_launch_executable(
 
         if managed_runtime_manager is None:
             managed_runtime_manager = ManagedLocalRuntimeManager(config)
-        managed = managed_runtime_manager
-        legacy_resolver = None
-        used_marker_backed_fallback = False
-        fallback = str(
-            managed.compatible_managed_llama_cpp_executable(model_profile)
-            or ""
-        ).strip()
-        if not fallback:
-            # A pre-existing Windows install may live under an older
-            # ``<drive>:/AI/runtimes/aoitalk-managed-*`` root rather than this
-            # process's configured runtime root.  Recover it only through the
-            # marker-backed, exact-profile helper; the persisted executable
-            # setting itself is intentionally left unchanged.
-            legacy_resolver = getattr(
-                managed,
-                "compatible_marker_backed_legacy_llama_cpp_executable",
-                None,
-            )
-            if callable(legacy_resolver):
-                fallback = str(
-                    legacy_resolver(configured, model_profile) or ""
-                ).strip()
-                used_marker_backed_fallback = bool(fallback)
+        recovered = recover_llama_cpp_profile_executable(
+            managed_runtime_manager, configured, model_profile,
+            source=executable_source, executable=executable,
+        )
+        fallback = recovered["executable"]
         if not fallback:
             raise
-        same_path = False
-        if executable:
-            try:
-                same_path = Path(fallback).expanduser().resolve(strict=False) == Path(
-                    executable
-                ).expanduser().resolve(strict=False)
-            except (OSError, RuntimeError, ValueError):
-                same_path = os.path.normcase(os.path.normpath(fallback)) == os.path.normcase(
-                    os.path.normpath(executable)
-                )
-        if same_path:
-            raise
-        if used_marker_backed_fallback:
+        if recovered["recovery"] == "legacy":
             logger.warning(
                 "Persisted llama.cpp executable is incompatible with profile %s; "
                 "using marker-backed legacy managed runtime %s; "
@@ -3999,7 +4086,33 @@ def _llama_cpp_launch_plan(
     ]
     if mmproj_path:
         args.extend(["--mmproj", mmproj_path])
-    args.extend(str(item) for item in settings["extra_args"])
+    extra_args = [str(item) for item in settings["extra_args"]]
+    default_parallel = settings.get("default_parallel")
+    if default_parallel not in (None, ""):
+        has_parallel_arg = any(
+            token.split("=", 1)[0].casefold() in {"--parallel", "-np"}
+            for token in extra_args
+        )
+        if not has_parallel_arg:
+            extra_args.extend(["--parallel", str(default_parallel)])
+    if llama_cpp_thinking_mode(profile=model_profile) == "always":
+        # LFM2.5's official template always emits a thinking section.  A
+        # stale operator extra such as ``--reasoning off`` must not silently
+        # change the parser contract; discard that one runtime switch and
+        # apply the profile-owned ``on`` value below.
+        filtered_extra_args: list[str] = []
+        index = 0
+        while index < len(extra_args):
+            token = extra_args[index]
+            option = token.split("=", 1)[0].casefold()
+            if option in {"--reasoning", "-rea"}:
+                index += 2 if "=" not in token and index + 1 < len(extra_args) else 1
+                continue
+            filtered_extra_args.append(token)
+            index += 1
+        extra_args = filtered_extra_args
+        extra_args.extend(["--reasoning", "on"])
+    args.extend(extra_args)
     # MTP flags are generated only from the resolved profile capability and
     # artifact state.  Never add spec-draft-n-max here; llama.cpp owns its
     # current default (3) and AoiTalk does not persist a tuning knob for it.
@@ -4008,53 +4121,62 @@ def _llama_cpp_launch_plan(
         executable,
         model_profile=model_profile,
     )
-    mtp_ready = bool(settings.get("mtp_enabled")) and bool(settings.get("mtp_available"))
+    mtp_ready = bool(settings.get("mtp_enabled")) and bool(
+        settings.get("mtp_available")
+    )
     effective_model_file = model_file
     if mtp_ready:
         mtp_mode = str(settings.get("mtp_mode") or "").strip().lower()
         if mtp_mode == "embedded":
-            variant_model_path = str(
-                settings.get("mtp_variant_model_path") or ""
-            ).strip()
             variant_metadata = llama_cpp_mtp_metadata(profile=model_profile) or {}
-            variant_decl = variant_metadata.get("embedded_variant")
-            variant_files = (
-                [str(item).strip() for item in variant_decl.get("filenames", [])]
-                if isinstance(variant_decl, dict)
-                and isinstance(variant_decl.get("filenames"), (list, tuple))
-                else []
-            )
-            variant_primary = (
-                str(variant_decl.get("primary_filename") or "").strip()
-                if isinstance(variant_decl, dict)
-                else ""
-            )
-            variant_path_obj = Path(variant_model_path).expanduser()
-            variant_complete = bool(
-                variant_model_path
-                and variant_primary
-                and variant_path_obj.name == variant_primary
-                and variant_files
-                and all(
-                    _llama_cpp_regular_non_symlink_file(
-                        variant_path_obj.parent / filename
-                    )
-                    for filename in variant_files
-                )
-            )
-            if variant_complete:
-                # The variant has already been checked as a complete exact
-                # shard set by the profile resolver.  It is intentionally
-                # not passed through base-profile filename validation: the
-                # selected profile identity remains the original 3-shard
-                # Flash model while the effective GGUF is the derived bundle.
-                effective_model_file = variant_model_path
+            if bool(variant_metadata.get("embedded_in_primary")):
+                # Some upstream GGUFs store the MTP/NextN tensors in the
+                # selected primary model itself.  Keep the ordinary --model
+                # path and only enable the profile-owned speculative decoder.
+                if not _llama_cpp_regular_non_symlink_file(Path(model_file)):
+                    mtp_ready = False
             else:
-                # A stale/incomplete computed projection must never turn into
-                # a speculative launch.  Keep the base model and omit all MTP
-                # flags if the embedded primary disappeared between resolve
-                # and launch.
-                mtp_ready = False
+                variant_model_path = str(
+                    settings.get("mtp_variant_model_path") or ""
+                ).strip()
+                variant_decl = variant_metadata.get("embedded_variant")
+                variant_files = (
+                    [str(item).strip() for item in variant_decl.get("filenames", [])]
+                    if isinstance(variant_decl, dict)
+                    and isinstance(variant_decl.get("filenames"), (list, tuple))
+                    else []
+                )
+                variant_primary = (
+                    str(variant_decl.get("primary_filename") or "").strip()
+                    if isinstance(variant_decl, dict)
+                    else ""
+                )
+                variant_path_obj = Path(variant_model_path).expanduser()
+                variant_complete = bool(
+                    variant_model_path
+                    and variant_primary
+                    and variant_path_obj.name == variant_primary
+                    and variant_files
+                    and all(
+                        _llama_cpp_regular_non_symlink_file(
+                            variant_path_obj.parent / filename
+                        )
+                        for filename in variant_files
+                    )
+                )
+                if variant_complete:
+                    # The variant has already been checked as a complete exact
+                    # shard set by the profile resolver.  It is intentionally
+                    # not passed through base-profile filename validation: the
+                    # selected profile identity remains the original 3-shard
+                    # Flash model while the effective GGUF is the derived bundle.
+                    effective_model_file = variant_model_path
+                else:
+                    # A stale/incomplete computed projection must never turn into
+                    # a speculative launch.  Keep the base model and omit all MTP
+                    # flags if the embedded primary disappeared between resolve
+                    # and launch.
+                    mtp_ready = False
         if mtp_ready:
             # Replace the model value assembled above only after every MTP
             # compatibility gate has passed.  Companion mode intentionally
@@ -4308,6 +4430,154 @@ def _start_logged_openai_compatible_process(
     return proc
 
 
+def _start_llama_cpp_visible_console(
+    log_path: Path,
+) -> subprocess.Popen | None:
+    """Tail the persistent llama log in an independent Windows terminal.
+
+    Keep the worker's stdout/stderr file-only: attaching a new console or
+    parent-owned pipe directly to llama-server can stall CUDA startup.
+    Closing the companion terminal stops only its read-only viewer.
+    """
+
+    if not _IS_WINDOWS:
+        return None
+    enabled = os.getenv("AOITALK_LLAMA_CPP_VISIBLE_CONSOLE", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        logger.warning("llama.cpp visible console requires Windows PowerShell")
+        return None
+
+    script = (
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "$Host.UI.RawUI.WindowTitle = 'AoiTalk llama.cpp'; "
+        "Get-Content -LiteralPath $env:AOITALK_LLAMA_CPP_LOG_PATH "
+        "-Encoding UTF8 -Tail 300 -Wait"
+    )
+    console_env = os.environ.copy()
+    # Pass the literal path through the environment, never interpolate it
+    # into shell source. The model retains its separate file-only handles.
+    console_env["AOITALK_LLAMA_CPP_LOG_PATH"] = str(log_path)
+    try:
+        # Do not pass stdin/stdout/stderr: any explicit std handle makes
+        # Popen inherit the parent's (often file-redirected) handles for the
+        # others, and the new console would stay blank.  Without them the
+        # console uses its own handles.
+        console = subprocess.Popen(
+            [powershell, "-NoLogo", "-NoProfile", "-Command", script],
+            cwd=str(log_path.parent),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            env=console_env,
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("llama.cpp visible console could not be opened: %s", exc)
+        return None
+    _track_child_process(console, openai_compatible_local=False)
+    return console
+
+
+def _watch_llama_cpp_visible_console(
+    worker: subprocess.Popen,
+    console: subprocess.Popen,
+) -> None:
+    """Close the log-tail window when the llama worker exits."""
+
+    try:
+        worker.wait()
+    except Exception:
+        return
+    try:
+        from src.service_manager import _remove_tracked_process, _terminate_process_tree
+
+        _terminate_process_tree(console)
+        _remove_tracked_process(console)
+    except Exception:
+        logger.debug("llama.cpp visible console cleanup failed", exc_info=True)
+
+
+def _set_llama_cpp_startup_state(proc: object, state: str) -> None:
+    """Serialize ready confirmation with a guarded loader's failure claim."""
+
+    lock = getattr(proc, "_aoi_llama_cpp_startup_state_lock", None)
+    if lock is None:
+        setattr(proc, "_aoi_local_readiness_state", state)
+        return
+    with lock:
+        current = getattr(proc, "_aoi_local_readiness_state", "")
+        if state == "loading" and current in {"ready", "failed"}:
+            return
+        if state == "ready":
+            if current == "failed":
+                raise RuntimeError(
+                    getattr(proc, "_aoi_local_startup_guard_error", "")
+                    or "llama.cppの起動guardがモデルロードを停止しました。"
+                )
+            if proc.poll() is not None:
+                raise RuntimeError("llama-serverがready確定前に終了しました。")
+        setattr(proc, "_aoi_local_readiness_state", state)
+
+
+def _watch_llama_cpp_startup_memory(
+    proc: subprocess.Popen,
+    *,
+    base_url: str,
+    model_alias: str,
+    minimum_available_gib: float,
+    timeout_seconds: float,
+) -> None:
+    """Bound the load of this newly owned process and retain a RAM reserve."""
+
+    import psutil
+
+    lock = getattr(proc, "_aoi_llama_cpp_startup_state_lock", None)
+    if lock is None:
+        # Production creates this before starting the guard thread.  This
+        # fallback also keeps standalone guard integrations synchronized.
+        lock = threading.Lock()
+        proc._aoi_llama_cpp_startup_state_lock = lock
+    deadline = time.monotonic() + timeout_seconds
+    while proc.poll() is None:
+        served_ids = _local_openai_model_ids_exact(base_url)
+        reason = None
+        with lock:
+            # A slow probe can return an old empty response after a normal
+            # waiter confirmed ready or an API switch ended this process.
+            # Recheck both after HTTP and claim failure under the same lock
+            # used by that waiter; the probe alone cannot authorize a stop.
+            if proc.poll() is not None or getattr(
+                proc, "_aoi_local_readiness_state", ""
+            ) in {"ready", "failed"}:
+                return
+            if model_alias in served_ids:
+                proc._aoi_local_readiness_state = "ready"
+                return
+            available_gib = psutil.virtual_memory().available / 2**30
+            if available_gib < minimum_available_gib:
+                reason = (
+                    "llama.cppのモデルロードを停止しました。"
+                    f"空きRAM {available_gib:.1f}GiBが保護下限"
+                    f" {minimum_available_gib:g}GiBを下回りました。"
+                )
+            elif time.monotonic() >= deadline:
+                reason = f"llama.cppのモデルロードが{timeout_seconds:g}秒でtimeoutしました。"
+            if reason is not None:
+                proc._aoi_local_readiness_state = "failed"
+                proc._aoi_local_startup_guard_error = reason
+        if reason is None:
+            time.sleep(1)
+            continue
+        # This guard receives only the Popen created by _start_llama_cpp_server;
+        # it never searches for, or stops, a different endpoint's process.
+        logger.error("%s alias=%s", reason, model_alias)
+        from src.service_manager import _terminate_process_tree
+
+        _terminate_process_tree(proc)
+        return
+
+
 def _start_llama_cpp_server(
     project_root: Path,
     config: object | None = None,
@@ -4315,7 +4585,25 @@ def _start_llama_cpp_server(
     model: str | None = None,
     overrides: dict[str, object] | None = None,
     is_windows: bool | None = None,
+    watch_readiness: bool = False,
 ) -> subprocess.Popen:
+    selected_model = _llama_cpp_selected_model(config, model)
+    profile = llama_cpp_model_profile(selected_model) or {}
+    minimum_available_gib = float(profile.get("startup_min_available_memory_gib") or 0)
+    startup_guard_settings = None
+    if minimum_available_gib > 0:
+        import psutil
+
+        minimum_initial_gib = float(profile.get("startup_min_initial_available_memory_gib") or 0)
+        available_gib = psutil.virtual_memory().available / 2**30
+        if available_gib < minimum_initial_gib:
+            raise RuntimeError(
+                "llama.cppのモデル起動には空きRAM"
+                f" {minimum_initial_gib:g}GiBが必要です（現在 {available_gib:.1f}GiB）。"
+            )
+        startup_guard_settings = _llama_cpp_settings(
+            config, model=model, overrides=overrides, is_windows=is_windows,
+        )
     args, cwd = _llama_cpp_launch_plan(
         config,
         project_root=project_root,
@@ -4331,7 +4619,6 @@ def _start_llama_cpp_server(
     planned_executable_identity = _llama_cpp_executable_identity(
         str(args[0]) if args else ""
     )
-    selected_model = _llama_cpp_selected_model(config, model)
     planned_model_path = ""
     try:
         planned_model_path = str(args[args.index("--model") + 1])
@@ -4393,6 +4680,38 @@ def _start_llama_cpp_server(
         mirror_to_parent_console=False,
         create_new_console_on_windows=False,
     )
+    # Keep model loading on the stable file handle, then expose that same
+    # stream in a separate visible console on real Windows launches.  Test
+    # doubles are intentionally excluded from the companion process.
+    try:
+        is_real_process = isinstance(proc, subprocess.Popen)
+    except TypeError:
+        # Tests and embedding hosts may replace ``subprocess.Popen`` with a
+        # factory function; such doubles must not open a real console.
+        is_real_process = False
+    if _IS_WINDOWS and is_real_process:
+        console = _start_llama_cpp_visible_console(
+            _models_log_dir(project_root) / "llama_cpp.log"
+        )
+        if console is not None:
+            try:
+                setattr(proc, "_aoi_llama_cpp_console_process", console)
+                threading.Thread(
+                    target=_watch_llama_cpp_visible_console,
+                    args=(proc, console),
+                    daemon=True,
+                    name="llama-cpp-visible-console",
+                ).start()
+            except Exception:
+                try:
+                    from src.service_manager import _terminate_process_tree
+
+                    _terminate_process_tree(console)
+                except Exception:
+                    logger.debug(
+                        "llama.cpp visible console rollback failed",
+                        exc_info=True,
+                    )
     # Keep endpoint ownership attached to the tracked process itself.  The
     # persisted config can change before a hot-switch validation runs, so
     # consulting the current config alone could incorrectly claim a new port
@@ -4409,6 +4728,9 @@ def _start_llama_cpp_server(
             ),
         )
         setattr(proc, "_aoi_local_runtime", "llama_cpp")
+        # Record the final plan, including any compatibility fallback. Config
+        # and env may change while this PID keeps running the original exe.
+        setattr(proc, "_aoi_local_executable", str(args[0]) if args else "")
         setattr(
             proc,
             "_aoi_local_base_url",
@@ -4432,6 +4754,29 @@ def _start_llama_cpp_server(
         )
     except Exception:
         logger.debug("llama.cpp process endpoint metadataを設定できません", exc_info=True)
+    if is_real_process and (minimum_available_gib > 0 or watch_readiness):
+        if startup_guard_settings is None:
+            startup_guard_settings = settings
+        proc._aoi_llama_cpp_startup_state_lock = threading.Lock()
+        guard = threading.Thread(
+            target=_watch_llama_cpp_startup_memory,
+            kwargs={
+                "proc": proc,
+                "base_url": str(getattr(proc, "_aoi_local_base_url", "")),
+                "model_alias": str(getattr(proc, "_aoi_local_model_alias", "")),
+                "minimum_available_gib": minimum_available_gib,
+                "timeout_seconds": float(startup_guard_settings["readiness_timeout"]),
+            },
+            daemon=True,
+            name="llama-cpp-startup-memory",
+        )
+        try:
+            guard.start()
+        except BaseException:
+            from src.service_manager import _terminate_process_tree
+
+            _terminate_process_tree(proc)
+            raise
     logger.info(
         "llama-server started (PID %s)",
         proc.pid,

@@ -12,11 +12,17 @@ export const CHAT_COMPOSER_DRAFT_DEBOUNCE_MS = 400;
 export const CHAT_COMPOSER_DRAFT_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 const ANONYMOUS_SCOPE = "__anonymous__";
 
+export type ChatComposerDispatchMode = "chat" | "deep_research";
+
 export type ChatComposerDraft = {
   content: string;
   mentions: MentionItem[];
   activeCommand: ActiveChatCommand | null;
   toolFreeMode: boolean;
+  /** Reuse the server idempotency key when a failed send is restored. */
+  clientMessageId?: string;
+  /** Preserve the selected route when retrying an uncertain submission. */
+  dispatchMode?: ChatComposerDispatchMode;
 };
 
 export const EMPTY_CHAT_COMPOSER_DRAFT: ChatComposerDraft = {
@@ -77,6 +83,40 @@ export function getChatComposerDraftStorageKey(
   if (!normalizedUserId || !key) return null;
   // user/session ID に区切り文字が含まれてもキー衝突しないようエンコードする。
   return `${CHAT_COMPOSER_DRAFT_STORAGE_PREFIX}:${encodeStoragePart(normalizedUserId)}:${encodeStoragePart(key)}`;
+}
+
+/**
+ * Cold Chat entry checks whether a durable draft exists before it decides
+ * whether the legacy last-session route may be restored. This is deliberately
+ * storage-only: hydration into the external-store memory remains a Composer
+ * concern and this helper has no render-time side effects.
+ */
+export function hasPersistedChatComposerDraft(
+  key: string,
+  userId?: string | null,
+): boolean {
+  const storage = getBrowserStorage();
+  const storageKey = getChatComposerDraftStorageKey(userId, key);
+  if (!storage || !storageKey) return false;
+
+  let raw: string | null = null;
+  try {
+    raw = storage.getItem(storageKey);
+  } catch {
+    return false;
+  }
+  if (!raw) return false;
+
+  try {
+    const persisted = parsePersistedDraft(JSON.parse(raw));
+    return Boolean(
+      persisted &&
+        Date.now() - persisted.updatedAt <= CHAT_COMPOSER_DRAFT_MAX_AGE_MS &&
+        !isDraftEmpty(persisted.draft),
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getDraftScope(key: string, userId?: string | null): DraftScope {
@@ -167,6 +207,20 @@ function parsePersistedDraft(value: unknown): {
   ) {
     return null;
   }
+  if (
+    rawDraft.clientMessageId !== undefined &&
+    (typeof rawDraft.clientMessageId !== "string" ||
+      rawDraft.clientMessageId.length > 512)
+  ) {
+    return null;
+  }
+  if (
+    rawDraft.dispatchMode !== undefined &&
+    rawDraft.dispatchMode !== "chat" &&
+    rawDraft.dispatchMode !== "deep_research"
+  ) {
+    return null;
+  }
 
   const updatedAt =
     typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt)
@@ -181,6 +235,14 @@ function parsePersistedDraft(value: unknown): {
           ? null
           : (rawDraft.activeCommand as ActiveChatCommand | null),
       toolFreeMode: rawDraft.toolFreeMode === true,
+      clientMessageId:
+        typeof rawDraft.clientMessageId === "string"
+          ? rawDraft.clientMessageId
+          : undefined,
+      dispatchMode:
+        rawDraft.dispatchMode === "chat" || rawDraft.dispatchMode === "deep_research"
+          ? rawDraft.dispatchMode
+          : undefined,
     },
     updatedAt,
   };
@@ -224,6 +286,10 @@ function writeDraftNow(scope: DraftScope): boolean {
       mentions: draft.mentions,
       activeCommand: draft.activeCommand,
       toolFreeMode: draft.toolFreeMode,
+      ...(draft.clientMessageId
+        ? { clientMessageId: draft.clientMessageId }
+        : {}),
+      ...(draft.dispatchMode ? { dispatchMode: draft.dispatchMode } : {}),
     },
   };
   try {

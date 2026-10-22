@@ -1,3 +1,4 @@
+import { withBasePath } from "@/lib/base-path";
 import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
@@ -373,13 +374,13 @@ async function serializeAttachment(
     subtitle: `${row.kind} · ${row.sizeBytes ?? 0} bytes`,
     target_id: row.id,
     target_path: row.filePath,
-    target_url: `/api/tasks/${row.taskId}/attachments/${row.id}`,
+    target_url: withBasePath(`/api/tasks/${row.taskId}/attachments/${row.id}`),
     metadata: row.attachmentMetadata ?? {},
     created_by: row.createdBy,
     created_at: row.createdAt,
     can_remove: canRemove,
     exists,
-    open: { id: row.id, path: row.filePath, url: `/api/tasks/${row.taskId}/attachments/${row.id}` },
+    open: { id: row.id, path: row.filePath, url: withBasePath(`/api/tasks/${row.taskId}/attachments/${row.id}`) },
     attachment: {
       id: row.id,
       task_id: row.taskId,
@@ -392,7 +393,7 @@ async function serializeAttachment(
       created_by: row.createdBy,
       created_at: row.createdAt,
       metadata: row.attachmentMetadata ?? {},
-      url: `/api/tasks/${row.taskId}/attachments/${row.id}`,
+      url: withBasePath(`/api/tasks/${row.taskId}/attachments/${row.id}`),
     },
   };
 }

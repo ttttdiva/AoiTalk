@@ -3,7 +3,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { AppState, Pressable, Text, View } from "react-native";
+import { AppState, Linking, Pressable, Text, View } from "react-native";
 import { Slot } from "expo-router";
 import { PaperProvider, MD3DarkTheme } from "react-native-paper";
 import { StatusBar } from "expo-status-bar";
@@ -19,16 +19,22 @@ import { ProjectProvider } from "../contexts/ProjectContext";
 import { ensureSchema, ensureSchemaAsync } from "../db/migrate";
 import { queryClient, asyncStoragePersister } from "../query/client";
 import { useNetworkStore } from "../stores/network";
+import { getToken, getTokenAuthScope } from "../lib/auth";
+import { useSyncStatusStore } from "../stores/sync-status";
 import { useProjectStore } from "../stores/project";
 import { scheduleSyncAfterInteractions } from "../lib/background-sync";
 import { setSyncExecutionActive } from "../sync/engine";
 import { checkForUpdate, showUpdateAlert } from "../lib/update-service";
 import { configureNetworkEndpointRouting } from "../lib/connection-routing";
+import { completePortalCallback } from "../lib/portal-auth";
+import { isGatewayCallbackUrl } from "../constants/config";
 import {
   initializeLocalNotifications,
   installLocalNotificationResponseHandler,
   rescheduleLocalTaskNotificationsFromCache,
 } from "../lib/local-notifications";
+import { AoiDotsProvider } from "../features/aoidots/AoiDotsOverlay";
+import { ReadOnlyDiagnosticsBadge } from "../components/read-only-diagnostics-badge";
 
 const theme = {
   ...MD3DarkTheme,
@@ -102,6 +108,30 @@ export default function RootLayout() {
   );
   const [schemaAttempt, setSchemaAttempt] = useState(0);
 
+  // Gateway OAuth returns to the app scheme while the app may be cold, warm,
+  // or resumed from the browser. Complete the SDK exchange at the root so the
+  // callback is handled exactly once and never rendered as an Expo Router
+  // screen (the native-intent shim below also redirects it to Login).
+  useEffect(() => {
+    const handled = new Set<string>();
+    const handleGatewayCallback = async (url: string | null) => {
+      if (!url || !isGatewayCallbackUrl(url) || handled.has(url)) return;
+      handled.add(url);
+      try {
+        await completePortalCallback(url);
+      } catch {
+        // The SDK persists retryable exchange state. Keep callback credentials
+        // out of UI errors and logs; Login/Connection settings can retry.
+      }
+    };
+
+    const subscription = Linking.addEventListener("url", ({ url }) => {
+      void handleGatewayCallback(url);
+    });
+    void Linking.getInitialURL().then(handleGatewayCallback).catch(() => undefined);
+    return () => subscription.remove();
+  }, []);
+
   useEffect(() => {
     void ScreenOrientation.lockAsync(
       ScreenOrientation.OrientationLock.PORTRAIT_UP,
@@ -169,9 +199,25 @@ export default function RootLayout() {
       ) {
         return;
       }
+      // Spaces are not part of the delta sync. Give a missing Space cache a
+      // head start before the potentially long general/Docs sync occupies the
+      // auth-scope queue. A complete cache stays entirely local/no-op here.
+      const projectState = useProjectStore.getState();
+      const knownSpaceIds = new Set(projectState.spaces.map((space) => space.id));
+      const needsSpaceCatchUp =
+        projectState.spaces.length === 0 ||
+        projectState.projects.some(
+          (project) =>
+            Boolean(project.space_id) &&
+            !knownSpaceIds.has(project.space_id!),
+        );
+      if (needsSpaceCatchUp) {
+        void projectState.refreshProjects({ spacesOnly: true });
+      }
+
       cancelScheduledSync?.();
       cancelScheduledSync = scheduleSyncAfterInteractions(() =>
-        useProjectStore.getState().refreshProjects({ localOnly: true }),
+        useProjectStore.getState().refreshProjects({ spacesOnly: true }),
       );
     };
     const unsubscribe = useNetworkStore.subscribe((state, prevState) => {
@@ -179,9 +225,30 @@ export default function RootLayout() {
         scheduleRootSync();
       }
     });
+    // General data is committed while Docs still owns the auth-scope queue.
+    // Never queue a canonical/remote refresh from this notification.
+    let rootActive = true;
+    let appGeneration = 0;
+    const unsubscribeGeneral = useSyncStatusStore.subscribe((state, previous) => {
+      if (
+        state.generalRevision === previous.generalRevision ||
+        !state.generalAuthScope || currentAppState !== "active"
+      ) return;
+      const { generalRevision, generalAuthScope } = state;
+      const generation = appGeneration;
+      void getToken().then((token) => {
+        const latest = useSyncStatusStore.getState();
+        if (!rootActive || generation !== appGeneration || currentAppState !== "active" ||
+            latest.generalRevision !== generalRevision ||
+            latest.generalAuthScope !== generalAuthScope ||
+            getTokenAuthScope(token) !== generalAuthScope) return;
+        return useProjectStore.getState().refreshProjects({ localOnly: true });
+      }).catch(() => undefined);
+    });
     const appStateSubscription = AppState.addEventListener(
       "change",
       (nextAppState) => {
+        ++appGeneration;
         const wasActive = currentAppState === "active";
         currentAppState = nextAppState;
         setSyncExecutionActive(nextAppState === "active");
@@ -198,6 +265,8 @@ export default function RootLayout() {
     }, 60_000);
     scheduleRootSync();
     return () => {
+      rootActive = false;
+      unsubscribeGeneral();
       removeNotificationResponseHandler();
       cancelScheduledSync?.();
       setSyncExecutionActive(false);
@@ -235,10 +304,13 @@ export default function RootLayout() {
                 <StatusBar style="light" />
                 {schemaState === "ready" ? (
                   <ProjectProvider>
-                    <AppSidebar>
-                      <Slot />
-                    </AppSidebar>
-                    <TaskCompletionUndoStack />
+                    <AoiDotsProvider>
+                      <AppSidebar>
+                        <Slot />
+                        <ReadOnlyDiagnosticsBadge />
+                      </AppSidebar>
+                      <TaskCompletionUndoStack />
+                    </AoiDotsProvider>
                   </ProjectProvider>
                 ) : (
                   <SchemaBootstrapScreen

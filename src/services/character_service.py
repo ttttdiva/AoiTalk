@@ -53,18 +53,18 @@ class CharacterNotFoundError(CharacterError):
 
 _SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,98}[a-z0-9]$")
 _REQUIRED_FIELDS = ("name", "slug")
-_VALID_TYPES = {"assistant", "roleplay", "trpg_npc", "gm"}
+_VALID_TYPES = {"assistant", "roleplay"}
 # A Character row has two independent concerns:
 #
 # * ``character_type`` selects the execution surface (ordinary assistant vs
-#   Story/Roleplay/TRPG persona).
+#   Roleplay persona).
 # * ``allowed_tools`` describes the tools available *inside* that Character's
 #   own execution.
 #
 # The latter must never become an allow-list for publishing Character bridges
 # into the ordinary Main runtime.  Only assistant Characters are eligible for
-# that public root bridge; Roleplay/TRPG/GM rows remain available to their
-# dedicated direct/group/story routes.
+# that public root bridge; Roleplay rows remain available to their
+# dedicated direct/group routes.
 _ROOT_AGENT_CHARACTER_TYPES = frozenset({"assistant"})
 _CHARACTER_SLUG_ALIASES = {
     "project_management_assistant": "project_manager",
@@ -409,16 +409,16 @@ def build_character_agent_tools(config: Any) -> List[ToolDefinition]:
     """有効なキャラクター（エージェント型）をランタイムツールとして構築する。
 
     通常のMain runtimeへ公開するのは ``assistant`` Characterだけに限定
-    する。Roleplay/TRPG/GM Characterは、直接Character chat、Group chat、
-    Story/TRPG経路から同じCharacter DBを参照するため、ここで除外しても
-    それらの専用実行経路には影響しない。
+    する。Roleplay Characterは、直接Character chat、Group chat経路から
+    同じCharacter DBを参照するため、ここで除外してもそれらの専用実行
+    経路には影響しない。
 
     ``allowed_tools`` はCharacter自身の実行時ツール設定であり、公開可否
     の条件には使わない。従来の実装はこの値が空の行を黙って落としていた
     ため、公開境界と内部権限が混同されていた。
 
     専用経路が必要な場合もこの公開ブリッジを拡張せず、直接Character
-    chat/Group/Story/TRPG側の実行経路からCharacter DBを参照する。
+    chat/Group側の実行経路からCharacter DBを参照する。
     """
     try:
         characters = _run_sync(list_characters(enabled_only=True))
@@ -433,12 +433,12 @@ def build_character_agent_tools(config: Any) -> List[ToolDefinition]:
     for char_data in characters:
         # Missing/blank/unknown types are not legacy assistant aliases here:
         # the root publication boundary is fail-closed.  Persisted rows with
-        # an explicit ``assistant`` type remain eligible, while Roleplay/TRPG/
-        # GM (and malformed rows) stay on their dedicated routes only.
+        # an explicit ``assistant`` type remain eligible, while Roleplay
+        # (and malformed rows) stay on their dedicated routes only.
         character_type = str(char_data.get("character_type") or "").strip().lower()
         if character_type not in _ROOT_AGENT_CHARACTER_TYPES:
-            # Roleplay/TRPG/GM Character rows are intentionally not root tools;
-            # their direct/group/story routes still call get_character_for_prompt.
+            # Roleplay Character rows are intentionally not root tools;
+            # their direct/group routes still call get_character_for_prompt.
             continue
         # system_prompt があるキャラクターのみツールとして登録
         if not char_data.get("system_prompt"):

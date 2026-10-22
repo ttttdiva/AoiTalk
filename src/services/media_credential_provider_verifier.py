@@ -70,6 +70,45 @@ def _safe_ref(value: Any) -> str | None:
     return None
 
 
+def _granted_scopes(payload: Mapping[str, Any]) -> set[str]:
+    value = payload.get("scope")
+    if value is None:
+        value = payload.get("scopes")
+    raw: list[Any]
+    if isinstance(value, str):
+        raw = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        raw = list(value)
+    else:
+        raw = []
+    return {
+        str(item).strip()
+        for item in raw
+        if isinstance(item, str) and str(item).strip() and len(str(item).strip()) <= 256
+    }
+
+
+def _verified_capabilities(platform: str, payload: Mapping[str, Any]) -> dict[str, str]:
+    result = _unknown()
+    result["identity"] = "available"
+    scopes = _granted_scopes(payload)
+    if platform == "x":
+        if "tweet.write" in scopes:
+            result["publish"] = "available"
+        if {"tweet.write", "media.write"}.issubset(scopes):
+            result["media"] = "available"
+    elif platform == "youtube":
+        upload_scopes = {
+            "https://www.googleapis.com/auth/youtube",
+            "https://www.googleapis.com/auth/youtube.force-ssl",
+            "https://www.googleapis.com/auth/youtube.upload",
+        }
+        if scopes.intersection(upload_scopes):
+            result["publish"] = "available"
+            result["media"] = "available"
+    return result
+
+
 def _matches(account_ref: str | None, values: list[Any]) -> bool:
     expected = str(account_ref or "").strip().lstrip("@").casefold()
     if not expected:
@@ -234,11 +273,21 @@ class MediaCredentialProviderVerifier:
         ]
         if not normalized_values:
             return CredentialVerificationResult("verification_pending", _unknown(), provider_code="provider_response_unknown")
-        if not _matches(account_ref, normalized_values):
+        if platform == "youtube":
+            # Stable channel IDs are case-sensitive; handles are not. A
+            # casefolded channel ID must never bind another brand's channel.
+            expected = str(account_ref or "").strip()
+            matched = expected == remote_ref or (
+                expected.casefold() != str(remote_ref).casefold()
+                and _matches(expected, [snippet.get("customUrl")])
+            )
+        else:
+            matched = _matches(account_ref, normalized_values)
+        if not matched:
             return CredentialVerificationResult("invalid", _unknown(), remote_ref, "identity_mismatch")
         return CredentialVerificationResult(
             "verified",
-            {**_unknown(), "identity": "available"},
+            _verified_capabilities(platform, package.payload),
             remote_ref,
             "identity_match",
             _PROVIDER_IDENTITY_EVIDENCE,

@@ -16,6 +16,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import shlex
 import signal
@@ -754,18 +755,34 @@ class MageVLService:
         )
 
     @staticmethod
-    def probe_video(path: Path) -> dict[str, float | int | None]:
-        """Read lightweight duration/frame metadata without importing cv2."""
+    def probe_video(path: Path) -> dict[str, float | int | str | None]:
+        """Read lightweight video metadata without importing cv2.
+
+        ``ffprobe`` is part of the sampling contract.  A failed probe is
+        returned with a stable reason so callers can expose the failure and
+        avoid treating a single frame at timestamp zero as full coverage.
+        """
+
+        def _empty(reason: str) -> dict[str, float | int | str | None]:
+            return {
+                "duration_seconds": None,
+                "frame_count": None,
+                "fps": None,
+                "width": None,
+                "height": None,
+                "start_time_seconds": None,
+                "reason": reason,
+            }
 
         executable = shutil.which("ffprobe")
         if not executable:
-            return {"duration_seconds": None, "frame_count": None, "fps": None}
+            return _empty("ffprobe_unavailable")
         command = [
             executable,
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,duration,nb_frames,r_frame_rate",
+            "format=start_time,duration:stream=codec_type,duration,nb_frames,r_frame_rate,width,height,start_time",
             "-of",
             "json",
             str(path),
@@ -779,11 +796,25 @@ class MageVLService:
                 timeout=20,
             )
             payload = json.loads(completed.stdout or "{}")
+        except subprocess.TimeoutExpired:
+            return _empty("ffprobe_timeout")
+        except (OSError, subprocess.CalledProcessError):
+            return _empty("ffprobe_failed")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return _empty("ffprobe_invalid_output")
         except Exception:
-            return {"duration_seconds": None, "frame_count": None, "fps": None}
+            # Keep probe failures at the metadata boundary.  The caller sees
+            # a reason and can reject the request without exposing tool output.
+            return _empty("ffprobe_failed")
 
+        if not isinstance(payload, dict):
+            return _empty("ffprobe_invalid_output")
         format_data = payload.get("format") or {}
+        if not isinstance(format_data, dict):
+            format_data = {}
         streams = payload.get("streams") or []
+        if not isinstance(streams, list):
+            return _empty("ffprobe_invalid_output")
         video_stream = next(
             (
                 item
@@ -792,19 +823,25 @@ class MageVLService:
             ),
             {},
         )
+        if not video_stream:
+            return _empty("video_stream_missing")
 
-        def _float(value: Any) -> float | None:
+        def _finite_float(value: Any) -> float | None:
             try:
                 parsed = float(value)
-                return parsed if parsed >= 0 else None
-            except (TypeError, ValueError):
+                return parsed if math.isfinite(parsed) else None
+            except (TypeError, ValueError, OverflowError):
                 return None
+
+        def _float(value: Any) -> float | None:
+            parsed = _finite_float(value)
+            return parsed if parsed is not None and parsed >= 0 else None
 
         def _int(value: Any) -> int | None:
             try:
                 parsed = int(value)
                 return parsed if parsed >= 0 else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
 
         fps: float | None = None
@@ -812,18 +849,35 @@ class MageVLService:
         if "/" in rate:
             numerator, denominator = rate.split("/", 1)
             try:
-                if float(denominator):
-                    fps = float(numerator) / float(denominator)
-            except (TypeError, ValueError, ZeroDivisionError):
+                denominator_value = float(denominator)
+                if math.isfinite(denominator_value) and denominator_value:
+                    candidate = float(numerator) / denominator_value
+                    if math.isfinite(candidate) and candidate >= 0:
+                        fps = candidate
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
                 fps = None
+        else:
+            fps = _float(rate)
+
         duration = _float(format_data.get("duration")) or _float(video_stream.get("duration"))
         frame_count = _int(video_stream.get("nb_frames"))
-        if duration is None and frame_count and fps:
-            duration = frame_count / fps
+        if duration is None and frame_count and isinstance(fps, (int, float)) and fps > 0:
+            derived = frame_count / fps
+            duration = derived if math.isfinite(derived) else None
+        width = _int(video_stream.get("width"))
+        height = _int(video_stream.get("height"))
+        start_time = _finite_float(format_data.get("start_time"))
+        if start_time is None:
+            start_time = _finite_float(video_stream.get("start_time"))
+        reason = None if duration is not None else "duration_unknown"
         return {
             "duration_seconds": duration,
             "frame_count": frame_count,
             "fps": fps,
+            "width": width,
+            "height": height,
+            "start_time_seconds": start_time,
+            "reason": reason,
         }
 
     @classmethod
@@ -839,27 +893,51 @@ class MageVLService:
         if not executable:
             raise RuntimeError("ffmpegが見つからないためMage-VL用フレームを抽出できません")
         metadata = cls.probe_video(path)
+        reason = metadata.get("reason")
+        if reason:
+            raise RuntimeError(f"動画メタデータを取得できないためフレーム抽出を続行できません: {reason}")
         duration = metadata.get("duration_seconds")
         frame_count = metadata.get("frame_count")
         fps = metadata.get("fps")
-        if not isinstance(duration, (int, float)) or duration <= 0:
-            if isinstance(frame_count, int) and frame_count > 0 and isinstance(fps, (int, float)) and fps > 0:
-                duration = frame_count / fps
-            else:
-                duration = None
+        try:
+            duration_value = (
+                float(duration)
+                if isinstance(duration, (int, float)) and math.isfinite(float(duration))
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            duration_value = None
+        try:
+            fps_value = (
+                float(fps)
+                if isinstance(fps, (int, float)) and math.isfinite(float(fps))
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            fps_value = None
+        if duration_value is None or duration_value <= 0:
+            duration_value = None
+            if isinstance(frame_count, int) and frame_count > 0 and fps_value is not None and fps_value > 0:
+                derived_duration = frame_count / fps_value
+                duration_value = (
+                    derived_duration
+                    if math.isfinite(derived_duration) and derived_duration > 0
+                    else None
+                )
+        if duration_value is None:
+            raise RuntimeError(
+                "動画メタデータを取得できないためフレーム抽出を続行できません: duration_unknown"
+            )
 
         count = min(num_frames, int(frame_count)) if isinstance(frame_count, int) and frame_count > 0 else num_frames
         if count <= 0:
             count = 1
-        if isinstance(duration, (int, float)) and duration > 0:
-            frame_period = (1.0 / float(fps)) if isinstance(fps, (int, float)) and fps > 0 else 0.05
-            last_timestamp = max(0.0, float(duration) - frame_period)
-            timestamps = [
-                last_timestamp * index / max(1, count - 1)
-                for index in range(count)
-            ]
-        else:
-            timestamps = [0.0]
+        frame_period = (1.0 / fps_value) if fps_value is not None and fps_value > 0 else 0.05
+        last_timestamp = max(0.0, duration_value - frame_period)
+        timestamps = [
+            last_timestamp * index / max(1, count - 1)
+            for index in range(count)
+        ]
 
         urls: list[str] = []
         for timestamp in timestamps:
@@ -868,6 +946,7 @@ class MageVLService:
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-nostdin",
                 "-ss",
                 f"{timestamp:.3f}",
                 "-i",
@@ -905,7 +984,7 @@ class MageVLService:
                 "data:image/jpeg;base64,"
                 + base64.b64encode(buffer.getvalue()).decode("ascii")
             )
-        return urls, float(duration) if isinstance(duration, (int, float)) else None
+        return urls, duration_value
 
 
 _instances: dict[int, MageVLService] = {}

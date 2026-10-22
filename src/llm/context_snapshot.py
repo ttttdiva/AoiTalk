@@ -428,7 +428,24 @@ def message_components(messages: Iterable[dict[str, Any]]) -> list[dict[str, Any
             category, label = "tool_results", "Tool results"
         else:
             category, label = "conversation_history", "Conversation history"
-        result.append(component(category, label, content, source=f"messages[{index}] ({role})"))
+        extra = {k: v for k, v in message.items() if k not in {"role", "content"} and v not in (None, "", [], {})}
+        tokens = None
+        preview = None
+        if extra:
+            tokens = estimated_tokens(content) + estimated_tokens(extra)
+            notes = [structural_preview(content)] if content not in (None, "", [], {}) else []
+            tool_calls = extra.get("tool_calls")
+            if isinstance(tool_calls, list):
+                notes.append(f"tool_calls {len(tool_calls):,}件")
+            others = [str(k) for k in extra if k != "tool_calls"][:8]
+            if others:
+                notes.append(f"追加フィールド（{', '.join(others)}）")
+            notes.append(f"非content {estimated_tokens(extra):,}tok相当")
+            preview = " / ".join(notes)
+        result.append(component(
+            category, label, content, source=f"messages[{index}] ({role})",
+            tokens=tokens, preview=preview,
+        ))
         if isinstance(content, list) and any(
             isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
             for part in content
@@ -516,6 +533,37 @@ def openai_compatible_request_components(
             source=f"{provider} chat.completions tools payload",
         ),
     ]
+
+
+def context_bundle_partition_components(
+    bundle: Any,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Return exact stable/dynamic bundle text plus provenance components."""
+
+    if bundle is None:
+        return "", "", []
+    render_partitioned = getattr(bundle, "render_partitioned_with_trace", None)
+    if callable(render_partitioned):
+        stable, dynamic, trace = render_partitioned()
+    elif hasattr(bundle, "render_with_trace"):
+        dynamic, trace = bundle.render_with_trace()
+        stable = ""
+    else:
+        return "", "", []
+    result = [
+        component(
+            item["category"], item["label"], item.get("text", ""),
+            source=item["source"], status=item.get("status", "active"),
+            tokens=0 if item.get("status") == "deferred" else None,
+            preview=item.get("preview"),
+            selection_reason=item.get("selection_reason"),
+            duration_ms=item.get("duration_ms"),
+            retrieved_chars=item.get("retrieved_chars"),
+            selected_chars=item.get("selected_chars"),
+        )
+        for item in trace
+    ]
+    return stable, dynamic, result
 
 
 def context_bundle_components(bundle: Any) -> tuple[str, list[dict[str, Any]]]:

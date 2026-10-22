@@ -56,11 +56,8 @@ if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
     throw "DDNS 更新スクリプトが見つかりません: $scriptPath"
 }
 
-# リポジトリで使う venv を優先し、開発環境で .venv を使う場合だけフォールバックする。
+# リポジトリ標準の venv だけを使用する。
 $pythonPath = Join-Path $ProjectRoot 'venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-    $pythonPath = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-}
 if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "プロジェクト venv の Python が見つかりません (venv\Scripts\python.exe)"
 }

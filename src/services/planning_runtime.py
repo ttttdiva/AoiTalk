@@ -11,7 +11,10 @@ import uuid
 from typing import Any, Iterator, Optional
 
 from ..llm.generation_policy import GenerationPolicy, get_current_generation_policy
-from ..llm.generation_cancellation import PlanningInteractionTerminated
+from ..llm.generation_cancellation import (
+    AgentDialogueInputPending,
+    PlanningInteractionTerminated,
+)
 from ..llm.planning_policy import (
     ApprovedPlan,
     PlanningPolicy,
@@ -48,6 +51,7 @@ from ..services.human_interaction import (
     HumanInteractionKind,
     get_human_interaction_manager,
 )
+from .planning_tool_outcome import planning_failure_outcome
 from ..tools.core import ToolDefinition, ToolParam
 from ..tools.external_llm_permission import get_permission_request_scope
 
@@ -703,7 +707,59 @@ async def execute_ask_user_question(
     session_id: str = "",
     user_id: str = "",
     revision: int = 0,
+    input_kind: str = "agent_question",
 ) -> dict[str, Any]:
+    # A worker dialogue has a durable answer ledger and must never suspend on
+    # the process-local HumanInteraction Future.  Persist the question and
+    # fence the worker Run/Work first; the typed signal is caught by the
+    # terminal stream boundary and stops provider continuation.
+    turn = get_turn_context()
+    dialogue_role = str(turn.agent_dialogue_role or "").strip().casefold()
+    dialogue_binding = turn.agent_execution_binding
+    if not dialogue_role and isinstance(dialogue_binding, ABCMapping):
+        dialogue_role = str(
+            dialogue_binding.get("agent_dialogue_role")
+            or dialogue_binding.get("dialogue_role")
+            or dialogue_binding.get("role")
+            or ""
+        ).strip().casefold()
+    if dialogue_role == "worker":
+        from .agent_run_service import AgentRunService
+
+        requested_input_kind = str(input_kind or "agent_question").strip().casefold()
+        if requested_input_kind not in {"agent_question", "human_question"}:
+            raise AgentDialogueInputPending(
+                input_id=str(turn.agent_dialogue_input_id or ""),
+                dialogue_id=turn.agent_dialogue_id,
+                reason="dialogue_input_kind_invalid",
+                user_message="質問の送信先種別が不正なため、処理を停止しました。",
+            )
+        run_id = str(agent_run_id or get_current_agent_run_id() or "").strip()
+        service = AgentRunService()
+        pause = await service.pause_agent_dialogue_for_input(
+            run_id=run_id,
+            question=question,
+            input_type=input_type,
+            choices=choices or [],
+            allow_multiple=bool(allow_multiple),
+            allow_free_text=bool(allow_free_text),
+            dialogue_id=turn.agent_dialogue_id,
+            expected_control_revision=turn.agent_dialogue_control_revision,
+            input_kind=requested_input_kind,
+        )
+        if not isinstance(pause, ABCMapping) or not pause.get("input_id"):
+            raise AgentDialogueInputPending(
+                input_id=str(turn.agent_dialogue_input_id or ""),
+                dialogue_id=turn.agent_dialogue_id,
+                reason="dialogue_input_persist_failed",
+                user_message="担当Agentの質問を保存できなかったため、処理を停止しました。",
+            )
+        raise AgentDialogueInputPending(
+            input_id=str(pause["input_id"]),
+            dialogue_id=str(pause.get("dialogue_id") or turn.agent_dialogue_id or "")
+            or None,
+        )
+
     manager = get_human_interaction_manager()
     if manager is None:
         return {"success": False, "error": "human_interaction_unavailable"}
@@ -787,7 +843,8 @@ ASK_USER_QUESTION_TOOL = ToolDefinition(
     description=(
         "Ask the user a structured question and wait for a correlated answer. "
         "Use for ambiguity, preference, or approval checkpoints. "
-        "Subagents must escalate to the root agent instead of calling this directly."
+        "Agent Team specialist subagents must escalate to the root agent; "
+        "a server-bound AoiDots Worker may ask through its durable AgentDialogue input path."
     ),
     function=_ask_user_question_tool,
     parameters=[
@@ -843,12 +900,13 @@ async def submit_plan_for_approval_tool(
 ) -> dict[str, Any]:
     state = get_current_planning_run_state()
     if state is None:
-        return {"success": False, "error": "planning_not_active"}
+        return planning_failure_outcome("planning_not_active")
 
     if state.phase == PlanningRunPhase.AWAITING_PLAN_APPROVAL:
-        return {"success": False, "error": "approval_already_pending"}
+        return planning_failure_outcome("approval_already_pending")
     if state.metadata.get("approval_request_active"):
-        return {"success": False, "error": "approval_already_pending"}
+        return planning_failure_outcome("approval_already_pending")
+    correction_revision = max(1, int(state.interaction_revision) + 1)
 
     try:
         validated_actions = validate_material_actions(actions_json)
@@ -858,14 +916,11 @@ async def submit_plan_for_approval_tool(
             status="rejected",
             payload={"reason": str(exc)},
         )
-        return {
-            "success": False,
-            "error": "structured_actions_required",
-            "message": (
-                "Plan approval requires a non-empty typed actions_json array "
-                "with tool and args for every action."
-            ),
-        }
+        return planning_failure_outcome(
+            "structured_actions_required",
+            allowed_tools=tuple(sorted(ATOMIC_APPROVED_PLAN_TOOLS)),
+            revision=correction_revision,
+        )
     unsupported_tools = sorted(
         {
             str(action.get("tool") or "").strip()
@@ -880,11 +935,11 @@ async def submit_plan_for_approval_tool(
             status="rejected",
             payload={"tool_count": len(unsupported_tools)},
         )
-        return {
-            "success": False,
-            "error": "approved_action_atomicity_unsupported",
-            "message": "Only atomic approved Task/Docs actions may be planned for execution.",
-        }
+        return planning_failure_outcome(
+            "approved_action_atomicity_unsupported",
+            allowed_tools=tuple(sorted(ATOMIC_APPROVED_PLAN_TOOLS)),
+            revision=correction_revision,
+        )
     try:
         requested_preview = build_material_action_preview(validated_actions)
         requested_preview_digest = material_action_preview_digest(requested_preview)
@@ -894,17 +949,17 @@ async def submit_plan_for_approval_tool(
             status="rejected",
             payload={"reason": str(exc)[:256]},
         )
-        return {
-            "success": False,
-            "error": "material_action_preview_invalid",
-            "message": "Approved actions exceed the bounded preview contract.",
-        }
+        return planning_failure_outcome(
+            "material_action_preview_invalid",
+            allowed_tools=tuple(sorted(ATOMIC_APPROVED_PLAN_TOOLS)),
+            revision=correction_revision,
+        )
 
     async with state.approval_request_lock:
         if state.phase == PlanningRunPhase.AWAITING_PLAN_APPROVAL:
-            return {"success": False, "error": "approval_already_pending"}
+            return planning_failure_outcome("approval_already_pending")
         if state.metadata.get("approval_request_active"):
-            return {"success": False, "error": "approval_already_pending"}
+            return planning_failure_outcome("approval_already_pending")
         state.metadata["approval_request_active"] = True
         try:
             revision = max(1, state.interaction_revision + 1)

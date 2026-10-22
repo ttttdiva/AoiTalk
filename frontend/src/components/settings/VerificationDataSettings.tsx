@@ -56,6 +56,7 @@ type CleanupResult = {
   removed_count?: number;
   already_removed_count?: number;
   failed_count?: number;
+  failures?: unknown[] | null;
   counts?: Record<string, number> | null;
   deleted?: unknown[] | null;
   message?: string;
@@ -236,6 +237,110 @@ function errorMessage(value: unknown, fallback: string): string {
   return fallback;
 }
 
+function cleanupStatus(value: CleanupResult): string {
+  return typeof value.status === "string" ? value.status.trim().toLowerCase() : "failed";
+}
+
+function cleanupFailureLabels(value: CleanupResult): string[] {
+  const failures: string[] = [];
+  const add = (candidate: unknown) => {
+    if (typeof candidate !== "string" || !candidate.trim()) return;
+    const normalized = candidate.trim();
+    if (!failures.includes(normalized)) failures.push(normalized);
+  };
+  if (Array.isArray(value.failures)) value.failures.forEach(add);
+  if (Array.isArray(value.deleted)) {
+    for (const result of value.deleted) {
+      if (isRecord(result) && Array.isArray(result.failures)) result.failures.forEach(add);
+    }
+  }
+  return failures.map((failure) => {
+    if (failure === "filesystem_cleanup") return "ファイルの後片づけ";
+    if (failure === "post_commit") return "後処理";
+    return failure;
+  });
+}
+
+const CLEANUP_DB_SUCCESS_STATUSES = new Set(["completed", "idempotent", "succeeded", "already_clean", "partial"]);
+
+function cleanupRunSummary(value: CleanupResult): { dbCompleted: number; failed: number; total: number } {
+  const rawRuns = Array.isArray(value.deleted) ? value.deleted : [];
+  if (rawRuns.length === 0) {
+    const status = cleanupStatus(value);
+    if (CLEANUP_DB_SUCCESS_STATUSES.has(status)) return { dbCompleted: 1, failed: 0, total: 1 };
+    if (status === "failed") return { dbCompleted: 0, failed: 1, total: 1 };
+    return { dbCompleted: 0, failed: 0, total: 0 };
+  }
+  let dbCompleted = 0;
+  let failed = 0;
+  for (const rawRun of rawRuns) {
+    const status = isRecord(rawRun) && typeof rawRun.status === "string"
+      ? rawRun.status.trim().toLowerCase()
+      : "failed";
+    if (CLEANUP_DB_SUCCESS_STATUSES.has(status)) dbCompleted += 1;
+    else failed += 1;
+  }
+  return { dbCompleted, failed, total: rawRuns.length };
+}
+
+function cleanupCountSuffix(value: CleanupResult): string {
+  const removed = typeof value.removed_count === "number" ? value.removed_count : null;
+  const alreadyRemoved = typeof value.already_removed_count === "number" ? value.already_removed_count : null;
+  const deletedRuns = Array.isArray(value.deleted) ? value.deleted.length : null;
+  const reportedRuns = typeof value.counts?.runs === "number" ? value.counts.runs : null;
+  const suffixParts = [
+    removed !== null || alreadyRemoved !== null
+      ? `削除済み ${removed ?? 0}件、既削除 ${alreadyRemoved ?? 0}件`
+      : null,
+    deletedRuns !== null
+      ? `処理 run ${deletedRuns}件`
+      : reportedRuns !== null
+        ? `処理 run ${reportedRuns}件`
+        : null,
+  ].filter((part): part is string => part !== null);
+  return suffixParts.length > 0 ? `（${suffixParts.join("、")}）` : "";
+}
+
+function cleanupFeedback(value: CleanupResult): { kind: "success" | "error"; message: string } {
+  const status = cleanupStatus(value);
+  const suffix = cleanupCountSuffix(value);
+  const failures = cleanupFailureLabels(value);
+  const runSummary = cleanupRunSummary(value);
+  const failureText = failures.length > 0 ? `失敗: ${failures.join("、")}` : "失敗した後処理があります";
+  const mixedRunText = `DB削除完了${runSummary.dbCompleted}件、失敗${runSummary.failed}件`;
+  if (status === "partial") {
+    if (runSummary.dbCompleted > 0 && runSummary.failed > 0) {
+      return {
+        kind: "error",
+        message: `${mixedRunText}。${failureText}。${suffix}残った対象を確認して再実行してください。`,
+      };
+    }
+    return {
+      kind: "error",
+      message: `検証データのDB削除は完了しましたが、${failureText}。${suffix}残ったファイルを確認して再実行してください。`,
+    };
+  }
+  if (status === "failed") {
+    return {
+      kind: "error",
+      message: `検証データの削除処理に失敗しました。${failureText}${suffix}`,
+    };
+  }
+  if (status === "idempotent") {
+    return {
+      kind: "success",
+      message: `検証データは既に削除済みです。${suffix}`,
+    };
+  }
+  if (status !== "completed" && status !== "succeeded" && status !== "already_clean") {
+    return {
+      kind: "error",
+      message: `検証データの削除結果を確認できませんでした。${failureText}`,
+    };
+  }
+  return { kind: "success", message: `検証データの削除処理が完了しました。${suffix}` };
+}
+
 export function VerificationDataSettings() {
   const [expanded, setExpanded] = useState(false);
   const fetchPreview = useCallback(async (): Promise<VerificationPreview> => {
@@ -365,22 +470,7 @@ export function VerificationDataSettings() {
       });
       const body = await readJson<CleanupResult>(response);
       if (!response.ok) throw new Error(errorMessage(body, `削除に失敗しました（${response.status}）`));
-      const removed = typeof body?.removed_count === "number" ? body.removed_count : null;
-      const alreadyRemoved = typeof body?.already_removed_count === "number" ? body.already_removed_count : null;
-      const deletedRuns = Array.isArray(body?.deleted) ? body.deleted.length : null;
-      const reportedRuns = typeof body?.counts?.runs === "number" ? body.counts.runs : null;
-      const suffixParts = [
-        removed !== null || alreadyRemoved !== null
-          ? `削除済み ${removed ?? 0}件、既削除 ${alreadyRemoved ?? 0}件`
-          : null,
-        deletedRuns !== null
-          ? `処理 run ${deletedRuns}件`
-          : reportedRuns !== null
-            ? `処理 run ${reportedRuns}件`
-            : null,
-      ].filter((part): part is string => part !== null);
-      const suffix = suffixParts.length > 0 ? `（${suffixParts.join("、")}）` : "";
-      setFeedback({ kind: "success", message: `検証データの削除処理が完了しました。${suffix}` });
+      setFeedback(cleanupFeedback(body ?? {}));
       setSelectedKeysOverride(null);
       await loadPreview({ clearFeedback: false });
     } catch (cause) {
@@ -401,12 +491,9 @@ export function VerificationDataSettings() {
       targetId="verification-data"
       onOpenChange={setExpanded}
       summary={<Badge variant="outline">admin only</Badge>}
+      help="明示的なprovenanceがあり、A判定になった検証データだけを対象にします。B/C判定や判定不能のデータは表示・操作しません。"
     >
       <div className="space-y-3" data-verification-data-settings>
-        <p className="text-xs text-muted-foreground">
-          明示的な provenance があり、A 判定になった検証データだけを対象にします。B/C 判定や判定不能のデータは表示・操作しません。
-        </p>
-
         {isLoading && !preview ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
             <Loader2 className="size-4 animate-spin" />
@@ -534,14 +621,14 @@ export function VerificationDataSettings() {
               </CardContent>
             </Card>
 
-            {feedback ? (
-              <p className={feedback.kind === "error" ? "text-sm text-destructive" : "flex items-center gap-1 text-sm text-green-600 dark:text-green-400"} role={feedback.kind === "error" ? "alert" : "status"}>
-                {feedback.kind === "success" ? <CheckCircle2 className="size-4" /> : null}
-                {feedback.message}
-              </p>
-            ) : null}
           </>
         )}
+        {feedback ? (
+          <p className={feedback.kind === "error" ? "text-sm text-destructive" : "flex items-center gap-1 text-sm text-green-600 dark:text-green-400"} role={feedback.kind === "error" ? "alert" : "status"}>
+            {feedback.kind === "success" ? <CheckCircle2 className="size-4" /> : null}
+            {feedback.message}
+          </p>
+        ) : null}
       </div>
     </SettingsDisclosure>
   );

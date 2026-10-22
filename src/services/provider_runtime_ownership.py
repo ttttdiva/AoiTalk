@@ -114,7 +114,14 @@ def _openai_compatible_local_runtime(
         return None, False
 
     runtime = managed_local_runtime_for_model(config, selected_model)
-    if runtime == "freetoken":
+    if runtime == "strata":
+        from src.services.strata_runtime import strata_external
+
+        if strata_external(config):
+            return runtime, False
+        env_name = "STRATA_AUTO_START"
+        config_key = "openai_compatible_local.strata.auto_start"
+    elif runtime == "freetoken":
         env_name = "FREETOKEN_AUTO_START"
         config_key = "openai_compatible_local.freetoken.auto_start"
     else:
@@ -266,7 +273,7 @@ def provider_runtime_ownership(
             process_owner="managed" if managed else "external",
             managed_runtime=managed,
             supports_install=actionable,
-            supports_delete=actionable,
+            supports_delete=actionable and runtime != "strata",
             supports_stop=actionable,
             platform_candidate=True,
             platform_reason=(

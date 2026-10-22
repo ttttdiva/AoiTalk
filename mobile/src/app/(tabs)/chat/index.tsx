@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   BackHandler,
   FlatList,
@@ -29,7 +30,7 @@ import { useAuth } from "../../../contexts/AuthContext";
 import { useProject } from "../../../contexts/ProjectContext";
 import { conversationsRepo, uploadLocalSession } from "../../../repositories";
 import { chatRepo } from "../../../repositories/chat";
-import { applyForegroundConversationSessions } from "../../../repositories/conversations";
+import { applyForegroundConversationSessions, subscribeToConversationChanges } from "../../../repositories/conversations";
 import { runSync } from "../../../sync/engine";
 import { scheduleSyncAfterInteractions } from "../../../lib/background-sync";
 import { createCurrentCharacterSession } from "../../../features/characters/current-character";
@@ -38,6 +39,11 @@ import {
   animateNextListChange,
   areConversationListsEqual,
 } from "../../../features/ui/list-transitions";
+import {
+  filterChatSearchResults,
+  filterChatSessions,
+  type ChatHistoryFilter,
+} from "../../../lib/chat-session-view";
 import { useReducedMotion } from "../../../features/ui/use-reduced-motion";
 import { ScreenHeader } from "../../../components/screen-header";
 import {
@@ -48,10 +54,17 @@ import {
 } from "../../../features/conversation/session-selection";
 import type { ConversationSession } from "../../../types/api";
 import { chatApi, type ConversationSearchResult } from "../../../lib/chat-api";
+import { ConversationHistoryFilter } from "../../../components/conversation-history-filter";
+
+const CHAT_HISTORY_FILTER_KEY = "aoitalk-chat-history-status";
+
+function isChatHistoryFilter(value: string | null): value is ChatHistoryFilter {
+  return value === "all" || value === "ready" || value === "needs_attention" || value === "working";
+}
 
 export default function ChatListScreen() {
   const router = useRouter();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, user } = useAuth();
   const { selectedProjectId } = useProject();
   const reduceMotion = useReducedMotion();
   const reduceMotionRef = useRef(reduceMotion);
@@ -78,10 +91,13 @@ export default function ChatListScreen() {
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [copiedNotice, setCopiedNotice] = useState(false);
+  const [pinNotice, setPinNotice] = useState<string | null>(null);
   const [searchVisible, setSearchVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<ConversationSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [historyFilter, setHistoryFilter] = useState<ChatHistoryFilter>("all");
+  const historyFilterChangedRef = useRef(false);
   const creatingChatRef = useRef(false);
   const [creatingChat, setCreatingChat] = useState(false);
   const [createChatError, setCreateChatError] = useState<string | null>(null);
@@ -100,8 +116,30 @@ export default function ChatListScreen() {
   const longPressedSessionIdRef = useRef<string | null>(null);
 
   const showingSearch = searchVisible && Boolean(searchQuery.trim());
+  useEffect(() => {
+    let mounted = true;
+    void AsyncStorage.getItem(CHAT_HISTORY_FILTER_KEY).then((saved) => {
+      if (mounted && !historyFilterChangedRef.current && isChatHistoryFilter(saved)) {
+        setHistoryFilter(saved);
+      }
+    }).catch(() => undefined);
+    return () => { mounted = false; };
+  }, []);
+  const changeHistoryFilter = useCallback((value: ChatHistoryFilter) => {
+    historyFilterChangedRef.current = true;
+    setHistoryFilter(value);
+    void AsyncStorage.setItem(CHAT_HISTORY_FILTER_KEY, value).catch(() => undefined);
+  }, []);
+  const filteredSessions = useMemo(
+    () => filterChatSessions(sessions, historyFilter),
+    [historyFilter, sessions],
+  );
+  const filteredSearchResults = useMemo(
+    () => filterChatSearchResults(searchResults, historyFilter),
+    [historyFilter, searchResults],
+  );
   const listData: Array<ConversationSession | ConversationSearchResult> =
-    showingSearch ? searchResults : sessions;
+    showingSearch ? filteredSearchResults : filteredSessions;
   const visibleSessionIds = useMemo(() => getVisibleSessionIds(listData), [listData]);
   const selectedCount = visibleSessionIds.filter((id) => selectedSessionIds.has(id)).length;
   const allSelected = visibleSessionIds.length > 0 && selectedCount === visibleSessionIds.length;
@@ -142,7 +180,7 @@ export default function ChatListScreen() {
   }, [selectionMode, deleteTargets.length, clearSelection]);
 
   const loadSessions = useCallback(
-    async (options?: { forceRefresh?: boolean }) => {
+    async (options?: { forceRefresh?: boolean; localOnly?: boolean }) => {
       if (!focusedRef.current) return;
       if (deletingRef.current) {
         reloadAfterDeleteRef.current = true;
@@ -163,8 +201,6 @@ export default function ChatListScreen() {
 
       if (options?.forceRefresh) {
         try {
-          await runSync();
-          if (requestId !== loadRequestRef.current) return;
           const list = await conversationsRepo.listSessions(
             selectedProjectId,
             options,
@@ -173,15 +209,43 @@ export default function ChatListScreen() {
         } catch {
           // Keep the current list visible if an explicit refresh fails.
         }
+        if (requestId !== loadRequestRef.current) return;
+        // Chat一覧の明示更新をDocs等の全体sync完了待ちにしない。
+        // 会話一覧は上で直接更新し、残りの同期は操作後にバックグラウンドで収束させる。
+        syncTaskRef.current = scheduleSyncAfterInteractions(async () => {
+          if (requestId !== loadRequestRef.current) return;
+          try {
+            applyList(await conversationsRepo.listSessionsLocal(selectedProjectId));
+          } catch {
+            // 全体同期後の再読込失敗でも、直接取得した一覧を維持する。
+          }
+        });
         return;
       }
 
+      let localSessions: ConversationSession[] | null = null;
       try {
-        applyList(await conversationsRepo.listSessionsLocal(selectedProjectId));
+        localSessions = await conversationsRepo.listSessionsLocal(selectedProjectId);
+        applyList(localSessions);
       } catch {
         // A sync can still repair a failed/stale local read.
       }
       if (requestId !== loadRequestRef.current) return;
+
+      if (options?.localOnly) return;
+
+      // 初回/再ログイン直後などSQLiteが空のときは、重いDocs同期を含むrunSyncに
+      // 会話一覧表示を依存させない。listSessionsはlocalが空の場合だけ
+      // /api/conversationsを直接取得するため、通常のlocal-first表示は維持される。
+      if (localSessions?.length === 0) {
+        try {
+          applyList(await conversationsRepo.listSessions(selectedProjectId));
+        } catch {
+          // Offline/未認証では空のローカル一覧をそのまま表示する。
+        }
+        if (requestId !== loadRequestRef.current) return;
+      }
+
       syncTaskRef.current = scheduleSyncAfterInteractions(async () => {
         if (requestId !== loadRequestRef.current) return;
         try {
@@ -191,7 +255,7 @@ export default function ChatListScreen() {
         }
       });
     },
-    [selectedProjectId],
+    [selectedProjectId, isAuthenticated, user?.user_id],
   );
   const loadSessionsRef = useRef(loadSessions);
   loadSessionsRef.current = loadSessions;
@@ -199,8 +263,14 @@ export default function ChatListScreen() {
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
+      // Drawer pin changes do not change route focus. Repository notifications
+      // only reread SQLite; they must never start another remote refresh/sync.
+      const unsubscribe = subscribeToConversationChanges(() => {
+        void loadSessions({ localOnly: true });
+      });
       void loadSessions();
       return () => {
+        unsubscribe();
         focusedRef.current = false;
         screenEpochRef.current += 1;
         loadRequestRef.current += 1;
@@ -258,6 +328,7 @@ export default function ChatListScreen() {
     try {
       const session = await createCurrentCharacterSession(selectedProjectId, {
         localFirst: true,
+        userId: user?.user_id,
       });
 
       setSessions((previous) => [
@@ -393,6 +464,11 @@ export default function ChatListScreen() {
         targets,
         (id) => conversationsRepo.deleteSession(id),
       );
+      if (deletedIds.length > 0) {
+        void runSync().catch(() => {
+          // The durable outbox keeps server deletes pending until connectivity returns.
+        });
+      }
       const deleted = new Set(deletedIds);
       setSessions((current) => current.filter((session) => !deleted.has(session.id)));
       setSearchResults((current) => current.filter((item) => !deleted.has(item.session_id)));
@@ -424,6 +500,37 @@ export default function ChatListScreen() {
     await Clipboard.setStringAsync(actionTarget.id);
     setActionTarget(null);
     setCopiedNotice(true);
+  };
+
+  const handleTogglePin = async () => {
+    if (!actionTarget) return;
+    const target = actionTarget;
+    const nextPinned = !target.is_pinned;
+    setActionTarget(null);
+    try {
+      await conversationsRepo.setSessionPinned(target.id, nextPinned);
+      const list = await conversationsRepo.listSessionsLocal(selectedProjectId);
+      if (focusedRef.current) {
+        animateNextListChange(reduceMotionRef.current);
+        setSessions(list);
+      }
+      setPinNotice(
+        nextPinned ? "会話をピン留めしました" : "ピン留めを解除しました",
+      );
+      void runSync()
+        .then(() => {
+          if (focusedRef.current) void loadSessionsRef.current();
+        })
+        .catch(() => {
+          // The outbox keeps the mutation pending until connectivity returns.
+        });
+    } catch (error) {
+      setPinNotice(
+        error instanceof Error
+          ? error.message
+          : "ピン状態を更新できませんでした。",
+      );
+    }
   };
 
   const openRename = () => {
@@ -502,6 +609,23 @@ export default function ChatListScreen() {
     setSelectedSessionIds((current) => new Set(current).add(sessionId));
   };
 
+  const markSessionOpened = (sessionId: string) => {
+    void conversationsRepo.markSessionRead?.(sessionId);
+    // The server projection defines ready as an unread completed response.
+    // Keep an active ready filter coherent while the durable read request and
+    // its follow-up sync are still in flight.
+    setSessions((current) => current.map((session) =>
+      session.id === sessionId && session.history_status === "ready"
+        ? { ...session, history_status: "idle", is_unread: false }
+        : session,
+    ));
+    setSearchResults((current) => current.map((result) =>
+      result.session_id === sessionId && result.history_status === "ready"
+        ? { ...result, history_status: "idle" }
+        : result,
+    ));
+  };
+
   const pressSession = (sessionId: string) => {
     if (deletingRef.current) return;
     // 長押しと同じジェスチャーのpressだけを無視し、次のpressInで解除する。
@@ -517,6 +641,7 @@ export default function ChatListScreen() {
       setSearchVisible(false);
       setSearchQuery("");
     }
+    markSessionOpened(sessionId);
     router.push(`/(tabs)/chat/${sessionId}`);
   };
 
@@ -560,7 +685,29 @@ export default function ChatListScreen() {
       description={`${item.snippet}${item.character_name ? ` · ${item.character_name}` : ""}`}
       left={(props) => selectionMode
         ? selectionCheckbox(item.session_id)
-        : <List.Icon {...props} icon="text-search" color="#89b4fa" />}
+        : (
+          <List.Icon
+            {...props}
+            icon={
+              item.history_status === "ready"
+                ? "check-circle-outline"
+                : item.history_status === "needs_attention"
+                  ? "alert-circle-outline"
+                  : item.is_pinned
+                    ? "pin"
+                    : "text-search"
+            }
+            color={
+              item.history_status === "needs_attention"
+                ? "#f9a8d4"
+                : item.history_status === "ready"
+                  ? "#89dceb"
+                  : item.is_pinned
+                    ? "#c4b5fd"
+                    : "#89b4fa"
+            }
+          />
+        )}
       style={[styles.listItem, selectionMode && selectedSessionIds.has(item.session_id) && styles.selectedItem]}
     />
   );
@@ -579,7 +726,29 @@ export default function ChatListScreen() {
       descriptionStyle={styles.sessionDesc}
       left={(props) => selectionMode
         ? selectionCheckbox(item.id)
-        : <List.Icon {...props} icon="chat" color="#7c3aed" />}
+        : (
+          <List.Icon
+            {...props}
+            icon={
+              item.history_status === "ready"
+                ? "check-circle-outline"
+                : item.history_status === "needs_attention"
+                  ? "alert-circle-outline"
+                  : item.is_pinned
+                    ? "pin"
+                    : "chat"
+            }
+            color={
+              item.history_status === "needs_attention"
+                ? "#f9a8d4"
+                : item.history_status === "ready"
+                  ? "#89dceb"
+                  : item.is_pinned
+                    ? "#c4b5fd"
+                    : "#7c3aed"
+            }
+          />
+        )}
       right={selectionMode ? undefined : () => (
         <IconButton
           icon="dots-vertical"
@@ -607,15 +776,22 @@ export default function ChatListScreen() {
           <IconButton
             icon="close"
             iconColor="#cdd6f4"
+            style={styles.headerIconButton}
             accessibilityLabel="複数選択を終了"
             disabled={deleting}
             onPress={() => { if (!deletingRef.current) clearSelection(); }}
           />
         ) : (
           <View style={styles.headerActions}>
+            <ConversationHistoryFilter
+              value={historyFilter}
+              onChange={changeHistoryFilter}
+              disabled={deleting}
+            />
             <IconButton
               icon="account-multiple-plus-outline"
               iconColor="#cdd6f4"
+              style={styles.headerIconButton}
               accessibilityLabel="新規グループチャット"
               disabled={!isAuthenticated || deleting}
               onPress={openGroupPicker}
@@ -623,6 +799,7 @@ export default function ChatListScreen() {
             <IconButton
               icon={searchVisible ? "magnify-close" : "magnify"}
               iconColor="#cdd6f4"
+              style={styles.headerIconButton}
               accessibilityLabel="会話を検索"
               disabled={deleting}
               onPress={() => {
@@ -701,11 +878,15 @@ export default function ChatListScreen() {
               {searching
                 ? "検索中…"
                 : searchVisible && searchQuery.trim()
-                  ? "検索結果はありません。"
+                  ? historyFilter === "all" ? "検索結果はありません。" : "この状態の検索結果はありません。"
+                  : historyFilter !== "all"
+                    ? "この状態の会話はありません。"
                   : "No conversations yet."}
             </Text>
             <Text style={styles.emptySubtext}>
-              Create a session to start chatting.
+              {historyFilter !== "all" && !(searchVisible && searchQuery.trim())
+                ? "履歴フィルターを変更してください。"
+                : "Create a session to start chatting."}
             </Text>
           </View>
         }
@@ -813,11 +994,31 @@ export default function ChatListScreen() {
               onPress={openRename}
             />
             <List.Item
+              title={actionTarget?.is_pinned ? "ピン留めを解除" : "ピン留め"}
+              description={
+                (actionTarget?.user_id === "" || actionTarget?.is_local_only === true)
+                  ? "サーバー同期後に利用できます"
+                  : undefined
+              }
+              left={(props) => (
+                <List.Icon
+                  {...props}
+                  icon={
+                    actionTarget?.is_pinned
+                      ? "pin-off-outline"
+                      : "pin-outline"
+                  }
+                />
+              )}
+              disabled={(actionTarget?.user_id === "" || actionTarget?.is_local_only === true)}
+              onPress={() => void handleTogglePin()}
+            />
+            <List.Item
               title="セッションIDをコピー"
               left={(props) => <List.Icon {...props} icon="content-copy" />}
               onPress={() => void handleCopySessionId()}
             />
-            {actionTarget?.user_id === "" ? (
+            {(actionTarget?.user_id === "" || actionTarget?.is_local_only === true) ? (
               <List.Item
                 title="サーバーへ同期"
                 left={(props) => <List.Icon {...props} icon="cloud-upload-outline" />}
@@ -975,6 +1176,14 @@ export default function ChatListScreen() {
           セッションIDをコピーしました
         </Snackbar>
         <Snackbar
+          visible={!!pinNotice}
+          onDismiss={() => setPinNotice(null)}
+          duration={3200}
+          style={styles.snackbar}
+        >
+          {pinNotice}
+        </Snackbar>
+        <Snackbar
           visible={!!createChatError}
           onDismiss={() => setCreateChatError(null)}
           duration={4000}
@@ -989,7 +1198,18 @@ export default function ChatListScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  headerActions: { flexDirection: "row", alignItems: "center" },
+  headerActions: {
+    width: "100%",
+    maxWidth: "100%",
+    minWidth: 0,
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    flexWrap: "wrap",
+    gap: 2,
+  },
+  headerIconButton: { width: 44, height: 44, minWidth: 44, minHeight: 44, margin: 0 },
   searchInput: { backgroundColor: "#1e1e2e", marginHorizontal: 12, marginBottom: 6 },
   listItem: { backgroundColor: "#11111b", paddingVertical: 4 },
   selectedItem: { backgroundColor: "#302445" },

@@ -22,23 +22,8 @@ export type ConversationNetworkTarget = "server" | "direct";
 
 export function inferSessionKind(session: ConversationSession | null): SessionKind {
   if (!session) return "normal";
-  const characterName = session.character_name || "";
-  const title = session.title || "";
   if ((session as ConversationSession & { is_group_chat?: boolean }).is_group_chat) {
     return "group";
-  }
-  if (characterName.startsWith("trpg_room_") || title.startsWith("[TRPG]")) {
-    return "trpg-linked";
-  }
-  if (/^scenario_roleplay:[^:]+:[^:]+$/.test(characterName)) {
-    return "scenario-roleplay";
-  }
-  if (
-    characterName.startsWith("scenario_") ||
-    title.startsWith("[シナリオ]") ||
-    title.startsWith("[執筆]")
-  ) {
-    return "scenario-writing";
   }
   return "normal";
 }
@@ -160,13 +145,6 @@ export function buildSessionCapabilities(args: {
   if (args.sessionKind === "group") {
     capabilities.add("canGroupRespond");
   }
-  if (
-    args.sessionKind === "scenario-roleplay" ||
-    args.sessionKind === "scenario-writing" ||
-    args.sessionKind === "trpg-linked"
-  ) {
-    capabilities.add("canSteer");
-  }
   return Array.from(capabilities);
 }
 
@@ -250,17 +228,6 @@ export function buildCommandRegistry(args: {
             : busy
               ? busyReason
               : undefined,
-    },
-    {
-      id: "scenario-steering",
-      label: "Steering",
-      description: "シナリオ/RP/TRPG の進行設定を開きます。",
-      icon: "tune-variant",
-      category: "session",
-      enabled: capabilityEnabled(args.capabilities, "canSteer"),
-      reason: capabilityEnabled(args.capabilities, "canSteer")
-        ? undefined
-        : "シナリオ/RP/TRPG セッションで利用できます",
     },
     {
       id: "edit-message",

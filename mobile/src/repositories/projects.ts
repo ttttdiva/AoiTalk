@@ -15,6 +15,7 @@
 
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import {
   ApiHttpError,
@@ -28,7 +29,8 @@ import { projectApi } from "../lib/project-api";
 import { isForeignDefaultInboxProject } from "../lib/project-list-visibility";
 import { canAttemptAoiTalkServer } from "../stores/network";
 import type { Project as ApiProject } from "../types/api";
-import { enqueueOutbox, randomId } from "./outbox";
+import { enqueueOutbox, getOutboxMutationWakeScope, randomId } from "./outbox";
+import { notifyMutationQueued } from "../sync/task-mutation-wake";
 
 type DbProject = typeof schema.projects.$inferSelect;
 const DEFAULT_LOCAL_PROJECT_ID = "local-default-project";
@@ -420,7 +422,7 @@ export const projectsRepo = {
     const local = buildLocalProject(data);
     await applyRemoteProjects([local]);
     if (hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "projects",
         action: "create",
         entityId: local.id,
@@ -434,6 +436,10 @@ export const projectsRepo = {
           project_metadata: local.metadata ?? null,
         },
       });
+      const wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      notifyMutationQueued(wakeScope);
     }
     return local;
   },
@@ -495,7 +501,7 @@ export const projectsRepo = {
       throw new Error("Project not found");
     }
     if (before && hasToken) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "projects",
         action: "update",
         entityId: projectId,
@@ -503,6 +509,10 @@ export const projectsRepo = {
         payload: data,
         baseUpdatedAt: before.updated_at ?? null,
       });
+      const wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      notifyMutationQueued(wakeScope);
     }
     return local;
   },
@@ -530,7 +540,7 @@ export const projectsRepo = {
       .set({ deletedAt: now, updatedAt: now })
       .where(eq(schema.projects.id, projectId));
     if (shouldQueue) {
-      await enqueueOutbox({
+      const opId = await enqueueOutbox({
         table: "projects",
         action: "delete",
         entityId: projectId,
@@ -538,6 +548,10 @@ export const projectsRepo = {
         payload: {},
         baseUpdatedAt: before?.updated_at ?? null,
       });
+      const wakeScope = await runForegroundSqliteWrite(() =>
+        getOutboxMutationWakeScope(opId),
+      );
+      notifyMutationQueued(wakeScope);
     }
   },
 };

@@ -4,12 +4,17 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useId,
+  type ReactNode,
   useRef,
   useState,
 } from "react";
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Info,
   Clock3,
   Loader2,
   RefreshCw,
@@ -18,12 +23,7 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 import { ProjectOverviewGraph } from "./project-overview-graph";
@@ -52,7 +52,8 @@ const ERROR_LABELS: Record<string, string> = {
   overview_generation_timeout: "生成がタイムアウトしました。",
   overview_provider_error: "Overview生成モデルを利用できませんでした。",
   overview_invalid_json: "生成結果を解釈できませんでした。",
-  overview_layout_validation_failed: "生成結果がOverview形式に適合しませんでした。",
+  overview_layout_validation_failed:
+    "生成結果がOverview形式に適合しませんでした。",
   overview_layout_invalid: "保存済みOverview形式を安全に表示できません。",
   overview_response_invalid: "Overview応答を安全に表示できません。",
   overview_refresh_failed: "Overview更新に失敗しました。",
@@ -65,10 +66,7 @@ const ERROR_LABELS: Record<string, string> = {
   client_creation_failed: "Overview生成モデルの初期化に失敗しました。",
 };
 
-const EMPHASIS_CLASS: Record<
-  ProjectOverviewSection["emphasis"],
-  string
-> = {
+const EMPHASIS_CLASS: Record<ProjectOverviewSection["emphasis"], string> = {
   normal: "border-border bg-card",
   primary: "border-primary/40 bg-primary/5",
   warning: "border-amber-500/40 bg-amber-500/5",
@@ -92,18 +90,13 @@ async function responseError(
   response: Response,
   fallback: string,
 ): Promise<string> {
-  return errorDetail(
-    await response.json().catch(() => null),
-    fallback,
-  );
+  return errorDetail(await response.json().catch(() => null), fallback);
 }
 
 function formatTimestamp(value: string | null | undefined): string {
   if (!value) return "未生成";
   const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : date.toLocaleString("ja-JP");
+  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString("ja-JP");
 }
 
 function statusIcon(status: ProjectOverviewStatus) {
@@ -125,75 +118,95 @@ function knownSafeError(value: string | null): string | null {
   return ERROR_LABELS[value] ?? "Overview生成に失敗しました。";
 }
 
-function isTransitionalStatus(
-  status: ProjectOverviewStatus,
-): boolean {
+function isTransitionalStatus(status: ProjectOverviewStatus): boolean {
   return status === "pending" || status === "building";
 }
 
-function MemoryEvidenceButton({
-  memory,
-  selected,
-  onSelect,
-}: {
-  memory: ProjectOverviewMemoryRef;
-  selected: boolean;
-  onSelect: () => void;
-}) {
+function sameText(left: string | null, right: string): boolean {
   return (
-    <button
-      type="button"
-      aria-pressed={selected}
-      className={cn(
-        "w-full rounded-md border px-3 py-2 text-left transition-colors",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        selected
-          ? "border-primary bg-primary/10"
-          : "border-border bg-background hover:border-primary/50",
-      )}
-      onClick={onSelect}
-    >
-      <div className="flex min-w-0 items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-sm font-medium">
-          {memory.title || memory.content || "Project Memory"}
-        </span>
-        <Badge variant="outline" className="shrink-0 text-[10px]">
-          {memory.memory_type}
-        </Badge>
-      </div>
-      {memory.content ? (
-        <p className="mt-1 line-clamp-3 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
+    Boolean(left?.trim()) &&
+    left!.replace(/\s+/g, " ").trim() === right.replace(/\s+/g, " ").trim()
+  );
+}
+
+function MemoryDetails({ memory }: { memory: ProjectOverviewMemoryRef }) {
+  return (
+    <div className="min-w-0 space-y-2 text-xs">
+      {!sameText(memory.title, memory.content) && memory.content ? (
+        <p className="whitespace-pre-wrap leading-6 [overflow-wrap:anywhere]">
           {memory.content}
         </p>
       ) : null}
-    </button>
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+        <span>{memory.memory_type}</span>
+        {memory.is_pinned ? <span>固定済み</span> : null}
+        {memory.updated_at ? (
+          <span>メモリ更新 {formatTimestamp(memory.updated_at)}</span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function MemoryRecord({ memory }: { memory: ProjectOverviewMemoryRef }) {
+  return (
+    <details className="group min-w-0 rounded-md border border-border/70 bg-background/60 open:bg-background">
+      <summary className="flex min-w-0 cursor-pointer list-none items-start gap-2 px-3 py-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start gap-2">
+            <span className="min-w-0 flex-1 line-clamp-2 text-sm font-medium leading-5 [overflow-wrap:anywhere] group-open:line-clamp-none">
+              {memory.title || "メモリの記録"}
+            </span>
+            <Badge
+              variant="outline"
+              className="max-w-24 shrink-0 truncate text-[10px]"
+            >
+              {memory.memory_type}
+            </Badge>
+          </div>
+          {memory.content && !sameText(memory.title, memory.content) ? (
+            <p className="mt-1 line-clamp-2 whitespace-pre-wrap text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere] group-open:hidden">
+              {memory.content}
+            </p>
+          ) : null}
+        </div>
+        <ChevronDown
+          aria-hidden="true"
+          className="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180"
+        />
+      </summary>
+      <div className="min-w-0 border-t border-border/60 px-3 py-2.5">
+        <MemoryDetails memory={memory} />
+      </div>
+    </details>
   );
 }
 
 function OverviewSection({
   section,
   memoryRefs,
-  selectedMemoryIds,
-  onSelectMemoryIds,
+  id,
 }: {
   section: ProjectOverviewSection;
   memoryRefs: Record<string, ProjectOverviewMemoryRef>;
-  selectedMemoryIds: Set<string>;
-  onSelectMemoryIds: (ids: string[]) => void;
+  id: string;
 }) {
   return (
     <section
+      id={id}
+      tabIndex={-1}
       className={cn(
-        "rounded-lg border",
-        section.density === "compact" ? "p-3" : "p-4",
+        "min-w-0 scroll-mt-3 rounded-lg border p-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         EMPHASIS_CLASS[section.emphasis],
       )}
     >
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h3 className="text-sm font-semibold">{section.title}</h3>
-        <Badge variant="secondary" className="text-[10px]">
-          {section.kind}
-        </Badge>
+      <div className="mb-2 flex min-w-0 items-start justify-between gap-2">
+        <h3 className="min-w-0 text-sm font-semibold [overflow-wrap:anywhere]">
+          {section.title}
+        </h3>
+        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+          参照 {section.memory_ids.length}件
+        </span>
       </div>
       {section.memory_ids.length === 0 ? (
         <p className="text-xs text-muted-foreground">
@@ -202,29 +215,22 @@ function OverviewSection({
       ) : (
         <div
           className={cn(
-            "grid gap-2",
+            "grid min-w-0 grid-cols-1 gap-2",
             section.columns === 2 && "md:grid-cols-2",
+            section.kind === "timeline" && "border-l-2 border-border pl-3",
           )}
         >
           {section.memory_ids.map((memoryId) => {
             const memory = memoryRefs[memoryId];
-            if (!memory) {
-              return (
-                <div
-                  key={memoryId}
-                  className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground"
-                >
-                  この参照メモリは現在activeではありません。
-                </div>
-              );
-            }
-            return (
-              <MemoryEvidenceButton
+            return memory ? (
+              <MemoryRecord key={memoryId} memory={memory} />
+            ) : (
+              <p
                 key={memoryId}
-                memory={memory}
-                selected={selectedMemoryIds.has(memoryId)}
-                onSelect={() => onSelectMemoryIds([memoryId])}
-              />
+                className="min-w-0 rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground"
+              >
+                この参照メモリは現在activeではありません。
+              </p>
             );
           })}
         </div>
@@ -236,12 +242,18 @@ function OverviewSection({
 export function ProjectOverviewPanel({
   projectId,
   canManageSettings,
+  taskSummary,
+  onOpenMemory,
 }: {
   projectId: string;
   canManageSettings: boolean;
+  taskSummary?: ReactNode;
+  onOpenMemory?: () => void;
 }) {
-  const [overview, setOverview] =
-    useState<ProjectOverviewResponse | null>(null);
+  const sectionPrefix = useId();
+  const [overview, setOverview] = useState<ProjectOverviewResponse | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -297,7 +309,7 @@ export function ProjectOverviewPanel({
           controller.signal.aborted ||
           generation !== requestGenerationRef.current
         ) {
-          return normalized;
+          return null;
         }
         setOverview(normalized);
         if (!normalized.layoutValid) {
@@ -389,9 +401,9 @@ export function ProjectOverviewPanel({
   }, [beginPolling, clearPoll, load]);
 
   const refresh = useCallback(async () => {
-    if (!canManageSettings || refreshing) return;
+    if (!canManageSettings || refreshing || refreshControllerRef.current)
+      return;
     clearPoll();
-    refreshControllerRef.current?.abort();
     const controller = new AbortController();
     refreshControllerRef.current = controller;
     setRefreshing(true);
@@ -406,6 +418,7 @@ export function ProjectOverviewPanel({
           signal: controller.signal,
         },
       );
+      if (controller.signal.aborted) return;
       if (!response.ok && response.status !== 202) {
         throw new Error(
           await responseError(
@@ -415,11 +428,10 @@ export function ProjectOverviewPanel({
         );
       }
       setOverview((current) =>
-        current
-          ? { ...current, status: "pending" }
-          : current,
+        current ? { ...current, status: "pending" } : current,
       );
       const next = await load({ quiet: true });
+      if (controller.signal.aborted) return;
       if (next && isTransitionalStatus(next.status)) {
         beginPolling();
       } else {
@@ -438,123 +450,106 @@ export function ProjectOverviewPanel({
         refreshControllerRef.current = null;
       }
     }
-  }, [
-    beginPolling,
-    canManageSettings,
-    clearPoll,
-    load,
-    projectId,
-    refreshing,
-  ]);
+  }, [beginPolling, canManageSettings, clearPoll, load, projectId, refreshing]);
 
   const status = projectOverviewDisplayStatus(overview, refreshing);
-  const selectedSet = useMemo(
-    () => new Set(selectedMemoryIds),
-    [selectedMemoryIds],
-  );
   const selectedMemories = useMemo(
     () =>
       selectedMemoryIds
         .map((id) => overview?.memory_refs[id])
-        .filter(
-          (item): item is ProjectOverviewMemoryRef =>
-            Boolean(item),
-        ),
+        .filter((item): item is ProjectOverviewMemoryRef => Boolean(item)),
     [overview?.memory_refs, selectedMemoryIds],
   );
   const hasContent = overview
     ? projectOverviewLayoutHasContent(overview.layout)
     : false;
-  const safeGenerationError = knownSafeError(
-    overview?.error_message ?? null,
-  );
+  const safeGenerationError = knownSafeError(overview?.error_message ?? null);
 
   return (
     <Card
-      className="border-border bg-card shadow-none"
+      className="min-w-0 gap-3 rounded-none border-0 bg-transparent py-0 shadow-none"
       data-testid="project-overview-panel"
     >
-      <CardHeader className="border-b border-border">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <CardTitle className="flex items-center gap-2 text-base font-semibold">
+      <CardHeader className="min-w-0 rounded-lg border border-border bg-card px-3 py-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <CardTitle className="flex items-center gap-2 text-sm font-semibold">
               <Sparkles className="size-4" />
-              Project Overview
+              メモリの記録
             </CardTitle>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Active Project Memory から生成された固定レイアウトです。
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
             <Badge
               variant={status === "fresh" ? "secondary" : "outline"}
               data-testid="project-overview-status"
             >
-              <span className="mr-1 inline-flex">
-                {statusIcon(status)}
-              </span>
+              <span className="mr-1 inline-flex">{statusIcon(status)}</span>
               {STATUS_LABELS[status]}
             </Badge>
-            {canManageSettings ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={refreshing}
-                onClick={() => void refresh()}
-              >
-                {refreshing ? (
-                  <Loader2 className="mr-2 size-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="mr-2 size-4" />
-                )}
-                更新
-              </Button>
-            ) : null}
-          </div>
-        </div>
-      </CardHeader>
-
-      <CardContent className="space-y-4 pt-5">
-        <dl className="grid gap-3 text-xs text-muted-foreground sm:grid-cols-3">
-          <div>
-            <dt>generated_at</dt>
-            <dd
-              className="mt-1 text-sm text-foreground"
+            <span
+              className="text-xs text-muted-foreground"
               data-testid="project-overview-generated-at"
             >
-              {formatTimestamp(overview?.generated_at)}
-            </dd>
+              構成更新 {formatTimestamp(overview?.generated_at)}
+            </span>
           </div>
-          <div>
-            <dt>generation_version</dt>
-            <dd className="mt-1 text-sm text-foreground">
-              {overview?.generation_version ?? 1}
-            </dd>
+          {canManageSettings ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={refreshing}
+              onClick={() => void refresh()}
+            >
+              {refreshing || isTransitionalStatus(status) ? (
+                <Loader2 className="mr-2 size-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 size-3.5" />
+              )}
+              更新
+            </Button>
+          ) : null}
+        </div>
+        <details className="min-w-0 text-xs text-muted-foreground">
+          <summary className="mt-1 flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <Info className="size-3.5" />
+            生成情報
+          </summary>
+          <div className="mt-2 space-y-2 border-t border-border pt-2">
+            <p>
+              Active Project
+              Memoryをもとにした表示構成です。記録中のタスク集計は、現在のタスク状態を示すものではありません。
+            </p>
+            <dl className="grid min-w-0 gap-2 sm:grid-cols-2">
+              <div>
+                <dt>構成生成日時</dt>
+                <dd>{formatTimestamp(overview?.generated_at)}</dd>
+              </div>
+              <div>
+                <dt>生成バージョン</dt>
+                <dd>{overview?.generation_version ?? "—"}</dd>
+              </div>
+              <div className="min-w-0 sm:col-span-2">
+                <dt>ソースダイジェスト</dt>
+                <dd className="font-mono text-[11px] [overflow-wrap:anywhere]">
+                  {overview?.source_digest || "—"}
+                </dd>
+              </div>
+            </dl>
+            {!canManageSettings ? (
+              <p>更新にはProjectのmanage_settings権限が必要です。</p>
+            ) : null}
           </div>
-          <div>
-            <dt>source_digest</dt>
-            <dd className="mt-1 truncate font-mono text-[11px] text-foreground">
-              {overview?.source_digest || "—"}
-            </dd>
-          </div>
-        </dl>
+        </details>
+      </CardHeader>
 
-        {!canManageSettings ? (
-          <p className="text-xs text-muted-foreground">
-            更新にはProjectのmanage_settings権限が必要です。
-          </p>
-        ) : null}
-
+      <CardContent className="min-w-0 space-y-3 px-0">
         {error ? (
           <div
             role="alert"
-            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm"
+            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm [overflow-wrap:anywhere]"
           >
             {error}
           </div>
         ) : null}
-
         {status === "failed" && safeGenerationError ? (
           <div
             role="status"
@@ -568,86 +563,132 @@ export function ProjectOverviewPanel({
             ) : null}
           </div>
         ) : null}
-
-        {loading && !overview ? (
-          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" />
-            Project Overviewを読み込み中…
-          </div>
-        ) : !overview ? null : !hasContent ? (
-          <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
-            <p className="text-sm font-medium">
-              Overviewはまだありません
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Active Project Memoryが追加されると自動更新されます。
-            </p>
-          </div>
-        ) : (
-          <>
-            {overview.layout.sections.length > 0 ? (
-              <div className="grid gap-3">
+        <div
+          className={cn(
+            "grid min-w-0 grid-cols-1 items-start gap-3",
+            taskSummary && "xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]",
+          )}
+        >
+          <div className="min-w-0 space-y-3">
+            {loading && !overview ? (
+              <div className="flex items-center gap-2 rounded-lg border bg-card p-4 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                Project Overviewを読み込み中…
+              </div>
+            ) : !overview ? null : !hasContent ? (
+              <div className="rounded-lg border border-dashed border-border px-3 py-4">
+                <p className="text-sm font-medium">Overviewはまだありません</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Active Project Memoryが追加されると自動更新されます。
+                </p>
+              </div>
+            ) : (
+              <>
+                {selectedMemories.length > 0 ? (
+                  <section
+                    aria-label="選択中のProject Memory"
+                    className="min-w-0 rounded-lg border border-primary/40 bg-card p-3"
+                  >
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <h3 className="text-sm font-semibold">根拠のメモリ</h3>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => setSelectedMemoryIds([])}
+                      >
+                        選択解除
+                      </Button>
+                    </div>
+                    <div className="min-w-0 space-y-3">
+                      {selectedMemories.map((memory) => (
+                        <article key={memory.id} className="min-w-0">
+                          <h4 className="mb-1 text-sm font-medium [overflow-wrap:anywhere]">
+                            {memory.title || "メモリの記録"}
+                          </h4>
+                          <MemoryDetails memory={memory} />
+                        </article>
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
+                {overview.layout.graph.nodes.length > 0 ? (
+                  <div className="min-w-0 space-y-2">
+                    <h3 className="text-sm font-semibold [overflow-wrap:anywhere]">
+                      {overview.layout.graph.title || "メモリに基づく関係図"}
+                    </h3>
+                    <ProjectOverviewGraph
+                      graph={overview.layout.graph}
+                      compact
+                      onSelectMemoryIds={setSelectedMemoryIds}
+                    />
+                  </div>
+                ) : null}
                 {overview.layout.sections.map((section, index) => (
                   <OverviewSection
                     key={
-                      section.id ||
-                      `${section.kind}-${index}-${section.title}`
+                      section.id || `${section.kind}-${index}-${section.title}`
                     }
+                    id={`${sectionPrefix}-section-${index}`}
                     section={section}
                     memoryRefs={overview.memory_refs}
-                    selectedMemoryIds={selectedSet}
-                    onSelectMemoryIds={setSelectedMemoryIds}
                   />
                 ))}
-              </div>
+              </>
+            )}
+            {hasContent ? (
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                本文は現在activeな参照メモリを最大2,000文字まで表示します。元の全文はメモリタブで確認できます。
+              </p>
             ) : null}
-
-            {overview.layout.graph.title ? (
-              <h3 className="text-sm font-semibold">
-                {overview.layout.graph.title}
-              </h3>
+          </div>
+          <aside className="order-first min-w-0 space-y-3 xl:order-last">
+            {taskSummary}
+            {overview && overview.layout.sections.length > 1 ? (
+              <nav
+                aria-label="参照セクション"
+                className="min-w-0 rounded-lg border border-border bg-card p-3"
+              >
+                <h3 className="mb-2 text-sm font-semibold">参照セクション</h3>
+                <ul className="divide-y divide-border">
+                  {overview.layout.sections.map((section, index) => (
+                    <li key={section.id || index}>
+                      <button
+                        type="button"
+                        className="flex w-full min-w-0 items-center gap-2 rounded-sm py-2 text-left text-xs hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={() => {
+                          const target = document.getElementById(
+                            `${sectionPrefix}-section-${index}`,
+                          );
+                          target?.scrollIntoView({ block: "start" });
+                          target?.focus({ preventScroll: true });
+                        }}
+                      >
+                        <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                          {section.title}
+                        </span>
+                        <ChevronRight className="size-3.5 shrink-0" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </nav>
             ) : null}
-
-            <ProjectOverviewGraph
-              graph={overview.layout.graph}
-              onSelectMemoryIds={setSelectedMemoryIds}
-            />
-          </>
-        )}
-
-        {selectedMemories.length > 0 ? (
-          <section
-            aria-label="選択中のProject Memory"
-            className="rounded-lg border border-border bg-surface-container-low p-3"
-          >
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold">
-                Evidence
-              </h3>
+            {onOpenMemory ? (
               <Button
                 type="button"
+                variant="outline"
                 size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                onClick={() => setSelectedMemoryIds([])}
+                className="w-full"
+                onClick={onOpenMemory}
               >
-                選択解除
+                元のメモリを開く
+                <ChevronRight className="ml-1 size-3.5" />
               </Button>
-            </div>
-            <div className="grid gap-2 md:grid-cols-2">
-              {selectedMemories.map((memory) => (
-                <MemoryEvidenceButton
-                  key={memory.id}
-                  memory={memory}
-                  selected
-                  onSelect={() =>
-                    setSelectedMemoryIds([memory.id])
-                  }
-                />
-              ))}
-            </div>
-          </section>
-        ) : null}
+            ) : null}
+          </aside>
+        </div>
       </CardContent>
     </Card>
   );

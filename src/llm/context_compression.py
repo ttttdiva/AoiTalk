@@ -8,6 +8,7 @@ for UI, logging, retries, and grounding guards.
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -41,6 +42,8 @@ FILE_LISTING_TOOLS = {
 PROTECTED_LATEST_TOOLS = {
     "get_project_progress",
 }
+MEDIA_TOOL_NAMES = frozenset({"media_search", "media_read"})
+MEDIA_TARGET_KINDS = frozenset({"media", "docs", "knowledge", "conversation"})
 
 ERROR_MARKERS = (
     "error:",
@@ -177,6 +180,58 @@ def context_compression_policy(
     )
 
 
+def compact_media_tool_result(
+    *,
+    tool_name: str,
+    output: str,
+    max_chars: int | None,
+) -> CompressionResult | None:
+    """Keep media search/read results parseable while reducing only safe fields.
+
+    ``media_search`` carries opaque ``read_args`` objects that are handed back
+    to ``media_read``.  ``media_read`` carries source citations and URLs that
+    must remain exact enough for grounding.  This public seam is shared by the
+    normal model-result path and provider-specific overflow retries; callers
+    must use the returned JSON as-is instead of applying a second clipper.
+
+    ``None`` means that the value is not a recognized media contract (or is not
+    a structured object), so the caller may use its ordinary fallback.
+    """
+
+    raw = str(output or "")
+    payload = _parse_structured(raw)
+    if not isinstance(payload, dict):
+        return None
+
+    resolved_name = str(tool_name or "").strip()
+    if not resolved_name:
+        resolved_name = _infer_media_tool_name(payload)
+    elif resolved_name not in MEDIA_TOOL_NAMES:
+        return None
+    if resolved_name not in MEDIA_TOOL_NAMES:
+        return None
+
+    limit = _parse_int(max_chars)
+    if limit is None or limit <= 0 or len(raw) <= limit:
+        return CompressionResult(
+            text=raw,
+            original_chars=len(raw),
+            compressed_chars=len(raw),
+            strategy=f"{resolved_name}_structured",
+        )
+
+    if resolved_name == "media_search":
+        text = _compact_media_search_payload(payload, limit)
+    else:
+        text = _compact_media_read_payload(payload, limit)
+    return CompressionResult(
+        text=text,
+        original_chars=len(raw),
+        compressed_chars=len(text),
+        strategy=f"{resolved_name}_structured",
+    )
+
+
 def model_tool_result_payload(
     *,
     tool_name: str,
@@ -207,6 +262,18 @@ def model_tool_result_payload(
                 text=document, original_chars=len(raw), compressed_chars=len(document),
                 strategy="docs_document_page",
             )
+    media_limit = (
+        max_chars
+        if max_chars is not None and max_chars > 0
+        else policy.max_chars if policy.enabled else None
+    )
+    media = compact_media_tool_result(
+        tool_name=tool_name,
+        output=raw,
+        max_chars=media_limit,
+    )
+    if media is not None:
+        return media
     if not policy.enabled:
         # Exact query metadata is a tool contract, including when optional
         # context compression is disabled. Never byte-clip a structured total.
@@ -257,6 +324,13 @@ def compress_tool_result_for_model(
                 text=document, original_chars=len(raw), compressed_chars=len(document),
                 strategy="docs_document_page",
             )
+    media = compact_media_tool_result(
+        tool_name=tool_name,
+        output=raw,
+        max_chars=target_chars,
+    )
+    if media is not None:
+        return media
     source = raw
     stripped_data_url = False
 
@@ -318,6 +392,202 @@ def compress_tool_result_for_model(
         source=source,
         strategy=strategy,
     )
+
+
+def _infer_media_tool_name(payload: dict[str, Any]) -> str:
+    """Infer a media contract only from stable, tool-specific fields."""
+
+    success = payload.get("success")
+    if type(success) is not bool:
+        return ""
+
+    results = payload.get("results")
+    if isinstance(results, list):
+        if any(
+            isinstance(item, dict)
+            and _is_media_read_args(item.get("read_args"))
+            for item in results
+        ):
+            return "media_search"
+        # Empty searches have no row-level read_args.  Require the result
+        # aggregate and several coverage fields before treating an arbitrary
+        # JSON list as the media search contract.
+        if (
+            {"total_count", "returned_count", "truncated", "complete"}
+            <= payload.keys()
+            and len(
+                {
+                    key
+                    for key in (
+                        "searched_scope",
+                        "lane_status",
+                        "query_sources",
+                        "next_step",
+                        "warnings",
+                    )
+                    if key in payload
+                }
+            )
+            >= 2
+        ):
+            return "media_search"
+
+    text = payload.get("text")
+    if isinstance(text, str):
+        target_kind = payload.get("target_kind")
+        citation = payload.get("citation")
+        locator = payload.get("locator")
+        has_url = "original_url" in payload or "conversation_url" in payload
+        if (
+            target_kind in MEDIA_TARGET_KINDS
+            and (
+                isinstance(citation, dict)
+                or isinstance(locator, dict)
+                or bool(payload.get("unit_id"))
+            )
+        ):
+            return "media_read"
+        # The media target's read response has unit_id/source identifiers but
+        # no target_kind; canonical Docs/Knowledge/Conversation responses have
+        # citation plus an original/conversation URL.
+        if (
+            has_url
+            and isinstance(citation, dict)
+            and ("complete" in payload or "warnings" in payload)
+        ):
+            return "media_read"
+        if (
+            has_url
+            and bool(payload.get("unit_id"))
+            and bool(payload.get("source_kind"))
+            and bool(payload.get("source_id"))
+        ):
+            return "media_read"
+    return ""
+
+
+def _is_media_read_args(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    target_kind = value.get("target_kind")
+    scope = value.get("scope")
+    if target_kind not in MEDIA_TARGET_KINDS or not isinstance(scope, str) or not scope:
+        return False
+    if target_kind == "media":
+        return bool(value.get("unit_id"))
+    locator = value.get("locator")
+    citation = value.get("citation")
+    expected_kind = {
+        "docs": "docs_node",
+        "knowledge": "knowledge_document",
+        "conversation": "conversation_message",
+    }[target_kind]
+    return (
+        isinstance(locator, dict)
+        and locator.get("kind") == expected_kind
+        and bool(locator.get("id"))
+        and isinstance(citation, dict)
+    )
+
+
+def _compact_media_search_payload(payload: dict[str, Any], max_chars: int) -> str:
+    """Reduce result count/snippets while preserving media_read handoff data."""
+
+    original_results = payload.get("results")
+    if not isinstance(original_results, list) or not original_results:
+        # Error/no-results envelopes contain the authoritative status and
+        # coverage explanation.  Minify only the JSON representation; never
+        # generic-clip their messages or warnings into a partial contract.
+        return _dump_media_json(payload)
+
+    original_count = len(original_results)
+    candidate_counts: list[int] = []
+    for count in (original_count, 8, 4, 2, 1):
+        bounded = max(1, min(original_count, count))
+        if bounded not in candidate_counts:
+            candidate_counts.append(bounded)
+
+    last = _dump_media_json(payload)
+    for result_count in candidate_counts:
+        snippet_limits: list[int] = []
+        for limit in (
+            max(8, min(300, max_chars // max(4, result_count * 2))),
+            max(8, min(160, max_chars // max(6, result_count * 3))),
+            24,
+            8,
+            1,
+        ):
+            if limit not in snippet_limits:
+                snippet_limits.append(limit)
+        for snippet_limit in snippet_limits:
+            compacted = copy.deepcopy(payload)
+            compacted_results: list[Any] = []
+            for result in original_results[:result_count]:
+                if not isinstance(result, dict):
+                    compacted_results.append(result)
+                    continue
+                item = copy.deepcopy(result)
+                snippet = item.get("snippet")
+                if isinstance(snippet, str) and len(snippet) > snippet_limit:
+                    item["snippet"] = _clip_media_string(snippet, snippet_limit)
+                    item["snippet_truncated"] = True
+                compacted_results.append(item)
+            compacted["results"] = compacted_results
+            if "returned_count" in compacted:
+                compacted["returned_count"] = len(compacted_results)
+            if "truncated" in compacted:
+                compacted["truncated"] = bool(compacted.get("truncated")) or (
+                    len(compacted_results) < original_count
+                )
+            last = _dump_media_json(compacted)
+            if len(last) <= max_chars:
+                return last
+    # An opaque locator/citation may be larger than the entire nominal budget;
+    # keep the shortest valid contract rather than cutting JSON or read_args.
+    return last
+
+
+def _compact_media_read_payload(payload: dict[str, Any], max_chars: int) -> str:
+    """Reduce only canonical read text while retaining source metadata."""
+
+    original_text = payload.get("text")
+    if not isinstance(original_text, str) or not original_text:
+        # Error payloads and empty reads retain their complete status envelope.
+        return _dump_media_json(payload)
+
+    last = _dump_media_json(payload)
+    text_limits: list[int] = []
+    for limit in (
+        max(8, max_chars // 2),
+        max(8, max_chars // 4),
+        24,
+        8,
+        1,
+    ):
+        if limit not in text_limits:
+            text_limits.append(limit)
+    for text_limit in text_limits:
+        compacted = copy.deepcopy(payload)
+        compacted["text"] = _clip_media_string(original_text, text_limit)
+        shortened = len(original_text) > text_limit
+        if shortened:
+            compacted["text_truncated"] = True
+            # A context-shortened body must never be presented as complete
+            # source evidence, even when the producer omitted the field.
+            compacted["complete"] = False
+        last = _dump_media_json(compacted)
+        if len(last) <= max_chars:
+            return last
+    return last
+
+
+def _clip_media_string(value: str, limit: int) -> str:
+    text = str(value or "")
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit == 1:
+        return "…"
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _compress_docs_document_page(raw: str, max_chars: int) -> str | None:
@@ -899,6 +1169,10 @@ def _dedupe_indexed_items_preserve_order(
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _dump_media_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _strategy_enabled(policy: ContextCompressionPolicy, strategy: str) -> bool:

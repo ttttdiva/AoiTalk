@@ -38,6 +38,49 @@ def _repo_map_path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _active_private_agent_read_root() -> tuple[Optional[Path], Optional[str]]:
+    """Return the bound non-native AgentDialogue read root, if present."""
+
+    try:
+        from ..os_operations.tools import _agent_dialogue_read_root
+    except ImportError:
+        # Stripped embeddings without AgentDialogue support retain the legacy
+        # Personal RepoMap lane.
+        return None, None
+    try:
+        return _agent_dialogue_read_root()
+    except Exception as exc:  # pragma: no cover - defensive boundary guard
+        return None, f"Agent workspace boundary cannot be inspected: {exc}"
+
+
+def _resolve_private_agent_read_path(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve one RepoMap root through a bound private Agent workspace."""
+
+    private_root, boundary_error = _active_private_agent_read_root()
+    if boundary_error:
+        return None, boundary_error
+    if private_root is None:
+        return None, None
+
+    try:
+        from ..os_operations.tools import _resolve_read_target
+        from ..file_explorer.file_explorer_service import (
+            is_safe_workspace_path,
+        )
+
+        resolved, _is_absolute, error = _resolve_read_target(raw)
+        if error or not resolved:
+            return None, error or "Agent workspace path cannot be resolved"
+        candidate = Path(resolved).resolve(strict=False)
+        if not is_safe_workspace_path(private_root, candidate):
+            return None, "Path is outside the Agent workspace"
+        if not _repo_map_path_is_within(candidate, private_root):
+            return None, "Path is outside the Agent workspace"
+        return str(candidate), None
+    except (OSError, RuntimeError, TypeError, ValueError, PermissionError) as exc:
+        return None, f"Agent workspace path cannot be resolved: {exc}"
+
+
 def _resolve_repo_map_path(path: str) -> str:
     """Resolve a RepoMap root through the active execution boundary.
 
@@ -111,6 +154,12 @@ def _resolve_repo_map_path(path: str) -> str:
         except Exception as exc:
             raise ValueError(f"run-scope denied repo map path: {exc}") from exc
 
+    private_path, private_error = _resolve_private_agent_read_path(raw)
+    if private_error:
+        raise ValueError(f"Agent workspace denied repo map path: {private_error}")
+    if private_path is not None:
+        return private_path
+
     try:
         from ...features import Features
 
@@ -154,6 +203,7 @@ def _authorize_repo_map_descendant(
     *,
     scope: Any = None,
     enterprise: bool = False,
+    private_root: Path | None = None,
 ) -> Optional[str]:
     """Authorize one source file before RepoMap is allowed to read it.
 
@@ -169,6 +219,16 @@ def _authorize_repo_map_descendant(
             # The run scope is the authority for coding/worker calls.  It also
             # rejects escaping symlink/junction/reparse components.
             authorised = Path(scope.assert_read_allowed(str(candidate)))
+        elif private_root is not None:
+            # Bound non-native AgentDialogue turns must use the same private
+            # read resolver as the root selection.  Without this branch a
+            # descendant callback could re-enter RepoMap's Personal fallback.
+            from ..os_operations.tools import _resolve_read_target
+
+            resolved, _is_absolute, error = _resolve_read_target(str(candidate))
+            if error or not resolved:
+                return None
+            authorised = Path(resolved)
         elif enterprise:
             # Ordinary Enterprise reads must use the same user/workspace ACL
             # resolver as read_file/list_directory/search_files.  Importing
@@ -202,7 +262,11 @@ def _authorize_repo_map_descendant(
     return str(canonical)
 
 
-def _collect_authorized_repo_files(root: Path) -> Optional[List[str]]:
+def _collect_authorized_repo_files(
+    root: Path,
+    *,
+    private_root: Path | None = None,
+) -> Optional[List[str]]:
     """Enumerate only descendants safe for a scoped/Enterprise RepoMap call.
 
     A ``None`` result means an unscoped Personal call, for which the legacy
@@ -212,8 +276,15 @@ def _collect_authorized_repo_files(root: Path) -> Optional[List[str]]:
     """
 
     scope, enterprise = _repo_map_boundary_context()
+    if scope is None and private_root is None:
+        private_root, private_error = _active_private_agent_read_root()
+        if private_error:
+            raise ValueError(private_error)
 
-    if scope is None and not enterprise:
+    if private_root is not None and not _repo_map_path_is_within(root, private_root):
+        raise ValueError("RepoMap root is outside the Agent workspace")
+
+    if scope is None and not enterprise and private_root is None:
         # Personal mode has no new boundary and must preserve RepoMap's
         # historical os.walk behavior, including its singleton/cache path.
         return None
@@ -244,6 +315,7 @@ def _collect_authorized_repo_files(root: Path) -> Optional[List[str]]:
                     root,
                     scope=scope,
                     enterprise=enterprise,
+                    private_root=private_root,
                 )
                 if not authorised:
                     continue
@@ -322,17 +394,40 @@ def get_repo_map(
     
     try:
         authorized_path = _resolve_repo_map_path(path)
+        root = Path(authorized_path)
+        scope, enterprise = _repo_map_boundary_context()
+        private_root = None
+        if scope is None:
+            private_root, private_error = _active_private_agent_read_root()
+            if private_error:
+                raise ValueError(private_error)
+            if private_root is not None and not _repo_map_path_is_within(
+                root, private_root
+            ):
+                raise ValueError("RepoMap root is outside the Agent workspace")
+
         rm = get_repo_map_instance(authorized_path)
-        rm.max_tokens = max_tokens
+        if private_root is not None:
+            expected_root = root.resolve(strict=False)
+            try:
+                actual_root = Path(getattr(rm, "root")).resolve(strict=False)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("RepoMap instance root is unavailable") from exc
+            expected_key = os.path.normcase(os.path.normpath(str(expected_root)))
+            actual_key = os.path.normcase(os.path.normpath(str(actual_root)))
+            if actual_key != expected_key:
+                raise ValueError("RepoMap instance root differs from Agent workspace root")
 
         # The legacy RepoMap scanner is intentionally bypassed whenever an
         # explicit AgentRunScope or Enterprise workspace boundary is active.
         # Every descendant is then canonicalized and authorized before the
         # parser can open it; an unsafe child is omitted rather than causing a
         # fallback to unrestricted ``os.walk``.
-        root = Path(authorized_path)
-        scope, enterprise = _repo_map_boundary_context()
-        authorized_files = _collect_authorized_repo_files(root)
+        rm.max_tokens = max_tokens
+        authorized_files = _collect_authorized_repo_files(
+            root,
+            private_root=private_root,
+        )
 
         if authorized_files is None:
             # Unscoped Personal mode deliberately retains RepoMap's original
@@ -346,6 +441,7 @@ def get_repo_map(
                 root,
                 scope=scope,
                 enterprise=enterprise,
+                private_root=private_root,
             )
 
         with repo_map_read_authorizer(authorizer):

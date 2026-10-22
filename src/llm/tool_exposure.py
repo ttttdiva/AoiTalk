@@ -34,7 +34,6 @@ from .tool_packs import (
     ToolPackSession,
     auto_load_contextual_packs,
     auto_load_packs_for_command_capabilities,
-    auto_load_packs_for_tool_names,
     build_load_tool_pack_tool,
     contextual_agent_team_scope,
     tool_pack_session_for_client,
@@ -44,6 +43,7 @@ from .tool_policy import (
     DOCS_READ_TOOL_NAMES,
     FILESYSTEM_READ_TOOL_NAMES,
     PROJECT_MANAGEMENT_READ_TOOL_NAMES,
+    agent_tool_scope_permits_exposure,
     SEARCH_TOOL_NAMES,
     command_capabilities_from_text,
     get_current_user_input,
@@ -62,6 +62,9 @@ REVIEW_TOOL_ALLOWLIST = frozenset(
         "knowledge_query",
         "knowledge_read",
         "knowledge_status",
+        "media_search",
+        "media_read",
+        "chat_search_sources",
         "search_past_chats",
         "list_chat_sessions",
         "read_chat_session",
@@ -71,6 +74,7 @@ REVIEW_TOOL_ALLOWLIST = frozenset(
         "get_current_time",
         "get_weather_info",
         "calculate",
+        "computer_observe",
     }
 )
 
@@ -79,6 +83,21 @@ PLANNING_TOOL_ALLOWLIST = frozenset(
         *REVIEW_TOOL_ALLOWLIST,
         "ask_user_question",
         "submit_plan_for_approval",
+    }
+)
+
+# These controls are retained by the local-native narrowing path even when an
+# Agent scope narrows the ordinary capability surface.  Keep the same bounded
+# exemptions here so provider-neutral presentation filtering does not remove
+# the controls before that path can apply its request-local handling.
+_AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES = frozenset(
+    {
+        "send_agent_work_message",
+        "get_agent_work_status",
+        "delegate_agent_work",
+        "answer_agent_work_question",
+        "ask_user_question",
+        "load_tool_pack",
     }
 )
 
@@ -290,85 +309,24 @@ def _strict_project_tool_definition(
         return None
 
 
-_STORY_CONTEXT_UNSET = object()
-
-
 @dataclass(frozen=True)
 class ToolExposureContext:
-    """Immutable request-local Story and Agent Team activation snapshot."""
+    """Immutable request-local Agent Team activation snapshot."""
 
-    story_context: Any
     scope: Mapping[str, Any]
-    story_resolution_failed: bool = False
-
-
-def resolve_story_chat_context_for_client(client: Any) -> tuple[Any, bool]:
-    """Resolve trusted Story context once for one provider exposure pass.
-
-    Providers use their existing async bridge to run the lightweight durable
-    ``StoryWritingSession`` resolver.  It returns only activation metadata
-    (never the large Story prompt); no user prose is inspected.  The boolean
-    distinguishes a resolver exception from a normal non-Story ``None``.
-    """
-
-    # The immutable server-bound TurnContext wins over a mutable/shared client
-    # attribute.  This prevents a fixed provider instance serving concurrent
-    # Story and General turns from resolving the wrong conversation.
-    turn_session_id = str(getattr(get_turn_context(), "session_id", None) or "").strip()
-    session_id = turn_session_id or str(
-        getattr(client, "current_session_id", None) or ""
-    ).strip()
-    runner = (
-        getattr(client, "_run_async_sync", None)
-        or getattr(client, "_run_async_in_new_loop", None)
-        or getattr(client, "_run_sync", None)
-    )
-    if session_id and callable(runner):
-        try:
-            # Provider getters retain their compatibility catch-to-None
-            # behavior for prompt construction.  Tool exposure deliberately
-            # bypasses them and calls the strict durable resolver so DB/ACL
-            # errors remain distinguishable from an ordinary non-Story turn.
-            from ..services.story_chat_context import (
-                resolve_story_workflow_context_strict,
-            )
-
-            return runner(resolve_story_workflow_context_strict(session_id)), False
-        except Exception:  # noqa: BLE001 - caller must fail closed
-            return None, True
-
-    # Lightweight/legacy callers without an async bridge can still provide a
-    # trusted pre-resolved context getter.  This compatibility branch is not
-    # used by the real Manager/Gemini/CLI provider classes above.
-    getter = getattr(client, "_get_story_chat_context_sync", None)
-    if callable(getter):
-        try:
-            return getter(), False
-        except Exception:  # noqa: BLE001 - caller must fail closed
-            return None, True
-    return None, False
 
 
 def resolve_tool_exposure_context(
     client: Any,
     *,
-    story_context: Any = _STORY_CONTEXT_UNSET,
-    story_resolution_failed: bool | None = None,
     project_context: dict[str, Any] | None = None,
 ) -> ToolExposureContext:
-    """Resolve Story + canonical Team activation at most once per exposure."""
+    """Resolve canonical Team activation at most once per exposure."""
 
-    if story_context is _STORY_CONTEXT_UNSET:
-        story_context, resolved_failed = resolve_story_chat_context_for_client(client)
-        if story_resolution_failed is None:
-            story_resolution_failed = resolved_failed
-    elif story_resolution_failed is None:
-        story_resolution_failed = False
     scope = contextual_agent_team_scope(
         getattr(client, "config", None),
         client=client,
         project_context=project_context,
-        story_context=story_context,
     )
     # The resolver returns fresh lists for human-readable metadata.  Freeze
     # those containers before handing the snapshot to every deferred-pack and
@@ -378,11 +336,7 @@ def resolve_tool_exposure_context(
         key: tuple(value) if isinstance(value, (list, set, frozenset)) else value
         for key, value in scope.items()
     }
-    return ToolExposureContext(
-        story_context=story_context,
-        scope=MappingProxyType(frozen_scope),
-        story_resolution_failed=bool(story_resolution_failed),
-    )
+    return ToolExposureContext(scope=MappingProxyType(frozen_scope))
 
 
 def tool_name(tool: Any) -> str:
@@ -659,7 +613,7 @@ def effective_tool_pack_session(
     if capabilities:
         auto_load_packs_for_command_capabilities(session, capabilities)
     session.load("browser")
-    # Apps and App Development/Story Team packs are activated only from one
+    # Apps and App Development Team packs are activated only from one
     # server-resolved structured snapshot for this exposure pass.
     exposure = exposure or resolve_tool_exposure_context(client)
     auto_load_contextual_packs(
@@ -670,22 +624,10 @@ def effective_tool_pack_session(
     return session
 
 
-def apply_story_pack_auto_load(client: Any, story_chat_context: Any) -> None:
-    """Story writing 文脈で許可された pack を自動ロードする。"""
-    if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-        return
-    if not story_chat_context:
-        return
-    allowed = getattr(story_chat_context, "allowed_tools", None) or frozenset()
-    auto_load_packs_for_tool_names(tool_pack_session_for_client(client), allowed)
-
-
 def filter_tools_for_client(
     client: Any,
     tools: Iterable[Any],
     *,
-    story_context: Any = _STORY_CONTEXT_UNSET,
-    story_resolution_failed: bool | None = None,
     exposure: ToolExposureContext | None = None,
 ) -> list[Any]:
     """Return only tools that may be shown for the client's current session."""
@@ -713,7 +655,7 @@ def filter_tools_for_client(
     if trusted_input:
         current_capabilities |= command_capabilities_from_text(trusted_input)
     # Reserved Help turns must publish zero provider schemas.  Keep this check
-    # before registry resolution, contextual pack loading, story/planning
+    # before registry resolution, contextual pack loading, planning
     # filters, or any other dynamic exposure work so stale registries cannot
     # leak a tool on the first provider request.
     if "aoitalk_help" in current_capabilities:
@@ -735,6 +677,16 @@ def filter_tools_for_client(
                 except Exception:  # noqa: BLE001 - diagnostic registry seam
                     definition = candidate
         if runtime_tool_capability_status(definition, client=client) is None:
+            if (
+                tool_name(candidate)
+                not in _AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES
+                and agent_tool_scope_permits_exposure(
+                    tool_name(candidate),
+                    definition,
+                )
+                is False
+            ):
+                continue
             gated_values.append(candidate)
     values = gated_values
 
@@ -775,30 +727,9 @@ def filter_tools_for_client(
                     constrained.append(wrapped)
             values = constrained
 
-    # StoryWritingSession is a server-resolved workflow boundary, not a prompt
-    # hint.  Enforce its narrow allow-list here as the provider-neutral final
-    # filter so legacy providers (OpenAI-compatible, Ollama, SGLang) cannot
-    # publish General/App/Apps schemas even when they do not use AgentSetup.
-    exposure = exposure or resolve_tool_exposure_context(
-        client,
-        story_context=story_context,
-        story_resolution_failed=story_resolution_failed,
-    )
-    if exposure.story_resolution_failed:
-        # A Story resolver failure must not silently widen the schema to normal
-        # tools.  The durable resolver itself returns None for ordinary
-        # non-Story sessions, which remains distinct from this error state.
-        return []
+    exposure = exposure or resolve_tool_exposure_context(client)
     if is_planning_cancelled_terminal():
         return []
-    story_context = exposure.story_context
-    if story_context:
-        allowed_story_tools = {
-            str(name).strip()
-            for name in (getattr(story_context, "allowed_tools", None) or ())
-            if str(name).strip()
-        }
-        values = [tool for tool in values if tool_name(tool) in allowed_story_tools]
     if get_client_generation_policy(client).profile == GenerationProfile.REVIEW:
         planning_state = get_current_planning_run_state()
         if planning_state is not None and planning_state.phase in {
@@ -887,7 +818,7 @@ def filter_tools_for_client(
                         contextual_scope=exposure.scope,
                     )
                 except Exception:  # noqa: BLE001 - never leak stale roster
-                    # A shared registry may contain a build-time App/Story
+                    # A shared registry may contain a build-time App
                     # roster.  Keeping that base definition after a failed
                     # request-local specialization would expose inactive
                     # Teams/Subagents, so drop the delegate fail-closed.
@@ -904,8 +835,6 @@ def filtered_registry_for_client(
     client: Any,
     registry: ToolRegistry,
     *,
-    story_context: Any = _STORY_CONTEXT_UNSET,
-    story_resolution_failed: bool | None = None,
     exposure: ToolExposureContext | None = None,
 ) -> ToolRegistry:
     """Create a non-expanding registry view for model exposure and execution."""
@@ -938,13 +867,7 @@ def filtered_registry_for_client(
             if callable(get_names) and callable(get_tool)
             else []
         )
-    filtered = filter_tools_for_client(
-        client,
-        values,
-        story_context=story_context,
-        story_resolution_failed=story_resolution_failed,
-        exposure=exposure,
-    )
+    filtered = filter_tools_for_client(client, values, exposure=exposure)
     # 取り出せない形のレジストリ（テスト用のフェイクなど）は values が空になるため、
     # 絞り込みが発生しない場合は元のレジストリをそのまま返す。
     # A same-sized result can still contain request-local clones (notably the

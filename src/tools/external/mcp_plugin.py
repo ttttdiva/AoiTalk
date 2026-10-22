@@ -9,14 +9,18 @@ import json
 import os
 import inspect
 import warnings
+import copy
+import hashlib
+import re
 from contextvars import ContextVar
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from ...utils.subprocess_env import build_aoitalk_subprocess_env
 from ...runtime import AsyncResourceScope
 
-from ..core import ToolDefinition, ToolParam
+from ..core import ToolDefinition, ToolParam, ToolArgumentValidationError
 from ...services.outbound_privacy_service import (
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
@@ -713,23 +717,115 @@ def _mcp_tool_params(input_schema: Any) -> List[ToolParam]:
                 required=name in required,
                 default=spec.get("default"),
                 enum=spec.get("enum") if isinstance(spec.get("enum"), list) else None,
+                schema=copy.deepcopy(spec),
             )
         )
     return params
 
 
+def _mcp_child_environment(explicit_env: Mapping[str, str], *, isolated: bool) -> Dict[str, str]:
+    if not isolated:
+        return build_aoitalk_subprocess_env(extra_env=explicit_env, sensitive_env_keys=explicit_env)
+    allowed = {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR"}
+    scope_keys = {"HOME_MCP_PROFILE", "HOME_MCP_WORKSPACE", "HOME_MCP_AGENT_RUN_ID", "HOME_MCP_OWNER_ID", "HOME_MCP_AOITALK_ENABLED"}
+    if set(explicit_env) - scope_keys:
+        raise ValueError("Unexpected isolated MCP environment key")
+    if explicit_env.get("HOME_MCP_PROFILE") != "local_agent_read_only" or explicit_env.get("HOME_MCP_AOITALK_ENABLED") != "0":
+        raise ValueError("Invalid isolated MCP profile")
+    child = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    child.update(explicit_env)
+    child.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1", PYTHON_DOTENV_DISABLED="1")
+    return child
+
+
+def _validate_mcp_arguments(schema: Mapping[str, Any], arguments: Any) -> dict[str, Any]:
+    import jsonschema
+    from referencing import Registry
+
+    if not isinstance(arguments, Mapping):
+        raise ValueError("MCP arguments must be an object")
+    validator = jsonschema.validators.validator_for(schema)
+    validator.check_schema(schema)
+    # Empty registry fails unresolved references closed and performs no HTTP.
+    validator(schema, registry=Registry()).validate(dict(arguments))
+    return dict(arguments)
+
+
+@dataclass
+class _MCPToolDefinition(ToolDefinition):
+    """Keep the wire schema authoritative through every native adapter."""
+
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+
+    def to_json_schema(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.input_schema)
+
+    def normalize_arguments(self, arguments: Mapping[str, Any] | None) -> Dict[str, Any]:
+        try:
+            return _validate_mcp_arguments(self.input_schema, {} if arguments is None else arguments)
+        except Exception as exc:
+            raise ToolArgumentValidationError(self.name, code="tool_argument_invalid") from exc
+
+
+MCP_RESULT_TEXT_LIMIT = 48000
+
+
 def _format_mcp_content(content: Any) -> str:
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if hasattr(item, "text"):
-                texts.append(str(item.text))
-            elif isinstance(item, dict) and "text" in item:
-                texts.append(str(item["text"]))
-            else:
-                texts.append(str(item))
-        return "\n".join(texts)
-    return str(content)
+    """Project text only; never stringify binary/resource provider objects."""
+    items = content if isinstance(content, list) else [content]
+    texts = []
+    for item in items:
+        if isinstance(item, str):
+            texts.append(item)
+            continue
+        kind = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
+        value = item.get("text") if isinstance(item, Mapping) else getattr(item, "text", None)
+        if kind not in (None, "text") or not isinstance(value, str):
+            raise ValueError("unsupported_mcp_content")
+        texts.append(value)
+    text = "\n".join(texts)
+    return text[:MCP_RESULT_TEXT_LIMIT] + ("\n[MCP result truncated]" if len(text) > MCP_RESULT_TEXT_LIMIT else "")
+
+
+def _format_mcp_result(result: Mapping[str, Any]) -> str:
+    """Preserve MCP/business errors and structured results in a text lane."""
+    try:
+        content = _format_mcp_content(result.get("content", []))
+    except ValueError:
+        return json.dumps({"isError": True, "error": "unsupported_mcp_content", "message": "This text-only tool route cannot consume image, audio or resource content."})
+    structured = result.get("structuredContent")
+    if structured is not None:
+        try:
+            rendered = json.dumps({"content": content, "structuredContent": structured,
+                                   "isError": bool(result.get("isError", False))}, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return json.dumps({"isError": True, "error": "invalid_mcp_structured_content"})
+        if len(rendered) > MCP_RESULT_TEXT_LIMIT * 3:
+            return json.dumps({"isError": True, "error": "mcp_result_too_large"})
+        return rendered
+    if result.get("isError", False):
+        return f"Tool execution error: {content}"
+    return content
+
+
+def _native_mcp_result(result: Mapping[str, Any]) -> Any:
+    """Keep structured failure visible to the common tool runtime as data."""
+    rendered = _format_mcp_result(result)
+    structured = result.get("structuredContent")
+    if structured is not None:
+        projected = json.loads(rendered)
+        if "structuredContent" not in projected:
+            return {**projected, "success": False}
+        business_error = isinstance(structured, Mapping) and (
+            structured.get("ok") is False or structured.get("success") is False
+        )
+        projected["success"] = not bool(result.get("isError", False) or business_error)
+        return projected
+    if result.get("isError", False):
+        return {"success": False, "isError": True, "error": rendered}
+    if rendered.startswith('{"isError": true, "error": "unsupported_mcp_content"'):
+        return {**json.loads(rendered), "success": False}
+    return rendered
 
 
 class MCPClient:
@@ -752,6 +848,7 @@ class MCPClient:
         self._server_metadata: Dict[str, Dict[str, Any]] = {}
         self._tool_metadata: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._search_egress_config: Any = None
+        self._runtime_config_provider = None
         self._lifecycle_lock: Optional[asyncio.Lock] = None
         self._server_generation: Dict[str, int] = {}
         self._starting_scopes: Dict[str, AsyncResourceScope] = {}
@@ -759,6 +856,8 @@ class MCPClient:
         self._inflight_tasks: Dict[str, set[asyncio.Task[Any]]] = {}
         self._inflight_events: Dict[str, asyncio.Event] = {}
         self._started = False
+        self._tool_call_guards: Dict[str, Callable] = {}
+        self._listed_servers: set[str] = set()
 
     def _get_lifecycle_lock(self) -> asyncio.Lock:
         """Return the lock used to serialize server lifecycle operations."""
@@ -868,6 +967,7 @@ class MCPClient:
         operation: Callable[[Any], Awaitable[Any]],
         *,
         timeout: float = 30.0,
+        expected_generation: int | None = None,
     ) -> Any:
         """Run one MCP request without holding the lifecycle lock.
 
@@ -879,7 +979,10 @@ class MCPClient:
 
         async with self._get_lifecycle_lock():
             session = self.sessions.get(server_name)
-            if session is None:
+            if session is None or (
+                expected_generation is not None
+                and self._server_generation.get(server_name, 0) != expected_generation
+            ):
                 return None
             task = asyncio.create_task(
                 operation(session),
@@ -1103,6 +1206,8 @@ class MCPClient:
             self._starting_tasks.clear()
             self._server_metadata.clear()
             self._tool_metadata.clear()
+            self._tool_call_guards.clear()
+            self._listed_servers.clear()
             self.sessions.clear()
             self.servers.clear()
             self._started = False
@@ -1146,7 +1251,26 @@ class MCPClient:
         if cancellation_requested:
             raise asyncio.CancelledError
 
-    async def add_server(self, name: str, command: str, args: List[str] = None, env: Dict[str, str] = None):
+    async def _own_stdio_session(self, parameters: Any, ready: asyncio.Future) -> None:
+        """Enter and exit SDK/AnyIO contexts in the same lifetime-owner task."""
+        try:
+            async with stdio_client(parameters) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    if not ready.done():
+                        ready.set_result(session)
+                    # AsyncResourceScope owns this task and cancels it when
+                    # removing this server, timing out or ending the run.
+                    await asyncio.Event().wait()
+        except BaseException as exc:
+            if not ready.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    ready.cancel()
+                else:
+                    ready.set_exception(exc)
+            raise
+
+    async def add_server(self, name: str, command: str, args: List[str] = None, env: Dict[str, str] = None, *, cwd: str | None = None, isolated: bool = False):
         """
         Add an MCP server
 
@@ -1163,10 +1287,7 @@ class MCPClient:
         # as a default.  Only values supplied by the MCP server configuration
         # are explicit child overrides.
         explicit_env = env or {}
-        child_env = build_aoitalk_subprocess_env(
-            extra_env=explicit_env,
-            sensitive_env_keys=explicit_env,
-        )
+        child_env = _mcp_child_environment(explicit_env, isolated=isolated)
 
         scope: AsyncResourceScope
         async with self._get_lifecycle_lock():
@@ -1198,25 +1319,17 @@ class MCPClient:
                 command=command,
                 args=args,
                 env=child_env,
+                **({"cwd": cwd} if cwd is not None else {}),
             )
 
-            # Add bounded timeouts to server startup and initialization.  The
-            # helper detaches an SDK awaitable that suppresses cancellation,
-            # keeping lifecycle operations finite.
-            stdio_client_result = await self._bounded_await(
-                scope.enter_async_context(stdio_client(server_params)),
-                timeout=45.0,
-                description=f"server:{name}:connect",
+            ready = asyncio.get_running_loop().create_future()
+            scope.spawn(
+                self._own_stdio_session(server_params, ready),
+                name=f"mcp:{name}:owner",
             )
-            read_stream, write_stream = stdio_client_result
             session = await self._bounded_await(
-                scope.enter_async_context(ClientSession(read_stream, write_stream)),
-                timeout=30.0,
-                description=f"server:{name}:session",
-            )
-            await self._bounded_await(
-                session.initialize(),
-                timeout=30.0,
+                ready,
+                timeout=105.0,
                 description=f"server:{name}:initialize",
             )
         except asyncio.CancelledError:
@@ -1261,6 +1374,7 @@ class MCPClient:
                     "command": command,
                     "args": args,
                     "env": child_env,
+                    "cwd": cwd,
                 }
                 self._server_scopes[name] = scope
         if not valid:
@@ -1279,6 +1393,8 @@ class MCPClient:
             # Remove all projections before close to prevent a concurrent
             # operation from using a session whose transport is being closed.
             scope = self._server_scopes.pop(name, None)
+            self._tool_call_guards.pop(name, None)
+            self._listed_servers.discard(name)
             starting_scope = self._starting_scopes.pop(name, None)
             starting_task = self._starting_tasks.pop(name, None)
             existed = (
@@ -1340,6 +1456,8 @@ class MCPClient:
             Dictionary mapping server names to their tool lists
         """
         tools = {}
+        if self._capability_reason(server_name or "", ""):
+            return tools
 
         async with self._get_lifecycle_lock():
             if server_name:
@@ -1357,14 +1475,28 @@ class MCPClient:
                 continue
 
             try:
-                response = await self._session_request(
-                    name,
-                    lambda session: session.list_tools(),
-                )
-                if response is None:
-                    continue
+                listed_tools = []
+                cursor = None
+                seen_cursors = set()
+                for _page in range(100):
+                    response = await self._session_request(
+                        name,
+                        lambda session, cursor=cursor: session.list_tools(cursor=cursor) if cursor else session.list_tools(),
+                    )
+                    if response is None:
+                        raise RuntimeError("MCP disconnected while listing tools")
+                    listed_tools.extend(response.tools)
+                    cursor = getattr(response, "nextCursor", None)
+                    if not cursor:
+                        break
+                    if not isinstance(cursor, str) or cursor in seen_cursors:
+                        raise RuntimeError("Invalid MCP tools pagination")
+                    seen_cursors.add(cursor)
+                else:
+                    raise RuntimeError("MCP tools pagination limit exceeded")
                 normalized_tools: list[Dict[str, Any]] = []
-                for tool in response.tools:
+                seen_names = set()
+                for tool in listed_tools:
                     def _tool_value(key: str, default: Any = None) -> Any:
                         if isinstance(tool, Mapping):
                             return tool.get(key, default)
@@ -1376,7 +1508,7 @@ class MCPClient:
                     entry: Dict[str, Any] = {
                         "name": _tool_value("name", ""),
                         "description": _tool_value("description", ""),
-                        "inputSchema": _tool_value("inputSchema", None),
+                        "inputSchema": copy.deepcopy(_tool_value("inputSchema", None)),
                     }
                     for key in (
                         "annotations",
@@ -1401,6 +1533,9 @@ class MCPClient:
                         value = _tool_value(key)
                         if value is not None:
                             entry[key] = value
+                    if not entry["name"] or entry["name"] in seen_names:
+                        raise RuntimeError("Invalid or duplicate MCP tool name")
+                    seen_names.add(entry["name"])
                     normalized_tools.append(entry)
                 async with self._get_lifecycle_lock():
                     # Do not publish metadata from a response belonging to a
@@ -1410,6 +1545,10 @@ class MCPClient:
                         or self._server_generation.get(name, 0) != generation
                     ):
                         continue
+                    self._listed_servers.add(name)
+                    for key in list(self._tool_metadata):
+                        if key[0] == name:
+                            self._tool_metadata.pop(key, None)
                     for entry in normalized_tools:
                         tool_name = str(entry.get("name") or "")
                         if tool_name:
@@ -1417,9 +1556,18 @@ class MCPClient:
                             # do not travel through the native ToolDefinition
                             # path.
                             self._tool_metadata[(name, tool_name)] = entry
-                    tools[name] = normalized_tools
+                    tools[name] = [
+                        entry for entry in normalized_tools
+                        if self._capability_reason(name, str(entry.get("name") or "")) is None
+                    ]
             except Exception as e:
                 logger.error(f"Failed to list tools from server '{name}': {e}")
+                async with self._get_lifecycle_lock():
+                    if self._server_generation.get(name, 0) == generation and name in self.sessions:
+                        self._listed_servers.add(name)
+                        for key in list(self._tool_metadata):
+                            if key[0] == name:
+                                self._tool_metadata.pop(key, None)
                 tools[name] = []
 
         return tools
@@ -1444,6 +1592,18 @@ class MCPClient:
         """Set the config consulted by marked external search calls."""
 
         self._search_egress_config = config
+
+    def current_runtime_config(self):
+        return self._runtime_config_provider() if self._runtime_config_provider else self._search_egress_config
+
+    def _capability_reason(self, server_name: str, tool_name: str) -> str | None:
+        from ...llm.tool_policy import _runtime_capability_for_tool
+
+        return _runtime_capability_for_tool(
+            f"mcp_{server_name}_{tool_name}",
+            config=self.current_runtime_config(),
+            tool_definition={"owner": f"mcp:{server_name}", "availability": self._metadata_for_tool(server_name, tool_name)},
+        )
 
     def _metadata_for_tool(
         self,
@@ -1521,7 +1681,7 @@ class MCPClient:
                 RuntimeError("search egress policy unavailable")
             )
 
-        config = self._search_egress_config
+        config = self.current_runtime_config()
         engine = _search_engine_for_metadata(
             tool_metadata,
             server_name=server_name,
@@ -1586,6 +1746,33 @@ class MCPClient:
             return _sanitized_search_egress_error(exc)
         return None
 
+    def set_tool_call_guard(self, server_name: str, guard: Callable) -> None:
+        """Bind server-owned live scope validation below every invocation path."""
+        if not callable(guard):
+            raise TypeError("MCP call guard must be callable")
+        self._tool_call_guards[server_name] = guard
+
+    async def _guarded_call(self, server_name: str, tool_name: str, arguments: Any, *, generation: int):
+        guard = self._tool_call_guards.get(server_name)
+        if guard is not None:
+            decision = guard(tool_name, arguments)
+            if inspect.isawaitable(decision):
+                decision = await decision
+            if decision is not True:
+                raise PermissionError("MCP execution scope denied")
+        metadata = self._tool_metadata.get((server_name, tool_name))
+        if server_name in self._listed_servers and metadata is None:
+            raise PermissionError("MCP tool is no longer registered")
+        if metadata and isinstance(metadata.get("inputSchema"), dict):
+            try:
+                arguments = _validate_mcp_arguments(metadata["inputSchema"], arguments)
+            except Exception as exc:
+                raise ToolArgumentValidationError(tool_name, code="tool_argument_invalid") from exc
+        return await self._session_request(
+            server_name, lambda session: session.call_tool(tool_name, dict(arguments)),
+            expected_generation=generation,
+        )
+
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict]:
         """
         Call a tool on a specific MCP server
@@ -1602,6 +1789,11 @@ class MCPClient:
             if server_name not in self.sessions:
                 logger.error(f"Server '{server_name}' not found")
                 return None
+            generation = self._server_generation.get(server_name, 0)
+
+        reason = self._capability_reason(server_name, tool_name)
+        if reason:
+            return {"content": [reason], "isError": True}
 
         # This is the lowest shared call boundary used by both native MCP
         # definitions and the legacy ``call_mcp_tool`` helper.  Only a tool
@@ -1618,7 +1810,6 @@ class MCPClient:
                 "isError": True,
             }
 
-        metadata = self._metadata_for_tool(server_name, tool_name)
         # Every dynamic MCP tool is an external operation by default.  The
         # only local exception is configuration-owned ``egress_scope=local``
         # pointing at a gateway-trusted endpoint.  Tool/provider metadata is
@@ -1627,9 +1818,9 @@ class MCPClient:
         route_metadata = server_metadata if isinstance(server_metadata, Mapping) else {}
         provider, endpoint, _scope = _mcp_operation_route(
             route_metadata,
-            config=self._search_egress_config,
+            config=self.current_runtime_config(),
         )
-        privacy_gateway = _mcp_gateway(self._search_egress_config)
+        privacy_gateway = _mcp_gateway(self.current_runtime_config())
         descriptor = _mcp_egress_descriptor(
             action="mcp.call_tool",
             server_name=server_name,
@@ -1646,14 +1837,8 @@ class MCPClient:
                 descriptor=descriptor,
                 base_url=endpoint or None,
                 source_kind="mcp_call_tool",
-                sender=lambda protected_payload: self._session_request(
-                    server_name,
-                    lambda session: session.call_tool(
-                        tool_name,
-                        dict(protected_payload)
-                        if isinstance(protected_payload, Mapping)
-                        else protected_payload,
-                    ),
+                sender=lambda protected_payload: self._guarded_call(
+                    server_name, tool_name, protected_payload, generation=generation,
                 ),
             )
             if response is None:
@@ -1681,9 +1866,15 @@ class MCPClient:
                 content = privacy_gateway.restore_aliases(content)
             return {
                 'content': content,
-                'isError': response_is_error
+                'isError': response_is_error,
+                **({'structuredContent': privacy_gateway.restore_aliases(response.structuredContent) if privacy_gateway is not None else response.structuredContent}
+                   if getattr(response, 'structuredContent', None) is not None else {}),
             }
 
+        except ToolArgumentValidationError:
+            return {"content": ["Invalid MCP tool arguments"], "isError": True, "error": "invalid_arguments"}
+        except PermissionError:
+            return {"content": ["MCP execution scope denied"], "isError": True, "error": "scope_denied"}
         except asyncio.TimeoutError:
             logger.error(f"Tool '{tool_name}' on server '{server_name}' timed out after 30 seconds")
             if mcp_tool_is_search(
@@ -1729,12 +1920,14 @@ class MCPClient:
             Dictionary mapping server names to their resource lists
         """
         resources = {}
+        if self._capability_reason(server_name or "", ""):
+            return resources
 
         async with self._get_lifecycle_lock():
             servers_to_check = [server_name] if server_name else list(self.sessions.keys())
 
         for name in servers_to_check:
-            if name not in self.sessions:
+            if name not in self.sessions or self._capability_reason(name, ""):
                 continue
 
             try:
@@ -1770,6 +1963,8 @@ class MCPClient:
         Returns:
             Resource content or None if failed
         """
+        if self._capability_reason(server_name, ""):
+            return None
         async with self._get_lifecycle_lock():
             if server_name not in self.sessions:
                 logger.error(f"Server '{server_name}' not found")
@@ -1786,9 +1981,9 @@ class MCPClient:
             )
             provider, endpoint, _scope = _mcp_operation_route(
                 route_metadata,
-                config=self._search_egress_config,
+                config=self.current_runtime_config(),
             )
-            gateway = _mcp_gateway(self._search_egress_config)
+            gateway = _mcp_gateway(self.current_runtime_config())
             descriptor = _mcp_egress_descriptor(
                 action="mcp.read_resource",
                 server_name=server_name,
@@ -1854,10 +2049,27 @@ class MCPPlugin:
         self.client = MCPClient()
         self._initialized = False
         self._init_loop_id = None
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
+        self._native_tool_targets: Dict[str, tuple[str, str]] = {}
         # Retain the server configuration for runtime search preconditions.
         # This is configuration state only; credentials are never copied into
         # tool metadata or error messages.
         self._config: Any = None
+        self._runtime_config_provider = None
+
+    def configure_runtime(self, config_provider):
+        """Bind this instance to its owning runtime's current configuration."""
+        self._runtime_config_provider = config_provider
+        self.client._runtime_config_provider = config_provider
+
+    def _capability_reason(self, server_name: str, tool_name: str, metadata=None):
+        from ...llm.tool_policy import _runtime_capability_for_tool
+
+        config = self._runtime_config_provider() if self._runtime_config_provider else self._config
+        return _runtime_capability_for_tool(
+            f"mcp_{server_name}_{tool_name}", config=config,
+            tool_definition={"owner": f"mcp:{server_name}", "availability": metadata or {}},
+        )
 
     async def initialize(self, config: Dict[str, Any] = None):
         """Initialize the MCP plugin"""
@@ -1874,6 +2086,7 @@ class MCPPlugin:
         try:
             current_loop = asyncio.get_running_loop()
             self._init_loop_id = id(current_loop)
+            self._owner_loop = current_loop
         except RuntimeError:
             self._init_loop_id = None
 
@@ -1978,6 +2191,7 @@ class MCPPlugin:
                             command=actual_config.get('command'),
                             args=actual_config.get('args', []),
                             env=expanded_env,
+                            **({'cwd': actual_config['cwd']} if actual_config.get('cwd') else {}),
                         )
                         if connected and server_metadata:
                             self.client.set_server_metadata(name, server_metadata)
@@ -2003,12 +2217,16 @@ class MCPPlugin:
                 # drained, this plugin instance must not advertise a live
                 # client on a subsequent lifecycle attempt.
                 self._initialized = False
+                self._native_tool_targets.clear()
+                self._owner_loop = None
                 self._config = None
+                self._runtime_config_provider = None
+                self.client._runtime_config_provider = None
                 set_search_config = getattr(self.client, "set_search_egress_config", None)
                 if callable(set_search_config):
                     set_search_config(None)
 
-    async def add_server(self, name: str, command: str, args: List[str] = None, env: Dict[str, str] = None):
+    async def add_server(self, name: str, command: str, args: List[str] = None, env: Dict[str, str] = None, *, cwd: str | None = None, isolated: bool = False):
         """Add an MCP server"""
         if not self._initialized:
             logger.error("MCP plugin not initialized")
@@ -2017,11 +2235,8 @@ class MCPPlugin:
         # callers that replace/instrument the client cannot accidentally pass
         # the parent process environment to a server.
         explicit_env = env or {}
-        child_env = build_aoitalk_subprocess_env(
-            extra_env=explicit_env,
-            sensitive_env_keys=explicit_env,
-        )
-        return await self.client.add_server(name, command, args, child_env)
+        child_env = _mcp_child_environment(explicit_env, isolated=isolated)
+        return await self.client.add_server(name, command, args, explicit_env if isolated else child_env, **({"cwd": cwd} if cwd is not None else {}), **({"isolated": True} if isolated else {}))
 
     def is_initialized(self) -> bool:
         """Check if plugin is initialized"""
@@ -2038,6 +2253,20 @@ class MCPPlugin:
             # No running loop
             return self._initialized and self._init_loop_id is None
 
+    def _register_tool_name(self, server_name: str, tool_name: str) -> str:
+        raw = f"mcp_{server_name}_{tool_name}"
+        # Underscores in the server identifier make prefix splitting
+        # ambiguous. Keep established simple identifiers, hash all ambiguous
+        # or provider-invalid names, and always dispatch from this map.
+        if "_" in server_name or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw):
+            digest = hashlib.sha256(json.dumps([server_name, tool_name]).encode()).hexdigest()[:16]
+            raw = re.sub(r"[^A-Za-z0-9_-]", "_", raw)[:43] + "_" + digest
+        target = (server_name, tool_name)
+        if raw in self._native_tool_targets and self._native_tool_targets[raw] != target:
+            raise ValueError("MCP native tool name collision")
+        self._native_tool_targets[raw] = target
+        return raw
+
     async def get_tools_for_agent(self) -> List[Dict]:
         """
         Get all available tools formatted for agent use
@@ -2045,16 +2274,18 @@ class MCPPlugin:
         Returns:
             List of tool definitions
         """
-        if not self._initialized:
+        if not self._initialized or self._capability_reason("", ""):
             return []
 
         all_tools = await self.client.list_tools()
         agent_tools = []
 
-        for server_name, tools in all_tools.items():
-            for tool in tools:
+        for server_name, tools in sorted(all_tools.items()):
+            for tool in sorted(tools, key=lambda item: item["name"]):
                 merged_tool = self._merge_tool_metadata(server_name, tool)
                 self._remember_tool_metadata(server_name, merged_tool)
+                if self._capability_reason(server_name, str(merged_tool.get("name") or ""), merged_tool):
+                    continue
                 search_capability = mcp_tool_is_search(
                     merged_tool,
                     server_metadata=getattr(self.client, "_server_metadata", {}).get(server_name),
@@ -2088,7 +2319,7 @@ class MCPPlugin:
                 agent_tools.append({
                     'type': 'function',
                     'function': {
-                        'name': f"mcp_{server_name}_{merged_tool['name']}",
+                        'name': self._register_tool_name(server_name, merged_tool['name']),
                         'description': f"[MCP:{server_name}] {merged_tool['description']}",
                         'parameters': merged_tool['inputSchema']
                     },
@@ -2128,6 +2359,18 @@ class MCPPlugin:
             setattr(self.client, "_tool_metadata", tool_metadata)
         tool_metadata[(server_name, tool_name)] = dict(mcp_tool)
 
+    async def _call_owned_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]):
+        """Drive native/sync adapters on the live session's original loop."""
+        owner = self._owner_loop
+        if owner is not None and owner is not asyncio.get_running_loop():
+            if owner.is_closed() or not owner.is_running():
+                return {"content": ["MCP connection owner loop is unavailable"], "isError": True}
+            future = asyncio.run_coroutine_threadsafe(
+                self.client.call_tool(server_name, tool_name, arguments), owner,
+            )
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=35)
+        return await self.client.call_tool(server_name, tool_name, arguments)
+
     async def execute_tool(self, tool_call) -> str:
         """
         Execute an MCP tool call
@@ -2145,21 +2388,12 @@ class MCPPlugin:
         if not tool_name.startswith('mcp_'):
             return "Not an MCP tool"
 
-        # Parse server and tool name from function name
-        remaining = tool_name[4:]  # Remove 'mcp_' prefix
-
-        # Try to match with known servers
-        server_name = None
-        actual_tool_name = None
-
-        for known_server in self.client.sessions.keys():
-            if remaining.startswith(known_server + '_'):
-                server_name = known_server
-                actual_tool_name = remaining[len(known_server) + 1:]
-                break
-
-        if server_name is None or actual_tool_name is None:
-            return f"Invalid MCP tool name format: {tool_name}"
+        target = self._native_tool_targets.get(tool_name)
+        if target is None:
+            return f"Unknown MCP tool: {tool_name}"
+        server_name, actual_tool_name = target
+        if server_name not in self.client.sessions:
+            return f"MCP server is disconnected: {server_name}"
         arguments = tool_call.get('arguments', {})
 
         # Handle string arguments (from JSON)
@@ -2169,41 +2403,19 @@ class MCPPlugin:
             except json.JSONDecodeError:
                 return "Invalid tool arguments JSON"
 
-        # Some callers carry the exposed tool metadata alongside a function
-        # call.  Remember it before crossing the client boundary so a
-        # tool-level marker is enforced even when this legacy path is used.
-        supplied_metadata = tool_call.get("metadata") or tool_call.get("tool_definition")
-        if supplied_metadata is not None:
-            metadata = dict(supplied_metadata) if isinstance(supplied_metadata, Mapping) else {
-                "metadata": supplied_metadata,
-            }
-            metadata.setdefault("name", actual_tool_name)
-            self._remember_tool_metadata(server_name, metadata)
+        metadata = self._merge_tool_metadata(
+            server_name,
+            getattr(self.client, "_tool_metadata", {}).get((server_name, actual_tool_name), {"name": actual_tool_name}),
+        )
+        reason = self._capability_reason(server_name, actual_tool_name, metadata)
+        if reason:
+            return f"Tool execution error: {reason}"
 
-        result = await self.client.call_tool(server_name, actual_tool_name, arguments)
+        result = await self._call_owned_tool(server_name, actual_tool_name, arguments)
         if result is None:
             return f"Failed to execute tool {actual_tool_name} on server {server_name}"
 
-        if result.get('isError', False):
-            return f"Tool execution error: {result.get('content', 'Unknown error')}"
-
-        # Format content for return
-        content = result.get('content', [])
-        if isinstance(content, list):
-            texts = []
-            for item in content:
-                if hasattr(item, 'text'):
-                    # TextContent object
-                    texts.append(str(item.text))
-                elif isinstance(item, dict) and 'text' in item:
-                    # Dictionary with 'text' key
-                    texts.append(str(item['text']))
-                else:
-                    # Other types
-                    texts.append(str(item))
-            return '\n'.join(texts)
-        else:
-            return str(content)
+        return _format_mcp_result(result)
 
     def is_available(self) -> bool:
         """Check if MCP is available"""
@@ -2211,16 +2423,18 @@ class MCPPlugin:
 
     async def list_tools(self):
         """List MCP tools as native AoiTalk ToolDefinition instances."""
-        if not self._initialized:
+        if not self._initialized or self._capability_reason("", ""):
             return []
 
         all_tools = await self.client.list_tools()
         tools_list = []
 
-        for server_name, tools in all_tools.items():
-            for mcp_tool in tools:
+        for server_name, tools in sorted(all_tools.items()):
+            for mcp_tool in sorted(tools, key=lambda item: item["name"]):
                 merged_tool = self._merge_tool_metadata(server_name, mcp_tool)
                 self._remember_tool_metadata(server_name, merged_tool)
+                if self._capability_reason(server_name, str(merged_tool.get("name") or ""), merged_tool):
+                    continue
                 tools_list.append(self._to_tool_definition(server_name, merged_tool))
 
         return tools_list
@@ -2233,16 +2447,17 @@ class MCPPlugin:
         mcp_tool = self._merge_tool_metadata(server_name, mcp_tool)
         self._remember_tool_metadata(server_name, mcp_tool)
         tool_name = str(mcp_tool.get("name") or "")
-        native_name = f"mcp_{server_name}_{tool_name}"
+        native_name = self._register_tool_name(server_name, tool_name)
         description = str(mcp_tool.get("description") or tool_name)
 
         async def _invoke(**kwargs):
-            result = await self.client.call_tool(server_name, tool_name, kwargs)
+            reason = self._capability_reason(server_name, tool_name, mcp_tool)
+            if reason:
+                return f"Tool execution error: {reason}"
+            result = await self._call_owned_tool(server_name, tool_name, kwargs)
             if result is None:
                 return f"Failed to execute tool {tool_name}"
-            if result.get("isError", False):
-                return f'Tool execution error: {result.get("content", "Unknown error")}'
-            return _format_mcp_content(result.get("content", []))
+            return _native_mcp_result(result)
 
         availability = {
             key: mcp_tool[key]
@@ -2278,7 +2493,8 @@ class MCPPlugin:
         ):
             availability["search_capability"] = True
 
-        definition = ToolDefinition(
+        definition = _MCPToolDefinition(
+            input_schema=copy.deepcopy(mcp_tool.get("inputSchema") or {"type": "object", "properties": {}, "additionalProperties": False}),
             name=native_name,
             description=f"[MCP:{server_name}] {description}",
             function=_invoke,

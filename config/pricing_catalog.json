@@ -1,9 +1,12 @@
 {
-  "catalog_version": "2026-08-01.1",
+  "catalog_version": "2026-10-07.1",
   "schema_version": 1,
-  "generated_at": "2026-08-01T00:00:00Z",
+  "generated_at": "2026-10-07T00:00:00Z",
   "free_incentive_groups": {
     "1m": [
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.5-2026-04-23",
       "gpt-5.4-2026-03-05",

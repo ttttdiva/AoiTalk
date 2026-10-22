@@ -1,4 +1,5 @@
-import { eq, inArray } from "drizzle-orm";
+import { docsIdIn } from "@/lib/server/docs-id-condition";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { knowledgeNodes } from "@/db/schema";
 import {
@@ -445,7 +446,7 @@ export async function archiveDocsNodesForCleanup(
   return client
     .update(knowledgeNodes)
     .set(input)
-    .where(inArray(knowledgeNodes.id, nodeIds))
+    .where(docsIdIn(knowledgeNodes.id, nodeIds))
     .returning();
 }
 
@@ -469,7 +470,7 @@ export async function updateDocsNodesByIds(
         isExplicitBlank: knowledgeNodes.isExplicitBlank,
       })
       .from(knowledgeNodes)
-      .where(inArray(knowledgeNodes.id, nodeIds));
+      .where(docsIdIn(knowledgeNodes.id, nodeIds));
     const updatedRows: Array<typeof knowledgeNodes.$inferSelect> = [];
     for (const current of currentRows) {
       let isExplicitBlank: boolean;
@@ -540,6 +541,6 @@ export async function updateDocsNodesByIds(
   return await client
     .update(knowledgeNodes)
     .set(values)
-    .where(inArray(knowledgeNodes.id, nodeIds))
+    .where(docsIdIn(knowledgeNodes.id, nodeIds))
     .returning();
 }

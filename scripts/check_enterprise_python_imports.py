@@ -19,7 +19,6 @@ from typing import Iterable, Sequence
 IMPORT_ERROR_ALLOWLIST = frozenset(
     {
         "src.api.comfyui_routes",
-        "src.tools.hydrus_browser",
     }
 )
 

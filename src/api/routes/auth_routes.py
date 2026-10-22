@@ -17,6 +17,7 @@ import jwt
 from ...features import Features
 from ...memory.enterprise_bootstrap_repository import EnterpriseBootstrapRepository
 from ..router_helpers import cookie_auth_dependency
+from ..public_base_path import public_cookie_path
 from .payloads import ChangePasswordPayload, LoginPayload, ResetPasswordPayload
 from ...security_secret import resolve_auth_secret_env
 
@@ -777,7 +778,8 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
             server.legacy_cookie_name,
             server.next_cookie_name,
         }:
-            response.delete_cookie(cookie_name)
+            for cookie_path in {public_cookie_path(), "/"}:
+                response.delete_cookie(cookie_name, path=cookie_path)
         return response
 
     @app.get("/api/auth/login-history")
@@ -1064,6 +1066,7 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
                     samesite="lax",
                     secure=request.url.scheme == "https",
                     max_age=server.session_ttl_seconds,
+                    path=public_cookie_path(),
                 )
                 return response
             finally:

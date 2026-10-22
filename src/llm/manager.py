@@ -22,6 +22,14 @@ from .native_runtime import (
     create_async_openai_client,
 )
 from .provider_capabilities import ProviderCapabilities
+from .provider_mode_adapters import resolve_strata_response_mode
+from .deepinfra import (
+    DEEPINFRA_DEFAULT_BASE_URL,
+    DEEPINFRA_DEFAULT_MODEL,
+    model_capabilities as deepinfra_model_capabilities,
+    normalize_base_url as normalize_deepinfra_base_url,
+    resolve_reasoning_effort as resolve_deepinfra_reasoning_effort,
+)
 from ..tools import init_spotify_manager
 from ..memory.manager import ConversationMemoryManager
 from ..memory.config import MemoryConfig
@@ -34,6 +42,11 @@ from .tool_packs import ensure_load_tool_pack_tool
 from .generation_policy import DEFAULT_GENERATION_POLICY
 from .planning_policy import DEFAULT_PLANNING_POLICY
 from .conversation_context import conversation_state_mode
+from .openrouter_provider_routing import (
+    MODEL_PROVIDER_OPTIONS_CONFIG_KEY,
+    normalize_model_provider_options,
+    provider_options_for_model,
+)
 from .deployment_resolver import (
     KNOWN_PROVIDER_IDS,
     canonical_model_for_provider,
@@ -58,6 +71,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FIXED_DECART_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+_FIXED_DECART_PROVIDER_PROFILE = {
+    "only": ["decart"],
+    "order": ["decart"],
+    "allow_fallbacks": False,
+    "require_parameters": True,
+}
+
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
@@ -77,6 +98,31 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
             current = current[part]
         return current
     return default
+
+
+def _fixed_decart_model_provider_options(
+    config: Any,
+    *,
+    provider: str,
+    model: str,
+) -> Dict[str, Dict[str, Any]] | None:
+    """Project the pinned DeepSeek/Decart route into this client config."""
+
+    if (
+        str(provider or "").strip().lower() != "openrouter"
+        or str(model or "").strip() != _FIXED_DECART_MODEL
+    ):
+        return None
+    model_options = normalize_model_provider_options(
+        _config_get(config, MODEL_PROVIDER_OPTIONS_CONFIG_KEY, {})
+    )
+    configured = dict(model_options.get(_FIXED_DECART_MODEL) or {})
+    # Preserve optional supported profile settings such as zdr, while the
+    # pinned route's provider, order, fallback and parameter contract is
+    # authoritative for this exact model.
+    configured.update(_FIXED_DECART_PROVIDER_PROFILE)
+    model_options[_FIXED_DECART_MODEL] = configured
+    return model_options
 
 
 def _config_bool(config: Any, key: str, default: bool) -> bool:
@@ -161,17 +207,36 @@ class AgentLLMClient(
             )
         self.model_name = normalized_model
         self.provider_label = provider_label
+        self.model_capabilities = (
+            deepinfra_model_capabilities(config, self.model_name)
+            if provider_label == "deepinfra"
+            else {}
+        )
+        model_supports_tools = self.model_capabilities.get("supports_tools")
+        model_supports_response_format = self.model_capabilities.get(
+            "supports_response_format"
+        )
+        model_supports_extra_body = self.model_capabilities.get(
+            "supports_extra_body"
+        )
         self._native_tools_enabled = (
             bool(supports_tools)
+            and model_supports_tools is not False
             and not self._lightweight_ephemeral_client
         )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
             supports_tools=self._native_tools_enabled,
-            supports_response_format=provider_label in {"openai", "deepseek", "deepinfra"},
+            supports_response_format=(
+                provider_label in {"openai", "deepseek", "deepinfra"}
+                and model_supports_response_format is not False
+            ),
             supports_model_pull=False,
             supports_model_delete=False,
-            supports_extra_body=provider_label in {"openrouter", "deepseek", "deepinfra"},
+            supports_extra_body=(
+                provider_label in {"openrouter", "deepseek", "deepinfra"}
+                and model_supports_extra_body is not False
+            ),
         )
         self._openai_client = create_async_openai_client(
             api_key=api_key,
@@ -218,6 +283,9 @@ class AgentLLMClient(
         self.planning_policy = DEFAULT_PLANNING_POLICY
         self.current_edit_message_id: Optional[str] = None
         self._current_context_bundle: Optional[ContextBundle] = None
+        self._current_prompt_stable_context: list[tuple[str, str]] = []
+        self._current_prompt_dynamic_context: list[tuple[str, str]] = []
+        self._current_project_cache_revision: str = ""
         self._last_context_snapshots: list[dict[str, Any]] = []
         self._loaded_history_session_id: Optional[str] = None
         self._model_transcript: list[dict[str, Any]] = []
@@ -551,7 +619,20 @@ def _overlay_openai_compatible_local_target_runtime(
         config,
         target_model,
     )
-    if managed_runtime == "freetoken":
+    if managed_runtime == "strata":
+        # Strata owns its endpoint and launch settings. Never resolve this
+        # target through llama.cpp or carry its MTP/effort state into Strata.
+        # Inherit callers resolve Main's saved mode before this boundary.
+        # An empty target effort is the model default (e.g. a static Team
+        # profile), so it must not inherit an unrelated global thinking mode.
+        overrides["llm_runtime_mode"] = resolve_strata_response_mode(None)
+        local_copy["server_profile"] = "strata"
+        local_copy["llama_cpp"] = {}
+        local_copy["reasoning_effort"] = None
+        overrides["runtime.target_reasoning_effort"] = None
+        for key in _LLAMA_CPP_FREETOKEN_MASK_KEYS:
+            overrides[f"openai_compatible_local.llama_cpp.{key}"] = None
+    elif managed_runtime == "freetoken":
         from src.service_manager._local_llm_servers import _freetoken_settings
 
         resolved = _freetoken_settings(
@@ -662,6 +743,13 @@ def create_llm_client_for_target(
         model = enforce_enterprise_sglang_model(config, provider, model)
     options = dict(provider_options or {})
     enable_tools = _target_enable_tools_option(options)
+    model_capability_metadata = (
+        options.get("model_capabilities")
+        if isinstance(options.get("model_capabilities"), dict)
+        else options.get("model_metadata")
+        if isinstance(options.get("model_metadata"), dict)
+        else None
+    )
     lightweight_client = options.get("lightweight_client", False)
     if not isinstance(lightweight_client, bool):
         raise ValueError(
@@ -682,6 +770,7 @@ def create_llm_client_for_target(
         # 通常利用のfallback文言は維持し、無料Teamだけrouting層へ元例外を返す。
         "free_team.propagate_errors": True,
     }
+    target_response_mode: str | None = None
     if options.get("max_output_tokens") is not None:
         overrides["runtime.target_max_output_tokens"] = max(
             1, int(options["max_output_tokens"])
@@ -689,6 +778,17 @@ def create_llm_client_for_target(
     if options.get("ephemeral_session_client"):
         overrides["runtime.ephemeral_session_client"] = True
         overrides["memory.enabled"] = False
+        # A target client can outlive its individual request (session,
+        # group/meeting, Agent Team, or Operations task).  Mark it as a local
+        # runtime consumer so a global engine switch waits for cleanup instead
+        # of force-killing the managed GPU process it still targets.
+        consumer_kind = str(
+            options.get("runtime_consumer")
+            or options.get("consumer")
+            or "session"
+        ).strip()
+        if consumer_kind:
+            overrides["runtime.local_runtime_consumer"] = consumer_kind[:80]
     if enable_tools is not None:
         overrides["runtime.target_enable_tools"] = enable_tools
     if "lightweight_client" in options:
@@ -700,6 +800,10 @@ def create_llm_client_for_target(
         overrides["runtime.target_api_key"] = resolved_key
     if resolved_base_url:
         overrides["runtime.target_base_url"] = resolved_base_url
+    if provider == "deepinfra" and model_capability_metadata:
+        overrides["runtime.target_model_capabilities"] = copy.deepcopy(
+            model_capability_metadata
+        )
     if options.get("defer_server_start"):
         overrides["runtime.defer_server_start"] = True
     if options.get("disable_server_auto_start"):
@@ -729,11 +833,48 @@ def create_llm_client_for_target(
         overrides["openrouter.enable_tools"] = "tools" in set(
             options.get("capabilities") or []
         ) or bool(options.get("enable_tools", True))
+        normalized_model = str(model or "").strip()
+        fixed_model_options = _fixed_decart_model_provider_options(
+            config,
+            provider=provider,
+            model=normalized_model,
+        )
+        is_free_team_openrouter_request = (
+            options.get("_free_team_openrouter_request") is True
+        )
+        if fixed_model_options is not None and not is_free_team_openrouter_request:
+            # A Subagent route pins provider/model in AgentRevision; project
+            # this model's provider policy onto the target config before the
+            # normal client factory decides whether to add its free-team cap.
+            overrides[MODEL_PROVIDER_OPTIONS_CONFIG_KEY] = fixed_model_options
+            configured_provider_options = dict(
+                fixed_model_options.get(normalized_model) or {}
+            )
+        else:
+            configured_provider_options = provider_options_for_model(
+                config, normalized_model
+            )
+        if is_free_team_openrouter_request:
+            # Free Team's price ceiling remains a separate request policy.
+            overrides["runtime.free_team_openrouter_request"] = True
+        # The pinned paid Decart profile must be allowed to reach its provider;
+        # Free Team calls and every other OpenRouter target retain the guard.
+        is_paid_fixed_decart_profile = (
+            options.get("_free_team_openrouter_request") is not True
+            and normalized_model == _FIXED_DECART_MODEL
+            and configured_provider_options.get("only") == ["decart"]
+            and configured_provider_options.get("order") == ["decart"]
+            and configured_provider_options.get("allow_fallbacks") is False
+            and configured_provider_options.get("require_parameters") is True
+        )
+        provider_request_options: Dict[str, Any] = {"allow_fallbacks": False}
+        if not is_paid_fixed_decart_profile:
+            provider_request_options["max_price"] = {
+                "prompt": 0,
+                "completion": 0,
+            }
         overrides["free_team.request_extra_body"] = {
-            "provider": {
-                "allow_fallbacks": False,
-                "max_price": {"prompt": 0, "completion": 0},
-            },
+            "provider": provider_request_options,
         }
     elif provider == "deepseek":
         if resolved_key:
@@ -755,11 +896,16 @@ def create_llm_client_for_target(
         if resolved_base_url:
             overrides["deepinfra.base_url"] = resolved_base_url
             overrides["deepinfra_base_url"] = resolved_base_url
-        selected_effort = str(
-            effort or options.get("reasoning_effort") or "high"
-        ).strip().lower()
-        if selected_effort not in {"none", "low", "medium", "high"}:
-            selected_effort = "high"
+        effort_config = (
+            {"runtime.target_model_capabilities": model_capability_metadata}
+            if model_capability_metadata
+            else config
+        )
+        selected_effort = resolve_deepinfra_reasoning_effort(
+            effort_config,
+            model,
+            effort or options.get("reasoning_effort"),
+        )
         overrides["deepinfra.reasoning_effort"] = selected_effort
     elif provider == "kimi":
         if resolved_key:
@@ -780,6 +926,9 @@ def create_llm_client_for_target(
         )
 
         local_runtime = managed_local_runtime_for_model(config, model)
+        if local_runtime == "strata":
+            if str(effort or "").strip():
+                target_response_mode = resolve_strata_response_mode(config, effort)
         local_metadata = (
             None
             if local_runtime == "freetoken"
@@ -799,6 +948,10 @@ def create_llm_client_for_target(
             model,
             options=options,
         )
+        if target_response_mode is not None:
+            # Child Team routes resolve Main again from this target config.
+            # Keep that projection aligned with the parent's selected wire.
+            overrides["llm_runtime_mode"] = target_response_mode
     elif provider == "ollama":
         overrides["ollama.model"] = model
         if resolved_base_url:
@@ -813,10 +966,18 @@ def create_llm_client_for_target(
             )
         overrides["llm_provider"] = "routing-profile"
         overrides["llm_model"] = "free-team"
-    if resolved_base_url and provider not in {"openrouter"}:
+    if resolved_base_url and provider != "openrouter":
         overrides[f"{provider}.base_url"] = resolved_base_url
     target_config = TargetConfig(config, overrides)
-    return create_llm_client(target_config)
+    client = create_llm_client(target_config)
+    if target_response_mode is not None:
+        set_mode = getattr(client, "set_llm_mode", None)
+        if not callable(set_mode):
+            raise ValueError(
+                "Strata target client does not support response mode selection"
+            )
+        set_mode(target_response_mode)
+    return client
 
 
 def create_llm_client(
@@ -861,6 +1022,24 @@ def create_llm_client(
         current_model = str(config.get("llm_model", "") or "").strip()
         if current_model != safe_model:
             config = TargetConfig(config, {"llm_model": safe_model})
+
+    if (
+        llm_provider == "openrouter"
+        and not _config_bool(config, "runtime.free_team_openrouter_request", False)
+    ):
+        fixed_model_options = _fixed_decart_model_provider_options(
+            config,
+            provider=llm_provider,
+            model=str(config.get("llm_model", "") or "").strip(),
+        )
+        if fixed_model_options is not None:
+            # Normal Chat UI clients also receive the route before the
+            # OpenRouter client is created; request assembly then forwards it
+            # through the same model-profile merge as every other request.
+            config = TargetConfig(
+                config,
+                {MODEL_PROVIDER_OPTIONS_CONFIG_KEY: fixed_model_options},
+            )
 
     if llm_provider == "routing-profile":
         model = str(config.get("llm_model", "") or "")
@@ -1015,18 +1194,18 @@ def create_llm_client(
             raise RuntimeError(
                 "DeepInfraを使用するには DEEPINFRA_TOKEN を設定してください"
             )
-        base_url = (
+        base_url = normalize_deepinfra_base_url(
             config.get("deepinfra.base_url")
             or config.get("deepinfra_base_url")
             or os.getenv("DEEPINFRA_BASE_URL")
-            or "https://api.deepinfra.com/v1/openai"
+            or DEEPINFRA_DEFAULT_BASE_URL
         )
         return AgentLLMClient(
             api_key=api_key,
             model=(
                 config.get("llm_model")
                 or config.get("deepinfra.model")
-                or "deepseek-ai/DeepSeek-V4-Flash"
+                or DEEPINFRA_DEFAULT_MODEL
             ),
             config=config,
             provider_label="deepinfra",

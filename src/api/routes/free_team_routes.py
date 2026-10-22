@@ -19,6 +19,8 @@ from ...memory.models.free_team import (
     FreeTeamCandidateModel,
     FreeTeamCredentialProfile,
     FreeTeamQuotaPool,
+    OPENAI_DAILY_QUOTA_GROUPS,
+    OPENAI_SAFETY_TOKENS,
 )
 from ...services.free_team_service import (
     FREE_TEAM_PROFILE_ID,
@@ -27,6 +29,10 @@ from ...services.free_team_service import (
     recover_credential_after_auth_update,
     release_expired_reservations,
     seed_free_team_defaults,
+    complimentary_model_group,
+    _reset_quota_if_needed,
+    sync_provider_observation,
+    FreeTeamUnavailableError,
 )
 from ...services.llm_model_catalog import default_fetch_json
 from ...llm.deployment_resolver import is_retired_model
@@ -49,7 +55,7 @@ def _non_negative(value: Any, field: str) -> Decimal:
         parsed = Decimal(str(value))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"{field} は数値で指定してください") from exc
-    if parsed < 0:
+    if not parsed.is_finite() or parsed < 0:
         raise HTTPException(status_code=422, detail=f"{field} は0以上で指定してください")
     return parsed
 
@@ -178,7 +184,16 @@ def _validate_base_url(value: Any) -> str:
 
 
 def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
+    from .openai_confirmation_routes import register_openai_confirmation_routes
+    register_openai_confirmation_routes(app, server)
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+
+    async def require_quota_admin(request: Request, _: None = Depends(require_auth)) -> None:
+        if getattr(server, "auth_enabled", True) is False:
+            return
+        admin_check = getattr(server, "_is_admin_user", None)
+        if not callable(admin_check) or not await admin_check(request):
+            raise HTTPException(status_code=403, detail="Administrator privileges required")
 
     async def free_team_reaper_loop() -> None:
         while True:
@@ -219,7 +234,7 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
     @app.get("/api/free-team/settings")
     async def get_settings(_: None = Depends(require_auth)):
         state = await get_free_team_state(
-            include_quotas=False, include_reservations=False
+            include_quotas=False, include_reservations=False, config=server.config
         )
         return {
             "routing_profile_id": FREE_TEAM_PROFILE_ID,
@@ -229,8 +244,8 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
 
     @app.get("/api/free-team/usage")
     async def get_usage(_: None = Depends(require_auth)):
-        state = await get_free_team_state(include_reservations=False)
-        return {"quota_pools": state["quota_pools"]}
+        state = await get_free_team_state(include_reservations=False, config=server.config)
+        return {"quota_pools": state["quota_pools"], "verification": state["verification"]}
 
     @app.put("/api/free-team/settings")
     async def update_settings(request: Request, _: None = Depends(require_auth)):
@@ -360,6 +375,12 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
         session = await get_db_session()
         try:
             async with session.begin():
+                # Match declaration/request lock ordering: global config before
+                # credential. Keep rotation invalidation in this transaction.
+                confirmation_row = confirmation_stored = None
+                if profile_id == "openai-complimentary":
+                    from ...services import openai_confirmation_service as confirmation
+                    confirmation_row, confirmation_stored, _ = await confirmation.config_row(session, lock=True)
                 await seed_free_team_defaults(session)
                 result = await session.execute(
                     select(FreeTeamCredentialProfile)
@@ -369,6 +390,7 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 profile = result.scalar_one_or_none()
                 if profile is None:
                     raise HTTPException(status_code=404, detail="認証プロファイルがありません")
+                before_identity = (profile.api_key, profile.base_url)
                 for field in (
                     "display_name",
                     "cli_auth_reference",
@@ -396,6 +418,13 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # 有料超過は明示入力でも無料Teamの自動選択対象外になる。
                 if "allow_paid_overage" in body:
                     profile.allow_paid_overage = bool(body["allow_paid_overage"])
+                if confirmation_stored is not None and before_identity != (profile.api_key, profile.base_url):
+                    receipt = (confirmation_stored.get("openai") or {}).get("complimentary_verification") or {}
+                    bindings = receipt.get("credentials") or []
+                    if any(binding.get("credential_reference") == "free-team:openai-complimentary" for binding in bindings):
+                        if confirmation.revoke_record(confirmation_stored, reason="credential_changed"):
+                            from ...security.field_crypto import encrypt_json_secret_leaves
+                            confirmation_row.value = encrypt_json_secret_leaves(confirmation_stored, aad_prefix="app_config_settings.value")
                 safe = profile.to_safe_dict()
             return {"success": True, "credential": safe}
         finally:
@@ -408,6 +437,7 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
         body = await request.json()
         allowed = {
             "enabled",
+            "model",
             "priority",
             "weight",
             "effort",
@@ -432,6 +462,18 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 candidate = result.scalar_one_or_none()
                 if candidate is None:
                     raise HTTPException(status_code=404, detail="候補モデルがありません")
+                if "model" in body:
+                    model = body["model"]
+                    if not isinstance(model, str) or not model.strip() or len(model) > 240 or is_retired_model(model):
+                        raise HTTPException(status_code=422, detail="model が不正です")
+                    model = model.strip()
+                    if candidate.provider == "openai":
+                        group = complimentary_model_group(model)
+                        if group is None or not candidate.quota_pool_ids or any(
+                            OPENAI_DAILY_QUOTA_GROUPS.get(pool) != group for pool in candidate.quota_pool_ids
+                        ):
+                            raise HTTPException(status_code=422, detail="model は既存共有quotaの対象model groupに限定されます")
+                    candidate.model = model
                 if "enabled" in body:
                     candidate.enabled = bool(body["enabled"])
                     if candidate.enabled and candidate.status in {
@@ -479,11 +521,12 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
 
     @app.patch("/api/free-team/quota-pools/{quota_id}")
     async def update_quota(
-        quota_id: str, request: Request, _: None = Depends(require_auth)
+        quota_id: str, request: Request, _: None = Depends(require_quota_admin)
     ):
         body = await request.json()
         allowed = {
             "limit",
+            "daily_cap",
             "safety_margin_ratio",
             "safety_margin_units",
             "reset_policy",
@@ -516,6 +559,12 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                     quota.safety_margin_units = _non_negative(
                         body["safety_margin_units"], "safety_margin_units"
                     )
+                if "daily_cap" in body:
+                    cap = _non_negative(body["daily_cap"], "daily_cap")
+                    if cap > Decimal(quota.limit_value):
+                        raise HTTPException(status_code=422, detail="daily_cap はquota上限以下です")
+                    quota.safety_margin_ratio = Decimal("0")
+                    quota.safety_margin_units = Decimal(quota.limit_value) - cap
                 if "reset_policy" in body:
                     if not isinstance(body["reset_policy"], dict):
                         raise HTTPException(status_code=422, detail="reset_policy はobjectです")
@@ -536,9 +585,19 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                             status_code=422,
                             detail="reset_policy.timezone は現在UTCのみ対応です",
                         )
-                    quota.reset_policy = policy
+                    quota.reset_policy = {**policy, **({"billing_scope_id": quota.reset_policy["billing_scope_id"]} if "billing_scope_id" in (quota.reset_policy or {}) else {})}
                 if "status" in body:
                     quota.status = str(body["status"] or "active")
+                if quota.id in OPENAI_DAILY_QUOTA_GROUPS:
+                    from ...services.pricing.free_tier import FREE_TIER_LIMITS
+                    official_limit = Decimal(FREE_TIER_LIMITS["tier_3_plus"][OPENAI_DAILY_QUOTA_GROUPS[quota.id]])
+                    if quota.limit_value > official_limit or quota.safety_margin_units < OPENAI_SAFETY_TOKENS:
+                        raise HTTPException(status_code=422, detail="OpenAI共有quotaは公式上限以下・安全量30000以上です")
+                    policy = quota.reset_policy or {}
+                    if policy.get("kind") != "daily" or str(policy.get("timezone", "UTC")).upper() != "UTC" or policy.get("hour", 0) != 0:
+                        raise HTTPException(status_code=422, detail="OpenAI共有quotaは00:00 UTC日次reset固定です")
+                    if quota.status not in {"active", "exhausted", "disabled"}:
+                        raise HTTPException(status_code=422, detail="quota status が不正です")
                 safe = quota.to_dict()
             return {"success": True, "quota_pool": safe}
         finally:
@@ -628,6 +687,7 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 result = await session.execute(
                     select(FreeTeamQuotaPool)
                     .where(FreeTeamQuotaPool.id.in_(list(observed)))
+                    .order_by(FreeTeamQuotaPool.id)
                     .with_for_update()
                 )
                 quotas = {item.id: item for item in result.scalars().all()}
@@ -635,12 +695,10 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                     quota = quotas.get(quota_id)
                     if quota is None:
                         continue
-                    # 遅延した外部値でローカルのハードストップを解除しない。
-                    quota.provider_observed_usage = max(
-                        Decimal(str(quota.provider_observed_usage or 0)),
-                        _non_negative(value, quota_id),
-                    )
-                    quota.last_provider_sync_at = datetime.utcnow()
+                    try:
+                        await sync_provider_observation(session, quota, value, config=server.config)
+                    except FreeTeamUnavailableError as exc:
+                        raise HTTPException(status_code=409 if str(exc) == "provider_observation_conflict" else 422, detail=str(exc)) from exc
                     updated.append(quota_id)
             return {"success": True, "updated": updated}
         finally:

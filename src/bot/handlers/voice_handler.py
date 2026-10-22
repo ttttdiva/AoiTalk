@@ -1027,6 +1027,8 @@ class VoiceHandler:
                 engine = await self.tts_manager.create_cevio_engine()
             elif engine_name == 'nijivoice':
                 engine = await self.tts_manager.create_nijivoice_engine(self.config.get('nijivoice_api_key'))
+            elif engine_name == 'gemini_tts':
+                engine = await self.tts_manager.create_gemini_tts_engine(self.config.get('gemini_api_key'))
             else:
                 logger.warning("Unsupported Discord TTS engine: %s", engine_name)
                 return False

@@ -634,6 +634,7 @@ class DreamingMemoryState(Base):
     last_incremental_at = Column(DateTime, nullable=True)
     last_dreamed_at = Column(DateTime, nullable=True)
     last_history_digest = Column(String(64), nullable=True)
+    source_policy_revision = Column(String(64), nullable=True)
     last_full_reconcile_at = Column(DateTime, nullable=True)
     next_retry_at = Column(DateTime, nullable=True)
     consecutive_failures = Column(
@@ -674,6 +675,7 @@ class DreamingMemoryState(Base):
                 self.last_dreamed_at.isoformat() if self.last_dreamed_at else None
             ),
             "last_history_digest": self.last_history_digest,
+            "source_policy_revision": self.source_policy_revision,
             "last_full_reconcile_at": (
                 self.last_full_reconcile_at.isoformat()
                 if self.last_full_reconcile_at
@@ -734,7 +736,7 @@ class DreamingMemoryRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "trigger IN ('idle', 'startup', 'reconcile')",
+            "trigger IN ('idle', 'startup', 'reconcile', 'source_policy_repair')",
             name="ck_dreaming_memory_runs_trigger",
         ),
         CheckConstraint(

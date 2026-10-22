@@ -131,7 +131,17 @@ export function FeedbackSection() {
     <Card size="sm" className="rounded-md border-border dark:border-[#333335] bg-card dark:bg-[#1a1a1b] py-0">
       <CardHeader
         className="cursor-pointer select-none"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        data-settings-target-activation="feedback"
         onClick={handleToggle}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            handleToggle();
+          }
+        }}
       >
         <CardTitle className="flex items-center justify-between text-sm">
           <span className="flex items-center gap-2">

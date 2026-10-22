@@ -3,7 +3,7 @@
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { X } from "lucide-react";
+import { ResizableContextRail } from "./resizable-context-rail";
 import { useSidebar } from "@/components/ui/sidebar";
 import {
   Sheet,
@@ -18,6 +18,7 @@ import {
   type ShellChromeContextValue,
   useShellChrome,
 } from "./shell-context";
+import { AoiDotsPanel } from "@/components/aoidots/aoidots-panel";
 
 export type SharedAppShellProps = {
   children: ReactNode;
@@ -94,6 +95,7 @@ function SharedAppShellInner({
   const compactDesktopUserOpenedRef = useRef(false);
   const previousNavigationOpenRef = useRef(false);
   const shellRootRef = useRef<HTMLDivElement>(null);
+  const mainCanvasRef = useRef<HTMLElement>(null);
   const isAppsRoute = pathname === "/apps" || pathname?.startsWith("/apps/");
   const registeredWorkspaceNavigation = resolveRegisteredSlot(
     pathname,
@@ -115,6 +117,7 @@ function SharedAppShellInner({
     workspaceShellRegistrations,
     "contextRail",
   );
+  const contextRailPresentation = contextRail === undefined ? registeredContextRailEntry?.contextRailPresentation : undefined;
   const resolvedWorkspaceNavigation =
     workspaceNavigation !== undefined
       ? workspaceNavigation
@@ -137,14 +140,21 @@ function SharedAppShellInner({
   const isDesktopPersistentContextRail =
     !isMobile &&
     contextRail === undefined &&
+    contextRailPresentation === undefined &&
     registeredContextRailEntry?.contextRailPersistent === true &&
     registeredContextRailEntry.contextRail != null;
+  const persistentContextRailVisible =
+    registeredContextRailEntry?.contextRailPersistentVisible ?? true;
   // Context Rail is normally a shell transient. Chat's information rail opts
-  // into a desktop-persistent registration and remains visible while Runtime,
-  // Escape, or the global rail toggle changes transient state.
+  // into a desktop-persistent registration; its route-owned visibility value
+  // remains independent from Runtime, Escape, and the global transient toggle.
   const showContextRail =
     resolvedContextRail != null &&
-    (contextRailOpen || isDesktopPersistentContextRail);
+    (contextRailPresentation !== undefined
+      ? contextRailOpen
+      : isDesktopPersistentContextRail
+        ? persistentContextRailVisible
+        : contextRailOpen);
 
   useEffect(() => {
     if (isMobile) {
@@ -193,6 +203,7 @@ function SharedAppShellInner({
   }, [isCompactDesktop, isDesktopPersistentWorkspaceNavigation, isMobile, setOpen, state]);
 
   useEffect(() => {
+    if (contextRailPresentation) return;
     if (!contextRailOpen) return;
     // Context Rail is the only shell surface that replaces workspace
     // navigation. Runtime is a fixed utility popup anchored to the global
@@ -209,6 +220,7 @@ function SharedAppShellInner({
     }
   }, [
     contextRailOpen,
+    contextRailPresentation,
     isCompactDesktop,
     isDesktopPersistentWorkspaceNavigation,
     isMobile,
@@ -341,6 +353,7 @@ function SharedAppShellInner({
           )}
 
           <main
+            ref={mainCanvasRef}
             className="ao-main-canvas ao-main-panel flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
             data-shell-region="main-canvas"
           >
@@ -349,35 +362,28 @@ function SharedAppShellInner({
             </div>
           </main>
 
-          {showContextRail && (
-            <aside
-              className="ao-context-rail shrink-0 overflow-hidden border-l"
-              aria-label={
-                isDesktopPersistentContextRail ? "チャット情報レール" : "Context Rail"
-              }
-              data-shell-region="context-rail"
-              data-context-rail-persistent={
-                isDesktopPersistentContextRail ? "true" : "false"
-              }
+          {resolvedContextRail != null &&
+            (showContextRail ||
+              contextRailPresentation !== undefined ||
+              isDesktopPersistentContextRail) && (
+            <ResizableContextRail
+              mainRef={mainCanvasRef}
+              isMobile={isMobile}
+              persistent={isDesktopPersistentContextRail}
+              hidden={!showContextRail}
+              temporary={contextRailPresentation !== undefined}
+              onClose={() => setContextRailOpen(false)}
             >
-              {!isDesktopPersistentContextRail && (
-                <button
-                  type="button"
-                  className="ao-context-rail-close"
-                  aria-label="Context Railを閉じる"
-                  title="Context Railを閉じる"
-                  onClick={() => setContextRailOpen(false)}
-                >
-                  <X className="size-4" />
-                </button>
-              )}
-              <div className="ao-context-rail-content h-full min-h-0 overflow-auto">
-                {resolvedContextRail}
-              </div>
-            </aside>
+              {resolvedContextRail}
+            </ResizableContextRail>
           )}
         </div>
       </div>
+
+      {/* AoiDots owns an independent root/session controller. Keep it mounted
+          while closed so draft, socket metadata, and pending Work survive UI
+          toggles and route changes. */}
+      <AoiDotsPanel />
 
     </div>
   );

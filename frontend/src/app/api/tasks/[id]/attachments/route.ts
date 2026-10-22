@@ -1,3 +1,4 @@
+import { withBasePath } from "@/lib/base-path";
 import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
 import path from "node:path";
@@ -66,7 +67,7 @@ function serializeAttachment(
     created_by: row.createdBy,
     created_at: row.createdAt,
     metadata: row.attachmentMetadata ?? {},
-    url: `/api/tasks/${taskId}/attachments/${row.id}`,
+    url: withBasePath(`/api/tasks/${taskId}/attachments/${row.id}`),
   };
 }
 

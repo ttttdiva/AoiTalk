@@ -13,9 +13,30 @@ import {
   ConversationScopeError,
 } from "@/lib/server/conversation-route-utils";
 import { getReadableProjectIds } from "@/lib/server/task-route-utils";
+import {
+  ConversationHistoryStatusBridgeError,
+  fetchConversationHistoryStatuses,
+  isConversationHistoryStatusBridgeError,
+} from "@/lib/server/conversation-history-status";
 
 type SearchMatchType = "message" | "session";
-const MESSAGE_SCAN_LIMIT = 2000;
+const MESSAGE_PAGE_SIZE = 200;
+
+function isCorruptConversationContentError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message === "unsupported encrypted field format") return true;
+  if (error.message === "encrypted field authentication failed") return true;
+  return /unable to authenticate data/i.test(error.message);
+}
+
+function decryptConversationContent(value: string): string | null {
+  try {
+    return decryptTextIfNeeded(value, "conversation_messages.content") || "";
+  } catch (error) {
+    if (!isCorruptConversationContentError(error)) throw error;
+    return null;
+  }
+}
 
 function escapeLikeTerm(value: string): string {
   return value.replace(/[\\%_]/g, (match) => `\\${match}`).toLowerCase();
@@ -40,18 +61,6 @@ function createSnippet(content: string, query: string, maxLength = 160): string 
   return `${prefix}${normalizedContent.slice(start, end)}${suffix}`;
 }
 
-function isStoryWorkflowSession(row: {
-  characterName?: string | null;
-  title?: string | null;
-}): boolean {
-  const characterName = row.characterName || "";
-  const title = row.title || "";
-  return (
-    characterName.startsWith("story_") ||
-    title.startsWith("[執筆]")
-  );
-}
-
 function toResult(args: {
   matchType: SearchMatchType;
   session: typeof conversationSessions.$inferSelect;
@@ -60,6 +69,7 @@ function toResult(args: {
   query: string;
 }) {
   const { matchType, session, message, messageContent, query } = args;
+  const agentId = (session as unknown as { agentId?: unknown }).agentId;
   const createdAt = message?.createdAt ?? session.lastActivity ?? session.sessionStart;
   const snippet = message
     ? createSnippet(messageContent ?? "", query)
@@ -82,6 +92,9 @@ function toResult(args: {
     created_at: createdAt,
     last_activity: session.lastActivity ?? session.sessionStart,
     project_id: session.projectId,
+    agent_id: typeof agentId === "string" ? agentId : null,
+    is_pinned: session.isPinned,
+    pinned_at: session.pinnedAt,
   };
 }
 
@@ -125,6 +138,7 @@ export async function GET(request: NextRequest) {
       eq(conversationSessions.userId, user.id),
       isNotNull(conversationParticipants.id),
     ),
+    eq(conversationSessions.isActive, true),
     isNull(conversationSessions.deletedAt),
   ];
   if (projectId) {
@@ -140,56 +154,82 @@ export async function GET(request: NextRequest) {
     sessionConditions.push(isNull(conversationSessions.projectId));
   }
 
-  const messageRows = await db
-    .select({
-      session: conversationSessions,
-      message: conversationMessages,
-    })
-    .from(conversationMessages)
-    .innerJoin(
-      conversationSessions,
-      eq(conversationMessages.sessionId, conversationSessions.id),
-    )
-    .leftJoin(
-      conversationParticipants,
-      and(
-        eq(conversationParticipants.sessionId, conversationSessions.id),
-        eq(conversationParticipants.participantType, "user"),
-        eq(conversationParticipants.participantId, user.id),
-        eq(conversationParticipants.status, "joined"),
-      ),
-    )
-    .where(
-      and(
-        ...sessionConditions,
-        or(
-          eq(conversationMessages.isActiveBranch, true),
-          isNull(conversationMessages.isActiveBranch),
-        ),
-      ),
-    )
-    .orderBy(desc(conversationMessages.createdAt), desc(conversationMessages.id))
-    .limit(MESSAGE_SCAN_LIMIT);
-
   const lowerQuery = query.toLowerCase();
   const results: ReturnType<typeof toResult>[] = [];
-  for (const row of messageRows) {
-    if (results.length >= limit) break;
-    if (isStoryWorkflowSession(row.session)) continue;
-    const content = decryptTextIfNeeded(
-      row.message.content,
-      "conversation_messages.content",
-    ) || "";
-    if (!content.toLowerCase().includes(lowerQuery)) continue;
-    results.push(
-      toResult({
-        matchType: "message",
-        session: row.session,
-        message: row.message,
-        messageContent: content,
-        query,
-      }),
-    );
+  const messageOrderCreatedAt = sql`
+    coalesce(${conversationMessages.createdAt}, timestamp '0001-01-01 00:00:00')
+  `;
+  const messageCursorCreatedAt = sql<string>`${messageOrderCreatedAt}::text`;
+  let messageCursor: { createdAt: string; id: string } | null = null;
+
+  while (results.length < limit) {
+    const messageConditions = [
+      ...sessionConditions,
+      isNull(conversationMessages.deletedAt),
+      or(
+        eq(conversationMessages.isActiveBranch, true),
+        isNull(conversationMessages.isActiveBranch),
+      ),
+    ];
+    if (messageCursor) {
+      const cursorCreatedAt = sql`${messageCursor.createdAt}::text::timestamp`;
+      messageConditions.push(sql`(
+        ${messageOrderCreatedAt} < ${cursorCreatedAt}
+        or (
+          ${messageOrderCreatedAt} = ${cursorCreatedAt}
+          and ${conversationMessages.id} < ${messageCursor.id}
+        )
+      )`);
+    }
+
+    const messageRows = await db
+      .select({
+        session: conversationSessions,
+        message: conversationMessages,
+        messageCursorCreatedAt,
+      })
+      .from(conversationMessages)
+      .innerJoin(
+        conversationSessions,
+        eq(conversationMessages.sessionId, conversationSessions.id),
+      )
+      .leftJoin(
+        conversationParticipants,
+        and(
+          eq(conversationParticipants.sessionId, conversationSessions.id),
+          eq(conversationParticipants.participantType, "user"),
+          eq(conversationParticipants.participantId, user.id),
+          eq(conversationParticipants.status, "joined"),
+        ),
+      )
+      .where(and(...messageConditions))
+      .orderBy(desc(messageOrderCreatedAt), desc(conversationMessages.id))
+      .limit(MESSAGE_PAGE_SIZE);
+
+    if (messageRows.length === 0) break;
+    for (const row of messageRows) {
+      if (results.length >= limit) break;
+      const content = decryptConversationContent(row.message.content);
+      if (content === null || !content.toLowerCase().includes(lowerQuery)) continue;
+      results.push(
+        toResult({
+          matchType: "message",
+          session: row.session,
+          message: row.message,
+          messageContent: content,
+          query,
+        }),
+      );
+    }
+
+    const lastRow = messageRows[messageRows.length - 1];
+    const lastMessage = lastRow?.message;
+    if (!lastMessage?.id || !lastRow?.messageCursorCreatedAt) break;
+    messageCursor = {
+      createdAt: lastRow.messageCursorCreatedAt,
+      id: lastMessage.id,
+    };
+    if (messageRows.length < MESSAGE_PAGE_SIZE) break;
   }
 
   const remainingLimit = Math.max(0, limit - results.length);
@@ -229,10 +269,61 @@ export async function GET(request: NextRequest) {
         ? row.conversation_sessions
         : row;
       if (matchedSessionIds.has(session.id)) continue;
-      if (isStoryWorkflowSession(session)) continue;
       results.push(toResult({ matchType: "session", session, query }));
     }
   }
 
-  return NextResponse.json({ results, total: results.length });
+  if (results.length === 0) {
+    return NextResponse.json({ results: [], total: 0 });
+  }
+
+  let statusProjections: Awaited<
+    ReturnType<typeof fetchConversationHistoryStatuses>
+  >;
+  try {
+    statusProjections = await fetchConversationHistoryStatuses(
+      results.map((result) => result.session_id),
+      user,
+    );
+  } catch (error) {
+    if (isConversationHistoryStatusBridgeError(error)) {
+      return NextResponse.json(
+        { detail: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+
+  let projectedResults: typeof results;
+  try {
+    projectedResults = results.map((result) => {
+      const projection = statusProjections.get(result.session_id);
+      if (!projection) {
+        throw new ConversationHistoryStatusBridgeError(
+          502,
+          "history_status_missing_projection",
+          "会話履歴の状態投影が一部欠落しています",
+        );
+      }
+      return {
+        ...result,
+        history_status: projection.history_status,
+        history_completed_at: projection.history_completed_at,
+      };
+    });
+  } catch (error) {
+    if (isConversationHistoryStatusBridgeError(error)) {
+      return NextResponse.json(
+        { detail: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+
+  return NextResponse.json({
+    results: projectedResults,
+    total: projectedResults.length,
+  });
 }

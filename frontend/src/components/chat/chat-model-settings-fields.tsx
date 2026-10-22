@@ -13,6 +13,7 @@ import type {
 import type { RuntimeContextValue } from "@/contexts/runtime-context";
 import type { UserSettings } from "@/lib/user-settings";
 import { cn } from "@/lib/utils";
+import { displayModelOptionLabel } from "@/lib/local-runtime-status";
 
 const runtimeSelectClassName =
   "h-8 min-h-8 border-input bg-background text-xs text-foreground shadow-none";
@@ -37,7 +38,12 @@ type ChatModelSettingsRouteProps = {
   }>;
   effectiveProvider: string;
   effectiveModel: string;
-  modelOptions: Array<{ id: string; label?: string }>;
+  modelOptions: Array<{
+    id: string;
+    label?: string;
+    installed?: boolean;
+    source_label?: string;
+  }>;
   providerDisabled: boolean;
   modelDisabled: boolean;
   settingsLoading: boolean;
@@ -163,7 +169,7 @@ export function ChatModelSettingsFields({
             >
               {modelOptions.map((model) => (
                 <option key={model.id} value={model.id}>
-                  {model.label || model.id}
+                  {displayModelOptionLabel(model)}
                 </option>
               ))}
             </AppSelect>
@@ -174,9 +180,9 @@ export function ChatModelSettingsFields({
       {effortSlot}
 
       <label className="grid gap-1 text-xs text-muted-foreground">
-        <span>Agent Team</span>
+        <span>Execution Team</span>
         <AppSelect
-          aria-label="Agent Team"
+          aria-label="Execution Team"
           data-chat-settings-item="agentTeam"
           value={agentTeamSelectorValue}
           onChange={handleAgentTeamChange}

@@ -61,7 +61,7 @@ class PersonaRevisionCreateRequest(_MediaCommandModel):
     )
     platforms: list[MediaPlatform] = Field(
         default_factory=list,
-        max_length=6,
+        max_length=8,
     )
     content_pillars: list[ContentPillar] = Field(
         default_factory=list,
@@ -127,7 +127,7 @@ class MediaCharacterPatchRequest(_MediaCommandModel):
     summary: str | None = Field(default=None, max_length=4000)
     voice: str | None = Field(default=None, max_length=4000)
     audience: str | None = Field(default=None, max_length=4000)
-    platforms: list[MediaPlatform] | None = Field(default=None, max_length=6)
+    platforms: list[MediaPlatform] | None = Field(default=None, max_length=8)
     content_pillars: list[ContentPillar] | None = Field(default=None, max_length=20)
     public_aliases: list[str] | None = Field(default=None, max_length=20)
     niche: str | None = Field(default=None, max_length=1000)
@@ -272,7 +272,7 @@ class PersonaRevisionResponse(
     video_production_policy: dict[str, Any]
     public_aliases: list[str]
     platforms: list[MediaPlatform] = Field(
-        max_length=6
+        max_length=8
     )
     content_pillars: list[str] = Field(
         max_length=20

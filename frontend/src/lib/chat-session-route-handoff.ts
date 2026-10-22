@@ -154,7 +154,7 @@ export function assertPendingHandoffApplied(
 
   if (!agentTeamSelectionsMatch(pending.agent_team_selection, response.settings.agent_team_selection)) {
     throw new PendingLlmHandoffError(
-      "新規チャットの Agent Team 設定がセッションに正しく反映されませんでした。",
+      "新規チャットの Execution Team 設定がセッションに正しく反映されませんでした。",
     );
   }
 

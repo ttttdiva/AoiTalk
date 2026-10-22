@@ -2,8 +2,8 @@
 
 Operations combines a company-wide read-only command-center projection with
 dedicated domain management panels. The bare route is the Overview; Media
-Persona remains an explicit tab. AI employee management is documented in
-[AI employee platform](ai_employee_platform.md). The command-center API itself
+Persona remains an explicit tab. Agent management is documented in
+[Agent platform](ai_employee_platform.md). The command-center API itself
 remains read-only and stores no queue, approval or domain state.
 
 ## Route map
@@ -11,7 +11,7 @@ remains read-only and stores no queue, approval or domain state.
 | URL | Surface | Mutating? |
 | --- | --- | --- |
 | `/operations` | Overview / Command Center | No; read-only projection |
-| `/operations?tab=agents` | AI employee identity, role revisions, assignments, automation, integration, phone and activity | Dedicated identity/rule/policy/credential/telephony commands; projection remains read-only |
+| `/operations?tab=agents` | Agent identity, role revisions, assignments, automation, integration, phone and activity | Dedicated identity/rule/policy/credential/telephony commands; projection remains read-only |
 | `/operations?tab=work` | Generic AgentWorkItems and latest attempts | No |
 | `/operations?tab=activity` | Cross-ledger activity timeline | No |
 | `/operations?tab=personas` | Existing Media Persona/brand surface | Existing domain commands only |
@@ -67,6 +67,41 @@ The Overview presents these safe summary counters:
 
 Counts are projections, not write authority.  “Working” must not be inferred
 from a process-local worker map when a durable WorkItem row exists.
+
+### Work-first dashboard
+
+The Overview orders approval requests, work counts, and work cards before the
+company map. Counts describe only the records returned for the selected scope,
+not an installation-wide total. Cards never invent subtask counts or infer a
+completion percentage from attempts or elapsed time. `succeeded` records count
+as completed; `cancelled` records are included in finished history but counted
+separately. Failed, blocked, stale, and uncertain work remains in the unfinished
+list. `work_view=open|all|completed` persists that list selection in the URL
+without changing the server query or refetching the same scope.
+
+The approval banner distinguishes proposed external actions from work awaiting
+approval. Approved/running/failed external actions do not inflate the approval
+count. The two record types may refer to the same action, so their counts are
+shown separately rather than added together. The banner explicitly describes
+fetched records and always links to the approval list, even when no returned
+record is pending; bounded recent rows are not proof of an empty global queue.
+Last checked refers to the last
+successful response; a failed request displays an error instead of a healthy
+zero-count dashboard. Older requests cannot replace a newer scope's result.
+
+Advanced scope filters, company structure, and secondary runtime records are
+collapsed by default. Narrow navigation wraps primary links and groups media /
+external routes with native keyboard-accessible disclosures. All canonical
+routes remain available.
+
+The Project/Space catalog follows the existing personal Inbox browsing policy:
+a reserved Inbox is visible to its owner, and another user's reserved Inbox is
+excluded before the catalog limit, including for administrators. The test is
+owner ID plus the exact reserved slug (`inbox-<owner UUID>` or
+`inbox-project-<owner UUID>`), never the display name or metadata alone.
+Ordinary shared records named Inbox remain visible and distinct by ID. This
+catalog rule does not change the operator's existing Work/Agent ledger ACL.
+It does not delete, merge, or repair stored Inbox data.
 
 ## Agents view
 
@@ -131,7 +166,7 @@ empty safe projection or a bounded validation error, never all-company data.
 ## Existing surfaces preserved
 
 Persona is a public Media identity and remains addressable at
-`tab=personas`; it must not be relabeled as an AI employee.  Existing
+`tab=personas`; it must not be relabeled as an Agent.  Existing
 Research/Generation/Pipeline/Calendar/Results and EngagementOps tabs remain
 functional when autonomous flags are disabled.  Approvals/Actions remain a
 human command surface, not an Agent self-approval control.

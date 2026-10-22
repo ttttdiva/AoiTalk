@@ -1,5 +1,7 @@
 import { fetchApi, getBaseUrl } from './api-client';
-import { getToken } from './auth';
+import { FILES_DELETE_TIMEOUT_MS } from '../constants/config';
+import { sendWithTransportAuth } from './transport-auth';
+import { nativeMultipartUpload, type NativeMultipartFile } from './native-multipart';
 import type {
   Project,
   ProjectMember,
@@ -147,13 +149,16 @@ function withQuery(path: string, params: Record<string, string | number | undefi
   return encoded ? `${path}?${encoded}` : path;
 }
 
-async function uploadProjectForm<T>(path: string, form: FormData): Promise<T> {
-  const token = await getToken();
-  const response = await fetch(`${await getBaseUrl()}${path}`, {
-    method: 'POST',
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    body: form,
-  });
+async function uploadProjectFile<T>(path: string, file: NativeMultipartFile): Promise<T> {
+  const baseUrl = await getBaseUrl();
+  const url = `${baseUrl}${path}`;
+  const response = await sendWithTransportAuth(url, { targetBaseUrl: baseUrl }, (headers) =>
+    nativeMultipartUpload({
+      url,
+      headers,
+      file,
+    }),
+  );
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(`API Error ${response.status}: ${body.slice(0, 500)}`);
@@ -455,25 +460,29 @@ export const projectApi = {
   },
 
   async deleteFile(projectId: string, path: string): Promise<ProjectFileListing> {
-    return fetchApi(withQuery(projectPath(projectId, '/files'), { path }), {
-      method: 'DELETE',
-    });
+    return fetchApi(
+      withQuery(projectPath(projectId, '/files'), { path }),
+      { method: 'DELETE' },
+      FILES_DELETE_TIMEOUT_MS,
+    );
   },
 
   async uploadFile(
     projectId: string,
     file: { uri: string; name: string; mimeType?: string | null },
     path = '',
+    overwrite = false,
   ): Promise<ProjectFileListing> {
-    const form = new FormData();
-    form.append('file', {
-      uri: file.uri,
-      name: file.name,
-      type: file.mimeType || 'application/octet-stream',
-    } as unknown as Blob);
-    return uploadProjectForm(
-      withQuery(projectPath(projectId, '/files/upload'), { path }),
-      form,
+    return uploadProjectFile(
+      withQuery(projectPath(projectId, '/files/upload'), {
+        path,
+        overwrite: overwrite ? 'true' : undefined,
+      }),
+      {
+        uri: file.uri,
+        name: file.name,
+        mimeType: file.mimeType || 'application/octet-stream',
+      },
     );
   },
 

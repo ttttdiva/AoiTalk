@@ -18,7 +18,7 @@ type Props = {
   localModelOptions?: Array<{ id: string; label: string; provider: string }>;
 };
 
-/** 外部送信ポリシーを Agent Team のモデル分担から分離して編集する。 */
+/** 外部送信ポリシーを Execution Team のモデル分担から分離して編集する。 */
 export function LlmExternalPrivacySettings({ value, onChange, onSave, saving = false, localModelOptions = [] }: Props) {
   const update = <K extends keyof ExternalModelPrivacySettings>(key: K, next: ExternalModelPrivacySettings[K]) => {
     onChange((current) => ({ ...current, [key]: next }));

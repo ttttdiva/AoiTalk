@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -16,10 +17,8 @@ import {
   Clock3,
   Loader2,
   RefreshCw,
-  Send,
   Timer,
 } from "lucide-react";
-import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -31,60 +30,25 @@ import {
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { NumberTicker } from "@/components/magicui/number-ticker";
-import {
-  buildTaskChatDraft,
-  buildTaskChatSessionTitle,
-} from "@/lib/task-agent";
-import { taskApi, type Task, type TaskOccurrence } from "@/lib/task-api";
+import { taskApi } from "@/lib/task-api";
+import { TaskProposalList } from "@/components/tasks/task-proposal-card";
+import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
+import type { TaskProposal } from "@/lib/task-proposals-api";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
+import { TASK_STATUS_DOT_COLORS, TASK_STATUS_LABELS } from "@/lib/task-status";
+import { useOptionalProject } from "@/contexts/project-context";
 import {
-  getTaskDisplayAllDay,
-  getTaskDisplayEndAt,
-  getTaskDisplayStartAt,
-} from "@/lib/task-effective-date";
-import {
-  isClosedTaskStatus,
-  TASK_STATUS_DOT_COLORS,
-  TASK_STATUS_LABELS,
-} from "@/lib/task-status";
-import { chatApi } from "@/lib/chat-api";
+  buildHomeTodayView,
+  type HomeTodayData,
+  type TodayEntry,
+} from "@/lib/home-today-data";
 import { cn } from "@/lib/utils";
-
-type TodayEntryKind = "scheduled" | "active" | "overdue" | "unscheduled";
-
-type TodayEntry = {
-  key: string;
-  task: Task;
-  occurrence?: TaskOccurrence;
-  kind: TodayEntryKind;
-  title: string;
-  projectName: string | null;
-  status: string;
-  priority: string;
-  startAt: string | null;
-  endAt: string | null;
-  allDay: boolean;
-  reason: string;
-  score: number;
-};
-
-type HomeData = {
-  tasks: Task[];
-  occurrences: TaskOccurrence[];
-};
 
 const PRIORITY_LABELS: Record<string, string> = {
   urgent: "Urgent",
   high: "High",
   medium: "Medium",
   low: "Low",
-};
-
-const PRIORITY_SCORES: Record<string, number> = {
-  urgent: 40,
-  high: 28,
-  medium: 14,
-  low: 4,
 };
 
 function pad(value: number): string {
@@ -99,20 +63,6 @@ function formatLocalDateTime(value: Date): string {
   )}`;
 }
 
-function parseDate(value: string | null | undefined): Date | null {
-  if (!value) return null;
-  const dateOnly = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (dateOnly) {
-    return new Date(
-      Number(dateOnly[1]),
-      Number(dateOnly[2]) - 1,
-      Number(dateOnly[3]),
-    );
-  }
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
 function startOfToday(): Date {
   const now = new Date();
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -123,181 +73,6 @@ function endOfToday(): Date {
   end.setDate(end.getDate() + 1);
   end.setMilliseconds(-1);
   return end;
-}
-
-function isSameLocalDay(value: string | null | undefined): boolean {
-  const date = parseDate(value);
-  if (!date) return false;
-  const today = startOfToday();
-  return (
-    date.getFullYear() === today.getFullYear() &&
-    date.getMonth() === today.getMonth() &&
-    date.getDate() === today.getDate()
-  );
-}
-
-function overlapsToday(
-  startValue: string | null | undefined,
-  endValue: string | null | undefined,
-): boolean {
-  const start = parseDate(startValue);
-  const end = parseDate(endValue) ?? start;
-  if (!start || !end) return false;
-  return start <= endOfToday() && end >= startOfToday();
-}
-
-function isOverdueTask(task: Task): boolean {
-  if (isClosedTaskStatus(task.status)) return false;
-  const endAt = getTaskDisplayEndAt(task);
-  const due = parseDate(endAt);
-  if (!due) return false;
-  if (getTaskDisplayAllDay(task)) {
-    return due < startOfToday();
-  }
-  return due < new Date();
-}
-
-function priorityScore(priority: string): number {
-  return PRIORITY_SCORES[priority] ?? 8;
-}
-
-function taskScore(task: Task, kind: TodayEntryKind): number {
-  let score = priorityScore(task.priority);
-  if (kind === "overdue") score += 70;
-  if (kind === "active") score += 58;
-  if (kind === "scheduled") score += 34;
-  if (task.active_time_entry) score += 12;
-  if (task.status === "review") score += 10;
-  const triageStatus = task.metadata?.agent_triage_status;
-  if (triageStatus === "ready" || triageStatus === "needs_user") score += 8;
-  return score;
-}
-
-function getTaskKind(task: Task): TodayEntryKind | null {
-  if (task.active_time_entry || task.status === "in_progress") return "active";
-  if (isOverdueTask(task)) return "overdue";
-  const startAt = getTaskDisplayStartAt(task);
-  const endAt = getTaskDisplayEndAt(task);
-  if (
-    overlapsToday(startAt, endAt) ||
-    isSameLocalDay(startAt) ||
-    isSameLocalDay(endAt)
-  ) {
-    return "scheduled";
-  }
-  if (task.priority === "urgent" || task.priority === "high")
-    return "unscheduled";
-  return null;
-}
-
-function reasonForEntry(kind: TodayEntryKind): string {
-  switch (kind) {
-    case "active":
-      return "進行中";
-    case "overdue":
-      return "期限超過";
-    case "scheduled":
-      return "今日";
-    case "unscheduled":
-      return "高優先度";
-  }
-}
-
-function taskWithOccurrence(task: Task, occurrence: TaskOccurrence): Task {
-  return {
-    ...task,
-    title: occurrence.title || task.title,
-    project_name: occurrence.project_name ?? task.project_name,
-    project_color: occurrence.project_color ?? task.project_color,
-    status: occurrence.status || task.status,
-    all_day: occurrence.all_day,
-    effective_start_at: occurrence.start_at ?? null,
-    effective_end_at: occurrence.end_at ?? null,
-    effective_all_day: occurrence.all_day,
-    effective_occurrence_id: occurrence.id,
-    effective_occurrence_start_at: occurrence.start_at ?? null,
-    effective_occurrence_end_at: occurrence.end_at ?? null,
-    effective_occurrence_original_start_at:
-      occurrence.original_start_at ?? occurrence.start_at ?? null,
-    effective_occurrence_source_kind: occurrence.source_kind,
-    effective_occurrence_status: occurrence.status,
-    tags: occurrence.tags ?? task.tags,
-  };
-}
-
-function shouldPrepareTaskForAgent(
-  metadata: Record<string, unknown> | null | undefined,
-): boolean {
-  const status =
-    metadata && typeof metadata.agent_triage_status === "string"
-      ? metadata.agent_triage_status
-      : "pending";
-  return status === "pending" || status === "failed";
-}
-
-function buildEntries(data: HomeData): TodayEntry[] {
-  const taskById = new Map(data.tasks.map((task) => [task.id, task]));
-  const occurrenceTaskIds = new Set<string>();
-  const entries: TodayEntry[] = [];
-
-  for (const occurrence of data.occurrences) {
-    if (isClosedTaskStatus(occurrence.status)) continue;
-    const baseTask = taskById.get(occurrence.task_id);
-    if (!baseTask || baseTask.parent_task_id) continue;
-    occurrenceTaskIds.add(baseTask.id);
-    const task = taskWithOccurrence(baseTask, occurrence);
-    const kind =
-      task.active_time_entry || task.status === "in_progress"
-        ? "active"
-        : "scheduled";
-    entries.push({
-      key: `occurrence:${occurrence.id}`,
-      task,
-      occurrence,
-      kind,
-      title: occurrence.title || baseTask.title,
-      projectName: occurrence.project_name ?? baseTask.project_name ?? null,
-      status: occurrence.status,
-      priority: baseTask.priority,
-      startAt: occurrence.start_at ?? null,
-      endAt: occurrence.end_at ?? null,
-      allDay: occurrence.all_day,
-      reason: reasonForEntry(kind),
-      score: taskScore(task, kind),
-    });
-  }
-
-  for (const task of data.tasks) {
-    if (task.parent_task_id || isClosedTaskStatus(task.status)) continue;
-    if (occurrenceTaskIds.has(task.id)) continue;
-    const kind = getTaskKind(task);
-    if (!kind) continue;
-    const startAt = getTaskDisplayStartAt(task) ?? null;
-    const endAt = getTaskDisplayEndAt(task) ?? null;
-    entries.push({
-      key: `task:${task.id}`,
-      task,
-      kind,
-      title: task.title,
-      projectName: task.project_name ?? null,
-      status: task.status,
-      priority: task.priority,
-      startAt,
-      endAt,
-      allDay: getTaskDisplayAllDay(task),
-      reason: reasonForEntry(kind),
-      score: taskScore(task, kind),
-    });
-  }
-
-  return entries.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    const aTime =
-      parseDate(a.startAt ?? a.endAt)?.getTime() ?? Number.MAX_SAFE_INTEGER;
-    const bTime =
-      parseDate(b.startAt ?? b.endAt)?.getTime() ?? Number.MAX_SAFE_INTEGER;
-    return aTime - bTime;
-  });
 }
 
 function formatEntryTime(entry: TodayEntry): string {
@@ -328,7 +103,7 @@ function SummaryMetric({
 }: {
   icon: ReactNode;
   label: string;
-  value: number;
+  value: number | null;
   tone?: string;
 }) {
   return (
@@ -338,11 +113,15 @@ function SummaryMetric({
         <span>{label}</span>
       </div>
       <div className={cn("text-xl font-semibold tabular-nums", tone)}>
-        <NumberTicker
-          value={value}
-          decimalPlaces={0}
-          className="tabular-nums text-inherit tracking-normal"
-        />
+        {value === null ? (
+          <span aria-label="不明">—</span>
+        ) : (
+          <NumberTicker
+            value={value}
+            decimalPlaces={0}
+            className="tabular-nums text-inherit tracking-normal"
+          />
+        )}
       </div>
     </div>
   );
@@ -350,14 +129,10 @@ function SummaryMetric({
 
 function TaskEntryRow({
   entry,
-  launching,
   onOpenTask,
-  onStartAgent,
 }: {
   entry: TodayEntry;
-  launching: boolean;
   onOpenTask: (entry: TodayEntry) => void;
-  onStartAgent: (entry: TodayEntry) => void;
 }) {
   const timeLabel = formatEntryTime(entry);
   return (
@@ -394,21 +169,6 @@ function TaskEntryRow({
           {timeLabel ? <span>{timeLabel}</span> : null}
         </div>
       </div>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        className="h-7 gap-1.5"
-        disabled={launching}
-        onClick={() => onStartAgent(entry)}
-      >
-        {launching ? (
-          <Loader2 className="size-3.5 animate-spin" />
-        ) : (
-          <Send className="size-3.5" />
-        )}
-        確認
-      </Button>
     </div>
   );
 }
@@ -440,37 +200,44 @@ function LoadingState() {
 
 export function HomeTodayOverlay() {
   const router = useRouter();
+  const projectContext = useOptionalProject();
   const [open, setOpen] = useState(false);
-  const [data, setData] = useState<HomeData>({ tasks: [], occurrences: [] });
+  const [data, setData] = useState<HomeTodayData>({
+    tasks: [],
+    occurrences: [],
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [launchingKey, setLaunchingKey] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const requestGeneration = ++requestGenerationRef.current;
     setLoading(true);
     setError(null);
     try {
       const start = startOfToday();
       const end = endOfToday();
       const [tasks, occurrences] = await Promise.all([
-        taskApi.listTasks(),
-        taskApi
-          .listOccurrences(
-            {},
-            formatLocalDateTime(start),
-            formatLocalDateTime(end),
-          )
-          .catch((err) => {
-            console.error("Home occurrence fetch failed", err);
-            return [] as TaskOccurrence[];
-          }),
+        taskApi.listTodayTasks(),
+        taskApi.listTodayOccurrences(
+          formatLocalDateTime(start),
+          formatLocalDateTime(end),
+        ),
       ]);
+      if (requestGeneration !== requestGenerationRef.current) return;
       setData({ tasks, occurrences });
     } catch (err) {
+      if (requestGeneration !== requestGenerationRef.current) return;
       console.error("Home data fetch failed", err);
-      setError(err instanceof Error ? err.message : "Home data fetch failed");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Today の情報を取得できませんでした",
+      );
     } finally {
-      setLoading(false);
+      if (requestGeneration === requestGenerationRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -484,20 +251,71 @@ export function HomeTodayOverlay() {
     if (open) void fetchData();
   }, [fetchData, open]);
 
-  const entries = useMemo(() => buildEntries(data), [data]);
-  const todayEntries = entries.filter((entry) => entry.kind !== "unscheduled");
-  const agentEntries = entries.slice(0, 6);
-  const openTaskCount = data.tasks.filter(
-    (task) => !task.parent_task_id && !isClosedTaskStatus(task.status),
-  ).length;
-  const activeCount = entries.filter((entry) => entry.kind === "active").length;
-  const overdueCount = entries.filter(
-    (entry) => entry.kind === "overdue",
-  ).length;
-  const readyCount = data.tasks.filter((task) => {
-    const status = task.metadata?.agent_triage_status;
-    return status === "ready" || status === "needs_user";
-  }).length;
+  useEffect(() => {
+    if (!open) return;
+    const refresh = () => void fetchData();
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("task-list-refresh", refresh);
+    window.addEventListener("task-sidebar-refresh", refresh);
+    window.addEventListener("timer-changed", refresh);
+    window.addEventListener("online", refresh);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("task-list-refresh", refresh);
+      window.removeEventListener("task-sidebar-refresh", refresh);
+      window.removeEventListener("timer-changed", refresh);
+      window.removeEventListener("online", refresh);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [fetchData, open]);
+
+  useEffect(
+    () => () => {
+      requestGenerationRef.current += 1;
+    },
+    [],
+  );
+
+  const {
+    todayEntries,
+    openTaskCount,
+    activeCount,
+    overdueCount,
+  } = useMemo(() => buildHomeTodayView(data), [data]);
+
+  const proposalTaskIds = useMemo(
+    () => data.tasks.map((task) => task.id),
+    [data.tasks],
+  );
+  const proposalState = useTaskProposals({
+    taskIds: proposalTaskIds,
+    enabled: open,
+    loading: open && loading && data.tasks.length === 0,
+  });
+  const refreshProposalState = proposalState.refresh;
+  const pendingProposalCount = proposalState.proposals.length;
+  const pendingProposalMetric =
+    proposalState.status === "ready" || proposalState.status === "empty"
+      ? pendingProposalCount
+      : null;
+  const projectAccessById = useMemo(
+    () =>
+      new Map(
+        [
+          ...(projectContext?.accessibleProjects ?? []),
+          ...(projectContext?.projects ?? []),
+        ].map((project) => [project.id, project] as const),
+      ),
+    [projectContext?.accessibleProjects, projectContext?.projects],
+  );
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([fetchData(), refreshProposalState()]);
+  }, [fetchData, refreshProposalState]);
 
   const openTask = useCallback(
     (entry: TodayEntry) => {
@@ -513,43 +331,10 @@ export function HomeTodayOverlay() {
     [router],
   );
 
-  const startAgent = useCallback(
-    async (entry: TodayEntry) => {
-      let launchTask = entry.task;
-      setLaunchingKey(entry.key);
-      try {
-        if (shouldPrepareTaskForAgent(launchTask.metadata)) {
-          const result = await taskApi.runAgentTriage(launchTask.id);
-          launchTask = {
-            ...launchTask,
-            metadata: {
-              ...(launchTask.metadata || {}),
-              ...result.metadata,
-            },
-          };
-        }
-        const created = await chatApi.createSession(
-          await chatApi.getCurrentCharacterName(),
-          launchTask.project_id || undefined,
-        );
-        const sessionId = created.session.id;
-        await chatApi.updateSessionTitle(
-          sessionId,
-          buildTaskChatSessionTitle(launchTask.title),
-        );
-        await chatApi.dispatchMessage(sessionId, {
-          message: buildTaskChatDraft(launchTask),
-          project_id: launchTask.project_id || undefined,
-          generation_profile: "assisted_work",
-        });
-        setOpen(false);
-        router.push(`/chat?s=${sessionId}`);
-      } catch (err) {
-        console.error("Failed to start task agent", err);
-        toast.error("エージェント確認の開始に失敗しました");
-      } finally {
-        setLaunchingKey(null);
-      }
+  const confirmProposal = useCallback(
+    (proposal: TaskProposal) => {
+      setOpen(false);
+      router.push(`/chat?s=${encodeURIComponent(proposal.session_id)}`);
     },
     [router],
   );
@@ -581,7 +366,7 @@ export function HomeTodayOverlay() {
               variant="outline"
               size="sm"
               className="gap-1.5"
-              onClick={() => void fetchData()}
+              onClick={() => void refreshAll()}
               disabled={loading}
             >
               {loading ? (
@@ -623,8 +408,8 @@ export function HomeTodayOverlay() {
                 />
                 <SummaryMetric
                   icon={<Bot className="size-3.5" />}
-                  label="準備済み"
-                  value={readyCount}
+                  label="承認待ち"
+                  value={pendingProposalMetric}
                   tone="text-emerald-600 dark:text-emerald-300"
                 />
               </div>
@@ -635,23 +420,35 @@ export function HomeTodayOverlay() {
                     <Bot className="size-4 text-primary" />
                     エージェント確認
                   </h2>
-                  <Badge variant="outline">{agentEntries.length}件</Badge>
+                  <Badge variant="outline">
+                    {pendingProposalMetric === null
+                      ? "—"
+                      : String(pendingProposalMetric) + "件"}
+                  </Badge>
                 </div>
-                {agentEntries.length > 0 ? (
-                  <div className="space-y-2">
-                    {agentEntries.map((entry) => (
-                      <TaskEntryRow
-                        key={entry.key}
-                        entry={entry}
-                        launching={launchingKey === entry.key}
-                        onOpenTask={openTask}
-                        onStartAgent={(item) => void startAgent(item)}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <EmptyState label="エージェントに渡す候補はありません" />
-                )}
+                <TaskProposalList
+                  state={proposalState}
+                  getDecisionState={proposalState.getDecisionState}
+                  onDecision={proposalState.decide}
+                  onConfirm={confirmProposal}
+                  onRefresh={proposalState.refresh}
+                  decisionDisabled={(proposal) => {
+                    const task = data.tasks.find(
+                      (item) => item.id === proposal.task_id,
+                    );
+                    const project = task
+                      ? projectAccessById.get(task.project_id)
+                      : null;
+                    return (
+                      !task ||
+                      !project ||
+                      task.source === "remote" ||
+                      project.source === "remote" ||
+                      project.can_write === false
+                    );
+                  }}
+                  heading={null}
+                />
               </section>
 
               <section className="space-y-2">
@@ -668,9 +465,7 @@ export function HomeTodayOverlay() {
                       <TaskEntryRow
                         key={entry.key}
                         entry={entry}
-                        launching={launchingKey === entry.key}
                         onOpenTask={openTask}
-                        onStartAgent={(item) => void startAgent(item)}
                       />
                     ))}
                   </div>
@@ -683,10 +478,10 @@ export function HomeTodayOverlay() {
                 <div className="rounded-md border bg-muted/20 px-3 py-2 text-sm">
                   <div className="flex items-center gap-2 font-medium">
                     <Timer className="size-4 text-primary" />
-                    進行中のタスクがあります
+                    タイマー計測中のタスクがあります
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {activeCount}件が進行中またはタイマー計測中です。
+                    {activeCount}件をタイマー計測中です。
                   </p>
                 </div>
               ) : null}

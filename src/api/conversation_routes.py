@@ -6,6 +6,7 @@ Provides REST API endpoints for managing conversation sessions and messages.
 
 import logging
 import re
+import time
 from typing import Any, Literal, Mapping, Optional
 from datetime import datetime, timezone
 from uuid import UUID
@@ -13,6 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config_errors import (
     CharacterLookupError,
@@ -27,10 +29,36 @@ from ..llm.context_snapshot import (
     validate_context_manifest_metadata,
 )
 from ..services.conversation_title_service import ensure_conversation_title
+from ..services.conversation_agent_service import (
+    ConversationAgentConflictError,
+    ConversationAgentError,
+    ConversationAgentService,
+)
+from ..services.agent_root_lifecycle import (
+    AgentRootLifecycleError,
+    project_private_root_metadata,
+)
+from ..services.conversation_status import project_conversation_statuses
 from ..services.session_llm_runtime import release_session_agent_team_registry
 from .http_cache import etag_json_response, make_weak_etag_from_payload
+from .memory_selection_models import MemorySelectionResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _history_completion_iso(value: Any) -> str | None:
+    """Serialize status fences as explicit UTC so Web and Mobile parse alike."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        stamp = value
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        else:
+            stamp = stamp.astimezone(timezone.utc)
+        return stamp.isoformat().replace("+00:00", "Z")
+    return str(value)
 
 
 def _request_correlation_ids(request: Request | None) -> tuple[str | None, str | None]:
@@ -117,12 +145,35 @@ def _parse_since_param(value: Optional[str]) -> Optional[datetime]:
         raise HTTPException(status_code=400, detail="Invalid since") from exc
 
 
+def _initial_character_greeting(char_data: dict | None) -> str | None:
+    try:
+        if char_data:
+            greeting = char_data.get("first_message", "")
+            if not greeting and char_data.get("alternate_greetings"):
+                import random
+
+                greeting = random.choice(char_data["alternate_greetings"])
+            return greeting or None
+    except Exception as exc:
+        logger.warning("Failed to get first_message: %s", exc)
+    return None
+
+
 class CreateSessionMainRoute(BaseModel):
     """Optional displayed route to pin on a newly created session."""
 
     provider: Optional[str] = None
     model: Optional[str] = None
     effort: Optional[str] = None
+
+
+class InitialUserMessageRequest(BaseModel):
+    """Optional first user turn for the idempotent native session aggregate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1)
+    client_message_id: str = Field(min_length=1, max_length=512)
 
 
 class CreateSessionRequest(BaseModel):
@@ -132,6 +183,10 @@ class CreateSessionRequest(BaseModel):
     project_id: Optional[str] = None
     app_id: Optional[str] = None
     app_target_id: Optional[str] = None
+    # Optional canonical Operations Agent.  Character-only sessions keep the
+    # legacy ``None`` value and are handled exactly as before.
+    agent_id: Optional[str] = None
+    initial_message: Optional[InitialUserMessageRequest] = None
     main_route: Optional[CreateSessionMainRoute] = None
 
 
@@ -139,12 +194,14 @@ class UpdateSessionRequest(BaseModel):
     """Request model for updating a session"""
 
     title: Optional[str] = None
+    title_source: Literal["manual", "llm", "fallback"] = "manual"
     is_active: Optional[bool] = None
     project_id: Optional[str] = None
     character_name: Optional[str] = None
     app_id: Optional[str] = None
     app_target_id: Optional[str] = None
     development_status: Optional[str] = None
+    is_pinned: Optional[bool] = None
 
 
 class AddMessageRequest(BaseModel):
@@ -194,6 +251,161 @@ class ForkConversationRequest(BaseModel):
     title: Optional[str] = None
 
 
+class ConversationAgentBindingRequest(BaseModel):
+    """CAS request for selecting or clearing a session's canonical Agent."""
+
+    agent_id: Optional[str] = Field(default=None, max_length=64)
+    expected_agent_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class ConversationSessionAgentProjection(BaseModel):
+    """Typed session DTO shared by Agent binding/history responses."""
+
+    id: str
+    user_id: str
+    character_name: str
+    title: str = ""
+    session_start: Optional[str] = None
+    last_activity: Optional[str] = None
+    message_count: int = 0
+    context: dict[str, Any] = Field(default_factory=dict)
+    current_summary: Optional[str] = None
+    is_active: bool = True
+    is_pinned: bool = False
+    pinned_at: Optional[str] = None
+    pin_updated_at: Optional[str] = None
+    deleted_at: Optional[str] = None
+    project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    agent_binding_updated_at: Optional[str] = None
+    app_id: Optional[str] = None
+    app_target_id: Optional[str] = None
+    development_status: Optional[str] = None
+    last_read_at: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    forked_from_message_id: Optional[str] = None
+    is_group_chat: bool = False
+    group_character_names: list[Any] = Field(default_factory=list)
+    participants: list[dict[str, Any]] = Field(default_factory=list)
+    rp_settings: dict[str, Any] = Field(default_factory=dict)
+    is_unread: Optional[bool] = None
+    private_agent_root: Optional[bool] = None
+    purpose: Optional[str] = None
+    readonly_binding: Optional[bool] = None
+    private_agent_root_metadata: Optional[dict[str, Any]] = None
+
+
+ConversationHistoryStatus = Literal["idle", "ready", "needs_attention", "working"]
+
+
+class ConversationHistorySessionProjection(ConversationSessionAgentProjection):
+    """Session row returned by the shared history list endpoint."""
+
+    history_status: ConversationHistoryStatus = "idle"
+    history_completed_at: Optional[str] = None
+
+
+class ConversationHistoryListResponse(BaseModel):
+    """Canonical Web/Mobile conversation history list contract."""
+
+    success: bool = True
+    conversations: list[ConversationHistorySessionProjection]
+    total: int
+    limit: int
+    offset: int
+
+
+class ConversationHistoryStatusRequest(BaseModel):
+    """Batch status request used by the Web BFF bridge."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class ConversationHistoryStatusItem(BaseModel):
+    session_id: str
+    history_status: ConversationHistoryStatus
+    history_completed_at: Optional[str] = None
+
+
+class ConversationHistoryStatusResponse(BaseModel):
+    statuses: list[ConversationHistoryStatusItem]
+
+
+class ConversationAgentBindingProjection(BaseModel):
+    id: str
+    session_id: str
+    agent_id: str
+    agent_revision_id: str
+    revision_version: int
+    agent_team_id: str
+    execution_profile_id: str
+    snapshot_hash: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AgentConversationSessionProjection(BaseModel):
+    """Minimal Agent activity DTO; private conversation state is omitted."""
+
+    id: str
+    user_id: str
+    character_name: str
+    title: str = ""
+    session_start: Optional[str] = None
+    last_activity: Optional[str] = None
+    message_count: int = 0
+    is_active: bool = True
+    is_pinned: bool = False
+    pinned_at: Optional[str] = None
+    pin_updated_at: Optional[str] = None
+    project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    agent_binding_updated_at: Optional[str] = None
+    app_id: Optional[str] = None
+    app_target_id: Optional[str] = None
+    development_status: Optional[str] = None
+    last_read_at: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    forked_from_message_id: Optional[str] = None
+    is_group_chat: bool = False
+    private_agent_root: Optional[bool] = None
+    purpose: Optional[str] = None
+    readonly_binding: Optional[bool] = None
+    private_agent_root_metadata: Optional[dict[str, Any]] = None
+
+
+class ConversationAgentBindingResponse(BaseModel):
+    success: bool = True
+    session: ConversationSessionAgentProjection
+    binding: Optional[ConversationAgentBindingProjection] = None
+    control_notices: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConversationAgentSafeDTO(BaseModel):
+    id: str
+    display_name: str
+    slug: Optional[str] = None
+    state: str
+    latest_revision_id: str
+    latest_revision_version: int
+    character_id: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class ConversationAgentListResponse(BaseModel):
+    success: bool = True
+    agents: list[ConversationAgentSafeDTO]
+
+
+class AgentConversationsResponse(BaseModel):
+    success: bool = True
+    sessions: list[AgentConversationSessionProjection]
+    total: int
+    limit: int
+    offset: int
+
+
 class UpdateRpSettingsRequest(BaseModel):
     """Request model for updating RP steering settings"""
 
@@ -217,6 +429,10 @@ class ConversationSearchResult(BaseModel):
     created_at: Optional[str] = None
     last_activity: Optional[str] = None
     project_id: Optional[str] = None
+    is_pinned: bool = False
+    pinned_at: Optional[str] = None
+    history_status: Optional[ConversationHistoryStatus] = None
+    history_completed_at: Optional[str] = None
 
 
 class ConversationSearchResponse(BaseModel):
@@ -224,6 +440,19 @@ class ConversationSearchResponse(BaseModel):
 
     results: list[ConversationSearchResult]
     total: int
+
+
+# Content search has to decrypt rows in the API process. Keep each database
+# round-trip bounded while allowing the cursor to advance across the full
+# readable message history, including inactive conversation sessions.
+_CONVERSATION_SEARCH_MESSAGE_PAGE_SIZE = 200
+_CONVERSATION_SEARCH_SESSION_PAGE_SIZE = 200
+_CORRUPT_CONVERSATION_CONTENT_ERRORS = frozenset(
+    {
+        "unsupported encrypted field format",
+        "encrypted field authentication failed",
+    }
+)
 
 
 def _conversation_search_snippet(content: str, query: str, max_length: int = 160) -> str:
@@ -241,14 +470,6 @@ def _conversation_search_snippet(content: str, query: str, max_length: int = 160
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(normalized_content) else ""
     return f"{prefix}{normalized_content[start:end]}{suffix}"
-
-
-def _is_story_workflow_session(session) -> bool:
-    """Keep writing-workflow sessions out of the generic Chat search."""
-
-    character_name = str(getattr(session, "character_name", "") or "")
-    title = str(getattr(session, "title", "") or "")
-    return character_name.startswith("story_") or title.startswith("[執筆]")
 
 
 # ContextManifest is an optional observation attached to one assistant
@@ -766,6 +987,10 @@ def _conversation_search_session_result(session, query: str) -> dict[str, object
         "created_at": created_at.isoformat() if created_at else None,
         "last_activity": last_activity.isoformat() if last_activity else None,
         "project_id": str(session.project_id) if session.project_id else None,
+        "is_pinned": bool(getattr(session, "is_pinned", False)),
+        "pinned_at": (
+            session.pinned_at.isoformat() if getattr(session, "pinned_at", None) else None
+        ),
     }
 
 
@@ -788,11 +1013,18 @@ def _conversation_search_message_result(session, message, content: str, query: s
         "created_at": created_at.isoformat() if created_at else None,
         "last_activity": last_activity.isoformat() if last_activity else None,
         "project_id": str(session.project_id) if session.project_id else None,
+        "is_pinned": bool(getattr(session, "is_pinned", False)),
+        "pinned_at": (
+            session.pinned_at.isoformat() if getattr(session, "pinned_at", None) else None
+        ),
     }
 
 
 def create_conversation_router(
-    require_auth, get_current_user, get_llm_for_title_generation=None
+    require_auth,
+    get_current_user,
+    get_llm_for_title_generation=None,
+    get_title_config=None,
 ) -> APIRouter:
     """Create conversation history router
 
@@ -811,6 +1043,7 @@ def create_conversation_router(
         from ..memory.conversation_repository import (
             ConversationMessageIdempotencyConflict,
             ConversationRepository,
+            ConversationSessionCreateConflict,
             ConversationWriteAuthorizationError,
         )
 
@@ -838,18 +1071,59 @@ def create_conversation_router(
             raise HTTPException(status_code=400, detail="開発チャットの状態が不正です")
         return normalized
 
-    def _session_to_list_dict(session) -> dict:
+    def _session_to_list_dict(
+        session,
+        *,
+        status: ConversationHistoryStatus = "idle",
+        history_completed_at: Optional[str] = None,
+    ) -> dict:
         """Serialize a session with the sidebar-specific unread projection."""
-        payload = session.to_dict()
-        last_activity = getattr(session, "last_activity", None)
-        last_read_at = getattr(session, "last_read_at", None)
-        payload["is_unread"] = bool(
-            getattr(session, "app_id", None) is not None
-            and getattr(session, "development_status", None) == "waiting_for_user"
-            and last_activity is not None
-            and (last_read_at is None or last_activity > last_read_at)
-        )
+        payload = _session_to_api_dict(session)
+        # Keep this legacy marker aligned with the cross-surface projection.
+        # ``last_activity`` also moves for user/title edits, so it cannot be
+        # used as an unread assistant-result fence.
+        payload["is_unread"] = status == "ready"
+        # ``history_status`` is the shared history filter state.  Keep the
+        # additive field explicit so both clients consume the same projection.
+        payload["history_status"] = status
+        payload["history_completed_at"] = history_completed_at
         return payload
+
+    async def _session_list_payload(sessions) -> list[dict]:
+        """Decorate a visible page with one batch status projection."""
+
+        session_ids = [str(getattr(session, "id", "")) for session in sessions]
+        last_read_at = {
+            str(getattr(session, "id", "")): getattr(session, "last_read_at", None)
+            for session in sessions
+        }
+        statuses = await project_conversation_statuses(
+            session_ids,
+            last_read_at_by_session=last_read_at,
+        )
+        payload: list[dict] = []
+        for session in sessions:
+            projection = statuses.get(str(getattr(session, "id", "")))
+            payload.append(
+                _session_to_list_dict(
+                    session,
+                    status=projection.status if projection is not None else "idle",
+                    history_completed_at=(
+                        _history_completion_iso(projection.history_completed_at)
+                        if projection is not None
+                        else None
+                    ),
+                )
+            )
+        return payload
+
+    def _session_to_api_dict(session) -> dict:
+        """Serialize ordinary session data plus the durable root projection."""
+
+        return project_private_root_metadata(
+            session.to_dict(),
+            getattr(session, "_private_agent_root_metadata", None),
+        )
 
     def _messages_with_branch_info(messages, branch_info: dict) -> list[dict]:
         """Serialize messages with the branch projection shared by chat clients."""
@@ -978,6 +1252,15 @@ def create_conversation_router(
                 return True
         return False
 
+    def _conversation_agent_service() -> ConversationAgentService:
+        config = None
+        if callable(get_title_config):
+            try:
+                config = get_title_config()
+            except Exception:
+                config = None
+        return ConversationAgentService(config=config)
+
     async def _require_project_permission(
         project_id,
         user_info: dict,
@@ -1053,7 +1336,7 @@ def create_conversation_router(
     ):
         """Search readable conversation messages and session metadata.
 
-        Message content is encrypted at rest, so the bounded message scan is
+        Message content is encrypted at rest, so bounded message pages are
         decrypted inside the API process after the same visibility and Project
         ACL checks used by the rest of the conversation router.  This is the
         FastAPI canonical operation; the Web BFF remains an adapter.
@@ -1071,6 +1354,7 @@ def create_conversation_router(
 
         from ..memory.database import get_database_manager
         from ..memory.models import ConversationMessage, ConversationParticipant, ConversationSession
+        from ..security.field_crypto import FieldCryptoError
 
         db_session = await get_database_manager().get_session()
         try:
@@ -1090,6 +1374,9 @@ def create_conversation_router(
                     ConversationSession.user_id.in_(visible_user_ids),
                     ConversationSession.id.in_(participant_session_ids),
                 ),
+                # Creating another chat deactivates earlier sessions. History
+                # search includes those sessions; deletion, ownership and the
+                # Project ACL still determine whether they are readable.
                 ConversationSession.deleted_at.is_(None),
             ]
 
@@ -1132,10 +1419,18 @@ def create_conversation_router(
                 project_access[key] = True
                 return True
 
-            # Content is encrypted at rest; scan only the most recent bounded
-            # active-branch messages, then decrypt/filter in-process.
-            message_rows = (
-                await db_session.execute(
+            results: list[dict[str, object]] = []
+            status_sessions: dict[str, Any] = {}
+            lower_query = normalized.casefold()
+            # ``created_at`` is normally non-null, but coalescing it keeps the
+            # keyset cursor total and deterministic for legacy rows too.
+            message_order_created_at = func.coalesce(
+                ConversationMessage.created_at,
+                datetime.min,
+            )
+            message_cursor: tuple[datetime, object] | None = None
+            while len(results) < limit:
+                message_query = (
                     select(ConversationSession, ConversationMessage)
                     .join(
                         ConversationMessage,
@@ -1151,29 +1446,76 @@ def create_conversation_router(
                             ),
                         )
                     )
-                    .order_by(
-                        desc(ConversationMessage.created_at),
-                        desc(ConversationMessage.id),
-                    )
-                    .limit(2000)
                 )
-            ).all()
-
-            results: list[dict[str, object]] = []
-            lower_query = normalized.casefold()
-            for session, message in message_rows:
-                if len(results) >= limit:
+                if message_cursor is not None:
+                    cursor_created_at, cursor_message_id = message_cursor
+                    message_query = message_query.where(
+                        or_(
+                            message_order_created_at < cursor_created_at,
+                            and_(
+                                message_order_created_at == cursor_created_at,
+                                ConversationMessage.id < cursor_message_id,
+                            ),
+                        )
+                    )
+                message_rows = (
+                    await db_session.execute(
+                        message_query.order_by(
+                            desc(message_order_created_at),
+                            desc(ConversationMessage.id),
+                        ).limit(_CONVERSATION_SEARCH_MESSAGE_PAGE_SIZE)
+                    )
+                ).all()
+                if not message_rows:
                     break
-                if _is_story_workflow_session(session) or not await readable(session):
-                    continue
-                content = str(getattr(message, "content", "") or "")
-                if lower_query not in content.casefold():
-                    continue
-                results.append(
-                    _conversation_search_message_result(
-                        session, message, content, normalized
+
+                for session, message in message_rows:
+                    if len(results) >= limit:
+                        break
+                    if not await readable(session):
+                        continue
+                    status_sessions[str(session.id)] = session
+                    try:
+                        content = str(getattr(message, "content", "") or "")
+                    except (FieldCryptoError, UnicodeDecodeError) as exc:
+                        if (
+                            isinstance(exc, FieldCryptoError)
+                            and str(exc) not in _CORRUPT_CONVERSATION_CONTENT_ERRORS
+                        ):
+                            raise
+                        # A single corrupt/tampered ciphertext must not hide
+                        # otherwise searchable messages. Keep diagnostics
+                        # metadata-only so content and ciphertext never enter
+                        # logs.
+                        logger.warning(
+                            "Skipping conversation search message with unreadable content "
+                            "session=%s message=%s error=%s",
+                            getattr(session, "id", None),
+                            getattr(message, "id", None),
+                            type(exc).__name__,
+                        )
+                        continue
+                    if lower_query not in content.casefold():
+                        continue
+                    results.append(
+                        _conversation_search_message_result(
+                            session, message, content, normalized
+                        )
                     )
+
+                last_message = message_rows[-1][1]
+                last_message_created_at = getattr(last_message, "created_at", None)
+                last_message_id = getattr(last_message, "id", None)
+                if last_message_id is None:
+                    # Every persisted message has a primary key. Stop rather
+                    # than risking a repeated page for malformed legacy data.
+                    break
+                message_cursor = (
+                    last_message_created_at or datetime.min,
+                    last_message_id,
                 )
+                if len(message_rows) < _CONVERSATION_SEARCH_MESSAGE_PAGE_SIZE:
+                    break
 
             remaining_limit = max(0, limit - len(results))
             if remaining_limit:
@@ -1187,52 +1529,104 @@ def create_conversation_router(
                     .casefold()
                 )
                 pattern = f"%{escaped}%"
-                session_rows = (
-                    await db_session.execute(
-                        select(ConversationSession)
-                        .where(
-                            and_(
-                                *session_conditions,
-                                or_(
-                                    func.lower(
-                                        func.coalesce(ConversationSession.title, "")
-                                    ).like(pattern, escape="\\"),
-                                    func.lower(
-                                        func.coalesce(
-                                            ConversationSession.character_name, ""
-                                        )
-                                    ).like(pattern, escape="\\"),
+                session_order_activity = func.coalesce(
+                    ConversationSession.last_activity,
+                    ConversationSession.session_start,
+                    datetime.min,
+                )
+                session_cursor: tuple[datetime, object] | None = None
+                while len(results) < limit:
+                    session_query = select(ConversationSession).where(
+                        and_(
+                            *session_conditions,
+                            or_(
+                                func.lower(
+                                    func.coalesce(ConversationSession.title, "")
+                                ).like(pattern, escape="\\"),
+                                func.lower(
+                                    func.coalesce(
+                                        ConversationSession.character_name, ""
+                                    )
+                                ).like(pattern, escape="\\"),
+                            ),
+                        )
+                    )
+                    if session_cursor is not None:
+                        cursor_activity, cursor_session_id = session_cursor
+                        session_query = session_query.where(
+                            or_(
+                                session_order_activity < cursor_activity,
+                                and_(
+                                    session_order_activity == cursor_activity,
+                                    ConversationSession.id < cursor_session_id,
                                 ),
                             )
                         )
-                        .order_by(
-                            desc(
-                                func.coalesce(
-                                    ConversationSession.last_activity,
-                                    ConversationSession.session_start,
-                                )
-                            ),
-                            desc(ConversationSession.id),
+                    session_rows = (
+                        await db_session.execute(
+                            session_query.order_by(
+                                desc(session_order_activity),
+                                desc(ConversationSession.id),
+                            ).limit(_CONVERSATION_SEARCH_SESSION_PAGE_SIZE)
                         )
-                        .limit(remaining_limit),
-                    )
-                ).scalars().all()
-                for session in session_rows:
-                    if len(results) >= limit:
+                    ).scalars().all()
+                    if not session_rows:
                         break
-                    if (
-                        str(session.id) in matched_session_ids
-                        or _is_story_workflow_session(session)
-                        or not await readable(session)
-                    ):
-                        continue
-                    results.append(_conversation_search_session_result(session, normalized))
+                    # Apply the result limit after duplicate and Project ACL
+                    # checks so earlier unreadable/title+body matches cannot
+                    # hide an older readable title match.
+                    for session in session_rows:
+                        if len(results) >= limit:
+                            break
+                        if (
+                            str(session.id) in matched_session_ids
+                            or not await readable(session)
+                        ):
+                            continue
+                        status_sessions[str(session.id)] = session
+                        results.append(
+                            _conversation_search_session_result(session, normalized)
+                        )
+                    last_session = session_rows[-1]
+                    last_session_id = getattr(last_session, "id", None)
+                    if last_session_id is None:
+                        break
+                    session_cursor = (
+                        getattr(last_session, "last_activity", None)
+                        or getattr(last_session, "session_start", None)
+                        or datetime.min,
+                        last_session_id,
+                    )
+                    if len(session_rows) < _CONVERSATION_SEARCH_SESSION_PAGE_SIZE:
+                        break
 
+            # The canonical search route runs with the real AsyncSession.  A
+            # few legacy adapters intentionally expose only the two historical
+            # search queries and do not implement the lifecycle tables; they
+            # leave the additive status fields absent rather than weakening
+            # the strict canonical projection.
+            if status_sessions and isinstance(db_session, AsyncSession):
+                status_projections = await project_conversation_statuses(
+                    list(status_sessions),
+                    last_read_at_by_session={
+                        session_id: getattr(session, "last_read_at", None)
+                        for session_id, session in status_sessions.items()
+                    },
+                    db_session=db_session,
+                )
+                for result in results:
+                    projection = status_projections.get(str(result.get("session_id") or ""))
+                    if projection is None:
+                        continue
+                    result["history_status"] = projection.status
+                    result["history_completed_at"] = (
+                        _history_completion_iso(projection.history_completed_at)
+                    )
             return ConversationSearchResponse(results=results, total=len(results))
         finally:
             await db_session.close()
 
-    @router.get("")
+    @router.get("", response_model=ConversationHistoryListResponse)
     async def list_sessions(
         limit: int = 50,
         offset: int = 0,
@@ -1287,7 +1681,7 @@ def create_conversation_router(
 
             payload = {
                 "success": True,
-                "conversations": [_session_to_list_dict(s) for s in sessions],
+                "conversations": await _session_list_payload(sessions),
                 "total": total,
                 "limit": limit,
                 "offset": offset,
@@ -1335,7 +1729,7 @@ def create_conversation_router(
             return JSONResponse(
                 {
                     "success": True,
-                    "conversations": [_session_to_list_dict(s) for s in sessions],
+                    "conversations": await _session_list_payload(sessions),
                     "total": total,
                     "limit": limit,
                     "offset": offset,
@@ -1348,21 +1742,39 @@ def create_conversation_router(
             logger.error(f"Failed to get project conversations: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    @router.post("")
-    async def create_session(
+    async def _create_session(
         payload: CreateSessionRequest,
-        _: None = Depends(require_auth),
-        request: Request = None,
+        request: Request | None,
+        client_session_id: UUID | None = None,
     ):
         """Create a new conversation session"""
         if not REPO_AVAILABLE:
             raise HTTPException(status_code=503, detail="Database not available")
 
+        started = time.monotonic()
+        phase = "request"
+        outcome = "failed"
+        persisted_session_id = "-"
+        supplied_request_id = _request_correlation_ids(request)[0] or "-"
+        request_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", supplied_request_id[:128])
+
+        def mark_phase(name: str) -> None:
+            nonlocal phase
+            phase = name
+            logger.info(
+                "conversation_create phase=%s elapsed_ms=%.1f request_id=%s "
+                "client_session_id=%s session_id=%s",
+                phase, (time.monotonic() - started) * 1000, request_id,
+                str(client_session_id or "-"), persisted_session_id,
+            )
+
         try:
+            mark_phase("principal")
             user_info = await _get_current_conversation_user(request)
             user_id = str(user_info.get("id") or "default_user")
 
             requested_character_name = str(payload.character_name or "").strip()
+            mark_phase("character_lookup")
             char_data = await _load_character_for_conversation(
                 requested_character_name,
                 request,
@@ -1386,11 +1798,31 @@ def create_conversation_router(
             # Validate the requested scope before changing the user's current
             # session. A denied create request must not have a side effect on
             # an unrelated active conversation.
+            mark_phase("requested_scope")
             await _require_project_permission(
                 normalized_project_id,
                 user_info,
                 permission="write",
             )
+
+            requested_agent_id = str(payload.agent_id or "").strip() or None
+            if requested_agent_id:
+                # Validate against the server's Agent/Revision and the
+                # human/project ACL before deactivating an existing session.
+                # Client supplied revision/prose data is intentionally not
+                # accepted here; the binding service reads canonical rows.
+                try:
+                    await _conversation_agent_service().validate_agent_selection(
+                        agent_id=requested_agent_id,
+                        actor_user_id=user_id,
+                        actor_role=user_info.get("role"),
+                        project_id=normalized_project_id,
+                    )
+                except ConversationAgentError as exc:
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail={"code": exc.code},
+                    ) from exc
 
             normalized_app_id, normalized_app_target_id = await _validate_app_scope(
                 request,
@@ -1401,37 +1833,207 @@ def create_conversation_router(
 
             repo = ConversationRepository()
 
+            if client_session_id is not None:
+                # Resolve optional defaults before opening the aggregate write
+                # transaction. An account-settings read/backfill cannot leave
+                # a half-created conversation behind.
+                from ..services.conversation_session_selection import (
+                    merge_session_llm_settings,
+                )
+                from ..services.user_llm_preference_service import (
+                    get_user_last_used_main_route,
+                    has_explicit_last_used_route,
+                    normalize_last_used_main_route,
+                    read_last_used_main_route,
+                )
+
+                try:
+                    user_id = str(UUID(user_id))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=403, detail="An authenticated account is required",
+                    ) from exc
+                client_route = normalize_last_used_main_route(
+                    payload.main_route.model_dump() if payload.main_route else None
+                )
+                mark_phase("route_defaults")
+                route = client_route
+                if not has_explicit_last_used_route(route):
+                    route = read_last_used_main_route(user_info.get("settings"))
+                    if not has_explicit_last_used_route(route):
+                        route = await get_user_last_used_main_route(user_id)
+                context = (
+                    merge_session_llm_settings({}, {"main_route": route})
+                    if has_explicit_last_used_route(route) else {}
+                )
+
+                async def authorize_created_session(db_session, created):
+                    current_project_id = getattr(created, "project_id", None)
+                    await _require_project_permission(
+                        current_project_id, user_info, permission="write",
+                        db_session=db_session,
+                    )
+                    await _validate_app_scope(
+                        request,
+                        app_id=(
+                            str(created.app_id)
+                            if getattr(created, "app_id", None) else None
+                        ),
+                        app_target_id=(
+                            str(created.app_target_id)
+                            if getattr(created, "app_target_id", None) else None
+                        ),
+                        project_id=str(current_project_id) if current_project_id else None,
+                        db_session=db_session,
+                    )
+
+                async def initialize_created_agent(db_session, created):
+                    if not requested_agent_id:
+                        return
+                    await _conversation_agent_service().pin_turn_binding(
+                        db_session=db_session,
+                        session_id=created.id,
+                        agent_id=requested_agent_id,
+                        actor_user_id=user_id,
+                        actor_role=user_info.get("role"),
+                    )
+
+                mark_phase("atomic_create_or_replay")
+                client_create_kwargs = {
+                    "client_session_id": str(client_session_id),
+                    "user_id": user_id,
+                    "character_name": character_name,
+                    "request_payload": {
+                        "character_name": character_name,
+                        "project_id": (
+                            str(UUID(normalized_project_id))
+                            if normalized_project_id else None
+                        ),
+                        "app_id": normalized_app_id,
+                        "app_target_id": normalized_app_target_id,
+                        "agent_id": requested_agent_id,
+                        "initial_message": (
+                            payload.initial_message.model_dump()
+                            if payload.initial_message is not None
+                            else None
+                        ),
+                        "main_route": client_route,
+                    },
+                    "display_name": str(
+                        user_info.get("display_name")
+                        or user_info.get("username") or "default_user"
+                    ),
+                    "project_id": normalized_project_id,
+                    "app_id": normalized_app_id,
+                    "app_target_id": normalized_app_target_id,
+                    "context": context,
+                    "first_message": _initial_character_greeting(char_data),
+                    "initial_message": (
+                        payload.initial_message.model_dump()
+                        if payload.initial_message is not None
+                        else None
+                    ),
+                    "character_display_name": str(
+                        char_data.get("name") or requested_character_name
+                    ).strip(),
+                    "authorize": authorize_created_session,
+                }
+                if requested_agent_id:
+                    client_create_kwargs.update(
+                        {
+                            "agent_id": requested_agent_id,
+                            "initialize_agent": initialize_created_agent,
+                        }
+                    )
+                session, first_msg_content = await repo.create_client_session(
+                    **client_create_kwargs
+                )
+                persisted_session_id = str(session.id)
+                mark_phase("response")
+                response = {"success": True, "session": _session_to_api_dict(session)}
+                if first_msg_content:
+                    response["first_message"] = first_msg_content
+                initial_user_message = getattr(session, "_initial_user_message", None)
+                if initial_user_message is not None:
+                    response["initial_message"] = initial_user_message
+                result = JSONResponse(response)
+                outcome = "success"
+                return result
+
             # Deactivate current active session for this user/character only
             # after all authorization and scope validation has succeeded.
-            active = await repo.get_active_session(user_id, character_name)
-            if active:
-                # Closing the previous session is lifecycle metadata, not a
-                # new chat activity. Keep its last_activity timestamp stable
-                # so creating a new session does not reorder the old one.
-                await repo.deactivate_session(str(active.id), touch_activity=False)
+            if payload.initial_message is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="initial_message requires the idempotent client session endpoint",
+                )
+            mark_phase("previous_active")
+            if not requested_agent_id:
+                active = await repo.get_active_session(
+                    user_id,
+                    character_name,
+                    exclude_private_root=True,
+                )
+                if active:
+                    # Closing the previous session is lifecycle metadata, not a
+                    # new chat activity. Keep its last_activity timestamp stable
+                    # so creating a new session does not reorder the old one.
+                    await repo.deactivate_session(str(active.id), touch_activity=False)
 
             # Create new session
-            session = await repo.create_session(
-                user_id=user_id,
-                character_name=character_name,
-                title="",  # Will be generated on first message
-                project_id=normalized_project_id,
-                app_id=normalized_app_id,
-                app_target_id=normalized_app_target_id,
-                development_status="working" if normalized_app_id else None,
-            )
-            await repo.ensure_participant(
-                str(session.id),
-                "user",
-                user_id,
-                display_name=str(
-                    user_info.get("display_name")
-                    or user_info.get("username")
-                    or "default_user"
-                ),
-                role="owner",
-                status="joined",
-            )
+            mark_phase("persist_session")
+            create_session_kwargs = {
+                "user_id": user_id,
+                "character_name": character_name,
+                "title": "",  # Will be generated on first message
+                "project_id": normalized_project_id,
+                "app_id": normalized_app_id,
+                "app_target_id": normalized_app_target_id,
+                "development_status": "working" if normalized_app_id else None,
+            }
+            if requested_agent_id:
+                async def initialize_standard_agent(db_session, created):
+                    await _conversation_agent_service().pin_turn_binding(
+                        db_session=db_session,
+                        session_id=created.id,
+                        agent_id=requested_agent_id,
+                        actor_user_id=user_id,
+                        actor_role=user_info.get("role"),
+                    )
+
+                create_session_kwargs.update(
+                    {
+                        "agent_id": requested_agent_id,
+                        "owner_participant": {
+                            "participant_id": user_id,
+                            "display_name": str(
+                                user_info.get("display_name")
+                                or user_info.get("username")
+                                or "default_user"
+                            ),
+                            "role": "owner",
+                            "status": "joined",
+                        },
+                        "initialize_agent": initialize_standard_agent,
+                        "deactivate_previous": True,
+                    }
+                )
+            session = await repo.create_session(**create_session_kwargs)
+            persisted_session_id = str(session.id)
+            mark_phase("owner_participant")
+            if not requested_agent_id:
+                await repo.ensure_participant(
+                    str(session.id),
+                    "user",
+                    user_id,
+                    display_name=str(
+                        user_info.get("display_name")
+                        or user_info.get("username")
+                        or "default_user"
+                    ),
+                    role="owner",
+                    status="joined",
+                )
 
             try:
                 from ..services.conversation_session_selection import (
@@ -1444,6 +2046,7 @@ def create_conversation_router(
                     if payload.main_route is not None
                     else None
                 )
+                mark_phase("stamp_route")
                 session = await stamp_new_session_main_route(
                     repo,
                     session,
@@ -1457,20 +2060,10 @@ def create_conversation_router(
                 ) from stamp_exc
 
             # first_message 挿入
-            first_msg_content = None
-            try:
-                if char_data:
-                    first_msg_content = char_data.get("first_message", "")
-                    if not first_msg_content and char_data.get("alternate_greetings"):
-                        import random
-
-                        greetings = char_data["alternate_greetings"]
-                        if greetings:
-                            first_msg_content = random.choice(greetings)
-            except Exception as e:
-                logger.warning(f"Failed to get first_message: {e}")
+            first_msg_content = _initial_character_greeting(char_data)
 
             if first_msg_content:
+                mark_phase("initial_greeting")
                 await repo.add_message(
                     session_id=str(session.id),
                     role="assistant",
@@ -1482,12 +2075,19 @@ def create_conversation_router(
                     ).strip(),
                 )
 
-            response = {"success": True, "session": session.to_dict()}
+            mark_phase("response")
+            response = {"success": True, "session": _session_to_api_dict(session)}
             if first_msg_content:
                 response["first_message"] = first_msg_content
-            return JSONResponse(response)
+            result = JSONResponse(response)
+            outcome = "success"
+            return result
         except HTTPException:
             raise
+        except ConversationSessionCreateConflict as exc:
+            raise HTTPException(
+                status_code=409, detail="Client session creation key conflict",
+            ) from exc
         except CharacterLookupError as exc:
             logger.error(
                 "Character lookup failed while creating conversation: "
@@ -1506,6 +2106,91 @@ def create_conversation_router(
                 status_code=500,
                 detail="Failed to create conversation",
             ) from None
+
+        finally:
+            logger.info(
+                "conversation_create_end outcome=%s phase=%s elapsed_ms=%.1f "
+                "request_id=%s client_session_id=%s session_id=%s",
+                outcome, phase, (time.monotonic() - started) * 1000,
+                request_id, str(client_session_id or "-"), persisted_session_id,
+            )
+
+    @router.post("")
+    async def create_session(
+        payload: CreateSessionRequest,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Create a new conversation session"""
+        return await _create_session(payload, request)
+
+    @router.put("/client/{client_session_id}")
+    async def create_client_session(
+        client_session_id: UUID,
+        payload: CreateSessionRequest,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Create/replay one account-scoped native local conversation UUID.
+
+        Clients must retain the UUID for retries and must not fall back to
+        POST if an older server returns 404/405 for this endpoint.
+        """
+        return await _create_session(payload, request, client_session_id)
+
+    @router.patch(
+        "/{session_id}/agent",
+        response_model=ConversationAgentBindingResponse,
+        operation_id="bind_conversation_agent",
+    )
+    async def bind_conversation_agent(
+        session_id: str,
+        payload: ConversationAgentBindingRequest,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Select or clear the one canonical Operations Agent for a session."""
+
+        if not REPO_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Database not available")
+        user_info = await _get_current_conversation_user(request)
+        user_id = str(user_info.get("id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            result = await _conversation_agent_service().bind_session_agent(
+                session_id=session_id,
+                agent_id=payload.agent_id,
+                expected_agent_id=payload.expected_agent_id,
+                actor_user_id=user_id,
+                actor_role=user_info.get("role"),
+            )
+            binding_payload = None
+            if result.binding is not None:
+                binding_payload = ConversationAgentBindingProjection(
+                    id=str(result.binding.binding_id),
+                    session_id=result.binding.session_id,
+                    agent_id=result.binding.agent_id,
+                    agent_revision_id=result.binding.agent_revision_id,
+                    revision_version=result.binding.revision_version,
+                    agent_team_id=result.binding.agent_team_id,
+                    execution_profile_id=result.binding.execution_profile_id,
+                    snapshot_hash=result.binding.snapshot_hash,
+                    created_at=result.binding.created_at,
+                )
+            return ConversationAgentBindingResponse(
+                success=True,
+                session=ConversationSessionAgentProjection.model_validate(
+                    _session_to_api_dict(result.session)
+                ),
+                binding=binding_payload,
+                control_notices=[dict(item) for item in result.control_notices],
+            )
+        except ConversationAgentError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code},
+            ) from exc
 
     # Note: This route must come before /{session_id} to avoid path matching conflicts
     @router.get("/active/current")
@@ -1547,7 +2232,7 @@ def create_conversation_router(
                 return JSONResponse(
                     {
                         "success": True,
-                        "session": session.to_dict(),
+                        "session": _session_to_api_dict(session),
                         "messages": [m.to_dict() for m in messages],
                     }
                 )
@@ -1558,6 +2243,150 @@ def create_conversation_router(
         except Exception as e:
             logger.error(f"Failed to get active session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/history-status",
+        response_model=ConversationHistoryStatusResponse,
+        operation_id="project_conversation_history_statuses",
+    )
+    async def project_history_statuses(
+        payload: ConversationHistoryStatusRequest,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ) -> ConversationHistoryStatusResponse:
+        """Project status for an already visible page of session IDs.
+
+        The Web BFF uses this bounded bridge after applying its own
+        visibility/project filters.  Python still applies its authenticated
+        session and Project ACL before returning any status, and the service
+        performs one fixed batch of lifecycle reads for the authorized IDs.
+        """
+
+        if not REPO_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Database not available")
+
+        normalized_ids: list[str] = []
+        for raw_id in payload.session_ids:
+            try:
+                normalized = str(UUID(str(raw_id)))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="Invalid session_id") from exc
+            if normalized not in normalized_ids:
+                normalized_ids.append(normalized)
+
+        user_info = await _get_current_conversation_user(request)
+        visible_user_ids = await _get_visible_conversation_user_ids(request)
+        from sqlalchemy import and_, or_, select
+        from sqlalchemy.orm import selectinload
+
+        from ..memory.database import get_database_manager
+        from ..memory.models import ConversationParticipant, ConversationSession
+        from ..memory.project_repository import ProjectRepository
+
+        participant_session_ids = (
+            select(ConversationParticipant.session_id)
+            .where(
+                and_(
+                    ConversationParticipant.participant_type == "user",
+                    ConversationParticipant.participant_id.in_(visible_user_ids),
+                    ConversationParticipant.status == "joined",
+                )
+            )
+            .scalar_subquery()
+        )
+        session_factory_result = get_database_manager().get_session()
+        db_session = (
+            await session_factory_result
+            if hasattr(session_factory_result, "__await__")
+            else session_factory_result
+        )
+        accessible_project_ids: set[UUID] | None = None
+        try:
+            visible_sessions = list(
+                (
+                    await db_session.execute(
+                        select(ConversationSession)
+                        .options(selectinload(ConversationSession.participants))
+                        .where(
+                            ConversationSession.id.in_(
+                                [UUID(session_id) for session_id in normalized_ids]
+                            ),
+                            ConversationSession.deleted_at.is_(None),
+                            or_(
+                                ConversationSession.user_id.in_(visible_user_ids),
+                                ConversationSession.id.in_(participant_session_ids),
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .unique()
+                .all()
+            )
+            project_sessions = [
+                session
+                for session in visible_sessions
+                if getattr(session, "project_id", None) is not None
+            ]
+            if project_sessions:
+                try:
+                    actor_uuid = UUID(str(user_info.get("id") or ""))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Project access denied",
+                    ) from exc
+                accessible_project_ids = set(
+                    await ProjectRepository.get_accessible_project_ids(
+                        db_session,
+                        actor_uuid,
+                    )
+                )
+        finally:
+            await db_session.close()
+        requested = set(normalized_ids)
+        sessions_by_id = {
+            str(session.id): session
+            for session in visible_sessions
+            if str(session.id) in requested
+        }
+        authorized_sessions = []
+        for session_id in normalized_ids:
+            session = sessions_by_id.get(session_id)
+            if session is None:
+                continue
+            project_id = getattr(session, "project_id", None)
+            if (
+                project_id is not None
+                and accessible_project_ids is not None
+                and project_id not in accessible_project_ids
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Project permission denied",
+                )
+            authorized_sessions.append(session)
+
+        projections = await project_conversation_statuses(
+            [str(session.id) for session in authorized_sessions],
+            last_read_at_by_session={
+                str(session.id): getattr(session, "last_read_at", None)
+                for session in authorized_sessions
+            },
+        )
+        return ConversationHistoryStatusResponse(
+            statuses=[
+                ConversationHistoryStatusItem(
+                    session_id=session_id,
+                    history_status=projections[session_id].status,
+                    history_completed_at=_history_completion_iso(
+                        projections[session_id].history_completed_at
+                    ),
+                )
+                for session_id in normalized_ids
+                if session_id in projections
+            ]
+        )
 
     @router.get("/{session_id}")
     async def get_session(
@@ -1581,12 +2410,142 @@ def create_conversation_router(
             user_info = await _get_current_conversation_user(request)
             await _require_session_project_permission(session, user_info)
 
-            return JSONResponse({"success": True, "session": session.to_dict()})
+            return JSONResponse({"success": True, "session": _session_to_api_dict(session)})
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Failed to get session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/{session_id}/memory-selection", response_model=MemorySelectionResponse, response_model_exclude_none=True)
+    async def get_session_memory_selection(
+        session_id: str,
+        agent_run_id: str | None = Query(default=None, max_length=128),
+        message_id: str | None = Query(default=None, max_length=128),
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Read the observed turn only; never search or invoke Jev on display."""
+        if not REPO_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Database not available")
+        from ..services.memory_selection_observation import live_observation, project_memory_selection
+        repo = ConversationRepository()
+        session = await repo.get_session_by_id(session_id, with_messages=False)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        visible_user_ids = await _get_visible_conversation_user_ids(request)
+        if not _session_is_visible(session, visible_user_ids):
+            raise HTTPException(status_code=403, detail="Access denied")
+        user_info = await _get_current_conversation_user(request)
+        await _require_session_project_permission(session, user_info)
+        active_messages = await repo.get_active_messages_for_turn(
+            session_id, message_id=message_id, agent_run_id=agent_run_id,
+        )
+        current = None
+        record = None
+        run = None
+        fork_boundary = False
+        # Exact turn requests never fall back to the previous answer. A copied
+        # fork row is a hard boundary even if legacy metadata survived.
+        for message in reversed(active_messages):
+            metadata = message.message_metadata if isinstance(message.message_metadata, dict) else {}
+            if message_id and str(message.id) != message_id:
+                continue
+            if agent_run_id and str(metadata.get("agent_run_id") or "") != agent_run_id:
+                continue
+            fork_boundary = bool(metadata.get("fork_source_message_id"))
+            if message.role == "assistant" and not metadata.get("fork_source_message_id"):
+                current = message
+                record = metadata.get("memory_selection_observation")
+            # With no exact selector the latest active message owns the view,
+            # including a new user turn with no response/observation yet.
+            break
+        if record is None and agent_run_id and not message_id and current is None and not fork_boundary:
+            # A live record is valid only for a running durable run whose user
+            # message still belongs to the latest active turn. Back/fork/retry
+            # must not resurrect a cached old run from this process.
+            from ..services.agent_run_service import AgentRunService
+            run = await AgentRunService().get_run(agent_run_id, include_tool_calls=True)
+            latest_active = await repo.get_active_messages_for_turn(session_id)
+            latest_user = latest_active[-1] if latest_active and latest_active[-1].role == "user" else None
+            user_metadata = getattr(latest_user, "message_metadata", None) or {}
+            live = live_observation(str(session_id), agent_run_id)
+            live_binding = live.get("binding", {}) if isinstance(live, dict) else {}
+            if (isinstance(run, dict) and run.get("status") in {"queued", "running", "awaiting_approval"}
+                    and str(run.get("session_id") or "") == str(session_id)
+                    and str(run.get("user_id") or "") == str(user_info.get("id") or "")
+                    and latest_user is not None and not user_metadata.get("fork_source_message_id")
+                    and str(run.get("client_message_id") or "") == str(user_metadata.get("client_message_id") or "")
+                    and bool(run.get("client_message_id"))
+                    and live_binding.get("client_message_id") == run.get("client_message_id")):
+                record = live
+        projection = await project_memory_selection(
+            record, actor_id=str(user_info.get("id") or ""), session_id=str(session_id),
+            agent_run_id=agent_run_id,
+        )
+        record_binding = record.get("binding", {}) if isinstance(record, dict) else {}
+        bound_run = str(record_binding.get("agent_run_id") or "") or None
+        if current is not None:
+            metadata = current.message_metadata or {}
+            if str(metadata.get("agent_run_id") or "") != str(bound_run or ""):
+                projection = None
+        tool_recall = None
+        current_metadata = getattr(current, "message_metadata", None) or {}
+        tool_run_id = str(current_metadata.get("agent_run_id") or agent_run_id or "")
+        if current is not None and current_metadata.get("tool_results"):
+            from ..services.agent_run_service import AgentRunService
+            try:
+                run = await AgentRunService().get_run(tool_run_id, include_tool_calls=True)
+            except Exception:
+                run = None
+        if (isinstance(run, dict) and str(run.get("session_id") or "") == str(session_id)
+                and str(run.get("user_id") or "") == str(user_info.get("id") or "")
+                and (current is not None or record is not None)):
+            from ..services.memory_tool_observation import project_memory_tool_results, match_observed_original
+            async def resolve_conversation(hit, identifier):
+                source = await repo.get_session_by_id(identifier, with_messages=False)
+                if not source or getattr(source, "deleted_at", None) is not None or not _session_is_visible(source, visible_user_ids):
+                    return None
+                try:
+                    await _require_session_project_permission(source, user_info)
+                except HTTPException:
+                    return None
+                # Existing semantic/text results identify the original session
+                # and timestamp, not an exact message ID. Verify that original
+                # still belongs to the active branch; do not invent an ID.
+                stamp = hit.get("timestamp") or hit.get("created_at")
+                if not stamp or hit.get("type") == "archived_summary":
+                    return None
+                try:
+                    at = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                    if at.tzinfo is not None:
+                        at = at.astimezone(timezone.utc).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    return None
+                originals = await repo.get_active_messages_for_turn(identifier, created_at=at, role=hit.get("role"), count=100)
+                original = match_observed_original(hit, originals)
+                if original is None:
+                    return None
+                return {"kind": "conversation", "source_id": identifier, "version": None,
+                        "title": str(getattr(source, "title", None) or "元の会話")[:180],
+                        "excerpt": str(original.content or "")[:240], "href": f"/chat?s={identifier}"}
+            tool_recall = await project_memory_tool_results(
+                run.get("tool_calls") or current_metadata.get("tool_results"),
+                actor_id=str(user_info.get("id") or ""), resolve_conversation=resolve_conversation,
+            )
+            if not tool_recall["calls"]:
+                tool_recall = None
+            elif not bound_run:
+                bound_run = tool_run_id
+        available = projection is not None or tool_recall is not None
+        return {
+            "success": True, "status": "available" if available else "unavailable",
+            "binding": {"session_id": str(session_id), "message_id": str(current.id) if current else None,
+                        "agent_run_id": bound_run if available else None,
+                        "active_branch": available},
+            "observation": projection,
+            "tool_recall": tool_recall,
+        }
 
     @router.get("/{session_id}/context-snapshot")
     async def get_session_context_snapshot(
@@ -1886,10 +2845,11 @@ def create_conversation_router(
             replayed = bool(getattr(message, "_idempotency_replayed", False))
             generated_title = None
             if not replayed:
+                # メッセージ保存の応答は題名LLMを待たない。fallback だけ即時に返す。
                 generated_title = await ensure_conversation_title(
                     repo=repo,
                     session_id=session_id,
-                    llm_generator=get_llm_for_title_generation,
+                    llm_generator=None,
                 )
 
             response = {
@@ -2057,10 +3017,27 @@ def create_conversation_router(
                 permission="write",
             )
 
+            async def _title_for_session(prompt: str) -> Optional[str]:
+                from ..assistant.conversation_title_events import (
+                    generate_title_with_session_route,
+                    session_has_explicit_main_route,
+                )
+
+                if session_has_explicit_main_route(session):
+                    config = get_title_config() if callable(get_title_config) else None
+                    if config is None:
+                        return None
+                    return await generate_title_with_session_route(
+                        config, session, prompt
+                    )
+                if get_llm_for_title_generation is None:
+                    return None
+                return await get_llm_for_title_generation(prompt)
+
             generated = await ensure_conversation_title(
                 repo=repo,
                 session_id=session_id,
-                llm_generator=get_llm_for_title_generation,
+                llm_generator=_title_for_session,
             )
 
             updated = await repo.get_session_by_id(session_id)
@@ -2085,6 +3062,11 @@ def create_conversation_router(
         request: Request = None,
     ):
         """Mark a conversation as read without changing its activity order."""
+        # Capture the user-visible read fence before session/project ACL
+        # awaits.  Completion committed during authorization must remain a
+        # later unread result; the repository advances the durable fence
+        # monotonically against concurrent reads.
+        requested_read_at = datetime.utcnow()
         if not REPO_AVAILABLE:
             raise HTTPException(status_code=503, detail="Database not available")
 
@@ -2101,19 +3083,17 @@ def create_conversation_router(
             await _require_session_project_permission(session, user_info)
             if not _session_can_manage(session, user_info):
                 raise HTTPException(status_code=403, detail="Conversation read-state denied")
-            read_at = datetime.utcnow()
-            updated = await repo.update_session(
+            durable_read_at = await repo.mark_session_read_monotonic(
                 session_id,
-                touch_activity=False,
-                last_read_at=read_at,
+                requested_read_at,
             )
-            if not updated:
+            if durable_read_at is None:
                 raise HTTPException(status_code=404, detail="Session not found")
             return JSONResponse(
                 {
                     "success": True,
                     "session_id": session_id,
-                    "last_read_at": read_at.isoformat(),
+                    "last_read_at": _history_completion_iso(durable_read_at),
                 }
             )
         except HTTPException:
@@ -2176,7 +3156,20 @@ def create_conversation_router(
                     except ValueError as exc:
                         raise HTTPException(status_code=400, detail="project_idが不正です") from exc
             if payload.title is not None:
+                context = dict(session.context) if isinstance(session.context, dict) else {}
+                generation = context.get("title_generation")
+                if (
+                    payload.title_source != "manual"
+                    and isinstance(generation, dict)
+                    and generation.get("source") == "manual"
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="手動で設定したタイトルは自動更新できません",
+                    )
                 updates["title"] = payload.title
+                context["title_generation"] = {"source": payload.title_source}
+                updates["context"] = context
             if payload.is_active is not None:
                 updates["is_active"] = payload.is_active
             if project_scope_provided:
@@ -2259,6 +3252,17 @@ def create_conversation_router(
                 # working/waiting_for_userとしてサイドバーへ投影される。
                 updates["development_status"] = None
 
+            if "is_pinned" in payload.model_fields_set:
+                if payload.is_pinned is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="is_pinnedにはtrueまたはfalseを指定してください",
+                    )
+                pin_changed_at = datetime.utcnow()
+                updates["is_pinned"] = payload.is_pinned
+                updates["pinned_at"] = pin_changed_at if payload.is_pinned else None
+                updates["pin_updated_at"] = pin_changed_at
+
             if updates:
                 # Session metadata (title, character/scope, active flag, or
                 # development state) is not chat activity. Only creating a
@@ -2267,6 +3271,7 @@ def create_conversation_router(
                 await repo.update_session(
                     session_id,
                     touch_activity=False,
+                    actor_user_id=user_info.get("id"),
                     **updates,
                 )
 
@@ -2274,10 +3279,18 @@ def create_conversation_router(
             updated = await repo.get_session_by_id(session_id)
 
             return JSONResponse(
-                {"success": True, "session": updated.to_dict() if updated else None}
+                {
+                    "success": True,
+                    "session": _session_to_api_dict(updated) if updated else None,
+                }
             )
         except HTTPException:
             raise
+        except AgentRootLifecycleError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except CharacterLookupError as exc:
             logger.error(
                 "Character lookup failed while updating conversation: "
@@ -2330,7 +3343,10 @@ def create_conversation_router(
                 permission="write",
             )
 
-            deleted = await repo.delete_session(session_id)
+            deleted = await repo.delete_session(
+                session_id,
+                actor_user_id=user_info.get("id"),
+            )
 
             # The process-local manual Team projection follows the durable
             # session row.  Release it only after the repository confirms the
@@ -2344,6 +3360,11 @@ def create_conversation_router(
             return JSONResponse({"success": deleted})
         except HTTPException:
             raise
+        except AgentRootLifecycleError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except Exception as e:
             logger.error(f"Failed to delete session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -2390,6 +3411,7 @@ def create_conversation_router(
                 if (
                     str(s.id) != session_id
                     and s.character_name == session.character_name
+                    and getattr(s, "_private_agent_root_metadata", None) is None
                 ):
                     await repo.deactivate_session(str(s.id), touch_activity=False)
 
@@ -2412,12 +3434,17 @@ def create_conversation_router(
             return JSONResponse(
                 {
                     "success": True,
-                    "session": updated.to_dict() if updated else None,
+                    "session": _session_to_api_dict(updated) if updated else None,
                     "messages": [m.to_dict() for m in messages],
                 }
             )
         except HTTPException:
             raise
+        except AgentRootLifecycleError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except Exception as e:
             logger.error(f"Failed to resume session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -2463,23 +3490,16 @@ def create_conversation_router(
                 title=payload.title,
             )
 
-            # シナリオ執筆チャットの場合だけ、対象Docs nodeと選択範囲も引き継ぐ。
-            from ..services.story_studio import clone_story_writing_session_for_conversation
-
-            try:
-                await clone_story_writing_session_for_conversation(
-                    session_id, str(forked.id)
-                )
-            except Exception:
-                logger.exception(
-                    "Conversation fork succeeded but writing context clone failed: %s",
-                    forked.id,
-                )
-            return JSONResponse({"success": True, "session": forked.to_dict()})
+            return JSONResponse({"success": True, "session": _session_to_api_dict(forked)})
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except HTTPException:
             raise
+        except AgentRootLifecycleError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except Exception as exc:
             logger.error("Failed to fork conversation: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -2864,5 +3884,99 @@ def create_conversation_router(
         except Exception as e:
             logger.error(f"Failed to update RP settings: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    return router
+
+
+def create_conversation_agent_router(
+    require_auth,
+    get_current_user,
+    *,
+    config: Any | None = None,
+) -> APIRouter:
+    """Create the sibling Agent selector catalog route.
+
+    It is kept separate from ``/api/conversations`` so the canonical public
+    path remains ``GET /api/conversation-agents``.  The composition root must
+    include this router alongside ``create_conversation_router``.
+    """
+
+    # This router owns two sibling API prefixes: the selectable Agent catalog
+    # and the ACL-filtered session history for one Agent.
+    router = APIRouter(tags=["conversation-agents"])
+
+    async def actor(request: Request) -> dict[str, Any]:
+        value = get_current_user(request)
+        if hasattr(value, "__await__"):
+            value = await value
+        return value or {}
+
+    @router.get(
+        "/api/conversation-agents",
+        response_model=ConversationAgentListResponse,
+        operation_id="list_conversation_agents",
+    )
+    async def list_conversation_agents(
+        session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        limit: int = Query(default=100, ge=1, le=200),
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        user_info = await actor(request)
+        user_id = str(user_info.get("id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            agents = await ConversationAgentService(config=config).list_available_agents(
+                actor_user_id=user_id,
+                actor_role=user_info.get("role"),
+                session_id=session_id,
+                project_id=project_id,
+                limit=limit,
+            )
+            return ConversationAgentListResponse(success=True, agents=agents)
+        except ConversationAgentError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code},
+            ) from exc
+
+    @router.get(
+        "/api/agents/{agent_id}/conversations",
+        response_model=AgentConversationsResponse,
+        operation_id="list_agent_conversations",
+    )
+    async def list_agent_conversations(
+        agent_id: str,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        user_info = await actor(request)
+        user_id = str(user_info.get("id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            sessions = await ConversationAgentService(config=config).list_agent_conversations(
+                agent_id=agent_id,
+                actor_user_id=user_id,
+                actor_role=user_info.get("role"),
+                limit=limit,
+                offset=offset,
+            )
+            return AgentConversationsResponse(
+                success=True,
+                sessions=sessions,
+                total=len(sessions),
+                limit=limit,
+                offset=offset,
+            )
+        except ConversationAgentError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code},
+            ) from exc
 
     return router

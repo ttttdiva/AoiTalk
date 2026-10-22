@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import contextvars
 import hashlib
 import inspect
@@ -62,6 +63,10 @@ from ..services.agent_team_v3 import (
     filter_agent_team_capabilities,
     resolve_agent_team_v3_route,
 )
+from ..services.agent_model_routing import (
+    AgentModelRouteError,
+    resolve_agent_subagent_route,
+)
 from .tool_packs import (
     CHARACTER_TOOL_OWNER,
     contextual_agent_team_scope,
@@ -76,6 +81,8 @@ from .tool_policy import (
     get_current_user_input,
     is_knowledge_search_enabled,
     is_memory_search_enabled,
+    _policy_config_bool,
+    agent_team_subagent_capability_reason,
     looks_like_docs_agent_delegation_request,
 )
 from .specialist_delegate import (
@@ -111,6 +118,138 @@ _DOCS_ROOT_DELEGATION_COMPLETED: contextvars.ContextVar[bool] = contextvars.Cont
 _ROOT_TOOL_FAILURE_BREAKERS: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "aoitalk_root_tool_failure_breakers", default={}
 )
+
+
+def _specialist_child_usage(
+    runner: Any,
+    child_run_id: str | None,
+) -> dict[str, Any] | None:
+    """Project one child run's exact shared-ledger receipts."""
+
+    ledger = getattr(runner, "_agent_dialogue_turn_ledger", None)
+    records = getattr(ledger, "usage_records", None)
+    if not isinstance(records, Mapping):
+        return None
+    marker = str(child_run_id or "").strip()
+    prefix = f"specialist:{marker}:" if marker else "specialist:"
+    selected = [
+        value
+        for key, value in records.items()
+        if str(key).startswith(prefix) and isinstance(value, Mapping)
+    ]
+    if not selected:
+        return None
+    totals: dict[str, Any] = {}
+    for value in selected:
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "cost_micros",
+        ):
+            raw = value.get(key)
+            if raw is None:
+                continue
+            try:
+                totals[key] = totals.get(key, 0) + max(0, int(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+    if not totals:
+        return None
+    totals.setdefault(
+        "total_tokens",
+        totals.get("input_tokens", 0)
+        + totals.get("output_tokens", 0)
+        + totals.get("reasoning_tokens", 0),
+    )
+    totals["provider"] = str(getattr(runner, "provider", "") or "").strip().lower()
+    totals["model"] = str(getattr(runner, "model", "") or "").strip()
+    reasoning_flags = {
+        value.get("output_includes_reasoning")
+        for value in selected
+        if isinstance(value.get("output_includes_reasoning"), bool)
+    }
+    if len(reasoning_flags) == 1:
+        totals["output_includes_reasoning"] = next(iter(reasoning_flags))
+    sources = {
+        str(value.get("total_tokens_source"))
+        for value in selected
+        if value.get("total_tokens_source") in {"reported", "derived"}
+    }
+    if len(sources) == 1:
+        totals["total_tokens_source"] = next(iter(sources))
+    if bool(getattr(ledger, "usage_unknown", False)):
+        totals["usage_state"] = "unknown"
+    totals["usage_keys"] = [
+        str(key) for key, value in records.items()
+        if str(key).startswith(prefix) and isinstance(value, Mapping)
+    ]
+    return totals
+
+
+def _merge_dialogue_usage_into_parent_client(runner: Any, usage: Mapping[str, Any] | None) -> None:
+    """Expose child receipts on the parent's terminal meter exactly once."""
+
+    if not isinstance(usage, Mapping):
+        return
+    scope = getattr(runner, "_agent_dialogue_budget_scope", None)
+    parent = getattr(scope, "client", None) if scope is not None else None
+    ledger = getattr(scope, "ledger", None) if scope is not None else None
+    if parent is None:
+        return
+    canonical = {
+        key: max(0, int(usage.get(key) or 0))
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "cost_micros",
+        )
+        if usage.get(key) is not None
+    }
+    if not canonical:
+        return
+    if ledger is not None and isinstance(getattr(ledger, "usage", None), Mapping):
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "cost_micros",
+        ):
+            if ledger.usage.get(key) is not None:
+                canonical[key] = max(0, int(ledger.usage.get(key) or 0))
+    current = getattr(parent, "_agent_run_usage", None)
+    current = dict(current) if isinstance(current, Mapping) else {}
+    # Shared ledger totals are already cumulative; assigning the canonical
+    # snapshot avoids adding the same child receipt twice on a retry/finalize.
+    current.update({key: value for key, value in canonical.items()})
+    current.setdefault(
+        "total_tokens",
+        current.get("input_tokens", 0)
+        + current.get("output_tokens", 0)
+        + current.get("reasoning_tokens", 0),
+    )
+    setattr(parent, "_agent_run_usage", current)
+    parent_usage = dict(current)
+    for key in ("output_includes_reasoning", "total_tokens_source"):
+        if usage.get(key) is not None:
+            parent_usage[key] = usage[key]
+    if bool(getattr(ledger, "usage_unknown", False)):
+        parent_usage["usage_state"] = "unknown"
+    setattr(parent, "_agent_dialogue_usage", parent_usage)
+    records = getattr(parent, "_last_usage_records", None)
+    if not isinstance(records, list):
+        records = []
+    key = str(usage.get("usage_keys", [""])[0] if usage.get("usage_keys") else "").strip()
+    if key and not any(str(item.get("usage_key") or "") == key for item in records if isinstance(item, Mapping)):
+        records.append({**canonical, "usage_key": key, "provider": usage.get("provider"), "model": usage.get("model")})
+    setattr(parent, "_last_usage_records", records)
 
 
 class _BoundedManagedToolExecutionAdapter:
@@ -414,7 +553,7 @@ def _register_load_agent_team_tool(
         return
 
     async def load_agent_team(team_id: str) -> str:
-        """Load one manual Agent Team by name or stable ID for this session."""
+        """Load one manual Execution Team by name or stable ID for this session."""
         client_config = getattr(client, "config", None)
         effective_config = client_config if client_config is not None else config
         if not agent_team_v3_delegation_enabled(effective_config):
@@ -450,7 +589,7 @@ def _register_load_agent_team_tool(
 
     load_agent_team.__name__ = "load_agent_team"
     load_agent_team.__doc__ = (
-        "Load a manual Agent Team by its display name or stable team_id for this conversation. "
+        "Load a manual Execution Team by its display name or stable team_id for this conversation. "
         "Always/contextual Teams are active according to their activation settings."
     )
     registry.register(
@@ -678,42 +817,20 @@ def _agent_enabled(config: Any, domain_key: str, default: bool = True) -> bool:
         return False
     if not config:
         return default
-    if domain_key == "media":
-        # Shared integrations intentionally live outside Agent Team.  Keep
-        # their direct integration entry points available regardless of Team
-        # topology.
-        return bool(config.get("agents", {}).get(domain_key, {}).get("enabled", default))
-    return bool(config.get("agents", {}).get(domain_key, {}).get("enabled", default))
-
-
-def _strict_config_bool(value: Any, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in {0, 1}:
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-        if normalized in {"false", "0", "no", "off", ""}:
-            return False
-    # A malformed persisted policy must never expose process/write tools.
-    return False
+    return _policy_config_bool(_config_get(config, f"agents.{domain_key}.enabled", default), default=default)
 
 
 def _apps_enabled(config: Any, default: bool = True) -> bool:
     if not config:
         return default
     if isinstance(config, dict):
-        return _strict_config_bool(
+        return _policy_config_bool(
             (config.get("apps") or {}).get("enabled", default),
             default=default,
         )
     getter = getattr(config, "get", None)
     if callable(getter):
-        return _strict_config_bool(
+        return _policy_config_bool(
             getter("apps.enabled", default),
             default=default,
         )
@@ -728,7 +845,7 @@ def _managed_tool_promotion_settings(config: Any) -> dict[str, Any] | None:
     raw = _config_get(config, "apps.managed_tool_promotion", None)
     # A partially migrated/hand-written config must not expose write/process
     # tools accidentally.  Fresh installs receive this branch from the seed.
-    if not isinstance(raw, Mapping) or not _strict_config_bool(
+    if not isinstance(raw, Mapping) or not _policy_config_bool(
         raw.get("enabled", False),
         default=False,
     ):
@@ -801,25 +918,13 @@ def _register_managed_tool_direct_tools(
     return registered
 
 
-def _story_context_active_for_client(client: Any) -> bool:
-    """Read the existing StoryChatContext without publishing it to normal chat."""
-
-    getter = getattr(client, "_get_story_chat_context_sync", None) if client is not None else None
-    if not callable(getter):
-        return False
-    try:
-        return bool(getter())
-    except Exception:
-        return False
-
-
 def _project_management_direct_tools_enabled(config: Any, default: bool = True) -> bool:
     if not config:
         return default
     agents = config.get("agents", {}) if hasattr(config, "get") else {}
     project_config = agents.get("project_management", {}) if isinstance(agents, dict) else {}
     if isinstance(project_config, dict) and "direct_tools_enabled" in project_config:
-        return bool(project_config.get("direct_tools_enabled"))
+        return _policy_config_bool(project_config.get("direct_tools_enabled"), default=default)
     return default
 
 
@@ -863,7 +968,7 @@ def _spotify_integration_enabled(config: Any) -> bool:
         # are handled by _config_get above; missing canonical state is treated
         # as disabled so fresh/partially migrated installs fail closed.
         return False
-    return bool(value)
+    return _policy_config_bool(value, default=False)
 
 
 def _register_spotify_direct_tools(registry: ToolRegistry) -> bool:
@@ -1119,6 +1224,12 @@ def _register_search_direct_tools(
                 )
                 or registered
             )
+
+    # Main conversation search is independent of the optional Knowledge flag.
+    # Per-turn registry filtering and live source ACLs still apply.
+    from ..tools.knowledge import media_search, media_read, chat_search_sources
+    for definition in (media_search, media_read, chat_search_sources):
+        registered = _register_tool_definition(registry, definition, owner="search", risk="low") or registered
 
     if _webex_configured():
         from ..tools.webex import (
@@ -1752,11 +1863,13 @@ def _agent_team_delegate_roster(
     active_subagent_ids = {
         str(item.get("subagent_id") or "")
         for item in agent_team_v3_subagents(config, include_disabled=False)
-        if str(item.get("subagent_id") or "") in active_visible_ids
+        if agent_team_subagent_capability_reason(config, item) is None
+        and str(item.get("subagent_id") or "") in active_visible_ids
     }
     subagents_by_id = {
         str(item.get("subagent_id") or ""): item
         for item in agent_team_v3_subagents(config, include_disabled=False)
+        if agent_team_subagent_capability_reason(config, item) is None
     }
     roster_lines: list[str] = []
     for team_config in configured_teams:
@@ -1782,6 +1895,78 @@ def _agent_team_delegate_roster(
     return "\n\n".join(roster_lines), active_team_ids, active_subagent_ids
 
 
+_AGENT_TEAM_ROSTER_HEADING = "Available Execution Teams and Subagents:"
+
+
+def _config_with_pinned_subagent_route(
+    config: Any,
+    *,
+    team_id: str,
+    profile_id: str,
+    subagent_id: str,
+    route: Mapping[str, Any],
+) -> Any:
+    """Copy runtime config with one immutable AgentRevision route overlay."""
+
+    try:
+        if isinstance(config, Mapping):
+            cloned = copy.deepcopy(config)
+            root = cloned
+        else:
+            cloned = copy.copy(config)
+            root = copy.deepcopy(getattr(config, "config"))
+            setattr(cloned, "config", root)
+        agent_team = root.setdefault("agent_team", {})
+        teams = agent_team.setdefault("teams", {})
+        team = teams.setdefault(team_id, {"team_id": team_id, "enabled": True})
+        profiles = team.setdefault("execution_profiles", {})
+        profile = profiles.setdefault(
+            profile_id,
+            {
+                "profile_id": profile_id,
+                "enabled": True,
+                "default_route": {
+                    "inherit_model": False,
+                    "provider": route.get("provider"),
+                    "model": route.get("model"),
+                    "effort_policy": "explicit",
+                    "effort": route.get("effort") or "",
+                },
+                "overrides": {},
+            },
+        )
+        overrides = profile.setdefault("overrides", {})
+        overrides[subagent_id] = {
+            "inherit_model": False,
+            "provider": route.get("provider"),
+            "model": route.get("model"),
+            "effort_policy": "explicit",
+            "effort": route.get("effort") or "",
+        }
+        return cloned
+    except Exception:
+        # A pinned Agent turn must fail closed if its route cannot be projected
+        # into the provider construction config; callers treat the original
+        # config as legacy-only and refuse the pinned child below.
+        return None
+
+
+def _with_agent_team_roster_description(description: str, roster_text: str) -> str:
+    """Replace an old or current generated roster without changing the base text."""
+
+    # Reused tool definitions may carry the previous product label. Match only
+    # the generated standalone section, not mentions inside the base description.
+    headings = (
+        "Available Agent Teams and Subagents:",
+        _AGENT_TEAM_ROSTER_HEADING,
+    )
+    boundary = r"\n\n(?:" + "|".join(re.escape(item) for item in headings) + r")(?:\n|$)"
+    base_description = re.split(boundary, str(description or ""), maxsplit=1)[0]
+    if not roster_text:
+        return base_description
+    return f"{base_description}\n\n{_AGENT_TEAM_ROSTER_HEADING}\n{roster_text}"
+
+
 def specialize_agent_team_delegate_definition(
     definition: ToolDefinition,
     *,
@@ -1805,13 +1990,9 @@ def specialize_agent_team_delegate_definition(
         project_context=project_context,
         contextual_scope=contextual_scope,
     )
-    base_description = str(definition.description or "").split(
-        "\n\nAvailable Agent Teams and Subagents:",
-        1,
-    )[0]
-    description = base_description
-    if roster_text:
-        description = f"{base_description}\n\nAvailable Agent Teams and Subagents:\n{roster_text}"
+    description = _with_agent_team_roster_description(
+        definition.description, roster_text
+    )
     return replace(definition, description=description)
 
 
@@ -1878,10 +2059,10 @@ def _register_agent_team_delegate_tool(
         work_mode: str = "read",
         scopes: Optional[list[str]] = None,
     ) -> str:
-        """Delegate bounded work to a Subagent in an available Agent Team.
+        """Delegate bounded work to a Subagent in an available Execution Team.
 
         Args:
-            team: Agent Team name or stable ID from the available Team roster.
+            team: Execution Team name or stable ID from the available Team roster.
             subagent: Subagent name or stable ID listed under that Team.
             task: The bounded assignment for the teammate(s).
             instances: How many instances to run. Clamped by the Subagent limits.
@@ -1988,6 +2169,9 @@ def _register_agent_team_delegate_tool(
             return f"Subagent {requested_subagent_id} is not a subagent of Agent Team {requested_team_id}"
         if not subagent.get("enabled", True):
             return f"Subagent is disabled: {requested_subagent_id}"
+        capability_reason = agent_team_subagent_capability_reason(effective_config, subagent)
+        if capability_reason:
+            return f"Subagent is disabled: {requested_subagent_id}: {capability_reason}"
         subagent_id = canonical_subagent_id
         if requested_work_mode == "write" and not agent_team_subagent_allows_write(subagent):
             return f"Subagent {subagent_id} does not allow write mode"
@@ -2084,7 +2268,47 @@ def _register_agent_team_delegate_tool(
                 if str(capability).strip()
             )
         )
-        route = resolve_agent_team_v3_route(effective_config, subagent_id) or {}
+        agent_execution_binding = getattr(
+            get_turn_context(), "agent_execution_binding", None
+        )
+        if agent_execution_binding is not None:
+            if selected_team_id != str(
+                getattr(agent_execution_binding, "agent_team_id", "") or ""
+            ).strip():
+                return "Agent Team is outside the pinned AgentRevision"
+            if subagent_id not in {
+                str(item).strip()
+                for item in (getattr(agent_execution_binding, "allowed_subagent_ids", ()) or ())
+            }:
+                return "Subagent is outside the pinned AgentRevision"
+            try:
+                pinned_route = resolve_agent_subagent_route(
+                    effective_config,
+                    agent_execution_binding.routing_pins(),
+                    subagent_id,
+                    require_allowed=True,
+                )
+            except (AgentModelRouteError, AttributeError, TypeError, ValueError):
+                return "Subagent route is unavailable in the pinned AgentRevision"
+            route = pinned_route.provenance()
+        else:
+            route = resolve_agent_team_v3_route(effective_config, subagent_id) or {}
+        child_config = effective_config
+        pinned_child_route = agent_execution_binding is not None
+        pinned_profile_id = ""
+        if pinned_child_route:
+            pinned_profile_id = str(
+                getattr(agent_execution_binding, "execution_profile_id", "") or ""
+            ).strip() or "__agent_revision_pinned__"
+            child_config = _config_with_pinned_subagent_route(
+                effective_config,
+                team_id=selected_team_id,
+                profile_id=pinned_profile_id,
+                subagent_id=subagent_id,
+                route=route,
+            )
+            if child_config is None:
+                return "Subagent route could not be projected from the pinned AgentRevision"
         backend = str(
             route.get("backend")
             or ("cli" if str(route.get("provider") or "").endswith("-cli") else "api")
@@ -2139,6 +2363,7 @@ def _register_agent_team_delegate_tool(
         delegation_id = str(uuid4())
         instance_route_metadata: dict[int, dict[str, Any]] = {}
         instance_reports: dict[int, dict[str, Any]] = {}
+        instance_usage: dict[int, dict[str, Any]] = {}
         # インスタンスごとに子 AgentRun を作り、タイムラインから委譲先へ辿れるようにする。
         child_run_ids: dict[int, str] = {}
         breaker_key = f"{parent_agent_run_id or 'no-parent'}:{subagent_id}"
@@ -2307,6 +2532,8 @@ def _register_agent_team_delegate_tool(
                 parent_run_id=parent_agent_run_id,
             )
             payload["worker_report"] = report
+            if index in instance_usage:
+                payload["usage"] = dict(instance_usage[index])
             payload["publication"] = report.get(
                 "publication",
                 parent_publication_metadata(parent_run_id=parent_agent_run_id),
@@ -2440,7 +2667,22 @@ def _register_agent_team_delegate_tool(
                 runner_params = {}
             if "work_mode" in runner_params:
                 runner_kwargs["work_mode"] = requested_work_mode
-            runner = AgentTeamSubagentDelegationRunner(effective_config, **runner_kwargs)
+            runner_config = child_config
+            runner = None
+            session_selection_token = None
+            session_profile_token = None
+            if pinned_child_route:
+                from ..services.session_llm_runtime_context import (
+                    bind_session_agent_team_selection,
+                    bind_session_execution_profile_id,
+                )
+
+                session_selection_token = bind_session_agent_team_selection(
+                    {"mode": "fixed", "team_id": selected_team_id}
+                )
+                session_profile_token = bind_session_execution_profile_id(
+                    pinned_profile_id
+                )
             scope = (
                 normalized_scopes[index - 1]
                 if normalized_scopes
@@ -2463,9 +2705,32 @@ def _register_agent_team_delegate_tool(
                 set_current_agent_run_id(child_run_id) if child_run_id else None
             )
             try:
+                runner = AgentTeamSubagentDelegationRunner(
+                    runner_config,
+                    **runner_kwargs,
+                )
+                if pinned_child_route:
+                    route_metadata = dict(getattr(runner, "route_metadata", {}) or {})
+                    route_metadata.update(
+                        {
+                            "agent_id": getattr(agent_execution_binding, "agent_id", None),
+                            "agent_revision_id": getattr(
+                                agent_execution_binding, "agent_revision_id", None
+                            ),
+                            "route_source": "agent_revision",
+                            "provider": route.get("provider"),
+                            "model": route.get("model"),
+                            "execution_profile_id": route.get("execution_profile_id"),
+                        }
+                    )
+                    runner.route_metadata = route_metadata
                 result = await runner.run_async(
                     scoped_task, project_context=project_context
                 )
+                child_usage = _specialist_child_usage(runner, child_run_id)
+                if child_usage is not None:
+                    instance_usage[index] = child_usage
+                    _merge_dialogue_usage_into_parent_client(runner, child_usage)
                 # Keep the provider-facing result string unchanged for
                 # backwards compatibility, while retaining a bounded,
                 # structured WorkerReport for the parent timeline/run record.
@@ -2517,8 +2782,25 @@ def _register_agent_team_delegate_tool(
                         return f"{label}-{index} delegation error: internal tool failure circuit open"
                 return result
             finally:
+                if runner is not None:
+                    child_usage = _specialist_child_usage(runner, child_run_id)
+                    if child_usage is not None:
+                        instance_usage[index] = child_usage
+                        _merge_dialogue_usage_into_parent_client(runner, child_usage)
                 if run_id_token is not None:
                     reset_current_agent_run_id(run_id_token)
+                if session_profile_token is not None:
+                    from ..services.session_llm_runtime_context import (
+                        reset_session_execution_profile_id,
+                    )
+
+                    reset_session_execution_profile_id(session_profile_token)
+                if session_selection_token is not None:
+                    from ..services.session_llm_runtime_context import (
+                        reset_session_agent_team_selection,
+                    )
+
+                    reset_session_agent_team_selection(session_selection_token)
                 instance_route_metadata[index] = dict(
                     getattr(runner, "route_metadata", {}) or {}
                 )
@@ -2666,6 +2948,8 @@ def _register_agent_team_delegate_tool(
                     parent_publication_metadata(parent_run_id=parent_agent_run_id),
                 ),
             }
+            if index in instance_usage:
+                report_metadata["usage"] = dict(instance_usage[index])
             if status == "failed":
                 if child_run_id and agent_run_service:
                     try:
@@ -2821,11 +3105,11 @@ def _register_agent_team_delegate_tool(
                         "QA browser coordinator cleanup failed", exc_info=True
                     )
 
-    agent_team_delegate.__doc__ = (
-        _agent_team_delegate_impl.__doc__ or ""
-    ) + f"\nAvailable Agent Teams and Subagents:\n{roster_text}"
+    agent_team_delegate.__doc__ = _agent_team_delegate_impl.__doc__ or ""
     definition = tool_decorator(agent_team_delegate)
-    description = f"{definition.description}\n\nAvailable Agent Teams and Subagents:\n{roster_text}"
+    description = _with_agent_team_roster_description(
+        definition.description, roster_text
+    )
     definition = replace(
         definition,
         description=description,
@@ -2866,7 +3150,7 @@ def _register_project_workspace_tools(
     if not project_id:
         return
     metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
-    enabled = bool(context.get("workspace_tools_enabled", metadata.get("workspace_tools_enabled", False)))
+    enabled = _policy_config_bool(context.get("workspace_tools_enabled", metadata.get("workspace_tools_enabled", False)), default=False)
     if not enabled:
         return
     from ..services.workspace_tool_runner import load_workspace_tool_manifests, manifest_to_tool
@@ -2957,7 +3241,30 @@ def _register_cloud_advisor_tool(
     )
 
 
-def build_runtime_tool_registry(
+def _register_agent_dialogue_tools(registry: ToolRegistry) -> None:
+    """Register the generic root-Agent AoiDots dialogue tools.
+
+    The definitions are ordinary Agent tools.  They do not create an AoiDots
+    provider loop: AgentDialogueService delegates child session creation and
+    delivery to the shared provisioner/transport boundaries and returns only
+    bounded references to the model.
+    """
+
+    try:
+        from ..tools.agent_dialogue import build_agent_dialogue_tools
+
+        for definition in build_agent_dialogue_tools():
+            registry.register(definition)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "AoiDots AgentDialogue tools could not be registered",
+            exc_info=True,
+        )
+
+
+def _build_runtime_tool_registry(
     config: Any,
     project_context: dict[str, Any] | None = None,
     *,
@@ -3006,11 +3313,18 @@ def build_runtime_tool_registry(
         client=client,
     )
 
-    if config and not config.get("use_tools", True):
+    if config and not _policy_config_bool(_config_get(config, "use_tools", True), default=True):
         return registry
 
-    if config and config.get("skills", {}).get("enabled", True) and invoke_skill is not None:
+    if config and _policy_config_bool(_config_get(config, "skills.enabled", True), default=True) and invoke_skill is not None:
         registry.register(invoke_skill)
+
+    from ..services.skill_execution_service import skill_capability_enabled
+    if skill_capability_enabled(config):
+        from ..tools.skill_management import build_skill_tools
+        for skill_tool in build_skill_tools(config, client=client):
+            if skill_tool.name != "run_skill" or skill_capability_enabled(config, browser=True):
+                registry.register(skill_tool)
 
     # Engagement Operations is a direct, ACL-backed root capability.  Register
     # it before the legacy ``not config`` return so providers using the default
@@ -3053,6 +3367,11 @@ def build_runtime_tool_registry(
             workspace_root=project_workspace_root,
         ):
             registry.register(definition)
+
+    # AoiDots is a generic root-Agent surface and remains available for the
+    # minimal/default config path too; its service boundary still fails closed
+    # when the durable private-root/provisioner is unavailable.
+    _register_agent_dialogue_tools(registry)
 
     if not config:
         _register_project_workspace_tools(
@@ -3099,9 +3418,14 @@ def build_runtime_tool_registry(
     )
     _register_scoped_memory_tools(registry)
 
-    from ..tools.browser_agent import build_browser_agent_tool
+    from ..tools.browser_agent import build_browser_agent_tool, build_dedicated_browser_agent_tool
     registry.register(build_browser_agent_tool(config, client=client))
-    from ..tools.computer_use import build_computer_use_tool
+    from ..services.browser_agent_models import BrowserAgentSettings
+    browser_settings = BrowserAgentSettings.from_config(config)
+    if browser_settings.enabled and browser_settings.dedicated_enabled:
+        registry.register(build_dedicated_browser_agent_tool(config, client=client))
+    from ..tools.computer_use import build_computer_observe_tool, build_computer_use_tool
+    registry.register(build_computer_observe_tool(config, client=client))
     registry.register(build_computer_use_tool(config, client=client))
 
     # Spotify is a disabled-by-default Shared Integration.  When enabled,
@@ -3188,6 +3512,88 @@ def build_runtime_tool_registry(
         model_project_context,
         client=client,
     )
+    return registry
+
+
+def build_runtime_tool_registry(config: Any, project_context: dict[str, Any] | None = None, **kwargs: Any) -> ToolRegistry:
+    """Build a registry whose schemas and retained definitions honor live gates.
+
+    Optional definitions are regenerated on a configuration change, including
+    OFF -> ON on the next turn. Project authorization remains request-local in
+    tool_exposure; Project metadata never supplies application feature flags.
+    """
+    client = kwargs.get("client")
+
+    def current_config():
+        value = getattr(client, "config", None)
+        return config if value is None else value
+
+    def current_project_context():
+        from .tool_exposure import _current_project_scope_for_tool
+        current = _current_project_scope_for_tool(client)
+        # An explicitly empty request must not inherit a constructor Project.
+        if current is not None or runtime_project_context_is_bound():
+            return current or {}
+        return project_context
+
+    def fingerprint():
+        value = current_config()
+        keys = ("use_tools", "runtime.target_enable_tools", "agents", "skills", "apps", "integrations", "search", "memory", "browser_agent", "cloud_advisor", "agent_team", "mcp_enabled")
+        snapshot = [_config_get(value, key) for key in keys]
+        snapshot.extend((Features.is_enterprise(), Features.entertainment()))
+        context = _model_visible_project_context(current_project_context(), client=client) or {}
+        metadata = context.get("metadata") if isinstance(context.get("metadata"), Mapping) else {}
+        enabled = _policy_config_bool(context.get("workspace_tools_enabled", metadata.get("workspace_tools_enabled")), default=False)
+        snapshot.append((str(context.get("id") or ""), enabled))
+        if enabled and not Features.is_enterprise():
+            # Recreate schemas after Project option/manifest/entrypoint changes.
+            # Paths come only from the canonical workspace and validated loader.
+            try:
+                from ..services.project_workspace_cleanup import get_project_workspace_path
+                from ..services.workspace_tool_runner import load_workspace_tool_manifests
+
+                workspace = get_project_workspace_path(UUID(str(context.get("id") or "")))
+                snapshot.append([
+                    (item.name,
+                     hashlib.sha256((workspace / "tools" / item.name / "manifest.yaml").read_bytes()).hexdigest(),
+                     hashlib.sha256(item.entrypoint.read_bytes()).hexdigest())
+                    for item in load_workspace_tool_manifests(workspace)
+                ])
+            except (OSError, ValueError):
+                snapshot.append("workspace tools unavailable")
+        return hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
+
+    def capability_check(definition):
+        from .tool_exposure import runtime_tool_capability_status
+
+        return runtime_tool_capability_status(definition, client=client, config=current_config())
+
+    registry = _build_runtime_tool_registry(current_config(), current_project_context(), **kwargs)
+    built_names = set(registry.get_names())
+    revision = fingerprint()
+
+    def refresh(target):
+        nonlocal revision, built_names
+        current_revision = fingerprint()
+        if current_revision == revision:
+            return
+        rebuilt = _build_runtime_tool_registry(current_config(), current_project_context(), **kwargs)
+        # Provider/plugin additions belong to their own lifecycle. Retain
+        # those definitions and gate them using the same current settings.
+        extras = [item for name, item in target._tools.items() if name not in built_names and name != "load_tool_pack"]
+        definitions = rebuilt.get_all()
+        built_names = {item.name for item in definitions}
+        replacement = ToolRegistry(capability_check=capability_check)
+        for item in (*definitions, *extras):
+            replacement.register(item)
+        target._tools = replacement._tools
+        revision = current_revision
+        if client is not None:
+            from .tool_packs import ensure_load_tool_pack_tool
+
+            ensure_load_tool_pack_tool(target, client)
+
+    registry.configure_runtime(capability_check=capability_check, refresh=refresh)
     return registry
 
 

@@ -6,6 +6,7 @@ import { AppSelect } from "@/components/ui/app-select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { employeeKey, employeeRequest } from "@/lib/agent-employees-api";
 import { operationsApi, type OperationsConnection } from "@/lib/operations-api";
+import { HelpPopover } from "@/components/ui/help-popover";
 
 type EmployeePanelProps = { agentId: string; revisionId: string | null; canManage: boolean };
 type Policy = {
@@ -47,8 +48,8 @@ const readinessLabels: Record<string, string> = {
   telephony_route_inactive: "受付は停止中です。設定を確認して有効化してください。",
   telephony_route_key_unavailable: "登録済み回線の設定を確認してください。",
   telephony_webhook_unconfigured: "接続のWebhookシークレットを設定してください。",
-  telephony_authority_denied: "AI社員の権限・役割リビジョンを確認してください。",
-  telephony_readiness_unavailable: "接続の認証情報とAI社員の権限を確認してください。",
+  telephony_authority_denied: "Agentの権限・役割リビジョンを確認してください。",
+  telephony_readiness_unavailable: "接続の認証情報とAgentの権限を確認してください。",
 };
 function statusLabel(value: string) { return statuses[value] ?? "未確認"; }
 function errorStatus(error: unknown): number | undefined {
@@ -109,8 +110,7 @@ function IntegrationsPanel({ agentId, canManage }: EmployeePanelProps) {
   }, [agentId, reload]);
   const selected = connections.find(item => item.id === selectedId);
   return <section aria-label="外部接続・認証情報" className="space-y-4">
-    <h3 className="font-semibold">外部接続・認証情報</h3>
-    <p className="text-sm text-muted-foreground">接続に保存した認証情報は、この接続を使う他のAI社員にも影響します。</p>
+    <h3 className="inline-flex items-center gap-1 font-semibold">外部接続・認証情報<HelpPopover label="外部接続・認証情報">接続に保存した認証情報は、この接続を使う他のAgentにも影響します。</HelpPopover></h3>
     {loading && <p role="status">接続を読み込み中…</p>}
     {error && <Failure message={error} busy={loading} reload={() => { setLoading(true); setReload(value => value + 1); }} />}
     {!loading && !error && <>
@@ -118,9 +118,9 @@ function IntegrationsPanel({ agentId, canManage }: EmployeePanelProps) {
         <label className="block">接続<AppSelect aria-label="接続" className="mt-1 w-full" value={selectedId} onValueChange={setSelectedId}>
           {connections.map(item => <option key={item.id} value={item.id}>{item.display_name}（{item.provider_key}）</option>)}
         </AppSelect></label>}
-      {usageError && <p className="text-sm">このAI社員での接続の使用状況を取得できませんでした。</p>}
+      {usageError && <p className="text-sm">このAgentでの接続の使用状況を取得できませんでした。</p>}
       {selected && <>
-        <p className="text-sm">このAI社員の使用先: {[...policies.filter(item => item.current_revision?.connection_id === selected.id).map(item => item.display_name), ...routes.filter(item => item.connection_id === selected.id).map(item => item.display_name)].join("、") || (usageError ? "未確認" : "まだ割り当てられていません")}</p>
+        <p className="text-sm">このAgentの使用先: {[...policies.filter(item => item.current_revision?.connection_id === selected.id).map(item => item.display_name), ...routes.filter(item => item.connection_id === selected.id).map(item => item.display_name)].join("、") || (usageError ? "未確認" : "まだ割り当てられていません")}</p>
         <CredentialCard key={`${selected.id}:${reload}`} connection={selected} canManage={canManage} />
       </>}
     </>}
@@ -233,7 +233,7 @@ function PhonePanel({ agentId, revisionId, canManage }: EmployeePanelProps) {
       {data.catalog.route_keys.length === 0 ? <p>登録済みの電話回線がありません。管理者による接続先・回線カタログの設定が必要です。</p> :
         canManage && <PhoneRouteForm agentId={agentId} catalog={data.catalog} policies={data.policies} onSaved={reloadAll} />}
       {!canManage && <p className="text-sm text-muted-foreground">閲覧専用です。変更には管理権限が必要です。</p>}
-      {data.routes.length === 0 && <p>このAI社員の電話受付は未設定です。</p>}
+      {data.routes.length === 0 && <p>このAgentの電話受付は未設定です。</p>}
       {data.routes.map(route => <PhoneRouteCard key={`${route.id}:${route.version}:${reload}`} route={route} agentId={agentId} revisionId={revisionId} canManage={canManage} catalog={data.catalog} policies={data.policies} onSaved={reloadAll} />)}
     </>}
   </section>;
@@ -317,7 +317,7 @@ function PhoneRouteForm({ agentId, catalog, policies, route, onSaved }: {
       </AppSelect></label>
       {revisionsLoading && <p role="status">役割リビジョンを読み込み中…</p>}
       {revisionsError && <Failure message={revisionsError} busy={busy || revisionsLoading} reload={() => { setRevisionsLoading(true); setRevisionReload(value => value + 1); }} />}
-      {!revisionsLoading && !revisionsError && revisions.length === 0 && <p>電話受付を設定するには、先にAI社員の役割リビジョンを作成してください。</p>}
+      {!revisionsLoading && !revisionsError && revisions.length === 0 && <p>電話受付を設定するには、先にAgentの役割リビジョンを作成してください。</p>}
       <p className="text-sm">選択した版と実行プロファイルを使用します。電話受付用のプロファイルを確認してください。</p>
       {route && route.agent_revision_id !== boundRevision && <p className="text-sm">保存すると選択した役割リビジョンに更新されます。進行中の通話は元のリビジョンを使用します。</p>}
       <label className="block">タイムゾーン<input className={fieldClass} required maxLength={64} value={timezone} onChange={event => setTimezone(event.target.value)} /></label>
@@ -391,7 +391,7 @@ function PhoneRouteCard({ route: initial, agentId, canManage, catalog, policies,
     {error && <Failure message={error} reload={refresh} busy={busy || loading} />}
     {details && !loading && <>
       <p role="status">{details.readiness.ready ? "受付準備が整っています" : "受付準備が完了していません"} · プロバイダー: {statusLabel(details.readiness.provider_status)} · 外部回線: {statusLabel(details.readiness.external_setup)}</p>
-      {details.readiness.reason_codes.length > 0 && <ul className="text-sm">{[...new Set(details.readiness.reason_codes.map(code => readinessLabels[code] ?? "未完了の設定があります。AI社員・接続の認証・回線設定・転送ポリシーを確認してください。"))].map(message => <li key={message}>{message}</li>)}</ul>}
+      {details.readiness.reason_codes.length > 0 && <ul className="text-sm">{[...new Set(details.readiness.reason_codes.map(code => readinessLabels[code] ?? "未完了の設定があります。Agent・接続の認証・回線設定・転送ポリシーを確認してください。"))].map(message => <li key={message}>{message}</li>)}</ul>}
       <Button variant="outline" disabled={busy} onClick={refresh}>受付状態・通話履歴を更新</Button>
       {canManage && route.state !== "retired" && <div className="flex flex-wrap gap-2">
         <Button variant="outline" disabled={busy || stale} onClick={() => setEditing(value => !value)}>{editing ? "編集を閉じる" : "電話受付を編集"}</Button>

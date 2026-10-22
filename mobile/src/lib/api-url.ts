@@ -4,10 +4,17 @@ export function normalizeApiUrl(value: string): string {
 
   try {
     const url = new URL(trimmed);
-
-    url.pathname = "";
     url.search = "";
     url.hash = "";
+
+    // Keep a configured service path.  The public Gateway is rooted at
+    // `/at`, and stripping that path turns a valid selected service into the
+    // unrelated portal root.  Only the transport decoration is removed here;
+    // callers retain the path when constructing `/api/*` requests.
+    url.pathname = url.pathname.replace(/\/{2,}/g, "/");
+    if (url.pathname.length > 1) {
+      url.pathname = url.pathname.replace(/\/+$/, "");
+    }
 
     return url.toString().replace(/\/+$/, "");
   } catch {

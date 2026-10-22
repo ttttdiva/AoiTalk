@@ -165,8 +165,17 @@ class AppStorageError(ValueError):
 
 
 def get_workspaces_root(workspace_root: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve the configured workspace root without creating it."""
     value = workspace_root or os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
     root = Path(value).expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise NotADirectoryError(f"workspace root is not a directory: {root}")
+    return root
+
+
+def ensure_workspaces_root(workspace_root: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve and create the configured workspace root for a write operation."""
+    root = get_workspaces_root(workspace_root)
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -940,6 +949,7 @@ __all__ = [
     "ensure_app_gitignore",
     "ensure_app_instance",
     "ensure_app_workspace",
+    "ensure_workspaces_root",
     "get_app_artifact_path",
     "get_app_instance_path",
     "get_app_workspace_path",

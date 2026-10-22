@@ -5,6 +5,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import useSWR from "swr";
 import { CheckCheck, Bell, X } from "lucide-react";
 import { formatRelativeTime } from "@/lib/utils";
+import { PUBLIC_BASE_PATH, withBasePath } from "@/lib/base-path";
 import {
   claimOsNotificationCandidates,
   isFreshUnreadOsNotification,
@@ -40,7 +41,8 @@ const OS_NOTIFICATION_SEEN_KEY = "aoitalk-os-notification-seen";
 const OS_NOTIFICATION_SEEN_LIMIT = 200;
 const OS_NOTIFICATION_STALE_MS = 24 * 60 * 60 * 1000;
 const OS_NOTIFICATION_LOCK_NAME = "aoitalk-os-notification-claim";
-const NOTIFICATION_SERVICE_WORKER_URL = "/aoitalk-notifications-sw.js";
+const NOTIFICATION_SERVICE_WORKER_URL = withBasePath("/notifications-sw.js");
+const NOTIFICATION_SERVICE_WORKER_SCOPE = `${PUBLIC_BASE_PATH || ""}/`;
 const NOTIFICATIONS_SWR_KEY = "layout/notifications";
 const HANDLED_SERVICE_WORKER_CLICK_EVENTS = new WeakSet<object>();
 const CONSUMED_OPEN_NOTIFICATION_IDS = new Set<string>();
@@ -170,7 +172,7 @@ async function getNotificationServiceWorkerRegistration() {
   try {
     const registration = await navigator.serviceWorker.register(
       NOTIFICATION_SERVICE_WORKER_URL,
-      { scope: "/" },
+      { scope: NOTIFICATION_SERVICE_WORKER_SCOPE },
     );
     // `register()` may return before the worker controls the page.  Awaiting
     // `ready` avoids subscribing against an installing worker and makes
@@ -684,7 +686,7 @@ export function NotificationPanel({
               url,
               notificationId: notification.id,
             },
-        icon: "/favicon.ico",
+        icon: withBasePath("/favicon.ico"),
         requireInteraction: true,
       };
 
@@ -1129,6 +1131,8 @@ export function NotificationPanel({
       notificationId={reviewNotificationId}
       target={reviewTarget}
       candidate={reviewCandidate}
+      readOnly={reviewCandidate?.canWrite !== true}
+      canPublish={reviewCandidate?.canPublish === true}
       onOpenChange={handleReviewOpenChange}
       onDidOpen={handleReviewDidOpen}
       onResolved={handleReviewResolved}

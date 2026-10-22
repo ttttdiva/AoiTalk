@@ -11,6 +11,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Union
 
+from ..generation_error import require_complete_model_output
 from ..native_runtime import responses_output_text
 from ..openrouter_provider_routing import merge_provider_options_into_extra_body
 from ..conversation_context import normalize_usage, persist_usage_sync
@@ -132,6 +133,43 @@ class GenerationApiMixin:
         base_url = str(
             getattr(getattr(self, "_openai_client", None), "base_url", "") or ""
         )
+        from ...services.free_team_service import openai_credential_identity
+        model = str(payload.get("model") or getattr(self, "model_name", "") or "")
+        if provider == "openai" and transport == "openai.responses":
+            # Plain/memory helpers bypass the native agent's ModelSettings.
+            # Resolve the same model-supported effort before privacy and quota
+            # inspect the exact outbound request.
+            effort = self._get_reasoning_effort()
+            if effort:
+                payload = {**payload, "reasoning": {**(payload.get("reasoning") or {}), "effort": effort}}
+        # Output limits are never injected here.  Only an explicit limit (the
+        # caller's payload field or runtime.target_max_output_tokens below)
+        # reaches the wire; otherwise the provider's own maximum applies and
+        # the Free Team reservation bounds it by the documented model maximum.
+        from ..generation_budget import constrain_model_request_extra_body, current_generation_budget, record_bounded_model_request
+        # Plain/utility requests bypass AgentTurnRunner. Apply the target's
+        # allowance here before privacy and quota inspect the outbound body.
+        config = getattr(self, "config", None)
+        from ...services.agent_team_service import config_get
+        # Same explicit-setting semantics as the native runner: a falsy value
+        # means "unset", never an injected default.
+        limit = config_get(config, "runtime.target_max_output_tokens", None) if config is not None else None
+        limit = limit or None
+        budget = current_generation_budget.get()
+        if limit is not None:
+            limits = [int(payload[key]) for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+                if payload.get(key) is not None]
+            limit = min(max(1, int(limit)), *limits) if limits else max(1, int(limit))
+            payload = {key: value for key, value in payload.items()
+                if key not in {"max_output_tokens", "max_completion_tokens", "max_tokens"}}
+            token_key = "max_output_tokens" if transport == "openai.responses" else (
+                "max_completion_tokens" if (provider == "kimi" and model == "kimi-k3") or provider == "openai" else "max_tokens")
+            payload[token_key] = limit
+        if limit is not None or (budget is not None and budget.max_requests is not None):
+            payload = constrain_model_request_extra_body(payload)
+        async def bounded_sender(outbound):
+            record_bounded_model_request(outbound)
+            return await sender(outbound)
         active_gateway = gateway or self._privacy_gateway_for_generation()
         return await active_gateway.execute(
             payload,
@@ -139,13 +177,14 @@ class GenerationApiMixin:
             descriptor=self._model_egress_descriptor(
                 transport=transport,
                 provider=provider,
-                model=str(getattr(self, "model_name", "") or ""),
+                model=model,
                 base_url=base_url,
             ),
-            sender=sender,
+            sender=bounded_sender,
             base_url=base_url,
             source_kind=source_kind,
-            model=str(getattr(self, "model_name", "") or ""),
+            model=model,
+            credential_identity=openai_credential_identity(getattr(self, "_openai_client", None)),
         )
 
     """chat/generate_* 系の公開エントリポイント、ストリーム抽出、シーン画像生成。"""
@@ -569,8 +608,7 @@ class GenerationApiMixin:
             # 公式 OpenAI 経路は Responses API を使う（tools なしの単純呼び出し）。
             try:
                 # temperature は reasoning 系モデルが拒否するため指定しない。
-                # max_output_tokens は reasoning トークンも消費するため、
-                # 小さい値で JSON が途中打ち切りになるのを避けて未指定とする。
+                # reasoning を含む出力上限を共通送信境界で指定して事前予約する。
                 started_at = time.monotonic()
                 request_kwargs = {
                     "model": self.model_name,
@@ -596,7 +634,10 @@ class GenerationApiMixin:
                 request_type="memory_extraction",
                 started_at=started_at,
             )
-            return gateway.restore(responses_output_text(response))
+            return gateway.restore(require_complete_model_output(
+                response, responses_output_text(response),
+                transport="openai.responses", request_type="memory_extraction",
+            ))
 
         messages = [
             {"role": "system", "content": system_prompt or ""},
@@ -693,7 +734,10 @@ class GenerationApiMixin:
             )
         choice = response.choices[0]
         message = choice.message
-        return gateway.restore(str(getattr(message, "content", "") or ""))
+        return gateway.restore(require_complete_model_output(
+            response, str(getattr(message, "content", "") or ""),
+            transport="openai.chat.completions", request_type="memory_extraction",
+        ))
 
     async def generate_plain_text_async(
         self,
@@ -738,7 +782,10 @@ class GenerationApiMixin:
                 request_type=request_type,
                 started_at=started_at,
             )
-            return gateway.restore(responses_output_text(response))
+            return gateway.restore(require_complete_model_output(
+                response, responses_output_text(response),
+                transport="openai.responses", request_type=request_type,
+            ))
 
         kwargs: Dict[str, Any] = dict(
             model=self.model_name,
@@ -795,7 +842,10 @@ class GenerationApiMixin:
             request_type=request_type,
             started_at=started_at,
         )
-        return gateway.restore(str(response.choices[0].message.content or ""))
+        return gateway.restore(require_complete_model_output(
+            response, str(response.choices[0].message.content or ""),
+            transport="openai.chat.completions", request_type=request_type,
+        ))
 
     async def generate_title_async(self, prompt: str) -> str:
         """Generate a title through the side-effect-free API and meter it as title."""

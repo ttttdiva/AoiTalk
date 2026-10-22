@@ -4,6 +4,7 @@ import { useState, useCallback, useMemo, type ReactNode } from "react";
 import { useExplorer } from "@/contexts/explorer-context";
 import type { ExplorerDirectory, ExplorerFile } from "@/lib/explorer-api";
 import { useFilerOperations } from "@/hooks/use-filer-operations";
+import { useExplorerLongPressContextMenu } from "@/hooks/use-explorer-long-press-context-menu";
 import {
   sortExplorerDirectories,
   sortExplorerFiles,
@@ -107,10 +108,10 @@ export function FileList({
     sortKey,
     sortDir,
     setSort,
-    isHydrusMode,
     capabilities,
   } = useExplorer();
   const { transfer } = useFilerOperations({ capabilities, refresh });
+  const longPressHandlers = useExplorerLongPressContextMenu();
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const displayedPathSet = useMemo(
     () =>
@@ -206,16 +207,10 @@ export function FileList({
 
   if (!browseData) return null;
 
-  // Hydrus は検索時に Hydrus 側で全件ソート済みのため、1ページ分だけを
-  // フロント側で並べ替えると全体の順序が壊れる。API 応答順のまま描画する。
   const sourceDirectories = directories ?? browseData.directories;
   const sourceFiles = files ?? browseData.files;
-  const sortedDirs = isHydrusMode
-    ? sourceDirectories
-    : sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
-  const sortedFiles = isHydrusMode
-    ? sourceFiles
-    : sortExplorerFiles(sourceFiles, sortKey, sortDir);
+  const sortedDirs = sortExplorerDirectories(sourceDirectories, sortKey, sortDir);
+  const sortedFiles = sortExplorerFiles(sourceFiles, sortKey, sortDir);
   const orderedPaths = [
     ...sortedDirs.map((dir) => dir.path),
     ...sortedFiles.map((file) => file.path),
@@ -257,7 +252,7 @@ export function FileList({
             </tr>
           )}
         </thead>
-        <tbody>
+        <tbody {...longPressHandlers}>
           {sortedDirs.map((dir) => (
             <tr
               key={dir.path}

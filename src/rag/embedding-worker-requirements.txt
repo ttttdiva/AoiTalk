@@ -1,0 +1,12 @@
+# Private worker only. Never install into the AoiTalk host/TTS environment.
+sentence-transformers==6.1.0
+transformers==5.19.0
+huggingface-hub>=1.31.0,<2.0.0
+click>=8.4.2,<9.0.0
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+# torchvision 0.25 uses av.open(metadata_errors=...), removed in PyAV 19.
+av==18.1.0
+psutil>=5.9.0
+Pillow>=10.0.0

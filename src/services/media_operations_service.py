@@ -344,7 +344,7 @@ def _normalize_platforms(values: Sequence[Any] | None) -> list[str]:
         if rendered not in MEDIA_PLATFORM_VALUES:
             raise MediaOperationsValidationError(
                 "platform must be one of "
-                "x, pixiv, dlsite, patreon, youtube, instagram"
+                "x, pixiv, dlsite, patreon, youtube, instagram, fanza, tiktok"
             )
         selected.add(rendered)
 
@@ -1297,6 +1297,8 @@ class MediaOperationsService:
             platform_youtube="youtube" in platforms,
             platform_instagram="instagram"
             in platforms,
+            platform_fanza="fanza" in platforms,
+            platform_tiktok="tiktok" in platforms,
             content_pillars_json=list(
                 content["content_pillars"]
             ),

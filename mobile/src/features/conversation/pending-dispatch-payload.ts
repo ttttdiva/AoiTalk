@@ -17,10 +17,13 @@ export const PENDING_DISPATCH_VERSION = 1 as const;
 export type PendingDispatchPayload = {
   message: string;
   project_id?: string;
+  context_project_hint_id?: string;
   app_id?: string;
   app_target_id?: string;
   include_project_context: boolean;
   agent_mode: string;
+  /** Exact Agent binding observed when this input was queued. */
+  expected_agent_id: string | null;
   edit_message_id?: string;
   response_model?: ChatResponseModelSelection;
   command_capabilities?: ChatCommandCapability[];
@@ -41,19 +44,23 @@ export type PendingDispatchSnapshot = {
 
 export type PendingDispatchFallback = {
   projectId?: string | null;
+  contextProjectHintId?: string | null;
   appId?: string | null;
   appTargetId?: string | null;
   includeProjectContext?: boolean;
   agentMode?: string;
+  expectedAgentId?: string | null;
 };
 
 type PendingDispatchInput = {
   message: string;
   projectId?: string | null;
+  contextProjectHintId?: string | null;
   appId?: string | null;
   appTargetId?: string | null;
   includeProjectContext?: boolean;
   agentMode?: string;
+  expectedAgentId?: string | null;
   editMessageId?: string;
   responseModel?: ChatResponseModelSelection;
   commandCapabilities?: ChatCommandCapability[];
@@ -62,6 +69,10 @@ type PendingDispatchInput = {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function nullableString(value: unknown): string | null {
+  return optionalString(value) ?? null;
 }
 
 function responseModelOf(value: unknown): ChatResponseModelSelection | undefined {
@@ -83,8 +94,10 @@ function storedPayloadOf(
   const record = value as Record<string, unknown>;
   if (typeof record.message !== "string" || !record.message.trim()) return null;
   const projectId = optionalString(record.project_id);
+  const contextProjectHintId = optionalString(record.context_project_hint_id);
   const appId = optionalString(record.app_id);
   const appTargetId = optionalString(record.app_target_id);
+  const expectedAgentId = nullableString(record.expected_agent_id);
   const editMessageId = optionalString(record.edit_message_id);
   const responseModel = responseModelOf(record.response_model);
   const commandCapabilities = sanitizeChatCommandCapabilities(
@@ -93,6 +106,7 @@ function storedPayloadOf(
   return {
     message: record.message,
     ...(projectId ? { project_id: projectId } : {}),
+    ...(contextProjectHintId ? { context_project_hint_id: contextProjectHintId } : {}),
     ...(appId ? { app_id: appId } : {}),
     ...(appTargetId ? { app_target_id: appTargetId } : {}),
     include_project_context:
@@ -100,6 +114,7 @@ function storedPayloadOf(
         ? record.include_project_context
         : Boolean(projectId),
     agent_mode: optionalString(record.agent_mode) ?? "confirm",
+    expected_agent_id: expectedAgentId,
     ...(editMessageId ? { edit_message_id: editMessageId } : {}),
     ...(responseModel ? { response_model: responseModel } : {}),
     ...(commandCapabilities.length
@@ -137,6 +152,9 @@ export function buildPendingDispatchMetadata(
     ...(optionalString(input.projectId)
       ? { project_id: optionalString(input.projectId) }
       : {}),
+    ...(optionalString(input.contextProjectHintId)
+      ? { context_project_hint_id: optionalString(input.contextProjectHintId) }
+      : {}),
     ...(optionalString(input.appId)
       ? { app_id: optionalString(input.appId) }
       : {}),
@@ -146,6 +164,7 @@ export function buildPendingDispatchMetadata(
     include_project_context:
       input.includeProjectContext ?? Boolean(optionalString(input.projectId)),
     agent_mode: optionalString(input.agentMode) ?? "confirm",
+    expected_agent_id: nullableString(input.expectedAgentId),
     ...(optionalString(input.editMessageId)
       ? { edit_message_id: optionalString(input.editMessageId) }
       : {}),
@@ -173,8 +192,12 @@ export function buildPendingDispatchMetadata(
   return {
     [PENDING_DISPATCH_METADATA_KEY]: snapshot,
     ...(payload.project_id ? { project_id: payload.project_id } : {}),
+    ...(payload.context_project_hint_id
+      ? { context_project_hint_id: payload.context_project_hint_id }
+      : {}),
     include_project_context: payload.include_project_context,
     agent_mode: payload.agent_mode,
+    expected_agent_id: payload.expected_agent_id,
     ...(payload.edit_message_id
       ? { edit_message_id: payload.edit_message_id }
       : {}),
@@ -204,8 +227,36 @@ function snapshotPayload(message: ConversationMessage) {
 }
 
 /**
- * versioned snapshotを優先し、旧message metadataだけの場合は明示的に再構築する。
+ * 保留中のローカル入力を編集したとき、本文と再送用snapshotを同時に更新する。
+ * 送信経路・モデル・添付など、送信開始時に固定した他のfieldは保持する。
  */
+export function replacePendingDispatchMessage(
+  message: ConversationMessage,
+  content: string,
+): Record<string, unknown> {
+  const normalized = content.trim();
+  if (!normalized) throw new Error("メッセージ本文を入力してください。");
+  const payload = pendingDispatchPayload(message);
+  return {
+    ...(message.metadata ?? {}),
+    ...buildPendingDispatchMetadata({
+      message: normalized,
+      projectId: payload.project_id,
+      contextProjectHintId: payload.context_project_hint_id,
+      appId: payload.app_id,
+      appTargetId: payload.app_target_id,
+      includeProjectContext: payload.include_project_context,
+      agentMode: payload.agent_mode,
+      expectedAgentId: payload.expected_agent_id,
+      editMessageId: payload.edit_message_id,
+      responseModel: payload.response_model,
+      commandCapabilities: payload.command_capabilities,
+      attachments: payload.attachments,
+    }),
+    direct_error: null,
+    delivery_error: null,
+  };
+}
 export function pendingDispatchPayload(
   message: ConversationMessage,
   fallback: PendingDispatchFallback = {},
@@ -228,17 +279,33 @@ export function pendingDispatchPayload(
   const metadata = message.metadata ?? {};
   const projectId =
     optionalString(metadata.project_id) ?? optionalString(fallback.projectId);
+  const contextProjectHintId =
+    optionalString(metadata.context_project_hint_id) ??
+    optionalString(fallback.contextProjectHintId);
   const appId = optionalString(metadata.app_id) ?? optionalString(fallback.appId);
   const appTargetId =
     optionalString(metadata.app_target_id) ?? optionalString(fallback.appTargetId);
+  const expectedAgentId = Object.prototype.hasOwnProperty.call(
+    metadata,
+    "expected_agent_id",
+  )
+    ? nullableString(metadata.expected_agent_id)
+    : fallback.expectedAgentId ?? null;
   const editMessageId = optionalString(metadata.edit_message_id);
   const responseModel = responseModelOf(metadata.response_model);
   const commandCapabilities = sanitizeChatCommandCapabilities(
     metadata.command_capabilities,
   );
+  const attachments =
+    metadata.attachments == null
+      ? []
+      : sanitizeChatAttachmentMetadata(metadata.attachments);
   return {
     message: message.content,
     ...(projectId ? { project_id: projectId } : {}),
+    ...(contextProjectHintId
+      ? { context_project_hint_id: contextProjectHintId }
+      : {}),
     ...(appId ? { app_id: appId } : {}),
     ...(appTargetId ? { app_target_id: appTargetId } : {}),
     include_project_context:
@@ -249,14 +316,13 @@ export function pendingDispatchPayload(
       optionalString(metadata.agent_mode) ??
       optionalString(fallback.agentMode) ??
       "confirm",
+    expected_agent_id: expectedAgentId,
     ...(editMessageId ? { edit_message_id: editMessageId } : {}),
     ...(responseModel ? { response_model: responseModel } : {}),
     ...(commandCapabilities.length
       ? { command_capabilities: commandCapabilities, tools_required: true }
       : {}),
-    ...(sanitizeChatAttachmentMetadata(metadata.attachments).length
-      ? { attachments: sanitizeChatAttachmentMetadata(metadata.attachments) }
-      : {}),
+    ...(attachments.length ? { attachments } : {}),
     client_message_id: message.id,
   };
 }

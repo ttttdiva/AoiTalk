@@ -4,6 +4,9 @@
  */
 
 export function errorTextOf(error: unknown, fallbackText: string): string {
+  if (error instanceof Error && error.name === "ApiEndpointUnavailableError") {
+    return "AoiTalkサーバーへ一時的に接続できませんでした。通信状態を確認して再試行してください。";
+  }
   return error instanceof Error ? error.message : fallbackText;
 }
 
@@ -11,6 +14,7 @@ export function isLikelyConnectivityFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return (
     error.name === "AbortError" ||
+    error.name === "ApiEndpointUnavailableError" ||
     /abort|timeout|timed out|network request failed|failed to fetch|networkerror|connection refused/i.test(
       error.message,
     )

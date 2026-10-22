@@ -11,6 +11,7 @@ import copy
 import logging
 import re
 from typing import Any
+from ..utils.config_values import strict_config_bool
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,8 @@ AGENT_TEAM_SCHEMA_VERSION = 3
 # Context tags are intentionally a small, public vocabulary.  Team IDs remain
 # user-owned stable identifiers and must never be used as a context/security
 # boundary.  Integrations may add tags in the future without changing this
-# topology (TRPG currently has only an explicit resolver hook).
-AGENT_TEAM_CONTEXT_TAGS = frozenset({"app_development", "story", "trpg"})
+# topology.
+AGENT_TEAM_CONTEXT_TAGS = frozenset({"app_development"})
 
 AGENT_TEAM_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     "workspace_read": {"id": "workspace_read", "family": "workspace", "access": "read", "native": True},
@@ -37,9 +38,6 @@ AGENT_TEAM_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     # of the default Team roster; a parent controller must inject a scoped
     # capability facade for a configured UI-QA worker.
     "browser_qa": {"id": "browser_qa", "family": "browser", "access": "write", "native": False, "parent_owned": True},
-    "story_write": {"id": "story_write", "family": "story", "access": "write", "native": False},
-    "story_read": {"id": "story_read", "family": "story", "access": "read", "native": False},
-    "story_import": {"id": "story_import", "family": "story", "access": "write", "native": False},
     # Shared integrations are intentionally not fresh Team entries.
     "media": {"id": "media", "family": "media", "access": "write", "native": False},
     "spotify": {"id": "spotify", "family": "spotify", "access": "write", "native": False},
@@ -94,31 +92,26 @@ def _subagent(
 
 # Code-level catalog only; it is never serialized as App Config topology.
 AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
-    "employee_operator": _subagent("employee_operator", "社員業務", "管理者が設定した自動化と電話受付を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。", ["external_action_propose", "telephony_control"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
+    "employee_operator": _subagent("employee_operator", "Agent業務", "管理者が設定した自動化と電話受付を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。", ["external_action_propose", "telephony_control"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
     "general_worker": _subagent("general_worker", "汎用作業", "特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。", "特定分野に固定せず、比較、整理、要約、補助調査、小規模なファイル作業を行う。CLI Agentを選択した場合はnative toolsを利用できる。", ["workspace_read", "workspace_write", "repo_map", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
     "general_researcher": _subagent("general_researcher", "汎用調査", "Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。", "Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。", ["workspace_read", "repo_map", "web_read", "aoi_tools"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
     "docs_operator": _subagent("docs_operator", "Docs操作", "Docsノードの検索、読み取り、整理、再構成、更新。", "AoiTalkのDocs high-level toolsのみ使用する。canonical nodeを確認し、曖昧な対象を推測して更新せず、書き込み前に対象を確認する。AoiTalk DBへ直接アクセスしない。", ["docs_read", "docs_write"], scalable=True, default_instances=1, max_instances=4, workspace="none", native_tools=False),
     "project_operator": _subagent("project_operator", "案件・タスク操作", "Projects、Tasks、Calendar、WBS、Record Tables、課題・案件情報などProject管理系AoiTalk dataを扱う。", f"Projects、Tasks、Calendar、WBS、Record Tables、課題管理、案件情報等をAoiTalk high-level tools経由で確認・更新する。{PROJECT_OPERATOR_TASK_HIERARCHY_INSTRUCTIONS}", ["project_read", "project_write", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="read", native_tools=False),
     "workspace_operator": _subagent("workspace_operator", "Workspace操作", "Workspaces、ファイル認識・検索・読込・操作・整理・必要な変更を行う。", "割り当てられたWorkspaceのファイル検索、読込、複数ファイル操作、整理、必要な変更を行う。CLI providerではnative filesystem/search/edit/shell等を利用できる。", ["workspace_read", "workspace_write", "repo_map", "command_execute", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
-    "code_explorer": _subagent("code_explorer", "コード調査", "コードベース、依存関係、データフロー、既存実装等を調査するread-only Agent。", "コードベース、依存関係、データフロー、既存実装を調査し、ファイルを変更しない。", ["workspace_read", "repo_map"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
-    "architecture_planner": _subagent("architecture_planner", "設計", "実装方針、責務境界、影響範囲等を整理するread-only Agent。", "実装方針、責務境界、影響範囲等を整理し、実装計画を提案する。", ["workspace_read", "repo_map"], scalable=True, default_instances=1, max_instances=4, workspace="read", native_tools=True),
-    "code_implementer": _subagent("code_implementer", "実装", "実際にWorkspaceで変更を行うAgent。", "割り当てられた変更をWorkspace sandboxで実装する。API providerではAoiTalk Workspace mutation tools、CLI providerではCLI native filesystem/search/shell/edit/test/build等を利用する。", ["workspace_read", "workspace_write", "repo_map", "command_execute", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
+    "code_explorer": _subagent("code_explorer", "コード調査", "コードベース、依存関係、データフロー、既存実装等を調査するread-only Subagent。", "コードベース、依存関係、データフロー、既存実装を調査し、ファイルを変更しない。", ["workspace_read", "repo_map"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
+    "architecture_planner": _subagent("architecture_planner", "設計", "実装方針、責務境界、影響範囲等を整理するread-only Subagent。", "実装方針、責務境界、影響範囲等を整理し、実装計画を提案する。", ["workspace_read", "repo_map"], scalable=True, default_instances=1, max_instances=4, workspace="read", native_tools=True),
+    "code_implementer": _subagent("code_implementer", "実装", "実際にWorkspaceで変更を行うSubagent。", "割り当てられた変更をWorkspace sandboxで実装する。API providerではAoiTalk Workspace mutation tools、CLI providerではCLI native filesystem/search/shell/edit/test/build等を利用する。", ["workspace_read", "workspace_write", "repo_map", "command_execute", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
     "code_reviewer": _subagent("code_reviewer", "コードレビュー", "diff、コード、関連状態をread-onlyでレビューする。", "diff、コード、関連状態をread-onlyでレビューし、実行可能な指摘だけを報告する。存在することと毎回自動起動することは別である。", ["workspace_read", "repo_map"], scalable=True, default_instances=1, max_instances=4, workspace="read", native_tools=True),
     # UI-QA is opt-in rather than part of the normal App Development roster.
     # The parent controller must inject a QABrowserCapability before this leaf
     # can receive the browser-facing ToolDefinitions.
     "ui_qa_worker": _subagent("ui_qa_worker", "UI QA", "許可されたAoiTalk originだけを検証するUI-QA worker。", "親から発行されたQA capabilityだけで対象UIを操作し、画面状態・console・network・保存/再読込結果を報告する。ChatGPT/Directorには接続しない。", ["workspace_read", "browser_qa"], scalable=False, default_instances=1, max_instances=1, workspace="read", native_tools=False),
-    "story_writer": _subagent("story_writer", "執筆", "Story contextを読み、本文や設定資料を作成・更新する。", "Story contextを読み、本文や設定資料を作成・更新する。", ["story_read", "story_write"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
-    "story_consistency_reviewer": _subagent("story_consistency_reviewer", "設定整合性レビュー", "世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報の整合性を確認するread-only Agent。", "世界設定、時系列、キャラクター設定、過去シーン、用語、既存Story情報をread-onlyで確認し、矛盾を報告する。", ["story_read"], scalable=True, default_instances=1, max_instances=4, workspace="none", native_tools=False),
-    "character_voice_reviewer": _subagent("character_voice_reviewer", "キャラクター・口調レビュー", "キャラクターの人格、性格、口調、設定、既存発言との整合性を確認するread-only Agent。", "キャラクターの人格、性格、口調、設定、既存発言との整合性をread-onlyで確認し、逸脱を報告する。", ["story_read"], scalable=True, default_instances=1, max_instances=4, workspace="none", native_tools=False),
-    "story_import": _subagent("story_import", "Story取り込み", "既存のStory素材取り込み機能を担当する。", "既存のStory素材を取り込み、無関係な変更を避けて正規化する。", ["story_read", "story_import"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
 }
 
 AGENT_TEAM_DEFAULT_TEAMS: dict[str, dict[str, Any]] = {
-    "employee": {"team_id": "employee", "name": "Employee", "description": "AI社員が明示的に選択する業務実行Team。", "enabled": True, "sort_order": 40, "activation": {"mode": "manual", "contexts": []}, "subagent_ids": ["employee_operator"]},
+    "employee": {"team_id": "employee", "name": "Employee", "description": "Agentが明示的に選択する業務実行用のExecution Team。", "enabled": True, "sort_order": 40, "activation": {"mode": "manual", "contexts": []}, "subagent_ids": ["employee_operator"]},
     "general": {"team_id": "general", "name": "General", "description": "AoiTalkの通常利用を担う常用Team。", "enabled": True, "sort_order": 10, "activation": {"mode": "always", "contexts": []}, "subagent_ids": ["general_worker", "general_researcher", "docs_operator", "project_operator", "workspace_operator"]},
-    "app_development": {"team_id": "app_development", "name": "App Development", "description": "アプリ開発の探索、設計、実装、レビュー。", "enabled": True, "sort_order": 20, "activation": {"mode": "contextual", "contexts": ["app_development"]}, "subagent_ids": ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer"]},
-    "story": {"team_id": "story", "name": "Story", "description": "Storyの執筆、取り込み、整合性・キャラクター口調レビュー。", "enabled": True, "sort_order": 30, "activation": {"mode": "contextual", "contexts": ["story"]}, "subagent_ids": ["story_writer", "story_consistency_reviewer", "character_voice_reviewer", "story_import", "general_worker"]},
+    "app_development": {"team_id": "app_development", "name": "App Development", "description": "アプリ開発の探索、設計、実装、レビューと承認済み外部操作。", "enabled": True, "sort_order": 20, "activation": {"mode": "contextual", "contexts": ["app_development"]}, "subagent_ids": ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer", "employee_operator"]},
 }
 # Internal migration only.  Not part of the persisted canonical graph.
 AGENT_TEAM_DEFAULT_LLM_PROFILES: dict[str, dict[str, Any]] = {
@@ -126,6 +119,173 @@ AGENT_TEAM_DEFAULT_LLM_PROFILES: dict[str, dict[str, Any]] = {
     "light": {"profile_id": "light", "name": "軽量", "target_type": "inherit", "provider": "", "model": "", "effort_policy": "lower", "effort": "", "pool_id": "", "routing_profile_id": ""},
     "coding": {"profile_id": "coding", "name": "コーディング", "target_type": "inherit", "provider": "", "model": "", "effort_policy": "same", "effort": "", "pool_id": "", "routing_profile_id": ""},
 }
+
+# Built-in Team Execution Profiles.  These are deliberately kept in the
+# canonical Agent Team module rather than in a UI/client catalog so every
+# caller (fresh config, migration, API catalog and runtime routing) sees the
+# same provider/model/effort contract.  ``default`` is intentional for the
+# local model: Bonsai does not expose a portable effort vocabulary, so a
+# fabricated value such as ``max`` must never be sent to it.
+AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_VERSION = 1
+AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER = "preset_seed_version"
+
+
+def _preset_route(
+    provider: str,
+    model: str,
+    *,
+    effort_policy: str,
+    effort: str = "",
+) -> dict[str, Any]:
+    return {
+        "inherit_model": False,
+        "provider": provider,
+        "model": model,
+        "effort_policy": effort_policy,
+        "effort": effort,
+    }
+
+
+_PRESET_CODEX_SOL_HIGH = _preset_route(
+    "codex-cli", "gpt-5.6-sol", effort_policy="explicit", effort="high"
+)
+_PRESET_CLAUDE_OPUS_HIGH = _preset_route(
+    "claude-cli", "claude-opus-5-5", effort_policy="explicit", effort="high"
+)
+_PRESET_CODEX_LUNA_MAX = _preset_route(
+    "codex-cli", "gpt-5.6-luna", effort_policy="explicit", effort="max"
+)
+_PRESET_API_LUNA_MAX = _preset_route(
+    "openai", "gpt-5.6-luna", effort_policy="explicit", effort="max"
+)
+_PRESET_LOCAL_BONSAI = _preset_route(
+    "openai_compatible_local",
+    "bonsai-2-27b-ternary",
+    effort_policy="default",
+)
+
+
+def _preset_profile(
+    profile_id: str,
+    name: str,
+    default_route: dict[str, Any],
+    overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "profile_id": profile_id,
+        "name": name,
+        "enabled": True,
+        "default_route": copy.deepcopy(default_route),
+        "overrides": copy.deepcopy(overrides or {}),
+    }
+
+
+# The names also document the one capability boundary that is easy to miss:
+# API-Luna is suitable for managed-tool/API workers, while native code work is
+# kept on a Codex CLI route.  No separate review workflow is implied by any of
+# the General profiles.
+AGENT_TEAM_EXECUTION_PROFILE_PRESETS: dict[str, dict[str, dict[str, Any]]] = {
+    "general": {
+        "general-balanced": _preset_profile(
+            "general-balanced",
+            "Balanced (Bonsai + Codex research)",
+            _PRESET_LOCAL_BONSAI,
+            {
+                "general_researcher": _preset_route(
+                    "codex-cli",
+                    "gpt-5.6-sol",
+                    effort_policy="explicit",
+                    effort="high",
+                ),
+            },
+        ),
+        "general-api-luna": _preset_profile(
+            "general-api-luna",
+            "API Luna (Codex native research/workspace)",
+            _PRESET_API_LUNA_MAX,
+            {
+                "general_researcher": _PRESET_CODEX_SOL_HIGH,
+                "workspace_operator": _PRESET_CODEX_LUNA_MAX,
+            },
+        ),
+        "general-local": _preset_profile(
+            "general-local",
+            "Local Bonsai",
+            _PRESET_LOCAL_BONSAI,
+        ),
+        "general-quality": _preset_profile(
+            "general-quality",
+            "Quality (Codex Sol)",
+            _PRESET_CODEX_SOL_HIGH,
+        ),
+    },
+    "app_development": {
+        "dev-codex-local": _preset_profile(
+            "dev-codex-local",
+            "Codex Sol + Bonsai local worker",
+            _PRESET_CODEX_SOL_HIGH,
+            {
+                "code_explorer": _PRESET_LOCAL_BONSAI,
+                "code_implementer": _PRESET_LOCAL_BONSAI,
+                "employee_operator": _PRESET_LOCAL_BONSAI,
+            },
+        ),
+        "dev-claude-local": _preset_profile(
+            "dev-claude-local",
+            "Claude Opus + Bonsai local worker",
+            _PRESET_CLAUDE_OPUS_HIGH,
+            {
+                "code_explorer": _PRESET_LOCAL_BONSAI,
+                "code_implementer": _PRESET_LOCAL_BONSAI,
+                "employee_operator": _PRESET_LOCAL_BONSAI,
+            },
+        ),
+        "dev-codex-luna": _preset_profile(
+            "dev-codex-luna",
+            "Codex Sol + Codex Luna native work",
+            _PRESET_CODEX_SOL_HIGH,
+            {
+                "code_explorer": _PRESET_CODEX_LUNA_MAX,
+                "code_implementer": _PRESET_CODEX_LUNA_MAX,
+                "employee_operator": _PRESET_CODEX_LUNA_MAX,
+            },
+        ),
+        "dev-api-luna": _preset_profile(
+            "dev-api-luna",
+            "API Luna + Codex Luna native code",
+            _PRESET_CODEX_SOL_HIGH,
+            {
+                "code_explorer": _PRESET_CODEX_LUNA_MAX,
+                "code_implementer": _PRESET_CODEX_LUNA_MAX,
+                "employee_operator": _PRESET_API_LUNA_MAX,
+            },
+        ),
+        "dev-local-only": _preset_profile(
+            "dev-local-only",
+            "Local Bonsai only",
+            _PRESET_LOCAL_BONSAI,
+        ),
+        "dev-premium": _preset_profile(
+            "dev-premium",
+            "Premium (Codex planner/worker, Claude reviewer)",
+            _PRESET_CODEX_SOL_HIGH,
+            {
+                "architecture_planner": _PRESET_CODEX_SOL_HIGH,
+                "code_implementer": _preset_route(
+                    "codex-cli",
+                    "gpt-5.6-sol",
+                    effort_policy="explicit",
+                    effort="medium",
+                ),
+                "code_reviewer": _PRESET_CLAUDE_OPUS_HIGH,
+                "code_explorer": _PRESET_CODEX_LUNA_MAX,
+                "employee_operator": _PRESET_CODEX_LUNA_MAX,
+            },
+        ),
+    },
+}
+
+_PRESET_BUILTIN_TEAM_IDS = frozenset(AGENT_TEAM_EXECUTION_PROFILE_PRESETS)
 _CATALOG_LEGACY_LLM_PROFILE_IDS: dict[str, str] = {
     "general_worker": "heavy",
     "general_researcher": "light",
@@ -136,13 +296,27 @@ _CATALOG_LEGACY_LLM_PROFILE_IDS: dict[str, str] = {
     "architecture_planner": "heavy",
     "code_implementer": "coding",
     "code_reviewer": "light",
-    "story_writer": "heavy",
-    "story_consistency_reviewer": "light",
-    "character_voice_reviewer": "light",
-    "story_import": "light",
 }
 _SYSTEM_GLOBAL_EXECUTION_PROFILE_IDS = frozenset({"manual", "free-team"})
 _DEFAULT_SEED_LLM_PROFILE_IDS = frozenset(AGENT_TEAM_DEFAULT_LLM_PROFILES)
+_AGENT_TEAM_ROUTE_PROVIDERS = frozenset(
+    {
+        "openai",
+        "gemini",
+        "openrouter",
+        "deepseek",
+        "deepinfra",
+        "kimi",
+        "sglang",
+        "ollama",
+        "openai_compatible_local",
+        "routing-profile",
+        "antigravity-cli",
+        "claude-cli",
+        "codex-cli",
+        "grok-cli",
+    }
+)
 
 
 def _id(value: Any, fallback: str = "") -> str:
@@ -209,7 +383,7 @@ def _subagent_normalized(subagent_id: str, raw: Any) -> dict[str, Any]:
         "docs_operator" not in instructions or "project_operator" not in instructions
     ):
         instructions = f"{instructions} {GENERAL_RESEARCHER_DELEGATION_INSTRUCTIONS}".strip()
-    return {"subagent_id": sid, "name": str(raw.get("name") or raw.get("display_name") or seed.get("name") or sid).strip(), "description": str(raw.get("description") or seed.get("description") or "").strip(), "instructions": instructions, "enabled": bool(raw.get("enabled", seed.get("enabled", True))), "capability_ids": caps, "scalable": scalable, "default_instances": default_instances, "max_instances": max_instances, "max_workspace_access": access, "allow_cli_native_tools": bool(raw.get("allow_cli_native_tools", seed.get("allow_cli_native_tools", False)))}
+    return {"subagent_id": sid, "name": str(raw.get("name") or raw.get("display_name") or seed.get("name") or sid).strip(), "description": str(raw.get("description") or seed.get("description") or "").strip(), "instructions": instructions, "enabled": strict_config_bool(raw.get("enabled", seed.get("enabled", True))), "capability_ids": caps, "scalable": scalable, "default_instances": default_instances, "max_instances": max_instances, "max_workspace_access": access, "allow_cli_native_tools": strict_config_bool(raw.get("allow_cli_native_tools", seed.get("allow_cli_native_tools", False)))}
 
 
 def _activation(raw: Any) -> dict[str, Any]:
@@ -310,7 +484,7 @@ def _team_execution_profile(
     return {
         "profile_id": pid,
         "name": str(raw.get("name") or raw.get("display_name") or pid).strip(),
-        "enabled": bool(raw.get("enabled", True)),
+        "enabled": strict_config_bool(raw.get("enabled", True)),
         "default_route": default_route,
         "overrides": overrides,
     }
@@ -327,6 +501,104 @@ def _team_execution_profiles(
         if not pid:
             continue
         result[pid] = _team_execution_profile(pid, item, valid_subagents)
+    return result
+
+
+def _preset_seed_version(raw: Any) -> int:
+    if not isinstance(raw, dict):
+        return 0
+    try:
+        return max(0, int(raw.get(AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_builtin_preset_team(team_id: str, raw: Any) -> bool:
+    """Recognize the shipped General/App Development topology only.
+
+    Team IDs are user-owned, so an arbitrary Team named ``general`` or
+    ``app_development`` must not receive code-owned profiles after a user has
+    changed its identity or membership.  The old App Development description
+    and pre-Employee membership are accepted because they are still present in
+    saved v3 rows awaiting migration.
+    """
+
+    if team_id not in _PRESET_BUILTIN_TEAM_IDS or not isinstance(raw, dict):
+        return False
+    allowed_keys = {
+        "team_id",
+        "name",
+        "description",
+        "enabled",
+        "sort_order",
+        "activation",
+        "subagent_ids",
+        "execution_profiles",
+    }
+    if set(raw) - allowed_keys:
+        return False
+    expected = AGENT_TEAM_DEFAULT_TEAMS[team_id]
+    if str(raw.get("team_id") or "").strip() != team_id:
+        return False
+    if str(raw.get("name") or "").strip() != str(expected.get("name") or ""):
+        return False
+    if raw.get("enabled", True) is not True:
+        return False
+    try:
+        if int(raw.get("sort_order") or 0) != int(expected.get("sort_order") or 0):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if raw.get("activation") != expected.get("activation"):
+        return False
+    actual_ids = list(raw.get("subagent_ids") or [])
+    expected_ids = list(expected.get("subagent_ids") or [])
+    if team_id == "app_development":
+        # The shipped row before the Employee addition used this description
+        # and omitted employee_operator; both shapes are still built-in.
+        if str(raw.get("description") or "").strip() not in {
+            "アプリ開発の探索、設計、実装、レビュー。",
+            str(expected.get("description") or "").strip(),
+        }:
+            return False
+        if actual_ids not in (expected_ids, expected_ids[:-1]):
+            return False
+        return True
+    if str(raw.get("description") or "").strip() != str(expected.get("description") or ""):
+        return False
+    return actual_ids == expected_ids
+
+
+def seed_agent_team_execution_profile_presets(value: Any) -> dict[str, Any]:
+    """Add missing built-in presets to untouched shipped Teams exactly once.
+
+    Existing profile definitions win, including same-ID custom definitions.
+    The marker is stored in the canonical Agent Team envelope after the first
+    seed so deleting a built-in profile later is an intentional user action,
+    not an invitation to recreate it on every config load.
+    """
+
+    result = copy.deepcopy(value) if isinstance(value, dict) else {}
+    teams = result.get("teams") if isinstance(result.get("teams"), dict) else {}
+    eligible = {
+        team_id: team
+        for team_id, team in teams.items()
+        if _is_builtin_preset_team(str(team_id), team)
+    }
+    if not eligible or _preset_seed_version(result) >= AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_VERSION:
+        return result
+    for team_id, team in eligible.items():
+        profiles = team.get("execution_profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            team["execution_profiles"] = profiles
+        for profile_id, profile in AGENT_TEAM_EXECUTION_PROFILE_PRESETS[team_id].items():
+            if profile_id not in profiles:
+                profiles[profile_id] = copy.deepcopy(profile)
+    result[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = (
+        AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_VERSION
+    )
+    result["teams"] = teams
     return result
 
 
@@ -478,7 +750,7 @@ def _team(team_id: str, raw: Any, valid_subagents: set[str] | None = None) -> di
         "team_id": tid,
         "name": str(raw.get("name") or tid).strip(),
         "description": str(raw.get("description") or "").strip(),
-        "enabled": bool(raw.get("enabled", True)),
+        "enabled": strict_config_bool(raw.get("enabled", True)),
         "sort_order": sort_order,
         "activation": _activation(activation_value),
         "subagent_ids": ids,
@@ -533,13 +805,17 @@ def normalize_agent_team_v3(
                 global_execution_profiles=user_global_eps,
             )
         teams[tid] = team
-    return {
+    result = {
         "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-        "delegation_enabled": bool(raw.get("delegation_enabled", False)),
+        "delegation_enabled": strict_config_bool(raw.get("delegation_enabled", False)),
         "orchestration_mode": "director" if raw.get("orchestration_mode") == "director" else "standard",
         "teams": teams,
         "subagents": subagents,
     }
+    seed_version = _preset_seed_version(raw)
+    if seed_version:
+        result[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = seed_version
+    return result
 
 
 def agent_team_v3_enabled(config: Any) -> bool:
@@ -560,7 +836,7 @@ def agent_team_v3_delegation_enabled(config: Any) -> bool:
 
     if not agent_team_v3_enabled(config):
         return False
-    return bool(_section(config).get("delegation_enabled", False))
+    return strict_config_bool(_section(config).get("delegation_enabled", False))
 
 
 _EXTERNAL_APPROVAL_PROVIDERS = frozenset({
@@ -658,17 +934,27 @@ def _main_route(config: Any) -> dict[str, Any]:
     return resolve_main_route(config)
 
 
-def _catalog_effort_options(provider: str, model: str) -> list[str]:
+def _catalog_effort_options(
+    provider: str,
+    model: str,
+    *,
+    config: Any = None,
+) -> list[str]:
     from .llm_model_catalog import reasoning_effort_options_for_model
 
     return [
         str(item).strip()
-        for item in reasoning_effort_options_for_model(provider, model)
+        for item in reasoning_effort_options_for_model(provider, model, config=config)
         if str(item).strip()
     ]
 
 
-def _apply_explicit_route_effort(result: dict[str, Any], requested: Any) -> dict[str, Any]:
+def _apply_explicit_route_effort(
+    result: dict[str, Any],
+    requested: Any,
+    *,
+    config: Any = None,
+) -> dict[str, Any]:
     """Put a catalog-aligned explicit effort on the resolved route, or omit it.
 
     Clients must already see a value the resolved provider/model accepts.
@@ -679,7 +965,7 @@ def _apply_explicit_route_effort(result: dict[str, Any], requested: Any) -> dict
     requested_effort = str(requested or "").strip()
     provider_id = str(result.get("provider") or "").strip().lower()
     model_id = str(result.get("model") or "").strip()
-    options = _catalog_effort_options(provider_id, model_id)
+    options = _catalog_effort_options(provider_id, model_id, config=config)
     result.pop("effort", None)
     result.pop("reasoning_effort", None)
     if requested_effort and requested_effort in options:
@@ -714,7 +1000,12 @@ def _finalize_execution_route_effort(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _profile_route(profile: dict[str, Any], main: dict[str, Any]) -> dict[str, Any]:
+def _profile_route(
+    profile: dict[str, Any],
+    main: dict[str, Any],
+    *,
+    config: Any = None,
+) -> dict[str, Any]:
     target_type = str(profile.get("target_type") or "inherit")
     # The root Main route is already resolved from ``llm_provider`` /
     # ``llm_model`` by ``agent_team_service._main_route``.  In particular, a
@@ -752,7 +1043,11 @@ def _profile_route(profile: dict[str, Any], main: dict[str, Any]) -> dict[str, A
     # value.  Legacy static/pool same/lower must not copy Main's effort
     # onto a different model.
     if effort_policy == "explicit":
-        _apply_explicit_route_effort(result, profile.get("effort"))
+        _apply_explicit_route_effort(
+            result,
+            profile.get("effort"),
+            config=config,
+        )
     elif effort_policy == "default" or (
         target_type in {"static", "pool"} and effort_policy in {"same", "lower"}
     ):
@@ -765,7 +1060,11 @@ def _profile_route(profile: dict[str, Any], main: dict[str, Any]) -> dict[str, A
         model_id = str(result.get("model") or "").strip()
         options = [
             str(item).strip().lower()
-            for item in _catalog_effort_options(provider_id, model_id)
+            for item in _catalog_effort_options(
+                provider_id,
+                model_id,
+                config=config,
+            )
         ]
         if current and options and current in options:
             index = options.index(current)
@@ -782,7 +1081,12 @@ def _profile_route(profile: dict[str, Any], main: dict[str, Any]) -> dict[str, A
     return result
 
 
-def _apply_execution_route(route: dict[str, Any] | None, main: dict[str, Any]) -> dict[str, Any]:
+def _apply_execution_route(
+    route: dict[str, Any] | None,
+    main: dict[str, Any],
+    *,
+    config: Any = None,
+) -> dict[str, Any]:
     route = _execution_route(route) if route else empty_execution_route()
     profile = {
         "profile_id": "",
@@ -793,7 +1097,7 @@ def _apply_execution_route(route: dict[str, Any] | None, main: dict[str, Any]) -
         "effort_policy": route.get("effort_policy") or "same",
         "effort": route.get("effort") or "",
     }
-    applied = _profile_route(profile, main)
+    applied = _profile_route(profile, main, config=config)
     applied["inherit_model"] = bool(route.get("inherit_model", True))
     applied.pop("profile_id", None)
     applied.pop("profile_name", None)
@@ -898,13 +1202,17 @@ def resolve_agent_team_v3_route(config: Any, subagent_id: str, *, main_route: di
         route.pop("profile_id", None)
         route.pop("profile_name", None)
     else:
-        route = _apply_execution_route(exec_route, route_main)
+        route = _apply_execution_route(exec_route, route_main, config=config)
         _team_id, profile_id = _session_uses_team_execution_profile()
         route["execution_profile_id"] = profile_id or None
         route.pop("llm_profile_id", None)
         provider = str(route.get("provider") or "").strip().lower()
         model = str(route.get("model") or "").strip()
     if not provider or not model:
+        return None
+    if provider not in _AGENT_TEAM_ROUTE_PROVIDERS:
+        return None
+    if provider == "routing-profile" and model != "free-team":
         return None
     if provider == "routing-profile" and model == "free-team":
         route["pool_id"] = route.get("pool_id") or str(_config_get(config, "routing_profiles.free-team.main_pool_id", "coordinator") or "coordinator")
@@ -1027,7 +1335,7 @@ def filter_agent_team_capabilities(subagent: dict[str, Any] | None, requested: A
     return sorted(allowed)
 
 
-def agent_team_v3_context_tags(*, user: Any = None, project: Any = None, session: Any = None, generation_profile: str | None = None, app_target_id: str | None = None, development_status: str | None = None, story_mode: str | None = None, context_tags: Any = None, trpg_context: bool | None = None) -> set[str]:
+def agent_team_v3_context_tags(*, user: Any = None, project: Any = None, session: Any = None, generation_profile: str | None = None, app_target_id: str | None = None, development_status: str | None = None, context_tags: Any = None) -> set[str]:
     tags = {str(item).strip().lower() for item in (context_tags or []) if str(item).strip()} if isinstance(context_tags, (list, tuple, set, frozenset)) else set()
     def _read(obj: Any, *names: str) -> Any:
         if isinstance(obj, dict):
@@ -1071,34 +1379,10 @@ def agent_team_v3_context_tags(*, user: Any = None, project: Any = None, session
     ).strip().lower()
     if target and (not status or status in {"planning", "active", "in_progress", "review", "development", "working"}):
         tags.add("app_development")
-    story_value = story_mode
-    if story_value is None:
-        story_value = _read(session, "story_mode", "story_context") or _read(project, "story_mode")
-    session_mode = _read(session, "mode")
-    session_context_type = _read(session, "context_type")
-    session_agent_name = _read(session, "agent_name")
-    session_allowed_tools = _read(session, "allowed_tools")
-    session_type_name = type(session).__name__.lower() if session is not None else ""
-    story_session_shape = (
-        "storywriting" in session_type_name
-        or "storychat" in session_type_name
-        or (session_agent_name and "story" in str(session_agent_name).lower())
-        or (
-            isinstance(session_allowed_tools, (list, tuple, set, frozenset))
-            and any("writing" in str(item).lower() for item in session_allowed_tools)
-        )
-    )
-    if story_value or story_session_shape or any("story" in str(value).lower() for value in (generation_profile, session_mode, session_context_type) if value):
-        tags.add("story")
-    # Character/TRPG runtime is deliberately not inferred from ordinary
-    # conversation fields.  Integrations with a trustworthy TRPG session
-    # source can opt in through this narrow extension hook.
-    if trpg_context is True:
-        tags.add("trpg")
     return tags
 
 
-def agent_team_scope_active(config: Any, *, user: Any = None, project: Any = None, session: Any = None, generation_profile: str | None = None, app_target_id: str | None = None, development_status: str | None = None, story_mode: str | None = None, context_tags: Any = None, loaded_team_ids: Any = None, trpg_context: bool | None = None) -> dict[str, Any]:
+def agent_team_scope_active(config: Any, *, user: Any = None, project: Any = None, session: Any = None, generation_profile: str | None = None, app_target_id: str | None = None, development_status: str | None = None, context_tags: Any = None, loaded_team_ids: Any = None) -> dict[str, Any]:
     from .session_llm_runtime_context import session_agent_team_selection
 
     selection = session_agent_team_selection()
@@ -1150,9 +1434,7 @@ def agent_team_scope_active(config: Any, *, user: Any = None, project: Any = Non
                         generation_profile=generation_profile,
                         app_target_id=app_target_id,
                         development_status=development_status,
-                        story_mode=story_mode,
                         context_tags=context_tags,
-                        trpg_context=trpg_context,
                     )
                 ),
                 "active_team_ids": active_team_ids,
@@ -1168,7 +1450,7 @@ def agent_team_scope_active(config: Any, *, user: Any = None, project: Any = Non
             "reason": "fixed_unavailable",
         }
 
-    tags = agent_team_v3_context_tags(user=user, project=project, session=session, generation_profile=generation_profile, app_target_id=app_target_id, development_status=development_status, story_mode=story_mode, context_tags=context_tags, trpg_context=trpg_context)
+    tags = agent_team_v3_context_tags(user=user, project=project, session=session, generation_profile=generation_profile, app_target_id=app_target_id, development_status=development_status, context_tags=context_tags)
     loaded_source = loaded_team_ids
     if isinstance(selection, dict) and str(selection.get("mode") or "auto").strip().lower() == "auto":
         selection_loaded = selection.get("loaded_team_ids") or []
@@ -1224,7 +1506,7 @@ def filter_subagent_capabilities(subagent: dict[str, Any] | None, requested: Any
     return filter_agent_team_capabilities(subagent, requested=requested, work_mode=work_mode, backend=backend)
 
 
-def agent_team_v3_visible_subagents(config: Any, *, context_tags: Any = None, loaded_team_ids: Any = None, include_disabled: bool = False, user: Any = None, project: Any = None, session: Any = None, trpg_context: bool | None = None) -> list[dict[str, Any]]:
+def agent_team_v3_visible_subagents(config: Any, *, context_tags: Any = None, loaded_team_ids: Any = None, include_disabled: bool = False, user: Any = None, project: Any = None, session: Any = None) -> list[dict[str, Any]]:
     scope = agent_team_scope_active(
         config,
         context_tags=context_tags,
@@ -1232,7 +1514,6 @@ def agent_team_v3_visible_subagents(config: Any, *, context_tags: Any = None, lo
         user=user,
         project=project,
         session=session,
-        trpg_context=trpg_context,
     )
     visible = set(scope.get("active_subagent_ids") or [])
     return [item for item in agent_team_v3_subagents(config, include_disabled=include_disabled) if item.get("subagent_id") in visible]

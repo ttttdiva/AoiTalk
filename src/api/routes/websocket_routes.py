@@ -4,7 +4,9 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, FastAPI, WebSocket, WebSocketDisconnect
+
+from ..public_base_path import with_public_base_path
 
 # Import os_operations user context functions (server.py と同じフォールバック付き)
 try:
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
-    """/ws WebSocket エンドポイントを登録する"""
+    """/ws と直接接続用の公開prefix付きエンドポイントを登録する"""
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -88,10 +90,10 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
         server._permission_broadcast_loop = asyncio.get_running_loop()
 
-        # Set user context for os_operations permission checks
-        await server._setup_user_context(websocket, ws_user_info)
-
         try:
+            # Set user context for os_operations permission checks. Keep setup
+            # inside the connected lifetime so a setup failure is cleaned too.
+            await server._setup_user_context(websocket, ws_user_info)
             # Replay only live in-memory interactions after authentication,
             # session ACL validation, connection setup, and user-context
             # setup.  Audit events are not actionable and are never rebuilt
@@ -398,24 +400,37 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
                             }
                         )
                         continue
-                    await server._handle_set_llm_mode(data.get("data", {}))
+                    from .llm_routes import _guard_llm_runtime_change
+
+                    try:
+                        await _guard_llm_runtime_change(server._handle_set_llm_mode)(
+                            data.get("data", {})
+                        )
+                    except HTTPException as exc:
+                        await websocket.send_json({"type": "error", "error": exc.detail})
                 else:
                     logger.warning(f"Unknown message type: {message_type}")
 
         except WebSocketDisconnect:
-            server.manager.disconnect(websocket)
-            # Clear user context on disconnect
-            if OS_OPS_CONTEXT_AVAILABLE and clear_user_context:
-                clear_user_context()
+            pass
         except (OSError, ConnectionError) as e:
             # Expected on Windows when client connection times out (WinError 121 semaphore timeout)
             logger.info(f"WebSocket connection lost: {e}")
-            server.manager.disconnect(websocket)
-            if OS_OPS_CONTEXT_AVAILABLE and clear_user_context:
-                clear_user_context()
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
+        finally:
+            # Policy rejection returns and task cancellation also end an
+            # accepted connection. Release its state once on every exit;
+            # cancellation is deliberately not swallowed above.
             server.manager.disconnect(websocket)
-            # Clear user context on error
             if OS_OPS_CONTEXT_AVAILABLE and clear_user_context:
                 clear_user_context()
+
+    # HTTP/LAN frontends connect directly to FastAPI while their auth cookie
+    # remains scoped to the public prefix (for example /at). Keep that path
+    # valid without stripping the prefix in the browser or widening the cookie.
+    # The gateway's prefix-stripped /ws route and every authorization check
+    # above remain the same handler.
+    public_ws_path = with_public_base_path("/ws")
+    if public_ws_path != "/ws":
+        app.add_api_websocket_route(public_ws_path, websocket_endpoint)

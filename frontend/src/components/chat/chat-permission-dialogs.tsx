@@ -222,14 +222,18 @@ export function ExternalModelPromptDialog({
         if (!open) onDecision(false);
       }}
     >
-      <DialogContent showCloseButton={false} size="3xl">
+      <DialogContent
+        showCloseButton={false}
+        size="3xl"
+        className="max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden"
+      >
         <DialogHeader>
           <DialogTitle>外部モデル送信の確認</DialogTitle>
           <DialogDescription>{request?.description}</DialogDescription>
         </DialogHeader>
         {request && (
-          <div className="space-y-4">
-            <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+          <div className="min-h-0 min-w-0 space-y-4 overflow-y-auto overscroll-contain pr-1 scroll-pb-1">
+            <div className="grid gap-2 break-all text-xs text-muted-foreground sm:grid-cols-2">
               <span>action: {request.action}</span>
               <span>transport: {request.transport}</span>
               <span>destination: {request.destination}</span>
@@ -756,21 +760,21 @@ export function PlanApprovalDialog({
         if (!open) onCancel();
       }}
     >
-      <DialogContent showCloseButton={false} size="3xl">
+      <DialogContent showCloseButton={false} size="3xl" className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>計画の承認</DialogTitle>
           <DialogDescription>
             {request?.summary || "実行前に計画を確認してください。"}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3">
+        <div className="min-w-0 space-y-3">
           <div className="space-y-1">
             <span className="text-xs font-medium text-muted-foreground">
               実行計画（読み取り専用）
             </span>
             <pre
               data-testid="plan-approval-plan-text"
-              className="max-h-56 overflow-auto whitespace-pre-wrap rounded-md border border-input bg-muted/30 p-3 text-sm"
+              className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md border border-input bg-muted/30 p-3 text-sm"
             >
               {request?.planText || "（計画本文なし）"}
             </pre>
@@ -827,7 +831,7 @@ export function PlanApprovalDialog({
           </div>
           <div
             data-testid="plan-approval-binding"
-            className="grid gap-1 rounded-md border border-border-subtle bg-muted/20 p-3 text-[10px] text-muted-foreground sm:grid-cols-3"
+            className="grid min-w-0 gap-1 break-all rounded-md border border-border-subtle bg-muted/20 p-3 text-[10px] text-muted-foreground sm:grid-cols-3"
           >
             <span>plan digest: {request?.planDigest || "（なし）"}</span>
             <span>action digest: {request?.actionDigest || "（なし）"}</span>

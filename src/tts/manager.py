@@ -16,6 +16,11 @@ from .engines.voicevox_engine import VoicevoxEngine
 from .engines.aivisspeech_engine import AivisSpeechEngine
 from .engines.nijivoice_engine import NijivoiceEngine
 from .engines.miotts_engine import MioTTSEngine
+from .engines.gemini_tts_engine import (
+    GEMINI_TTS_ENGINE_NAME,
+    GeminiTTSEngine,
+    resolve_gemini_api_key,
+)
 from .irodori_config import (
     IRODORI_TTS_CHECKPOINT,
     normalize_irodori_settings,
@@ -326,6 +331,25 @@ class TTSManager:
             if isinstance(voice, Mapping)
             else ""
         )
+        if preferred_engine == GEMINI_TTS_ENGINE_NAME:
+            # Gemini TTS is a stateless cloud client, so a character switched
+            # to it in the GUI can start using it without a process restart.
+            if GEMINI_TTS_ENGINE_NAME not in self.engines:
+                try:
+                    gemini_engine = await self.create_gemini_tts_engine()
+                except Exception as exc:
+                    print(
+                        "[TTSManager] Gemini TTS lazy initialization failed; "
+                        f"keeping current engine ({type(exc).__name__})"
+                    )
+                    return
+                if gemini_engine is None:
+                    return
+                self.register_engine(GEMINI_TTS_ENGINE_NAME, gemini_engine)
+            if self.current_engine != GEMINI_TTS_ENGINE_NAME:
+                self.set_engine(GEMINI_TTS_ENGINE_NAME)
+            return
+
         if preferred_engine == "irodori_tts":
             # A GUI can switch a running character to Irodori without a
             # process restart.  Reuse an existing initialized engine whenever
@@ -688,6 +712,39 @@ class TTSManager:
         if not await engine.initialize():
             return None
 
+        return engine
+
+    def _gemini_tts_settings(self) -> Mapping[str, Any]:
+        tts_settings = self.config.get('tts_settings', {})
+        if not isinstance(tts_settings, Mapping):
+            return {}
+        settings = tts_settings.get(GEMINI_TTS_ENGINE_NAME, {})
+        return settings if isinstance(settings, Mapping) else {}
+
+    async def create_gemini_tts_engine(
+        self,
+        api_key: Optional[str] = None,
+    ) -> Optional[GeminiTTSEngine]:
+        """Create and initialize the Gemini API TTS engine.
+
+        The API key is resolved from ``gemini_api_key`` / ``GEMINI_API_KEY``
+        (or ``GOOGLE_API_KEY``); it is never read from character settings.
+        """
+        settings = self._gemini_tts_settings()
+        temperature = settings.get('temperature')
+        engine = GeminiTTSEngine(
+            api_key=api_key or resolve_gemini_api_key(self.config),
+            model=settings.get('model'),
+            voice=settings.get('voice'),
+            style=str(settings.get('style') or ''),
+            language_code=str(settings.get('language_code') or ''),
+            temperature=float(temperature) if temperature is not None else None,
+            timeout=float(settings.get('timeout', 180.0) or 180.0),
+            max_chars_per_request=int(settings.get('max_chars_per_request', 600) or 600),
+            config=self.config,
+        )
+        if not await engine.initialize():
+            return None
         return engine
 
     async def create_miotts_engine(
@@ -1194,6 +1251,39 @@ class TTSManager:
                     if value is not None:
                         miotts_kwargs[key] = value
                 kwargs.update({key: value for key, value in miotts_kwargs.items() if value is not None})
+
+            elif self.current_engine == GEMINI_TTS_ENGINE_NAME and isinstance(engine, GeminiTTSEngine):
+                voice_config = char_config.get('voice', {})
+                params = voice_config.get('parameters', {})
+                if not isinstance(params, Mapping):
+                    params = {}
+                intended_engine = str(voice_config.get('engine') or '').strip().lower()
+                if intended_engine == GEMINI_TTS_ENGINE_NAME:
+                    # voice_id holds the Gemini voice (prebuilt name or a
+                    # Voice Design ``voice_...`` id); voice_name is kept as a
+                    # display label and only used when it is the sole value.
+                    gemini_kwargs = {
+                        'voice': (
+                            params.get('voice')
+                            or voice_config.get('voice_id')
+                            or kwargs.get('voice')
+                        ),
+                        'model': params.get('model', kwargs.get('model')),
+                        'style': params.get('style', kwargs.get('style')),
+                        'language_code': params.get(
+                            'language_code', kwargs.get('language_code')
+                        ),
+                        'temperature': params.get(
+                            'temperature', kwargs.get('temperature')
+                        ),
+                        'speakers': params.get('speakers', kwargs.get('speakers')),
+                    }
+                    kwargs.update(
+                        {key: value for key, value in gemini_kwargs.items() if value not in (None, '')}
+                    )
+                # Engine-agnostic numeric parameters do not apply to Gemini.
+                for key in ('speaker_id', 'speed', 'pitch', 'intonation', 'volume', 'voice_name', 'voice_id'):
+                    kwargs.pop(key, None)
 
             elif IrodoriTTSEngine is not None and self.current_engine == "irodori_tts" and isinstance(engine, IrodoriTTSEngine):
                 voice_config = char_config.get('voice', {})

@@ -126,6 +126,14 @@ async function request<T>(path: string, init: RequestInit = {}, idempotencyKey?:
   return body as T;
 }
 
+// The server reports Generation Studio failures as stable codes; an empty list
+// always means the Studio answered with no Presets.
+const STUDIO_PRESET_ERRORS: Record<string, string> = {
+  studio_auth_failed: "Generation Studioの認証に失敗しました。AoiTalkサーバーの73認証設定（bootstrap token / Bearer token）を確認してください。",
+  studio_unconfigured: "Generation Studioの認証情報がAoiTalkサーバーに設定されていません。",
+  studio_unavailable: "Generation StudioからPresetを取得できません。73の起動状態と接続先を確認してください。",
+};
+
 const jsonBody = (value: unknown): RequestInit => ({ body: JSON.stringify(value), headers: { "content-type": "application/json" } });
 const id = (value: string) => encodeURIComponent(value);
 
@@ -150,7 +158,10 @@ export const mediaAutomationApi = {
     return request(`/operations/media/automations/${id(programId)}/duplicate`, { method: "POST", ...jsonBody({ name }) }, key);
   },
   presetCatalog(workspaceId: string): Promise<PresetCatalogItem[]> {
-    return request(`/operations/media/automations/generation-studio/${id(workspaceId)}/presets`);
+    return request<PresetCatalogItem[]>(`/operations/media/automations/generation-studio/${id(workspaceId)}/presets`).catch((cause: unknown) => {
+      const code = cause instanceof Error ? cause.message : "";
+      throw new Error(STUDIO_PRESET_ERRORS[code] ?? (code || STUDIO_PRESET_ERRORS.studio_unavailable));
+    });
   },
   trigger(programId: string, triggerKey: string, triggerKind = "manual"): Promise<AutomationRun> {
     return request(`/operations/media/automations/${id(programId)}/runs`, { method: "POST", ...jsonBody({ trigger_key: triggerKey, trigger_kind: triggerKind, execute: true }) });

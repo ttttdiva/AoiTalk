@@ -16,6 +16,7 @@ import { HomeTodayOverlay } from "@/components/layout/home-today-overlay";
 import { TaskCompletionUndoProvider } from "@/components/tasks/task-completion-undo-provider";
 import { TaskCompletionConfirmationProvider } from "@/components/tasks/task-completion-confirmation-provider";
 import { DocsCommandProvider } from "@/components/docs/hooks/use-docs-command-palette";
+import { DailyCaptureDialog } from "@/components/docs/daily-capture-dialog";
 import { DocsClipIngestProvider } from "@/components/docs/docs-clip-ingest-provider";
 import { ProjectProvider } from "@/contexts/project-context";
 import { ChatSessionProvider } from "@/contexts/chat-session-context";
@@ -68,6 +69,7 @@ export default async function AppLayout({
                             <ShortcutsHelpDialog />
                             <GlobalAdminRestart />
                             <GlobalMemoPad />
+                            <DailyCaptureDialog />
                             <HomeTodayOverlay />
                             <AudioPlayerBar />
                             <PetOverlay />

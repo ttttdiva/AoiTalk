@@ -5,6 +5,12 @@ import type {
   ConversationMessage,
 } from "@/lib/chat-api";
 
+export type ChatDeliveryState =
+  | "pending"
+  | "accepted"
+  | "failed"
+  | "uncertain";
+
 /**
  * ローカル（未保存）メッセージ生成とツール結果メタデータ判定のユーティリティ。
  * `chat/page.tsx` から挙動不変で切り出した純粋関数群。
@@ -83,6 +89,7 @@ export function createLocalUserMessage(
 ): ConversationMessage {
   const metadata: ConversationMessage["metadata"] = {
     client_message_id: clientMessageId,
+    delivery_state: "pending" satisfies ChatDeliveryState,
     ...extraMetadata,
   };
   if (commandCapabilities?.length) {
@@ -92,5 +99,10 @@ export function createLocalUserMessage(
   if (attachments) {
     metadata.attachments = attachments;
   }
-  return createLocalMessage(sessionId, "user", content, metadata);
+  return {
+    ...createLocalMessage(sessionId, "user", content, metadata),
+    // Keep the identity available even when an older server projection omits
+    // metadata.client_message_id. Reducer/hydration matching uses both forms.
+    client_message_id: clientMessageId,
+  };
 }

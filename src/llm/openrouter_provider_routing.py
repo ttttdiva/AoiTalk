@@ -12,7 +12,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 MODEL_PROVIDER_OPTIONS_CONFIG_KEY = "openrouter.model_provider_options"
 _PROVIDER_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
-_PROVIDER_OPTION_KEYS = {"only", "order", "allow_fallbacks", "zdr"}
+_PROVIDER_OPTION_KEYS = {
+    "only",
+    "order",
+    "allow_fallbacks",
+    "require_parameters",
+    "zdr",
+}
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -82,7 +88,7 @@ def normalize_provider_options(
             if normalized:
                 result[field] = normalized
 
-    for field in ("allow_fallbacks", "zdr"):
+    for field in ("allow_fallbacks", "require_parameters", "zdr"):
         if field not in value:
             continue
         boolean_value = value.get(field)

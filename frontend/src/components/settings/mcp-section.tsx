@@ -137,6 +137,7 @@ export function McpSection({
           )}
         </span>
       }
+      help="MCP連携と登録済みMCPサーバーの利用を切り替えます。登録済みサーバーの状態・ツールを確認し、必要に応じて再起動できます。"
       onOpenChange={handleOpenChange}
     >
       {settingsLoading ? (
@@ -147,9 +148,6 @@ export function McpSection({
             <Label htmlFor="mcp-enabled" className="text-sm font-medium">
               MCPを有効化
             </Label>
-            <p className="text-xs text-muted-foreground">
-              MCP連携と登録済みMCPサーバーの利用を切り替えます。
-            </p>
           </div>
           <Checkbox
             id="mcp-enabled"

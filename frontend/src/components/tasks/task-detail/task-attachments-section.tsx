@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import {
@@ -356,28 +358,28 @@ export function TaskReferencesSection({
   const openReference = useCallback((reference: TaskReference) => {
     if (!reference.exists) return;
     if (reference.reference_type === "app" && reference.target_id) {
-      window.location.href = reference.open.url || `/apps/${encodeURIComponent(reference.target_id)}${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`;
+      window.location.href = withBasePath(reference.open.url || `/apps/${encodeURIComponent(reference.target_id)}${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`);
       return;
     }
     if (reference.reference_type === "task" && reference.target_id) {
       if (onOpenTask) onOpenTask(reference.target_id);
-      else window.location.href = `/tasks?detail=${encodeURIComponent(reference.target_id)}`;
+      else window.location.href = withBasePath(`/tasks?detail=${encodeURIComponent(reference.target_id)}`);
       return;
     }
     const url = reference.open.url;
     const path = reference.open.path;
     const chatUrl = url ?? path;
     if (chatUrl?.startsWith("/chat")) {
-      if (!navigateChatSessionInPlace(chatUrl)) window.location.href = chatUrl;
+      if (!navigateChatSessionInPlace(chatUrl)) window.location.href = withBasePath(chatUrl);
       return;
     }
-    if (url) { window.open(url, "_blank", "noopener,noreferrer"); return; }
-    if (path?.startsWith("/")) { window.location.href = path; return; }
+    if (url) { window.open(withBasePath(url), "_blank", "noopener,noreferrer"); return; }
+    if (path?.startsWith("/")) { window.location.href = withBasePath(path); return; }
     if (reference.reference_type === "workspace_file" && reference.target_path) {
-      window.location.href = `/filer?path=${encodeURIComponent(reference.target_path)}`;
+      window.location.href = withBasePath(`/filer?path=${encodeURIComponent(reference.target_path)}`);
       return;
     }
-    if (reference.target_id) window.location.href = `/docs/${encodeURIComponent(reference.target_id)}`;
+    if (reference.target_id) window.location.href = withBasePath(`/docs/${encodeURIComponent(reference.target_id)}`);
   }, [onOpenTask, projectId]);
 
   const openTaskPicker = useCallback(async () => {

@@ -6,24 +6,33 @@ Used for managing chat history with PostgreSQL persistence.
 """
 
 import copy
+import hashlib
+import json
+import logging
 import uuid
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Awaitable, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, select, update, delete, desc, and_, or_, func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from .models import (
     ConversationSession,
     ConversationMessage,
     ConversationParticipant,
+    AgentExecutionBinding,
     Project,
     ProjectMember,
 )
 from .database import get_database_manager
+from .conversation_titles import update_title_in_transaction
 from ..features import Features
 from ..services.project_permissions import has_effective_project_permission
 from ..services.agent_automation_events import record_chat_message_event
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationMessageIdempotencyConflict(ValueError):
@@ -32,6 +41,24 @@ class ConversationMessageIdempotencyConflict(ValueError):
 
 class ConversationWriteAuthorizationError(PermissionError):
     """The actor lost write access before the locked message insert."""
+
+
+class ConversationSessionCreateConflict(ValueError):
+    """A client creation key cannot be replayed for this request."""
+
+
+_CLIENT_CREATE_CONTEXT_KEY = "_client_session_creation"
+_CLIENT_CREATE_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/ttttdiva/41_AoiTalk/client-session/v1"
+)
+
+
+def client_session_uuid(user_id: str, client_session_id: str) -> uuid.UUID:
+    """Scope a native local UUID to its authenticated owner, never a raw PK."""
+    return uuid.uuid5(
+        _CLIENT_CREATE_NAMESPACE,
+        f"{uuid.UUID(str(user_id))}:{uuid.UUID(str(client_session_id))}",
+    )
 
 
 def _monotonic_activity(value):
@@ -60,6 +87,51 @@ class ConversationRepository:
             return self._session
         db_manager = get_database_manager()
         return await db_manager.get_session()
+
+    async def _find_previous_active_non_root_session(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: str | list[str],
+        character_name: str,
+        exclude_session_id: uuid.UUID | None = None,
+    ) -> uuid.UUID | None:
+        """Pick the previous normal session without deactivating AoiDots Root."""
+
+        conditions = [
+            ConversationSession.user_id == user_id,
+            ConversationSession.character_name == character_name,
+            ConversationSession.is_active.is_(True),
+            ConversationSession.deleted_at.is_(None),
+        ]
+        if exclude_session_id is not None:
+            conditions.append(ConversationSession.id != exclude_session_id)
+        candidates = (
+            await session.execute(
+                select(ConversationSession.id)
+                .where(*conditions)
+                .order_by(
+                    desc(
+                        func.coalesce(
+                            ConversationSession.last_activity,
+                            ConversationSession.session_start,
+                        )
+                    ).nullslast(),
+                    desc(ConversationSession.session_start).nullslast(),
+                    desc(ConversationSession.id),
+                )
+                .limit(128)
+                .with_for_update()
+            )
+        ).scalars().all()
+        from ..services.agent_root_lifecycle import find_private_agent_root
+
+        for candidate_id in candidates:
+            if (
+                await find_private_agent_root(session, candidate_id)
+            ) is None:
+                return candidate_id
+        return None
 
     async def _assert_locked_message_write_access(
         self,
@@ -145,6 +217,217 @@ class ConversationRepository:
             raise ConversationWriteAuthorizationError("conversation write denied")
     
     # ─── Session CRUD ───────────────────────────────────────────────────
+
+    async def create_client_session(
+        self,
+        *,
+        client_session_id: str,
+        user_id: str,
+        character_name: str,
+        request_payload: Dict[str, Any],
+        display_name: str = "",
+        project_id: Optional[str] = None,
+        app_id: Optional[str] = None,
+        app_target_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        first_message: Optional[str] = None,
+        character_display_name: str = "",
+        initial_message: Optional[Dict[str, str]] = None,
+        authorize: Optional[
+            Callable[[AsyncSession, ConversationSession], Awaitable[None]]
+        ] = None,
+        initialize_agent: Optional[
+            Callable[[AsyncSession, ConversationSession], Awaitable[None]]
+        ] = None,
+    ) -> tuple[ConversationSession, Optional[str]]:
+        """Atomically initialize or replay a native local conversation.
+
+        The session PK arbitrates concurrent requests in PostgreSQL. No row
+        becomes visible before its participant, route and greeting commit.
+        Only the winning INSERT changes active-session lifecycle metadata.
+        A soft-deleted row remains a tombstone and is never resurrected.
+        """
+        if self._session is not None:
+            raise ValueError("Client session creation must own its transaction")
+        session_id = client_session_uuid(user_id, client_session_id)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                request_payload, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        initial_context = copy.deepcopy(context) if isinstance(context, dict) else {}
+        initial_context[_CLIENT_CREATE_CONTEXT_KEY] = {
+            "version": 1, "request_sha256": fingerprint,
+        }
+        greeting_id = uuid.uuid5(session_id, "initial-greeting")
+        initial_user_message_id = None
+        initial_user_message_client_id = None
+        initial_user_message_content = None
+        if isinstance(initial_message, dict):
+            initial_user_message_client_id = str(
+                initial_message.get("client_message_id") or ""
+            ).strip()
+            initial_user_message_content = str(
+                initial_message.get("content") or ""
+            )
+            if initial_user_message_client_id and initial_user_message_content:
+                initial_user_message_id = uuid.uuid5(
+                    session_id,
+                    f"initial-user-message:{initial_user_message_client_id}",
+                )
+        session = await self._get_session()
+        try:
+            async with session.begin():
+                # Match the canonical Project -> Session order before any
+                # FK/row lock on the new conversation can be acquired.
+                if project_id:
+                    await session.execute(
+                        select(Project.id)
+                        .where(Project.id == uuid.UUID(project_id))
+                        .with_for_update()
+                    )
+                inserted = await session.scalar(
+                    postgresql_insert(ConversationSession)
+                    .values(
+                        id=session_id, user_id=user_id,
+                        character_name=character_name, title="", is_active=True,
+                        message_count=0, context=initial_context,
+                        project_id=uuid.UUID(project_id) if project_id else None,
+                        app_id=uuid.UUID(app_id) if app_id else None,
+                        app_target_id=uuid.UUID(app_target_id) if app_target_id else None,
+                        agent_id=uuid.UUID(agent_id) if agent_id else None,
+                        development_status="working" if app_id else None,
+                    )
+                    .on_conflict_do_nothing(index_elements=[ConversationSession.id])
+                    .returning(ConversationSession.id)
+                )
+                created = await session.scalar(
+                    select(ConversationSession)
+                    .where(ConversationSession.id == session_id)
+                    .with_for_update()
+                )
+                if created is None:
+                    raise ConversationSessionCreateConflict("Creation key unavailable")
+                receipt = (
+                    created.context.get(_CLIENT_CREATE_CONTEXT_KEY)
+                    if isinstance(created.context, dict) else None
+                )
+                if (
+                    str(created.user_id) != str(user_id)
+                    or created.deleted_at is not None
+                    or not isinstance(receipt, dict)
+                    or receipt.get("version") != 1
+                    or receipt.get("request_sha256") != fingerprint
+                ):
+                    raise ConversationSessionCreateConflict("Creation key conflict")
+                if inserted is not None:
+                    previous_id = await self._find_previous_active_non_root_session(
+                        session,
+                        user_id=user_id,
+                        character_name=character_name,
+                        exclude_session_id=session_id,
+                    )
+                    if previous_id is not None:
+                        await session.execute(
+                            update(ConversationSession)
+                            .where(ConversationSession.id == previous_id)
+                            .values(is_active=False)
+                        )
+                    session.add(ConversationParticipant(
+                        session_id=session_id, participant_type="user",
+                        participant_id=user_id, display_name=display_name,
+                        role="owner", status="joined", auto_respond=False,
+                        participant_metadata={},
+                    ))
+                    if first_message:
+                        message = ConversationMessage(
+                            id=greeting_id, session_id=session_id, role="assistant",
+                            content=first_message, sender_type="character",
+                            sender_id=character_name,
+                            sender_display_name=character_display_name,
+                            parent_message_id=None, branch_index=0,
+                            is_active_branch=True, message_metadata={},
+                        )
+                        session.add(message)
+                        created.message_count = 1
+                        created.last_activity = datetime.utcnow()
+                        created.development_status = "waiting_for_user"
+                        if Features.virtual_company() and Features.autonomous_agent_runtime():
+                            await record_chat_message_event(session, message, created)
+                    if initial_user_message_id is not None:
+                        user_message = ConversationMessage(
+                            id=initial_user_message_id,
+                            session_id=session_id,
+                            role="user",
+                            content=initial_user_message_content,
+                            message_metadata={
+                                "client_message_id": initial_user_message_client_id,
+                            },
+                            client_message_id=initial_user_message_client_id,
+                            sender_type="user",
+                            sender_id=user_id,
+                            sender_display_name=display_name,
+                            parent_message_id=greeting_id if first_message else None,
+                            branch_index=0,
+                            is_active_branch=True,
+                        )
+                        session.add(user_message)
+                        created.message_count = int(created.message_count or 0) + 1
+                        created.last_activity = datetime.utcnow()
+                        created.development_status = "working"
+                        if Features.virtual_company() and Features.autonomous_agent_runtime():
+                            await record_chat_message_event(session, user_message, created)
+                    await session.flush()
+                # Load the API projection before commit. There is no follow-up
+                # refresh/new connection after the durable transaction commits.
+                created = await session.scalar(
+                    select(ConversationSession)
+                    .options(selectinload(ConversationSession.participants))
+                    .where(ConversationSession.id == session_id)
+                )
+                if authorize is not None:
+                    # A replay may refer to a session moved since its original
+                    # creation. Authorize its current scope before exposing it.
+                    await authorize(session, created)
+                if inserted is not None and initialize_agent is not None:
+                    await initialize_agent(session, created)
+                greeting = await session.scalar(
+                    select(ConversationMessage).where(
+                        ConversationMessage.id == greeting_id,
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.deleted_at.is_(None),
+                    )
+                )
+                greeting_content = greeting.content if greeting else None
+                initial_user_payload = None
+                if initial_user_message_id is not None:
+                    initial_user_message = await session.scalar(
+                        select(ConversationMessage).where(
+                            ConversationMessage.id == initial_user_message_id,
+                            ConversationMessage.session_id == session_id,
+                            ConversationMessage.deleted_at.is_(None),
+                        )
+                    )
+                    if initial_user_message is not None:
+                        initial_user_payload = initial_user_message.to_dict()
+                setattr(created, "_initial_user_message", initial_user_payload)
+                logger.info(
+                    "client_session_create phase=commit_begin session_id=%s", session_id,
+                )
+            logger.info(
+                "client_session_create phase=commit_complete session_id=%s", session_id,
+            )
+            return created, greeting_content
+        finally:
+            logger.info(
+                "client_session_create phase=close_begin session_id=%s", session_id,
+            )
+            await session.close()
+            logger.info(
+                "client_session_create phase=close_complete session_id=%s", session_id,
+            )
     
     async def create_session(
         self,
@@ -154,7 +437,13 @@ class ConversationRepository:
         project_id: Optional[str] = None,
         app_id: Optional[str] = None,
         app_target_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
         development_status: Optional[str] = None,
+        owner_participant: Optional[Dict[str, Any]] = None,
+        initialize_agent: Optional[
+            Callable[[AsyncSession, ConversationSession], Awaitable[None]]
+        ] = None,
+        deactivate_previous: bool = False,
     ) -> ConversationSession:
         """Create a new conversation session
         
@@ -169,6 +458,18 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            if deactivate_previous:
+                previous_id = await self._find_previous_active_non_root_session(
+                    session,
+                    user_id=user_id,
+                    character_name=character_name,
+                )
+                if previous_id is not None:
+                    await session.execute(
+                        update(ConversationSession)
+                        .where(ConversationSession.id == previous_id)
+                        .values(is_active=False)
+                    )
             new_session = ConversationSession(
                 user_id=user_id,
                 character_name=character_name,
@@ -178,9 +479,26 @@ class ConversationRepository:
                 project_id=uuid.UUID(project_id) if project_id else None,
                 app_id=uuid.UUID(app_id) if app_id else None,
                 app_target_id=uuid.UUID(app_target_id) if app_target_id else None,
+                agent_id=uuid.UUID(agent_id) if agent_id else None,
                 development_status=development_status if app_id else None,
             )
             session.add(new_session)
+            await session.flush()
+            if owner_participant:
+                session.add(
+                    ConversationParticipant(
+                        session_id=new_session.id,
+                        participant_type="user",
+                        participant_id=str(owner_participant["participant_id"]),
+                        display_name=str(owner_participant.get("display_name") or ""),
+                        role=str(owner_participant.get("role") or "owner"),
+                        status=str(owner_participant.get("status") or "joined"),
+                        auto_respond=False,
+                        participant_metadata={},
+                    )
+                )
+            if initialize_agent is not None:
+                await initialize_agent(session, new_session)
             await session.commit()
             await session.refresh(new_session)
             return new_session
@@ -207,7 +525,10 @@ class ConversationRepository:
             message_uuid = uuid.UUID(source_message_id)
             source = await session.scalar(
                 select(ConversationSession)
-                .options(selectinload(ConversationSession.participants))
+                .options(
+                    selectinload(ConversationSession.participants),
+                    selectinload(ConversationSession.execution_bindings),
+                )
                 .where(
                     ConversationSession.id == source_uuid,
                     ConversationSession.deleted_at.is_(None),
@@ -216,6 +537,19 @@ class ConversationRepository:
             )
             if source is None:
                 raise ValueError("Source session not found")
+
+            # The canonical AoiDots root is still an ordinary session, but it
+            # is identity-bearing.  Resolve the durable root row while the
+            # source lock is held so a forged client marker cannot turn it
+            # into a forkable/rebindable session.
+            from ..services.agent_root_lifecycle import guard_private_root_operation
+
+            await guard_private_root_operation(
+                session,
+                source,
+                operation="fork",
+                actor_user_id=user_id,
+            )
 
             target = await session.get(ConversationMessage, message_uuid)
             if target is None or target.session_id != source_uuid:
@@ -239,6 +573,9 @@ class ConversationRepository:
             inherited_title = str(source.title or "新しい会話").strip()
             fork_title = (title or f"{inherited_title}（フォーク）").strip()[:200]
             inherited_context = copy.deepcopy(source.context or {})
+            # The fork has its own explicit name (or stable fork suffix), not
+            # the source session's replaceable generated fallback.
+            inherited_context["title_generation"] = {"source": "manual"}
             inherited_context.pop("llm_provider_state", None)
             # A fork has a new active branch and must not inherit a provider
             # process continuation handle from the source conversation.
@@ -256,6 +593,8 @@ class ConversationRepository:
                 project_id=source.project_id,
                 app_id=source.app_id,
                 app_target_id=source.app_target_id,
+                agent_id=source.agent_id,
+                agent_binding_updated_at=source.agent_binding_updated_at,
                 parent_session_id=source.id,
                 forked_from_message_id=target.id,
                 is_group_chat=bool(source.is_group_chat),
@@ -264,6 +603,70 @@ class ConversationRepository:
             )
             session.add(forked)
             await session.flush()
+
+            # Preserve the latest immutable Agent/Revision snapshot for the
+            # fork.  The session identity remains the same Agent while each
+            # fork owns its own audit row; no provider continuation handles
+            # are copied.
+            source_bindings = list(source.execution_bindings or [])
+            if source_bindings and forked.agent_id is not None:
+                source_binding = max(
+                    source_bindings,
+                    key=lambda item: (
+                        item.created_at or datetime.min,
+                        str(item.id),
+                    ),
+                )
+                try:
+                    fork_created_by = uuid.UUID(str(user_id))
+                except (TypeError, ValueError, AttributeError):
+                    fork_created_by = None
+                from ..services.conversation_agent_service import (
+                    AgentExecutionBindingSnapshot,
+                    _snapshot_hash,
+                )
+
+                fork_binding = AgentExecutionBinding(
+                    session_id=forked.id,
+                    agent_id=source_binding.agent_id,
+                    agent_revision_id=source_binding.agent_revision_id,
+                    revision_version=source_binding.revision_version,
+                    display_name=source_binding.display_name,
+                    mission=source_binding.mission,
+                    responsibility_summary=source_binding.responsibility_summary,
+                    operational_instructions=source_binding.operational_instructions,
+                    agent_team_id=source_binding.agent_team_id,
+                    execution_profile_id=source_binding.execution_profile_id,
+                    allowed_subagent_ids=copy.deepcopy(
+                        source_binding.allowed_subagent_ids or []
+                    ),
+                    capability_ceiling_json=copy.deepcopy(
+                        source_binding.capability_ceiling_json or []
+                    ),
+                    route_snapshot=copy.deepcopy(source_binding.route_snapshot or {}),
+                    revision_content_hash=source_binding.revision_content_hash,
+                    snapshot_hash="0" * 64,
+                    created_by=fork_created_by,
+                )
+                fork_snapshot = AgentExecutionBindingSnapshot(
+                    binding_id=None,
+                    session_id=str(forked.id),
+                    agent_id=str(source_binding.agent_id),
+                    agent_revision_id=str(source_binding.agent_revision_id),
+                    revision_version=int(source_binding.revision_version or 0),
+                    display_name=source_binding.display_name or "",
+                    mission=source_binding.mission or "",
+                    responsibility_summary=source_binding.responsibility_summary or "",
+                    operational_instructions=source_binding.operational_instructions or "",
+                    agent_team_id=source_binding.agent_team_id or "",
+                    execution_profile_id=source_binding.execution_profile_id or "",
+                    allowed_subagent_ids=tuple(source_binding.allowed_subagent_ids or []),
+                    capability_ceiling=tuple(source_binding.capability_ceiling_json or []),
+                    route_snapshot=copy.deepcopy(source_binding.route_snapshot or {}),
+                    revision_content_hash=source_binding.revision_content_hash,
+                )
+                fork_binding.snapshot_hash = _snapshot_hash(fork_snapshot)
+                session.add(fork_binding)
 
             has_owner = False
             for participant in source.participants or []:
@@ -318,6 +721,7 @@ class ConversationRepository:
                 metadata.pop("agent_run_id", None)
                 metadata.pop("context_snapshot", None)
                 metadata.pop("context_manifest", None)
+                metadata.pop("memory_selection_observation", None)
                 metadata["fork_source_message_id"] = str(source_message.id)
                 copied_message = ConversationMessage(
                     id=new_id,
@@ -383,7 +787,12 @@ class ConversationRepository:
                 query = query.with_for_update()
             
             result = await session.execute(query)
-            return result.scalar_one_or_none()
+            row = result.scalar_one_or_none()
+            if row is not None:
+                from ..services.agent_root_lifecycle import attach_private_root_metadata
+
+                await attach_private_root_metadata(session, [row])
+            return row
         finally:
             if not self._session:
                 await session.close()
@@ -463,6 +872,7 @@ class ConversationRepository:
                 )
             ).nullslast()
             query = query.order_by(
+                desc(ConversationSession.is_pinned),
                 activity_order,
                 desc(ConversationSession.session_start).nullslast(),
                 desc(ConversationSession.id),
@@ -470,7 +880,11 @@ class ConversationRepository:
             query = query.limit(limit).offset(offset)
             
             result = await session.execute(query)
-            return list(result.scalars().all())
+            rows = list(result.scalars().all())
+            from ..services.agent_root_lifecycle import attach_private_root_metadata
+
+            await attach_private_root_metadata(session, rows)
+            return rows
         finally:
             if not self._session:
                 await session.close()
@@ -507,6 +921,7 @@ class ConversationRepository:
                 selectinload(ConversationSession.participants)
             )
             query = query.order_by(
+                desc(ConversationSession.is_pinned),
                 desc(
                     func.coalesce(
                         ConversationSession.last_activity,
@@ -519,7 +934,11 @@ class ConversationRepository:
             query = query.limit(limit).offset(offset)
             
             result = await session.execute(query)
-            return list(result.scalars().all())
+            rows = list(result.scalars().all())
+            from ..services.agent_root_lifecycle import attach_private_root_metadata
+
+            await attach_private_root_metadata(session, rows)
+            return rows
         finally:
             if not self._session:
                 await session.close()
@@ -527,7 +946,9 @@ class ConversationRepository:
     async def get_active_session(
         self,
         user_id: str,
-        character_name: Optional[str] = None
+        character_name: Optional[str] = None,
+        *,
+        exclude_private_root: bool = False,
     ) -> Optional[ConversationSession]:
         """Get the most recent active session for a user
         
@@ -540,6 +961,15 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            if exclude_private_root and character_name:
+                previous_id = await self._find_previous_active_non_root_session(
+                    session,
+                    user_id=user_id,
+                    character_name=character_name,
+                )
+                if previous_id is None:
+                    return None
+                return await session.get(ConversationSession, previous_id)
             conditions = [
                 ConversationSession.user_id == user_id,
                 ConversationSession.is_active == True,
@@ -562,7 +992,12 @@ class ConversationRepository:
             ).limit(1)
             
             result = await session.execute(query)
-            return result.scalar_one_or_none()
+            row = result.scalar_one_or_none()
+            if row is not None:
+                from ..services.agent_root_lifecycle import attach_private_root_metadata
+
+                await attach_private_root_metadata(session, [row])
+            return row
         finally:
             if not self._session:
                 await session.close()
@@ -573,6 +1008,7 @@ class ConversationRepository:
         touch_activity: bool = True,
         expected_character_name: Optional[str] = None,
         expected_title: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
         **kwargs
     ) -> bool:
         """Update session fields
@@ -591,6 +1027,86 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
+            mutation_row = None
+            explicit_child_binding_change = False
+            if (
+                "project_id" in kwargs
+                or "character_name" in kwargs
+                or "user_id" in kwargs
+            ):
+                mutation_row = await session.scalar(
+                    select(ConversationSession)
+                    .where(ConversationSession.id == uuid.UUID(session_id))
+                    .with_for_update()
+                )
+                if mutation_row is not None:
+                    old_project_id = mutation_row.project_id
+                    old_character_name = mutation_row.character_name
+                    explicit_child_binding_change = (
+                        (
+                            "project_id" in kwargs
+                            and str(old_project_id) != str(kwargs.get("project_id"))
+                        )
+                        or (
+                            "character_name" in kwargs
+                            and str(old_character_name)
+                            != str(kwargs.get("character_name"))
+                        )
+                    )
+            if kwargs:
+                from ..services.agent_root_lifecycle import guard_private_root_update
+
+                # This repository method is also called by non-HTTP writers;
+                # structural root updates are blocked here as a second
+                # boundary even when the route-level actor check is skipped.
+                await guard_private_root_update(
+                    session,
+                    mutation_row or session_id,
+                    # Pass proposed values so the root lifecycle guard can
+                    # distinguish an idempotent owner write from an owner
+                    # replacement.  Other protected fields retain their
+                    # existing structural-update behavior.
+                    fields=kwargs,
+                    actor_user_id=actor_user_id,
+                )
+            if explicit_child_binding_change and actor_user_id:
+                from ..services.agent_root_lifecycle import (
+                    fence_child_dialogues_for_binding_change,
+                )
+
+                await fence_child_dialogues_for_binding_change(
+                    session,
+                    mutation_row,
+                    actor_user_id=actor_user_id,
+                    current_binding={
+                        "agent_id": (
+                            str(mutation_row.agent_id)
+                            if mutation_row is not None and mutation_row.agent_id
+                            else None
+                        ),
+                        "project_id": (
+                            str(kwargs.get("project_id"))
+                            if "project_id" in kwargs and kwargs.get("project_id")
+                            else (
+                                str(mutation_row.project_id)
+                                if mutation_row is not None and mutation_row.project_id
+                                else None
+                            )
+                        ),
+                        "character_name": kwargs.get(
+                            "character_name",
+                            mutation_row.character_name if mutation_row is not None else None,
+                        ),
+                    },
+                    project_id=kwargs.get(
+                        "project_id",
+                        mutation_row.project_id if mutation_row is not None else None,
+                    ),
+                    character_name=kwargs.get(
+                        "character_name",
+                        mutation_row.character_name if mutation_row is not None else None,
+                    ),
+                )
             if touch_activity:
                 kwargs['last_activity'] = datetime.utcnow()
             if kwargs.get("last_activity") is not None:
@@ -619,6 +1135,44 @@ class ConversationRepository:
         finally:
             if not self._session:
                 await session.close()
+
+    async def mark_session_read_monotonic(
+        self,
+        session_id: str,
+        read_at: datetime,
+    ) -> datetime | None:
+        """Advance a session read fence without regressing a newer read.
+
+        The caller captures ``read_at`` at request entry.  A CAS-style SQL
+        expression preserves a later concurrent read and returns the durable
+        timestamp that the wire response must expose.
+        """
+
+        session = await self._get_session()
+        try:
+            effective_read_at = case(
+                (ConversationSession.last_read_at.is_(None), read_at),
+                (ConversationSession.last_read_at < read_at, read_at),
+                else_=ConversationSession.last_read_at,
+            )
+            result = await session.execute(
+                update(ConversationSession)
+                .where(
+                    ConversationSession.id == uuid.UUID(session_id),
+                    ConversationSession.deleted_at.is_(None),
+                )
+                .values(last_read_at=effective_read_at)
+                .returning(ConversationSession.last_read_at)
+            )
+            durable_read_at = result.scalar_one_or_none()
+            await session.commit()
+            return durable_read_at
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            if not self._session:
+                await session.close()
     
     async def update_session_title(
         self,
@@ -636,21 +1190,23 @@ class ConversationRepository:
         Returns:
             True if updated
         """
-        updates: Dict[str, Any] = {"title": title}
-        if source:
-            existing = await self.get_session_by_id(session_id, with_messages=False)
-            current_context = getattr(existing, "context", None) if existing else None
-            context = (
-                dict(current_context) if isinstance(current_context, dict) else {}
+        session = await self._get_session()
+        try:
+            updated = await update_title_in_transaction(
+                session,
+                uuid.UUID(session_id),
+                title,
+                source=source,
+                expected_title=expected_title,
             )
-            context["title_generation"] = {"source": source}
-            updates["context"] = context
-        return await self.update_session(
-            session_id,
-            touch_activity=False,
-            expected_title=expected_title,
-            **updates,
-        )
+            await session.commit()
+            return updated
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            if not self._session:
+                await session.close()
     
     async def deactivate_session(
         self,
@@ -671,7 +1227,12 @@ class ConversationRepository:
             touch_activity=touch_activity,
         )
     
-    async def delete_session(self, session_id: str) -> bool:
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        actor_user_id: Optional[str] = None,
+    ) -> bool:
         """Soft delete a session (mark as deleted, actual deletion after 3 months)
         
         Args:
@@ -685,6 +1246,7 @@ class ConversationRepository:
         return await self.update_session(
             session_id,
             touch_activity=False,
+            actor_user_id=actor_user_id,
             deleted_at=datetime.utcnow(),
         )
     
@@ -968,6 +1530,8 @@ class ConversationRepository:
         sender_display_name: Optional[str] = None,
         actor_user_id: Optional[str] = None,
         actor_role: Optional[str] = None,
+        branch_from_message_id: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> ConversationMessage:
         """Add a message to a session
         
@@ -1066,13 +1630,40 @@ class ConversationRepository:
 
             await self._ensure_linear_parent_links(session, session_id)
 
-            parent = await self._latest_active_message(session, session_id)
-            parent_message_id = parent.id if parent else None
-            branch_index = await self._count_branch_siblings(
-                session, session_id, str(parent_message_id) if parent_message_id else None
+            parent_message_id: Optional[uuid.UUID] = None
+            branch_index = 0
+            if branch_from_message_id and role == "user":
+                original_id = uuid.UUID(str(branch_from_message_id))
+                original = await session.scalar(
+                    select(ConversationMessage).where(
+                        ConversationMessage.id == original_id,
+                        ConversationMessage.session_id == session_uuid,
+                    )
+                )
+                if original is None:
+                    raise ValueError(f"Message not found: {branch_from_message_id}")
+                parent_message_id = original.parent_message_id
+                await self._deactivate_branch_from_message(
+                    session, str(original.id), session_id
+                )
+                branch_index = await self._count_branch_siblings(
+                    session,
+                    session_id,
+                    str(parent_message_id) if parent_message_id else None,
+                )
+            else:
+                parent = await self._latest_active_message(session, session_id)
+                parent_message_id = parent.id if parent else None
+                branch_index = await self._count_branch_siblings(
+                    session, session_id, str(parent_message_id) if parent_message_id else None
+                )
+
+            message_identity = (
+                {"id": uuid.UUID(str(message_id))} if message_id else {}
             )
 
             message = ConversationMessage(
+                **message_identity,
                 session_id=session_uuid,
                 role=role,
                 content=content,
@@ -1115,10 +1706,90 @@ class ConversationRepository:
             
             await session.commit()
             await session.refresh(message)
+            self._queue_message_attachments(message, session_row.user_id)
             return message
         except Exception as e:
             await session.rollback()
             raise e
+        finally:
+            if not self._session:
+                await session.close()
+
+    async def update_message_metadata(
+        self,
+        session_id: Union[str, uuid.UUID],
+        message_id: Union[str, uuid.UUID],
+        updates: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Merge metadata into one live message in its canonical session.
+
+        The session and message rows are locked in that order so concurrent
+        receipt writers serialize their read/merge/write cycle.  Only the
+        ``message_metadata`` JSON document is changed; sender fields and other
+        identity-bearing columns remain server-owned.
+        """
+
+        try:
+            session_uuid = uuid.UUID(str(session_id))
+            message_uuid = uuid.UUID(str(message_id))
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+        if updates is None:
+            normalized_updates: Dict[str, Any] = {}
+        elif isinstance(updates, dict):
+            normalized_updates = copy.deepcopy(updates)
+        else:
+            return False
+
+        session = await self._get_session()
+        try:
+            # Do not let a pending caller-side ORM mutation flush before the
+            # authorization/session lock is acquired.
+            with session.no_autoflush:
+                conversation = await session.scalar(
+                    select(ConversationSession)
+                    .where(
+                        ConversationSession.id == session_uuid,
+                        ConversationSession.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if conversation is None:
+                    return False
+
+                message = await session.scalar(
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.id == message_uuid,
+                        ConversationMessage.session_id == session_uuid,
+                        ConversationMessage.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+                if message is None:
+                    return False
+
+                existing_metadata = message.message_metadata
+                if existing_metadata is None:
+                    merged_metadata: Dict[str, Any] = {}
+                elif isinstance(existing_metadata, dict):
+                    merged_metadata = copy.deepcopy(existing_metadata)
+                else:
+                    # Avoid replacing a malformed/encrypted JSON payload with
+                    # a partial client document.
+                    return False
+
+                merged_metadata.update(normalized_updates)
+                if merged_metadata != existing_metadata:
+                    message.message_metadata = merged_metadata
+                    await session.flush()
+
+            await session.commit()
+            return True
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             if not self._session:
                 await session.close()
@@ -1259,6 +1930,43 @@ class ConversationRepository:
             if not self._session:
                 await session.close()
     
+    async def get_active_messages_for_turn(
+        self, session_id: str, *, count: int = 1,
+        message_id: str | None = None, agent_run_id: str | None = None,
+        created_at: datetime | None = None, role: str | None = None,
+    ) -> List[ConversationMessage]:
+        """Read a bounded active turn, with branch/session predicates before LIMIT.
+
+        Exact selectors query the row directly rather than a recent-message
+        window. This inspector read never repairs branches or writes links.
+        """
+        try:
+            session_uuid = uuid.UUID(session_id)
+            message_uuid = uuid.UUID(message_id) if message_id else None
+        except (ValueError, TypeError):
+            return []
+        session = await self._get_session()
+        try:
+            query = select(ConversationMessage).where(
+                ConversationMessage.session_id == session_uuid,
+                ConversationMessage.deleted_at.is_(None),
+                or_(ConversationMessage.is_active_branch.is_(True), ConversationMessage.is_active_branch.is_(None)),
+            )
+            if message_uuid:
+                query = query.where(ConversationMessage.id == message_uuid)
+            if agent_run_id:
+                query = query.where(ConversationMessage.message_metadata["agent_run_id"].as_string() == agent_run_id)
+            if created_at is not None:
+                query = query.where(ConversationMessage.created_at == created_at)
+            if role in {"user", "assistant"}:
+                query = query.where(ConversationMessage.role == role)
+            query = query.order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc()).limit(max(1, min(count, 100)))
+            result = await session.execute(query)
+            return list(reversed(result.scalars().all()))
+        finally:
+            if not self._session:
+                await session.close()
+
     async def count_user_sessions(self, user_id: str) -> int:
         """Count total sessions for a user
         
@@ -1281,6 +1989,12 @@ class ConversationRepository:
                 await session.close()
     
     # ─── Branching Operations ─────────────────────────────────────────────
+
+    @staticmethod
+    def _queue_message_attachments(message, actor):
+        from ..services.media_index_worker import notify_media_source
+        for index, _ in enumerate((message.message_metadata or {}).get("attachments") or []):
+            notify_media_source(actor, "chat_attachment", f"{message.id}:{index}")
     
     async def add_message_with_parent(
         self,
@@ -1356,6 +2070,7 @@ class ConversationRepository:
             
             await session.commit()
             await session.refresh(message)
+            self._queue_message_attachments(message, session_row.user_id)
             return message
         except Exception as e:
             await session.rollback()
@@ -1420,6 +2135,7 @@ class ConversationRepository:
             metadata.pop("agent_run_id", None)
             metadata.pop("context_snapshot", None)
             metadata.pop("context_manifest", None)
+            metadata.pop("memory_selection_observation", None)
             new_message = ConversationMessage(
                 session_id=original_msg.session_id,
                 role=original_msg.role,
@@ -1444,6 +2160,10 @@ class ConversationRepository:
             )
             await session.commit()
             await session.refresh(new_message)
+            if (new_message.message_metadata or {}).get("attachments"):
+                conversation = await session.get(ConversationSession, new_message.session_id)
+                if conversation:
+                    self._queue_message_attachments(new_message, conversation.user_id)
             return new_message
         except Exception as e:
             await session.rollback()

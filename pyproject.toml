@@ -28,27 +28,31 @@ dependencies = [
     "playwright>=1.55.0",
 
     # Memory Management (PostgreSQL)
-    "sqlalchemy>=2.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
     "asyncpg>=0.28.0",
     "alembic>=1.12.0",
-    "sentence-transformers>=2.2.0,<5.0.0",
+    "sentence-transformers>=5.7.0,<6.0.0",
     "pydantic>=2.0.0",
+    "jsonschema>=4.23.0,<5.0.0",
     "bcrypt>=4.0.0",
     "cryptography>=42.0.0",
     "PyJWT>=2.8.0",
     "itsdangerous>=2.1.0",
     "tiktoken>=0.5.0",
     "psycopg2-binary>=2.9.0",
+    # SQLAlchemy 2.1 resolves bare ``postgresql://`` URLs to psycopg (v3).
+    # Keep psycopg2 for legacy explicit ``postgresql+psycopg2`` callers.
+    "psycopg[binary]>=3.3.6",
     "mem0ai>=0.1.0",
 
-    # RAG (Qdrant + LlamaIndex + BGE)
+    # RAG (Qdrant + LlamaIndex + EmbeddingGemma 2)
     "qdrant-client>=1.16.0,<1.17.0",
     "llama-index>=0.10.0",
     "llama-index-vector-stores-qdrant>=0.1.0",
     "llama-index-embeddings-huggingface>=0.1.0",
     "llama-index-readers-file>=0.1.0",
-    "FlagEmbedding>=1.2.0",
     "pypdf>=3.0.0",
+    "PyMuPDF>=1.24.0",
 
     # Repository Maps
     "grep-ast>=0.3.0",
@@ -78,10 +82,17 @@ dependencies = [
     "PyYAML>=6.0",
     "python-dotenv>=1.0.0",
     "python-dateutil>=2.9.0",
+    # ZoneInfo needs an IANA database on Windows and minimal containers.
+    "tzdata>=2025.2",
     "numpy>=1.26.0",
-    "huggingface-hub>=0.34.0,<1.0",
+    # Irodori v4-Large requires Hugging Face Hub >=1.5 via Transformers 5.x.
+    # Hub 1.16.3+ raises Click to >=8.4, which conflicts with gTTS 2.5.x
+    # (Click <8.2), so keep the newest compatible Hub line here.
+    "huggingface-hub>=0.34.0,<1.16.3",
+    "click>=8.1.7,<8.2",
     "requests>=2.31.0",
     "httpx>=0.24.0",
+    "httpcore>=1.0.9,<2.0",
     "pywebpush>=2.0.0",
     "certifi>=2026.1.4",
     # Enterprise Active Directory authentication (imports are lazy so
@@ -90,12 +101,17 @@ dependencies = [
     "dnspython>=2.8.0",
     "aiofiles>=23.0.0",
     "py7zr>=1.1.0,<2.0.0",
+    # User-supplied Files regex searches require interruptible matching.
+    "regex>=2024.11.6",
     "beautifulsoup4>=4.12.0",
     "Pillow>=10.0.0",
     "croniter>=1.3.0",
     "nest-asyncio>=1.5.0",
     "psutil>=5.9.0",
     "scipy>=1.11.3",
+    # Cross-process media-index source locks; keep the thread_local=False API
+    # used by the async executor handoff on the audited 4.0 line.
+    "filelock>=4.0.12,<4.1.0",
 
     # Spotify (Optional but in core)
     "spotipy>=2.24.0",
@@ -167,7 +183,7 @@ irodori = [
     # mem0ai protobuf>=5.29.6 requirement; putting DACVAE in this extra would
     # make pip downgrade protobuf and break the existing memory stack.
     "datasets>=3.0.0",
-    "huggingface-hub>=0.34.0,<1.0",
+    "huggingface-hub>=1.5.0,<1.16.3",
     "llvmlite>=0.43.0",
     "numba>=0.60.0",
     "peft>=0.18.0",
@@ -181,12 +197,11 @@ irodori = [
     "torch>=2.10.0,<2.11.0",
     "torchaudio>=2.10.0,<2.11.0",
     "torchcodec>=0.10.0,<0.11.0",
-    # v4.1-Small uses ModernBERT and runs on transformers 4.57+ as well as the
-    # current 5.x API.  The <6 upper bound allows the official v5 runtime when
-    # installed alone, while MioTTS/yomi's existing <5 constraints resolve to
-    # the tested 4.x compatibility path instead of an impossible dependency
-    # intersection.
-    "transformers>=4.57.6,<6",
+    # v4-Large uses T5Gemma2TextEncoder, which is available in the current
+    # upstream Irodori-TTS runtime only on Transformers 5.12.1+.  Sentence
+    # Transformers 5.7 remains compatible with Transformers 5.x, so the main
+    # AoiTalk environment can load both embedding models and Irodori v4-Large.
+    "transformers>=5.12.1,<6",
     "tqdm>=4.67.3",
 ]
 
@@ -205,10 +220,10 @@ miotts = [
 
 # TTS共通の日本語誤読リスク検出（各TTSエンジンから独立）
 yomi-linter = [
-    "huggingface-hub>=0.34.0,<1.0",
+    "huggingface-hub>=0.34.0,<1.16.3",
     "safetensors>=0.7.0",
     "torch>=2.2.0,<2.11.0",
-    "transformers>=4.48.0,<5",
+    "transformers>=4.48.0,<6",
 ]
 
 [tool.ruff]

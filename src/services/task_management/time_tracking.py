@@ -402,6 +402,8 @@ class TimeTrackingMixin:
             session, project_id=task.project_id, user_id=user_id, permission="write"
         )
         now = datetime.utcnow()
+        if entry.ended_at is None:
+            entry.ended_at = timer_now_db()
         entry.deleted_at = now
         entry.updated_at = now
         await session.commit()

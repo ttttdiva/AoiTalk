@@ -1,5 +1,7 @@
 "use client";
 
+import { revenueEvidenceClass, revenueCurrency, revenueAmountText, revenueCostClass, revenueProfitAmount, REVENUE_COST_SCOPE_NOTE } from "@/lib/media-revenue-display";
+
 import {
   useCallback,
   useEffect,
@@ -46,6 +48,8 @@ import {
   type MediaCharacterDetail,
   type MediaPersonaResource,
   type MediaPlatform,
+  type RevenueCostProjection,
+  type RevenueCostRecord,
 } from "@/lib/media-operations-api";
 import { operationsApi } from "@/lib/operations-api";
 import { Button } from "@/components/ui/button";
@@ -53,12 +57,15 @@ import { Checkbox } from "@/components/ui/checkbox";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { CostEntriesPanel } from "./cost-entries-panel";
+import { RevenueCostEditor } from "./revenue-cost-editor";
+import { RevenueCostSummary } from "./revenue-cost-summary";
 import { PlatformAccountPanel } from "@/components/operations/media/platform-account-panel";
 
 const PLATFORMS: readonly MediaPlatform[] = [
@@ -68,6 +75,8 @@ const PLATFORMS: readonly MediaPlatform[] = [
   "patreon",
   "youtube",
   "instagram",
+  "fanza",
+  "tiktok",
 ];
 
 const PLATFORM_LABELS: Record<MediaPlatform, string> = {
@@ -77,6 +86,8 @@ const PLATFORM_LABELS: Record<MediaPlatform, string> = {
   patreon: "Patreon",
   youtube: "YouTube",
   instagram: "Instagram",
+  fanza: "FANZA",
+  tiktok: "TikTok",
 };
 
 const SAFE_CAPABILITY_KEYS = new Set([
@@ -257,7 +268,7 @@ function readableError(error: unknown): string {
   if (error instanceof Error && error.message) {
     return error.message;
   }
-  return "Character Kernel APIでエラーが発生しました";
+  return "Persona APIでエラーが発生しました";
 }
 
 function splitPillars(value: string): string[] {
@@ -534,7 +545,7 @@ function CharacterCard({
       </div>
 
       <span className="mt-3 block text-[10px] text-muted-foreground group-hover:text-foreground">
-        Character ID: {character.id}
+        Persona ID: {character.id}
       </span>
     </button>
   );
@@ -776,10 +787,6 @@ const SAFE_DASHBOARD_METRIC_KEYS = new Set([
   "click_through_rate",
   "conversion_rate",
   "sample_size",
-  "gross_revenue",
-  "net_revenue",
-  "refunds",
-  "cost",
 ]);
 
 function safeDashboardNumber(value: unknown): number | null {
@@ -911,12 +918,16 @@ function metricBuckets(
     .slice(0, MAX_DASHBOARD_BUCKETS);
 }
 
-type DashboardRevenueBucket = {
+type DashboardRevenueBucket = RevenueCostProjection & {
   key: string;
   label: string;
   eventCount: number;
-  gross: number;
-  net: number;
+  gross: number | null;
+  net: number | null;
+  authorityLabel: string;
+  eventLabel: string;
+  revenueAuthority: string;
+  currency: string | null;
 };
 
 type RevenueDimension = "platform" | "account" | "currency" | "content";
@@ -926,7 +937,7 @@ function revenueDimension(
   dimension: RevenueDimension,
   accountsByRef: Map<string, CharacterDashboardConnectedAccount>,
 ): { key: string; label: string } {
-  const currency = safeDashboardText(item.currency, "").toUpperCase();
+  const currency = revenueCurrency(item.currency) ?? "";
   const withCurrency = (key: string, label: string) =>
     currency ? { key: `${key}|${currency}`, label: `${label} · ${currency}` } : { key, label };
   const accountRef = safeDashboardText(item.platform_account_ref, "");
@@ -960,15 +971,31 @@ function revenueBuckets(
 ): DashboardRevenueBucket[] {
   const buckets = new Map<string, DashboardRevenueBucket>();
   for (const item of items) {
-    const { key, label } = revenueDimension(item, dimension, accountsByRef);
-    const gross = safeDashboardNumber(item.gross_amount) ?? 0;
-    const net = safeDashboardNumber(item.net_amount) ?? 0;
-    const bucket = buckets.get(key) ?? { key, label, eventCount: 0, gross: 0, net: 0 };
+    const dimensionValue = revenueDimension(item, dimension, accountsByRef);
+    const { authority, eventType, authorityLabel, eventLabel } = revenueEvidenceClass(item.revenue_authority, item.event_type);
+    const costClass = revenueCostClass(item.cost_authority);
+    const key = JSON.stringify([dimensionValue.key, authority, eventType, costClass.authority]);
+    const bucket = buckets.get(key) ?? {
+      key, label: dimensionValue.label, eventCount: 0, gross: 0, net: 0,
+      authorityLabel, eventLabel, revenueAuthority: authority, currency: revenueCurrency(item.currency),
+      fee_amount: 0, production_cost_amount: 0, human_cost_amount: 0, human_minutes: 0,
+      profit_amount: 0, profit_status: "calculated_input_scope", cost_authority: costClass.authority,
+    };
     bucket.eventCount += 1;
-    bucket.gross += gross;
-    bucket.net += net;
-    if (!Number.isFinite(bucket.gross) || Math.abs(bucket.gross) > 1_000_000_000_000) bucket.gross = 0;
-    if (!Number.isFinite(bucket.net) || Math.abs(bucket.net) > 1_000_000_000_000) bucket.net = 0;
+    const currencyKnown = revenueCurrency(item.currency) !== null;
+    for (const [total, raw] of [["gross", item.gross_amount], ["net", item.net_amount]] as const) {
+      const value = safeDashboardNumber(raw);
+      bucket[total] = !currencyKnown || value === null || bucket[total] === null
+        ? null : safeDashboardNumber(bucket[total] + value);
+    }
+    for (const field of ["fee_amount", "production_cost_amount", "human_cost_amount", "human_minutes", "profit_amount"] as const) {
+      const raw = field === "profit_amount" ? revenueProfitAmount(item.profit_amount, item.profit_status, item.currency) : item[field];
+      const value = safeDashboardNumber(raw);
+      const total = bucket[field];
+      bucket[field] = (field !== "human_minutes" && !currencyKnown) || value === null || total == null
+        ? null : safeDashboardNumber(total + value);
+    }
+    if (item.profit_status !== "calculated_input_scope") bucket.profit_status = item.profit_status ?? "unavailable_cost_record";
     buckets.set(key, bucket);
   }
   return Array.from(buckets.values())
@@ -1004,8 +1031,10 @@ function RevenueBucketList({ buckets }: { buckets: DashboardRevenueBucket[] }) {
             <span className="shrink-0 text-[10px] text-muted-foreground">{bucket.eventCount}件</span>
           </div>
           <p className="mt-1 text-[10px] tabular-nums text-muted-foreground">
-            Gross {new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 2 }).format(bucket.gross)} · Net {new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 2 }).format(bucket.net)}
+            {bucket.eventLabel} · {bucket.authorityLabel}<br />
+            総額 {revenueAmountText(bucket.gross)} · 手取り {revenueAmountText(bucket.net)}
           </p>
+          <RevenueCostSummary item={bucket} currency={bucket.currency} revenueAuthority={bucket.revenueAuthority} />
         </li>
       ))}
     </ul>
@@ -1013,13 +1042,26 @@ function RevenueBucketList({ buckets }: { buckets: DashboardRevenueBucket[] }) {
 }
 
 function CharacterResultsSummary({ dashboard }: { dashboard: MediaCharacterDashboard }) {
+  const [selectedRevenueId, setSelectedRevenueId] = useState<string | null>(null);
+  const [costReadbacks, setCostReadbacks] = useState<Record<string, RevenueCostRecord | null>>({});
   const results = dashboard.results ?? { snapshot_count: 0, metrics: {}, last_observed_at: null };
   const accountsByRef = dashboardAccountMap(dashboard.connected_accounts ?? []);
   const metricPage = dashboard.metrics ?? dashboard.metrics_page;
   const revenuePage = dashboard.revenue ?? dashboard.revenue_page;
   const experimentPage = dashboard.experiments ?? dashboard.experiments_page;
   const metricItems = dashboardPageItems(metricPage);
-  const revenueItems = dashboardPageItems(revenuePage);
+  const revenueItems = dashboardPageItems(revenuePage).map((item) => {
+    if (!Object.prototype.hasOwnProperty.call(costReadbacks, item.id)) return item;
+    const record = costReadbacks[item.id];
+    if ((item.cost_revision ?? 0) > (record?.revision ?? 0)) return item;
+    return { ...item,
+      fee_amount: record?.fee_amount ?? null, production_cost_amount: record?.production_cost_amount ?? null,
+      human_cost_amount: record?.human_cost_amount ?? null, human_minutes: record?.human_minutes ?? null,
+      profit_amount: record?.profit_amount ?? null, profit_status: record?.profit_status ?? "unavailable_cost_record",
+      cost_authority: record?.cost_authority ?? "unknown", cost_record_id: record?.id ?? null, cost_revision: record?.revision ?? null,
+    };
+  });
+  const selectedRevenue = revenueItems.find((item) => item.id === selectedRevenueId);
   const experimentItems = dashboardPageItems(experimentPage);
   const fallbackMetrics = safeDashboardMetricMap(results.metrics);
   const metricCount = Object.keys(fallbackMetrics).length;
@@ -1072,6 +1114,7 @@ function CharacterResultsSummary({ dashboard }: { dashboard: MediaCharacterDashb
           <h5 className="flex items-center gap-1.5 text-xs font-semibold"><CircleDollarSign className="size-3" aria-hidden="true" />Revenue（媒体 / アカウント / 通貨 / コンテンツ）</h5>
           <span className="text-[10px] text-muted-foreground">{revenueTotal}件{revenuePage?.has_more ? "（続きあり）" : ""}</span>
         </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">表示中の{revenueItems.length}件を通貨・記録種別ごとに集計。通貨未指定の金額Metricは集計対象外です。{REVENUE_COST_SCOPE_NOTE}</p>
         {revenueItems.length ? (
           <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
             {revenueDimensions.map(({ key, label }) => (
@@ -1082,8 +1125,21 @@ function CharacterResultsSummary({ dashboard }: { dashboard: MediaCharacterDashb
             ))}
           </div>
         ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">Characterに紐づくRevenue eventはまだありません。</p>
+          <p className="mt-2 text-[11px] text-muted-foreground">Personaに紐づくRevenue eventはまだありません。</p>
         )}
+        {revenueItems.length ? <div className="mt-3 space-y-2">
+          <h6 className="text-xs font-semibold">売上ごとの費用記録</h6>
+          <ul className="space-y-2">{revenueItems.map((item) => {
+            const classification = revenueEvidenceClass(item.revenue_authority, item.event_type);
+            return <li key={item.id} className="rounded-md border border-border/60 p-2 text-xs">
+              <p>{item.event_at ? formatDate(item.event_at) : "日時不明"} · {item.platform ?? "媒体未設定"} · {classification.eventLabel} · {classification.authorityLabel}</p>
+              <p>売上 {item.id} · {item.content_ref ?? "コンテンツ未設定"} · {revenueCurrency(item.currency) ?? "通貨不明"} · 手取り {revenueAmountText(revenueCurrency(item.currency) ? item.net_amount : null)}</p>
+              <Button type="button" variant="outline" size="sm" className="mt-1" onClick={() => setSelectedRevenueId(item.id)} aria-label={`売上 ${item.id} の費用記録を開く`}>費用記録・訂正履歴</Button>
+            </li>;
+          })}</ul>
+          {selectedRevenue ? <RevenueCostEditor key={selectedRevenue.id} event={selectedRevenue} onClose={() => setSelectedRevenueId(null)} onReadback={(record) => setCostReadbacks((current) => ({ ...current, [selectedRevenue.id]: record }))} /> : null}
+        </div> : null}
+        <CostEntriesPanel dashboard={dashboard} revenueItems={revenueItems} onAllocated={(eventId, record) => setCostReadbacks((current) => ({ ...current, [eventId]: record }))} />
       </section>
 
       <section data-testid="character-dashboard-experiments" className="rounded-md border border-border/60 p-2.5">
@@ -1101,7 +1157,7 @@ function CharacterResultsSummary({ dashboard }: { dashboard: MediaCharacterDashb
             ))}
           </ul>
         ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">Characterに紐づくExperimentはまだありません。</p>
+          <p className="mt-2 text-[11px] text-muted-foreground">Personaに紐づくExperimentはまだありません。</p>
         )}
       </section>
     </div>
@@ -1129,7 +1185,7 @@ function CharacterDashboard({
           <CalendarSummary entries={dashboard.calendar ?? []} />
         </DashboardSection>
         <DashboardSection title="Results" icon={BarChart3} testId="character-dashboard-results">
-          <CharacterResultsSummary dashboard={dashboard} />
+          <CharacterResultsSummary key={dashboard.character.id} dashboard={dashboard} />
         </DashboardSection>
         <DashboardSection title="Learning" icon={Check} testId="character-dashboard-learning">
           <LearningSummary learning={dashboard.learning ?? { count: 0, pending_review_count: 0, items: [] }} />
@@ -1251,13 +1307,15 @@ function CharacterFormPanel({
       <CardHeader className="border-b border-border/70">
         <CardTitle className="flex items-center gap-2 text-sm">
           {editing ? <Pencil className="size-3.5" /> : <Plus className="size-3.5" />}
-          {editing ? "Characterを編集" : "Characterを作成"}
+          <span className="inline-flex items-center gap-1">
+            {editing ? "Personaを編集" : "Personaを作成"}
+            <HelpPopover label={editing ? "Personaを編集" : "Personaを作成"}>
+              {editing
+                ? "更新は新しいRevisionとして保存され、過去の内容は上書きされません。"
+                : "必要な情報だけ入力してPersonaを追加します。作成時に初期データは生成しません。"}
+            </HelpPopover>
+          </span>
         </CardTitle>
-        <CardDescription>
-          {editing
-            ? "更新は新しいRevisionとして保存され、過去の内容は上書きされません。"
-            : "必要な情報だけ入力してCharacterを追加します。作成時に初期データは生成しません。"}
-        </CardDescription>
       </CardHeader>
 
       <CardContent className="pt-4">
@@ -1353,9 +1411,9 @@ function CharacterFormPanel({
   );
 }
 
-export function MediaPersonaPanel() {
+export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: string } = {}) {
   const [characters, setCharacters] = useState<MediaCharacter[]>([]);
-  const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
+  const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(initialPersonaId ?? null);
   const [detail, setDetail] = useState<MediaCharacterDetail | null>(null);
   const [dashboard, setDashboard] = useState<MediaCharacterDashboard | null>(null);
   const [form, setForm] = useState<CharacterForm>(emptyForm);
@@ -1406,7 +1464,7 @@ export function MediaPersonaPanel() {
       if (reset) {
         setSelectedCharacterId((current) => {
           if (current && deduped.some((item) => item.id === current)) return current;
-          const nextId = deduped[0]?.id ?? null;
+          const nextId = initialPersonaId ? null : deduped[0]?.id ?? null;
           if (!nextId) {
             setDetail(null);
             setDashboard(null);
@@ -1424,7 +1482,7 @@ export function MediaPersonaPanel() {
         else setLoadingMore(false);
       }
     }
-  }, []);
+  }, [initialPersonaId]);
 
   const loadResources = useCallback(async (characterId: string) => {
     const requestId = ++resourceRequestRef.current;
@@ -1545,14 +1603,14 @@ export function MediaPersonaPanel() {
         if (!dirtyFields.size) return;
         const patch = patchInputFromForm(detail, form, dirtyFields);
         saved = await mediaOperationsApi.patchCharacter(detail.id, patch, newIdempotencyKey());
-        toast.success("Characterを更新しました");
+        toast.success("Personaを更新しました");
       } else {
         const input: CharacterCreateInput = createInputFromForm(form);
         saved = await mediaOperationsApi.createCharacter(
           input,
           newIdempotencyKey(),
         );
-        toast.success("Characterを作成しました");
+        toast.success("Personaを作成しました");
       }
 
       setDetail(saved);
@@ -1652,10 +1710,12 @@ export function MediaPersonaPanel() {
     <div className="space-y-5" data-testid="media-persona-panel">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">Characters</h2>
-          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            Character Kernelで発信人格を管理します。Character数に固定枠はなく、接続・調査・生成・予定・結果・学習の状態をCharacter単位で確認できます。
-          </p>
+          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
+            Persona（発信人格）
+            <HelpPopover label="Persona（発信人格）">
+              Persona（発信人格）のうち、固定slotに紐づかないものを管理します。会話用Characterとは別です。接続・調査・生成・予定・結果・学習をPersona単位で確認できます。
+            </HelpPopover>
+          </h2>
         </div>
         <div className="flex gap-2">
           <Button type="button" variant="outline" size="sm" onClick={() => void loadCharacters()} disabled={loading}>
@@ -1663,7 +1723,7 @@ export function MediaPersonaPanel() {
             更新
           </Button>
           <Button type="button" size="sm" onClick={beginCreate} data-testid="character-create-button">
-            <Plus className="size-3.5" /> Characterを追加
+            <Plus className="size-3.5" /> Personaを追加
           </Button>
         </div>
       </div>
@@ -1672,14 +1732,17 @@ export function MediaPersonaPanel() {
 
       <Card size="sm" data-testid="character-list-card">
         <CardHeader className="border-b border-border/70">
-          <CardTitle className="text-sm">Characters</CardTitle>
-          <CardDescription>{characters.length}件 · Character Kernelの一覧</CardDescription>
+          <CardTitle className="inline-flex items-center gap-1 text-sm">
+            Persona（発信人格）
+            <HelpPopover label="Persona一覧">slotなしPersonaの一覧です。</HelpPopover>
+          </CardTitle>
+          <p className="text-sm text-muted-foreground">{characters.length}件</p>
         </CardHeader>
         <CardContent className="pt-4">
           <form className="mb-4 flex gap-2" aria-label="Character search" onSubmit={submitSearch}>
             <Input
               value={searchInput}
-              aria-label="Characterを検索"
+              aria-label="Personaを検索"
               placeholder="名前・概要で検索"
               onChange={(event) => setSearchInput(event.target.value)}
             />
@@ -1696,7 +1759,7 @@ export function MediaPersonaPanel() {
               ))}
             </div>
           ) : (
-            <EmptyState>Characterはまだありません。「Characterを追加」から作成してください。</EmptyState>
+            <EmptyState>Personaはまだありません。「Personaを追加」から作成してください。</EmptyState>
           )}
           {hasMore ? (
             <div className="mt-4 flex justify-center">
@@ -1714,8 +1777,7 @@ export function MediaPersonaPanel() {
 
         <Card size="sm" data-testid="character-detail-card">
           <CardHeader className="border-b border-border/70">
-            <CardTitle className="flex items-center gap-2 text-sm"><Users className="size-3.5" /> Character dashboard</CardTitle>
-            <CardDescription>選択したCharacterの状態を関連するMedia Operationsから集約します。</CardDescription>
+            <CardTitle className="flex items-center gap-2 text-sm"><Users className="size-3.5" /><span className="inline-flex items-center gap-1">Persona dashboard<HelpPopover label="Persona dashboard">選択したPersonaの状態を関連するMedia Operationsから集約します。</HelpPopover></span></CardTitle>
           </CardHeader>
           <CardContent className="space-y-4 pt-4">
             {detailLoading ? (
@@ -1738,8 +1800,10 @@ export function MediaPersonaPanel() {
                 <section className="rounded-lg border border-border/70 bg-background/40 p-3" data-testid="character-resources">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
-                      <h4 className="text-xs font-semibold">Avatar / Persona resources</h4>
-                      <p className="mt-0.5 text-[10px] text-muted-foreground">アップロード済みのサーバー素材のみ表示します。</p>
+                      <h4 className="inline-flex items-center gap-1 text-xs font-semibold">
+                        Avatar / Persona resources
+                        <HelpPopover label="Avatar / Persona resources">アップロード済みのサーバー素材のみ表示します。</HelpPopover>
+                      </h4>
                     </div>
                     <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={onAvatarInput} />
                     <Button type="button" size="sm" variant="outline" onClick={() => avatarInputRef.current?.click()} disabled={avatarUploading}>
@@ -1777,7 +1841,7 @@ export function MediaPersonaPanel() {
             ) : detail ? (
               <div className="py-8 text-center text-sm text-muted-foreground">Dashboardを読み込めませんでした。</div>
             ) : (
-              <div className="py-8 text-center text-sm text-muted-foreground">Characterを選択するか、新しいCharacterを作成してください。</div>
+              <div className="py-8 text-center text-sm text-muted-foreground">Personaを選択するか、新しいPersonaを作成してください。</div>
             )}
           </CardContent>
         </Card>

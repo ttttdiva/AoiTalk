@@ -10,6 +10,25 @@ export type FilesDownloadResult =
   | { status: "shared" };
 
 type ResolveDownloadUri = () => Promise<string>;
+type AssertCurrent = () => Promise<void>;
+
+export type FilesDownloadProgress = {
+  operation: "create" | "copy" | "share";
+  state: "started" | "completed";
+};
+
+type ReportProgress = (event: FilesDownloadProgress) => void;
+
+function reportProgress(
+  callback: ReportProgress | undefined,
+  event: FilesDownloadProgress,
+): void {
+  try {
+    callback?.(event);
+  } catch {
+    // Progress reporting must never change the native file operation result.
+  }
+}
 
 export function getUniqueDownloadName(
   requestedName: string,
@@ -43,6 +62,8 @@ export function getUniqueDownloadName(
 export async function downloadFileToDevice(
   entry: FilesEntry,
   resolveDownloadUri: ResolveDownloadUri,
+  assertCurrent?: AssertCurrent,
+  reportExternalProgress?: ReportProgress,
 ): Promise<FilesDownloadResult> {
   if (entry.type !== "file") {
     throw new Error("フォルダーはダウンロードできません");
@@ -57,6 +78,7 @@ export async function downloadFileToDevice(
       await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
         initialDirectoryUri,
       );
+    await assertCurrent?.();
     if (!permission.granted) {
       return { status: "cancelled" };
     }
@@ -64,8 +86,14 @@ export async function downloadFileToDevice(
     const existingNames = await FileExporter.listDisplayNames(
       permission.directoryUri,
     );
+    await assertCurrent?.();
     const destinationName = getUniqueDownloadName(entry.name, existingNames);
     const sourceUri = await resolveDownloadUri();
+    await assertCurrent?.();
+    reportProgress(reportExternalProgress, {
+      operation: "create",
+      state: "started",
+    });
     const destinationUri =
       await FileSystem.StorageAccessFramework.createFileAsync(
         permission.directoryUri,
@@ -75,17 +103,43 @@ export async function downloadFileToDevice(
         destinationName,
         "application/octet-stream",
       );
+    reportProgress(reportExternalProgress, {
+      operation: "create",
+      state: "completed",
+    });
+    await assertCurrent?.();
+    reportProgress(reportExternalProgress, {
+      operation: "copy",
+      state: "started",
+    });
     await FileExporter.copyFileToContentUri(sourceUri, destinationUri);
+    reportProgress(reportExternalProgress, {
+      operation: "copy",
+      state: "completed",
+    });
+    await assertCurrent?.();
     return { status: "saved", uri: destinationUri };
   }
 
-  if (!(await Sharing.isAvailableAsync())) {
+  const sharingAvailable = await Sharing.isAvailableAsync();
+  await assertCurrent?.();
+  if (!sharingAvailable) {
     throw new Error("この端末ではファイル保存を利用できません");
   }
   const sourceUri = await resolveDownloadUri();
+  await assertCurrent?.();
+  reportProgress(reportExternalProgress, {
+    operation: "share",
+    state: "started",
+  });
   await Sharing.shareAsync(sourceUri, {
     dialogTitle: `${entry.name} を保存`,
     mimeType,
   });
+  reportProgress(reportExternalProgress, {
+    operation: "share",
+    state: "completed",
+  });
+  await assertCurrent?.();
   return { status: "shared" };
 }

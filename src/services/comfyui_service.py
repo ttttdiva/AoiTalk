@@ -16,7 +16,6 @@ import random
 import re
 import socket
 import stat
-import time
 import uuid
 from pathlib import Path
 from collections.abc import Mapping
@@ -34,9 +33,8 @@ from .outbound_privacy_service import (
 
 logger = logging.getLogger(__name__)
 
-# 出力ディレクトリ
-OUTPUT_DIR = Path("temp/generated_images")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# 生成画像は製品データ領域へ集約し、repository root に temp/ を作らない。
+OUTPUT_DIR = Path("data/generated_media")
 
 # ワークフローディレクトリ
 WORKFLOWS_DIR = Path("config/comfyui_workflows")
@@ -1031,6 +1029,7 @@ class ComfyUIService:
         negative_prompt: str = "",
         workflow_path: Optional[str] = None,
         overrides: Optional[Dict[str, Any]] = None,
+        output_dir: str | Path | None = None,
     ) -> str:
         """画像を生成し、ローカルファイルパスを返す。
 
@@ -1071,7 +1070,7 @@ class ComfyUIService:
         result = await self._wait_for_completion(prompt_id)
 
         # 画像ダウンロード
-        image_path = await self._download_result_image(result)
+        image_path = await self._download_result_image(result, output_dir=output_dir)
         logger.info("ComfyUI 画像生成完了: %s", image_path)
 
         return str(image_path)
@@ -1388,7 +1387,12 @@ class ComfyUIService:
             raise ComfyUIError(f"生成失敗: {status.get('messages', [])}")
         return dict(recovered.get("history") or {})
 
-    async def _download_result_image(self, history_entry: dict) -> Path:
+    async def _download_result_image(
+        self,
+        history_entry: dict,
+        *,
+        output_dir: str | Path | None = None,
+    ) -> Path:
         """生成結果の画像をダウンロードしてローカルに保存する。"""
         outputs = history_entry.get("outputs", {})
 
@@ -1404,9 +1408,26 @@ class ComfyUIService:
                     {"filename": filename, "subfolder": subfolder, "type": "output"}
                 )
                 ext = Path(filename).suffix or ".png"
-                output_name = f"comfyui_{int(time.time())}_{random.randint(1000, 9999)}{ext}"
-                output_path = OUTPUT_DIR / output_name
-                output_path.write_bytes(content)
+                if output_dir is None:
+                    # Standalone tool output remains in the configured product
+                    # media root. DB-backed callers pass an ephemeral staging
+                    # directory and publish their canonical copy themselves.
+                    from .generated_media_storage import (
+                        get_media_root,
+                        media_relative_path,
+                        write_media,
+                    )
+
+                    logical_path = f"generated_media/{uuid.uuid4().hex}{ext}"
+                    await write_media(logical_path, content, OUTPUT_DIR)
+                    root = get_media_root(OUTPUT_DIR)
+                    return root.resolve(media_relative_path(logical_path))
+
+                destination_root = Path(output_dir).expanduser().resolve()
+                destination_root.mkdir(parents=True, exist_ok=True)
+                output_path = destination_root / f"comfyui_{uuid.uuid4().hex}{ext}"
+                with output_path.open("xb") as target:
+                    target.write(content)
                 return output_path.resolve()
 
         raise ComfyUIError("生成結果に画像が含まれていません")
@@ -1450,6 +1471,7 @@ async def generate_image(
     negative_prompt: str = "",
     workflow_path: Optional[str] = None,
     overrides: Optional[Dict[str, Any]] = None,
+    output_dir: str | Path | None = None,
 ) -> Dict[str, Any]:
     """ComfyUIで画像生成し、呼び出し元が扱いやすいdictで返す。"""
     service = get_comfyui_service()
@@ -1463,6 +1485,7 @@ async def generate_image(
         negative_prompt=negative_prompt,
         workflow_path=workflow_path,
         overrides=overrides or {},
+        output_dir=output_dir,
     )
     filename = Path(image_path).name
     return {

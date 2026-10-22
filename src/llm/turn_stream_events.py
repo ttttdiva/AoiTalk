@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 from typing import Any, Callable, Optional
@@ -173,12 +174,13 @@ def emit_assistant_text(
     text: Any,
     *,
     round_index: int,
+    tool_names: Any = (),
 ) -> bool:
     """ツール往復ラウンドの通常テキストを配信する。空文字なら何もしない。"""
     if emitter is None:
         return False
-    value = str(text or "").strip()
-    if not value:
+    value = strip_leading_think_markup(str(text or "")).strip()
+    if not value or looks_like_tool_call_echo(value, tool_names):
         return False
     emitter(ASSISTANT_TEXT_EVENT, {"text": value, "round": int(round_index)})
     return True
@@ -315,6 +317,186 @@ def strip_leading_think_markup(text: Any) -> str:
     if value.startswith("<think>") and "</think>" in value:
         value = value.split("</think>", 1)[1].lstrip()
     return value
+
+
+_TOOL_CALL_ECHO_PREFIX_RE = re.compile(
+    r"^\s*(?:【\s*ツール[^】]{0,12}】|\[\s*ツール[^\]]{0,12}\]|<\s*/?\s*tool_call\s*>"
+    r"|(?:tool[ _]?call|function[ _]?call|ツール(?:実行|呼び出し))\s*[:：])",
+    re.IGNORECASE,
+)
+
+
+_NATIVE_TOOL_CALL_START = "<|tool_call_start|>"
+_NATIVE_TOOL_CALL_END = "<|tool_call_end|>"
+_NATIVE_TOOL_CALL_BLOCK_RE = re.compile(
+    re.escape(_NATIVE_TOOL_CALL_START) + r".*?" + re.escape(_NATIVE_TOOL_CALL_END),
+    re.DOTALL,
+)
+
+
+def _is_native_special_token_tool_call(value: str) -> bool:
+    """Return whether text is only special-token wrapped tool calls.
+
+    LFM2/LFM2.5 chat templates wrap tool calls in the control tokens
+    ``<|tool_call_start|>[fn(arg=...)]<|tool_call_end|>``.  When the provider
+    did not parse them (for example a plain stream without ``tools``), the
+    control tokens arrive as text.  They are never user-facing prose, so the
+    wrapper itself is authoritative regardless of the called name.  A
+    trailing unterminated block (output cut by the token limit) is included.
+    """
+
+    if not value.startswith(_NATIVE_TOOL_CALL_START):
+        return False
+    remainder = _NATIVE_TOOL_CALL_BLOCK_RE.sub("", value).strip()
+    if not remainder:
+        return True
+    return (
+        remainder.startswith(_NATIVE_TOOL_CALL_START)
+        and _NATIVE_TOOL_CALL_END not in remainder
+    )
+
+
+def _call_suffix_state(value: str) -> str:
+    """Classify a parenthesized/object argument suffix for stream guards."""
+
+    text = str(value or "").lstrip()
+    if not text or text[0] not in "({[":
+        return "invalid"
+    closing = {"(": ")", "{": "}", "[": "]"}
+    stack: list[str] = []
+    quote = ""
+    escaped = False
+    for index, char in enumerate(text):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            continue
+        if char in closing:
+            stack.append(closing[char])
+            continue
+        if char in ")}]":
+            if not stack or char != stack.pop():
+                return "invalid"
+            if not stack:
+                return "complete" if not text[index + 1 :].strip() else "trailing"
+    return "incomplete"
+
+
+def _has_complete_call_suffix(value: str) -> bool:
+    """Return whether a parenthesized/object argument suffix is complete.
+
+    Stream chunks frequently end in the middle of a generated call.  The
+    complete echo detector must wait for the closing delimiter so a normal
+    sentence beginning with a registered tool name is not discarded.
+    """
+
+    return _call_suffix_state(value) == "complete"
+
+
+def _has_incomplete_call_suffix(value: str) -> bool:
+    """Return whether an argument opener has no closing delimiter yet."""
+
+    return _call_suffix_state(value) == "incomplete"
+
+
+def _echo_tool_name_allowed(name: str, names: set[str]) -> bool:
+    """Apply registered-name authority, with the legacy empty-set fallback."""
+
+    if name in names:
+        return True
+    # A few legacy event callers cannot expose a registry.  Keep their
+    # marker+``tool_name`` guard for unmistakable underscore-style names, but
+    # never treat arbitrary prose or an unknown JSON object as a tool echo.
+    return not names and "_" in name
+
+
+def looks_like_tool_call_echo(text: Any, tool_names: Any = ()) -> bool:
+    """Return true when text is only a generated tool-call/log echo.
+
+    This detector is shared by streamed assistant events and provider final
+    answer guards.  It deliberately accepts long JSON arguments while
+    requiring a call-shaped remainder for long marker-prefixed text.
+    """
+
+    value = strip_leading_think_markup(str(text or "")).strip()
+    if not value:
+        return False
+    if _is_native_special_token_tool_call(value):
+        return True
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        payload = None
+    names = {str(name) for name in tool_names or () if name}
+    if isinstance(payload, dict) and isinstance(payload.get("name"), str) and (
+        "arguments" in payload or "parameters" in payload
+    ):
+        return bool(names) and payload["name"] in names
+    if isinstance(payload, list) and payload and all(
+        isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and ("arguments" in item or "parameters" in item)
+        for item in payload
+    ):
+        return bool(names) and all(item["name"] in names for item in payload)
+    prefix_match = _TOOL_CALL_ECHO_PREFIX_RE.match(value)
+    if prefix_match:
+        remainder = value[prefix_match.end() :].lstrip()
+        if not remainder:
+            return False
+        # Some providers put the normal registered JSON shape after a marker.
+        # Reuse the strict JSON path above, without making marker prose an
+        # unconditional echo.
+        if remainder[:1] in "{[":
+            try:
+                marked_payload = json.loads(remainder)
+            except (TypeError, ValueError):
+                marked_payload = None
+            if isinstance(marked_payload, dict) and isinstance(
+                marked_payload.get("name"), str
+            ):
+                return bool(names) and marked_payload["name"] in names and (
+                    "arguments" in marked_payload
+                    or "parameters" in marked_payload
+                )
+            if isinstance(marked_payload, list) and marked_payload and all(
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and ("arguments" in item or "parameters" in item)
+                for item in marked_payload
+            ):
+                return bool(names) and all(item["name"] in names for item in marked_payload)
+            return False
+        name_match = re.fullmatch(
+            r"`?([A-Za-z_][A-Za-z0-9_.-]*)`?\s*(.*)",
+            remainder,
+            flags=re.DOTALL,
+        )
+        if not name_match:
+            return False
+        name, tail = name_match.groups()
+        if not _echo_tool_name_allowed(name, names):
+            return False
+        tail = tail.lstrip()
+        # A marker followed by the exact registered name is the final echo
+        # shape seen from local models (for example ``【ツール実行】 media_search``).
+        return not tail or _has_complete_call_suffix(tail)
+    match = re.match(
+        r"^`?([A-Za-z_][A-Za-z0-9_.-]*)`?\s*(.*)$",
+        value,
+        flags=re.DOTALL,
+    )
+    if match and _echo_tool_name_allowed(match.group(1), names):
+        rest = match.group(2).strip()
+        return not rest or _has_complete_call_suffix(rest)
+    return False
 
 
 def thinking_text_from_message(message: Any) -> str:

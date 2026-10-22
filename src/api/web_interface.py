@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_FASTAPI_STARTUP_TIMEOUT_SECONDS = 120.0
 _MAX_FASTAPI_STARTUP_TIMEOUT_SECONDS = 600.0
 _STARTUP_CANCEL_JOIN_SECONDS = 2.0
+_FASTAPI_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 # Keep readiness-clock calls behind tiny helpers so regression tests can model
@@ -161,6 +162,10 @@ class WebChatInterface:
     def set_llm_client_change_callback(self, callback):
         """Set callback invoked when the server switches LLM clients."""
         self.server.set_llm_client_change_callback(callback)
+
+    def set_session_llm_route_change_callback(self, callback):
+        """Set callback for session route cache retirement."""
+        self.server.set_session_llm_route_change_callback(callback)
 
     def set_llm_client(self, llm_client):
         """Set the active LLM client on the server."""
@@ -573,6 +578,7 @@ class WebChatInterface:
                     ssl_certfile=ssl_certfile if use_ssl else None,
                     ws_ping_interval=30,
                     ws_ping_timeout=10,
+                    timeout_graceful_shutdown=_FASTAPI_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
                 )
                 self.uvicorn_server = uvicorn.Server(config)
                 _startup_timer.mark("startup.web.fastapi.uvicorn_configured")

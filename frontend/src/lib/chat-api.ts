@@ -1,3 +1,4 @@
+import { withBasePath } from "@/lib/base-path";
 /**
  * チャットAPI クライアント
  * /api/ 経由（Next.js Route Handler）
@@ -8,6 +9,10 @@ export type { ChatCommandCapability } from "@/lib/chat-commands";
 import type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
 export type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
 import type { components } from "@/lib/api-types.gen";
+import {
+  normalizeCharacterOptions,
+  resolveCurrentCharacterSlug,
+} from "@/lib/character-options";
 
 // ─── OpenAPI 生成型ユーティリティ ───
 // FastAPI の OpenAPI スキーマから openapi-typescript が生成した型。
@@ -15,6 +20,23 @@ import type { components } from "@/lib/api-types.gen";
 // 経由（= FastAPI 直）のリクエストボディはここから型を引く。
 // （`/api/conversations/...` 等の Next.js BFF 経由は OpenAPI 対象外なので触らない）
 type Schemas = components["schemas"];
+export type MemorySelectionResponse = Schemas["MemorySelectionResponse"];
+export type MemorySelectionItem = Schemas["MemorySelectionItem"];
+export type MemoryToolReference = Schemas["MemoryToolReference"];
+export type MemoryToolProjection = Schemas["MemoryToolProjection"];
+
+/**
+ * Canonical status projected by the conversation history endpoint.
+ *
+ * The sidebar must consume this server projection as-is.  In particular, it
+ * must not reconstruct a history status from development_status, is_unread,
+ * or a client-side generation flag because ordinary chats and App sessions
+ * share the same history surface.
+ */
+export type ConversationHistoryStatus =
+  components["schemas"]["ConversationHistorySessionProjection"]["history_status"];
+/** Web adapter alias; the wire contract calls this ConversationHistoryStatus. */
+export type ChatHistoryStatus = ConversationHistoryStatus;
 
 // openapi-typescript は Pydantic のサーバー側デフォルト値を持つフィールドを
 // required として出力する。クライアント送信では省略可能なため、指定キーを任意化する。
@@ -32,12 +54,21 @@ export type ConversationSession = {
   last_activity?: string | null;
   message_count: number;
   is_active: boolean;
+  is_pinned?: boolean;
+  pinned_at?: string | null;
+  pin_updated_at?: string | null;
   /** Public session metadata; privacy_mode is used only for effective-mode display. */
   context?: Record<string, unknown>;
   project_id?: string | null;
+  /** Durable Operations Agent binding; Character remains presentation/voice state. */
+  agent_id?: string | null;
+  agent_binding_updated_at?: string | null;
   is_group_chat?: boolean;
   app_id?: string | null;
   app_target_id?: string | null;
+  /** Server-projected status shared by ordinary chats and App sessions. */
+  history_status?: ConversationHistoryStatus | null;
+  history_completed_at?: string | null;
   development_status?: "working" | "waiting_for_user" | "completed" | null;
   last_read_at?: string | null;
   is_unread?: boolean;
@@ -59,6 +90,14 @@ export type ConversationParticipant = {
   auto_respond?: boolean;
   metadata?: Record<string, unknown>;
 };
+
+/** Generate the UUID used by canonical client-session create/replay requests. */
+export function createStableClientSessionId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `00000000-0000-4000-8000-${Math.random().toString(16).slice(2, 14).padEnd(12, "0")}`;
+}
 
 export type ChatAttachmentKind =
   | "wbs"
@@ -450,6 +489,10 @@ export type ChatResponseModelOption = ChatResponseModelSelection & {
   label: string;
   providerLabel: string;
   modelLabel: string;
+  reasoningEffortOptions?: string[];
+  reasoningEffortDefault?: string | null;
+  reasoningEffortKind?: string;
+  supportsReasoning?: boolean;
   isCurrent?: boolean;
 };
 
@@ -460,14 +503,28 @@ export type LlmCatalogModelOption = {
   installed?: boolean;
   source?: string;
   source_label?: string;
+  /** Managed local runtime identity/status metadata when available. */
+  runtime?: string | null;
+  runtime_state?: string | null;
+  runtime_status?: string | null;
+  managed_runtime?: boolean;
+  prepared?: boolean | null;
+  model_installed?: boolean | null;
+  server_state?: string | null;
   provider_configured?: boolean;
   custom_current?: boolean;
   selection_kind?: "static" | "routing_profile";
   routing_profile_id?: string;
   reasoning_effort_options?: string[];
-  reasoning_effort_default?: string;
+  reasoning_effort_default?: string | null;
+  reasoning_effort_kind?: string;
   reasoning_effort_supports_disable?: boolean;
   reasoning_effort_wire?: { transport?: string; path?: string };
+  /** Profile-owned response-mode metadata for managed local models. */
+  thinking_mode?: string;
+  runtime_profile?: {
+    thinking_mode?: string;
+  };
   context_window_tokens?: number | null;
   supports_reasoning?: boolean;
 };
@@ -487,8 +544,9 @@ export type LlmCatalogProvider = {
   /** Compatibility alias for consumers that call this projection available_models. */
   available_models?: LlmCatalogModelOption[];
   availability?: {
-    state?: "available" | "empty" | "error" | "blocked" | "catalog" | string;
+    state?: "available" | "standby" | "empty" | "error" | "blocked" | "catalog" | string;
     error?: string | null;
+    message?: string | null;
   };
   settings?: {
     api_key_configured?: boolean;
@@ -522,6 +580,11 @@ export type ConversationSearchResult = {
   created_at?: string | null;
   last_activity?: string | null;
   project_id?: string | null;
+  agent_id?: string | null;
+  history_status?: ConversationHistoryStatus | null;
+  history_completed_at?: string | null;
+  is_pinned?: boolean;
+  pinned_at?: string | null;
 };
 
 export type ConversationGenerationStatus = {
@@ -641,6 +704,9 @@ export type AgentRun = {
   root_run_id?: string | null;
   parent_run_id?: string | null;
   session_id?: string | null;
+  agent_id?: string | null;
+  agent_revision_id?: string | null;
+  work_item_id?: string | null;
   project_id?: string | null;
   user_id?: string | null;
   run_type: string;
@@ -830,7 +896,7 @@ async function requestOnce<T>(
     if (res.status === 401) {
       const shouldRedirectToLogin = !path.startsWith("/api/python-proxy/");
       if (shouldRedirectToLogin && typeof window !== "undefined") {
-        window.location.href = "/login";
+        window.location.href = withBasePath("/login");
       }
     }
     throw new ChatApiError(details.message, res.status, details);
@@ -909,55 +975,32 @@ export const chatApi = {
     const data = await request<{
       current?: unknown;
       characters?: unknown;
+      character_options?: unknown;
     }>("/api/python-proxy/characters", {
       cache: "no-store",
       timeoutMs: 5000,
     });
+    const options = normalizeCharacterOptions(data);
     const current = typeof data.current === "string" ? data.current.trim() : "";
-    const characters = Array.isArray(data.characters)
-      ? data.characters.filter(
-          (value): value is string =>
-            typeof value === "string" && value.trim().length > 0,
-        )
-      : [];
-    if (!current) {
+    const explicitSlug = options.find((option) => option.slug === current);
+    const displayNameMatches = options.filter(
+      (option) => option.name === current,
+    );
+    const isProjectManagerAlias =
+      current === "project_management_assistant" &&
+      options.some((option) => option.slug === "project_manager");
+    if (
+      !explicitSlug &&
+      !isProjectManagerAlias &&
+      displayNameMatches.length !== 1
+    ) {
       throw new Error("現在のキャラクターを取得できませんでした");
     }
-    if (characters.length === 0 || characters.includes(current)) return current;
-
-    // /api/characters は表示名だけを返す旧互換APIのため、current が
-    // canonical slug（例: kotonoha_aoi）になっている場合は詳細一覧で
-    // 解決してからセッション作成へ渡す。
-    const catalog = await request<{
-      characters?: Array<{
-        slug?: unknown;
-        name?: unknown;
-        recognition_aliases?: unknown;
-      }>;
-    }>("/api/python-proxy/characters/manage?enabled_only=true", {
-      cache: "no-store",
-      timeoutMs: 5000,
-    });
-    const key = current.toLocaleLowerCase();
-    const match = (
-      Array.isArray(catalog.characters) ? catalog.characters : []
-    ).find((character) => {
-      const candidates = [
-        character.slug,
-        character.name,
-        ...(Array.isArray(character.recognition_aliases)
-          ? character.recognition_aliases
-          : []),
-      ];
-      return candidates.some(
-        (candidate) =>
-          typeof candidate === "string" &&
-          candidate.trim().toLocaleLowerCase() === key,
-      );
-    });
-    const slug = typeof match?.slug === "string" ? match.slug.trim() : "";
-    if (slug) return slug;
-    throw new Error("現在のキャラクターを解決できませんでした");
+    const currentSlug = resolveCurrentCharacterSlug(options, data.current);
+    if (!currentSlug || !options.some((option) => option.slug === currentSlug)) {
+      throw new Error("現在のキャラクターを取得できませんでした");
+    }
+    return currentSlug;
   },
 
   /** セッションのキャラクター種別（assistant / roleplay 等）を取得 */
@@ -1034,8 +1077,16 @@ export const chatApi = {
       model?: string;
       effort?: string;
     } | null,
-  ) =>
-    request<{
+    agentId?: string | null,
+    clientSessionId?: string | null,
+  ) => {
+    const normalizedAgentId =
+      typeof agentId === "string" ? agentId.trim() || null : agentId;
+    const normalizedClientSessionId = clientSessionId?.trim() || null;
+    const canonicalClientSessionId = normalizedAgentId
+      ? normalizedClientSessionId ?? createStableClientSessionId()
+      : normalizedClientSessionId;
+    return request<{
       session: ConversationSession;
       initial_message?: ConversationMessage;
     }>("/api/conversations", {
@@ -1045,12 +1096,27 @@ export const chatApi = {
         project_id: projectId,
         app_id: appContext?.appId,
         app_target_id: appContext?.targetId,
+        ...(agentId !== undefined ? { agent_id: normalizedAgentId } : {}),
+        ...(canonicalClientSessionId
+          ? { client_session_id: canonicalClientSessionId }
+          : {}),
         initial_message: initialMessage,
-        ...(mainRoute?.provider && mainRoute?.model
+        ...(!normalizedAgentId && mainRoute?.provider && mainRoute?.model
           ? { main_route: mainRoute }
           : {}),
       }),
-    }),
+    }).then((result) => {
+      if (
+        normalizedAgentId &&
+        (result.session.agent_id?.trim() || null) !== normalizedAgentId
+      ) {
+        throw new Error(
+          "サーバーでAgent bindingを確認できなかったため、Chatを開始しませんでした。",
+        );
+      }
+      return result;
+    });
+  },
 
   /**
    * セッションのメッセージ一覧取得。
@@ -1081,6 +1147,16 @@ export const chatApi = {
         retryDelayMs: 300,
       },
     ),
+
+  getMemorySelection: (sessionId: string, selector: { agentRunId?: string; messageId?: string }, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (selector.agentRunId) query.set("agent_run_id", selector.agentRunId);
+    if (selector.messageId) query.set("message_id", selector.messageId);
+    return request<MemorySelectionResponse>(
+      `/api/python-proxy/conversations/${encodeURIComponent(sessionId)}/memory-selection?${query}`,
+      { cache: "no-store", signal, retries: 0 },
+    );
+  },
 
   /** セッションにメッセージを追加 */
   addMessage: (
@@ -1137,7 +1213,10 @@ export const chatApi = {
       | "include_project_context"
       | "skip_user_persistence"
       | "cloud_advisor_explicit"
-    >,
+    > & {
+      /** Optional CAS token checked against the canonical session binding. */
+      expected_agent_id?: string | null;
+    },
   ) =>
     request<{
       success: boolean;
@@ -1240,6 +1319,15 @@ export const chatApi = {
       method: "PATCH",
       body: JSON.stringify({ title }),
     }),
+
+  updateSessionPinned: (sessionId: string, isPinned: boolean) =>
+    request<{ success: boolean; session: ConversationSession }>(
+      `/api/conversations/${sessionId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ is_pinned: isPinned }),
+      },
+    ),
 
   markSessionRead: (sessionId: string) =>
     request<{

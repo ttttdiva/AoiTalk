@@ -13,6 +13,10 @@ import {
   assertRunnerPermission,
   AppsOfflineMutationError,
   AppsPermissionError,
+  AppRuntimeContractError,
+  normalizeAppRuntimeFile,
+  normalizeAppRuntimeDeclaration,
+  normalizeAppRuntimeRun,
   permissionAtLeast,
   type AppContext,
   type AppFile,
@@ -20,6 +24,11 @@ import {
   type AppJob,
   type AppJobType,
   type AppRelease,
+  type AppRuntimeDeclaration,
+  type AppRuntimeFileModel,
+  type AppRuntimeFileAsset,
+  type AppRuntimeInputFile,
+  type AppRuntimeRun,
   type AppSummary,
   type AppTarget,
   type CreateAppInput,
@@ -34,6 +43,10 @@ import { getDb, schema } from "../db/client";
 import { ensureSchema } from "../db/migrate";
 
 const STORAGE_PREFIX = "aoitalk:apps-cache:v1:";
+const RUNTIME_PENDING_PREFIX = "aoitalk:app-runtime-pending:v1:";
+const EMPTY_FETCH_MARKER_PREFIX = "aoitalk:apps-empty-fetch:v1:";
+
+type EmptyFetchSection = "targets" | "files" | "releases" | "jobs";
 
 type AppsCacheState = {
   apps: AppSummary[];
@@ -49,10 +62,61 @@ type AppsCacheState = {
   jobs: Record<string, AppJob[]>;
 };
 
+export type AppsDetailReadSection =
+  | "context"
+  | "targets"
+  | "files"
+  | "releases"
+  | "jobs"
+  | "runtime"
+  | "runtimeRuns";
+
+export type AppsReadReason =
+  | "offline"
+  | "auth"
+  | "forbidden"
+  | "not_found"
+  | "network"
+  | "unknown"
+  | "not_loaded"
+  | "legacy";
+
+export type AppsReadStatus = {
+  state: "fresh" | "cached" | "unavailable";
+  reason: AppsReadReason | null;
+  legacy?: boolean;
+};
+
+export type AppsDetailReadStatuses = {
+  [section in AppsDetailReadSection]: AppsReadStatus;
+};
+
+export type PendingRuntimeAction = {
+  action_id: string;
+  idempotency_key: string;
+  run_id?: string;
+  created_at: number;
+};
+
 // The in-memory mirror avoids repeatedly parsing AsyncStorage while a screen is
 // focused. It is still keyed by auth scope and hydrated lazily from storage.
 const memoryCache = new Map<string, AppsCacheState>();
 const hydrateInFlight = new Map<string, Promise<AppsCacheState>>();
+const cacheCommitTails = new Map<string, Promise<void>>();
+
+// Runtime declarations and Action runs are deliberately kept out of the
+// generic Apps cache schema. They are immutable/read-only projections and
+// must never become an offline execution queue. A stale declaration may be
+// shown as unavailable, but an Action is always revalidated online.
+const runtimeCache = new Map<string, AppRuntimeDeclaration | null>();
+const runtimeRunsCache = new Map<string, AppRuntimeRun[]>();
+const detailReadStatusCache = new Map<string, AppsDetailReadStatuses>();
+type DetailListReadSection = "targets" | "releases";
+type DetailListReadTicket = { requestId: number; epoch: number };
+type ActiveDetailListReadTicket = DetailListReadTicket & { key: string };
+const latestDetailListReads = new Map<string, number>();
+let nextDetailListReadRequestId = 0;
+let detailListReadEpoch = 0;
 
 type AppsSqlite = {
   db: ReturnType<typeof getDb>;
@@ -83,6 +147,155 @@ function appScopedKey(appId: string, projectId?: string | null): string {
   return `${appId}:${appProjectKey(projectId)}`;
 }
 
+function runtimeScopedKey(scope: string, appId: string, projectId?: string | null): string {
+  return `${scope}:${appScopedKey(appId, projectId)}`;
+}
+
+function defaultDetailReadStatuses(): AppsDetailReadStatuses {
+  return {
+    context: { state: "unavailable", reason: "not_loaded" },
+    targets: { state: "unavailable", reason: "not_loaded" },
+    files: { state: "unavailable", reason: "not_loaded" },
+    releases: { state: "unavailable", reason: "not_loaded" },
+    jobs: { state: "unavailable", reason: "not_loaded" },
+    runtime: { state: "unavailable", reason: "not_loaded" },
+    runtimeRuns: { state: "unavailable", reason: "not_loaded" },
+  };
+}
+
+function detailReadStatusKey(scope: string, appId: string, projectId?: string | null): string {
+  return runtimeScopedKey(scope, appId, projectId);
+}
+
+function createDetailListReadTicket(): DetailListReadTicket {
+  return { requestId: ++nextDetailListReadRequestId, epoch: detailListReadEpoch };
+}
+
+function activateDetailListRead(
+  ticket: DetailListReadTicket,
+  scope: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: DetailListReadSection,
+): ActiveDetailListReadTicket {
+  const key = `${detailReadStatusKey(scope, appId, projectId)}:${section}`;
+  if (ticket.epoch === detailListReadEpoch) {
+    const latestRequestId = latestDetailListReads.get(key) ?? 0;
+    if (ticket.requestId > latestRequestId) latestDetailListReads.set(key, ticket.requestId);
+  }
+  return { ...ticket, key };
+}
+
+function isCurrentDetailListRead(ticket: ActiveDetailListReadTicket): boolean {
+  return ticket.epoch === detailListReadEpoch && latestDetailListReads.get(ticket.key) === ticket.requestId;
+}
+
+function setDetailReadStatus(
+  scope: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: AppsDetailReadSection,
+  status: AppsReadStatus,
+): void {
+  const key = detailReadStatusKey(scope, appId, projectId);
+  const previous = detailReadStatusCache.get(key) ?? defaultDetailReadStatuses();
+  detailReadStatusCache.set(key, { ...previous, [section]: status });
+}
+
+function getDetailReadStatusesSnapshot(
+  scope: string,
+  appId: string,
+  projectId?: string | null,
+): AppsDetailReadStatuses {
+  const key = detailReadStatusKey(scope, appId, projectId);
+  const current = detailReadStatusCache.get(key) ?? defaultDetailReadStatuses();
+  return {
+    context: { ...current.context },
+    targets: { ...current.targets },
+    files: { ...current.files },
+    releases: { ...current.releases },
+    jobs: { ...current.jobs },
+    runtime: { ...current.runtime },
+    runtimeRuns: { ...current.runtimeRuns },
+  };
+}
+
+function hasCacheEntry(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function statusFromCache(
+  cached: boolean,
+  reason: Exclude<AppsReadReason, "legacy" | "not_loaded" | null>,
+  legacy = false,
+): AppsReadStatus {
+  return {
+    state: cached ? "cached" : "unavailable",
+    reason,
+    ...(legacy ? { legacy: true } : {}),
+  };
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+function readErrorReason(error: unknown): Exclude<AppsReadReason, "legacy" | "not_loaded" | null> {
+  const status = errorStatus(error);
+  if (status === 401) return "auth";
+  if (status === 403) return "forbidden";
+  if (status === 404) return "not_found";
+  if (status === 0 || status === 408) return "network";
+
+  const record = error && typeof error === "object"
+    ? error as { code?: unknown; name?: unknown }
+    : undefined;
+  const code = typeof record?.code === "string" ? record.code.toLowerCase() : "";
+  const name = typeof record?.name === "string" ? record.name.toLowerCase() : "";
+  if (
+    code === "network" ||
+    code === "network_changed" ||
+    code === "fetch_failed" ||
+    code === "timeout" ||
+    code.includes("network") ||
+    code.includes("timeout") ||
+    code === "econnrefused" ||
+    code === "enotfound" ||
+    name === "apinetworkchangederror" ||
+    name === "apiroutingchangederror" ||
+    name === "apitimeouterror" ||
+    name === "apiendpointunavailableerror"
+  ) return "network";
+
+  // Network adapters commonly surface an unbranded TypeError or Error. The
+  // message is used only for local classification and is never returned.
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (/network|fetch|connection|timed? ?out|unreachable|offline/.test(message)) {
+    return "network";
+  }
+  return "unknown";
+}
+
+async function readAvailabilityReason(): Promise<"offline" | "auth" | null> {
+  const token = await getToken();
+  if (!token) return "auth";
+  return canAttemptAoiTalkServer() ? null : "offline";
+}
+
+function isLegacyRuntimeNotConfigured(error: unknown): boolean {
+  if (errorStatus(error) !== 409 || !error || typeof error !== "object") return false;
+  const responseBody = (error as { responseBody?: unknown }).responseBody;
+  if (typeof responseBody !== "string") return false;
+  try {
+    const payload: unknown = JSON.parse(responseBody);
+    return isRecord(payload) && isRecord(payload.detail) && payload.detail.code === "app_runtime_not_configured";
+  } catch {
+    return false;
+  }
+}
+
 function cloneEmptyCache(): AppsCacheState {
   return {
     apps: [],
@@ -101,6 +314,84 @@ function cloneEmptyCache(): AppsCacheState {
 
 function storageKey(scope: string): string {
   return `${STORAGE_PREFIX}${encodeURIComponent(scope)}`;
+}
+
+function emptyFetchMarkerKey(
+  scope: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: EmptyFetchSection,
+): string {
+  return `${EMPTY_FETCH_MARKER_PREFIX}${encodeURIComponent(scope)}:${encodeURIComponent(appId)}:${encodeURIComponent(appProjectKey(projectId))}:${section}`;
+}
+
+async function hasEmptyFetchMarker(
+  scope: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: EmptyFetchSection,
+): Promise<boolean> {
+  try {
+    return (await AsyncStorage.getItem(emptyFetchMarkerKey(scope, appId, projectId, section))) === "1";
+  } catch {
+    return false;
+  }
+}
+
+async function updateEmptyFetchMarker(
+  scope: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: EmptyFetchSection,
+  isEmpty: boolean,
+): Promise<void> {
+  try {
+    const key = emptyFetchMarkerKey(scope, appId, projectId, section);
+    if (isEmpty) await AsyncStorage.setItem(key, "1");
+    else await AsyncStorage.removeItem(key);
+  } catch {
+    // Markers are a best-effort restart hint; the in-memory/SQLite snapshot
+    // remains the source of the actual cached rows.
+  }
+}
+
+async function hasCachedArraySection(
+  scope: string,
+  record: Record<string, unknown>,
+  key: string,
+  appId: string,
+  projectId: string | null | undefined,
+  section: EmptyFetchSection,
+): Promise<boolean> {
+  if (hasCacheEntry(record, key)) return true;
+  return hasEmptyFetchMarker(scope, appId, projectId, section);
+}
+
+function runtimePendingKey(scope: string, appId: string, projectId?: string | null): string {
+  return `${RUNTIME_PENDING_PREFIX}${encodeURIComponent(scope)}:${encodeURIComponent(appScopedKey(appId, projectId))}`;
+}
+
+async function readRuntimePending(scope: string, appId: string, projectId?: string | null): Promise<PendingRuntimeAction[]> {
+  try {
+    const raw = await AsyncStorage.getItem(runtimePendingKey(scope, appId, projectId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is PendingRuntimeAction => Boolean(
+      item && typeof item === "object"
+      && typeof (item as PendingRuntimeAction).action_id === "string"
+      && typeof (item as PendingRuntimeAction).idempotency_key === "string"
+      && typeof (item as PendingRuntimeAction).created_at === "number"
+    ));
+  } catch {
+    return [];
+  }
+}
+
+async function writeRuntimePending(scope: string, appId: string, projectId: string | null | undefined, actions: PendingRuntimeAction[]): Promise<void> {
+  const key = runtimePendingKey(scope, appId, projectId);
+  if (actions.length) await AsyncStorage.setItem(key, JSON.stringify(actions));
+  else await AsyncStorage.removeItem(key);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -686,7 +977,7 @@ async function hydrate(scope: string): Promise<AppsCacheState> {
   return promise;
 }
 
-async function persist(
+async function persistSnapshot(
   scope: string,
   cache: AppsCacheState,
   replace?: PersistReplace,
@@ -701,6 +992,37 @@ async function persist(
     await AsyncStorage.setItem(storageKey(scope), JSON.stringify(cache));
   } catch {
     // Cache persistence is best effort; the in-memory snapshot remains useful.
+  }
+}
+
+async function commitCacheUpdate(
+  scope: string,
+  update: (latestCache: AppsCacheState) => {
+    cache: AppsCacheState;
+    replace?: PersistReplace;
+  } | null,
+  afterPersist?: () => void | Promise<void>,
+): Promise<void> {
+  const previous = cacheCommitTails.get(scope) ?? Promise.resolve();
+  const commit = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const latestCache = memoryCache.get(scope) ?? await hydrate(scope);
+      const result = update(latestCache);
+      if (!result) return;
+
+      // persistSnapshot installs memory synchronously before its first
+      // await. Keeping this call adjacent to update makes the read/merge/set
+      // atomic with respect to every commit queued for the same auth scope.
+      const persistence = persistSnapshot(scope, result.cache, result.replace);
+      await persistence;
+      await afterPersist?.();
+    });
+  cacheCommitTails.set(scope, commit);
+  try {
+    await commit;
+  } finally {
+    if (cacheCommitTails.get(scope) === commit) cacheCommitTails.delete(scope);
   }
 }
 
@@ -733,6 +1055,13 @@ function requireOnlineMutation(online: boolean): void {
 export function resetAppsRepositoryMemory(): void {
   memoryCache.clear();
   hydrateInFlight.clear();
+  // Keep active commit tails so work started after a reset cannot overtake an
+  // SQLite write that was already in progress. Completed tails remove themselves.
+  runtimeCache.clear();
+  runtimeRunsCache.clear();
+  detailReadStatusCache.clear();
+  latestDetailListReads.clear();
+  detailListReadEpoch += 1;
 }
 
 /** Remove every persisted Apps snapshot, used by auth-scope transition tests/tools. */
@@ -754,7 +1083,11 @@ export async function clearAppsCache(): Promise<void> {
     ]).catch(() => undefined);
   }
   const keys = await AsyncStorage.getAllKeys();
-  const appKeys = keys.filter((key) => key.startsWith(STORAGE_PREFIX));
+  const appKeys = keys.filter((key) =>
+    key.startsWith(STORAGE_PREFIX) ||
+    key.startsWith(RUNTIME_PENDING_PREFIX) ||
+    key.startsWith(EMPTY_FETCH_MARKER_PREFIX),
+  );
   if (appKeys.length > 0) await AsyncStorage.multiRemove(appKeys);
 }
 
@@ -772,47 +1105,42 @@ export const appsRepo = {
     void options.force;
     try {
       const remote = await appsApi.list(options.projectId);
-      const next = shallowCopyCache(cache);
-      // A project-scoped list is authoritative only for that projection. Keep
-      // all-app cache rows that belong to other projects to avoid cross-view loss.
-      if (options.projectId) {
-        const previousProjectIds = new Set(
-          next.projectViews[options.projectId] ?? [],
-        );
-        const remoteIds = new Set(remote.map((item) => item.id));
-        next.projectViews = replaceRecord(next.projectViews, options.projectId, [
-          ...remoteIds,
-        ]);
-        next.apps = [
-          ...next.apps.filter(
-            (item) =>
-              !previousProjectIds.has(item.id) &&
-              !item.related_project_ids?.includes(options.projectId as string) &&
-              item.origin_project_id !== options.projectId,
-          ).filter((item) => !remoteIds.has(item.id)),
-          ...remote,
-        ];
-        const staleIds = [...previousProjectIds].filter((id) => {
-          if (remoteIds.has(id)) return false;
-          const existing = cache.apps.find((item) => item.id === id);
-          return !existing?.related_project_ids?.some(
-            (relatedId) => relatedId !== options.projectId,
-          ) && existing?.origin_project_id !== options.projectId;
-        });
-        await persist(
-          scope,
-          next,
-          staleIds.length > 0 ? { kind: "appsIds", ids: staleIds } : undefined,
-        );
-        return remote;
-      } else {
+      await commitCacheUpdate(scope, (latestCache) => {
+        const next = shallowCopyCache(latestCache);
+        const projectId = options.projectId;
+        // A project-scoped list is authoritative only for that projection. Keep
+        // all-app cache rows that belong to other projects to avoid cross-view loss.
+        if (projectId) {
+          const previousProjectIds = new Set(next.projectViews[projectId] ?? []);
+          const remoteIds = new Set(remote.map((item) => item.id));
+          next.projectViews = replaceRecord(next.projectViews, projectId, [...remoteIds]);
+          next.apps = [
+            ...next.apps.filter(
+              (item) =>
+                !previousProjectIds.has(item.id) &&
+                !item.related_project_ids?.includes(projectId) &&
+                item.origin_project_id !== projectId,
+            ).filter((item) => !remoteIds.has(item.id)),
+            ...remote,
+          ];
+          const staleIds = [...previousProjectIds].filter((id) => {
+            if (remoteIds.has(id)) return false;
+            const existing = latestCache.apps.find((item) => item.id === id);
+            return !existing?.related_project_ids?.some(
+              (relatedId) => relatedId !== projectId,
+            ) && existing?.origin_project_id !== projectId;
+          });
+          return {
+            cache: next,
+            replace: staleIds.length > 0 ? { kind: "appsIds", ids: staleIds } : undefined,
+          };
+        }
+
         // Empty is meaningful: it removes stale/ghost Apps for this scope.
         next.apps = remote;
-      }
-      if (!options.projectId) {
-        await persist(scope, next, { kind: "apps" });
-      }
-      return options.projectId ? remote : next.apps;
+        return { cache: next, replace: { kind: "apps" } };
+      });
+      return remote;
     } catch {
       // Failed refresh must not overwrite or clear a valid snapshot.
       return local;
@@ -831,7 +1159,12 @@ export const appsRepo = {
     if (!(await canUseServer())) return local;
     try {
       const remote = await appsApi.get(appId, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), apps: upsertApp(cache.apps, remote) });
+      await commitCacheUpdate(scope, (latestCache) => ({
+        cache: {
+          ...shallowCopyCache(latestCache),
+          apps: upsertApp(latestCache.apps, remote),
+        },
+      }));
       return remote;
     } catch {
       return local;
@@ -841,9 +1174,14 @@ export const appsRepo = {
   async create(input: CreateAppInput): Promise<AppSummary> {
     requireOnlineMutation(await canUseServer());
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const app = await appsApi.create(input);
-    await persist(scope, { ...shallowCopyCache(cache), apps: upsertApp(cache.apps, app) });
+    await commitCacheUpdate(scope, (latestCache) => ({
+      cache: {
+        ...shallowCopyCache(latestCache),
+        apps: upsertApp(latestCache.apps, app),
+      },
+    }));
     return app;
   },
 
@@ -858,9 +1196,14 @@ export const appsRepo = {
       throw new AppsPermissionError("App設定の変更には admin 権限が必要です");
     }
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const app = await appsApi.update(appId, input, options.projectId);
-    await persist(scope, { ...shallowCopyCache(cache), apps: upsertApp(cache.apps, app) });
+    await commitCacheUpdate(scope, (latestCache) => ({
+      cache: {
+        ...shallowCopyCache(latestCache),
+        apps: upsertApp(latestCache.apps, app),
+      },
+    }));
     return app;
   },
 
@@ -874,11 +1217,13 @@ export const appsRepo = {
       throw new AppsPermissionError("Appのアーカイブには admin 権限が必要です");
     }
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const archived = await appsApi.archive(appId, options.projectId);
-    const next = shallowCopyCache(cache);
-    next.apps = next.apps.filter((item) => item.id !== appId);
-    await persist(scope, next, { kind: "appsIds", ids: [appId] });
+    await commitCacheUpdate(scope, (latestCache) => {
+      const next = shallowCopyCache(latestCache);
+      next.apps = next.apps.filter((item) => item.id !== appId);
+      return { cache: next, replace: { kind: "appsIds", ids: [appId] } };
+    });
     return archived;
   },
 
@@ -889,33 +1234,459 @@ export const appsRepo = {
     const scope = await currentScope();
     const cache = await hydrate(scope);
     const contextKey = appScopedKey(appId, options.projectId);
-    const local = cache.contexts[contextKey] ?? null;
-    if (!(await canUseServer())) return local;
+    const localCached = hasCacheEntry(cache.contexts, contextKey);
+    const local = localCached ? cache.contexts[contextKey] : null;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "context",
+        statusFromCache(localCached, unavailableReason),
+      );
+      return local;
+    }
     try {
       const context = await appsApi.getContext(appId, options.projectId);
-      const next = shallowCopyCache(cache);
-      next.contexts = replaceRecord(next.contexts, contextKey, context);
-      next.apps = upsertApp(next.apps, context.app);
-      if (context.targets) next.targets = replaceRecord(next.targets, contextKey, context.targets);
-      if (context.releases) next.releases = replaceRecord(next.releases, contextKey, context.releases);
-      await persist(scope, next, { kind: "context", appId, projectKey: appProjectKey(options.projectId) });
+      await commitCacheUpdate(
+        scope,
+        (latestCache) => {
+          const next = shallowCopyCache(latestCache);
+          next.contexts = replaceRecord(next.contexts, contextKey, context);
+          next.apps = upsertApp(next.apps, context.app);
+          return {
+            cache: next,
+            replace: { kind: "context", appId, projectKey: appProjectKey(options.projectId) },
+          };
+        },
+        () => setDetailReadStatus(scope, appId, options.projectId, "context", { state: "fresh", reason: null }),
+      );
       return context;
-    } catch {
+    } catch (error) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "context",
+        statusFromCache(localCached, readErrorReason(error)),
+      );
       return local;
     }
   },
 
-  async listTargets(appId: string, options: { projectId?: string | null } = {}): Promise<AppTarget[]> {
+  async getDetailReadStatuses(
+    appId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<AppsDetailReadStatuses> {
     const scope = await currentScope();
+    const key = detailReadStatusKey(scope, appId, options.projectId);
+    const current = detailReadStatusCache.get(key);
+    const unavailableReason = await readAvailabilityReason();
+    if (!unavailableReason) return getDetailReadStatusesSnapshot(scope, appId, options.projectId);
+
+    const cache = await hydrate(scope);
+    const next = current ? getDetailReadStatusesSnapshot(scope, appId, options.projectId) : defaultDetailReadStatuses();
+    if (next.context.reason === "not_loaded") {
+      next.context = statusFromCache(
+        hasCacheEntry(cache.contexts, appScopedKey(appId, options.projectId)),
+        unavailableReason,
+      );
+    }
+    if (next.targets.reason === "not_loaded") {
+      next.targets = statusFromCache(
+        await hasCachedArraySection(
+          scope,
+          cache.targets,
+          appScopedKey(appId, options.projectId),
+          appId,
+          options.projectId,
+          "targets",
+        ),
+        unavailableReason,
+      );
+    }
+    if (next.files.reason === "not_loaded") {
+      next.files = statusFromCache(
+        await hasCachedArraySection(
+          scope,
+          cache.files,
+          appScopedKey(appId, options.projectId),
+          appId,
+          options.projectId,
+          "files",
+        ),
+        unavailableReason,
+      );
+    }
+    if (next.releases.reason === "not_loaded") {
+      next.releases = statusFromCache(
+        await hasCachedArraySection(
+          scope,
+          cache.releases,
+          appScopedKey(appId, options.projectId),
+          appId,
+          options.projectId,
+          "releases",
+        ),
+        unavailableReason,
+      );
+    }
+    if (next.jobs.reason === "not_loaded") {
+      next.jobs = statusFromCache(
+        await hasCachedArraySection(
+          scope,
+          cache.jobs,
+          appScopedKey(appId, options.projectId),
+          appId,
+          options.projectId,
+          "jobs",
+        ),
+        unavailableReason,
+      );
+    }
+    if (next.runtime.reason === "not_loaded") {
+      const runtimeCached = runtimeCache.has(key);
+      next.runtime = statusFromCache(
+        runtimeCached,
+        unavailableReason,
+        runtimeCached && runtimeCache.get(key) === null,
+      );
+    }
+    if (next.runtimeRuns.reason === "not_loaded") {
+      next.runtimeRuns = statusFromCache(
+        runtimeRunsCache.has(key),
+        unavailableReason,
+      );
+    }
+    detailReadStatusCache.set(key, next);
+    return getDetailReadStatusesSnapshot(scope, appId, options.projectId);
+  },
+
+  async getRuntime(
+    appId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<AppRuntimeDeclaration | null> {
+    const scope = await currentScope();
+    const key = runtimeScopedKey(scope, appId, options.projectId);
+    const localCached = runtimeCache.has(key);
+    const local = localCached ? runtimeCache.get(key) ?? null : null;
+    const legacyCached = localCached && local === null;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "runtime",
+        statusFromCache(localCached, unavailableReason, legacyCached),
+      );
+      return local;
+    }
+    try {
+      const response = await appsApi.getRuntime(appId, options);
+      // A null response is the legacy Apps runtime shape. Keep the null in
+      // the map so a cached legacy response differs from a missing response.
+      if (response === null) {
+        runtimeCache.set(key, null);
+        setDetailReadStatus(scope, appId, options.projectId, "runtime", {
+          state: "fresh",
+          reason: "legacy",
+          legacy: true,
+        });
+        return null;
+      }
+      const runtime = normalizeAppRuntimeDeclaration(response);
+      runtimeCache.set(key, runtime);
+      setDetailReadStatus(scope, appId, options.projectId, "runtime", { state: "fresh", reason: null });
+      return runtime;
+    } catch (error) {
+      if (isLegacyRuntimeNotConfigured(error)) {
+        runtimeCache.set(key, null);
+        setDetailReadStatus(scope, appId, options.projectId, "runtime", {
+          state: "fresh",
+          reason: "legacy",
+          legacy: true,
+        });
+        return null;
+      }
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "runtime",
+        statusFromCache(localCached, readErrorReason(error), legacyCached),
+      );
+      if (error instanceof AppRuntimeContractError) throw error;
+      // A cached declaration is a read-only hint. The UI must still disable
+      // every Action while offline and never turn this into an outbox entry.
+      return local;
+    }
+  },
+
+  async activateRelease(
+    appId: string,
+    releaseId: string,
+    options: { permission?: string | null; projectId?: string | null } = {},
+  ): Promise<AppRuntimeDeclaration> {
+    requireOnlineMutation(await canUseServer());
+    if (!permissionAtLeast(options.permission, "maintainer")) {
+      throw new AppsPermissionError("Releaseの有効化には maintainer 権限が必要です");
+    }
+    const scope = await currentScope();
+    const key = runtimeScopedKey(scope, appId, options.projectId);
+    const runtime = normalizeAppRuntimeDeclaration(await appsApi.activateRelease(appId, releaseId));
+    runtimeCache.set(key, runtime);
+    return runtime;
+  },
+
+  async listRuntimeRuns(
+    appId: string,
+    options: { projectId?: string | null; limit?: number; idempotencyKey?: string | null } = {},
+  ): Promise<AppRuntimeRun[]> {
+    const scope = await currentScope();
+    const key = runtimeScopedKey(scope, appId, options.projectId);
+    const localCached = runtimeRunsCache.has(key);
+    const local = localCached ? runtimeRunsCache.get(key) ?? [] : [];
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "runtimeRuns",
+        statusFromCache(localCached, unavailableReason),
+      );
+      return local;
+    }
+    try {
+      const response = await appsApi.listRuntimeRuns(appId, options);
+      if (!Array.isArray(response.runs)) throw new AppRuntimeContractError("runtime runsがarrayではありません");
+      const runs = response.runs.map(normalizeAppRuntimeRun);
+      runtimeRunsCache.set(key, runs);
+      setDetailReadStatus(scope, appId, options.projectId, "runtimeRuns", { state: "fresh", reason: null });
+      return runs;
+    } catch (error) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "runtimeRuns",
+        statusFromCache(localCached, readErrorReason(error)),
+      );
+      if (error instanceof AppRuntimeContractError) throw error;
+      return local;
+    }
+  },
+
+  async listRuntimePendingActions(
+    appId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<PendingRuntimeAction[]> {
+    return readRuntimePending(await currentScope(), appId, options.projectId);
+  },
+
+  async rememberRuntimeAction(
+    appId: string,
+    action: PendingRuntimeAction,
+    options: { projectId?: string | null } = {},
+  ): Promise<void> {
+    const scope = await currentScope();
+    const current = await readRuntimePending(scope, appId, options.projectId);
+    const next = [...current.filter((item) => item.action_id !== action.action_id), action];
+    await writeRuntimePending(scope, appId, options.projectId, next);
+  },
+
+  async forgetRuntimeAction(
+    appId: string,
+    actionId: string,
+    options: { projectId?: string | null; idempotencyKey?: string } = {},
+  ): Promise<void> {
+    const scope = await currentScope();
+    const current = await readRuntimePending(scope, appId, options.projectId);
+    await writeRuntimePending(
+      scope,
+      appId,
+      options.projectId,
+      current.filter((item) => item.action_id !== actionId && item.idempotency_key !== options.idempotencyKey),
+    );
+  },
+
+  async runRuntimeAction(
+    appId: string,
+    actionId: string,
+    input: Record<string, unknown>,
+    options: { idempotencyKey: string; projectId?: string | null },
+  ): Promise<AppRuntimeRun> {
+    // Action execution is online-only. In particular, do not use the generic
+    // sync outbox: retrying an unknown POST could execute the same Action twice.
+    requireOnlineMutation(await canUseServer());
+    const scope = await currentScope();
+    const key = runtimeScopedKey(scope, appId, options.projectId);
+    const response = await appsApi.runRuntimeAction(appId, actionId, input, options);
+    const run = normalizeAppRuntimeRun(response.run);
+    const previous = runtimeRunsCache.get(key) ?? [];
+    runtimeRunsCache.set(key, [run, ...previous.filter((item) => item.id !== run.id)].slice(0, 50));
+    return run;
+  },
+
+  async getRuntimeRun(
+    appId: string,
+    runId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<AppRuntimeRun | null> {
+    if (!(await canUseServer())) return null;
+    try {
+      return normalizeAppRuntimeRun(await appsApi.getRuntimeRun(appId, runId, options));
+    } catch (error) {
+      if (error instanceof AppRuntimeContractError) throw error;
+      return null;
+    }
+  },
+
+  async stopRuntimeRun(
+    appId: string,
+    runId: string,
+    options: { projectId?: string | null; permission?: string | null } = {},
+  ): Promise<AppRuntimeRun> {
+    requireOnlineMutation(await canUseServer());
+    if (!permissionAtLeast(options.permission, "runner")) {
+      throw new AppsPermissionError();
+    }
+    const scope = await currentScope();
+    const key = runtimeScopedKey(scope, appId, options.projectId);
+    const run = normalizeAppRuntimeRun(await appsApi.stopRuntimeRun(appId, runId, options));
+    const previous = runtimeRunsCache.get(key) ?? [];
+    runtimeRunsCache.set(key, [run, ...previous.filter((item) => item.id !== run.id)].slice(0, 50));
+    return run;
+  },
+
+  async getRuntimeRunLogs(
+    appId: string,
+    runId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<{ run_id: string; logs: string } | null> {
+    if (!(await canUseServer())) return null;
+    try {
+      const response = await appsApi.getRuntimeRunLogs(appId, runId, options);
+      return {
+        run_id: response.run_id,
+        logs: typeof response.logs === "string" ? response.logs : JSON.stringify(response.logs),
+      };
+    } catch (error) {
+      if (error instanceof AppRuntimeContractError) throw error;
+      return null;
+    }
+  },
+
+  async getRuntimeRunFile(
+    appId: string,
+    runId: string,
+    fileId: string,
+    options: { projectId?: string | null } = {},
+  ) {
+    if (!(await canUseServer())) return null;
+    try {
+      return normalizeAppRuntimeFile(await appsApi.getRuntimeRunFile(appId, runId, fileId, options));
+    } catch (error) {
+      if (error instanceof AppRuntimeContractError) throw error;
+      return null;
+    }
+  },
+
+  async listRuntimeRunFiles(
+    appId: string,
+    runId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<AppRuntimeFileModel[]> {
+    if (!(await canUseServer())) return [];
+    try {
+      return (await appsApi.listRuntimeRunFiles(appId, runId, options)).map(normalizeAppRuntimeFile);
+    } catch (error) {
+      if (error instanceof AppRuntimeContractError) throw error;
+      return [];
+    }
+  },
+
+  async uploadRuntimeInputFile(
+    appId: string,
+    actionId: string,
+    file: AppRuntimeFileAsset,
+    options: { projectId?: string | null } = {},
+  ): Promise<AppRuntimeInputFile> {
+    requireOnlineMutation(await canUseServer());
+    return appsApi.uploadRuntimeInputFile(appId, actionId, file, options);
+  },
+
+  async downloadRuntimeRunFileBytes(
+    appId: string,
+    runId: string,
+    fileId: string,
+    options: { projectId?: string | null } = {},
+  ): Promise<ArrayBuffer> {
+    requireOnlineMutation(await canUseServer());
+    return appsApi.downloadRuntimeRunFileBytes(appId, runId, fileId, options);
+  },
+
+  async listTargets(appId: string, options: { projectId?: string | null } = {}): Promise<AppTarget[]> {
+    const readTicket = createDetailListReadTicket();
+    const scope = await currentScope();
+    const activeReadTicket = activateDetailListRead(readTicket, scope, appId, options.projectId, "targets");
     const cache = await hydrate(scope);
     const key = appScopedKey(appId, options.projectId);
+    const localCached = await hasCachedArraySection(
+      scope,
+      cache.targets,
+      key,
+      appId,
+      options.projectId,
+      "targets",
+    );
     const local = cache.targets[key] ?? [];
-    if (!(await canUseServer())) return local;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        setDetailReadStatus(
+          scope,
+          appId,
+          options.projectId,
+          "targets",
+          statusFromCache(localCached, unavailableReason),
+        );
+      }
+      return local;
+    }
     try {
       const remote = await appsApi.getTargets(appId, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), targets: replaceRecord(cache.targets, key, remote) }, { kind: "targets", appId });
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        await commitCacheUpdate(
+          scope,
+          (latestCache) => {
+            if (!isCurrentDetailListRead(activeReadTicket)) return null;
+            const next = shallowCopyCache(latestCache);
+            next.targets = replaceRecord(latestCache.targets, key, remote);
+            return { cache: next, replace: { kind: "targets", appId } };
+          },
+          async () => {
+            if (!isCurrentDetailListRead(activeReadTicket)) return;
+            await updateEmptyFetchMarker(scope, appId, options.projectId, "targets", remote.length === 0);
+            if (isCurrentDetailListRead(activeReadTicket)) {
+              setDetailReadStatus(scope, appId, options.projectId, "targets", { state: "fresh", reason: null });
+            }
+          },
+        );
+      }
       return remote;
-    } catch {
+    } catch (error) {
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        setDetailReadStatus(
+          scope,
+          appId,
+          options.projectId,
+          "targets",
+          statusFromCache(localCached, readErrorReason(error)),
+        );
+      }
       return local;
     }
   },
@@ -924,13 +1695,51 @@ export const appsRepo = {
     const scope = await currentScope();
     const cache = await hydrate(scope);
     const key = appScopedKey(appId, options.projectId);
+    const localCached = await hasCachedArraySection(
+      scope,
+      cache.files,
+      key,
+      appId,
+      options.projectId,
+      "files",
+    );
     const local = cache.files[key] ?? [];
-    if (!(await canUseServer())) return local;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "files",
+        statusFromCache(localCached, unavailableReason),
+      );
+      return local;
+    }
     try {
       const remote = await appsApi.getFiles(appId, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), files: replaceRecord(cache.files, key, remote) }, { kind: "files", appId, projectKey: appProjectKey(options.projectId) });
+      await commitCacheUpdate(
+        scope,
+        (latestCache) => ({
+          cache: {
+            ...shallowCopyCache(latestCache),
+            files: replaceRecord(latestCache.files, key, remote),
+          },
+          replace: { kind: "files", appId, projectKey: appProjectKey(options.projectId) },
+        }),
+        async () => {
+          await updateEmptyFetchMarker(scope, appId, options.projectId, "files", remote.length === 0);
+          setDetailReadStatus(scope, appId, options.projectId, "files", { state: "fresh", reason: null });
+        },
+      );
       return remote;
-    } catch {
+    } catch (error) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "files",
+        statusFromCache(localCached, readErrorReason(error)),
+      );
       return local;
     }
   },
@@ -947,7 +1756,12 @@ export const appsRepo = {
     if (!(await canUseServer())) return local;
     try {
       const remote = await appsApi.getFile(appId, path, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), fileContents: replaceRecord(cache.fileContents, key, remote) });
+      await commitCacheUpdate(scope, (latestCache) => ({
+        cache: {
+          ...shallowCopyCache(latestCache),
+          fileContents: replaceRecord(latestCache.fileContents, key, remote),
+        },
+      }));
       return remote;
     } catch {
       return local;
@@ -955,16 +1769,64 @@ export const appsRepo = {
   },
 
   async listReleases(appId: string, options: { projectId?: string | null } = {}): Promise<AppRelease[]> {
+    const readTicket = createDetailListReadTicket();
     const scope = await currentScope();
+    const activeReadTicket = activateDetailListRead(readTicket, scope, appId, options.projectId, "releases");
     const cache = await hydrate(scope);
     const key = appScopedKey(appId, options.projectId);
+    const localCached = await hasCachedArraySection(
+      scope,
+      cache.releases,
+      key,
+      appId,
+      options.projectId,
+      "releases",
+    );
     const local = cache.releases[key] ?? [];
-    if (!(await canUseServer())) return local;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        setDetailReadStatus(
+          scope,
+          appId,
+          options.projectId,
+          "releases",
+          statusFromCache(localCached, unavailableReason),
+        );
+      }
+      return local;
+    }
     try {
       const remote = await appsApi.getReleases(appId, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), releases: replaceRecord(cache.releases, key, remote) }, { kind: "releases", appId });
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        await commitCacheUpdate(
+          scope,
+          (latestCache) => {
+            if (!isCurrentDetailListRead(activeReadTicket)) return null;
+            const next = shallowCopyCache(latestCache);
+            next.releases = replaceRecord(latestCache.releases, key, remote);
+            return { cache: next, replace: { kind: "releases", appId } };
+          },
+          async () => {
+            if (!isCurrentDetailListRead(activeReadTicket)) return;
+            await updateEmptyFetchMarker(scope, appId, options.projectId, "releases", remote.length === 0);
+            if (isCurrentDetailListRead(activeReadTicket)) {
+              setDetailReadStatus(scope, appId, options.projectId, "releases", { state: "fresh", reason: null });
+            }
+          },
+        );
+      }
       return remote;
-    } catch {
+    } catch (error) {
+      if (isCurrentDetailListRead(activeReadTicket)) {
+        setDetailReadStatus(
+          scope,
+          appId,
+          options.projectId,
+          "releases",
+          statusFromCache(localCached, readErrorReason(error)),
+        );
+      }
       return local;
     }
   },
@@ -973,13 +1835,51 @@ export const appsRepo = {
     const scope = await currentScope();
     const cache = await hydrate(scope);
     const key = appScopedKey(appId, options.projectId);
+    const localCached = await hasCachedArraySection(
+      scope,
+      cache.jobs,
+      key,
+      appId,
+      options.projectId,
+      "jobs",
+    );
     const local = cache.jobs[key] ?? [];
-    if (!(await canUseServer())) return local;
+    const unavailableReason = await readAvailabilityReason();
+    if (unavailableReason) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "jobs",
+        statusFromCache(localCached, unavailableReason),
+      );
+      return local;
+    }
     try {
       const remote = await appsApi.getJobs(appId, options.projectId);
-      await persist(scope, { ...shallowCopyCache(cache), jobs: replaceRecord(cache.jobs, key, remote) }, { kind: "jobs", appId, projectId: options.projectId });
+      await commitCacheUpdate(
+        scope,
+        (latestCache) => ({
+          cache: {
+            ...shallowCopyCache(latestCache),
+            jobs: replaceRecord(latestCache.jobs, key, remote),
+          },
+          replace: { kind: "jobs", appId, projectId: options.projectId },
+        }),
+        async () => {
+          await updateEmptyFetchMarker(scope, appId, options.projectId, "jobs", remote.length === 0);
+          setDetailReadStatus(scope, appId, options.projectId, "jobs", { state: "fresh", reason: null });
+        },
+      );
       return remote;
-    } catch {
+    } catch (error) {
+      setDetailReadStatus(
+        scope,
+        appId,
+        options.projectId,
+        "jobs",
+        statusFromCache(localCached, readErrorReason(error)),
+      );
       return local;
     }
   },
@@ -998,11 +1898,18 @@ export const appsRepo = {
     const app = await this.getLocal(appId);
     assertRunnerPermission(permission ?? app?.permission);
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const job = await appsApi.startJob(appId, input);
     const key = appScopedKey(appId, input.project_id);
-    const jobs = [job, ...(cache.jobs[key] ?? []).filter((item) => item.id !== job.id)];
-    await persist(scope, { ...shallowCopyCache(cache), jobs: replaceRecord(cache.jobs, key, jobs) });
+    await commitCacheUpdate(scope, (latestCache) => {
+      const jobs = [job, ...(latestCache.jobs[key] ?? []).filter((item) => item.id !== job.id)];
+      return {
+        cache: {
+          ...shallowCopyCache(latestCache),
+          jobs: replaceRecord(latestCache.jobs, key, jobs),
+        },
+      };
+    });
     return job;
   },
 
@@ -1015,11 +1922,18 @@ export const appsRepo = {
     const app = await this.getLocal(appId);
     assertRunnerPermission(options.permission ?? app?.permission);
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const job = await appsApi.stopJob(appId, jobId, options.projectId);
     const key = appScopedKey(appId, options.projectId);
-    const jobs = [job, ...(cache.jobs[key] ?? []).filter((item) => item.id !== job.id)];
-    await persist(scope, { ...shallowCopyCache(cache), jobs: replaceRecord(cache.jobs, key, jobs) });
+    await commitCacheUpdate(scope, (latestCache) => {
+      const jobs = [job, ...(latestCache.jobs[key] ?? []).filter((item) => item.id !== job.id)];
+      return {
+        cache: {
+          ...shallowCopyCache(latestCache),
+          jobs: replaceRecord(latestCache.jobs, key, jobs),
+        },
+      };
+    });
     return job;
   },
 
@@ -1043,7 +1957,13 @@ export const appsRepo = {
     if (!(await canUseServer())) return local;
     try {
       const remote = await appsApi.getProjectApps(projectId);
-      await persist(scope, { ...shallowCopyCache(cache), projectApps: replaceRecord(cache.projectApps, projectId, remote) }, { kind: "projectApps", projectId });
+      await commitCacheUpdate(scope, (latestCache) => ({
+        cache: {
+          ...shallowCopyCache(latestCache),
+          projectApps: replaceRecord(latestCache.projectApps, projectId, remote),
+        },
+        replace: { kind: "projectApps", projectId },
+      }));
       return remote;
     } catch {
       return local;
@@ -1058,14 +1978,21 @@ export const appsRepo = {
     requireOnlineMutation(await canUseServer());
     assertRunnerPermission(permission);
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const binding = await appsApi.linkProjectApp(projectId, input);
-    const existing = cache.projectApps[projectId] ?? [];
-    const nextBindings = [
-      ...existing.filter((item) => item.app_id !== binding.app_id),
-      binding,
-    ];
-    await persist(scope, { ...shallowCopyCache(cache), projectApps: replaceRecord(cache.projectApps, projectId, nextBindings) });
+    await commitCacheUpdate(scope, (latestCache) => {
+      const existing = latestCache.projectApps[projectId] ?? [];
+      const nextBindings = [
+        ...existing.filter((item) => item.app_id !== binding.app_id),
+        binding,
+      ];
+      return {
+        cache: {
+          ...shallowCopyCache(latestCache),
+          projectApps: replaceRecord(latestCache.projectApps, projectId, nextBindings),
+        },
+      };
+    });
     return binding;
   },
 
@@ -1078,19 +2005,20 @@ export const appsRepo = {
     requireOnlineMutation(await canUseServer());
     assertRunnerPermission(permission);
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const binding = await appsApi.updateProjectApp(projectId, appId, input);
-    const nextBindings = [
-      ...(cache.projectApps[projectId] ?? []).filter((item) => item.app_id !== appId),
-      binding,
-    ];
-    await persist(
-      scope,
-      {
-        ...shallowCopyCache(cache),
-        projectApps: replaceRecord(cache.projectApps, projectId, nextBindings),
-      },
-    );
+    await commitCacheUpdate(scope, (latestCache) => {
+      const nextBindings = [
+        ...(latestCache.projectApps[projectId] ?? []).filter((item) => item.app_id !== appId),
+        binding,
+      ];
+      return {
+        cache: {
+          ...shallowCopyCache(latestCache),
+          projectApps: replaceRecord(latestCache.projectApps, projectId, nextBindings),
+        },
+      };
+    });
     return binding;
   },
 
@@ -1102,15 +2030,17 @@ export const appsRepo = {
     requireOnlineMutation(await canUseServer());
     assertRunnerPermission(permission);
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     await appsApi.unlinkProjectApp(projectId, appId);
-    const next = shallowCopyCache(cache);
-    next.projectApps = replaceRecord(
-      next.projectApps,
-      projectId,
-      (next.projectApps[projectId] ?? []).filter((item) => item.app_id !== appId),
-    );
-    await persist(scope, next);
+    await commitCacheUpdate(scope, (latestCache) => {
+      const next = shallowCopyCache(latestCache);
+      next.projectApps = replaceRecord(
+        next.projectApps,
+        projectId,
+        (next.projectApps[projectId] ?? []).filter((item) => item.app_id !== appId),
+      );
+      return { cache: next };
+    });
   },
 
   async listTaskApps(taskId: string): Promise<TaskAppLink[]> {
@@ -1120,25 +2050,27 @@ export const appsRepo = {
     if (!(await canUseServer())) return local;
     try {
       const remote = await appsApi.listTaskApps(taskId);
-      const next = shallowCopyCache(cache);
-      next.taskApps = replaceRecord(next.taskApps, taskId, remote);
-      // Remove this task from every per-App projection before adding the
-      // authoritative response. An empty response is meaningful and must not
-      // leave deleted links visible in App detail.
-      for (const appId of Object.keys(next.appTasks)) {
-        next.appTasks[appId] = next.appTasks[appId].filter(
-          (link) => link.task_id !== taskId,
-        );
-      }
-      const appIds = new Set(remote.map((link) => link.app_id));
-      for (const appId of appIds) {
-        next.appTasks = replaceRecord(
-          next.appTasks,
-          appId,
-          remote.filter((link) => link.app_id === appId),
-        );
-      }
-      await persist(scope, next, { kind: "taskApps", taskId });
+      await commitCacheUpdate(scope, (latestCache) => {
+        const next = shallowCopyCache(latestCache);
+        next.taskApps = replaceRecord(next.taskApps, taskId, remote);
+        // Remove this task from every per-App projection before adding the
+        // authoritative response. An empty response is meaningful and must not
+        // leave deleted links visible in App detail.
+        for (const appId of Object.keys(next.appTasks)) {
+          next.appTasks[appId] = next.appTasks[appId].filter(
+            (link) => link.task_id !== taskId,
+          );
+        }
+        const appIds = new Set(remote.map((link) => link.app_id));
+        for (const appId of appIds) {
+          next.appTasks = replaceRecord(
+            next.appTasks,
+            appId,
+            remote.filter((link) => link.app_id === appId),
+          );
+        }
+        return { cache: next, replace: { kind: "taskApps", taskId } };
+      });
       return remote;
     } catch {
       return local;
@@ -1153,24 +2085,26 @@ export const appsRepo = {
     requireOnlineMutation(await canUseServer());
     void permission;
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     const link = await appsApi.linkTaskApp(taskId, input);
-    const existing = cache.taskApps[taskId] ?? [];
-    const key = `${link.app_id}:${link.target_id ?? ""}:${link.relation_type}`;
-    const nextLinks = [
-      ...existing.filter(
-        (item) => `${item.app_id}:${item.target_id ?? ""}:${item.relation_type}` !== key,
-      ),
-      link,
-    ];
-    const next = shallowCopyCache(cache);
-    next.taskApps = replaceRecord(next.taskApps, taskId, nextLinks);
-    next.appTasks = replaceRecord(
-      next.appTasks,
-      link.app_id,
-      [...(next.appTasks[link.app_id] ?? []).filter((item) => item.id !== link.id), link],
-    );
-    await persist(scope, next);
+    await commitCacheUpdate(scope, (latestCache) => {
+      const existing = latestCache.taskApps[taskId] ?? [];
+      const key = `${link.app_id}:${link.target_id ?? ""}:${link.relation_type}`;
+      const nextLinks = [
+        ...existing.filter(
+          (item) => `${item.app_id}:${item.target_id ?? ""}:${item.relation_type}` !== key,
+        ),
+        link,
+      ];
+      const next = shallowCopyCache(latestCache);
+      next.taskApps = replaceRecord(next.taskApps, taskId, nextLinks);
+      next.appTasks = replaceRecord(
+        next.appTasks,
+        link.app_id,
+        [...(next.appTasks[link.app_id] ?? []).filter((item) => item.id !== link.id), link],
+      );
+      return { cache: next };
+    });
     return link;
   },
 
@@ -1185,28 +2119,30 @@ export const appsRepo = {
   ): Promise<void> {
     requireOnlineMutation(await canUseServer());
     const scope = await currentScope();
-    const cache = await hydrate(scope);
+    await hydrate(scope);
     await appsApi.unlinkTaskApp(taskId, appId, options);
-    const next = shallowCopyCache(cache);
-    next.taskApps = replaceRecord(
-      next.taskApps,
-      taskId,
-      (next.taskApps[taskId] ?? []).filter(
-        (item) =>
-          item.app_id !== appId ||
+    await commitCacheUpdate(scope, (latestCache) => {
+      const next = shallowCopyCache(latestCache);
+      next.taskApps = replaceRecord(
+        next.taskApps,
+        taskId,
+        (next.taskApps[taskId] ?? []).filter(
+          (item) =>
+            item.app_id !== appId ||
+            (options.targetId !== undefined && item.target_id !== options.targetId) ||
+            (options.relationType !== undefined && item.relation_type !== options.relationType),
+        ),
+      );
+      next.appTasks = {
+        ...next.appTasks,
+        [appId]: (next.appTasks[appId] ?? []).filter((item) =>
+          item.task_id !== taskId ||
           (options.targetId !== undefined && item.target_id !== options.targetId) ||
           (options.relationType !== undefined && item.relation_type !== options.relationType),
-      ),
-    );
-    next.appTasks = {
-      ...next.appTasks,
-      [appId]: (next.appTasks[appId] ?? []).filter((item) =>
-        item.task_id !== taskId ||
-        (options.targetId !== undefined && item.target_id !== options.targetId) ||
-        (options.relationType !== undefined && item.relation_type !== options.relationType),
-      ),
-    };
-    await persist(scope, next);
+        ),
+      };
+      return { cache: next };
+    });
   },
 
   async listAppTasks(
@@ -1222,22 +2158,24 @@ export const appsRepo = {
     if (!(await canUseServer())) return local;
     try {
       const remote = await appsApi.listAppTasks(appId, projectId, relationType);
-      const next = shallowCopyCache(cache);
-      next.appTasks = replaceRecord(next.appTasks, appId, remote);
-      for (const taskId of Object.keys(next.taskApps)) {
-        next.taskApps[taskId] = next.taskApps[taskId].filter(
-          (link) => link.app_id !== appId,
-        );
-      }
-      for (const link of remote) {
-        next.taskApps[link.task_id] = [
-          ...(next.taskApps[link.task_id] ?? []).filter(
-            (existing) => existing.id !== link.id,
-          ),
-          link,
-        ];
-      }
-      await persist(scope, next, { kind: "appTaskLinks", appId });
+      await commitCacheUpdate(scope, (latestCache) => {
+        const next = shallowCopyCache(latestCache);
+        next.appTasks = replaceRecord(next.appTasks, appId, remote);
+        for (const taskId of Object.keys(next.taskApps)) {
+          next.taskApps[taskId] = next.taskApps[taskId].filter(
+            (link) => link.app_id !== appId,
+          );
+        }
+        for (const link of remote) {
+          next.taskApps[link.task_id] = [
+            ...(next.taskApps[link.task_id] ?? []).filter(
+              (existing) => existing.id !== link.id,
+            ),
+            link,
+          ];
+        }
+        return { cache: next, replace: { kind: "appTaskLinks", appId } };
+      });
       return remote;
     } catch {
       return local;

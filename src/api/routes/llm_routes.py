@@ -2,22 +2,36 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
 import re
+import socket
+import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from contextlib import contextmanager
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from ...services.llm_model_catalog import (
+    _strata_static_catalog_settings,
     build_engine_options as build_llm_engine_options,
     build_llm_mode_state,
     build_model_catalog as build_llm_model_catalog,
+    CACHEABLE_REMOTE_PROVIDERS,
+    cached_provider_has_snapshot,
+    cached_provider_is_fresh,
+    cached_provider_updated_at,
+    DEEPINFRA_MODEL_CATALOG_ERROR,
+    DEEPINFRA_MODEL_CATALOG_RETRY_SECONDS,
+    DEEPINFRA_MODEL_CATALOG_TTL_SECONDS,
     load_model_catalog_cache,
     save_model_catalog_cache,
     update_model_catalog_cache,
@@ -32,6 +46,7 @@ from ...services.conversation_session_selection import (
     merge_session_llm_settings,
     new_chat_llm_defaults_envelope,
     read_session_llm_settings,
+    session_main_route_override_for_binding,
     session_llm_settings_envelope,
     validate_session_llm_settings,
 )
@@ -60,10 +75,14 @@ from ...llm.deployment_resolver import (
 from ...llm.openai_compatible_local_profiles import (
     llama_cpp_auxiliary_artifacts,
     freetoken_model_profile,
+    llama_cpp_model_profiles,
+    strata_model_profile,
+    strata_model_profiles,
     llama_cpp_model_profile,
     llama_cpp_reasoning_effort_metadata,
     llama_cpp_runtime_distribution,
     managed_local_runtime_for_model,
+    normalize_openai_compatible_base_url,
     openai_compatible_local_base_url,
 )
 from ..router_helpers import cookie_auth_dependency
@@ -303,6 +322,186 @@ def _restore_llm_client(server: Any, old_client: Any) -> None:
     except Exception:
         logger.exception("Failed to run hooks while restoring previous LLM client")
         server._llm_client = old_client
+
+
+_LLM_RUNTIME_CHANGE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _llm_runtime_change_gate(*, wait: bool = False):
+    # Only setup completion may wait here, on its existing background thread.
+    # HTTP/WebSocket admission must never block the event loop or queue a change.
+    if not _LLM_RUNTIME_CHANGE_LOCK.acquire(blocking=wait):
+        raise HTTPException(status_code=409, detail="LLM runtime configuration is busy; retry after the current change completes")
+    try:
+        yield
+    finally:
+        _LLM_RUNTIME_CHANGE_LOCK.release()
+
+
+def _guard_llm_runtime_change(handler):
+    @wraps(handler)
+    async def guarded(*args, **kwargs):
+        # FastAPI has already resolved cookie/admin dependencies. Buffer HTTP
+        # input before admission so a slow body cannot monopolize the gate.
+        request = kwargs.get("request") or (args[0] if args else None)
+        if isinstance(request, Request):
+            await request.body()
+        with _llm_runtime_change_gate():
+            return await _await_llm_runtime_change(
+                asyncio.create_task(handler(*args, **kwargs))
+            )
+
+    return guarded
+
+
+def _commit_strata_runtime_change(
+    server: Any,
+    *,
+    model: str,
+    changes: dict[str, Any],
+    require_prepared: bool,
+) -> None:
+    # Setup completion already runs in a worker. Wait rather than fail a
+    # completed setup if another runtime mutation is briefly in progress.
+    with _llm_runtime_change_gate(wait=True):
+        _apply_strata_runtime_change(
+            server,
+            model=model,
+            changes=changes,
+            require_prepared=require_prepared,
+        )
+
+
+async def _run_llm_runtime_change_async(
+    change: Callable[..., Any], *args, **kwargs
+) -> Any:
+    return await _await_llm_runtime_change(
+        asyncio.create_task(asyncio.to_thread(change, *args, **kwargs))
+    )
+
+
+async def _await_llm_runtime_change(worker: asyncio.Task) -> Any:
+    # Cancelling an await cannot stop a synchronous startup or DB transaction.
+    # Retain the worker until commit/rollback completes, then propagate request
+    # cancellation. This also keeps a cancelled request from abandoning errors.
+    cancelled = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError as exc:
+            if worker.cancelled():
+                raise
+            cancelled = cancelled or exc
+        except Exception:
+            if cancelled is None:
+                raise
+            logger.exception("LLM runtime change failed after request cancellation")
+            break
+    if cancelled is not None:
+        raise cancelled
+    return result
+
+
+def _apply_strata_runtime_change(
+    server: Any,
+    *,
+    model: str,
+    changes: dict[str, Any],
+    require_prepared: bool,
+) -> None:
+    """Apply Strata settings transactionally around setup/client/process state.
+
+    Strata setup may take hours and runs in a worker thread.  Keep requested
+    settings in a staged overlay until the official setup has completed and an
+    active same-model client can be rebound.  If process/client/persistence
+    fails, restore the old client and the old owned endpoint before surfacing
+    the error.
+    """
+
+    from src.llm.manager import create_llm_client
+    from src.service_manager import (
+        ensure_openai_compatible_local_server,
+        stop_strata_server,
+    )
+    from src.services.strata_runtime import (
+        strata_base_url,
+        strata_prepared_config,
+        strata_settings,
+    )
+
+    current_provider = str(server.config.get("llm_provider", "") or "").strip().lower()
+    current_model = str(
+        server.config.get("llm_model", "")
+        or server.config.get("openai_compatible_local.model", "")
+        or ""
+    ).strip()
+    active = current_provider == "openai_compatible_local" and current_model == model
+    staged = _ConfigOverlay(server.config, changes)
+    old_settings = strata_settings(server.config, model=model)
+    new_settings = strata_settings(staged, model=model)
+    if require_prepared and new_settings["auto_start"]:
+        strata_prepared_config(new_settings)
+
+    old_auto_start = bool(old_settings["auto_start"])
+    new_auto_start = bool(new_settings["auto_start"])
+    old_client = getattr(server, "_llm_client", None)
+    old_runtime_mode = getattr(server, "_current_llm_mode", "")
+    new_process_started = False
+    old_process_stopped = False
+    new_client = None
+
+    try:
+        if active and old_auto_start and not new_auto_start:
+            old_process_stopped = bool(stop_strata_server(server.config, model=model))
+        elif active and new_auto_start:
+            # A successful setup/configure must make the selected config live;
+            # force_restart is scoped to Strata by service_manager and drains
+            # only the same-model endpoint.
+            new_process_started = bool(
+                ensure_openai_compatible_local_server(
+                    staged,
+                    model=model,
+                    raise_on_launch_error=True,
+                    force_restart=True,
+                )
+            )
+
+        if active:
+            new_client = create_llm_client(staged)
+            next_mode_state = build_llm_mode_state(staged, client=new_client)
+            next_mode = str(next_mode_state.get("mode") or "").strip()
+            if (
+                next_mode_state.get("kind") == "response_mode"
+                and hasattr(new_client, "set_llm_mode")
+            ):
+                new_client.set_llm_mode(next_mode)
+            server.set_llm_client(new_client)
+
+        _persist_config_changes(server.config, changes)
+        if active and new_client is not None:
+            server._current_llm_mode = next_mode
+    except Exception:
+        if active:
+            _restore_llm_client(server, old_client)
+            server._current_llm_mode = old_runtime_mode
+            try:
+                if new_auto_start and (new_process_started or old_process_stopped):
+                    stop_strata_server(staged, model=model)
+            except Exception:
+                logger.exception("Failed to stop replacement Strata process during rollback")
+            if old_auto_start:
+                try:
+                    ensure_openai_compatible_local_server(
+                        server.config,
+                        model=model,
+                        raise_on_launch_error=False,
+                        force_restart=False,
+                    )
+                except Exception:
+                    logger.exception("Failed to restore previous Strata process during rollback")
+        raise
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -1020,9 +1219,39 @@ def _local_runtime_public_reason(state: dict[str, Any]) -> str | None:
             "Managed local runtime preparation failed. "
             "Check server logs for details."
         ),
+        "cancelling": "Managed local runtime preparation is being cancelled.",
+        "cancelled": "Managed local runtime preparation was cancelled.",
         "not_found": "Local runtime prepare task not found.",
     }
     return reasons.get(status)
+
+
+def _probe_llama_cpp_endpoint(endpoint: str) -> str:
+    """Classify a local endpoint without sending an HTTP request.
+
+    ``_owned_llama_cpp_process_at`` only knows about tracked workers.  A
+    listener left by another process must therefore not be treated as an idle
+    managed worker.  Keep the probe bounded and preserve an explicit
+    ``unknown`` result: only a real connection refusal proves that the port is
+    closed and authorizes the waiting projection.
+    """
+
+    try:
+        parsed = urlsplit(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "unknown"
+        port = parsed.port
+        if port is None:
+            return "unknown"
+        with socket.create_connection(
+            (parsed.hostname, port),
+            timeout=0.35,
+        ):
+            return "open"
+    except ConnectionRefusedError:
+        return "closed"
+    except (PermissionError, TimeoutError, OSError, ValueError):
+        return "unknown"
 
 
 def _local_runtime_api_payload(
@@ -1057,6 +1286,7 @@ def _local_runtime_api_payload(
         else None
     )
     runtime_install_source = str(state.get("runtime_install_source") or "").strip() or None
+    runtime_root_source = str(state.get("runtime_root_source") or "").strip() or None
     runtime_release = str(state.get("runtime_release") or "").strip() or None
     runtime_asset = str(state.get("runtime_asset") or "").strip() or None
 
@@ -1086,6 +1316,8 @@ def _local_runtime_api_payload(
         if runtime == "llama_cpp"
         else freetoken_model_profile(model)
         if runtime == "freetoken"
+        else strata_model_profile(model)
+        if runtime == "strata"
         else None
     )
     auxiliary_contract = []
@@ -1110,7 +1342,7 @@ def _local_runtime_api_payload(
     profile_downloadable = bool(
         profile
         and profile.get("source_repository")
-        and (runtime == "freetoken" or profile.get("gguf_filename"))
+        and (runtime in {"freetoken", "strata"} or profile.get("gguf_filename"))
     )
     explicit_runtime_downloadable = runtime_install_state.get(
         "downloadable",
@@ -1157,6 +1389,7 @@ def _local_runtime_api_payload(
     ready_value = server_state.get("ready", state.get("server_ready"))
     server_running = running_value if isinstance(running_value, bool) else False
     server_ready = ready_value if isinstance(ready_value, bool) else None
+    endpoint_offline = server_state.get("endpoint_offline") is True
     server_base_url = None
     if managed and model:
         try:
@@ -1177,8 +1410,74 @@ def _local_runtime_api_payload(
                 return value
         return False
 
+    strata_public = None
+    if runtime == "strata":
+        from src.services.strata_runtime import SETUP_NOTICE
+
+        settings = _strata_static_catalog_settings(config, model)
+        strata_public = {key: settings[key] for key in ("context_size", "vision", "host", "port", "auto_start")}
+        strata_public.update({"operator_only": settings["operator_only"], "setup_notice": SETUP_NOTICE, "source_revision": profile["source_revision"], "source_url": profile["source_url"]})
+
+    server_public: dict[str, Any] = {
+        "status": str(
+            server_state.get("status")
+            or ("not_checked" if managed else "external")
+        ),
+        "running": server_running,
+        "ready": server_ready if managed else False,
+        "base_url": server_base_url,
+    }
+    if runtime == "strata":
+        startup_progress = (
+            server_state.get("startup_progress")
+            if isinstance(server_state.get("startup_progress"), dict)
+            else None
+        )
+        if startup_progress is not None:
+            phase = startup_progress.get("phase")
+            elapsed_s = startup_progress.get("elapsed_s")
+            if phase not in {"loading", "reading_weights", "allocating_cache", "initializing"}:
+                startup_progress = None
+            elif not isinstance(elapsed_s, (int, float)) or isinstance(elapsed_s, bool) or elapsed_s < 0:
+                startup_progress = None
+            else:
+                startup_progress = {"phase": phase, "elapsed_s": elapsed_s}
+        server_public.update(
+            {
+                "context_size": server_state.get("context_size"),
+                "vision": server_state.get("vision"),
+                "startup_progress": startup_progress,
+                # Prepared + auto_start + stopped is the normal idle state:
+                # the next chat turn starts Strata (lazy start).
+                "auto_start_on_send": bool(
+                    strata_public
+                    and strata_public["auto_start"]
+                    and not strata_public["operator_only"]
+                    and prepared
+                    and not server_running
+                    and server_public["status"] == "offline"
+                    and endpoint_offline
+                ),
+            }
+        )
+    elif runtime == "llama_cpp":
+        # The status route marks a prepared, stopped managed llama.cpp worker
+        # as ``waiting`` only when its auto-start setting has already been
+        # validated. Preserve that proof for the UI without treating any
+        # other offline, failed, live, or identity-mismatched state as lazy
+        # loadable.
+        server_public["auto_start_on_send"] = bool(
+            managed
+            and prepared
+            and server_public["status"] == "waiting"
+            and not server_running
+            and server_ready is False
+            and endpoint_offline
+        )
+
     return {
         "task_id": task_id,
+        "strata": strata_public,
         "model": model,
         "runtime": runtime,
         "runtime_distribution": runtime_distribution,
@@ -1210,6 +1509,9 @@ def _local_runtime_api_payload(
         "runtime_version": runtime_version,
         "runtime_build": runtime_build,
         "runtime_install_source": runtime_install_source,
+        # Keep provenance without exposing the manager's local filesystem
+        # root; the raw manager state retains runtime_root for diagnostics.
+        "runtime_root_source": runtime_root_source,
         "runtime_release": runtime_release,
         "runtime_asset": runtime_asset,
         "runtime_install": {
@@ -1243,20 +1545,19 @@ def _local_runtime_api_payload(
         },
         # B2a prepares runtime/model artifacts only. Server launch/readiness is
         # intentionally not inferred from filesystem state.
-        "server": {
-            "status": str(
-                server_state.get("status")
-                or ("not_checked" if managed else "external")
-            ),
-            "running": server_running,
-            "ready": server_ready if managed else False,
-            "base_url": server_base_url,
-        },
+        "server": server_public,
         "actions": {
             "prepare": bool(
                 prepare_supported and done and not prepared
             ),
             "poll": bool(task_id and not done),
+            "cancel": bool(
+                runtime == "strata"
+                and
+                task_id
+                and not done
+                and status in {"queued", "running", "preparing", "cancelling"}
+            ),
             "retry": bool(
                 prepare_supported
                 and done
@@ -1288,6 +1589,246 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         local_runtime_manager = ManagedLocalRuntimeManager(server.config)
         server._local_llm_runtime_manager = local_runtime_manager
 
+    # Explicit runtime discovery may fan out to several loopback providers and
+    # creates its own bounded worker pool inside the catalog helper. Keep one
+    # such operation in flight per FastAPI loop; metadata/static reads do not
+    # acquire this gate.
+    runtime_discovery_gate = asyncio.Semaphore(1)
+    runtime_discovery_queue_timeout = 0.25
+    # A normal catalog read is a metadata snapshot, so concurrent settings and
+    # runtime-context requests should share one worker.  Shield the worker
+    # from request cancellation; otherwise each browser timeout would leave a
+    # new filesystem-heavy catalog build behind it.
+    normal_catalog_tasks: dict[str, asyncio.Task[Any]] = {}
+    # Cloud registry refreshes are independent from local runtime discovery.
+    # Coalesce explicit DeepInfra refreshes as well as the TTL-triggered
+    # normal read, so several settings tabs cannot fan out identical GETs.
+    deepinfra_catalog_tasks: dict[str, asyncio.Task[Any]] = {}
+    deepinfra_refresh_retry_until: dict[str, float] = {}
+    deepinfra_refresh_errors: dict[str, str] = {}
+    model_catalog_cache_write_lock = asyncio.Lock()
+
+    def _normal_catalog_snapshot_key(
+        config: Any,
+        provider: Optional[str],
+    ) -> str:
+        """Build a secret-free key for one current catalog snapshot."""
+
+        def value(key: str) -> Any:
+            getter = getattr(config, "get", None)
+            if callable(getter):
+                return getter(key, None)
+            if isinstance(config, dict):
+                current: Any = config
+                for part in key.split("."):
+                    if not isinstance(current, dict) or part not in current:
+                        return None
+                    current = current[part]
+                return current
+            return None
+
+        snapshot = {
+            "provider": str(provider or "").strip().lower(),
+            "llm_provider": value("llm_provider"),
+            "llm_model": value("llm_model"),
+            "local_model": value("openai_compatible_local.model"),
+            "local_base_url": value("openai_compatible_local.base_url"),
+            "local_server_profile": value("openai_compatible_local.server_profile"),
+            "hidden_provider_ids": value("llm_provider_visibility.hidden_provider_ids"),
+            "runtime_mode": value("llm_runtime_mode"),
+            "config_revision": value("config_revision")
+            or value("app_config_revision")
+            or value("app_config_schema_version"),
+            # The model-list endpoint and connection host affect the effective
+            # DeepInfra catalog. Include only non-secret connection metadata;
+            # the complete snapshot is hashed before it becomes a task key.
+            "deepinfra": {
+                "base_url": value("deepinfra.base_url")
+                or value("deepinfra_base_url"),
+                "models_url": value("deepinfra.models_url"),
+                "api_key_configured": bool(
+                    value("deepinfra_api_key")
+                    or os.environ.get("DEEPINFRA_TOKEN")
+                ),
+                "base_url_env": os.environ.get("DEEPINFRA_BASE_URL"),
+                "models_url_env": os.environ.get("DEEPINFRA_MODELS_URL"),
+            },
+            "strata": {
+                key: value(f"openai_compatible_local.strata.{key}")
+                for key in (
+                    "source_root",
+                    "data_dir",
+                    "gguf_dir",
+                    "host",
+                    "port",
+                    "context_size",
+                    "vision",
+                    "auto_start",
+                    "readiness_timeout",
+                    "prefill",
+                    "vram_reserve_mib",
+                    "expert_cache",
+                )
+            },
+            "freetoken": {
+                key: value(f"openai_compatible_local.freetoken.{key}")
+                for key in ("host", "port", "auto_start")
+            },
+            # Local profile discovery is read-only but depends on the selected
+            # root, executable, and per-profile launch controls. Include only
+            # operational fields in the coalescing key; credentials and other
+            # secret-bearing settings must never enter it.
+            "llama_cpp": {
+                key: value(f"openai_compatible_local.llama_cpp.{key}")
+                for key in (
+                    "model_root",
+                    "model_dir",
+                    "model_path",
+                    "model_alias",
+                    "executable",
+                    "auto_start",
+                    "context_size",
+                    "gpu_layers",
+                    "extra_args",
+                    "readiness_timeout",
+                    "mtp_enabled",
+                )
+            },
+            # These environment values are part of the effective local
+            # runtime resolver. Keep the allowlist limited to operational
+            # paths/toggles; provider credentials are deliberately omitted.
+            "environment": {
+                name: os.environ.get(name)
+                for name in (
+                    "LLAMA_CPP_MODEL_ROOT",
+                    "AOITALK_LLAMA_CPP_MODEL_ROOT",
+                    "AOITALK_REQUIRE_EXTERNAL_LLM_MODEL_ROOT",
+                    "LLAMA_CPP_EXECUTABLE",
+                    "LLAMA_SERVER_EXE",
+                    "LLAMA_CPP_MODEL_PATH",
+                    "LLAMA_CPP_MODEL_ALIAS",
+                    "LLAMA_CPP_AUTO_START",
+                    "STRATA_SOURCE_ROOT",
+                    "STRATA_DATA_DIR",
+                    "STRATA_GGUF_DIR",
+                    "STRATA_AUTO_START",
+                    "FREETOKEN_HOST",
+                    "FREETOKEN_PORT",
+                    "FREETOKEN_AUTO_START",
+                )
+            },
+            "registered_profiles": {
+                "llama_cpp": sorted(
+                    str(profile.get("id") or "")
+                    for profile in llama_cpp_model_profiles()
+                    if isinstance(profile, dict) and profile.get("id")
+                ),
+                "strata": sorted(
+                    str(profile.get("id") or "")
+                    for profile in strata_model_profiles()
+                    if isinstance(profile, dict) and profile.get("id")
+                ),
+            },
+        }
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _run_coalesced_normal_catalog(
+        operation: Callable[..., Any],
+        snapshot_key: str,
+        *args: Any,
+    ) -> Any:
+        key = snapshot_key
+        worker = normal_catalog_tasks.get(key)
+        if worker is None or worker.done():
+            worker = asyncio.create_task(
+                asyncio.to_thread(operation, *args)
+            )
+            normal_catalog_tasks[key] = worker
+
+            def _consume_failed_worker(done: asyncio.Task[Any]) -> None:
+                if not done.cancelled():
+                    done.exception()
+
+            worker.add_done_callback(_consume_failed_worker)
+        try:
+            return await asyncio.shield(worker)
+        finally:
+            if worker.done() and normal_catalog_tasks.get(key) is worker:
+                normal_catalog_tasks.pop(key, None)
+
+    async def _run_coalesced_deepinfra_catalog(
+        operation: Callable[..., Any],
+        snapshot_key: str,
+        *args: Any,
+    ) -> Any:
+        """Share one DeepInfra registry fetch for a config snapshot."""
+
+        worker = deepinfra_catalog_tasks.get(snapshot_key)
+        if worker is None or worker.done():
+            worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+            deepinfra_catalog_tasks[snapshot_key] = worker
+
+            def _consume_failed_deepinfra_worker(done: asyncio.Task[Any]) -> None:
+                if not done.cancelled():
+                    done.exception()
+
+            worker.add_done_callback(_consume_failed_deepinfra_worker)
+        try:
+            return await asyncio.shield(worker)
+        finally:
+            if worker.done() and deepinfra_catalog_tasks.get(snapshot_key) is worker:
+                deepinfra_catalog_tasks.pop(snapshot_key, None)
+
+    async def _drain_runtime_discovery(worker: asyncio.Task[Any]) -> Any:
+        """Await a discovery worker to completion even after request cancel."""
+
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(worker)
+                break
+            except asyncio.CancelledError as exc:
+                if worker.cancelled():
+                    raise
+                cancelled = cancelled or exc
+            except Exception:
+                if cancelled is None:
+                    raise
+                break
+        if cancelled is not None:
+            raise cancelled
+        return result
+
+    async def _run_bounded_runtime_discovery(
+        operation: Callable[..., Any], *args: Any
+    ) -> Any:
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    runtime_discovery_gate.acquire(),
+                    timeout=runtime_discovery_queue_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail="LLM runtime discovery is busy; retry shortly",
+                    headers={"Retry-After": "1"},
+                ) from exc
+            acquired = True
+            worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+            return await _drain_runtime_discovery(worker)
+        finally:
+            if acquired:
+                runtime_discovery_gate.release()
+
     async def _resolve_request_user_id(request: Request) -> str | None:
         user_resolver = getattr(server, "_get_user_info_from_request", None)
         if not callable(user_resolver):
@@ -1301,7 +1842,9 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         actor_id = user_info.get("id") or user_info.get("user_id")
         return str(actor_id).strip() if actor_id else None
 
-    async def _require_global_config_admin(request: Request) -> None:
+    async def _require_global_config_admin(
+        request: Request, _: None = Depends(require_auth)
+    ) -> None:
         if getattr(server, "auth_enabled", True) is False:
             return
         if not await server._is_admin_user(request):
@@ -1339,11 +1882,284 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         model_id = str(model or "").strip()
         if not model_id:
             raise HTTPException(status_code=400, detail="model は必須です")
-        try:
-            state = await asyncio.to_thread(
-                local_runtime_manager.status,
-                model_id,
+
+        def _llama_cpp_auto_start_enabled() -> bool:
+            """Read the launch toggle without resolving or probing a runtime."""
+
+            value: Any = None
+            getter = getattr(server.config, "get", None)
+            if callable(getter):
+                try:
+                    value = getter(
+                        "openai_compatible_local.llama_cpp.auto_start",
+                        None,
+                    )
+                except TypeError:
+                    value = None
+            if value is None and isinstance(server.config, dict):
+                local = server.config.get("openai_compatible_local") or {}
+                llama = local.get("llama_cpp") if isinstance(local, dict) else {}
+                if isinstance(llama, dict):
+                    value = llama.get("auto_start")
+            if value is None:
+                value = os.getenv("LLAMA_CPP_AUTO_START")
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return True
+            return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+        def _llama_cpp_process_snapshot(
+            endpoint: str,
+            expected_alias: str,
+        ) -> tuple[object | None, bool, bool]:
+            """Find one tracked worker and validate its controller identity."""
+
+            from src.service_manager import (
+                _openai_compatible_local_processes,
+                _owned_llama_cpp_process_at,
             )
+
+            process = None
+            try:
+                process = _owned_llama_cpp_process_at(endpoint, expected_alias)
+            except Exception:
+                process = None
+            if process is None:
+                for candidate in list(_openai_compatible_local_processes):
+                    recorded_endpoint = str(
+                        getattr(candidate, "_aoi_local_base_url", None)
+                        or getattr(candidate, "_aoi_llama_cpp_base_url", "")
+                        or ""
+                    ).strip()
+                    if not recorded_endpoint:
+                        continue
+                    try:
+                        same_endpoint = (
+                            normalize_openai_compatible_base_url(recorded_endpoint)
+                            == endpoint
+                        )
+                    except Exception:
+                        same_endpoint = False
+                    if (
+                        same_endpoint
+                        and str(
+                            getattr(candidate, "_aoi_local_runtime", "") or ""
+                        )
+                        == "llama_cpp"
+                    ):
+                        process = candidate
+                        break
+            if process is None:
+                return None, False, False
+            try:
+                process_live = process.poll() is None
+            except Exception:
+                process_live = False
+            process_runtime = str(
+                getattr(process, "_aoi_local_runtime", "") or ""
+            )
+            process_alias = str(
+                getattr(process, "_aoi_local_model_alias", "") or ""
+            ).strip()
+            process_endpoint = str(
+                getattr(process, "_aoi_local_base_url", None)
+                or getattr(process, "_aoi_llama_cpp_base_url", "")
+                or ""
+            ).strip()
+            try:
+                process_endpoint = normalize_openai_compatible_base_url(
+                    process_endpoint
+                )
+            except Exception:
+                process_endpoint = ""
+            identity_ok = bool(
+                process_runtime == "llama_cpp"
+                and process_endpoint == endpoint
+                and process_alias
+                and process_alias == expected_alias
+            )
+            return process, process_live, identity_ok
+
+        try:
+            state = None
+            owned_process = None
+            strata_readiness = None
+            llama_cpp_process = None
+            llama_cpp_endpoint = None
+            llama_cpp_expected_alias = None
+            llama_cpp_process_live = False
+            llama_cpp_process_identity_ok = False
+            managed_runtime = managed_local_runtime_for_model(server.config, model_id)
+            managed_ownership = provider_runtime_ownership(
+                "openai_compatible_local",
+                server.config,
+                model=model_id,
+            )
+            if (
+                managed_runtime == "strata"
+                and managed_ownership.managed_runtime
+            ):
+                from src.services.strata_runtime import strata_base_url, strata_readiness
+
+                try:
+                    from src.service_manager import _owned_strata_process_at
+
+                    owned_process = _owned_strata_process_at(
+                        strata_base_url(server.config, model=model_id)
+                    )
+                except Exception:
+                    owned_process = None
+                fast_status = getattr(
+                    local_runtime_manager,
+                    "status_for_owned_strata",
+                    None,
+                )
+                if owned_process is not None and callable(fast_status):
+                    state = await asyncio.to_thread(
+                        fast_status,
+                        model_id,
+                        owned_process,
+                    )
+
+            if managed_runtime == "llama_cpp" and managed_ownership.managed_runtime:
+                cpp_profile = llama_cpp_model_profile(model_id)
+                if cpp_profile is not None:
+                    llama_cpp_expected_alias = str(
+                        cpp_profile.get("served_alias")
+                        or cpp_profile.get("id")
+                        or model_id
+                    ).strip()
+                try:
+                    llama_cpp_endpoint = normalize_openai_compatible_base_url(
+                        openai_compatible_local_base_url(
+                            server.config,
+                            model=model_id,
+                        )
+                    )
+                    (
+                        llama_cpp_process,
+                        llama_cpp_process_live,
+                        llama_cpp_process_identity_ok,
+                    ) = await asyncio.to_thread(
+                        _llama_cpp_process_snapshot,
+                        llama_cpp_endpoint,
+                        llama_cpp_expected_alias or model_id,
+                    )
+                    if llama_cpp_process_live and llama_cpp_process_identity_ok:
+                        fast_status = getattr(
+                            local_runtime_manager,
+                            "status_for_owned_llama_cpp",
+                            None,
+                        )
+                        if callable(fast_status):
+                            state = await asyncio.to_thread(
+                                fast_status,
+                                model_id,
+                                llama_cpp_process,
+                            )
+                except Exception:
+                    # Status is diagnostic. A malformed/stale process record
+                    # falls through to the cheap artifact snapshot below.
+                    llama_cpp_process = None
+
+            if not isinstance(state, dict):
+                poll_status = getattr(local_runtime_manager, "status_for_poll", None)
+                if callable(poll_status):
+                    state = await asyncio.to_thread(
+                        poll_status,
+                        model_id,
+                    )
+                else:
+                    state = await asyncio.to_thread(
+                        local_runtime_manager.status,
+                        model_id,
+                    )
+
+            if (
+                managed_runtime == "llama_cpp"
+                and managed_ownership.managed_runtime
+                and llama_cpp_endpoint
+            ):
+                if llama_cpp_process is None:
+                    prepared = bool(state.get("prepared"))
+                    auto_start_enabled = _llama_cpp_auto_start_enabled()
+                    endpoint_probe = "unknown"
+                    if prepared and auto_start_enabled:
+                        endpoint_probe = await asyncio.to_thread(
+                            _probe_llama_cpp_endpoint,
+                            llama_cpp_endpoint,
+                        )
+                    waiting = (
+                        prepared
+                        and auto_start_enabled
+                        and endpoint_probe == "closed"
+                    )
+                    state["server"] = {
+                        "status": "waiting" if waiting else "offline",
+                        "running": False,
+                        "ready": False,
+                        "base_url": llama_cpp_endpoint,
+                        "endpoint_offline": endpoint_probe == "closed",
+                    }
+                elif not llama_cpp_process_live:
+                    state["status"] = "failed"
+                    state["phase"] = "runtime"
+                    state["done"] = True
+                    state["error"] = "llama.cpp server exited before readiness."
+                    state["server"] = {
+                        "status": "failed",
+                        "running": False,
+                        "ready": False,
+                        "base_url": llama_cpp_endpoint,
+                        "endpoint_offline": True,
+                    }
+                elif not llama_cpp_process_identity_ok:
+                    state["status"] = "failed"
+                    state["phase"] = "runtime"
+                    state["done"] = True
+                    state["error"] = "llama.cpp server identity does not match."
+                    state["server"] = {
+                        "status": "failed",
+                        "running": True,
+                        "ready": False,
+                        "base_url": llama_cpp_endpoint,
+                    }
+                else:
+                    from src.service_manager._local_llm_servers import (
+                        _llama_cpp_model_ids_exact,
+                    )
+
+                    try:
+                        served_ids = await asyncio.to_thread(
+                            _llama_cpp_model_ids_exact,
+                            llama_cpp_endpoint,
+                        )
+                    except Exception:
+                        served_ids = set()
+                    expected_alias = llama_cpp_expected_alias or model_id
+                    if expected_alias in served_ids:
+                        server_status = "ready"
+                        server_ready = True
+                    elif served_ids:
+                        # A live worker serving another alias is an explicit
+                        # identity failure. Preserve the requested alias in
+                        # the state while refusing to claim readiness.
+                        state["status"] = "failed"
+                        state["phase"] = "runtime"
+                        state["done"] = True
+                        state["error"] = "llama.cpp server model alias mismatch."
+                        server_status = "failed"
+                        server_ready = False
+                    else:
+                        server_status = "loading"
+                        server_ready = False
+                    state["server"] = {
+                        "status": server_status,
+                        "running": True,
+                        "ready": server_ready,
+                        "base_url": llama_cpp_endpoint,
+                    }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception:
@@ -1352,14 +2168,23 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 status_code=500,
                 detail="Failed to inspect managed local runtime",
             ) from None
+        if state.get("runtime") == "strata":
+            if strata_readiness is None:
+                from src.services.strata_runtime import strata_readiness
+            state["server"] = await asyncio.to_thread(
+                strata_readiness,
+                server.config,
+                model=model_id,
+                owned_process=owned_process,
+            )
         return JSONResponse(_local_runtime_api_payload(state, server.config))
 
     @app.post("/api/llm/local-runtime/prepare")
+    @_guard_llm_runtime_change
     async def prepare_local_runtime(
         request: Request,
-        _: None = Depends(require_auth),
+        _: None = Depends(_require_global_config_admin),
     ):
-        await _require_global_config_admin(request)
         try:
             body = await request.json()
         except Exception as exc:
@@ -1389,11 +2214,100 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             else None
         )
 
+        is_strata = managed_local_runtime_for_model(server.config, model_id) == "strata"
+        setup_kwargs: dict[str, Any] = {}
+        if is_strata:
+            from src.services.strata_runtime import normalize_strata_settings, strata_external, strata_settings
+
+            if strata_external(server.config):
+                raise HTTPException(status_code=409, detail="EnterpriseのStrataはoperator管理です。AoiTalkからsetupしません")
+            if runtime not in (None, "strata"):
+                raise HTTPException(status_code=400, detail="Strata runtimeが一致しません")
+            action = body.get("action", "setup")
+            if action in {"start", "stop"}:
+                from src.service_manager import ensure_openai_compatible_local_server, stop_strata_server
+                from src.services.strata_runtime import strata_readiness
+
+                if not strata_settings(server.config, model=model_id)["auto_start"]:
+                    raise HTTPException(status_code=409, detail="外部Strataはoperator管理です")
+                if action == "start":
+                    await _run_llm_runtime_change_async(ensure_openai_compatible_local_server, server.config, model=model_id, raise_on_launch_error=True)
+                else:
+                    await _run_llm_runtime_change_async(stop_strata_server, server.config, model=model_id)
+                state = await asyncio.to_thread(local_runtime_manager.status, model_id, "strata")
+                state["server"] = await asyncio.to_thread(strata_readiness, server.config, model=model_id)
+                return JSONResponse(_local_runtime_api_payload(state, server.config))
+            if action not in {"setup", "configure"}:
+                raise HTTPException(status_code=400, detail="Strata actionが不正です")
+            configure_only = body.get("configure_only") is True or action == "configure"
+            if not configure_only and body.get("setup_confirmed") is not True:
+                raise HTTPException(status_code=400, detail="公式setup実行・大容量downloadの確認が必要です")
+            try:
+                settings = normalize_strata_settings(body.get("strata", {}))
+                changes = {f"openai_compatible_local.strata.{key}": value for key, value in settings.items()}
+                endpoint = body.get("base_url")
+                if endpoint is not None:
+                    from urllib.parse import urlsplit
+
+                    parsed = urlsplit(str(endpoint))
+                    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                        raise ValueError("Strata外部endpointは認証情報を含まないhttp(s) URLで指定してください")
+                    changes["openai_compatible_local.base_url"] = str(endpoint)
+                staged = _ConfigOverlay(server.config, changes)
+                effective = strata_settings(staged, model=model_id)
+                # Preserve known successful engine performance flags when a
+                # path/config change is saved.  The official setup otherwise
+                # regenerates --prefill and --vram-reserve-mib with its own
+                # defaults, while Strata's generated JSON is not the durable
+                # AoiTalk settings store.
+                for performance_key in ("prefill", "vram_reserve_mib", "expert_cache"):
+                    if (
+                        performance_key not in settings
+                        and effective.get(performance_key) is not None
+                    ):
+                        changes[
+                            f"openai_compatible_local.strata.{performance_key}"
+                        ] = effective[performance_key]
+                if not configure_only and not effective["auto_start"]:
+                    raise ValueError("外部Strataのsetupはoperatorが行ってください")
+                if not configure_only and not settings.get("data_dir") and not server.config.get("openai_compatible_local.strata.data_dir", ""):
+                    raise ValueError("大容量データの保存先（repository外）を明示してください")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if configure_only:
+                try:
+                    await _run_llm_runtime_change_async(
+                        _apply_strata_runtime_change,
+                        server,
+                        model=model_id,
+                        changes=changes,
+                        require_prepared=True,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                state = await asyncio.to_thread(local_runtime_manager.status, model_id, "strata")
+                return JSONResponse(_local_runtime_api_payload(state, server.config))
+            try:
+                from src.service_manager import validate_strata_setup_safety
+
+                validate_strata_setup_safety(server.config, model=model_id)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            setup_kwargs["setup_confirmed"] = True
+            setup_kwargs["strata_settings_override"] = effective
+            setup_kwargs["on_success"] = lambda: _commit_strata_runtime_change(
+                server,
+                model=model_id,
+                changes=changes,
+                require_prepared=True,
+            )
+
         try:
             state = await asyncio.to_thread(
                 local_runtime_manager.start_prepare,
                 model_id,
                 runtime,
+                **setup_kwargs,
             )
         except ValueError as exc:
             # Includes unknown/untrusted profiles and explicit
@@ -1427,6 +2341,35 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 detail="Failed to inspect managed local runtime task",
             ) from None
 
+        payload = _local_runtime_api_payload(state, server.config)
+        return JSONResponse(
+            payload,
+            status_code=404 if payload["status"] == "not_found" else 200,
+        )
+
+    @app.post("/api/llm/local-runtime/tasks/{task_id}/cancel")
+    async def cancel_local_runtime_task(
+        request: Request,
+        task_id: str,
+        _: None = Depends(require_auth),
+    ):
+        await _require_global_config_admin(request)
+        clean_task_id = str(task_id or "").strip()
+        if not clean_task_id:
+            raise HTTPException(status_code=400, detail="task_id は必須です")
+        try:
+            state = await asyncio.to_thread(
+                local_runtime_manager.cancel_prepare,
+                clean_task_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception:
+            logger.exception("Managed local runtime task cancellation failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to cancel managed local runtime preparation",
+            ) from None
         payload = _local_runtime_api_payload(state, server.config)
         return JSONResponse(
             payload,
@@ -1566,9 +2509,9 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         return JSONResponse({"result": result, "confidence": 0.78})
 
     @app.post("/api/llm/mode")
-    async def set_llm_mode(request: Request, _: None = Depends(require_auth)):
+    @_guard_llm_runtime_change
+    async def set_llm_mode(request: Request, _: None = Depends(_require_global_config_admin)):
         """Set the current LLM response mode or reasoning effort."""
-        await _require_global_config_admin(request)
         try:
             body = await request.json()
             mode = str(body.get("mode", "")).strip()
@@ -1697,7 +2640,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         include_remote: bool = False,
         refresh_provider: Optional[str] = None,
         cached_catalog: Optional[Dict[str, Any]] = None,
-        include_runtime_models: bool = True,
+        include_runtime_models: bool = False,
+        include_installed_local_models: bool = False,
     ):
         return build_llm_model_catalog(
             cfg,
@@ -1706,6 +2650,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             refresh_provider=refresh_provider,
             cached_catalog=cached_catalog,
             include_runtime_models=include_runtime_models,
+            include_installed_local_models=include_installed_local_models,
         )
 
     def _build_engine_list(cfg):
@@ -1715,6 +2660,80 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             ollama_model_manager=server._ollama_model_manager,
         )
 
+    def _deepinfra_catalog_key(config: Any) -> str:
+        return _normal_catalog_snapshot_key(config, "deepinfra")
+
+    def _deepinfra_retry_active(snapshot_key: str) -> bool:
+        return deepinfra_refresh_retry_until.get(snapshot_key, 0.0) > time.monotonic()
+
+    def _annotate_deepinfra_failure(catalog: Dict[str, Any], snapshot_key: str) -> None:
+        error = deepinfra_refresh_errors.get(snapshot_key)
+        if not error or not isinstance(catalog, dict):
+            return
+        providers = catalog.get("providers")
+        if not isinstance(providers, list):
+            return
+        for provider_payload in providers:
+            if isinstance(provider_payload, dict) and provider_payload.get("id") == "deepinfra":
+                # Keep the stale/static model list visible while making the
+                # failed refresh explicit to the settings UI.
+                provider_payload["error"] = error
+
+    async def _persist_catalog_provider_cache(
+        cached_catalog: Dict[str, Any],
+        provider: str,
+        catalog: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist one successful provider refresh without lost updates."""
+
+        providers = catalog.get("providers") if isinstance(catalog, dict) else None
+        if not isinstance(providers, list):
+            return cached_catalog
+        refreshed_provider = next(
+            (
+                item
+                for item in providers
+                if isinstance(item, dict) and item.get("id") == provider
+            ),
+            None,
+        )
+        if not refreshed_provider:
+            return cached_catalog
+        if provider == "deepinfra" and (
+            refreshed_provider.get("refreshed") is not True
+            or refreshed_provider.get("source") != "remote"
+        ):
+            # A blocked deployment or an unconfigured custom endpoint can
+            # yield an empty/static provider payload without a successful
+            # remote snapshot. Never let that clear a good dynamic cache.
+            return cached_catalog
+
+        # Reload while holding the process-local lock so simultaneous refreshes
+        # of different providers merge into the latest cache snapshot instead
+        # of overwriting one another with an older request-local copy.
+        async with model_catalog_cache_write_lock:
+            latest_cache = await asyncio.to_thread(load_model_catalog_cache)
+            if not isinstance(latest_cache, dict):
+                latest_cache = cached_catalog if isinstance(cached_catalog, dict) else {}
+            next_cache = await asyncio.to_thread(
+                update_model_catalog_cache,
+                latest_cache,
+                provider,
+                refreshed_provider.get("models") or [],
+                allow_empty_remote=provider == "deepinfra",
+            )
+            if next_cache == latest_cache:
+                return latest_cache
+            await asyncio.to_thread(save_model_catalog_cache, next_cache)
+            refreshed_at = cached_provider_updated_at(provider, next_cache)
+
+        # The response came from the provider just now.  Keep that remote
+        # provenance in this response instead of rebuilding from cache and
+        # labelling the fresh list as a previous retrieval.
+        if refreshed_at:
+            refreshed_provider["cached_at"] = refreshed_at
+        return next_cache
+
     @app.get("/api/llm/models")
     async def get_llm_models(
         refresh: bool = Query(False),
@@ -1723,45 +2742,124 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
     ):
         """Return provider-grouped model options for the settings screen."""
         started_at = time.perf_counter()
-        # Catalog construction performs synchronous local/provider discovery
-        # and cache I/O. Keep it off the FastAPI event loop; positional
-        # arguments make the wrapper safe for lightweight test doubles that do
-        # not accept keyword arguments.
+        # Catalog construction and cache I/O are synchronous. Keep them off the
+        # FastAPI event loop; normal reads use a read-only local inventory so an
+        # installed model is selectable before its first request. HTTP runtime
+        # discovery remains an explicit refresh operation; a slow local
+        # endpoint must not hide the disk inventory behind the request timeout.
+        # Positional arguments keep this safe for lightweight test doubles.
         cached_catalog = await asyncio.to_thread(load_model_catalog_cache)
-        catalog = await asyncio.to_thread(
-            _build_model_catalog,
-            server.config,
-            refresh,
-            provider,
-            cached_catalog,
-        )
-        if refresh and provider:
-            refreshed_provider = next(
-                (item for item in catalog["providers"] if item["id"] == provider),
-                None,
-            )
-            if refreshed_provider:
-                next_cache = await asyncio.to_thread(
-                    update_model_catalog_cache,
+        deepinfra_key = _deepinfra_catalog_key(server.config)
+        deepinfra_auto_refresh = (
+            not refresh
+            and provider in {None, "deepinfra"}
+            and (
+                not cached_provider_has_snapshot("deepinfra", cached_catalog)
+                or not cached_provider_is_fresh(
+                    "deepinfra",
                     cached_catalog,
-                    provider,
-                    refreshed_provider.get("models") or [],
+                    ttl_seconds=DEEPINFRA_MODEL_CATALOG_TTL_SECONDS,
                 )
-                if next_cache != cached_catalog:
+            )
+            and not _deepinfra_retry_active(deepinfra_key)
+        )
+        if refresh and provider == "deepinfra":
+            # DeepInfra's public registry does not need local runtime probes;
+            # use a dedicated coalesced worker so concurrent refreshes share
+            # one request and cannot be rejected by the local discovery gate.
+            catalog = await _run_coalesced_deepinfra_catalog(
+                _build_model_catalog,
+                deepinfra_key,
+                server.config,
+                True,
+                provider,
+                cached_catalog,
+                False,
+                True,
+            )
+        elif refresh:
+            catalog = await _run_bounded_runtime_discovery(
+                _build_model_catalog,
+                server.config,
+                refresh,
+                provider,
+                cached_catalog,
+                True,
+                False,
+            )
+        elif deepinfra_auto_refresh:
+            catalog = await _run_coalesced_deepinfra_catalog(
+                _build_model_catalog,
+                deepinfra_key,
+                server.config,
+                True,
+                "deepinfra",
+                cached_catalog,
+                False,
+                True,
+            )
+        else:
+            catalog = await _run_coalesced_normal_catalog(
+                _build_model_catalog,
+                _normal_catalog_snapshot_key(server.config, provider),
+                server.config,
+                refresh,
+                provider,
+                cached_catalog,
+                False,
+                True,
+            )
+        refresh_targets: list[str] = []
+        if refresh:
+            if provider:
+                refresh_targets = [provider]
+            else:
+                refresh_targets = [
+                    str(item.get("id") or "")
+                    for item in (catalog.get("providers") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "") in CACHEABLE_REMOTE_PROVIDERS
+                ]
+        elif deepinfra_auto_refresh:
+            refresh_targets = ["deepinfra"]
+
+        if refresh_targets:
+            catalog_providers = catalog.get("providers") if isinstance(catalog, dict) else []
+            for refresh_target in refresh_targets:
+                target_provider = next(
+                    (
+                        item
+                        for item in (catalog_providers or [])
+                        if isinstance(item, dict) and item.get("id") == refresh_target
+                    ),
+                    None,
+                )
+                target_error = target_provider.get("error") if target_provider else None
+                if refresh_target == "deepinfra":
+                    if target_error:
+                        deepinfra_refresh_retry_until[deepinfra_key] = (
+                            time.monotonic() + DEEPINFRA_MODEL_CATALOG_RETRY_SECONDS
+                        )
+                        deepinfra_refresh_errors[deepinfra_key] = (
+                            DEEPINFRA_MODEL_CATALOG_ERROR
+                        )
+                    else:
+                        deepinfra_refresh_retry_until.pop(deepinfra_key, None)
+                        deepinfra_refresh_errors.pop(deepinfra_key, None)
+                if target_provider and not target_error:
                     try:
-                        await asyncio.to_thread(save_model_catalog_cache, next_cache)
-                        catalog = await asyncio.to_thread(
-                            _build_model_catalog,
-                            server.config,
-                            False,
-                            None,
-                            next_cache,
+                        await _persist_catalog_provider_cache(
+                            cached_catalog,
+                            refresh_target,
+                            catalog,
                         )
                     except Exception as exc:
                         logger.warning(
                             "Failed to save LLM model catalog cache: %s",
-                            exc,
+                            type(exc).__name__,
                         )
+        elif not refresh:
+            _annotate_deepinfra_failure(catalog, deepinfra_key)
         return _attach_server_timing(
             JSONResponse(catalog),
             "aoi_llm_models",
@@ -1844,9 +2942,9 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
     @app.get("/api/llm/engine")
     async def get_llm_engine(
-        include_available: bool = Query(True),
+        include_available: bool = Query(False),
     ):
-        """現在のLLMエンジン情報と利用可能エンジン一覧を返す"""
+        """現在のLLMエンジン情報を返す（候補探索は明示時だけ実行する）"""
         started_at = time.perf_counter()
         provider = server.config.get("llm_provider", "openai")
         model = server.config.get("llm_model", "gpt-4o")
@@ -1862,10 +2960,10 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             "effective_main": resolve_execution_main_route(server.config),
         }
         if include_available:
-            # The compact list performs the same synchronous discovery as the
-            # full model catalog. Keep it opt-out for callers that already
-            # fetch /api/llm/models while preserving the legacy default.
-            response["available"] = await asyncio.to_thread(
+            # Runtime discovery can wait for a managed server that is still
+            # loading a model. Keep it an explicit opt-in so a metadata read
+            # never holds the request open during a cold start.
+            response["available"] = await _run_bounded_runtime_discovery(
                 _build_engine_list,
                 server.config,
             )
@@ -1893,15 +2991,21 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
 
     @app.post("/api/llm/engine")
-    async def set_llm_engine(request: Request, _: None = Depends(require_auth)):
+    @_guard_llm_runtime_change
+    async def set_llm_engine(request: Request, _: None = Depends(_require_global_config_admin)):
         """Switch the active LLM engine (provider/model)."""
         started_at = time.perf_counter()
-        await _require_global_config_admin(request)
         try:
             body = await request.json()
             provider = str(body.get("provider", "")).strip()
             model = str(body.get("model", "")).strip()
             base_url = body.get("base_url")
+            refresh_runtime = body.get("refresh_runtime", False)
+            if not isinstance(refresh_runtime, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail="refresh_runtime は真偽値で指定してください",
+                )
 
             if not provider or not model:
                 raise HTTPException(
@@ -1918,9 +3022,23 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 else None
             )
             freetoken_selected = selected_managed_runtime == "freetoken"
+            strata_selected = selected_managed_runtime == "strata"
             freetoken_settings: dict[str, Any] = {}
+            strata_response_mode: str | None = None
 
-            if freetoken_selected:
+            if strata_selected:
+                if body.get("llama_cpp") not in (None, {}) or body.get("runtime_settings") not in (None, {}):
+                    raise HTTPException(status_code=400, detail="Strataではllama.cpp設定を使用できません")
+                llama_model_profile = None
+                llama_profile_selected = False
+                llama_cpp_settings = {}
+                from src.service_manager import validate_openai_compatible_local_launch_selection
+
+                try:
+                    validate_openai_compatible_local_launch_selection(server.config, provider=provider, model=model)
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+            elif freetoken_selected:
                 forbidden_llama_input = bool(
                     body.get("llama_cpp") not in (None, {})
                     or body.get("runtime_settings") not in (None, {})
@@ -1982,9 +3100,27 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     llama_cpp_settings = {}
 
             requested_reasoning_effort = body.get("reasoning_effort")
+            if strata_selected and requested_reasoning_effort not in (None, ""):
+                if not isinstance(requested_reasoning_effort, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Strataのresponse modeはfast / thinkingから選択してください",
+                    )
+                from ...llm.provider_mode_adapters import FAST_THINKING_MODE_OPTIONS
+
+                strata_response_mode = requested_reasoning_effort.strip().lower()
+                if strata_response_mode not in FAST_THINKING_MODE_OPTIONS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Strataのresponse modeは "
+                            f"{', '.join(FAST_THINKING_MODE_OPTIONS)} から選択してください"
+                        ),
+                    )
             if (
                 provider == "openai_compatible_local"
                 and not freetoken_selected
+                and not strata_selected
                 and isinstance(requested_reasoning_effort, str)
             ):
                 effort_metadata = llama_cpp_reasoning_effort_metadata(model)
@@ -1993,7 +3129,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            "Qwen3.8の推論effortは "
+                            "選択モデルの推論effortは "
                             f"{', '.join(effort_metadata['options'])} から選択してください"
                         ),
                     )
@@ -2071,6 +3207,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 if (
                     provider == "openai_compatible_local"
                     and not freetoken_selected
+                and not strata_selected
                     and next_managed_runtime
                 )
                 else False
@@ -2085,7 +3222,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 else False
             )
             local_runtime_changed = (
-                llama_cpp_runtime_changed or freetoken_runtime_changed
+                llama_cpp_runtime_changed
+                or freetoken_runtime_changed
             )
 
             if (
@@ -2180,6 +3318,13 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             previous_provider = str(server.config.get("llm_provider", "") or "")
             previous_model = str(server.config.get("llm_model", "") or "")
+            if (
+                refresh_runtime
+                and strata_selected
+                and previous_provider.strip().lower() == "openai_compatible_local"
+                and previous_model == model
+            ):
+                local_runtime_changed = True
             previous_runtime_ownership = (
                 provider_runtime_ownership(
                     "openai_compatible_local",
@@ -2189,26 +3334,10 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 if previous_provider.strip().lower() == "openai_compatible_local"
                 else None
             )
-            should_stop_previous_local_server = (
-                _should_stop_previous_openai_compatible_local_server(
-                    previous_provider,
-                    previous_model,
-                    provider,
-                    model,
-                    previous_ownership=previous_runtime_ownership,
-                    next_ownership=next_runtime_ownership,
-                )
-            )
-            if deployment is not None and deployment.fixed:
-                # A fixed Enterprise backend owns its local server lifecycle;
-                # never stop/start an operator-managed llama.cpp/Ollama process
-                # as a side effect of selecting the already-effective model.
-                should_stop_previous_local_server = False
-            stopped_local_servers = 0
-
             if (
                 provider == "openai_compatible_local"
                 and not freetoken_selected
+                and not strata_selected
                 and llama_cpp_settings
             ):
                 # llama_cpp.host/port are canonical for an explicit manual or
@@ -2227,6 +3356,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 provider == "openai_compatible_local"
                 and next_managed_runtime
                 and not freetoken_selected
+                and not strata_selected
                 and not (deployment is not None and deployment.fixed)
             ):
                 if llama_profile_selected and not llama_cpp_settings:
@@ -2254,6 +3384,12 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     raise HTTPException(status_code=400, detail=str(exc))
 
             config_changes: dict[str, Any] = {}
+            if strata_response_mode is not None:
+                # This is a request-scoped response mode for the shared local
+                # client.  It is removed before persistence so it cannot leak
+                # into llama.cpp reasoning-effort settings; the final
+                # ``llm_runtime_mode`` is persisted after client creation.
+                config_changes["runtime.target_reasoning_effort"] = strata_response_mode
 
             # A profile-owned GGUF/alias/context must not survive a switch to
             # another profile (or to an external local-model).  Preserve any
@@ -2289,6 +3425,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 if (
                     provider == "openai_compatible_local"
                     and not freetoken_selected
+                and not strata_selected
                 )
                 else None
             )
@@ -2312,6 +3449,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 and provider == "openai_compatible_local"
                 and next_managed_runtime
                 and not freetoken_selected
+                and not strata_selected
             ):
                 from src.service_manager._local_llm_servers import (
                     _PROFILE_RUNTIME_SETTING_KEYS,
@@ -2340,6 +3478,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 persist_user_config
                 and provider == "openai_compatible_local"
                 and not freetoken_selected
+                and not strata_selected
                 and not llama_cpp_settings
                 and next_profile is None
                 and previous_llama_runtime_configured
@@ -2445,6 +3584,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             if (
                 provider == "openai_compatible_local"
                 and not freetoken_selected
+                and not strata_selected
                 and (
                     bool(llama_cpp_settings)
                     or (next_managed_runtime and llama_profile_selected)
@@ -2471,6 +3611,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 provider == "openai_compatible_local"
                 and next_managed_runtime
                 and not freetoken_selected
+                and not strata_selected
             ):
                 from src.llm.openai_compatible_local_profiles import (
                     local_server_profile_for_model,
@@ -2551,6 +3692,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     effort
                     and provider == "openai_compatible_local"
                     and not freetoken_selected
+                and not strata_selected
                 ):
                     metadata = llama_cpp_reasoning_effort_metadata(model)
                     if metadata is not None:
@@ -2558,7 +3700,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                             raise HTTPException(
                                 status_code=400,
                                 detail=(
-                                    "Qwen3.8の推論effortは "
+                                    "選択モデルの推論effortは "
                                     f"{', '.join(metadata['options'])} から選択してください"
                                 ),
                             )
@@ -2581,6 +3723,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # and canonical dotted-key patch as a managed selection.
                 and (next_managed_runtime or llama_profile_selected)
                 and not freetoken_selected
+                and not strata_selected
                 and should_resolve_llama_cpp_runtime_for_engine_switch(
                     server.config,
                     model=model,
@@ -2615,6 +3758,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     "gpu_layers",
                     "auto_start",
                     "mtp_enabled",
+                    "readiness_timeout",
                 ):
                     if setting_key not in llama_cpp_settings:
                         # Keep an existing operator-owned selection
@@ -2647,77 +3791,92 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     ),
                 },
             )
-            local_switch_in_progress = (
-                previous_provider == "openai_compatible_local"
-                and provider == "openai_compatible_local"
-                and (
-                    previous_runtime_managed
-                    or next_managed_runtime
-                )
-                and local_runtime_changed
-            )
+            local_switch_in_progress = False
 
             def _compensate_local_server_switch() -> None:
                 nonlocal local_switch_in_progress
                 if not local_switch_in_progress:
                     return
                 local_switch_in_progress = False
-                from src.service_manager import (
-                    ensure_openai_compatible_local_server,
-                    stop_owned_openai_compatible_local_servers_respecting_generation_leases,
+                from ...services.llm_engine_switch_service import (
+                    switch_managed_local_runtime,
                 )
 
                 try:
-                    stop_owned_openai_compatible_local_servers_respecting_generation_leases()
-                except Exception:
-                    logger.exception(
-                        "Failed to stop the replacement local LLM server"
-                    )
-                try:
-                    ensure_openai_compatible_local_server(
-                        previous_local_config,
-                        raise_on_launch_error=False,
+                    # Reverse the worker transition against the still-live
+                    # persisted route. This scopes cleanup to the candidate
+                    # process and restores the previous managed target.
+                    switch_managed_local_runtime(
+                        server.config,
+                        previous_provider=provider,
+                        previous_model=model,
+                        next_provider=previous_provider,
+                        next_model=previous_model,
+                        next_config=previous_local_config,
                         force_restart=False,
+                        stop_same_scope=bool(local_runtime_changed),
+                        resolve_endpoints=False,
                     )
                 except Exception:
-                    logger.exception(
-                        "Failed to restore the previous local LLM server"
-                    )
+                    logger.exception("Failed to restore the previous local LLM runtime")
 
-            if (
+            # A managed local candidate must be started before client
+            # construction. When switching away to a cloud/external route,
+            # defer the old local stop until after the replacement client and
+            # config commit so a lease timeout leaves the committed route live.
+            manage_before_client = bool(
                 provider == "openai_compatible_local"
                 and (next_managed_runtime or freetoken_selected)
                 and not (deployment is not None and deployment.fixed)
-            ):
-                from src.service_manager import (
-                    ensure_openai_compatible_local_server,
-                    stop_owned_openai_compatible_local_servers_respecting_generation_leases,
-                )
-
-                try:
-                    if should_stop_previous_local_server:
-                        stopped_local_servers = await asyncio.to_thread(
-                            stop_owned_openai_compatible_local_servers_respecting_generation_leases
-                        )
-                        if stopped_local_servers:
-                            local_switch_in_progress = True
-                        if stopped_local_servers:
-                            logger.info(
-                                "Stopped %s managed OpenAI-compatible local server "
-                                "process(es) before local model switch",
-                                stopped_local_servers,
-                            )
-
-                    started_local_server = await asyncio.to_thread(
-                        ensure_openai_compatible_local_server,
-                        staged_config,
-                        raise_on_launch_error=True,
-                        force_restart=local_runtime_changed,
+            )
+            if manage_before_client:
+                # Mark the transition before entering the worker so a
+                # candidate preflight/readiness failure can restore an old
+                # same-scope worker as well as a model-changing worker.
+                local_switch_in_progress = bool(
+                    local_runtime_changed
+                    or (
+                        previous_runtime_ownership is not None
+                        and previous_runtime_ownership.managed_runtime
                     )
-                    if started_local_server:
-                        local_switch_in_progress = True
+                    or next_managed_runtime
+                )
+                try:
+                    from ...services.llm_engine_switch_service import (
+                        switch_managed_local_runtime,
+                    )
+
+                    transition = await asyncio.to_thread(
+                        switch_managed_local_runtime,
+                        server.config,
+                        previous_provider=previous_provider,
+                        previous_model=previous_model,
+                        next_provider=provider,
+                        next_model=model,
+                        next_config=staged_config,
+                        force_restart=local_runtime_changed,
+                        rollback_on_error=False,
+                        # Admission validates the owned listener; weights are
+                        # observed by the existing runtime status polling.
+                        # Generation still uses strict same-alias readiness.
+                        wait_for_model_ready=selected_managed_runtime != "llama_cpp",
+                    )
+                    stopped_local_servers = int(transition.get("stopped") or 0)
+                    started_local_server = bool(transition.get("started"))
+                    local_switch_in_progress = bool(
+                        stopped_local_servers or started_local_server
+                    )
+                    if stopped_local_servers:
+                        logger.info(
+                            "Stopped %s managed OpenAI-compatible local server "
+                            "process(es) during engine switch",
+                            stopped_local_servers,
+                        )
                 except Exception as exc:
-                    await asyncio.to_thread(_compensate_local_server_switch)
+                    if not getattr(exc, "_managed_local_runtime_restored", False):
+                        await asyncio.to_thread(_compensate_local_server_switch)
+                    else:
+                        local_switch_in_progress = False
                     raise HTTPException(status_code=400, detail=str(exc))
 
             # 新しいLLMクライアントを生成して差し替え
@@ -2747,6 +3906,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 old_runtime_mode = server._current_llm_mode
                 if persist_user_config:
                     config_changes["llm_runtime_mode"] = next_runtime_mode
+                if strata_selected:
+                    config_changes.pop("runtime.target_reasoning_effort", None)
 
                 # The production setter assigns first and catches callback
                 # failures, so activate the ready client before DB commit.
@@ -2771,39 +3932,39 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             server._current_llm_mode = next_runtime_mode
             local_switch_in_progress = False
 
-            if (
-                should_stop_previous_local_server
-                and (
-                    provider != "openai_compatible_local"
-                    or not next_managed_runtime
-                )
+            if not manage_before_client and not (
+                deployment is not None and deployment.fixed
             ):
-                from src.service_manager import (
-                    _LlamaCppGenerationLeaseTimeout,
-                    stop_owned_openai_compatible_local_servers_respecting_generation_leases,
+                from ...service_manager import _LlamaCppGenerationLeaseTimeout
+                from ...services.llm_engine_switch_service import (
+                    switch_managed_local_runtime,
                 )
 
                 try:
-                    stopped_local_servers = await asyncio.to_thread(
-                        stop_owned_openai_compatible_local_servers_respecting_generation_leases
+                    transition_config = (
+                        server.config if manage_before_client else previous_local_config
+                    )
+                    await asyncio.to_thread(
+                        switch_managed_local_runtime,
+                        transition_config,
+                        previous_provider=previous_provider,
+                        previous_model=previous_model,
+                        next_provider=provider,
+                        next_model=model,
+                        next_config=staged_config,
+                        force_restart=False,
+                        resolve_endpoints=manage_before_client,
+                        timeout_seconds=0 if not manage_before_client else None,
+                        defer_on_timeout=not manage_before_client,
                     )
                 except _LlamaCppGenerationLeaseTimeout as exc:
-                    # The new client and persisted route are already active at
-                    # this point.  A lease timeout therefore cannot turn the
-                    # completed switch into an HTTP failure: leave the old
-                    # managed process running and report the new route as the
-                    # successful, authoritative state.
+                    # The route/client/config commit is already authoritative;
+                    # leave the old owned worker running until its consumers
+                    # drain rather than turning a successful switch into a
+                    # REST failure.
                     logger.warning(
-                        "旧managed llama.cppの停止を延期しました。"
-                        "切替済みのclient/configを維持します: %s",
+                        "旧managed local runtimeの停止を延期しました: %s",
                         exc,
-                    )
-                    stopped_local_servers = 0
-                if stopped_local_servers:
-                    logger.info(
-                        "Stopped %s managed OpenAI-compatible local server "
-                        "process(es) after switching away",
-                        stopped_local_servers,
                     )
 
             logger.info(f"LLM engine switched to {provider}/{model}")
@@ -3067,6 +4228,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             row = await repo.get_session_by_id(session_id, for_update=True)
             if row is None:
                 raise HTTPException(status_code=404, detail="Session not found")
+            previous_session_settings = read_session_llm_settings(row.context)
             settings, warnings = validate_session_llm_settings(
                 patch if isinstance(patch, dict) else {},
                 context=row.context,
@@ -3092,6 +4254,130 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 raise HTTPException(status_code=404, detail="Session not found")
         finally:
             await db_session.close()
+
+        # Retire this session's response-model cache before touching a managed
+        # local process.  The callback releases only idle consumer retention;
+        # active generation/title work remains protected until its normal
+        # terminal path.  This must run before the switch so an idle old
+        # consumer cannot make an LFM -> Qwen transition defer indefinitely.
+        if "main_route" in patch:
+            retire_session_cache = getattr(
+                server,
+                "on_session_llm_route_change",
+                None,
+            )
+            if callable(retire_session_cache):
+                try:
+                    from ...services.session_llm_generation import (
+                        retire_session_response_model_cache,
+                    )
+
+                    retirement = await retire_session_response_model_cache(
+                        retire_session_cache,
+                        session_id,
+                    )
+                    deferred = retirement["deferred"]
+                    errors = retirement["errors"]
+                    if deferred:
+                        warnings.append(
+                            "このsessionの旧response-model clientは、"
+                            f"active work終了後にconsumerを解放します ({deferred})"
+                        )
+                    if errors:
+                        warnings.append(
+                            "response-model consumerの解放を確認できませんでした。"
+                            "次の送信時に再検証します"
+                        )
+                except Exception as exc:
+                    # Persisted settings remain usable, but do not claim that
+                    # the old local consumer was released when the owner-side
+                    # retire hook failed.
+                    warnings.append(
+                        "response-model clientのretireを延期しました: "
+                        f"{type(exc).__name__}"
+                    )
+
+        # Session route changes are persisted above before touching a managed
+        # local process. This keeps the row lock short even when a cold model
+        # takes a long time to start. Session routes are overlays, so only an
+        # explicit previous local route is eligible for stop; the global Main
+        # runtime remains owned by its own route and consumers.
+        if "main_route" in patch:
+            previous_route = session_main_route_override_for_binding(
+                previous_session_settings
+            ) or {}
+            next_route = session_main_route_override_for_binding(
+                read_session_llm_settings(merged_context)
+            ) or {}
+            previous_provider = str(previous_route.get("provider") or "").strip().lower()
+            previous_model = str(previous_route.get("model") or "").strip()
+            next_provider = str(next_route.get("provider") or "").strip().lower()
+            next_model = str(next_route.get("model") or "").strip()
+            if not next_provider or not next_model:
+                # Clearing a session override returns to the global Main
+                # route. Resolve that fallback before deciding whether the
+                # previous explicit local runtime is still needed; otherwise
+                # clearing an override for the same local model would stop
+                # the global worker unnecessarily.
+                global_route = resolve_execution_main_route(server.config)
+                next_provider = str(global_route.get("provider") or "").strip().lower()
+                next_model = str(global_route.get("model") or "").strip()
+            if previous_provider == "openai_compatible_local" or (
+                next_provider == "openai_compatible_local"
+                and next_model
+            ):
+                try:
+                    from ...llm.manager import TargetConfig
+                    from ...services.llm_engine_switch_service import (
+                        start_session_route_warmup,
+                        switch_managed_local_runtime,
+                    )
+
+                    next_config = TargetConfig(
+                        server.config,
+                        {
+                            "llm_provider": next_provider,
+                            "llm_model": next_model,
+                            "openai_compatible_local.model": next_model,
+                        },
+                    )
+                    switch_kwargs = dict(
+                        previous_provider=previous_provider,
+                        previous_model=previous_model,
+                        next_provider=next_provider,
+                        next_model=next_model,
+                        next_config=next_config,
+                        force_restart=False,
+                        timeout_seconds=(
+                            0
+                            if next_provider != "openai_compatible_local"
+                            else None
+                        ),
+                        defer_on_timeout=next_provider != "openai_compatible_local",
+                    )
+                    if next_provider == "openai_compatible_local" and next_model:
+                        # Do not hold this save until a cold model is ready:
+                        # the WebUI queues the next save of this session behind
+                        # it, which kept a newer selection from cancelling the
+                        # obsolete warm-up.
+                        start_session_route_warmup(server.config, **switch_kwargs)
+                    else:
+                        # Leaving a local route only stops it; the stop also
+                        # cancels a still-loading warm-up of that scope.
+                        await asyncio.to_thread(
+                            switch_managed_local_runtime,
+                            server.config,
+                            supersedable=True,
+                            **switch_kwargs,
+                        )
+                except Exception as exc:
+                    # Settings are already durable and the next session turn
+                    # has its own strict ensure path. Surface a warning while
+                    # keeping the route selection usable for retry/recovery.
+                    warnings.append(
+                        "ローカルLLM runtimeの切替を延期しました。"
+                        f"次の送信時に再試行します: {exc}"
+                    )
         if "main_route" in patch:
             main_route = (
                 settings.get("main_route")

@@ -6,10 +6,12 @@ Supports two modes:
 2. Local mode: Use local file storage (no server required, like SQLite)
 """
 
-import asyncio
 import contextlib
 import logging
 import threading
+import math
+import re
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -23,14 +25,65 @@ except ImportError:
     QDRANT_AVAILABLE = False
 
 from .config import QdrantConfig
-from ..security.field_crypto import decrypt_text_if_needed, encrypt_text
+from .embedding_identity import DIMENSION, EMBEDDING_FINGERPRINT, embedding_collection_name
+from .index_io import run_index_io
+from ..security.field_crypto import (
+    FieldCryptoError,
+    decrypt_text_if_needed,
+    encrypt_text,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class QdrantSearchUnavailable(RuntimeError):
+    """Sanitized opt-in failure distinguishing outage from zero hits."""
+
+    def __init__(self, code: str = "backend_failed"):
+        self.code = code if code in {"index_unavailable", "backend_failed"} else "backend_failed"
+        super().__init__(self.code)
+
+
+_CORRUPT_PAYLOAD_FIELD_ERRORS = {
+    "unsupported encrypted field format",
+    "encrypted field authentication failed",
+}
+
+
+def _is_corrupt_payload_field_error(error: FieldCryptoError) -> bool:
+    """Classify per-point ciphertext damage without exposing payload details."""
+
+    return str(error) in _CORRUPT_PAYLOAD_FIELD_ERRORS
+
 
 # ローカル(embedded)モードは local_path ごとに単一の QdrantLocal クライアントを
 # 共有する(SharedQdrantClient)。QdrantLocal はスレッド安全でないため、
 # to_thread 経由の並行クエリを直列化する。server モードでは不要。
-_LOCAL_QUERY_LOCK = asyncio.Lock()
+# Every embedded collection shares the same client. Use a thread lock across
+# writers, readers, and sync-bridge event loops; an asyncio Lock is insufficient.
+_LOCAL_INDEX_IO_LOCK = threading.RLock()
+_OWNED_EMBEDDING_COLLECTION = re.compile(
+    r"^aoitalk_(?:docs|knowledge|media|conversation_memory)__eg2_[0-9a-f]{16}$"
+)
+
+
+def _uses_drvfs_managed_storage(config: QdrantConfig) -> bool:
+    """Limit the optimizer override to AoiTalk's Windows WSL drive bind."""
+    return bool(
+        config.mode == "local-managed"
+        and not config.local_path
+        and config.wsl_distribution
+        and isinstance(config.storage_path, str)
+        and re.match(r"^/mnt/[A-Za-z](?:/|$)", config.storage_path)
+        and _OWNED_EMBEDDING_COLLECTION.fullmatch(config.collection_name)
+    )
+
+
+def _drvfs_optimizer_config(config: QdrantConfig):
+    """Return typed optimizer config for a future owned WSL collection."""
+    if not QDRANT_AVAILABLE or not _uses_drvfs_managed_storage(config):
+        return None
+    return models.OptimizersConfigDiff(max_optimization_threads=0)
 
 
 class SharedQdrantClient:
@@ -48,7 +101,7 @@ class SharedQdrantClient:
     def get_client(cls, local_path: str) -> 'QdrantClient':
         # Async callers can open storage in executor threads. Serialize with
         # legacy synchronous callers so only one client acquires its file lock.
-        with cls._creation_lock:
+        with _LOCAL_INDEX_IO_LOCK, cls._creation_lock:
             return cls._get_client_locked(local_path)
 
     @classmethod
@@ -70,7 +123,7 @@ class SharedQdrantClient:
 
     @classmethod
     def close(cls):
-        with cls._creation_lock:
+        with _LOCAL_INDEX_IO_LOCK, cls._creation_lock:
             cls._close_locked()
 
     @classmethod
@@ -86,6 +139,12 @@ class SharedQdrantClient:
     @classmethod
     def list_all_collections(cls, config: QdrantConfig) -> List[Dict[str, Any]]:
         """List all Qdrant collections with basic info."""
+        guard = _LOCAL_INDEX_IO_LOCK if config.local_path else contextlib.nullcontext()
+        with guard:
+            return cls._list_all_collections(config)
+
+    @classmethod
+    def _list_all_collections(cls, config: QdrantConfig) -> List[Dict[str, Any]]:
         if not QDRANT_AVAILABLE:
             return []
         try:
@@ -103,7 +162,7 @@ class SharedQdrantClient:
                     result.append({
                         "name": c.name,
                         "points_count": info.points_count,
-                        "vectors_count": info.vectors_count,
+                        "vectors_count": getattr(info, "vectors_count", None),
                         "status": info.status.value if info.status else "unknown",
                     })
                 except Exception:
@@ -125,6 +184,17 @@ class SearchResult:
     metadata: Dict[str, Any]
 
 
+class _LocalMatchValues(list):
+    """Keep Qdrant's JSON list while making local membership constant time."""
+
+    def __init__(self, values):
+        super().__init__(values)
+        self._members = frozenset(self)
+
+    def __contains__(self, value):
+        return value in self._members
+
+
 class QdrantManager:
     """Manager for Qdrant vector database operations.
     
@@ -133,15 +203,18 @@ class QdrantManager:
     - Local mode: Use local file storage (set local_path in config)
     """
     
-    def __init__(self, config: QdrantConfig, vector_size: int = 1024):
+    def __init__(self, config: QdrantConfig, vector_size: int = DIMENSION):
         """Initialize Qdrant manager.
         
         Args:
             config: Qdrant configuration
-            vector_size: Dimension of embedding vectors (1024 for bge-m3)
+            vector_size: Dimension of the pinned embedding vectors (768)
         """
-        self.config = config
-        self.vector_size = vector_size
+        from dataclasses import replace
+        self.config = replace(config, collection_name=embedding_collection_name(config.collection_name))
+        if vector_size != DIMENSION:
+            raise ValueError("EmbeddingGemma 2 requires one 768-dimensional vector space")
+        self.vector_size = DIMENSION
         self.client: Optional['QdrantClient'] = None
         self._initialized = False
         self._is_local_mode = False
@@ -150,7 +223,17 @@ class QdrantManager:
         if not QDRANT_AVAILABLE:
             logger.warning("qdrant-client not installed. RAG features will be disabled.")
     
+    async def _io(self, operation, *args, **kwargs):
+        return await run_index_io(
+            operation, *args,
+            lock=_LOCAL_INDEX_IO_LOCK if self.config.local_path else None,
+            **kwargs,
+        )
+
     async def initialize(self) -> bool:
+        return await self._io(self._initialize)
+
+    def _initialize(self) -> bool:
         """Initialize connection to Qdrant.
         
         Uses local file storage mode if config.local_path is set,
@@ -189,16 +272,23 @@ class QdrantManager:
             
             if self.config.collection_name not in collection_names:
                 logger.info(f"Creating collection: {self.config.collection_name}")
-                self.client.create_collection(
-                    collection_name=self.config.collection_name,
-                    vectors_config=VectorParams(
+                create_kwargs = {
+                    "collection_name": self.config.collection_name,
+                    "vectors_config": VectorParams(
                         size=self.vector_size,
                         distance=Distance.COSINE
                     )
-                )
+                }
+                optimizer_config = _drvfs_optimizer_config(self.config)
+                if optimizer_config is not None:
+                    create_kwargs["optimizers_config"] = optimizer_config
+                self.client.create_collection(**create_kwargs)
             else:
                 # Get current point count for ID generation
                 info = self.client.get_collection(self.config.collection_name)
+                vectors = info.config.params.vectors
+                if isinstance(vectors, dict) or vectors.size != self.vector_size:
+                    raise RuntimeError("Incompatible embedding collection; explicit reindex required")
                 self._point_id_counter = info.points_count or 0
             
             # Local Qdrant ignores payload indexes and emits noisy warnings.
@@ -223,6 +313,26 @@ class QdrantManager:
             logger.error(f"Failed to initialize Qdrant: {e}")
             return False
     
+    async def has_verified_document(self, doc_id: str, input_hash: str) -> bool:
+        """Verify persisted vectors before a migration skips an unchanged input."""
+        if not self._initialized or self.client is None:
+            return False
+        points = await self._io(self.client.retrieve,
+            collection_name=self.config.collection_name,
+            ids=[str(uuid.uuid5(uuid.NAMESPACE_URL, "aoitalk:" + doc_id))],
+            with_payload=True, with_vectors=True)
+        if len(points) != 1:
+            return False
+        point = points[0]
+        payload = point.payload or {}
+        vector = point.vector
+        return (payload.get("doc_id") == doc_id
+                and payload.get("embedding_fingerprint") == EMBEDDING_FINGERPRINT
+                and payload.get("embedding_input_hash") == input_hash
+                and isinstance(vector, list) and len(vector) == self.vector_size
+                and all(math.isfinite(float(x)) for x in vector)
+                and abs(sum(float(x)**2 for x in vector) - 1.0) <= .01)
+
     async def add_documents(
         self,
         ids: List[str],
@@ -246,22 +356,28 @@ class QdrantManager:
             return False
         
         try:
+            if not (len(ids) == len(embeddings) == len(texts) == len(metadata_list)):
+                raise ValueError("Embedding/document counts differ")
+            if any(len(v) != self.vector_size or not all(math.isfinite(float(x)) for x in v)
+                   or abs(sum(float(x)**2 for x in v)-1.0) > .01 for v in embeddings):
+                raise ValueError("Invalid dense embedding dimension or values")
             points = []
             for doc_id, embedding, text, metadata in zip(ids, embeddings, texts, metadata_list):
                 payload = {
                     "text": encrypt_text(text, aad=f"qdrant.payload.text:{doc_id}"),
                     "doc_id": doc_id,
-                    **metadata
+                    **metadata,
+                    "embedding_fingerprint": EMBEDDING_FINGERPRINT,
                 }
-                # Use incrementing numeric IDs
+                # Stable IDs make resumed migration an idempotent upsert.
                 points.append(PointStruct(
-                    id=self._point_id_counter,
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, "aoitalk:" + doc_id)),
                     vector=embedding,
                     payload=payload
                 ))
                 self._point_id_counter += 1
             
-            self.client.upsert(
+            await self._io(self.client.upsert,
                 collection_name=self.config.collection_name,
                 points=points
             )
@@ -277,7 +393,9 @@ class QdrantManager:
         self,
         query_embedding: List[float],
         top_k: int = 20,
-        filter_conditions: Optional[Dict[str, Any]] = None
+        filter_conditions: Optional[Dict[str, Any]] = None,
+        *,
+        raise_on_error: bool = False,
     ) -> List[SearchResult]:
         """Search for similar documents.
         
@@ -290,60 +408,125 @@ class QdrantManager:
             List of search results
         """
         if not self._initialized or self.client is None:
+            if raise_on_error:
+                raise QdrantSearchUnavailable("index_unavailable")
             logger.error("Qdrant not initialized")
             return []
         
         try:
             # Build filter if provided
             query_filter = None
+            must_conditions = [models.FieldCondition(key="embedding_fingerprint", match=models.MatchValue(value=EMBEDDING_FINGERPRINT))]
             if filter_conditions:
-                must_conditions = []
                 for key, value in filter_conditions.items():
+                    match = (models.MatchAny(any=value) if isinstance(value, list)
+                             else models.MatchValue(value=value))
+                    if isinstance(match, models.MatchAny) and self._is_local_mode:
+                        # Apply after Pydantic validation, which creates a list.
+                        match.any = _LocalMatchValues(match.any)
                     must_conditions.append(
                         models.FieldCondition(
                             key=key,
-                            match=models.MatchValue(value=value)
+                            match=match
                         )
                     )
-                query_filter = models.Filter(must=must_conditions)
+            query_filter = models.Filter(must=must_conditions)
             
-            # qdrant-client 1.12+ で旧 `search` は削除されたため query_points を使う。
-            # query_points はブロッキング呼び出しなので event loop を塞がないよう別スレッドへ回す。
-            # ローカルモードのみ、共有クライアントへの並行アクセスをロックで直列化する。
-            query_guard = (
-                _LOCAL_QUERY_LOCK
-                if self.config.local_path
-                else contextlib.nullcontext()
-            )
-            async with query_guard:
-                response = await asyncio.to_thread(
-                    self.client.query_points,
-                    collection_name=self.config.collection_name,
-                    query=query_embedding,
-                    limit=top_k,
-                    query_filter=query_filter,
-                    with_payload=True,
-                )
-            results = response.points
-
+            # Sync bridges use separate event loops. The common thread lock
+            # serializes reads with writes without binding callers to one loop.
             search_results = []
-            for hit in results:
-                doc_id = hit.payload.get("doc_id", str(hit.id))
-                search_results.append(SearchResult(
-                    id=doc_id,
-                    score=hit.score,
-                    text=decrypt_text_if_needed(
-                        hit.payload.get("text", ""),
-                        aad=f"qdrant.payload.text:{doc_id}",
-                    ),
-                    metadata={k: v for k, v in hit.payload.items() 
-                             if k not in ["text", "doc_id"]}
-                ))
-            
+            invalid_points = 0
+            scanned = 0
+            # Qdrant's offset preserves the same vector ranking while allowing
+            # malformed leading points to be replaced.  Ordinary requests up
+            # to 400 may scan at most 4x their requested page, capped at 400;
+            # a larger explicit request keeps its own requested size as the
+            # scan bound and never triggers an unbounded full-corpus walk.
+            max_scan = max(top_k, min(top_k * 4, 400))
+            while scanned < max_scan and len(search_results) < top_k:
+                page_limit = min(top_k, max_scan - scanned)
+                query_options = {
+                    "collection_name": self.config.collection_name,
+                    "query": query_embedding,
+                    "limit": page_limit,
+                    "query_filter": query_filter,
+                    "with_payload": True,
+                }
+                if scanned:
+                    query_options["offset"] = scanned
+                response = await self._io(self.client.query_points, **query_options)
+                raw_points = response.points
+                if not raw_points:
+                    break
+                scanned += len(raw_points)
+                for hit in raw_points:
+                    try:
+                        payload = hit.payload
+                        if not isinstance(payload, dict):
+                            raise ValueError("malformed qdrant payload")
+
+                        raw_doc_id = payload.get("doc_id", hit.id)
+                        if raw_doc_id is None:
+                            raise ValueError("missing qdrant document id")
+                        doc_id = str(raw_doc_id)
+                        if not doc_id:
+                            raise ValueError("empty qdrant document id")
+
+                        score = float(hit.score)
+                        if not math.isfinite(score):
+                            raise ValueError("non-finite qdrant score")
+
+                        raw_text = payload.get("text", "")
+                        if raw_text is None:
+                            raw_text = ""
+                        if not isinstance(raw_text, str):
+                            raise ValueError("malformed qdrant text payload")
+                        text = decrypt_text_if_needed(
+                            raw_text,
+                            aad=f"qdrant.payload.text:{doc_id}",
+                        )
+                        if text is None:
+                            text = ""
+                        if not isinstance(text, str):
+                            raise ValueError("malformed qdrant text payload")
+
+                        search_results.append(SearchResult(
+                            id=doc_id,
+                            score=score,
+                            text=text,
+                            metadata={
+                                key: value
+                                for key, value in payload.items()
+                                if key not in ["text", "doc_id"]
+                            },
+                        ))
+                    except FieldCryptoError as exc:
+                        if not _is_corrupt_payload_field_error(exc):
+                            raise
+                        invalid_points += 1
+                        # A single damaged derivative must not hide healthy
+                        # canonical candidates. Keep this log payload-free.
+                        logger.warning("Qdrant search discarded an invalid point")
+                    except (TypeError, ValueError, UnicodeDecodeError):
+                        invalid_points += 1
+                        # Point payloads are untrusted index data. Exclude only
+                        # the malformed point and keep the ranked page going.
+                        logger.warning("Qdrant search discarded an invalid point")
+                if len(raw_points) < page_limit:
+                    break
+
+            # A non-empty page with no usable point is an index corruption
+            # failure in strict mode. Empty Qdrant results remain a successful
+            # zero-hit search.
+            if scanned and invalid_points and not search_results:
+                raise FieldCryptoError("qdrant search returned no valid points")
+
             return search_results
             
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
+        except Exception as exc:
+            logger.warning("Qdrant search backend unavailable")
+            if raise_on_error:
+                raise QdrantSearchUnavailable("backend_failed") from exc
             return []
     
     async def delete_collection(self) -> bool:
@@ -356,7 +539,7 @@ class QdrantManager:
             return False
         
         try:
-            self.client.delete_collection(self.config.collection_name)
+            await self._io(self.client.delete_collection, self.config.collection_name)
             self._point_id_counter = 0
             logger.info(f"Deleted collection: {self.config.collection_name}")
             return True
@@ -374,29 +557,22 @@ class QdrantManager:
             return False
             
         try:
-            self.client.recreate_collection(
-                collection_name=self.config.collection_name,
-                vectors_config=models.VectorParams(
-                    size=self.vector_size,
-                    distance=models.Distance.COSINE
-                )
-            )
-            
-            # Re-create payload indexes
-            try:
-                self.client.create_payload_index(
+            def recreate():
+                self.client.recreate_collection(
                     collection_name=self.config.collection_name,
-                    field_name="doc_id",
-                    field_schema=models.PayloadSchemaType.KEYWORD
+                    vectors_config=models.VectorParams(
+                        size=self.vector_size, distance=models.Distance.COSINE
+                    ),
                 )
-                self.client.create_payload_index(
-                    collection_name=self.config.collection_name,
-                    field_name="source_file",
-                    field_schema=models.PayloadSchemaType.KEYWORD
-                )
-            except Exception as e:
-                # Log but don't fail if index creation fails (e.g. local mode warning)
-                logger.warning(f"Could not create payload index during recreation: {e}")
+                # Retain collection ownership until its schema is complete.
+                if not self._is_local_mode:
+                    for field in ("doc_id", "source_file"):
+                        self.client.create_payload_index(
+                            collection_name=self.config.collection_name,
+                            field_name=field,
+                            field_schema=models.PayloadSchemaType.KEYWORD,
+                        )
+            await self._io(recreate)
             
             self._point_id_counter = 0
             logger.info(f"Recreated collection: {self.config.collection_name}")
@@ -416,11 +592,11 @@ class QdrantManager:
             return None
         
         try:
-            info = self.client.get_collection(self.config.collection_name)
+            info = await self._io(self.client.get_collection, self.config.collection_name)
             return {
                 "name": self.config.collection_name,
                 "points_count": info.points_count,
-                "vectors_count": info.vectors_count,
+                "vectors_count": getattr(info, "vectors_count", None),
                 "status": info.status.value,
                 "mode": "local" if self._is_local_mode else "server"
             }
@@ -453,7 +629,7 @@ class QdrantManager:
             
             # Use count/scroll to check existence
             # For Qdrant, count is efficient
-            count_result = self.client.count(
+            count_result = await self._io(self.client.count,
                 collection_name=self.config.collection_name,
                 count_filter=query_filter
             )
@@ -479,10 +655,10 @@ class QdrantManager:
         try:
             # Check if collection exists first
             try:
-                info = self.client.get_collection(self.config.collection_name)
+                info = await self._io(self.client.get_collection, self.config.collection_name)
                 if not info or info.points_count == 0:
                     return set()
-            except:
+            except Exception:
                 return set()
 
             logger.info("Scanning existing documents (this may take a moment)...")
@@ -494,7 +670,7 @@ class QdrantManager:
             total_scanned = 0
             
             while True:
-                records, next_offset = self.client.scroll(
+                records, next_offset = await self._io(self.client.scroll,
                     collection_name=self.config.collection_name,
                     scroll_filter=None,
                     limit=2000, # Large batch for speed
@@ -534,7 +710,7 @@ class QdrantManager:
             return False
 
         try:
-            self.client.delete(
+            await self._io(self.client.delete,
                 collection_name=self.config.collection_name,
                 points_selector=models.FilterSelector(
                     filter=models.Filter(
@@ -567,7 +743,7 @@ class QdrantManager:
 
         try:
             try:
-                info = self.client.get_collection(self.config.collection_name)
+                info = await self._io(self.client.get_collection, self.config.collection_name)
                 if not info or info.points_count == 0:
                     return {}
             except Exception:
@@ -579,7 +755,7 @@ class QdrantManager:
             total_scanned = 0
 
             while True:
-                records, next_offset = self.client.scroll(
+                records, next_offset = await self._io(self.client.scroll,
                     collection_name=self.config.collection_name,
                     scroll_filter=None,
                     limit=2000,

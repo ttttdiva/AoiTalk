@@ -10,6 +10,9 @@ import { filesApi } from "../../lib/files-api";
 
 type MediaSource = Awaited<ReturnType<typeof filesApi.getMediaSource>>;
 
+const DOUBLE_TAP_DELAY_MS = 260;
+const DOUBLE_TAP_SCALE = 2.5;
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -25,19 +28,27 @@ function touchDistance(
 export function ZoomableImage({
   source,
   onError,
+  onLoad,
+  onSingleTap,
   onSwipeLeft,
   onSwipeRight,
+  onSwipeDown,
 }: {
   source: MediaSource;
   onError: () => void;
+  onLoad?: () => void;
+  onSingleTap?: () => void;
   onSwipeLeft: () => void;
   onSwipeRight: () => void;
+  onSwipeDown?: () => void;
 }) {
   const [scale, setScale] = useState(1);
   const [translate, setTranslate] = useState({ x: 0, y: 0 });
   const [viewport, setViewport] = useState({ width: 1, height: 1 });
   const scaleRef = useRef(1);
   const translateRef = useRef({ x: 0, y: 0 });
+  const lastTapAtRef = useRef(0);
+  const singleTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gestureRef = useRef({
     startDistance: 0,
     startScale: 1,
@@ -78,18 +89,57 @@ export function ZoomableImage({
     resetZoom();
   }, [resetZoom, source.uri]);
 
+  useEffect(
+    () => () => {
+      if (singleTapTimerRef.current) {
+        clearTimeout(singleTapTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const handlePress = useCallback(() => {
+    const now = Date.now();
+    if (
+      lastTapAtRef.current > 0 &&
+      now - lastTapAtRef.current <= DOUBLE_TAP_DELAY_MS
+    ) {
+      if (singleTapTimerRef.current) {
+        clearTimeout(singleTapTimerRef.current);
+        singleTapTimerRef.current = null;
+      }
+      lastTapAtRef.current = 0;
+      if (scaleRef.current > 1.03) {
+        resetZoom();
+      } else {
+        applyTransform(DOUBLE_TAP_SCALE, 0, 0);
+      }
+      return;
+    }
+
+    lastTapAtRef.current = now;
+    if (!onSingleTap) return;
+    singleTapTimerRef.current = setTimeout(() => {
+      singleTapTimerRef.current = null;
+      lastTapAtRef.current = 0;
+      onSingleTap();
+    }, DOUBLE_TAP_DELAY_MS);
+  }, [applyTransform, onSingleTap, resetZoom]);
+
   const panResponder = useMemo(
     () =>
       PanResponder.create({
         onStartShouldSetPanResponder: (event) =>
-          event.nativeEvent.touches.length >= 2 || scaleRef.current > 1,
+          event.nativeEvent.touches.length >= 2,
         onMoveShouldSetPanResponder: (event, gesture) =>
           event.nativeEvent.touches.length >= 2 ||
           (scaleRef.current > 1 &&
             (Math.abs(gesture.dx) > 2 || Math.abs(gesture.dy) > 2)) ||
           (scaleRef.current <= 1 &&
-            Math.abs(gesture.dx) > 12 &&
-            Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4),
+            ((Math.abs(gesture.dx) > 12 &&
+              Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4) ||
+              (gesture.dy > 18 &&
+                Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.25))),
         onPanResponderGrant: (event) => {
           const touches = event.nativeEvent.touches;
           gestureRef.current = {
@@ -124,6 +174,14 @@ export function ZoomableImage({
         onPanResponderRelease: (_, gesture) => {
           if (scaleRef.current <= 1.03) {
             if (
+              gesture.dy > 80 &&
+              Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.25
+            ) {
+              onSwipeDown?.();
+              resetZoom();
+              return;
+            }
+            if (
               Math.abs(gesture.dx) > 50 &&
               Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4
             ) {
@@ -143,7 +201,7 @@ export function ZoomableImage({
         },
         onPanResponderTerminationRequest: () => false,
       }),
-    [applyTransform, onSwipeLeft, onSwipeRight, resetZoom],
+    [applyTransform, onSwipeDown, onSwipeLeft, onSwipeRight, resetZoom],
   );
 
   const handleLayout = (event: LayoutChangeEvent) => {
@@ -153,12 +211,14 @@ export function ZoomableImage({
 
   return (
     <Pressable
+      testID="zoomable-image-surface"
       style={styles.zoomSurface}
       onLayout={handleLayout}
-      onLongPress={resetZoom}
+      onPress={handlePress}
       {...panResponder.panHandlers}
     >
       <Image
+        testID="zoomable-image"
         source={source}
         style={[
           styles.viewerImage,
@@ -171,6 +231,7 @@ export function ZoomableImage({
           },
         ]}
         resizeMode="contain"
+        onLoad={onLoad}
         onError={onError}
       />
     </Pressable>

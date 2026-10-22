@@ -168,6 +168,13 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+echo EmbeddingGemma 2専用worker環境を準備中...
+python scripts\setup_embeddinggemma2_worker.py --host-check
+if errorlevel 1 (
+    echo [エラー] EmbeddingGemma 2 workerまたはhostの依存検証に失敗しました。
+    pause
+    exit /b 1
+)
 echo インストール後のPyTorch/CUDAランタイムを検証中...
 python scripts\windows_torch_setup.py verify
 if errorlevel 1 (

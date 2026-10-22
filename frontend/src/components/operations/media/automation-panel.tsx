@@ -5,7 +5,8 @@ import { Bot, Copy, ExternalLink, Loader2, Play, RefreshCw, Save, Sparkles } fro
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { AppSelect } from "@/components/ui/app-select";
@@ -47,8 +48,19 @@ function stateLabel(value: string): string {
   } as Record<string, string>)[value] ?? value;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return <label className="space-y-1.5 text-xs font-medium text-foreground"><span>{label}</span>{children}</label>;
+function Field({ label, help, children }: { label: string; help?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="space-y-1.5 text-xs font-medium text-foreground">
+      <div className="inline-flex items-center gap-1">
+        {label}
+        {help ? <HelpPopover label={label}>{help}</HelpPopover> : null}
+      </div>
+      <label className="block">
+        <span className="sr-only">{label}</span>
+        {children}
+      </label>
+    </div>
+  );
 }
 function Status({ value }: { value: string }) {
   return <span className="inline-flex rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">{stateLabel(value)}</span>;
@@ -70,6 +82,8 @@ type FormState = {
   fetchPages: boolean;
   novelty: string;
   candidateCount: string;
+  maxGenerationRetries: string;
+  maxActiveGenerations: string;
   workspaceId: string;
   presetId: string;
   revisionPolicy: string;
@@ -81,7 +95,7 @@ type FormState = {
 const blank: FormState = {
   name: "", mode: "review_before_generate", triggerType: "manual", dedupePeriod: "daily", schedule: "", assignedAgentId: "",
   discoveryType: "manual", theme: "", discoveryUrl: "", discoveryQuery: "", researchRoutineId: "",
-  researchRoutineVersion: "", fetchPages: true, novelty: "balanced", candidateCount: "3", workspaceId: "",
+  researchRoutineVersion: "", fetchPages: true, novelty: "balanced", candidateCount: "3", maxGenerationRetries: "1", maxActiveGenerations: "1", workspaceId: "",
   presetId: "", revisionPolicy: "latest_at_submission", pinnedRevisionId: "", fallbackTheme: "",
   fallbackResearch: "observation_only",
 };
@@ -110,6 +124,8 @@ function formFromProgram(program: AutomationProgram): FormState {
     fetchPages: research.fetch_pages !== false,
     novelty: text(planning.novelty_policy) || "balanced",
     candidateCount: text(planning.candidate_count) || "3",
+    maxGenerationRetries: text(planning.max_generation_retries ?? 1),
+    maxActiveGenerations: text(planning.max_active_generations ?? 1),
     workspaceId: text(generation.studio_workspace_binding_id),
     presetId: text(generation.preset_id),
     revisionPolicy: text(generation.preset_revision_policy) || "latest_at_submission",
@@ -144,7 +160,7 @@ function revisionInput(form: FormState): AutomationRevisionInput {
     trigger: { type: form.triggerType, dedupe_period: form.dedupePeriod, schedule: form.schedule.trim() || undefined, assigned_agent_id: form.assignedAgentId.trim() || undefined },
     discovery,
     research_binding: research,
-    planning_policy: { novelty_policy: form.novelty, candidate_count: Math.max(1, Number(form.candidateCount) || 3) },
+    planning_policy: { novelty_policy: form.novelty, candidate_count: Math.max(1, Number(form.candidateCount) || 3), max_generation_retries: Number(form.maxGenerationRetries), max_active_generations: Number(form.maxActiveGenerations) },
     generation_action: generation,
     fallback: { theme: form.fallbackTheme.trim() || undefined, research_policy: form.fallbackResearch || undefined },
   };
@@ -159,6 +175,7 @@ export function MediaAutomationPanel() {
   const [workspaces, setWorkspaces] = useState<GenerationWorkspace[]>([]);
   const [routines, setRoutines] = useState<ResearchRoutine[]>([]);
   const [presets, setPresets] = useState<PresetCatalogItem[]>([]);
+  const [presetError, setPresetError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
 
@@ -187,8 +204,13 @@ export function MediaAutomationPanel() {
     }).catch(setError);
   }, [selectedProgram]);
   useEffect(() => {
+    setPresetError("");
     if (!form.workspaceId) { setPresets([]); return; }
-    void mediaAutomationApi.presetCatalog(form.workspaceId).then(setPresets).catch((next) => { setPresets([]); setError(next); });
+    let active = true;
+    void mediaAutomationApi.presetCatalog(form.workspaceId)
+      .then((next) => { if (active) setPresets(next); })
+      .catch((next) => { if (active) { setPresets([]); setPresetError(readable(next)); } });
+    return () => { active = false; };
   }, [form.workspaceId]);
 
   const update = <K extends keyof FormState>(name: K, value: FormState[K]) => setForm((current) => ({ ...current, [name]: value }));
@@ -229,9 +251,17 @@ export function MediaAutomationPanel() {
     catch (next) { setError(next); } finally { setBusy(null); }
   };
 
+  const submission = selectedRun?.novelty_snapshot?.generation_submission;
+  const retryLedger = submission && typeof submission === "object" && !Array.isArray(submission) ? submission as Record<string, unknown> : null;
+  const attemptCount = typeof retryLedger?.attempt_count === "number" ? retryLedger.attempt_count : null;
+  const retryLimit = typeof retryLedger?.max_generation_retries === "number" ? retryLedger.max_generation_retries : null;
+  const retryBlocked = attemptCount === null || retryLimit === null || attemptCount >= 1 + retryLimit;
   const outputIds = selectedRun ? lines(selectedRun.generation_result?.output_asset_ids) : [];
   const sourceRefs = selectedRun ? lines(selectedRun.research_brief?.source_refs) : [];
   const keyFacts = selectedRun ? lines(selectedRun.research_brief?.key_facts) : [];
+  const unverifiedSignals = selectedRun ? lines(selectedRun.research_brief?.unverified_signals) : [];
+  const researchStatus = text(selectedRun?.research_brief?.research_status);
+  const researchStatusLabel = ({ sources_only: "出典候補を取得・主張は未検証", empty: "該当候補なし", partial: "一部の取得に失敗", not_executed: "調査未実行・入力情報のみ" } as Record<string, string>)[researchStatus] || researchStatus;
   const studioLink = selectedRun?.result_deep_link
     ? selectedRun.result_deep_link.startsWith("http") ? selectedRun.result_deep_link : `${text(selectedWorkspace?.base_url).replace(/\/$/u, "")}${selectedRun.result_deep_link}`
     : null;
@@ -241,7 +271,7 @@ export function MediaAutomationPanel() {
       {error ? <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{readable(error)}</div> : null}
       <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
         <Card size="sm">
-          <CardHeader className="border-b border-border/70"><CardTitle className="flex items-center gap-2 text-sm"><Bot className="size-4" /> Automations</CardTitle><CardDescription>41 AoiTalkがworkflow ownerです。</CardDescription></CardHeader>
+          <CardHeader className="border-b border-border/70"><CardTitle className="flex items-center gap-2 text-sm"><Bot className="size-4" /><span className="inline-flex items-center gap-1">Automations<HelpPopover label="Automations">41 AoiTalkがworkflow ownerです。</HelpPopover></span></CardTitle></CardHeader>
           <CardContent className="space-y-3 pt-3">
             <Button size="sm" variant="outline" className="w-full" onClick={() => { setSelectedProgramId(""); setForm(blank); }}><Sparkles className="size-3.5" /> 新規Automation</Button>
             {programs.map((program) => <button type="button" key={program.id} onClick={() => setSelectedProgramId(program.id)} className={`w-full rounded-md border p-3 text-left text-sm ${selectedProgramId === program.id ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40"}`}><div className="flex items-center justify-between gap-2"><span className="font-medium">{program.name}</span><span className="text-[10px] text-muted-foreground">r{program.current_revision.version}</span></div><div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground"><span>{program.current_revision.execution_mode}</span><span>{program.enabled ? "Enabled" : "Disabled"}</span></div>{program.latest_run ? <div className="mt-2"><Status value={program.latest_run.state} /></div> : null}</button>)}
@@ -251,7 +281,7 @@ export function MediaAutomationPanel() {
 
         <div className="space-y-4">
           <Card size="sm">
-            <CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Automation Editor</CardTitle><CardDescription>Presetの中身は73に保持し、ここでは参照とcreative intentだけを設定します。</CardDescription></CardHeader>
+            <CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Automation Editor<HelpPopover label="Automation Editor">Presetの中身は73に保持し、ここでは参照とcreative intentだけを設定します。</HelpPopover></CardTitle></CardHeader>
             <CardContent className="space-y-4 pt-4">
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                 <Field label="名前"><Input value={form.name} onChange={(event) => update("name", event.target.value)} disabled={Boolean(selectedProgram)} /></Field>
@@ -259,7 +289,7 @@ export function MediaAutomationPanel() {
                 <Field label="Trigger"><AppSelect value={form.triggerType} onValueChange={(value) => update("triggerType", value)}><option value="manual">Manual / Run Now</option><option value="windows_task_scheduler">Windows Task Scheduler</option><option value="external">External trigger</option><option value="heartbeat">AoiTalk heartbeat</option></AppSelect></Field>
                 <Field label="重複抑止の時間粒度"><AppSelect value={form.dedupePeriod} onValueChange={(value) => update("dedupePeriod", value)}><option value="daily">Daily</option><option value="hourly">Hourly</option><option value="minute">Minute</option></AppSelect></Field>
                 <Field label="Schedule label / cron（任意）"><Input value={form.schedule} onChange={(event) => update("schedule", event.target.value)} placeholder="07:00 daily / external schedule note" /></Field>
-                <Field label="AI employee Agent ID（heartbeat時）"><Input value={form.assignedAgentId} onChange={(event) => update("assignedAgentId", event.target.value)} placeholder="Agent assignmentがある場合のみ" /></Field>
+                <Field label="Agent ID（heartbeat時）"><Input value={form.assignedAgentId} onChange={(event) => update("assignedAgentId", event.target.value)} placeholder="Agent assignmentがある場合のみ" /></Field>
                 <Field label="Discovery"><AppSelect value={form.discoveryType} onValueChange={(value) => update("discoveryType", value)}><option value="manual">Manual theme</option><option value="local_pool">Local theme pool</option><option value="calendar">Calendar / seasonal</option><option value="web_search">Web Search</option><option value="rss">RSS / Atom</option><option value="json_feed">JSON feed</option></AppSelect></Field>
               </div>
               {form.discoveryType === "manual" || form.discoveryType === "local_pool" ? <Field label={form.discoveryType === "local_pool" ? "Theme pool（1行1件）" : "Theme"}>{form.discoveryType === "local_pool" ? <Textarea value={form.theme} onChange={(event) => update("theme", event.target.value)} /> : <Input value={form.theme} onChange={(event) => update("theme", event.target.value)} />}</Field> : null}
@@ -273,8 +303,10 @@ export function MediaAutomationPanel() {
                 <Field label="Concept数"><Input type="number" min={1} max={12} value={form.candidateCount} onChange={(event) => update("candidateCount", event.target.value)} /></Field>
               </div>
 
-              {(form.mode === "review_before_generate" || form.mode === "auto_generate") ? <div className="rounded-md border border-border p-3"><p className="mb-3 text-xs font-semibold">Generation Studio binding</p><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Field label="Workspace"><AppSelect value={form.workspaceId} onValueChange={(value) => { update("workspaceId", value); update("presetId", ""); }}><option value="">選択してください</option>{workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.external_workspace_id} · {workspace.status}</option>)}</AppSelect></Field><Field label="Preset"><AppSelect value={form.presetId} onValueChange={(value) => { update("presetId", value); const preset = presets.find((item) => item.preset_id === value); if (preset) update("pinnedRevisionId", preset.current_revision_id); }}><option value="">選択してください</option>{presets.map((preset) => <option key={preset.preset_id} value={preset.preset_id}>{preset.name} · r{preset.current_revision}</option>)}</AppSelect></Field><Field label="Revision policy"><AppSelect value={form.revisionPolicy} onValueChange={(value) => update("revisionPolicy", value)}><option value="latest_at_submission">Latest at submission</option><option value="pinned">Pinned</option></AppSelect></Field><Field label="Pinned revision ID"><Input value={form.pinnedRevisionId} onChange={(event) => update("pinnedRevisionId", event.target.value)} disabled={form.revisionPolicy !== "pinned"} /></Field></div>{selectedWorkspace?.base_url ? <p className="mt-2 text-[11px] text-muted-foreground">Presetの作成・編集はGeneration Studio側で行います: {text(selectedWorkspace.base_url)}</p> : null}</div> : null}
+              {(form.mode === "review_before_generate" || form.mode === "auto_generate") ? <div className="rounded-md border border-border p-3"><p className="mb-3 text-xs font-semibold">Generation Studio binding</p><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Field label="Workspace"><AppSelect value={form.workspaceId} onValueChange={(value) => { update("workspaceId", value); update("presetId", ""); }}><option value="">選択してください</option>{workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.external_workspace_id} · {workspace.status}</option>)}</AppSelect></Field><Field label="Preset"><AppSelect value={form.presetId} onValueChange={(value) => { update("presetId", value); const preset = presets.find((item) => item.preset_id === value); if (preset) update("pinnedRevisionId", preset.current_revision_id); }}><option value="">選択してください</option>{presets.map((preset) => <option key={preset.preset_id} value={preset.preset_id}>{preset.name} · r{preset.current_revision}</option>)}</AppSelect></Field><Field label="Revision policy"><AppSelect value={form.revisionPolicy} onValueChange={(value) => update("revisionPolicy", value)}><option value="latest_at_submission">Latest at submission</option><option value="pinned">Pinned</option></AppSelect></Field><Field label="Pinned revision ID"><Input value={form.pinnedRevisionId} onChange={(event) => update("pinnedRevisionId", event.target.value)} disabled={form.revisionPolicy !== "pinned"} /></Field></div>{presetError ? <p role="alert" className="mt-2 text-xs text-destructive">{presetError}</p> : null}{selectedWorkspace?.base_url ? <p className="mt-2 text-[11px] text-muted-foreground">Presetの作成・編集はGeneration Studio側で行います: {text(selectedWorkspace.base_url)}</p> : null}</div> : null}
 
+              <Field label="処理中の子生成上限（0–16件）" help="0は新規送信を停止。結果不明の生成も枠を使い、生成先で終了を確認してから空き枠に戻ります。"><Input type="number" min={0} max={16} step={1} value={form.maxActiveGenerations} onChange={(event) => update("maxActiveGenerations", event.target.value)} /></Field>
+              <Field label="生成の明示再試行上限（0–10回）" help="初回送信を除く上限です。変更は新しいRunから適用され、結果不明の送信は自動で繰り返しません。"><Input type="number" min={0} max={10} step={1} value={form.maxGenerationRetries} onChange={(event) => update("maxGenerationRetries", event.target.value)} /></Field>
               <div className="grid gap-3 md:grid-cols-2"><Field label="Fallback theme（任意）"><Input value={form.fallbackTheme} onChange={(event) => update("fallbackTheme", event.target.value)} /></Field><Field label="Research fallback"><AppSelect value={form.fallbackResearch} onValueChange={(value) => update("fallbackResearch", value)}><option value="observation_only">Theme observationで継続</option><option value="fail">失敗として停止</option></AppSelect></Field></div>
               <div className="flex flex-wrap justify-end gap-2">
                 {selectedProgram ? <><Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void mediaAutomationApi.setEnabled(selectedProgram.id, !selectedProgram.enabled).then(() => refreshProgram(selectedProgram.id)).catch(setError)}>{selectedProgram.enabled ? "Disable" : "Enable"}</Button><Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void mediaAutomationApi.duplicate(selectedProgram.id, `${selectedProgram.name} copy`, key("duplicate")).then(load).catch(setError)}><Copy className="size-3.5" /> Duplicate</Button><Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void saveRevision()}><Save className="size-3.5" /> Save revision</Button><Button size="sm" disabled={busy !== null} onClick={() => void runNow()}><Play className="size-3.5" /> Run Now</Button></> : <Button size="sm" disabled={busy !== null || !form.name.trim()} onClick={() => void createProgram()}><Sparkles className="size-3.5" /> Create</Button>}
@@ -282,10 +314,12 @@ export function MediaAutomationPanel() {
             </CardContent>
           </Card>
 
-          {selectedProgram ? <Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Recipe revision history</CardTitle><CardDescription>各Runはexact revisionをpinします。</CardDescription></CardHeader><CardContent className="pt-3"><div className="flex flex-wrap gap-2">{selectedProgram.revisions.map((revision) => <span key={revision.id} className="rounded border border-border px-2 py-1 text-xs">r{revision.version} · {revision.execution_mode} · {revision.content_hash.slice(0, 8)}</span>)}</div></CardContent></Card> : null}
+          {selectedProgram ? <Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Recipe revision history<HelpPopover label="Recipe revision history">各Runはexact revisionをpinします。</HelpPopover></CardTitle></CardHeader><CardContent className="pt-3"><div className="flex flex-wrap gap-2">{selectedProgram.revisions.map((revision) => <span key={revision.id} className="rounded border border-border px-2 py-1 text-xs">r{revision.version} · {revision.execution_mode} · {revision.content_hash.slice(0, 8)}</span>)}</div></CardContent></Card> : null}
 
-          {selectedProgram ? <Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="text-sm">Daily Board / Run detail</CardTitle><CardDescription>ResearchからGeneration receiptまで上位provenanceを追跡します。</CardDescription></CardHeader><CardContent className="space-y-4 pt-4"><div className="flex flex-wrap items-center gap-2"><AppSelect value={selectedRun?.id ?? ""} onValueChange={setSelectedRunId}><option value="">Runを選択</option>{runs.map((run) => <option key={run.id} value={run.id}>{run.created_at?.slice(0, 19) ?? run.id} · {stateLabel(run.state)}</option>)}</AppSelect>{selectedRun ? <Status value={selectedRun.state} /> : null}{selectedRun?.state === "generation_running" ? <Button size="sm" variant="outline" onClick={() => void runAction("reconcile", () => mediaAutomationApi.reconcile(selectedRun.id))}><RefreshCw className="size-3.5" /> Reconcile</Button> : null}{selectedRun?.state === "uncertain" ? <Button size="sm" variant="outline" onClick={() => void runAction("retry", () => mediaAutomationApi.retryUncertain(selectedRun.id))}>Explicit retry</Button> : null}</div>
-            {selectedRun ? <><div className="grid gap-3 md:grid-cols-2"><div className="rounded-md border border-border p-3"><p className="text-[11px] font-semibold uppercase text-muted-foreground">Theme</p><p className="mt-1 font-medium">{text(selectedRun.observation?.title) || "—"}</p><p className="mt-1 text-xs text-muted-foreground">{text(selectedRun.observation?.description)}</p></div><div className="rounded-md border border-border p-3"><p className="text-[11px] font-semibold uppercase text-muted-foreground">Research</p><p className="mt-1 text-xs">{keyFacts.slice(0, 5).join(" / ") || "Findingなし"}</p><p className="mt-2 text-[11px] text-muted-foreground">Sources: {sourceRefs.length} · ResearchRun: {selectedRun.research_run_id ?? "—"}</p></div></div>
+          {selectedProgram ? <Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Daily Board / Run detail<HelpPopover label="Daily Board / Run detail">ResearchからGeneration receiptまで上位provenanceを追跡します。</HelpPopover></CardTitle></CardHeader><CardContent className="space-y-4 pt-4"><div className="flex flex-wrap items-center gap-2"><AppSelect value={selectedRun?.id ?? ""} onValueChange={setSelectedRunId}><option value="">Runを選択</option>{runs.map((run) => <option key={run.id} value={run.id}>{run.created_at?.slice(0, 19) ?? run.id} · {stateLabel(run.state)}</option>)}</AppSelect>{selectedRun ? <Status value={selectedRun.state} /> : null}{(selectedRun?.external_run_id && ["generation_running", "uncertain", "complete", "failed"].includes(selectedRun.state)) ? <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void runAction("reconcile", () => mediaAutomationApi.reconcile(selectedRun.id))}><RefreshCw className="size-3.5" /> Reconcile</Button> : null}{selectedRun?.state === "uncertain" ? <Button size="sm" variant="outline" disabled={busy !== null || retryBlocked} onClick={() => void runAction("retry", () => mediaAutomationApi.retryUncertain(selectedRun.id))}>Explicit retry</Button> : null}</div>
+            {selectedRun?.state === "scheduled" && selectedRun.error_code === "generation_capacity_full" ? <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void runAction("resume", () => mediaAutomationApi.resume(selectedRun.id))}>生成枠を再確認して再開</Button> : null}
+            {selectedRun?.selected_candidate_id ? <p className="text-xs text-muted-foreground">{attemptCount === null || retryLimit === null ? "過去の生成送信回数が不明です。生成先で照合してください。" : `生成送信 ${attemptCount} 回 · 明示再試行 ${Math.max(0, attemptCount - 1)} / ${retryLimit} 回${retryBlocked ? "（上限到達・送信内容を保持）" : ""}`}</p> : null}
+            {selectedRun ? <><div className="grid gap-3 md:grid-cols-2"><div className="rounded-md border border-border p-3"><p className="text-[11px] font-semibold uppercase text-muted-foreground">Theme</p><p className="mt-1 font-medium">{text(selectedRun.observation?.title) || "—"}</p><p className="mt-1 text-xs text-muted-foreground">{text(selectedRun.observation?.description)}</p></div><div className="rounded-md border border-border p-3"><p className="text-[11px] font-semibold uppercase text-muted-foreground">Research</p><p className="mt-1 text-xs">検証済み主張: {keyFacts.slice(0, 5).join(" / ") || "なし"}</p>{unverifiedSignals.length ? <p className="mt-1 text-xs text-muted-foreground">未検証の情報: {unverifiedSignals.slice(0, 5).join(" / ")}</p> : null}{researchStatusLabel ? <p className="mt-1 text-xs text-muted-foreground">{researchStatusLabel}</p> : null}<p className="mt-2 text-[11px] text-muted-foreground">Sources: {sourceRefs.length} · ResearchRun: {selectedRun.research_run_id ?? "—"}</p></div></div>
             <div><div className="mb-2 flex items-center justify-between"><p className="text-xs font-semibold">Concept / Prompt Candidates</p>{selectedRun.state === "waiting_review" ? <Button size="sm" variant="outline" onClick={() => void runAction("regenerate", () => mediaAutomationApi.regenerate(selectedRun.id, key("regenerate")))}><Sparkles className="size-3.5" /> Regenerate</Button> : null}</div><div className="grid gap-3 lg:grid-cols-2">{selectedRun.candidates.map((candidate) => <CandidateCard key={candidate.candidate_id} run={selectedRun} candidate={candidate} busy={busy !== null} onSaved={(payload) => runAction("edit", () => mediaAutomationApi.editCandidate(selectedRun.id, candidate.candidate_id, payload))} onGenerate={() => runAction("approve", () => mediaAutomationApi.approve(selectedRun.id, candidate.candidate_id))} />)}</div></div>
             <div className="rounded-md border border-border p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-[11px] font-semibold uppercase text-muted-foreground">Generated output</p><p className="mt-1 text-xs">73 Run: {selectedRun.external_run_id ?? "—"} · Preset: {selectedRun.preset_id ?? "—"} / r{selectedRun.preset_revision_number ?? "—"}</p></div>{studioLink ? <a className="inline-flex items-center gap-1 text-xs text-primary hover:underline" href={studioLink} target="_blank" rel="noreferrer">Open in Generation Studio <ExternalLink className="size-3" /></a> : null}</div>{outputIds.length ? <div className="mt-2 flex flex-wrap gap-2">{outputIds.map((asset) => <span key={asset} className="rounded border px-2 py-1 font-mono text-[10px]">{asset}</span>)}</div> : <p className="mt-2 text-xs text-muted-foreground">出力はまだありません。</p>}</div>
             {selectedRun.error_code ? <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">{selectedRun.error_code}: {selectedRun.error_message}</div> : null}</> : <p className="py-8 text-center text-sm text-muted-foreground">Runを選択してください。</p>}

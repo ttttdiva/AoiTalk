@@ -2,11 +2,36 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 
 FAST_THINKING_MODE_OPTIONS = ["fast", "thinking"]
 OLLAMA_GPT_OSS_REASONING_EFFORT_OPTIONS = ["low", "medium", "high"]
+
+
+def resolve_strata_response_mode(config: Any, effort: Any = None) -> str:
+    """Resolve a Strata override or its saved response mode without writing config.
+
+    llama.cpp effort settings do not belong to Strata. Invalid explicit modes
+    fail closed; unset or legacy saved modes retain the default fast behavior.
+    """
+
+    explicit = str(effort or "").strip().lower()
+    if explicit:
+        if explicit not in FAST_THINKING_MODE_OPTIONS:
+            raise ValueError(
+                "Unsupported response mode for Strata: "
+                f"{effort!r}; expected one of {FAST_THINKING_MODE_OPTIONS}"
+            )
+        return explicit
+    getter = getattr(config, "get", None)
+    saved = (
+        getter("llm_runtime_mode", None)
+        if callable(getter)
+        else getattr(config, "llm_runtime_mode", None)
+    )
+    normalized = str(saved or "").strip().lower()
+    return normalized if normalized in FAST_THINKING_MODE_OPTIONS else "fast"
 
 
 def normalize_model_id_for_mode(model: str) -> str:

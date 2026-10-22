@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { voiceSessionAudioWebSocketUrl } from "@/lib/voice-session-api";
+import { observePlayback, parseVisemes, type Viseme } from "@/lib/aoirig/lip-sync";
 
 export type CharacterAudioTransportState =
   | "idle"
@@ -16,6 +17,7 @@ export type CharacterAudioAck = {
 };
 
 export type UseCharacterAudioTransportOptions = {
+  characterName?: string | null;
   sessionId: string | null;
   enabled: boolean;
   onStateChange?: (state: CharacterAudioTransportState) => void;
@@ -29,6 +31,7 @@ export type UseCharacterAudioTransportResult = {
 };
 
 type PendingSegment = {
+  visemes?: Viseme[];
   generationId: string;
   sequence: number;
   segmentId: string;
@@ -43,12 +46,14 @@ type PendingFrame = PendingSegment & {
  * Handles binary TTS frames, bounded queueing, and playback acks.
  */
 export function useCharacterAudioTransport({
+  characterName,
   sessionId,
   enabled,
   onStateChange,
   onError,
 }: UseCharacterAudioTransportOptions): UseCharacterAudioTransportResult {
   const stateRef = useRef<CharacterAudioTransportState>("idle");
+  const stopObservationRef = useRef<(() => void) | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const queueRef = useRef<PendingFrame[]>([]);
   const pendingSegmentRef = useRef<PendingSegment | null>(null);
@@ -86,6 +91,8 @@ export function useCharacterAudioTransport({
   }, []);
 
   const stopActivePlayback = useCallback(() => {
+    stopObservationRef.current?.();
+    stopObservationRef.current = null;
     ackEnabledRef.current = false;
     playbackEpochRef.current += 1;
     const source = activeSourceRef.current;
@@ -181,9 +188,18 @@ export function useCharacterAudioTransport({
           activeSourceRef.current = source;
           ackEnabledRef.current = true;
           let settled = false;
+          const start = context.currentTime;
+          const stopObservation = characterName && sessionId ? observePlayback(characterName, {
+            session: sessionId, generation: frame.generationId, segment: frame.segmentId,
+            context, buffer, start, visemes: frame.visemes ?? [],
+          }) : () => undefined;
+          stopObservationRef.current = stopObservation;
           const finish = () => {
             if (settled) return;
             settled = true;
+            stopObservation();
+            source.disconnect?.();
+            if (stopObservationRef.current === stopObservation) stopObservationRef.current = null;
             if (activeSourceRef.current === source) {
               activeSourceRef.current = null;
             }
@@ -196,13 +212,13 @@ export function useCharacterAudioTransport({
             resolve();
           };
           source.onended = finish;
-          source.start();
+          source.start(start);
         });
       } catch {
         failTransport("キャラクター音声の再生に失敗しました");
       }
     },
-    [ensureAudioContext, failTransport, sendAck],
+    [characterName, sessionId, ensureAudioContext, failTransport, sendAck],
   );
 
   const drainQueue = useCallback(async () => {
@@ -295,6 +311,7 @@ export function useCharacterAudioTransport({
             messageType === "audio.generation" &&
             typeof payload.generation_id === "string"
           ) {
+            if (currentGenerationRef.current && currentGenerationRef.current !== payload.generation_id) flush();
             currentGenerationRef.current = payload.generation_id;
             return;
           }
@@ -319,7 +336,7 @@ export function useCharacterAudioTransport({
               return;
             }
             if (!currentGenerationRef.current) return;
-            pendingSegmentRef.current = { generationId, sequence, segmentId };
+            pendingSegmentRef.current = { generationId, sequence, segmentId, visemes: parseVisemes(payload.visemes) };
           }
         } catch {
           // ignore control parse errors

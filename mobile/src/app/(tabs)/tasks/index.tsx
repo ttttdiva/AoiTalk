@@ -11,7 +11,9 @@ import React, {
 } from "react";
 import {
   Alert,
+  AppState,
   FlatList,
+  Keyboard,
   PanResponder,
   Pressable,
   RefreshControl,
@@ -25,6 +27,7 @@ import {
   Chip,
   Dialog,
   FAB,
+  Icon,
   IconButton,
   Menu,
   Portal,
@@ -35,6 +38,7 @@ import {
 } from "react-native-paper";
 import { useFocusEffect, useRouter } from "expo-router";
 import { tasksRepo } from "../../../repositories";
+import { useSyncStatusStore } from "../../../stores/sync-status";
 import { runSync } from "../../../sync/engine";
 import { useProjectStore } from "../../../stores/project";
 import { useProject } from "../../../contexts/ProjectContext";
@@ -61,6 +65,13 @@ import {
 } from "../../../stores/task-completion-undo";
 import { ScreenHeader } from "../../../components/screen-header";
 import { ScopeSwitcher } from "../../../components/scope-switcher";
+import { TaskDateFilterDialog } from "../../../components/task-date-filter-dialog";
+import {
+  EMPTY_TASK_DATE_FILTER,
+  applyTaskDateFilter,
+  countActiveTaskDateFilters,
+  type TaskDateFilter,
+} from "../../../lib/task-date-filter";
 
 const FILTERS = ["all", "open", "in_progress", "closed"] as const;
 const FILTER_LABELS: Record<string, string> = {
@@ -69,6 +80,81 @@ const FILTER_LABELS: Record<string, string> = {
   in_progress: "進行中",
   closed: "完了済み",
 };
+
+function TaskToolbarButton({
+  children,
+  icon,
+  selected,
+  variant,
+  onPress,
+}: {
+  children: React.ReactNode;
+  icon: string;
+  selected?: boolean;
+  variant: "status" | "future";
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ selected }}
+      accessibilityLabel={variant === "future" ? "未来を表示" : undefined}
+      onPress={onPress}
+      style={[
+        styles.toolbarFilterButton,
+        variant === "status"
+          ? styles.statusFilterButton
+          : styles.futureFilterButton,
+      ]}
+    >
+      <Icon
+        source={icon}
+        size={16}
+        color={selected ? "#cba6f7" : "#cdd6f4"}
+      />
+      <Text
+        style={[
+          styles.toolbarFilterText,
+          selected && styles.toolbarFilterTextSelected,
+        ]}
+      >
+        {children}
+      </Text>
+    </Pressable>
+  );
+}
+
+function TaskHeaderButton({
+  children,
+  color,
+  disabled,
+  onPress,
+  textOnly = false,
+}: {
+  children: React.ReactNode;
+  color: string;
+  disabled?: boolean;
+  onPress: () => void;
+  textOnly?: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
+      disabled={disabled}
+      onPress={onPress}
+      style={[
+        styles.bulkActionButton,
+        textOnly && styles.bulkActionTextButton,
+        !textOnly && { borderColor: color },
+        disabled && styles.bulkActionDisabled,
+      ]}
+    >
+      <Text style={[styles.bulkActionLabel, { color }]}>{children}</Text>
+    </Pressable>
+  );
+}
+
 type TaskCommandDialogProps = {
   visible: boolean;
   targetTitle: string | null;
@@ -416,20 +502,30 @@ function TaskCard({
         accessibilityRole="button"
         accessibilityState={{ selected }}
         accessibilityLabel={`${item.title}を開く`}
-        accessibilityHint="長押しで選択し、そのままドラッグして並べ替えます"
+        accessibilityHint={`${!selectedProjectId && item.project_name ? `プロジェクト: ${item.project_name}。` : ""}長押しで選択し、そのままドラッグして並べ替えます`}
       >
         <View style={styles.taskRow}>
           <View style={styles.statusButtonSpacer} />
           <View style={styles.taskContent} pointerEvents="none">
             <View style={styles.compactMainRow}>
               <Text
-                style={[
-                  styles.taskTitle,
-                  item.status === "closed" && styles.taskTitleDone,
-                ]}
+                style={styles.taskTitleLine}
                 numberOfLines={1}
+                ellipsizeMode="tail"
               >
-                {item.title}
+                <Text
+                  style={[
+                    styles.taskTitle,
+                    item.status === "closed" && styles.taskTitleDone,
+                  ]}
+                >
+                  {item.title}
+                </Text>
+                {!selectedProjectId && item.project_name ? (
+                  <Text style={styles.projectText}>
+                    {`  ${Array.from(item.project_name).slice(0, 3).join("")}`}
+                  </Text>
+                ) : null}
               </Text>
               {item.tags?.slice(0, 2).map((tag) => (
                 <View
@@ -457,9 +553,7 @@ function TaskCard({
                 </Chip>
               ) : null}
             </View>
-            {item.start_at ||
-            (!selectedProjectId && item.project_name) ||
-            item.active_time_entry ? (
+            {item.start_at || item.active_time_entry ? (
               <View style={styles.compactMetaRow}>
                 {item.start_at ? (
                   <Text style={styles.dueDate} numberOfLines={1}>
@@ -467,11 +561,6 @@ function TaskCard({
                       allDay: item.all_day,
                       absoluteStyle: "short",
                     })}
-                  </Text>
-                ) : null}
-                {!selectedProjectId && item.project_name ? (
-                  <Text style={styles.projectText} numberOfLines={1}>
-                    {item.project_name}
                   </Text>
                 ) : null}
                 {item.active_time_entry ? (
@@ -536,9 +625,13 @@ export default function TaskListScreen() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<string>("all");
   const [showFuture, setShowFuture] = useState(false);
+  const [dateFilter, setDateFilter] = useState<TaskDateFilter>(EMPTY_TASK_DATE_FILTER);
+  const [dateFilterVisible, setDateFilterVisible] = useState(false);
+  const dateFilterCount = countActiveTaskDateFilters(dateFilter);
   const [statusFilterMenuVisible, setStatusFilterMenuVisible] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [search, setSearch] = useState("");
+  const [searchExpanded, setSearchExpanded] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -572,10 +665,16 @@ export default function TaskListScreen() {
   } | null>(null);
 
   const loadTasks = useCallback(
-    async (options?: { force?: boolean }) => {
+    async (options?: { force?: boolean; localOnly?: boolean }) => {
     const requestId = ++loadRequestRef.current;
     try {
-      const list = selectedProjectId
+      const list = options?.localOnly
+        ? selectedProjectId
+          ? await tasksRepo.listLocal(selectedProjectId)
+          : selectedSpaceId
+            ? await tasksRepo.listLocalBySpace(selectedSpaceId)
+            : await tasksRepo.listLocal(null)
+        : selectedProjectId
         ? await tasksRepo.list(selectedProjectId, options)
         : await tasksRepo.listByScope(
             selectedSpaceId ? { space_id: selectedSpaceId } : {},
@@ -599,6 +698,20 @@ export default function TaskListScreen() {
   useFocusEffect(
     useCallback(() => {
       let active = true;
+      const unsubscribeGeneral = useSyncStatusStore.subscribe((state, previous) => {
+        if (state.generalAuthScope !== previous.generalAuthScope &&
+            state.generalAuthScope !== authScope) {
+          ++loadRequestRef.current;
+          return;
+        }
+        if (state.generalRevision === previous.generalRevision ||
+            state.generalAuthScope !== authScope ||
+            AppState.currentState !== "active") return;
+        void loadTasks({ localOnly: true });
+      });
+      const appStateSubscription = AppState.addEventListener("change", (state) => {
+        if (state !== "active") ++loadRequestRef.current;
+      });
       // フォーカス時はデルタ同期で鮮度を担保し、フル取得は throttle 側に委ねる。
       // 同期はSQLiteへ1行ずつ書き込むため、同時に読むと書き込み途中の中間状態を
       // 拾って毎回違う並びになる。同期完了後にもう一度読み直す。
@@ -614,8 +727,11 @@ export default function TaskListScreen() {
       void refreshProjects();
       return () => {
         active = false;
+        ++loadRequestRef.current;
+        unsubscribeGeneral();
+        appStateSubscription.remove();
       };
-    }, [loadTasks, refreshProjects]),
+    }, [authScope, loadTasks, refreshProjects]),
   );
 
   useEffect(() => {
@@ -672,19 +788,14 @@ export default function TaskListScreen() {
       );
     }
 
-    return sortTasksCanonical(result);
-  }, [filter, search, showFuture, tasks]);
+    return sortTasksCanonical(applyTaskDateFilter(result, dateFilter));
+  }, [dateFilter, filter, search, showFuture, tasks]);
 
   useEffect(() => {
     tasksRef.current = tasks;
     filteredTasksRef.current = filteredTasks;
   }, [filteredTasks, tasks]);
 
-  const scopeLabel = selectedProject
-    ? `プロジェクト: ${selectedProject.name}`
-    : selectedSpace
-      ? `スペース: ${selectedSpace.name}`
-      : "すべてのプロジェクト";
   const scopeSwitcherLabel =
     selectedProject?.name ?? selectedSpace?.name ?? "全体";
 
@@ -1105,77 +1216,149 @@ export default function TaskListScreen() {
     <View style={styles.container}>
       <ScreenHeader
         title="タスク"
-        subtitle={scopeLabel}
-        right={
-          <ScopeSwitcher
-            label={scopeSwitcherLabel}
-            variant="chip"
-            accessibilityLabel={`表示範囲: ${scopeSwitcherLabel}`}
-          />
-        }
+        compact
       />
       <Surface style={styles.header} elevation={1}>
-        <TextInput
-          value={search}
-          onChangeText={setSearch}
-          mode="outlined"
-          dense
-          placeholder="タスク・タグ・プロジェクトを検索"
-          style={styles.searchInput}
-          left={<TextInput.Icon icon="magnify" />}
-        />
-
-        <View style={styles.filterRow}>
-          <Menu
-            visible={statusFilterMenuVisible}
-            onDismiss={() => setStatusFilterMenuVisible(false)}
-            anchor={
-              <Chip
-                compact
-                icon="filter-variant"
-                onPress={() => setStatusFilterMenuVisible(true)}
-                style={styles.filterChip}
-                textStyle={styles.filterChipText}
-              >
-                状態: {FILTER_LABELS[filter]}
-              </Chip>
-            }
-            contentStyle={styles.menuContent}
-          >
-            {FILTERS.map((item) => (
-              <Menu.Item
-                key={item}
-                title={FILTER_LABELS[item]}
-                leadingIcon={filter === item ? "check" : undefined}
-                onPress={() => {
-                  setFilter(item);
-                  setStatusFilterMenuVisible(false);
-                }}
+        {searchExpanded ? (
+          <View style={styles.toolbarRow} testID="tasks-search-toolbar">
+            <TextInput
+              value={search}
+              onChangeText={setSearch}
+              mode="outlined"
+              dense
+              autoFocus
+              placeholder="タスク・タグ・プロジェクトを検索"
+              accessibilityLabel="タスク検索"
+              style={styles.searchInput}
+            />
+            <IconButton
+              icon="close-circle-outline"
+              iconColor="#cdd6f4"
+              size={22}
+              disabled={!search}
+              onPress={() => setSearch("")}
+              style={styles.toolbarIconButton}
+              accessibilityLabel="検索文字列をクリア"
+            />
+            <IconButton
+              icon="close"
+              iconColor="#cdd6f4"
+              size={22}
+              onPress={() => {
+                Keyboard.dismiss();
+                setSearchExpanded(false);
+              }}
+              style={styles.toolbarIconButton}
+              accessibilityLabel="検索を閉じる"
+            />
+          </View>
+        ) : (
+          <View style={styles.toolbarRow} testID="tasks-filter-toolbar">
+            <View style={styles.scopeSlot} testID="tasks-scope-slot">
+              <ScopeSwitcher
+                variant="inline"
+                allLabel="全体"
+                projectNameOnly
+                accessibilityLabel={`表示範囲: ${scopeSwitcherLabel}`}
               />
-            ))}
-          </Menu>
-
-          <Chip
-            compact
-            selected={showFuture}
-            icon={showFuture ? "calendar-clock" : "calendar-outline"}
-            onPress={() => setShowFuture((value) => !value)}
-            style={styles.filterChip}
-            textStyle={styles.filterChipText}
-          >
-            未来を表示
-          </Chip>
-        </View>
+            </View>
+            <View style={styles.searchAction}>
+              <IconButton
+                icon="magnify"
+                iconColor={search.trim() ? "#cba6f7" : "#cdd6f4"}
+                size={22}
+                onPress={() => {
+                  setStatusFilterMenuVisible(false);
+                  setSearchExpanded(true);
+                }}
+                style={styles.toolbarIconButton}
+                accessibilityLabel={
+                  search.trim()
+                    ? `検索中: ${search}。検索を開く`
+                    : "タスクを検索"
+                }
+                accessibilityState={{ selected: !!search.trim() }}
+              />
+              {search.trim() ? (
+                <View
+                  pointerEvents="none"
+                  style={styles.searchActiveBadge}
+                  testID="tasks-search-active-indicator"
+                />
+              ) : null}
+            </View>
+            <View style={styles.statusFilterSlot}>
+              <Menu
+                visible={statusFilterMenuVisible}
+                onDismiss={() => setStatusFilterMenuVisible(false)}
+                anchor={
+                  <TaskToolbarButton
+                    variant="status"
+                    icon="filter-variant"
+                    selected={filter !== "all"}
+                    onPress={() => setStatusFilterMenuVisible(true)}
+                  >
+                    状態: {FILTER_LABELS[filter]}
+                  </TaskToolbarButton>
+                }
+                contentStyle={styles.menuContent}
+              >
+                {FILTERS.map((item) => (
+                  <Menu.Item
+                    key={item}
+                    title={FILTER_LABELS[item]}
+                    leadingIcon={filter === item ? "check" : undefined}
+                    onPress={() => {
+                      setFilter(item);
+                      setStatusFilterMenuVisible(false);
+                    }}
+                  />
+                ))}
+              </Menu>
+            </View>
+            <TaskToolbarButton
+              variant="future"
+              selected={showFuture}
+              icon={showFuture ? "calendar-clock" : "calendar-outline"}
+              onPress={() => setShowFuture((value) => !value)}
+            >
+              未来
+            </TaskToolbarButton>
+            <View style={styles.dateFilterAction}>
+              <IconButton
+                icon="calendar-filter-outline"
+                iconColor={dateFilterCount > 0 ? "#cba6f7" : "#cdd6f4"}
+                size={22}
+                onPress={() => {
+                  setStatusFilterMenuVisible(false);
+                  setDateFilterVisible(true);
+                }}
+                style={styles.toolbarIconButton}
+                accessibilityLabel={
+                  dateFilterCount > 0
+                    ? `日付・期限の条件 ${dateFilterCount}件。開く`
+                    : "日付・期限の条件"
+                }
+                accessibilityState={{ selected: dateFilterCount > 0 }}
+              />
+              {dateFilterCount > 0 ? (
+                <View
+                  pointerEvents="none"
+                  style={styles.searchActiveBadge}
+                  testID="tasks-date-filter-active-indicator"
+                />
+              ) : null}
+            </View>
+          </View>
+        )}
 
         {selectedIds.size > 0 ? (
           <View style={styles.bulkBar}>
             <Text style={styles.bulkText}>{selectedIds.size}件選択中</Text>
             <View style={styles.bulkActions}>
               {selectedCommandTask ? (
-                <Button
-                  compact
-                  mode="outlined"
-                  textColor="#cdd6f4"
+                <TaskHeaderButton
+                  color="#cdd6f4"
                   onPress={() => {
                     setCommandError(null);
                     setShowCommandDialog(true);
@@ -1183,46 +1366,42 @@ export default function TaskListScreen() {
                   disabled={bulkBusy || commandBusy}
                 >
                   コマンド
-                </Button>
+                </TaskHeaderButton>
               ) : null}
-              <Button
-                compact
-                mode="outlined"
-                textColor="#a6e3a1"
+              <TaskHeaderButton
+                color="#a6e3a1"
                 onPress={handleBulkStatusToggle}
                 disabled={bulkBusy}
               >
                 完了/戻す
-              </Button>
-              <Button
-                compact
-                mode="outlined"
-                textColor="#89b4fa"
+              </TaskHeaderButton>
+              <TaskHeaderButton
+                color="#89b4fa"
                 onPress={handleBulkDuplicate}
                 disabled={bulkBusy}
               >
                 複製
-              </Button>
-              <Button
-                compact
-                mode="outlined"
-                textColor="#f38ba8"
+              </TaskHeaderButton>
+              <TaskHeaderButton
+                color="#f38ba8"
                 onPress={handleBulkDelete}
                 disabled={bulkBusy}
               >
                 削除
-              </Button>
-              <Button compact textColor="#a6adc8" onPress={clearSelection}>
+              </TaskHeaderButton>
+              <TaskHeaderButton color="#a6adc8" textOnly onPress={clearSelection}>
                 解除
-              </Button>
+              </TaskHeaderButton>
             </View>
           </View>
-        ) : (
-          <Text style={styles.hintText}>
-            タップで開く / 長押しで複数選択
-          </Text>
-        )}
+        ) : null}
       </Surface>
+      <TaskDateFilterDialog
+        visible={dateFilterVisible}
+        filter={dateFilter}
+        onChange={setDateFilter}
+        onDismiss={() => setDateFilterVisible(false)}
+      />
 
       <View style={styles.listFrame}>
         <FlatList
@@ -1291,24 +1470,79 @@ export default function TaskListScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
   header: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 0,
     backgroundColor: "#1e1e2e",
-    gap: 7,
+    gap: 0,
   },
-  displayConditionChip: { backgroundColor: "#313244", maxWidth: 190 },
-  filterRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  filterChip: { backgroundColor: "#313244", maxWidth: 190 },
-  filterChipText: { color: "#cdd6f4" },
-  projectChip: { backgroundColor: "#313244" },
-  scopeChip: { backgroundColor: "#181825" },
-  scopeActions: { flexDirection: "row", alignItems: "center", gap: 6 },
-  projectChipText: { color: "#cdd6f4" },
-  searchInput: { backgroundColor: "transparent" },
+  toolbarRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    columnGap: 2,
+    minHeight: 44,
+  },
+  scopeSlot: {
+    flex: 1,
+    minWidth: 64,
+    height: 40,
+    justifyContent: "center",
+    backgroundColor: "#313244",
+    borderRadius: 14,
+    marginRight: 2,
+  },
+  searchAction: { width: 40, height: 44 },
+  dateFilterAction: { width: 40, height: 44 },
+  toolbarIconButton: { width: 40, height: 44, margin: 0 },
+  searchActiveBadge: {
+    position: "absolute",
+    top: 5,
+    right: 5,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: "#cba6f7",
+  },
+  toolbarFilterButton: {
+    minHeight: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 3,
+    paddingHorizontal: 2,
+    flexShrink: 1,
+  },
+  statusFilterSlot: { flexShrink: 0 },
+  statusFilterButton: { paddingHorizontal: 4 },
+  futureFilterButton: { paddingHorizontal: 4, flexShrink: 0 },
+  toolbarFilterText: {
+    color: "#cdd6f4",
+    fontSize: 12,
+    textAlign: "center",
+  },
+  toolbarFilterTextSelected: { color: "#cba6f7" },
+  searchInput: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 44,
+    backgroundColor: "transparent",
+  },
   bulkBar: { gap: 10 },
   bulkText: { color: "#cdd6f4", fontSize: 13, fontWeight: "600" },
-  bulkActions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  hintText: { color: "#9399b2", fontSize: 11 },
+  bulkActions: { flexDirection: "row", flexWrap: "wrap", alignItems: "stretch", gap: 8 },
+  bulkActionButton: {
+    maxWidth: "100%",
+    minWidth: 44,
+    minHeight: 44,
+    flexShrink: 1,
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderRadius: 6,
+  },
+  bulkActionTextButton: { borderWidth: 0 },
+  bulkActionDisabled: { opacity: 0.5 },
+  bulkActionLabel: { flexShrink: 1, flexWrap: "wrap", textAlign: "center" },
   listFrame: { flex: 1 },
   listContent: { padding: 6, paddingBottom: 84 },
   taskCard: {
@@ -1346,7 +1580,8 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  taskTitle: { color: "#cdd6f4", fontSize: 14, flex: 1, minWidth: 48 },
+  taskTitleLine: { color: "#cdd6f4", fontSize: 14, flex: 1, minWidth: 0 },
+  taskTitle: { color: "#cdd6f4", fontSize: 14 },
   taskTitleDone: { textDecorationLine: "line-through", color: "#a6adc8" },
   selectedChip: { backgroundColor: "#7c3aed", height: 22 },
   selectedChipText: { color: "#f5e9ff", fontSize: 10 },
@@ -1356,7 +1591,7 @@ const styles = StyleSheet.create({
   dueDate: { color: "#a6adc8", fontSize: 11 },
   timerChip: { backgroundColor: "#4c1d95", height: 22 },
   timerChipText: { color: "#f9e2af", fontSize: 10 },
-  projectText: { color: "#bac2de", fontSize: 11, marginTop: 6 },
+  projectText: { color: "#a6adc8", fontSize: 11 },
   tagRow: { flexDirection: "row", flexWrap: "wrap", gap: 4, marginTop: 6 },
   tagDot: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 4 },
   tagDotText: { color: "#cdd6f4", fontSize: 10 },

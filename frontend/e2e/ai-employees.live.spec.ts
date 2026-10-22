@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-// Invoked only by the isolated AI employee QA harness. Credentials originate
+// Invoked only by the isolated Agent QA harness. Credentials originate
 // in repo .env.qa-login and are injected in memory; no trace/video captures.
 const baseURL = process.env.AI_EMPLOYEE_QA_BASE_URL;
 const backendURL = process.env.AI_EMPLOYEE_QA_BACKEND_URL;
@@ -27,8 +27,8 @@ async function capture(page: Page, name: string) {
   const directory = process.env.AI_EMPLOYEE_QA_SCREENSHOT_DIR;
   if (directory) await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true });
 }
-test("AI社員: authenticated draft, role, scopes, bounded fixture policy, rule, revision and deep links", async ({ page }) => {
-  test.skip(!baseURL || !backendURL || !username || !password || !projectId || !spaceId, "Requires isolated AI employee QA harness");
+test("Agent: authenticated draft, role, scopes, bounded fixture policy, rule, revision and deep links", async ({ page }) => {
+  test.skip(!baseURL || !backendURL || !username || !password || !projectId || !spaceId, "Requires isolated Agent QA harness");
   test.setTimeout(240_000);
   page.setDefaultTimeout(15_000);
   const consoleErrors: string[] = [];
@@ -63,17 +63,17 @@ test("AI社員: authenticated draft, role, scopes, bounded fixture policy, rule,
   page.on("response", response => { if (response.status() >= 500) serverErrors.push({ status: response.status(), path: new URL(response.url()).pathname }); });
   let journey: Record<string, unknown> = {};
   try {
-  const name = `QA AI社員 ${Date.now()}`;
+  const name = `QA Agent ${Date.now()}`;
   await page.goto("/login");
   await page.getByLabel("ユーザー名", { exact: true }).fill(username!);
   await page.getByLabel("パスワード", { exact: true }).fill(password!);
   await page.getByRole("button", { name: "ログイン", exact: true }).click();
   await expect(page).not.toHaveURL(/\/login(?:\?|$)/);
   await page.goto("/operations?tab=agents");
-  await expect(page.getByRole("button", { name: "＋ AI社員を追加" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "＋ Agentを追加" })).toBeVisible();
   await capture(page, "01-employee-list");
-  await page.getByRole("button", { name: "＋ AI社員を追加" }).click();
-  await page.getByLabel("社員名", { exact: true }).fill(name);
+  await page.getByRole("button", { name: "＋ Agentを追加" }).click();
+  await page.getByLabel("Agent名", { exact: true }).fill(name);
   await page.getByLabel("役職", { exact: true }).fill("備品・ウォーターサーバー担当");
   await page.getByLabel("責務の概要", { exact: true }).fill("交換用水の在庫を確認して補充する");
   await page.getByRole("button", { name: "下書きを保存して職務設定へ" }).click();
@@ -86,7 +86,7 @@ test("AI社員: authenticated draft, role, scopes, bounded fixture policy, rule,
   expect(catalogResponse.ok()).toBeTruthy();
   const catalog = await catalogResponse.json() as { teams: { team_id: string; name: string; execution_profiles: { profile_id: string; name: string }[] }[] };
   const team = catalog.teams.find(t => t.team_id === "employee"); expect(team).toBeTruthy();
-  await choose(page, "Agent Team", team!.name);
+  await choose(page, "Execution Team", team!.name);
   const manualProfile = team!.execution_profiles.find(p => p.profile_id === "manual"); expect(manualProfile).toBeTruthy();
   await choose(page, "Execution Profile", manualProfile!.name);
   const operator = page.getByRole("group", { name: "許可する Subagents" }).getByRole("checkbox").first();
@@ -100,10 +100,10 @@ test("AI社員: authenticated draft, role, scopes, bounded fixture policy, rule,
   await page.reload();
   await expect(page.getByRole("heading", { name: "職務・モデル — 現在 v1" })).toBeVisible();
   await page.getByRole("button", { name: "組織・所属", exact: true }).click();
-  await choose(page, "主所属 Space", "AI Employee QA Space (test)");
+  await choose(page, "主所属 Space", "Agent QA Space (test)");
   await choose(page, "自律レベル", "範囲内自律");
   await page.getByRole("button", { name: "組織プロフィールを保存" }).click();
-  await choose(page, "割り当て先", "AI Employee QA Space (test)");
+  await choose(page, "割り当て先", "Agent QA Space (test)");
   await page.getByRole("button", { name: "所属・権限を追加" }).click();
   await expect(page.getByRole("button", { name: "解除", exact: true })).toBeVisible();
   await choose(page, "所属・権限の種類", "Project 権限");
@@ -140,8 +140,8 @@ test("AI社員: authenticated draft, role, scopes, bounded fixture policy, rule,
   await page.getByRole("button", { name: "条件をテスト", exact: true }).click();
   await expect(page.getByText(/条件に一致しました/)).toBeVisible();
   await page.getByRole("button", { name: "概要・有効化", exact: true }).click();
-  await page.getByRole("button", { name: "社員を有効化", exact: true }).click();
-  await expect(page.getByRole("button", { name: "社員を一時停止", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Agentを有効化", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Agentを一時停止", exact: true })).toBeEnabled();
   await capture(page, "04-employee-overview");
   await page.getByRole("button", { name: "自動化", exact: true }).click();
   await page.getByRole("button", { name: "ルールを有効化", exact: true }).click();

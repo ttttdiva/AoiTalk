@@ -8,6 +8,7 @@ import re
 from typing import Any, Iterable
 
 from .deep_research_service import DeepResearchSearchClient, DeepResearchSource
+from .search_result_ranking import ranking_enabled, rerank_results, publication_evidence, explicit_conditions, matches_conditions
 from .search_egress_policy import (
     PUBLIC_SEARCH_ENGINES,
     SearchEgressPreconditionError,
@@ -216,20 +217,20 @@ def _truncate(text: str, limit: int) -> str:
 
 def normalize_local_search_query(query: str) -> str:
     """Convert delegated search requests into compact search keywords."""
-    original = re.sub(r"\s+", " ", str(query or "")).strip()
+    original = str(query or "").strip()
     if not original:
         return ""
 
-    normalized = original.strip(" \t\r\n\"'`")
+    normalized = original
     normalized = _JA_LEADING_SEARCH_COMMAND_RE.sub("", normalized)
     normalized = _EN_LEADING_SEARCH_COMMAND_RE.sub("", normalized)
     normalized = _JA_TRAILING_SEARCH_COMMAND_RE.sub("", normalized)
-    normalized = normalized.strip(" \t\r\n\"'`。、,.")
+    normalized = normalized.strip()
 
     return normalized or original
 
 
-def format_local_search_results(query: str, sources: list[DeepResearchSource]) -> str:
+def format_local_search_results(query: str, sources: list[DeepResearchSource], *, ranking=None, warnings=None) -> str:
     if not sources:
         return (
             "汎用Web検索結果は見つかりませんでした。"
@@ -241,17 +242,34 @@ def format_local_search_results(query: str, sources: list[DeepResearchSource]) -
         lines.append(f"[{source.id}] {source.title}")
         if source.url:
             lines.append(f"URL: {source.url}")
+        publication = publication_evidence(source)
         if source.published_at:
-            lines.append(f"公開日: {source.published_at}")
+            caption = "更新日（公開日ではありません）" if publication['kind'] == 'updated' else "公開日（検索元の値）"
+            lines.append(f"{caption}: {source.published_at}")
+        elif ranking is not None and ranking.status == 'ranked':
+            lines.append("公開日: 不明")
         if source.snippet:
             lines.append(f"概要: {_truncate(source.snippet, 420)}")
-        lines.append(f"検索元: {source.engine}")
+        origins = (source.raw or {}).get('provenance', [])
+        engines = list(dict.fromkeys([source.engine] + [v['engine'] for v in origins if isinstance(v, dict) and 'engine' in v]))
+        lines.append(f"検索元: {', '.join(engines)}")
+        if ranking is not None and ranking.status == 'ranked':
+            score = ranking.scores.get(id(source))
+            if score is not None:
+                lines.append(f"関連性評価: {score:.3f}（真偽の保証ではありません）")
+            condition = matches_conditions(source, explicit_conditions(query))
+            if condition != 'matched':
+                lines.append("明示条件: " + ("期間・日時を確認できません" if condition == 'unknown' else "条件外の参考候補"))
         lines.append("")
+    notices = list(warnings or []) + (ranking.warnings if ranking is not None else [])
+    if notices:
+        lines.append("検索状態: " + ", ".join(dict.fromkeys(notices)))
     return "\n".join(lines).strip()
 
 
 async def local_web_search_async(query: str, config: Any = None) -> str:
     max_results = get_local_search_max_results(config)
+    retrieve_results = min(10, max_results * 2) if ranking_enabled(config) else max_results
     normalized_query = normalize_local_search_query(query)
     candidates = [
         candidate
@@ -286,16 +304,22 @@ async def local_web_search_async(query: str, config: Any = None) -> str:
         sources = await client.search(
             candidate,
             engines=route_engines,
-            max_results_per_engine=max_results,
+            max_results_per_engine=retrieve_results,
             include_local_knowledge=include_local_knowledge,
             project_id=_config_get(config, "search.project_id", None),
         )
         last_query = candidate
-        last_sources = sources[:max_results]
+        last_sources = sources
         if last_sources:
             break
 
-    return format_local_search_results(last_query, last_sources)
+    ranking = await rerank_results(str(query or ''), last_sources, config)
+    observations = getattr(client, '_engine_observations', {})
+    warnings = [f"{engine}:{value.get('reason', 'unavailable')}" for engine, value in observations.items()
+                if value.get('reachability') == 'unreachable'] if isinstance(observations, dict) else []
+    if not last_sources and warnings:
+        return "検索元への問い合わせに失敗しました（0件の検索結果とは異なります）: " + ", ".join(warnings)
+    return format_local_search_results(last_query, ranking.sources[:max_results], ranking=ranking, warnings=warnings)
 
 
 def _run_async(coro_factory):

@@ -1,6 +1,6 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useLayoutEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { Keyboard, Pressable, ScrollView, View } from "react-native";
-import { Button, Dialog, Divider, IconButton, Portal, Surface, Text } from "react-native-paper";
+import { Button, Dialog, Divider, IconButton, Portal, Surface, Switch, Text } from "react-native-paper";
 import {
   filterSlashCommands,
   MOBILE_CHAT_COMMANDS,
@@ -10,9 +10,16 @@ import {
   type MobileChatCommand,
   type SkillSlashCommand,
 } from "../chat-commands";
+import { useChatIntent } from "../use-chat-intent";
+import { useChatIntentPreference } from "../use-chat-intent-preference";
+import { appendChatIntent, type ChatIntentCandidate } from "../../../lib/chat-intent-api";
+import { ChatIntentDialog } from "./ChatIntentDialog";
 import { ChatTextInput } from "../chat-input-theme";
+import { useChatComposerDraft } from "../use-chat-composer-draft";
 import { conversationPerformanceDiagnostics } from "../performance-diagnostics";
 import { chatScreenStyles as styles } from "./chat-screen.styles";
+
+import { ChatVoiceControls, type ChatVoiceContext, type ChatVoiceHandle } from "./ChatVoiceControls";
 
 function compactLabel(value: string): string {
   return value.length > 18 ? `${value.slice(0, 17)}...` : value;
@@ -25,6 +32,7 @@ export type ChatComposerSubmission = {
 };
 
 export type ChatComposerProps = {
+  voiceContext?: ChatVoiceContext;
   bottomInset: number;
   keyboardVisible: boolean;
   sendEnabled: boolean;
@@ -43,9 +51,13 @@ export type ChatComposerProps = {
   onOpenContextDiagnostics?: () => void;
   onOpenPendingQueue: () => void;
   onStartDeepResearch: (query: string) => Promise<void>;
+  /** Embedded fixed-Agent surfaces keep model/effort under Agent settings. */
+  hideModelSelector?: boolean;
+  hideEffortSelector?: boolean;
 };
 
 export const ChatComposer = React.memo(function ChatComposer({
+  voiceContext,
   bottomInset,
   keyboardVisible,
   sendEnabled,
@@ -64,13 +76,44 @@ export const ChatComposer = React.memo(function ChatComposer({
   onOpenContextDiagnostics,
   onOpenPendingQueue,
   onStartDeepResearch,
+  hideModelSelector = false,
+  hideEffortSelector = false,
 }: ChatComposerProps) {
   conversationPerformanceDiagnostics.recordRender("ChatComposer");
+  const voiceRef = useRef<ChatVoiceHandle>(null);
   const submissionRef = useRef(false);
+  const intentSubmissionRef = useRef(false);
+  const intentScope = JSON.stringify([voiceContext?.userId, voiceContext?.conversationKey, voiceContext?.projectId]);
+  const intentScopeRef = useRef(intentScope);
+  useLayoutEffect(() => {
+    if (intentScopeRef.current !== intentScope) retrySubmissionRef.current = null;
+    intentScopeRef.current = intentScope;
+  }, [intentScope]);
   const submissionSequenceRef = useRef(0);
   const retrySubmissionRef = useRef<{ key: string; id: string } | null>(null);
-  const [input, setInput] = useState("");
-  const [activeCommand, setActiveCommand] = useState<MobileChatCommand | null>(null);
+  const intentDraftRevisionRef = useRef(0);
+  const {
+    input,
+    activeCommand,
+    setInput: setDraftInput,
+    setActiveCommand: setDraftActiveCommand,
+    beginSubmission,
+    acceptSubmission,
+    rejectSubmission,
+    hydrated,
+  } = useChatComposerDraft({
+    authUser: isAuthenticated ? voiceContext?.userId ?? null : null,
+    conversationKey: voiceContext?.conversationKey ?? null,
+  });
+  const setInput = useCallback<Dispatch<SetStateAction<string>>>((next) => {
+    intentDraftRevisionRef.current += 1;
+    setDraftInput(next);
+  }, [setDraftInput]);
+  const setActiveCommand = useCallback<Dispatch<SetStateAction<MobileChatCommand | null>>>((next) => {
+    intentDraftRevisionRef.current += 1;
+    setDraftActiveCommand(next);
+  }, [setDraftActiveCommand]);
+  const intentPreference = useChatIntentPreference(isAuthenticated ? voiceContext?.userId ?? null : null);
   const [composerError, setComposerError] = useState<string | null>(null);
   const [commandSheetVisible, setCommandSheetVisible] = useState(false);
   const [deepResearchVisible, setDeepResearchVisible] = useState(false);
@@ -114,15 +157,73 @@ export const ChatComposer = React.memo(function ChatComposer({
     setComposerError(null);
     setInput((value) => (/^\/[^\s\n]*$/.test(value) ? "" : value));
     setCommandSheetVisible(false);
-  }, []);
+  }, [setActiveCommand, setInput]);
   const selectSkillCommand = useCallback((command: SkillSlashCommand) => {
     setActiveCommand(null);
     setComposerError(null);
     setInput(`${command.command} `);
     setCommandSheetVisible(false);
-  }, []);
+  }, [setActiveCommand, setInput]);
+  const handleIntentSend = useCallback(async (candidate: ChatIntentCandidate): Promise<boolean> => {
+    if (!hydrated || submissionRef.current || intentSubmissionRef.current || !sendEnabled || /^\/masking(?:\s|$)/i.test(input.trim())) return false;
+    const submission = resolveMobileCommandSubmission(input, activeCommand);
+    if (submission.error) { setComposerError(submission.error); return false; }
+    if (!submission.content) return false;
+    if (directResponseActive && (Boolean(submission.capabilities?.length) || submission.content.startsWith("/"))) {
+      setComposerError("組み込みコマンドとSkillsはServerモデルで実行してください。");
+      return false;
+    }
+    intentSubmissionRef.current = true;
+    const sequence = ++submissionSequenceRef.current;
+    const content = appendChatIntent(submission.content, candidate);
+    const key = JSON.stringify([content, submission.capabilities]);
+    const id = retrySubmissionRef.current?.key === key ? retrySubmissionRef.current.id
+      : `mobile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    retrySubmissionRef.current = null;
+    voiceRef.current?.beforeTextSend();
+    const draftRevision = intentDraftRevisionRef.current;
+    const draftSnapshot = beginSubmission();
+    if (!draftSnapshot) {
+      intentSubmissionRef.current = false;
+      return false;
+    }
+    const clearAccepted = () => {
+      if (intentScopeRef.current !== intentScope || intentDraftRevisionRef.current !== draftRevision) return;
+      acceptSubmission(draftSnapshot);
+      setComposerError(null);
+    };
+    try {
+      await onSend({ content, capabilities: submission.capabilities, submissionId: id });
+      clearAccepted();
+      return true;
+    } catch (error) {
+      if (error && typeof error === "object" && "retainedInTimeline" in error && error.retainedInTimeline === true) {
+        clearAccepted();
+        return true;
+      }
+      if (
+        intentScopeRef.current === intentScope &&
+        intentDraftRevisionRef.current === draftRevision
+      ) {
+        if (sequence === submissionSequenceRef.current) retrySubmissionRef.current = { key, id };
+        voiceRef.current?.submissionFailed();
+        rejectSubmission(draftSnapshot);
+      }
+      return false;
+    } finally { intentSubmissionRef.current = false; }
+  }, [acceptSubmission, activeCommand, beginSubmission, directResponseActive, hydrated, input, intentScope, onSend, rejectSubmission, sendEnabled]);
+  const intent = useChatIntent({
+    text: input,
+    scopeKey: JSON.stringify([intentScope, activeCommand, isAuthenticated, intentPreference.scope]),
+    sessionId: voiceContext?.sessionIsLocalOnly || voiceContext?.sessionId.startsWith("local-") || voiceContext?.sessionId === "new"
+      ? null : voiceContext?.sessionId,
+    projectId: voiceContext?.projectId,
+    enabled: isAuthenticated && hydrated && sendEnabled && !/^\/masking(?:\s|$)/i.test(input.trim()),
+    onSend: handleIntentSend,
+  });
+
   const handleSend = useCallback(() => {
-    if (submissionRef.current) return;
+    if (!hydrated || submissionRef.current || intentSubmissionRef.current || !intentPreference.loaded || intentPreference.saving) return;
     const submission = resolveMobileCommandSubmission(input, activeCommand);
     if (submission.error) {
       setComposerError(submission.error);
@@ -136,8 +237,14 @@ export const ChatComposer = React.memo(function ChatComposer({
       setComposerError("組み込みコマンドとSkillsはServerモデルで実行してください。");
       return;
     }
-    setInput("");
-    setActiveCommand(null);
+    if (intentPreference.enabled && isAuthenticated && !/^\/masking(?:\s|$)/i.test(input.trim())) {
+      setComposerError(null);
+      intent.open();
+      return;
+    }
+    voiceRef.current?.beforeTextSend();
+    const draftSnapshot = beginSubmission({ clearUi: true });
+    if (!draftSnapshot) return;
     setComposerError(null);
     submissionRef.current = true;
     const key = JSON.stringify([submission.content, submission.capabilities]);
@@ -149,19 +256,18 @@ export const ChatComposer = React.memo(function ChatComposer({
       : `mobile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     retrySubmissionRef.current = null;
     const restoreRejectedDraft = (error: unknown) => {
+      voiceRef.current?.submissionFailed();
       // Once accepted, the bubble owns retry/error state; never copy it back
       // into the input and create a second submission on the next press.
-      if (error && typeof error === "object" && "retainedInTimeline" in error && error.retainedInTimeline === true) return;
+      if (error && typeof error === "object" && "retainedInTimeline" in error && error.retainedInTimeline === true) {
+        acceptSubmission(draftSnapshot);
+        return;
+      }
       if (submissionSequenceRef.current !== sequence) return;
       retrySubmissionRef.current = { key, id };
       // Delivery failures after acceptance belong to the history. This callback
       // handles only validation/acceptance rejection from the controller.
-      const command = MOBILE_CHAT_COMMANDS.find((item) =>
-        item.capability && submission.capabilities?.includes(item.capability),
-      );
-      setInput((current) => current || (command
-        ? `${command.command} ${submission.content}`
-        : submission.content));
+      rejectSubmission(draftSnapshot);
       setComposerError(
         error instanceof Error ? error.message : "送信を開始できませんでした。入力を保持しました。",
       );
@@ -171,12 +277,13 @@ export const ChatComposer = React.memo(function ChatComposer({
         content: submission.content,
         capabilities: submission.capabilities,
         submissionId: id,
-      }).catch(restoreRejectedDraft);
+      }).then(() => acceptSubmission(draftSnapshot)).catch(restoreRejectedDraft);
     } catch (error) {
       restoreRejectedDraft(error);
     }
     queueMicrotask(() => { submissionRef.current = false; });
-  }, [activeCommand, directResponseActive, input, onSend, sendEnabled]);
+  }, [acceptSubmission, activeCommand, beginSubmission, directResponseActive, hydrated, input, intent.open, intentPreference.enabled, intentPreference.loaded, intentPreference.saving, isAuthenticated, onSend, rejectSubmission, sendEnabled]);
+
   const submitDeepResearch = useCallback(() => {
     const query = deepResearchQuery.trim() || input.trim();
     if (!query) return;
@@ -279,7 +386,15 @@ export const ChatComposer = React.memo(function ChatComposer({
                 }}
                 accessibilityLabel="ツールとコマンドを開く"
               />
-              <Pressable
+              {voiceContext ? (
+                <ChatVoiceControls
+                  ref={voiceRef}
+                  context={voiceContext}
+                  isAuthenticated={isAuthenticated}
+                  onSend={onSend}
+                />
+              ) : null}
+              {!hideModelSelector ? <Pressable
                 style={styles.composerSelector}
                 onPress={() => {
                   conversationPerformanceDiagnostics.measureInteraction(
@@ -297,8 +412,8 @@ export const ChatComposer = React.memo(function ChatComposer({
                   {compactLabel(currentResponseModelLabel)}
                 </Text>
                 <Text style={styles.composerSelectorChevron}>⌄</Text>
-              </Pressable>
-              {effortEnabled ? (
+              </Pressable> : null}
+              {effortEnabled && !hideEffortSelector ? (
               <Pressable
                 style={styles.composerSelector}
                 onPress={() => {
@@ -327,8 +442,8 @@ export const ChatComposer = React.memo(function ChatComposer({
               ) : null}
                 <IconButton
                   icon="arrow-up"
-                  iconColor={input.trim() && sendEnabled ? "#11111b" : "#6c7086"}
-                  containerColor={input.trim() && sendEnabled ? "#89b4fa" : "#313244"}
+                  iconColor={input.trim() && sendEnabled && hydrated ? "#11111b" : "#6c7086"}
+                  containerColor={input.trim() && sendEnabled && hydrated ? "#89b4fa" : "#313244"}
                   size={22}
                   style={styles.sendButton}
                   onPress={() =>
@@ -337,7 +452,7 @@ export const ChatComposer = React.memo(function ChatComposer({
                       handleSend,
                     )
                   }
-                  disabled={!input.trim() || !sendEnabled}
+                  disabled={!input.trim() || !hydrated || !sendEnabled || !intentPreference.loaded || intentPreference.saving || intent.sending}
                   accessibilityLabel="送信"
                 />
             </View>
@@ -345,6 +460,7 @@ export const ChatComposer = React.memo(function ChatComposer({
       </View>
 
       <Portal>
+        <ChatIntentDialog intent={intent} />
         {deepResearchVisible ? (
           <Dialog
             visible
@@ -386,6 +502,20 @@ export const ChatComposer = React.memo(function ChatComposer({
             <Dialog.ScrollArea style={styles.dialogScrollArea}>
               <ScrollView contentContainerStyle={styles.dialogScrollContent}>
                 <Text style={styles.commandSectionTitle}>ツール</Text>
+                <View style={styles.commandRow}>
+                  <View style={styles.commandText}>
+                    <Text style={styles.commandTitle}>意図確認</Text>
+                    <Text style={styles.commandDescription}>送信前に言葉の意図を確認</Text>
+                  </View>
+                  <Text style={styles.commandDescription}>{intentPreference.enabled ? "ON" : "OFF"}</Text>
+                  <Switch
+                    accessibilityLabel="意図確認"
+                    value={intentPreference.enabled}
+                    disabled={!intentPreference.loaded || intentPreference.saving || intent.sending}
+                    onValueChange={(value) => { intent.close(); void intentPreference.update(value); }}
+                  />
+                </View>
+                {intentPreference.error && <Text accessibilityRole="alert" style={styles.composerError}>{intentPreference.error}</Text>}
                 {onOpenContextDiagnostics ? (
                   <Button
                     icon="chart-box-outline"
@@ -481,3 +611,4 @@ export const ChatComposer = React.memo(function ChatComposer({
     </>
   );
 });
+

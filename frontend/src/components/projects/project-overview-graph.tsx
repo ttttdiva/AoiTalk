@@ -136,8 +136,10 @@ export function buildProjectOverviewFlow(
 export function ProjectOverviewGraph({
   graph,
   onSelectMemoryIds,
+  compact = false,
 }: {
   graph: ProjectOverviewLayout["graph"];
+  compact?: boolean;
   onSelectMemoryIds: (memoryIds: string[]) => void;
 }) {
   const { resolvedTheme } = useTheme();
@@ -154,7 +156,7 @@ export function ProjectOverviewGraph({
       className="overflow-hidden rounded-lg border border-border bg-surface-container-lowest"
       data-testid="project-overview-graph"
     >
-      <div className="h-[360px] min-h-[280px] w-full">
+      <div className={compact ? "h-56 min-h-0 w-full" : "h-[360px] min-h-[280px] w-full"}>
         <ReactFlow<OverviewFlowNode, OverviewFlowEdge>
           nodes={flow.nodes}
           edges={flow.edges}

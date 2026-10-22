@@ -283,13 +283,19 @@ def _apply_session_main_route_override(route: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _catalogize_main_route_effort(route: dict[str, Any]) -> dict[str, Any]:
+def _catalogize_main_route_effort(route: dict[str, Any], config: Any) -> dict[str, Any]:
     """Keep only a raw effort accepted by the resolved Main model catalog."""
 
     result = dict(route)
     provider = str(result.get("provider") or "").strip().lower()
     model = str(result.get("model") or "").strip()
     effort = str(result.get("effort") or result.get("reasoning_effort") or "").strip()
+    if provider == "openai_compatible_local" and model:
+        from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
+        from ..llm.provider_mode_adapters import resolve_strata_response_mode
+
+        if managed_local_runtime_for_model(config, model) == "strata":
+            effort = resolve_strata_response_mode(config, effort)
     # A session Main override can replace a configured provider/model without
     # carrying the old provider's effort.  DeepSeek's request boundary uses
     # high when its setting is empty, so expose that same effective value for
@@ -313,7 +319,7 @@ def _catalogize_main_route_effort(route: dict[str, Any]) -> dict[str, Any]:
 
     options = {
         str(item).strip()
-        for item in reasoning_effort_options_for_model(provider, model)
+        for item in reasoning_effort_options_for_model(provider, model, config=config)
         if str(item).strip()
     }
     if (options and effort not in options) or (not options and provider != "openai"):
@@ -338,10 +344,11 @@ def resolve_execution_main_route(config: Any) -> dict[str, Any]:
             {
                 "provider": deployment.effective_provider,
                 "model": deployment.effective_model,
-            }
+            },
+            config,
         )
     main = _main_route(config)
-    return _catalogize_main_route_effort(_apply_session_main_route_override(main))
+    return _catalogize_main_route_effort(_apply_session_main_route_override(main), config)
 
 
 def resolve_execution_profile_route(
@@ -527,7 +534,7 @@ def validate_execution_route(
     }
     options = [
         str(item).strip()
-        for item in reasoning_effort_options_for_model(provider, model)
+        for item in reasoning_effort_options_for_model(provider, model, config=config)
         if str(item).strip()
     ]
     if model_ids and model not in model_ids and raw_policy != "default" and not options:
@@ -741,11 +748,15 @@ def validate_execution_profile(
                 for item in models
                 if str(item.get("id") or "").strip()
             }
-            options = reasoning_effort_options_for_model(provider, model)
+            options = reasoning_effort_options_for_model(provider, model, config=config)
             if model_ids and model not in model_ids and not model_default and not options:
                 warnings.append(f"Unknown model for {provider} in {label}: {model}")
         else:
-            options = reasoning_effort_options_for_model(provider, model) if provider and model else []
+            options = (
+                reasoning_effort_options_for_model(provider, model, config=config)
+                if provider and model
+                else []
+            )
         if provider and model and effort and not model_default:
             if not options:
                 warnings.append(

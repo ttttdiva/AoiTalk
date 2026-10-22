@@ -360,8 +360,14 @@ class HelperMixin:
             return
         raise TaskManagementError("Project permission denied", status_code=403)
 
-    async def _load_task(self, session: AsyncSession, task_id: UUID) -> Task:
-        result = await session.execute(
+    async def _load_task(
+        self,
+        session: AsyncSession,
+        task_id: UUID,
+        *,
+        populate_existing: bool = False,
+    ) -> Task:
+        statement = (
             select(Task)
             .options(
                 selectinload(Task.project).selectinload(Project.space),
@@ -376,6 +382,12 @@ class HelperMixin:
             )
             .where(Task.id == task_id, Task.deleted_at.is_(None))
         )
+        if populate_existing:
+            # Relationship-only updates replace rows through bulk DELETEs and
+            # pending INSERTs.  The update response explicitly opts into a
+            # database refresh after its transaction has flushed.
+            statement = statement.execution_options(populate_existing=True)
+        result = await session.execute(statement)
         task = result.scalar_one_or_none()
         if task is None:
             raise TaskManagementError("Task not found", status_code=404)

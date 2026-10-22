@@ -10,7 +10,7 @@ type ProjectKnowledgeCaptureCandidateActionContext = {
   params: Promise<{ id: string; candidate_id: string; action: string }>;
 };
 
-const READ_ACTIONS = new Set(["dismiss"]);
+const READ_ACTIONS = new Set(["dismiss", "review"]);
 const MANAGE_ACTIONS = new Set(["publish", "adopt-publication-guard"]);
 
 function unauthorized() {
@@ -56,6 +56,7 @@ export async function POST(
 
   return proxyRequestToPythonApi(request, {
     path: [
+      ...(action === "review" ? ["projects", id] : []),
       "knowledge-capture",
       "candidates",
       candidateId,

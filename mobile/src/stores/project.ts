@@ -31,6 +31,13 @@ import type { Project, Space } from "../types/api";
 export interface RefreshProjectsOptions {
   force?: boolean;
   localOnly?: boolean;
+  /**
+   * Re-read Projects from SQLite, then fetch only the Space catalog when it is
+   * empty or a Project references a missing Space. Root sync uses this after
+   * the delta pull so it does not add
+   * a redundant canonical /api/projects request.
+   */
+  spacesOnly?: boolean;
 }
 
 interface ProjectStoreState {
@@ -45,8 +52,10 @@ interface ProjectStoreState {
   reset: () => void;
 }
 
-// projects / spaces のフル取得も 60秒 throttle する（デルタ同期が鮮度を担保）。
+// Project の canonical full fetch は 60秒 throttle する。
+// Space は delta sync 対象外なので別時刻で管理し、失敗時は成功扱いにしない。
 let lastProjectFullFetchAt: number | undefined;
+let lastSpaceFullFetchAt: number | undefined;
 
 // refresh の await 後に古い認証スコープの投影を復元しないための世代。
 // 新しい refresh の開始も古い refresh を無効化するので、reset を伴わない
@@ -204,7 +213,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   loaded: false,
 
   refreshProjects: async (options?: RefreshProjectsOptions) => {
-    const generation = ++projectRefreshGeneration;
+    // A local projection (including the post-sync Space-only pass) must not
+    // cancel an already-running remote refresh. Only a newer full remote
+    // refresh or reset/auth transition supersedes the previous generation.
+    const generation =
+      options?.localOnly || options?.spacesOnly
+        ? projectRefreshGeneration
+        : ++projectRefreshGeneration;
     const isCurrentGeneration = () =>
       generation === projectRefreshGeneration;
 
@@ -282,28 +297,58 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       // gate; a recent transport failure remains a short-lived retry throttle.
       const canServer = hasToken && canAttemptAoiTalkServer();
 
-      // フル取得は空初回・明示refresh・60秒throttleのみ。
-      if (
-        canServer &&
+      const now = Date.now();
+      const force = options?.force ?? false;
+      const projectFetchDue =
+        !options?.spacesOnly &&
         shouldRunFullFetch(
           lastProjectFullFetchAt,
-          Date.now(),
+          now,
           list.length === 0,
-          options?.force ?? false,
-        )
-      ) {
+          force,
+        );
+      const localSpaceIds = new Set(spaces.map((space) => space.id));
+      const hasMissingReferencedSpace = list.some(
+        (project) =>
+          Boolean(project.space_id) && !localSpaceIds.has(project.space_id!),
+      );
+      // Root's spacesOnly pass is intentionally demand-driven: fill an empty
+      // cache or a Project-referenced hole, but do not turn the 60s root sync
+      // into an unconditional Space catalog poll. Normal/manual refreshes keep
+      // the existing 60s freshness behavior.
+      const spaceFetchDue =
+        spaces.length === 0 ||
+        hasMissingReferencedSpace ||
+        (!options?.spacesOnly &&
+          shouldRunFullFetch(lastSpaceFullFetchAt, now, false, force));
+
+      if (canServer && (projectFetchDue || spaceFetchDue)) {
         const [freshSpaces, freshProjects] = await Promise.all([
-          refreshRemoteSpaces(isCurrentGeneration).catch(() => null),
-          projectsRepo.refresh().catch(() => null),
+          spaceFetchDue
+            ? refreshRemoteSpaces(isCurrentGeneration).catch(() => null)
+            : Promise.resolve(null),
+          projectFetchDue
+            ? projectsRepo.refresh().catch(() => null)
+            : Promise.resolve(null),
         ]);
         if (!isCurrentGeneration()) return;
-        if (freshProjects) list = freshProjects.filter((project) =>
-          isParticipatingProject(project, authScope),
-        );
-        if (freshSpaces) spaces = freshSpaces;
+        if (freshProjects) {
+          list = freshProjects.filter((project) =>
+            isParticipatingProject(project, authScope),
+          );
+          // Failed / cancelled canonical reads must remain immediately
+          // retryable instead of poisoning the throttle window.
+          lastProjectFullFetchAt = Date.now();
+        }
+        if (freshSpaces) {
+          spaces = freshSpaces;
+          lastSpaceFullFetchAt = Date.now();
+        }
         if (!isCurrentGeneration()) return;
-        lastProjectFullFetchAt = Date.now();
-        set({ spaces: participatingScopeSpaces(spaces, list, authScope), projects: list });
+        set({
+          spaces: participatingScopeSpaces(spaces, list, authScope),
+          projects: list,
+        });
       }
 
       await restoreSelection();
@@ -330,6 +375,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
     // 認証遷移では次回のフル取得を強制する。
     projectRefreshGeneration += 1;
     lastProjectFullFetchAt = undefined;
+    lastSpaceFullFetchAt = undefined;
     set({
       spaces: [],
       projects: [],

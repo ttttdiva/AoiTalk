@@ -3,6 +3,20 @@
  * All endpoints proxy through /api/python-proxy/ → Python FastAPI
  */
 
+import type { ConfirmOptions } from "@/hooks/use-confirm";
+
+import { readFileTransferCompatibilityPreference } from "@/lib/file-transfer-preference";
+import {
+  downloadFileTransfer,
+  FileTransferNativeRequiredError,
+  saveFileTransfer,
+  triggerFileTransferDownload,
+  uploadFileTransfer,
+  type FileTransferSaveMeta,
+} from "@/lib/file-transfer-client";
+import { MAX_COMPAT_UPLOAD_FILE_BYTES } from "@/lib/file-transfer-protocol";
+import { withBasePath, withoutBasePath } from "@/lib/base-path";
+
 import {
   getRemoteWorkspaceContent,
   getRemoteWorkspaceInfo,
@@ -11,9 +25,6 @@ import {
   remoteWorkspaceDownloadUrl,
   searchRemoteWorkspace,
 } from "@/lib/remote-servers";
-import { hfServeUrl, isHfPath, parseHfPath } from "@/lib/hf/virtual-path";
-import { isHydrusPath } from "@/lib/hydrus/virtual-path";
-import { getFileServeUrl } from "@/lib/explorer-serve-url";
 
 // ─── Types ───
 
@@ -137,6 +148,10 @@ export interface FileInfo {
   name: string;
   path: string;
   is_directory: boolean;
+  /** Optional file metadata returned for regular files by get_file_info(). */
+  type?: string;
+  extension?: string;
+  icon?: string;
   size_bytes: number;
   size_display: string;
   created_at: string;
@@ -160,7 +175,10 @@ function extractApiErrorMessage(status: number, text: string): string {
   if (!text) return `HTTP ${status}`;
   try {
     const json = JSON.parse(text) as { detail?: unknown; error?: unknown };
-    const message = json.detail ?? json.error;
+    const detail = json.detail ?? json.error;
+    const message = detail && typeof detail === "object" && "message" in detail
+      ? (detail as { message?: unknown }).message
+      : detail;
     if (typeof message === "string" && message.trim()) {
       return safeApiErrorFallback(status, message);
     }
@@ -168,6 +186,31 @@ function extractApiErrorMessage(status: number, text: string): string {
     // Use a bounded plain-text fallback below.
   }
   return safeApiErrorFallback(status, text);
+}
+
+function extractApiErrorCode(text: string): string | undefined {
+  try {
+    const json = JSON.parse(text) as { detail?: unknown };
+    if (!json.detail || typeof json.detail !== "object" || !("code" in json.detail)) {
+      return undefined;
+    }
+    const code = (json.detail as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Structured failure metadata for callers that need to distinguish API conflicts. */
+export class ExplorerApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly code: string | undefined,
+  ) {
+    super(message);
+    this.name = "ExplorerApiError";
+  }
 }
 
 export function explorerErrorMessage(error: unknown): string {
@@ -190,7 +233,11 @@ async function pyFetch<T = unknown>(
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(extractApiErrorMessage(res.status, text));
+    throw new ExplorerApiError(
+      res.status,
+      extractApiErrorMessage(res.status, text),
+      extractApiErrorCode(text),
+    );
   }
   return res.json();
 }
@@ -331,6 +378,7 @@ export interface ExplorerUploadBatchResult {
   totalCount: number;
   successCount: number;
   failureCount: number;
+  skippedCount?: number;
   results: unknown[];
   failures: ExplorerUploadFailure[];
 }
@@ -359,17 +407,7 @@ function normalizeUploadFile(item: ExplorerUploadSource): ExplorerUploadFile {
 
 async function uploadErrorMessage(res: Response): Promise<string> {
   const text = await res.text().catch(() => "");
-  if (!text) return `HTTP ${res.status}`;
-  try {
-    const json = JSON.parse(text) as { detail?: unknown; error?: unknown };
-    const message = json.detail ?? json.error;
-    if (typeof message === "string" && message.trim()) {
-      return safeApiErrorFallback(res.status, message);
-    }
-  } catch {
-    // Use a bounded plain-text fallback below.
-  }
-  return safeApiErrorFallback(res.status, text);
+  return extractApiErrorMessage(res.status, text);
 }
 
 function splitUploadRelativePath(
@@ -387,29 +425,43 @@ function splitUploadRelativePath(
   };
 }
 
+export interface ExplorerUploadOptions {
+  confirmOverwrite?: (options: ConfirmOptions) => Promise<boolean>;
+  /** Only for an intentional editor save, never for new files or imports. */
+  overwrite?: boolean;
+}
+
 export async function explorerUpload(
   path: string,
   files: FileList | ExplorerUploadSource[],
+  options: ExplorerUploadOptions = {},
 ) {
   const items = Array.from(files).map(normalizeUploadFile);
   const projectPath = parseProjectWorkspacePath(path);
-  const results = [];
-  const failures: ExplorerUploadFailure[] = [];
+  const compatibilityEnabled = readFileTransferCompatibilityPreference();
+  const itemResults: Array<unknown | undefined> = new Array(items.length);
+  const itemFailures: Array<ExplorerUploadFailure | undefined> = new Array(items.length);
+  const skippedItems = new Set<number>();
+  const conflicts: Array<{
+    index: number;
+    item: ExplorerUploadFile;
+    send: (overwrite: boolean) => Promise<Response>;
+  }> = [];
 
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     try {
       const uploadRelativePath = splitUploadRelativePath(
         item.relativePath,
         item.file.name,
       );
-      const formData = new FormData();
-      formData.append(
+      const nativeFormData = new FormData();
+      nativeFormData.append(
         "file",
         item.file,
         projectPath ? uploadRelativePath.filename : item.file.name,
       );
       if (!projectPath && item.relativePath) {
-        formData.append("relative_path", item.relativePath);
+        nativeFormData.append("relative_path", item.relativePath);
       }
 
       const uploadPath = projectPath
@@ -420,35 +472,130 @@ export async function explorerUpload(
       const url = projectPath
         ? `/api/python-proxy/projects/${encodeURIComponent(projectPath.projectId)}/files/upload?path=${encodeURIComponent(uploadPath)}`
         : `/api/python-proxy/explorer/upload?path=${encodeURIComponent(path)}`;
-      const res = await fetch(url, {
-        method: "POST",
-        credentials: "include",
-        body: formData,
-      });
+      const send = async (overwrite: boolean) => {
+        const requestUrl = overwrite ? `${url}&overwrite=true` : url;
+        if (
+          compatibilityEnabled &&
+          item.file.size <= MAX_COMPAT_UPLOAD_FILE_BYTES
+        ) {
+          return uploadFileTransfer(
+            {
+              operation: "upload",
+              url: requestUrl,
+              fileName: projectPath
+                ? uploadRelativePath.filename
+                : item.file.name,
+              fileType: item.file.type,
+              ...(projectPath || !item.relativePath
+                ? {}
+                : { relativePath: item.relativePath }),
+            },
+            item.file,
+          );
+        }
+
+        return fetch(requestUrl, {
+          method: "POST",
+          credentials: "include",
+          body: nativeFormData,
+        });
+      };
+      const res = await send(options.overwrite === true);
+      if (res.status === 409 && options.overwrite !== true) {
+        const conflict = await res.clone().json().catch(() => null);
+        if (conflict?.detail?.code === "already_exists") {
+          if (options.confirmOverwrite) {
+            conflicts.push({ index, item, send });
+            continue;
+          }
+        }
+      }
       if (!res.ok) {
-        failures.push({
+        itemFailures[index] = {
           name: item.file.name,
           relativePath: item.relativePath,
           status: res.status,
           message: await uploadErrorMessage(res),
-        });
+        };
         continue;
       }
-      results.push(await res.json());
+      itemResults[index] = await res.json();
     } catch (error) {
-      failures.push({
+      itemFailures[index] = {
         name: item.file.name,
         relativePath: item.relativePath,
         message:
           error instanceof Error ? error.message : "Upload request failed",
-      });
+      };
     }
   }
 
+  if (conflicts.length > 0 && options.confirmOverwrite) {
+    let approved = false;
+    let confirmationFailed = false;
+    try {
+      const fileList = conflicts
+        .map(({ item }) => `• ${item.relativePath || item.file.name}`)
+        .join("\n");
+      approved = await options.confirmOverwrite({
+        title: "同名ファイルを一括確認",
+        description: `${conflicts.length}件の同名ファイルが見つかりました。すべて上書きするか、すべてスキップするか選択してください。\n\n${fileList}`,
+        confirmLabel: `すべて上書き (${conflicts.length}件)`,
+        cancelLabel: "すべてスキップ",
+        destructive: true,
+      });
+    } catch (error) {
+      confirmationFailed = true;
+      const message =
+        error instanceof Error ? error.message : "Upload request failed";
+      for (const { index, item } of conflicts) {
+        itemFailures[index] = {
+          name: item.file.name,
+          relativePath: item.relativePath,
+          message,
+        };
+      }
+    }
+
+    if (!confirmationFailed) {
+      if (!approved) {
+        for (const { index } of conflicts) skippedItems.add(index);
+      } else {
+        for (const { index, item, send } of conflicts) {
+          try {
+            const res = await send(true);
+            if (!res.ok) {
+              itemFailures[index] = {
+                name: item.file.name,
+                relativePath: item.relativePath,
+                status: res.status,
+                message: await uploadErrorMessage(res),
+              };
+              continue;
+            }
+            itemResults[index] = await res.json();
+          } catch (error) {
+            itemFailures[index] = {
+              name: item.file.name,
+              relativePath: item.relativePath,
+              message:
+                error instanceof Error ? error.message : "Upload request failed",
+            };
+          }
+        }
+      }
+    }
+  }
+
+  const results = itemResults.filter((result) => result !== undefined);
+  const failures = itemFailures.filter(
+    (failure): failure is ExplorerUploadFailure => failure !== undefined,
+  );
   const batchResult: ExplorerUploadBatchResult = {
     totalCount: items.length,
     successCount: results.length,
     failureCount: failures.length,
+    skippedCount: skippedItems.size,
     results,
     failures,
   };
@@ -480,11 +627,7 @@ export function parseRemoteWorkspacePath(path: string): RemoteWorkspacePath | nu
 }
 
 function isUnsupportedDownloadPath(path: string): boolean {
-  return (
-    path.startsWith("aoitalk-record-table:") ||
-    isHfPath(path) ||
-    isHydrusPath(path)
-  );
+  return path.startsWith("aoitalk-record-table:");
 }
 
 function assertDownloadPaths(paths: string[]): void {
@@ -532,19 +675,63 @@ function fallbackDownloadFilename(value: string, fallback = "download"): string 
 async function preflightDownload(
   url: string,
   init: RequestInit,
+  options: Pick<
+    ExplorerDownloadResourceOptions,
+    "expectedContentType" | "requireAttachment" | "rejectRedirects"
+  > = {},
 ): Promise<string | null> {
   const res = await fetch(url, {
     credentials: "include",
     cache: "no-store",
     ...init,
+    ...(options.rejectRedirects ? { redirect: "manual" as const } : {}),
     headers: {
       "x-aoitalk-download-preflight": "1",
       ...(init.headers || {}),
     },
   });
+  if (
+    options.rejectRedirects &&
+    (res.redirected || res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400))
+  ) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // The authentication redirect is already sufficient to reject the response.
+    }
+    throw new Error("ダウンロード先が転送されました。ログイン状態を確認して再試行してください");
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(extractApiErrorMessage(res.status, text));
+  }
+
+  const disposition = res.headers.get("Content-Disposition");
+  if (options.expectedContentType) {
+    const contentType = res.headers
+      .get("Content-Type")
+      ?.split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (contentType !== options.expectedContentType.toLowerCase()) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        // Keep the response validation error as the user-visible result.
+      }
+      throw new Error("ZIPを取得できませんでした。ログイン状態を確認して再試行してください");
+    }
+  }
+  if (
+    options.requireAttachment &&
+    !/^\s*attachment(?:\s*;|\s*$)/i.test(disposition || "")
+  ) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // Keep the response validation error as the user-visible result.
+    }
+    throw new Error("ダウンロード応答を確認できませんでした。ログイン状態を確認して再試行してください");
   }
 
   // The preflight only validates authorization and captures response headers.
@@ -556,7 +743,7 @@ async function preflightDownload(
     // A response may have no cancellable body (or already be closed).  The
     // native download should still proceed after a successful preflight.
   }
-  return res.headers.get("Content-Disposition");
+  return disposition;
 }
 
 function createNativeDownloadFrame(): HTMLIFrameElement {
@@ -639,7 +826,8 @@ function triggerNativeFormDownload(paths: string[], action: string): void {
 
   const form = document.createElement("form");
   form.method = "POST";
-  form.action = action;
+  // submit() bypasses the submit event used by the base-path bootstrap.
+  form.action = withBasePath(action);
   form.target = target;
   form.enctype = "application/x-www-form-urlencoded";
   form.hidden = true;
@@ -665,6 +853,101 @@ function triggerNativeFormDownload(paths: string[], action: string): void {
   }
 }
 
+function isCompatibilityDownloadUrl(value: string): boolean {
+  try {
+    let pathname: string;
+    if (value.startsWith("/") && !value.startsWith("//")) {
+      const hashIndex = value.indexOf("#");
+      const withoutHash = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
+      const queryIndex = withoutHash.indexOf("?");
+      pathname = queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+    } else {
+      const parsed = new URL(value, window.location.origin);
+      if (parsed.origin !== window.location.origin) return false;
+      pathname = parsed.pathname;
+    }
+    pathname = withoutBasePath(pathname);
+    return (
+      pathname === "/api/python-proxy/explorer/download" ||
+      /^\/api\/python-proxy\/remote-servers\/[^/]+\/workspace\/download$/u.test(
+        pathname,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function canonicalCompatibilityDownloadUrl(value: string): string {
+  if (value.startsWith("/") && !value.startsWith("//")) {
+    const hashIndex = value.indexOf("#");
+    const withoutHash = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
+    const queryIndex = withoutHash.indexOf("?");
+    const pathname = queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+    const search = queryIndex >= 0 ? withoutHash.slice(queryIndex) : "";
+    return `${withoutBasePath(pathname)}${search}`;
+  }
+  const parsed = new URL(value, window.location.origin);
+  return `${withoutBasePath(parsed.pathname)}${parsed.search}`;
+}
+
+const activeCompatibilityDownloads = new Set<AbortController>();
+let compatibilityDownloadPagehideRegistered = false;
+
+function cleanupCompatibilityDownloadsOnPageHide(): void {
+  for (const controller of activeCompatibilityDownloads) controller.abort();
+  activeCompatibilityDownloads.clear();
+  compatibilityDownloadPagehideRegistered = false;
+  window.removeEventListener("pagehide", cleanupCompatibilityDownloadsOnPageHide);
+}
+
+function retainCompatibilityDownload(controller: AbortController): void {
+  activeCompatibilityDownloads.add(controller);
+  if (compatibilityDownloadPagehideRegistered) return;
+  compatibilityDownloadPagehideRegistered = true;
+  window.addEventListener("pagehide", cleanupCompatibilityDownloadsOnPageHide);
+}
+
+function releaseCompatibilityDownload(controller: AbortController): void {
+  activeCompatibilityDownloads.delete(controller);
+  if (compatibilityDownloadPagehideRegistered && activeCompatibilityDownloads.size === 0) {
+    compatibilityDownloadPagehideRegistered = false;
+    window.removeEventListener("pagehide", cleanupCompatibilityDownloadsOnPageHide);
+  }
+}
+
+async function compatibilityDownload(
+  url: string,
+  paths?: string[],
+  fallbackFilename?: string,
+): Promise<boolean> {
+  const controller = new AbortController();
+  retainCompatibilityDownload(controller);
+  try {
+    try {
+      const result = await downloadFileTransfer(
+        {
+          operation: "download",
+          url: canonicalCompatibilityDownloadUrl(url),
+          ...(paths ? { paths } : {}),
+          ...(fallbackFilename ? { fallbackFilename } : {}),
+        },
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted) {
+        throw new DOMException("The download was aborted", "AbortError");
+      }
+      triggerFileTransferDownload(result);
+      return true;
+    } catch (error) {
+      if (error instanceof FileTransferNativeRequiredError) return false;
+      throw error;
+    }
+  } finally {
+    releaseCompatibilityDownload(controller);
+  }
+}
+
 /**
  * Validate a download URL without buffering its response, then let the
  * browser's native download machinery stream the resource into a hidden
@@ -673,34 +956,52 @@ function triggerNativeFormDownload(paths: string[], action: string): void {
 export async function explorerDownloadResource(
   url: string,
   fallbackFilename?: string,
+  options: ExplorerDownloadResourceOptions = {},
 ): Promise<void> {
   const fallback =
     fallbackFilename?.trim() || fallbackDownloadFilename(url, "download");
-  const disposition = await preflightDownload(url, { method: "GET" });
+  const requiresPreflightContract = Boolean(
+    options.expectedContentType || options.requireAttachment || options.rejectRedirects || options.signal,
+  );
+  if (
+    !requiresPreflightContract &&
+    readFileTransferCompatibilityPreference() &&
+    isCompatibilityDownloadUrl(url)
+  ) {
+    if (await compatibilityDownload(url, undefined, fallback)) return;
+  }
+  if (options.signal?.aborted) {
+    throw new DOMException("The download was aborted", "AbortError");
+  }
+  const disposition = await preflightDownload(
+    url,
+    { method: "GET", signal: options.signal },
+    options,
+  );
+  if (options.signal?.aborted) {
+    throw new DOMException("The download was aborted", "AbortError");
+  }
   const filename = downloadFilenameFromDisposition(disposition, fallback);
   // Virtual resources do not all guarantee Content-Disposition; preserve the
   // caller-provided fallback only when the preflight did not supply one.
   triggerNativeAnchorDownload(url, filename, !disposition?.trim());
 }
 
+export interface ExplorerDownloadResourceOptions {
+  /** Require the final response's media type after ignoring parameters. */
+  expectedContentType?: string;
+  /** Require Content-Disposition to begin with the attachment token. */
+  requireAttachment?: boolean;
+  /** Reject fetch-followed redirects without exposing their destination URL. */
+  rejectRedirects?: boolean;
+  /** Cancel the preflight before it starts or before native navigation begins. */
+  signal?: AbortSignal;
+}
+
 export async function explorerDownloadPaths(paths: string[]): Promise<void> {
   if (paths.length === 0) return;
   assertDownloadPaths(paths);
-
-  if (paths.length === 1 && isHfPath(paths[0])) {
-    const url = hfServeUrl(paths[0]);
-    if (!url) throw new Error("HFファイルのパスが不正です");
-    const subPath = parseHfPath(paths[0])?.subPath ?? paths[0];
-    await explorerDownloadResource(url, fallbackDownloadFilename(subPath));
-    return;
-  }
-
-  if (paths.length === 1 && isHydrusPath(paths[0])) {
-    const url = getFileServeUrl(paths[0]);
-    if (!url) throw new Error("Hydrusファイルのパスが不正です");
-    await explorerDownloadResource(url, fallbackDownloadFilename(paths[0]));
-    return;
-  }
+  const compatibilityEnabled = readFileTransferCompatibilityPreference();
 
   if (paths.some((path) => isUnsupportedDownloadPath(path))) {
     throw new Error("この種類の仮想ファイルは専用のダウンロード経路を使用してください");
@@ -720,6 +1021,9 @@ export async function explorerDownloadPaths(paths: string[]): Promise<void> {
     const url = explorerDownloadUrl(path);
     const fallback = fallbackDownloadFilename(path);
     const remote = remotePaths[0];
+    if (compatibilityEnabled) {
+      if (await compatibilityDownload(url, undefined, fallback)) return;
+    }
     // Remote downloads expose a HEAD route so authorization and the
     // Content-Disposition header can be checked without transferring the
     // file body through the browser. Local explorer GET intentionally remains
@@ -746,6 +1050,9 @@ export async function explorerDownloadPaths(paths: string[]): Promise<void> {
     }
     const relativePaths = remotePaths.map((path) => path.relativePath);
     const action = remoteWorkspaceDownloadBatchUrl(profileId, projectId);
+    if (compatibilityEnabled) {
+      if (await compatibilityDownload(action, relativePaths)) return;
+    }
     await preflightDownload(action, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -753,6 +1060,12 @@ export async function explorerDownloadPaths(paths: string[]): Promise<void> {
     });
     triggerNativeFormDownload(relativePaths, action);
     return;
+  }
+
+  if (compatibilityEnabled) {
+    if (await compatibilityDownload("/api/python-proxy/explorer/download", paths)) {
+      return;
+    }
   }
 
   await preflightDownload("/api/python-proxy/explorer/download", {
@@ -787,7 +1100,27 @@ export async function explorerRename(path: string, newName: string) {
     : result;
 }
 
-export async function explorerMove(src: string, dest: string) {
+export interface ExplorerMoveOptions {
+  overwrite?: boolean;
+}
+
+export interface ExplorerMoveResult {
+  success: boolean;
+  new_path: string;
+  /** True when the move replaced a pre-existing destination entry. */
+  overwrote_existing?: boolean;
+  /** False when the previous destination content cannot be recovered by Undo. */
+  undoable?: boolean;
+  /** Human-readable limitation for an irreversible overwrite move. */
+  undo_limitation?: string | null;
+}
+
+export async function explorerMove(
+  src: string,
+  dest: string,
+  options: ExplorerMoveOptions = {},
+) {
+  const overwrite = options.overwrite === true ? { overwrite: true } : {};
   const srcProject = resolveProjectMutationPath(src, "移動");
   const destProject = resolveProjectMutationPath(dest, "移動", true);
   const sameProject =
@@ -795,11 +1128,12 @@ export async function explorerMove(src: string, dest: string) {
     destProject &&
     srcProject.projectId.toLowerCase() === destProject.projectId.toLowerCase();
   if (sameProject) {
-    const result = await pyFetchJson<{ success: boolean; new_path: string }>(
+    const result = await pyFetchJson<ExplorerMoveResult>(
       `/projects/${encodeURIComponent(srcProject.projectId)}/files/move`,
       {
         src: srcProject.relativePath,
         dest: destProject.relativePath,
+        ...overwrite,
       },
     );
     return {
@@ -809,9 +1143,10 @@ export async function explorerMove(src: string, dest: string) {
         : result.new_path,
     };
   }
-  return pyFetchJson<{ success: boolean; new_path: string }>("/explorer/move", {
+  return pyFetchJson<ExplorerMoveResult>("/explorer/move", {
     src,
     dest,
+    ...overwrite,
   });
 }
 
@@ -1010,11 +1345,37 @@ export async function explorerSave(
     await explorerUpload(
       `_projects/project_${projectPath.projectId}${directory ? `/${directory}` : ""}`,
       [file],
+      { overwrite: true },
     );
     return {
       success: true,
       message: "ファイルを保存しました",
       size_bytes: file.size,
+    };
+  }
+
+  const compatibilityEnabled = readFileTransferCompatibilityPreference();
+  const encodedContent = compatibilityEnabled
+    ? new TextEncoder().encode(content)
+    : undefined;
+  if (
+    compatibilityEnabled &&
+    encodedContent &&
+    encodedContent.byteLength <= MAX_COMPAT_UPLOAD_FILE_BYTES
+  ) {
+    const meta: FileTransferSaveMeta = {
+      operation: "save",
+      url: "/api/python-proxy/explorer/save",
+      path,
+      ...(encoding !== undefined ? { encoding } : {}),
+    };
+    const response = await saveFileTransfer(meta, content);
+    if (!response.ok) throw new Error(await uploadErrorMessage(response));
+    return (await response.json()) as {
+      success: boolean;
+      message: string;
+      size_bytes?: number;
+      modified_at?: string;
     };
   }
 
@@ -1057,6 +1418,10 @@ export interface SearchResult {
   item_count?: number | null;
   modified_at?: string;
   icon?: string;
+  /** 本文検索（mode=content）時の一致行数。 */
+  match_count?: number;
+  /** 本文検索（mode=content）時の一致行（先頭数件）。 */
+  matches?: { line: number; text: string }[];
 }
 
 export interface ExplorerSearchResponse {
@@ -1067,11 +1432,19 @@ export interface ExplorerSearchResponse {
   root_path?: string;
   truncated?: boolean;
   query: string;
+  /** 本文検索の打ち切り理由（results=件数上限 / scan=走査上限 / bytes=読取量上限）。 */
+  limit_reason?: "results" | "scan" | "bytes" | null;
+  scanned_files?: number;
+  skipped_large_files?: number;
 }
 
+export type ExplorerSearchMode = "name" | "content";
+
 export interface ExplorerSearchOptions {
-  /** ファイル名・フォルダ名を正規表現として照合する。 */
+  /** ファイル名・フォルダ名（本文検索時は本文の各行）を正規表現として照合する。 */
   regex?: boolean;
+  /** name=名前検索（既定）、content=テキストファイル本文の文字列検索。 */
+  mode?: ExplorerSearchMode;
 }
 
 export async function explorerSearch(
@@ -1080,11 +1453,6 @@ export async function explorerSearch(
   limit?: number,
   options?: ExplorerSearchOptions,
 ): Promise<ExplorerSearchResponse> {
-  if (isHfPath(root ?? "")) {
-    throw new Error(
-      "HF仮想パスはHugging Face検索プロバイダーを使用してください",
-    );
-  }
   const remote = parseRemoteWorkspacePath(root ?? "");
   if (remote) {
     const results = await searchRemoteWorkspace(
@@ -1106,6 +1474,7 @@ export async function explorerSearch(
   if (root) params.set("root", root);
   if (limit) params.set("limit", String(limit));
   if (options?.regex) params.set("regex", "true");
+  if (options?.mode === "content") params.set("mode", "content");
   return pyFetch(`/explorer/search?${params}`);
 }
 

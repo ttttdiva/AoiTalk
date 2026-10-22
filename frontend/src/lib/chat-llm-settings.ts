@@ -64,10 +64,97 @@ export type NewChatLlmDefaultsResponse = {
   effective_main: SessionMainRoute;
 };
 
+export type NewChatLlmDefaultsErrorCode =
+  | "http"
+  | "network"
+  | "timeout"
+  | "invalid"
+  | "aborted";
+
+/** Canonical new-chat defaults could not be read within the bounded request. */
+export class NewChatLlmDefaultsError extends Error {
+  readonly code: NewChatLlmDefaultsErrorCode;
+  readonly status?: number;
+
+  constructor(
+    code: NewChatLlmDefaultsErrorCode,
+    message: string,
+    options?: { status?: number; cause?: unknown },
+  ) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "NewChatLlmDefaultsError";
+    this.code = code;
+    this.status = options?.status;
+  }
+}
+
+export type FetchNewChatLlmDefaultsOptions = {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+const NEW_CHAT_LLM_DEFAULTS_TIMEOUT_MS = 8_000;
+
+function normalizeDefaultsTimeoutMs(timeoutMs?: number): number {
+  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs)
+    ? Math.max(1, timeoutMs)
+    : NEW_CHAT_LLM_DEFAULTS_TIMEOUT_MS;
+}
+
 const EMPTY_NEW_CHAT_LLM_DEFAULTS: NewChatLlmDefaultsResponse = {
   last_used_main: {},
   effective_main: {},
 };
+
+function normalizeDefaultsRoute(value: unknown): SessionMainRoute {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new NewChatLlmDefaultsError(
+      "invalid",
+      "new-chat-defaults の route が不正です。",
+    );
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["provider", "model", "effort"] as const) {
+    const field = record[key];
+    if (field !== undefined && field !== null && typeof field !== "string") {
+      throw new NewChatLlmDefaultsError(
+        "invalid",
+        `new-chat-defaults の ${key} が不正です。`,
+      );
+    }
+  }
+
+  const route: SessionMainRoute = {};
+  for (const key of ["provider", "model", "effort"] as const) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      route[key] = value.trim();
+    }
+  }
+  return route;
+}
+
+function parseNewChatLlmDefaults(value: unknown): NewChatLlmDefaultsResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new NewChatLlmDefaultsError(
+      "invalid",
+      "new-chat-defaults のレスポンスが不正です。",
+    );
+  }
+
+  const record = value as Record<string, unknown>;
+  if (!("last_used_main" in record) || !("effective_main" in record)) {
+    throw new NewChatLlmDefaultsError(
+      "invalid",
+      "new-chat-defaults のレスポンスに必要な route がありません。",
+    );
+  }
+  return {
+    last_used_main: normalizeDefaultsRoute(record.last_used_main),
+    effective_main: normalizeDefaultsRoute(record.effective_main),
+  };
+}
 
 export async function fetchSessionLlmSettings(
   sessionId: string,
@@ -134,19 +221,185 @@ export async function fetchNewChatLlmDefaultsAfterLastUsedFlush(
   return fetchNewChatLlmDefaults();
 }
 
-/** 新規チャット初期 route（C→D 解決済み）。失敗時は空 envelope を返し新規チャット表示を止めない。 */
-export async function fetchNewChatLlmDefaults(): Promise<NewChatLlmDefaultsResponse> {
+async function requestNewChatLlmDefaults(
+  options: FetchNewChatLlmDefaultsOptions = {},
+): Promise<NewChatLlmDefaultsResponse> {
+  const timeoutMs = normalizeDefaultsTimeoutMs(options.timeoutMs);
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort();
+
+  if (options.signal) {
+    if (options.signal.aborted) {
+      throw new NewChatLlmDefaultsError(
+        "aborted",
+        "new-chat-defaults の取得がキャンセルされました。",
+      );
+    }
+    options.signal.addEventListener("abort", abortFromCaller, { once: true });
+  }
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
   try {
     const response = await fetch("/api/python-proxy/llm/new-chat-defaults", {
       credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
     });
     if (!response.ok) {
-      return EMPTY_NEW_CHAT_LLM_DEFAULTS;
+      throw new NewChatLlmDefaultsError(
+        "http",
+        `new-chat-defaults の取得に失敗しました (${response.status})。`,
+        { status: response.status },
+      );
     }
-    return (await response.json()) as NewChatLlmDefaultsResponse;
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (timedOut) {
+        throw new NewChatLlmDefaultsError(
+          "timeout",
+          "new-chat-defaults の取得がタイムアウトしました。",
+          { cause: error },
+        );
+      }
+      if (options.signal?.aborted) {
+        throw new NewChatLlmDefaultsError(
+          "aborted",
+          "new-chat-defaults の取得がキャンセルされました。",
+          { cause: error },
+        );
+      }
+      throw new NewChatLlmDefaultsError(
+        "invalid",
+        "new-chat-defaults の JSON を読み取れませんでした。",
+        { cause: error },
+      );
+    }
+    return parseNewChatLlmDefaults(payload);
+  } catch (error) {
+    if (error instanceof NewChatLlmDefaultsError) throw error;
+    if (timedOut) {
+      throw new NewChatLlmDefaultsError(
+        "timeout",
+        "new-chat-defaults の取得がタイムアウトしました。",
+        { cause: error },
+      );
+    }
+    if (options.signal?.aborted) {
+      throw new NewChatLlmDefaultsError(
+        "aborted",
+        "new-chat-defaults の取得がキャンセルされました。",
+        { cause: error },
+      );
+    }
+    throw new NewChatLlmDefaultsError(
+      "network",
+      "new-chat-defaults に接続できませんでした。",
+      { cause: error },
+    );
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    options.signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+/** 新規チャット初期 route（C→D 解決済み）。表示用に失敗を空 envelope へ畳み込む。 */
+export async function fetchNewChatLlmDefaults(
+  options?: FetchNewChatLlmDefaultsOptions,
+): Promise<NewChatLlmDefaultsResponse> {
+  try {
+    return await requestNewChatLlmDefaults(options);
   } catch {
     return EMPTY_NEW_CHAT_LLM_DEFAULTS;
   }
+}
+
+function waitForLastUsedLlmRouteReady(
+  userId: string | null | undefined,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener("abort", abort);
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const abort = () =>
+      finish(() =>
+        reject(
+          new NewChatLlmDefaultsError(
+            "aborted",
+            "new-chat-defaults の取得がキャンセルされました。",
+          ),
+        ),
+      );
+
+    const timeoutId = setTimeout(
+      () =>
+        finish(() =>
+          reject(
+            new NewChatLlmDefaultsError(
+              "timeout",
+              "new-chat-defaults の取得がタイムアウトしました。",
+            ),
+          ),
+        ),
+      timeoutMs,
+    );
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    void awaitLastUsedLlmRouteReady(userId).then(
+      () => finish(resolve),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+/** 送信前に使う bounded な canonical defaults 取得。失敗理由を呼び出し側へ返す。 */
+export async function fetchNewChatLlmDefaultsStrict(
+  userId?: string | null,
+  options?: FetchNewChatLlmDefaultsOptions,
+): Promise<NewChatLlmDefaultsResponse> {
+  const timeoutMs = normalizeDefaultsTimeoutMs(options?.timeoutMs);
+  const startedAt = Date.now();
+  try {
+    await waitForLastUsedLlmRouteReady(userId, timeoutMs, options?.signal);
+  } catch (error) {
+    if (
+      error instanceof NewChatLlmDefaultsError &&
+      (error.code === "timeout" || error.code === "aborted")
+    ) {
+      throw error;
+    }
+    // last-used preference の失敗だけでは、canonical effective_main の取得を止めない。
+  }
+  const remainingMs = timeoutMs - (Date.now() - startedAt);
+  if (remainingMs <= 0) {
+    throw new NewChatLlmDefaultsError(
+      "timeout",
+      "new-chat-defaults の取得がタイムアウトしました。",
+    );
+  }
+  return requestNewChatLlmDefaults({
+    ...options,
+    timeoutMs: remainingMs,
+  });
 }
 
 /** 新規チャットでの選択を last-used (C) に残す。失敗しても呼び出し側の pending 保存は止めない。 */

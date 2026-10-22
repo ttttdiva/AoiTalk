@@ -43,7 +43,7 @@ export type ContentItemDetail =
   Schemas["ContentItemDetailResponse"];
 export type ContentItemCreateInput = OptionalDefaults<
   Schemas["ContentItemCreateRequest"],
-  "content_type"
+  "content_type" | "input_kind"
 >;
 
 /**
@@ -333,9 +333,9 @@ export const mediaResearchApi = {
     );
   },
 
-  async listPrograms(): Promise<EditorialProgram[]> {
+  async listPrograms(projectId?: string | null): Promise<EditorialProgram[]> {
     return request<EditorialProgram[]>(
-      "/operations/media/editorial-programs",
+      `/operations/media/editorial-programs${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
     );
   },
 
@@ -353,8 +353,21 @@ export const mediaResearchApi = {
     );
   },
 
+  async reviseProgram(
+    programId: string,
+    input: Schemas["EditorialProgramRevisionCreateRequest"],
+    idempotencyKey: string,
+  ): Promise<Schemas["EditorialProgramRevisionResponse"]> {
+    return request<Schemas["EditorialProgramRevisionResponse"]>(
+      `/operations/media/editorial-programs/${encodeURIComponent(programId)}/revisions`,
+      { method: "POST", ...jsonBody(input) },
+      idempotencyKey,
+    );
+  },
+
   async listContentItems(
     programId?: string | null,
+    page: { limit?: number; offset?: number; projectId?: string | null } = {},
   ): Promise<ContentItem[]> {
     const query = new URLSearchParams();
     if (programId) {
@@ -363,6 +376,9 @@ export const mediaResearchApi = {
         programId,
       );
     }
+    if (page.limit !== undefined) query.set("limit", String(page.limit));
+    if (page.offset !== undefined) query.set("offset", String(page.offset));
+    if (page.projectId) query.set("project_id", page.projectId);
     const suffix = query.toString()
       ? `?${query.toString()}`
       : "";

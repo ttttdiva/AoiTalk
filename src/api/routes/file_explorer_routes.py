@@ -16,6 +16,12 @@ from pydantic import BaseModel, Field, StrictStr, field_validator, model_validat
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
+
+_MOVE_OVERWRITE_UNDO_LIMITATION = (
+    "上書き移動では移動先の以前の内容を保持しないため、"
+    "通常のUndo/Redoでは元に戻せません"
+)
+
 from ..router_helpers import (
     await_task_completion_before_cancellation,
     cookie_auth_dependency,
@@ -61,6 +67,7 @@ try:
         save_file as explorer_save_file,
         get_full_content as explorer_get_full_content,
         search_workspace_entries as explorer_search_workspace_entries,
+        search_workspace_content as explorer_search_workspace_content,
         resolve_file_path as explorer_resolve_file_path,
         get_root_dir as explorer_get_root_dir,
         # Folder thumbnail
@@ -95,6 +102,7 @@ except ImportError:
     explorer_get_preview = None
     explorer_get_directory_tree = None
     explorer_search_workspace_entries = None
+    explorer_search_workspace_content = None
     explorer_resolve_file_path = None
     explorer_get_root_dir = None
     explorer_is_safe_workspace_path = None
@@ -102,6 +110,17 @@ except ImportError:
     prepare_download_file = None
     prepare_download_items = None
     remove_temp_download = None
+
+try:
+    from ...tools.file_explorer.file_explorer_service import (
+        finalize_move_item as explorer_finalize_move_item,
+        inspect_move_item_collision as explorer_inspect_move_item_collision,
+        rollback_move_item as explorer_rollback_move_item,
+    )
+except ImportError:
+    explorer_finalize_move_item = None
+    explorer_inspect_move_item_collision = None
+    explorer_rollback_move_item = None
 
 
 class _TemporaryFileResponse(FileResponse):
@@ -586,6 +605,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         operation: Literal["move", "copy"],
         source: str,
         destination: str,
+        overwrite: bool = False,
     ) -> dict:
         """Run a User↔Project transfer under the existing Project protocol."""
 
@@ -659,6 +679,9 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         operation_mutated = False
         created_path: Path | None = None
         source_absolute: Path | None = None
+        result: dict | None = None
+        overwrite_size = 0
+        same_file_move = False
 
         try:
             if project_permissions:
@@ -708,6 +731,27 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 is_admin=is_admin,
             )
 
+            if is_move and explorer_inspect_move_item_collision is not None:
+                collision = await run_in_threadpool(
+                    explorer_inspect_move_item_collision,
+                    str(source_absolute),
+                    str(destination_absolute),
+                    is_admin=True,
+                    allow_overwrite=overwrite,
+                )
+                if collision is not None:
+                    overwrite_size = int(collision.get("overwrite_size", 0) or 0)
+                    same_file_move = bool(collision.get("same_file"))
+                    if not collision.get("success"):
+                        code = str(collision.get("error_code") or "conflict")
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": code,
+                                "message": str(collision.get("error") or "Move conflict"),
+                            },
+                        )
+
             source_bytes: int | None = None
             if destination_project_id is not None and (
                 not is_move or source_project_id != destination_project_id
@@ -733,7 +777,15 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                         status_code=500, detail="Project storage quota is invalid"
                     ) from exc
                 quota_bytes = max(0, quota_mb) * 1024 * 1024
-                if int(before_usage["total_bytes"]) + source_bytes > quota_bytes:
+                replacement_credit = 0
+                if is_move:
+                    replacement_credit = source_bytes if same_file_move else overwrite_size
+                projected_bytes = (
+                    int(before_usage["total_bytes"])
+                    + source_bytes
+                    - replacement_credit
+                )
+                if projected_bytes > quota_bytes:
                     raise HTTPException(
                         status_code=413,
                         detail="Project storage quota exceeded",
@@ -745,6 +797,8 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                     authorized_source,
                     authorized_destination,
                     is_admin=is_admin,
+                    allow_overwrite=overwrite,
+                    retain_overwrite_backup=True,
                 )
             else:
                 result = await run_in_threadpool(
@@ -754,6 +808,15 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                     is_admin=is_admin,
                 )
             if not result.get("success"):
+                error_code = result.get("error_code") or result.get("code")
+                if is_move and error_code in {"already_exists", "unsupported_collision"}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": str(error_code),
+                            "message": str(result.get("error") or "Move conflict"),
+                        },
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail=result.get(
@@ -766,6 +829,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             created_path = destination_absolute / created_name
             operation_mutated = not (
                 (is_move and created_path == source_absolute)
+                or (is_move and same_file_move)
                 or (not is_move and result.get("created") is False)
             )
 
@@ -777,8 +841,23 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                         strict=True,
                     )
                     final_bytes = int(final_usage["total_bytes"])
-                    quota_check_required = destination_project_id == project_id and (
-                        not is_move or source_project_id != destination_project_id
+                    transaction = result.get("_move_overwrite_transaction")
+                    if is_move and isinstance(transaction, dict) and destination_project_id == project_id:
+                        try:
+                            Path(str(transaction["backup"])).relative_to(
+                                project_roots[project_id]
+                            )
+                        except (KeyError, ValueError):
+                            pass
+                        else:
+                            final_bytes = max(
+                                0,
+                                final_bytes - int(transaction.get("size", 0)),
+                            )
+                    quota_check_required = (
+                        not same_file_move
+                        and destination_project_id == project_id
+                        and (not is_move or source_project_id != destination_project_id)
                     )
                     if quota_check_required:
                         try:
@@ -799,16 +878,45 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                     project.storage_used_mb = final_bytes / (1024 * 1024)
                 await session.commit()
                 committed = True
+            if is_move:
+                # ``finalize_move_item`` removes the private transaction and its
+                # backup after the caller commits.  Publish the irreversible
+                # outcome before finalization so clients cannot mistake an
+                # overwritten move for an ordinary undoable move.
+                transaction = result.get("_move_overwrite_transaction")
+                overwrote_existing = isinstance(transaction, dict)
+                result["overwrote_existing"] = overwrote_existing
+                result["undoable"] = not overwrote_existing
+                result["undo_limitation"] = (
+                    _MOVE_OVERWRITE_UNDO_LIMITATION
+                    if overwrote_existing
+                    else None
+                )
+            if is_move and explorer_finalize_move_item is not None:
+                await run_in_threadpool(explorer_finalize_move_item, result)
             return result
         except HTTPException:
             if source_absolute is not None and created_path is not None and not committed:
-                await asyncio.to_thread(
-                    _rollback_explorer_transfer,
-                    operation,
-                    source_absolute,
-                    created_path,
-                    mutated=operation_mutated,
-                )
+                if (
+                    is_move
+                    and result is not None
+                    and result.get("success")
+                    and explorer_rollback_move_item is not None
+                ):
+                    await run_in_threadpool(
+                        explorer_rollback_move_item,
+                        result,
+                        source_absolute,
+                        created_path,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _rollback_explorer_transfer,
+                        operation,
+                        source_absolute,
+                        created_path,
+                        mutated=operation_mutated,
+                    )
             if session is not None and not committed:
                 try:
                     await session.rollback()
@@ -817,13 +925,26 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             raise
         except Exception as exc:
             if source_absolute is not None and created_path is not None and not committed:
-                await asyncio.to_thread(
-                    _rollback_explorer_transfer,
-                    operation,
-                    source_absolute,
-                    created_path,
-                    mutated=operation_mutated,
-                )
+                if (
+                    is_move
+                    and result is not None
+                    and result.get("success")
+                    and explorer_rollback_move_item is not None
+                ):
+                    await run_in_threadpool(
+                        explorer_rollback_move_item,
+                        result,
+                        source_absolute,
+                        created_path,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        _rollback_explorer_transfer,
+                        operation,
+                        source_absolute,
+                        created_path,
+                        mutated=operation_mutated,
+                    )
             if session is not None and not committed:
                 try:
                     await session.rollback()
@@ -942,6 +1063,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
     class ExplorerMovePayload(BaseModel):
         src: str
         dest: str
+        overwrite: bool = False
 
     class ExplorerCopyPayload(BaseModel):
         src: str
@@ -1087,6 +1209,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         file: UploadFile = File(...),
         relative_path: str = Form(""),
         path: str = "",
+        overwrite: bool = False,
         _: None = Depends(require_auth),
     ):
         """Upload a file to the specified directory"""
@@ -1117,13 +1240,16 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                     file.file,
                     is_admin,
                     allow_external=is_admin,
+                    allow_overwrite=overwrite,
                 )
             )
 
             if not result.get("success"):
                 raise HTTPException(
-                    status_code=400,
-                    detail=result.get("error", "Failed to upload file"),
+                    status_code=409 if result.get("code") == "already_exists" else 400,
+                    detail={"code": "already_exists", "message": result.get("error")}
+                    if result.get("code") == "already_exists"
+                    else result.get("error", "Failed to upload file"),
                 )
 
             logger.info(
@@ -1466,6 +1592,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 operation="move",
                 source=payload.src,
                 destination=payload.dest,
+                overwrite=payload.overwrite,
             )
         )
         return JSONResponse(result)
@@ -1749,23 +1876,6 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         re.IGNORECASE,
     )
 
-    def _is_hf_virtual_folder(path: str) -> bool:
-        """Recognize the HF virtual folder syntax without touching the network."""
-
-        if path == "HF":
-            return True
-        if not path.startswith("HF|"):
-            return False
-        parts = path.split("|")
-        # HF|account|model|repo[|sub-path] (repo ids may contain '/').
-        return (
-            len(parts) >= 4
-            and bool(parts[1])
-            and parts[2] in {"model", "dataset"}
-            and bool(parts[3])
-            and not any(part in {".", ".."} for part in parts[4:])
-        )
-
     async def _validate_record_table_launcher_path(
         request: Request,
         path: str,
@@ -1849,21 +1959,6 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         if not raw:
             raise HTTPException(status_code=422, detail="パスを指定してください")
 
-        if raw.startswith("HF|") or raw == "HF":
-            if target == "launcher":
-                raise HTTPException(
-                    status_code=400,
-                    detail="HF仮想フォルダはランチャーへ登録できません",
-                )
-            if not _is_hf_virtual_folder(raw):
-                raise HTTPException(status_code=400, detail="HF仮想パスが不正です")
-            return raw
-
-        if raw == "Hydrus" or raw.startswith("Hydrus|"):
-            raise HTTPException(
-                status_code=400,
-                detail="HydrusのタグはFilesブックマークから管理してください",
-            )
         if raw.startswith("remote://"):
             raise HTTPException(
                 status_code=400,
@@ -1889,11 +1984,6 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 detail=result.get("error", "対象が見つかりません"),
             )
         is_directory = bool(result.get("is_directory"))
-        if target == "bookmark" and not is_directory:
-            raise HTTPException(
-                status_code=400,
-                detail="ブックマーク対象はフォルダで指定してください",
-            )
         if target == "launcher" and is_directory:
             raise HTTPException(
                 status_code=400,
@@ -1933,11 +2023,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             )
 
         if (
-            raw == "HF"
-            or raw.startswith("HF|")
-            or raw == "Hydrus"
-            or raw.startswith("Hydrus|")
-            or raw.startswith("remote://")
+            raw.startswith("remote://")
             or raw.startswith("_users/")
             or raw.startswith("_users\\")
         ):
@@ -2015,8 +2101,6 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         if not info.get("success"):
             raise HTTPException(status_code=404, detail=info.get("error", "対象が見つかりません"))
         is_directory = bool(info.get("is_directory"))
-        if target == "bookmark" and not is_directory:
-            raise HTTPException(status_code=400, detail="ブックマーク対象はフォルダで指定してください")
         if target == "launcher" and is_directory:
             raise HTTPException(status_code=400, detail="ランチャー対象はファイルで指定してください")
         return authorized_path
@@ -3019,6 +3103,64 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             logger.error(f"Failed to get file content: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def _explorer_content_search(
+        request: Request, q: str, root: str, limit: int, regex: bool
+    ) -> JSONResponse:
+        """Body search limited to the caller's User Files or a readable Project.
+
+        Unlike the name search this never walks the workspace root, other
+        users' User Files (even for admins) or absolute paths: the read cost
+        and disclosure are bounded to the same scopes as the Files semantic
+        index.  Project roots always require the Project ``read`` permission.
+        """
+        parts = [part for part in str(root or "").replace("\\", "/").split("/") if part]
+        folded = [part.casefold() for part in parts]
+        if len(parts) < 2 or folded[0] not in {"_projects", "_users"}:
+            raise HTTPException(
+                status_code=403,
+                detail="本文検索は User Files または Project Files 内で実行してください",
+            )
+        if folded[0] == "_users":
+            match = _USER_SEGMENT.fullmatch(parts[1])
+            if match is None:
+                raise HTTPException(status_code=403, detail="無効なユーザーパスです")
+            if getattr(server, "auth_enabled", None) is not False:
+                user_info = await server._get_user_info_from_request(request)
+                try:
+                    caller = UUID(str((user_info or {}).get("id")))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=401, detail="Not authenticated")
+                if UUID(match.group(1)) != caller:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="他ユーザーのファイルは本文検索できません",
+                    )
+        try:
+            [root], is_admin = await authorize_explorer_paths(
+                request, [root], project_permission="read"
+            )
+            result = await asyncio.to_thread(
+                explorer_search_workspace_content,
+                q,
+                path=root,
+                max_results=limit,
+                is_admin=is_admin,
+                regex=regex,
+            )
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=400, detail=result.get("error", "Search failed")
+                )
+            result["total"] = result.get(
+                "total_returned", len(result.get("results", []))
+            )
+            return JSONResponse(result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to search file contents: {e}")
+            raise HTTPException(status_code=500, detail="本文検索に失敗しました")
+
     @app.get("/api/explorer/search")
     async def explorer_search_endpoint(
         request: Request,
@@ -3026,13 +3168,16 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         root: str = Query(""),
         limit: int = Query(20, ge=1, le=200),
         regex: bool = Query(False),
+        mode: Literal["name", "content"] = Query("name"),
         _: None = Depends(require_auth),
     ):
-        """Search files and directories by name"""
+        """Search files and directories by name, or text file bodies (mode=content)."""
         if not FILE_EXPLORER_AVAILABLE:
             raise HTTPException(
                 status_code=503, detail="File explorer is not available"
             )
+        if mode == "content":
+            return await _explorer_content_search(request, q, root, limit, regex)
         try:
             [root], is_admin = await authorize_explorer_paths(request, [root])
             result = explorer_search_workspace_entries(

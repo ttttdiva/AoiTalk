@@ -17,8 +17,12 @@ from urllib.parse import unquote
 
 from ._process_utils import _IS_WINDOWS, _read_log_tail
 
-_FRONTEND_BUILD_FINGERPRINT_VERSION = 2
+_FRONTEND_BUILD_FINGERPRINT_VERSION = 4
 _FRONTEND_BUILD_FINGERPRINT_REL_PATH = Path(".next") / "aoitalk-build-fingerprint.json"
+_SEETHROUGH_RIG_RUNTIME_REL_PATH = (
+    Path("resources") / "seethrough-rig" / "runtime"
+)
+_CHAT_BACKGROUND_REL_PATH = Path("resources") / "chat-background"
 _FRONTEND_BUILD_EXCLUDED_DIR_NAMES = {
     ".git",
     ".next",
@@ -181,6 +185,51 @@ def _iter_frontend_build_input_files(frontend_dir: Path) -> list[Path]:
             if _is_frontend_build_input(path, frontend_dir):
                 input_files.append(path)
     return sorted(input_files)
+
+
+def _iter_seethrough_rig_runtime_files(frontend_dir: Path) -> list[Path]:
+    """Return every checked-in See-through Rig runtime file.
+
+    The runtime is a local npm ``file:`` dependency of the frontend, so its
+    files are build inputs even though they live outside ``frontend/``.
+    Runtime provenance and hash metadata are intentionally included by using
+    no extension allowlist here.
+    """
+    runtime_dir = frontend_dir.parent / _SEETHROUGH_RIG_RUNTIME_REL_PATH
+    if not runtime_dir.is_dir():
+        return []
+
+    runtime_files: list[Path] = []
+    for root, _dir_names, file_names in os.walk(runtime_dir):
+        root_path = Path(root)
+        runtime_files.extend(
+            path
+            for path in (root_path / file_name for file_name in file_names)
+            if path.is_file()
+        )
+    return sorted(runtime_files)
+
+
+def _iter_chat_background_files(frontend_dir: Path) -> list[Path]:
+    """Return every checked-in shared Chat Background source file.
+
+    The Web and Native clients import this small TypeScript package from the
+    repository-level ``resources`` tree.  It is therefore a production build
+    input even though it is outside ``frontend/``.
+    """
+    resource_dir = frontend_dir.parent / _CHAT_BACKGROUND_REL_PATH
+    if not resource_dir.is_dir():
+        return []
+
+    resource_files: list[Path] = []
+    for root, _dir_names, file_names in os.walk(resource_dir):
+        root_path = Path(root)
+        resource_files.extend(
+            path
+            for path in (root_path / file_name for file_name in file_names)
+            if path.is_file()
+        )
+    return sorted(resource_files)
 
 
 def _skip_jsonc_trivia(text: str, index: int) -> int:
@@ -386,15 +435,58 @@ def _frontend_build_input_hash(path: Path) -> bytes:
     return digest.digest()
 
 
+def _seethrough_rig_runtime_file_hash(path: Path) -> bytes:
+    """Hash one runtime file without frontend-specific normalization."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _chat_background_file_hash(path: Path) -> bytes:
+    """Hash one shared Chat Background source without normalization."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
 def _frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object]:
     # Cold Windows file reads dominated startup. Read a bounded number in
     # parallel, retaining content-based checks (including same-size edits with
     # preserved timestamps), and combine hashes in deterministic path order.
     digest = hashlib.sha256()
-    paths = _iter_frontend_build_input_files(frontend_dir)
+    frontend_paths = _iter_frontend_build_input_files(frontend_dir)
+    runtime_dir = frontend_dir.parent / _SEETHROUGH_RIG_RUNTIME_REL_PATH
+    runtime_paths = _iter_seethrough_rig_runtime_files(frontend_dir)
+    chat_background_dir = frontend_dir.parent / _CHAT_BACKGROUND_REL_PATH
+    chat_background_paths = _iter_chat_background_files(frontend_dir)
     with ThreadPoolExecutor(max_workers=8, thread_name_prefix="frontend-input") as pool:
-        for path, file_hash in zip(paths, pool.map(_frontend_build_input_hash, paths)):
-            relative = path.relative_to(frontend_dir).as_posix()
+        for path, file_hash in zip(
+            frontend_paths, pool.map(_frontend_build_input_hash, frontend_paths)
+        ):
+            relative = "frontend/" + path.relative_to(frontend_dir).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(file_hash)
+            digest.update(b"\0")
+
+        for path, file_hash in zip(
+            runtime_paths, pool.map(_seethrough_rig_runtime_file_hash, runtime_paths)
+        ):
+            relative = "seethrough-rig-runtime/" + path.relative_to(runtime_dir).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(file_hash)
+            digest.update(b"\0")
+
+        for path, file_hash in zip(
+            chat_background_paths,
+            pool.map(_chat_background_file_hash, chat_background_paths),
+        ):
+            relative = "chat-background/" + path.relative_to(chat_background_dir).as_posix()
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
             digest.update(file_hash)
@@ -403,7 +495,10 @@ def _frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object]:
     return {
         "version": _FRONTEND_BUILD_FINGERPRINT_VERSION,
         "digest": digest.hexdigest(),
-        "file_count": len(paths),
+        "file_count": len(frontend_paths) + len(runtime_paths) + len(chat_background_paths),
+        "frontend_file_count": len(frontend_paths),
+        "runtime_file_count": len(runtime_paths),
+        "chat_background_file_count": len(chat_background_paths),
     }
 
 
@@ -555,7 +650,10 @@ def _validate_frontend_startup_artifacts(project_root: Path) -> None:
     if not _next_bin_path(frontend_dir).exists():
         raise RuntimeError(
             "Frontend dependencies are not installed. "
-            "Run setup.bat/setup.sh or `cd frontend && npm ci` before run.bat. "
+            "Move to the frontend directory and run these commands separately:\n"
+            "  cd frontend\n"
+            "  npm ci\n"
+            "Then retry run.bat. "
             "run.bat does not install dependencies."
         )
 
@@ -563,8 +661,10 @@ def _validate_frontend_startup_artifacts(project_root: Path) -> None:
     if invalid_reason:
         raise RuntimeError(
             f"Frontend build is not ready: {invalid_reason}. "
-            "Run `cd frontend && npm run build:production` manually, or restart "
-            "run.bat so its startup self-repair can retry the production build."
+            "Move to the frontend directory and run these commands separately:\n"
+            "  cd frontend\n"
+            "  npm run build:production\n"
+            "Then retry run.bat."
         )
 
 

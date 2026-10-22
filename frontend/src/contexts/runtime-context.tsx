@@ -144,6 +144,10 @@ type LlmEngineResponse = {
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
+// Model discovery can probe several local runtimes. Give it a separate,
+// bounded budget instead of the three-second lightweight health/engine limit.
+const LLM_CATALOG_TIMEOUT_MS = 30_000;
+
 function timeoutSignal(ms: number): AbortSignal | undefined {
   if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
     return AbortSignal.timeout(ms);
@@ -392,7 +396,7 @@ function mergeStrictRuntimeCatalogLkg(
   const providers = next.providers.map((provider) => {
     if (
       !STRICT_RUNTIME_PROVIDERS.has(providerId(provider.id)) ||
-      providerDiscoveryState(provider) !== "error"
+      !["error", "not_checked"].includes(providerDiscoveryState(provider))
     ) {
       return provider;
     }
@@ -544,6 +548,7 @@ export function RuntimeProvider({
 
   const llmRefreshPromiseRef =
     useRef<Promise<void> | null>(null);
+  const llmCatalogRequestRef = useRef<AbortController | null>(null);
   const llmNeedsRefreshRef =
     useRef(true);
 
@@ -1029,22 +1034,39 @@ export function RuntimeProvider({
           runIndependent(
             "LLM catalog",
             async () => {
-              const response = await fetch(
-                "/api/python-proxy/llm/models",
-                {
-                  credentials: "include",
-                  signal: timeoutSignal(3000),
-                },
-              );
+              const controller = new AbortController();
+              llmCatalogRequestRef.current = controller;
+              const timer = window.setTimeout(() => {
+                controller.abort(new Error(
+                  "LLMモデル一覧の取得がタイムアウトしました。再取得してください",
+                ));
+              }, LLM_CATALOG_TIMEOUT_MS);
 
-              if (!response.ok) {
-                throw new Error(
-                  `LLM catalog取得に失敗しました (${response.status})`,
+              let parsed: LlmModelCatalogResponse;
+              try {
+                const response = await fetch(
+                  "/api/python-proxy/llm/models",
+                  {
+                    credentials: "include",
+                    cache: "no-store",
+                    signal: controller.signal,
+                  },
                 );
-              }
 
-              const parsed =
-                (await response.json()) as LlmModelCatalogResponse;
+                if (!response.ok) {
+                  throw new Error(
+                    `LLM catalog取得に失敗しました (${response.status})`,
+                  );
+                }
+
+                // Keep the deadline active through body consumption too.
+                parsed = (await response.json()) as LlmModelCatalogResponse;
+              } finally {
+                window.clearTimeout(timer);
+                if (llmCatalogRequestRef.current === controller) {
+                  llmCatalogRequestRef.current = null;
+                }
+              }
 
               if (
                 !parsed ||
@@ -1329,6 +1351,14 @@ export function RuntimeProvider({
     void refreshCharacters();
     void refreshRuntimeFeatures();
     void refreshLlmMetadata();
+    return () => {
+      // Ignore late responses after navigation/unmount (including a Strict
+      // Mode effect replay), and allow the next mount to start a fresh GET.
+      llmRequestSeqRef.current += 1;
+      llmCatalogRequestRef.current?.abort();
+      llmCatalogRequestRef.current = null;
+      llmRefreshPromiseRef.current = null;
+    };
   }, [
     refreshCharacters,
     refreshLlmMetadata,
@@ -1698,6 +1728,8 @@ export function RuntimeProvider({
           llmEpochRef.current += 1;
           llmRequestSeqRef.current +=
             1;
+          llmCatalogRequestRef.current?.abort();
+          llmRefreshPromiseRef.current = null;
 
           const selected =
             runtimeLlmRoute(

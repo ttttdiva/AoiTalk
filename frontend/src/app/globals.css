@@ -2776,3 +2776,49 @@ html:not(.dark) .ao-calendar-canvas .fc .event-cancelled {
     max-width: 92vw;
   }
 }
+
+
+/* The shell owns desktop rail sizing; mobile keeps its existing drawer. */
+.ao-context-rail-resizer {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.ao-context-rail-resizer::after {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  content: "";
+}
+
+.ao-context-rail-resizer:hover::after,
+.ao-context-rail-resizer:focus-visible::after,
+.ao-context-rail[data-resizing="true"] .ao-context-rail-resizer::after {
+  background: var(--primary);
+}
+
+.ao-context-rail-resizer:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+/* Grow the chat avatar with its rail while retaining room to scroll its tabs.
+   Settings/production previews retain their original canvas dimensions. */
+@media (min-width: 768px) {
+  .ao-chat-character {
+    container-type: inline-size;
+    --ao-rig-height: clamp(24rem, 125cqi, 70dvh);
+    --ao-rig-max-height: 70dvh;
+  }
+
+  .ao-chat-character-still {
+    max-height: 70dvh;
+  }
+}

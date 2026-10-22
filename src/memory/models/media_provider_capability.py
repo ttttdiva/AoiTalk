@@ -136,7 +136,7 @@ class MediaProviderCapabilitySnapshot(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "provider IN ('x', 'pixiv', 'patreon', 'youtube', 'instagram', 'dlsite')",
+            "provider IN ('x', 'pixiv', 'patreon', 'youtube', 'instagram', 'dlsite', 'fanza', 'tiktok')",
             name="ck_media_provider_capability_snapshots_provider",
         ),
         CheckConstraint(

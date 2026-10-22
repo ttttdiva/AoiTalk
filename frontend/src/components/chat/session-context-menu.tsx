@@ -2,7 +2,7 @@
 
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Hash, Pencil, Trash2 } from "lucide-react";
+import { Hash, Pencil, Pin, PinOff, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -22,6 +22,7 @@ type ChatSessionContextMenuProps = {
   menu: ChatSessionContextMenuState | null;
   onClose: () => void;
   onRename: (session: ConversationSession) => void;
+  onTogglePin: (session: ConversationSession) => void | Promise<void>;
   onDelete: (id: string) => void | Promise<void>;
 };
 
@@ -53,11 +54,12 @@ export function ChatSessionContextMenu({
   menu,
   onClose,
   onRename,
+  onTogglePin,
   onDelete,
 }: ChatSessionContextMenuProps) {
   const { ref, style } = useContextMenuPosition(
     menu ? { x: menu.x, y: menu.y } : null,
-    { fallbackWidth: 192, fallbackHeight: 128 },
+    { fallbackWidth: 192, fallbackHeight: 164 },
   );
 
   useEffect(() => {
@@ -98,6 +100,11 @@ export function ChatSessionContextMenu({
     }
   };
 
+  const handleTogglePin = () => {
+    onClose();
+    void onTogglePin(menu.session);
+  };
+
   const handleDelete = () => {
     onClose();
     void onDelete(menu.session.id);
@@ -110,6 +117,19 @@ export function ChatSessionContextMenu({
       style={style}
       onContextMenu={(event) => event.preventDefault()}
     >
+      <MenuMnemonicButton
+        type="button"
+        mnemonic="P"
+        className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground cursor-default"
+        onClick={handleTogglePin}
+      >
+        {menu.session.is_pinned ? (
+          <PinOff className="size-4" />
+        ) : (
+          <Pin className="size-4" />
+        )}
+        {menu.session.is_pinned ? "ピン留めを解除" : "ピン留め"}
+      </MenuMnemonicButton>
       <MenuMnemonicButton
         type="button"
         mnemonic="E"

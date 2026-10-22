@@ -8,17 +8,22 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import html
 import http.client
 import ipaddress
+import inspect
 import json
 import os
 import re
+import select
 import socket
 import ssl
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
@@ -79,6 +84,11 @@ class UrlFetchResult:
     thread_context: list[str] = field(default_factory=list)
     external_links: list[str] = field(default_factory=list)
     media_descriptions: list[str] = field(default_factory=list)
+    # JSON is kept as a parsed, bounded response for public metadata callers.
+    # ``body`` remains the textual excerpt used by the historical clip path.
+    json_data: Any = None
+    status_code: int = 0
+    response_headers: dict[str, str] = field(default_factory=dict)
     error: str = ""
     acquisition_status: str = "fetch_failed"
 
@@ -90,12 +100,96 @@ class UrlFetchResult:
         return asdict(self)
 
 
+class _ByteBudgetExceeded(ValueError):
+    """Raised when one UrlIngestService instance has no wire budget left."""
+
+
+class _TransportCancelled(Exception):
+    """Raised inside the synchronous pinned transport after ``cancel()``."""
+
+
+def _consume_transport_task(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        return
+
+
+class _ByteBudgetReservation:
+    """Thread-safe reservation held by one pinned request.
+
+    ``_pinned_request`` runs in a worker thread because ``http.client`` is
+    synchronous.  Reserving the maximum number of bytes before creating that
+    thread is intentional: cancellation cannot leave an unbounded response
+    reader running after the caller has stopped waiting.
+    """
+
+    def __init__(self, budget: "_ByteBudget", reserved: int) -> None:
+        self._budget = budget
+        self.reserved = int(reserved)
+        self._settled = False
+        self._lock = threading.Lock()
+
+    def settle(self, actual: int) -> None:
+        with self._lock:
+            if self._settled:
+                return
+            self._settled = True
+        self._budget.settle(self.reserved, max(0, int(actual)))
+
+    @property
+    def settled(self) -> bool:
+        with self._lock:
+            return self._settled
+
+
+class _ByteBudget:
+    """Per-service wire budget; no mutable process-global accounting."""
+
+    def __init__(self, limit: int | None) -> None:
+        self.limit = None if limit is None else max(0, int(limit))
+        self.used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def remaining(self) -> int | None:
+        with self._lock:
+            if self.limit is None:
+                return None
+            return max(0, self.limit - self.used)
+
+    def reserve(self, requested: int) -> _ByteBudgetReservation:
+        requested = max(1, int(requested))
+        with self._lock:
+            if self.limit is None:
+                reserved = requested
+            else:
+                remaining = self.limit - self.used
+                if remaining <= 0:
+                    raise _ByteBudgetExceeded("取得全体のサイズ上限に達しました")
+                reserved = min(requested, remaining)
+            self.used += reserved
+        return _ByteBudgetReservation(self, reserved)
+
+    def settle(self, reserved: int, actual: int) -> None:
+        # A response can be shorter than its reservation.  Keep the actual
+        # bytes visible to callers and return only unused reservation capacity.
+        unused = max(0, int(reserved) - max(0, int(actual)))
+        if unused:
+            with self._lock:
+                self.used = max(0, self.used - unused)
+
+
 class UrlIngestService:
     def __init__(
         self,
         *,
         timeout_seconds: float = 25.0,
         max_body_chars: int = 60_000,
+        max_total_bytes: int | None = None,
+        checkpoint: Callable[..., Any] | None = None,
         config: Any = None,
         privacy_gateway: OutboundPrivacyGateway | None = None,
         yahoo_search_client: DeepResearchSearchClient | None = None,
@@ -104,6 +198,9 @@ class UrlIngestService:
     ):
         self.timeout = httpx.Timeout(timeout_seconds, connect=8.0)
         self.max_body_chars = max_body_chars
+        self.max_total_bytes = None if max_total_bytes is None else max(0, int(max_total_bytes))
+        self._byte_budget = _ByteBudget(self.max_total_bytes)
+        self.checkpoint = checkpoint
         self.config = config
         self.session_context = (
             dict(session_context) if isinstance(session_context, Mapping) else None
@@ -131,6 +228,66 @@ class UrlIngestService:
             "User-Agent": "Mozilla/5.0 (compatible; AoiTalkClip/1.0; +https://github.com/)",
             "Accept-Language": "ja,en;q=0.8",
         }
+        # The pinned transport is synchronous and runs in a worker thread.
+        # Keep cancellation state on this service instance so cancelling one
+        # expansion cannot affect another user's request or a different
+        # service instance.
+        self._cancel_event = threading.Event()
+        self._active_connections_lock = threading.RLock()
+        self._active_connections: set[Any] = set()
+
+    def cancel(self) -> None:
+        """Abort in-flight pinned requests and prevent new transport work."""
+
+        self._cancel_event.set()
+        with self._active_connections_lock:
+            connections = list(self._active_connections)
+        for connection in connections:
+            self._abort_connection(connection)
+
+    def close(self) -> None:
+        """Close the service's in-flight transport context."""
+
+        self.cancel()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise _TransportCancelled("URL取得がキャンセルされました")
+
+    @staticmethod
+    def _abort_connection(connection: Any) -> None:
+        """Shutdown and close a socket so a blocked worker read is released."""
+
+        sock = (
+            getattr(connection, "sock", None)
+            or getattr(connection, "_aoi_pending_sock", None)
+            or getattr(connection, "_aoi_transport_sock", None)
+        )
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    @property
+    def bytes_used(self) -> int:
+        """Wire bytes observed by this instance, including error/redirect bodies."""
+
+        return int(self._byte_budget.used)
+
+    @property
+    def bytes_remaining(self) -> int | None:
+        """Remaining total wire budget, or ``None`` when unlimited."""
+
+        return self._byte_budget.remaining
 
     async def _privacy_get(
         self,
@@ -163,6 +320,7 @@ class UrlIngestService:
                 params=dict(protected_params),
                 headers=dict(headers) if headers is not None else None,
                 cookies=dict(cookies) if cookies is not None else None,
+                follow_redirects=False,
             )
 
         return await self._privacy_gateway.execute(
@@ -309,8 +467,14 @@ class UrlIngestService:
                 return "rate_limited"
         if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
             return "network_error"
+        if isinstance(exc, (OSError, http.client.HTTPException)):
+            return "network_error"
         message = str(exc).casefold()
+        if "サイズ上限" in str(exc) or "byte budget" in message:
+            return "byte_budget_exhausted"
         if "content-type" in message:
+            return "unsupported_content"
+        if "encoding" in message or "compressed" in message or "圧縮" in str(exc):
             return "unsupported_content"
         if "本文" in str(exc) or "空" in str(exc):
             return "empty_body"
@@ -328,6 +492,8 @@ class UrlIngestService:
             "network_error": "ネットワーク接続に失敗しました",
             "empty_body": "取得応答に本文がありません",
             "unsupported_content": "本文として扱えない形式です",
+            "byte_budget_exhausted": "取得全体のサイズ上限に達しました",
+            "inaccessible": "公開本文を確認できないページです",
             "fetch_failed": "本文の取得に失敗しました",
         }.get(status, "本文の取得に失敗しました")
 
@@ -358,6 +524,245 @@ class UrlIngestService:
             body=body,
             external_links=links,
         )
+
+    async def fetch_public(
+        self,
+        url: str,
+        *,
+        kind: str = "auto",
+        max_body_chars: int | None = None,
+    ) -> UrlFetchResult:
+        """Fetch one public HTML/JSON URL through the pinned safe path.
+
+        This method deliberately does not dispatch to the historical X,
+        GitHub, Hugging Face, Civitai, or cookie-backed provider adapters.
+        Research expansion uses it for public evidence only, so an article
+        page or metadata endpoint cannot trigger a credential-provider
+        shortcut by hostname.
+        """
+
+        requested_url = str(url or "").strip()
+        if not requested_url:
+            return UrlFetchResult(
+                requested_url=requested_url,
+                final_url=requested_url,
+                error="URLが空です",
+                acquisition_status="fetch_failed",
+            )
+        # ``_safe_get`` uses the pinned transport and privacy gateway and does
+        # not depend on the AsyncClient instance.  A tiny client object keeps
+        # the call shape compatible with older embedding/test doubles.
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=False,
+            headers=self.headers,
+        ) as client:
+            try:
+                response = await self._safe_get(client, requested_url)
+                final_url = str(getattr(response, "url", "") or requested_url)
+                content_type = str(response.headers.get("content-type", ""))
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                response_headers = {
+                    str(key).lower(): str(value)
+                    for key, value in dict(getattr(response, "headers", {}) or {}).items()
+                }
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    status = self._status_from_exception(exc)
+                    error_body = getattr(response, "content", b"")
+                    if isinstance(error_body, (bytes, bytearray)):
+                        error_text = bytes(error_body).decode("utf-8", errors="replace")
+                    else:
+                        error_text = str(getattr(response, "text", "") or "")
+                    return UrlFetchResult(
+                        requested_url=requested_url,
+                        final_url=final_url,
+                        body=error_text[: max_body_chars or self.max_body_chars],
+                        status_code=status_code,
+                        response_headers=response_headers,
+                        error=self._status_message(status),
+                        acquisition_status=status,
+                    )
+                raw_body = getattr(response, "content", b"")
+                if isinstance(raw_body, str):
+                    raw_body = raw_body.encode("utf-8", errors="replace")
+                if not isinstance(raw_body, (bytes, bytearray)):
+                    raw_body = str(getattr(response, "text", "") or "").encode(
+                        "utf-8", errors="replace"
+                    )
+                text = bytes(raw_body).decode("utf-8", errors="replace")
+                requested_kind = str(kind or "auto").strip().lower()
+                if requested_kind not in {"auto", "html", "json"}:
+                    raise ValueError("公開URLの取得種別が不正です")
+                is_json = requested_kind == "json" or (
+                    requested_kind == "auto" and "json" in content_type.casefold()
+                )
+                if is_json:
+                    try:
+                        def reject_json_constant(value: str) -> None:
+                            raise ValueError(f"JSON定数が不正です: {value}")
+
+                        payload = json.loads(text, parse_constant=reject_json_constant)
+                    except (TypeError, ValueError) as exc:
+                        return UrlFetchResult(
+                            requested_url=requested_url,
+                            final_url=final_url,
+                            body=text[: max_body_chars or self.max_body_chars],
+                            status_code=status_code,
+                            response_headers=response_headers,
+                            error="公開JSONを解釈できませんでした",
+                            acquisition_status="parse_failed",
+                        )
+                    return UrlFetchResult(
+                        requested_url=requested_url,
+                        final_url=final_url,
+                        success=True,
+                        provider="public_http",
+                        body=text[: max_body_chars or self.max_body_chars],
+                        json_data=payload,
+                        status_code=status_code,
+                        response_headers=response_headers,
+                    )
+                if "html" not in content_type.casefold() and "text/" not in content_type.casefold():
+                    return UrlFetchResult(
+                        requested_url=requested_url,
+                        final_url=final_url,
+                        body=text[: max_body_chars or self.max_body_chars],
+                        status_code=status_code,
+                        response_headers=response_headers,
+                        error="本文として扱えない形式です",
+                        acquisition_status="unsupported_content",
+                    )
+                soup = BeautifulSoup(text, "html.parser")
+                title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                og_title = self._meta(soup, "property", "og:title")
+                og_description = self._meta(soup, "property", "og:description")
+                author = ""
+                for attr, key in (
+                    ("name", "author"),
+                    ("name", "citation_author"),
+                    ("property", "article:author"),
+                    ("name", "twitter:creator"),
+                ):
+                    author = self._meta(soup, attr, key)
+                    if author:
+                        break
+                published_at = ""
+                for attr, key in (
+                    ("property", "article:published_time"),
+                    ("name", "citation_publication_date"),
+                    ("name", "date"),
+                ):
+                    published_at = self._meta(soup, attr, key)
+                    if published_at:
+                        break
+                citation_doi = self._meta(soup, "name", "citation_doi")
+                # Keep link extraction before decomposing script/style nodes so
+                # hostile script text cannot become a candidate URL.
+                links = self._external_links(soup, final_url)
+                doi_url = self._citation_doi_url(citation_doi)
+                if doi_url and doi_url not in links:
+                    links.insert(0, doi_url)
+                for link in self._public_link_hints(soup, final_url):
+                    if link not in links:
+                        links.append(link)
+                    if len(links) >= 100:
+                        break
+                for tag in soup(["script", "style", "noscript", "svg"]):
+                    tag.decompose()
+                main = soup.find("article") or soup.find("main") or soup.body or soup
+                body = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))
+                body = body[: max_body_chars or self.max_body_chars]
+                shell_text = f"{title}\n{body}".casefold()
+                normalized_title = re.sub(r"\s+", " ", title).strip().casefold()
+                title_shell = bool(
+                    re.fullmatch(
+                        r"(?:login|required sign in|sign in|log in|access denied|captcha|verify you are human|cloudflare(?: challenge)?|paywall|ログイン|認証してください)(?:\s*[-|:].*)?",
+                        normalized_title,
+                    )
+                )
+                body_length = len(body.strip())
+                short_shell_markers = (
+                    "sign in",
+                    "log in",
+                    "login",
+                    "captcha",
+                    "access denied",
+                    "verify you are human",
+                    "enable javascript",
+                    "paywall",
+                    "cloudflare",
+                    "ログイン",
+                    "認証してください",
+                )
+                has_auth_form = False
+                for form in soup.find_all("form"):
+                    form_text = form.get_text(" ", strip=True).casefold()
+                    form_action = str(form.get("action") or "").casefold()
+                    input_types = {
+                        str(node.get("type") or "text").casefold()
+                        for node in form.find_all("input")
+                    }
+                    if (
+                        {"password", "email"} & input_types
+                        or "login" in form_action
+                        or "sign-in" in form_action
+                        or any(marker in form_text for marker in ("sign in", "log in", "login", "captcha", "ログイン"))
+                    ):
+                        has_auth_form = True
+                        break
+                short_shell = body_length < 200 and any(
+                    marker in shell_text for marker in short_shell_markers
+                )
+                form_shell = has_auth_form and body_length < 600
+                if title_shell or short_shell or form_shell or body_length < 80:
+                    return UrlFetchResult(
+                        requested_url=requested_url,
+                        final_url=final_url,
+                        provider="public_http",
+                        title=title,
+                        og_title=og_title,
+                        og_description=og_description,
+                        body="",
+                        author=author,
+                        published_at=published_at,
+                        external_links=links,
+                        status_code=status_code,
+                        response_headers=response_headers,
+                        error="公開本文を確認できないページです",
+                        acquisition_status="inaccessible" if body.strip() else "empty_body",
+                    )
+                return UrlFetchResult(
+                    requested_url=requested_url,
+                    final_url=final_url,
+                    success=len(body.strip()) >= 80,
+                    provider="public_http",
+                    title=title,
+                    og_title=og_title,
+                    og_description=og_description,
+                    body=body,
+                    author=author,
+                    published_at=published_at,
+                    external_links=links,
+                    status_code=status_code,
+                    response_headers=response_headers,
+                    acquisition_status="success" if len(body.strip()) >= 80 else "inaccessible",
+                )
+            except (ExternalProviderBlocked, PrivacyError):
+                raise
+            except (httpx.HTTPError, ValueError, OSError, http.client.HTTPException) as exc:
+                status = self._status_from_exception(exc)
+                return UrlFetchResult(
+                    requested_url=requested_url,
+                    final_url=requested_url,
+                    error=self._status_message(status),
+                    acquisition_status=status,
+                )
+            except asyncio.CancelledError:
+                self.cancel()
+                raise
+
 
     async def _fetch_github(self, client: httpx.AsyncClient, url: str) -> UrlFetchResult:
         parts = [part for part in urlsplit(url).path.split("/") if part]
@@ -798,44 +1203,370 @@ class UrlIngestService:
         return context
 
     @staticmethod
-    def _pinned_request(parts, address: str) -> httpx.Response:
+    def _register_connection(
+        connection: Any,
+        *,
+        active_connections: set[Any] | None,
+        active_connections_lock: threading.RLock | None,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        if active_connections is None or active_connections_lock is None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _TransportCancelled("URL取得がキャンセルされました")
+            return
+        with active_connections_lock:
+            active_connections.add(connection)
+            cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        if cancelled:
+            try:
+                UrlIngestService._abort_connection(connection)
+            finally:
+                raise _TransportCancelled("URL取得がキャンセルされました")
+
+    @staticmethod
+    def _unregister_connection(
+        connection: Any,
+        *,
+        active_connections: set[Any] | None,
+        active_connections_lock: threading.RLock | None,
+    ) -> None:
+        if active_connections is None or active_connections_lock is None:
+            return
+        with active_connections_lock:
+            active_connections.discard(connection)
+
+    @staticmethod
+    def _pinned_request(
+        parts,
+        address: str,
+        *,
+        max_bytes: int | None = None,
+        reservation: _ByteBudgetReservation | None = None,
+        cancel_event: threading.Event | None = None,
+        active_connections: set[Any] | None = None,
+        active_connections_lock: threading.RLock | None = None,
+    ) -> httpx.Response:
+        """Issue one DNS-pinned GET and account every received byte.
+
+        The historical default remains an 8 MiB response cap.  When a caller
+        supplies a reservation, the reservation is made before this function
+        runs in a worker thread and the read cap includes one probe byte when
+        capacity allows, so a single oversized response is detected without
+        exceeding the total budget.
+        """
+
         host = str(parts.hostname)
         port = parts.port or (443 if parts.scheme == "https" else 80)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
 
-        if parts.scheme == "https":
-            class PinnedHttpsConnection(http.client.HTTPSConnection):
-                def connect(self):
-                    sock = socket.create_connection((address, port), timeout=25)
-                    self.sock = self._context.wrap_socket(sock, server_hostname=host)
-            connection = PinnedHttpsConnection(
-                host,
-                port=port,
-                timeout=25,
-                context=UrlIngestService._verified_ssl_context(),
-            )
-        else:
-            connection = http.client.HTTPConnection(address, port=port, timeout=25)
+        actual_read = 0
+        connection: Any = None
+
+        def is_cancelled() -> bool:
+            return bool(cancel_event is not None and cancel_event.is_set())
+
+        def track_pending_socket(conn: Any, sock: Any) -> None:
+            if active_connections_lock is None:
+                if is_cancelled():
+                    sock.close()
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                conn._aoi_pending_sock = sock
+                return
+            with active_connections_lock:
+                cancelled = is_cancelled()
+                if not cancelled:
+                    conn._aoi_pending_sock = sock
+            if cancelled:
+                sock.close()
+                raise _TransportCancelled("URL取得がキャンセルされました")
+
+        def attach_connected_socket(conn: Any, sock: Any) -> None:
+            if active_connections_lock is None:
+                if is_cancelled():
+                    sock.close()
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                conn.sock = sock
+                conn._aoi_transport_sock = sock
+                conn._aoi_pending_sock = None
+                return
+            with active_connections_lock:
+                cancelled = is_cancelled()
+                if not cancelled:
+                    conn.sock = sock
+                    conn._aoi_transport_sock = sock
+                    conn._aoi_pending_sock = None
+            if cancelled:
+                UrlIngestService._abort_connection(conn)
+                raise _TransportCancelled("URL取得がキャンセルされました")
+
+        def pinned_connect(conn: Any, *, use_tls: bool) -> None:
+            if is_cancelled():
+                raise _TransportCancelled("URL取得がキャンセルされました")
+            tls_context = conn._context if use_tls else None
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            track_pending_socket(conn, sock)
+            try:
+                if family == socket.AF_INET6:
+                    scope = address.partition("%")[2]
+                    try:
+                        scope_id = int(scope) if scope else 0
+                    except ValueError:
+                        scope_id = socket.if_nametoindex(scope)
+                    sockaddr = (address.split("%", 1)[0], port, 0, scope_id)
+                else:
+                    sockaddr = (address, port)
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                # Poll nonblocking connect in short intervals so cancellation
+                # does not depend on whether Windows interrupts a blocking
+                # connect when another thread closes the socket.
+                connect_error = sock.connect_ex(sockaddr)
+                pending_errors = {
+                    errno.EINPROGRESS,
+                    errno.EALREADY,
+                    errno.EWOULDBLOCK,
+                    errno.EINTR,
+                    10035,  # WSAEWOULDBLOCK
+                    10036,  # WSAEINPROGRESS
+                    10037,  # WSAEALREADY
+                }
+                connected_errors = {0, errno.EISCONN, 10056}  # WSAEISCONN
+                deadline = time.monotonic() + 25.0
+                while connect_error not in connected_errors:
+                    if is_cancelled():
+                        raise _TransportCancelled("URL取得がキャンセルされました")
+                    if connect_error not in pending_errors:
+                        raise OSError(connect_error, os.strerror(connect_error))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("公開URL接続がタイムアウトしました")
+                    _, writable, exceptional = select.select(
+                        [], [sock], [sock], min(0.1, remaining)
+                    )
+                    if is_cancelled():
+                        raise _TransportCancelled("URL取得がキャンセルされました")
+                    if exceptional:
+                        connect_error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    elif writable:
+                        connect_error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if connect_error == 0:
+                            break
+                    if connect_error and connect_error not in pending_errors:
+                        raise OSError(connect_error, os.strerror(connect_error))
+                sock.settimeout(25)
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                if use_tls:
+                    if active_connections_lock is None:
+                        if is_cancelled():
+                            raise _TransportCancelled("URL取得がキャンセルされました")
+                        secure_sock = tls_context.wrap_socket(
+                            sock,
+                            server_hostname=host,
+                            do_handshake_on_connect=False,
+                        )
+                        conn.sock = secure_sock
+                        conn._aoi_transport_sock = secure_sock
+                        conn._aoi_pending_sock = None
+                    else:
+                        with active_connections_lock:
+                            if is_cancelled():
+                                cancelled = True
+                            else:
+                                secure_sock = tls_context.wrap_socket(
+                                    sock,
+                                    server_hostname=host,
+                                    do_handshake_on_connect=False,
+                                )
+                                conn.sock = secure_sock
+                                conn._aoi_transport_sock = secure_sock
+                                conn._aoi_pending_sock = None
+                                cancelled = is_cancelled()
+                        if cancelled:
+                            UrlIngestService._abort_connection(conn)
+                            raise _TransportCancelled("URL取得がキャンセルされました")
+                    secure_sock.setblocking(False)
+                    tls_deadline = time.monotonic() + 25.0
+                    while True:
+                        if is_cancelled():
+                            raise _TransportCancelled("URL取得がキャンセルされました")
+                        try:
+                            secure_sock.do_handshake()
+                            break
+                        except ssl.SSLWantReadError:
+                            read_socks, write_socks = [secure_sock], []
+                        except ssl.SSLWantWriteError:
+                            read_socks, write_socks = [], [secure_sock]
+                        remaining = tls_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise socket.timeout("TLS接続がタイムアウトしました")
+                        readable, writable, exceptional = select.select(
+                            read_socks, write_socks, [secure_sock], min(0.1, remaining)
+                        )
+                        if is_cancelled():
+                            raise _TransportCancelled("URL取得がキャンセルされました")
+                        if exceptional:
+                            raise OSError("TLSソケット接続に失敗しました")
+                        if not readable and not writable:
+                            continue
+                    secure_sock.settimeout(25)
+                    if is_cancelled():
+                        raise _TransportCancelled("URL取得がキャンセルされました")
+                else:
+                    attach_connected_socket(conn, sock)
+            except BaseException:
+                UrlIngestService._abort_connection(conn)
+                raise
+
+        def pinned_send(conn: Any, data: Any) -> None:
+            if conn.sock is None:
+                conn.connect()
+            if active_connections_lock is None:
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                sock = conn.sock
+            else:
+                with active_connections_lock:
+                    if is_cancelled():
+                        raise _TransportCancelled("URL取得がキャンセルされました")
+                    sock = conn.sock
+            if sock is None:
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                raise OSError("接続ソケットがありません")
+            if isinstance(data, str):
+                data = data.encode("ascii")
+            try:
+                sock.sendall(data)
+            except OSError:
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました") from None
+                raise
+
         try:
+            if parts.scheme == "https":
+                class PinnedHttpsConnection(http.client.HTTPSConnection):
+                    def connect(self):
+                        pinned_connect(self, use_tls=True)
+
+                    def send(self, data):
+                        pinned_send(self, data)
+
+                connection = PinnedHttpsConnection(
+                    host,
+                    port=port,
+                    timeout=25,
+                    context=UrlIngestService._verified_ssl_context(),
+                )
+            else:
+                class PinnedHttpConnection(http.client.HTTPConnection):
+                    def connect(self):
+                        pinned_connect(self, use_tls=False)
+
+                    def send(self, data):
+                        pinned_send(self, data)
+
+                connection = PinnedHttpConnection(address, port=port, timeout=25)
+            UrlIngestService._register_connection(
+                connection,
+                active_connections=active_connections,
+                active_connections_lock=active_connections_lock,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                raise _TransportCancelled("URL取得がキャンセルされました")
             connection.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
             connection.putheader("Host", host if parts.port is None else f"{host}:{parts.port}")
             connection.putheader("User-Agent", "Mozilla/5.0 (compatible; AoiTalkClip/1.0)")
             connection.putheader("Accept-Language", "ja,en;q=0.8")
             connection.putheader("Accept-Encoding", "identity")
             connection.endheaders()
+            if cancel_event is not None and cancel_event.is_set():
+                raise _TransportCancelled("URL取得がキャンセルされました")
             raw = connection.getresponse()
-            content = raw.read(8 * 1024 * 1024 + 1)
-            if len(content) > 8 * 1024 * 1024:
+            response_limit = 8 * 1024 * 1024
+            if max_bytes is None:
+                read_limit = response_limit + 1
+                exact_cap_requires_length = False
+            else:
+                budget_limit = max(0, int(max_bytes))
+                response_limit = min(response_limit, budget_limit)
+                # A one-byte probe is available only when the remaining
+                # instance budget is larger than the per-response cap.
+                read_limit = response_limit + 1 if budget_limit > response_limit else budget_limit
+                exact_cap_requires_length = budget_limit <= response_limit
+
+            chunks: list[bytes] = []
+            remaining = read_limit
+            while remaining > 0:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                try:
+                    chunk = raw.read(min(64 * 1024, remaining))
+                except (OSError, http.client.HTTPException):
+                    if is_cancelled():
+                        raise _TransportCancelled("URL取得がキャンセルされました") from None
+                    raise
+                if is_cancelled():
+                    raise _TransportCancelled("URL取得がキャンセルされました")
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                chunk = bytes(chunk)
+                chunks.append(chunk)
+                actual_read += len(chunk)
+                remaining -= len(chunk)
+                if len(chunk) > 64 * 1024:
+                    # A non-conforming test double or response object must not
+                    # make the loop read beyond the reservation.
+                    remaining = max(0, remaining)
+            content = b"".join(chunks)
+            content_length_header = raw.getheader("Content-Length")
+            content_encoding = str(raw.getheader("Content-Encoding") or "").strip().casefold()
+            if max_bytes is not None and content_encoding not in {"", "identity"}:
+                raise ValueError("圧縮された取得本文は扱えません")
+            content_length: int | None = None
+            if content_length_header not in (None, ""):
+                try:
+                    content_length = int(str(content_length_header))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("取得本文のサイズ情報が不正です") from exc
+                if content_length < 0:
+                    raise ValueError("取得本文のサイズ情報が不正です")
+                if content_length > response_limit:
+                    raise ValueError("取得本文がサイズ上限を超えました")
+                if actual_read < content_length:
+                    raise ValueError("取得本文が不完全です")
+                if actual_read > content_length:
+                    raise ValueError("取得本文のサイズ情報が不正です")
+            if len(content) > response_limit:
                 raise ValueError("取得本文がサイズ上限を超えました")
+            if exact_cap_requires_length and len(content) == response_limit:
+                # With no probe byte remaining, an unknown-length response
+                # filling the cap could be truncated at the total budget.
+                if content_length is None:
+                    raise ValueError("取得本文がサイズ上限を超えた可能性があります")
             url = parts.geturl()
             return httpx.Response(
                 raw.status, headers=dict(raw.getheaders()), content=content,
                 request=httpx.Request("GET", url),
             )
         finally:
-            connection.close()
+            if reservation is not None:
+                reservation.settle(actual_read)
+            if connection is not None:
+                UrlIngestService._unregister_connection(
+                    connection,
+                    active_connections=active_connections,
+                    active_connections_lock=active_connections_lock,
+                )
+                UrlIngestService._abort_connection(connection)
 
     async def _safe_get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
         """各redirect先を接続前に検証し、SSRFを防ぐ。
@@ -846,10 +1577,81 @@ class UrlIngestService:
         is revalidated and reviewed independently.
         """
         current = url
+        visited: set[str] = set()
         for _ in range(8):
-            parts, address = await self._resolve_public_url(current)
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError
+            await self._run_checkpoint("url_http_hop")
+            # Redirect cycles are bounded as an explicit condition, rather
+            # than spending all eight hops on the same two destinations.
+            current_key = UrlIngestService._canonical_public_url(current)
+            if current_key in visited:
+                raise ValueError("リダイレクト循環を検出しました")
+            visited.add(current_key)
+            ensure_allowed = getattr(self._privacy_gateway, "ensure_provider_allowed", None)
+            if callable(ensure_allowed):
+                ensure_allowed("url_ingest", base_url=current)
+            reservation: _ByteBudgetReservation | None = None
+            max_bytes: int | None = None
+            if self.max_total_bytes is not None:
+                # Reserve before starting the worker thread.  The per-response
+                # cap is still 8 MiB; a small remaining total budget narrows
+                # the read to the remaining capacity.
+                reservation = self._byte_budget.reserve(8 * 1024 * 1024 + 1)
+                max_bytes = reservation.reserved
+            try:
+                parts, address = await self._resolve_public_url(current)
+            except BaseException:
+                if reservation is not None:
+                    reservation.settle(0)
+                raise
+
+            request_started = threading.Event()
+
             async def sender(_protected_payload: Any) -> httpx.Response:
-                return await asyncio.to_thread(self._pinned_request, parts, address)
+                self._raise_if_cancelled()
+                request_started.set()
+                pinned = self._pinned_request
+                kwargs: dict[str, Any] = {}
+                # Keep narrow test doubles and existing embedders callable
+                # while passing the cancellation context to the canonical
+                # transport implementation.
+                try:
+                    parameters = inspect.signature(pinned).parameters
+                    accepts_kwargs = any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    parameters = {}
+                    accepts_kwargs = True
+                optional = {
+                    "max_bytes": max_bytes,
+                    "reservation": reservation,
+                    "cancel_event": self._cancel_event,
+                    "active_connections": self._active_connections,
+                    "active_connections_lock": self._active_connections_lock,
+                }
+                for name, value in optional.items():
+                    if accepts_kwargs or name in parameters:
+                        if value is not None:
+                            kwargs[name] = value
+                worker = asyncio.create_task(
+                    asyncio.to_thread(pinned, parts, address, **kwargs)
+                )
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # Shield keeps the underlying thread future alive while
+                    # the connection is shut down.  Await it briefly so a
+                    # cancelled fetch does not leave a worker holding the
+                    # service's reservation or active-connection slot.
+                    self.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(worker), timeout=1.0)
+                    except BaseException:
+                        worker.add_done_callback(_consume_transport_task)
+                    raise
 
             try:
                 response = await self._privacy_gateway.execute(
@@ -866,7 +1668,31 @@ class UrlIngestService:
                     source_kind="url_http_fetch",
                 )
             except (ExternalProviderBlocked, PrivacyError):
+                if reservation is not None and not request_started.is_set():
+                    # No transport bytes were observed when the gateway denied
+                    # the request before invoking the sender.
+                    reservation.settle(0)
                 raise
+            except _TransportCancelled as exc:
+                if reservation is not None and not request_started.is_set():
+                    reservation.settle(0)
+                raise asyncio.CancelledError from exc
+            except asyncio.CancelledError:
+                # ``asyncio.to_thread`` cannot stop a running synchronous
+                # reader by itself.  Close the registered connection before
+                # propagating cancellation so the worker exits promptly.
+                self.cancel()
+                raise
+            except Exception:
+                if reservation is not None and not request_started.is_set():
+                    reservation.settle(0)
+                raise
+            else:
+                if reservation is not None:
+                    actual = len(getattr(response, "content", b"") or b"")
+                    reservation.settle(actual)
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError
             if response.is_redirect:
                 location = response.headers.get("location")
                 if not location:
@@ -875,6 +1701,49 @@ class UrlIngestService:
                 continue
             return response
         raise ValueError("リダイレクト回数が上限を超えました")
+
+    async def _run_checkpoint(self, stage: str) -> None:
+        if self._cancel_event.is_set():
+            raise asyncio.CancelledError
+        callback = self.checkpoint
+        if callback is None:
+            return
+        try:
+            signature = inspect.signature(callback)
+            accepts_stage = any(
+                parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                )
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_stage = True
+        value = callback(stage) if accepts_stage else callback()
+        if inspect.isawaitable(value):
+            value = await value
+        if value is False:
+            self.cancel()
+            raise asyncio.CancelledError
+
+    @staticmethod
+    def _canonical_public_url(url: str) -> str:
+        """Normalize only scheme/hostname and remove fragments for loop checks."""
+
+        parts = urlsplit(str(url or ""))
+        hostname = (parts.hostname or "").casefold().rstrip(".")
+        if not hostname:
+            return str(url or "")
+        netloc = hostname
+        if parts.port is not None:
+            netloc = f"{hostname}:{parts.port}"
+        return parts._replace(
+            scheme=parts.scheme.casefold(),
+            netloc=netloc,
+            fragment="",
+        ).geturl()
 
     @staticmethod
     def _canonical_x_url(url: str) -> str:
@@ -1312,6 +2181,27 @@ class UrlIngestService:
         return str(node.get("content") or "").strip() if node else ""
 
     @staticmethod
+    def _citation_doi_url(value: str) -> str:
+        """Normalize one citation DOI metadata value to a public DOI URL."""
+
+        text = str(value or "").strip()
+        if text.casefold().startswith("doi:"):
+            text = text[4:].strip()
+        try:
+            parts = urlsplit(text)
+        except ValueError:
+            return ""
+        if parts.scheme in {"http", "https"} and (parts.hostname or "").casefold() in {
+            "doi.org",
+            "dx.doi.org",
+            "www.doi.org",
+        }:
+            text = parts.path.lstrip("/")
+        if not re.fullmatch(r"10\.\d{4,9}/\S+", text, flags=re.IGNORECASE):
+            return ""
+        return "https://doi.org/" + quote(text, safe="/._-()")
+
+    @staticmethod
     def _external_links(soup: BeautifulSoup, base_url: str) -> list[str]:
         base_host = (urlsplit(base_url).hostname or "").casefold()
         links: list[str] = []
@@ -1321,3 +2211,46 @@ class UrlIngestService:
                 if link not in links:
                     links.append(link)
         return links[:100]
+
+    @staticmethod
+    def _public_link_hints(soup: BeautifulSoup, base_url: str) -> list[str]:
+        """Return bounded same-site author/reference links from article markup.
+
+        Ordinary external-link extraction intentionally excludes same-host
+        navigation.  Citation expansion needs only explicit author/reference
+        hints, so retain those rel/class/path signals while ignoring generic
+        menus and links embedded in script text.
+        """
+
+        base_host = (urlsplit(base_url).hostname or "").casefold()
+        hints: list[str] = []
+        path_markers = ("/author", "/authors", "/reference", "/references", "/citation", "/bibliograph")
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href") or "").strip()
+            if not href:
+                continue
+            link = urljoin(base_url, href)
+            parts = urlsplit(link)
+            if parts.scheme not in {"http", "https"}:
+                continue
+            if (parts.hostname or "").casefold() != base_host:
+                continue
+            rel = " ".join(str(item) for item in (anchor.get("rel") or [])).casefold()
+            classes = " ".join(str(item) for item in (anchor.get("class") or [])).casefold()
+            text = anchor.get_text(" ", strip=True).casefold()
+            path = parts.path.casefold()
+            if (
+                "author" in rel
+                or "citation" in rel
+                or "reference" in rel
+                or "author" in classes
+                or "byline" in classes
+                or any(marker in path for marker in path_markers)
+                or text in {"author", "authors", "references", "citations"}
+            ):
+                normalized = parts._replace(fragment="").geturl()
+                if normalized not in hints:
+                    hints.append(normalized)
+                if len(hints) >= 32:
+                    break
+        return hints

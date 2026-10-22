@@ -1311,11 +1311,46 @@ class MediaRecognitionService:
             },
         ]
 
+    def _acquire_local_runtime_consumer_lease(self, route: Mapping[str, Any]):
+        provider = str(route.get("provider") or "").strip().lower()
+        if provider != "openai_compatible_local":
+            return None
+        from ..service_manager import _acquire_managed_local_runtime_consumer_for_route
+
+        return _acquire_managed_local_runtime_consumer_for_route(
+            self.config,
+            provider=provider,
+            model=str(route.get("model") or ""),
+            consumer="media",
+        )
+
     async def _recognize_openai_compatible_image(
         self,
         user_text: str,
         image: dict[str, Any],
         route: dict[str, Any],
+        *,
+        client: Any = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
+    ) -> str:
+        lease = self._acquire_local_runtime_consumer_lease(route)
+        try:
+            return await self._recognize_openai_compatible_image_unleased(
+                user_text,
+                image,
+                route,
+                client=client,
+                privacy_gateway=privacy_gateway,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    async def _recognize_openai_compatible_image_unleased(
+        self,
+        user_text: str,
+        image: dict[str, Any],
+        route: Mapping[str, Any],
         *,
         client: Any = None,
         privacy_gateway: OutboundPrivacyGateway | None = None,
@@ -1462,6 +1497,26 @@ class MediaRecognitionService:
                 return await client.chat.completions.create(**bare)
 
     async def _recognize_audio_with_llm(
+        self,
+        user_text: str,
+        audio: dict[str, Any],
+        route: dict[str, Any],
+        *,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
+    ) -> str:
+        lease = self._acquire_local_runtime_consumer_lease(route)
+        try:
+            return await self._recognize_audio_with_llm_unleased(
+                user_text,
+                audio,
+                route,
+                privacy_gateway=privacy_gateway,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    async def _recognize_audio_with_llm_unleased(
         self,
         user_text: str,
         audio: dict[str, Any],

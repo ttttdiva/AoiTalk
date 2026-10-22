@@ -151,8 +151,7 @@ rag:
     local_path: null  # リモート接続時はnull
     collection_name: aoitalk_knowledge
   embedding:
-    model: BAAI/bge-m3
-    batch_size: 32
+    batch_size: 8
     device: cpu
   reranker:
     model: BAAI/bge-reranker-v2-m3

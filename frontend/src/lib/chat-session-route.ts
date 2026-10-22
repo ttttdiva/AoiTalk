@@ -54,11 +54,30 @@ export function getModelEffortOptionsFromCatalog(
       : undefined;
   const modelEntry = modelCatalog?.find((item) => item.id === normalizedModel);
   if (normalizedProvider === "openai_compatible_local") {
+    const modelAlwaysThinking =
+      modelEntry?.thinking_mode?.trim().toLowerCase() === "always" ||
+      modelEntry?.runtime_profile?.thinking_mode?.trim().toLowerCase() === "always" ||
+      (modelEntry?.reasoning_effort_default?.trim().toLowerCase() === "always" &&
+        modelEntry.reasoning_effort_options?.length === 1 &&
+        modelEntry.reasoning_effort_options[0]?.trim().toLowerCase() === "always");
+    if (modelAlwaysThinking) return ["always"];
     const modelHasProfileContract = Boolean(
       modelEntry?.reasoning_effort_default && modelEntry?.reasoning_effort_wire,
     );
     if (modelHasProfileContract) return modelEntry?.reasoning_effort_options ?? [];
+    // Provider settings describe the configured model, not every served
+    // model.  Once a target entry exists, keep its own (possibly generic)
+    // contract authoritative instead of borrowing the current model's
+    // always-thinking fallback.
+    if (modelEntry) return [];
+    const settingsModel = providerEntry?.configured_model?.trim();
+    if (settingsModel !== normalizedModel) return [];
     const settings = providerEntry?.settings;
+    const settingsAlwaysThinking =
+      settings?.reasoning_effort_default?.trim().toLowerCase() === "always" &&
+      settings.reasoning_effort_options?.length === 1 &&
+      settings.reasoning_effort_options[0]?.trim().toLowerCase() === "always";
+    if (settingsAlwaysThinking) return ["always"];
     const settingsHaveProfileContract = Boolean(
       settings?.reasoning_effort_default && settings?.reasoning_effort_wire,
     );
@@ -79,6 +98,8 @@ export type UnderlyingRouteContext = {
   sessionEffectiveMain?: NullableRouteFields | null;
   runtimeProvider?: string | null;
   runtimeModel?: string | null;
+  /** Runtime route is generation-safe only when the caller has verified a served model proof. */
+  runtimeRouteReady?: boolean;
 };
 
 function resolveRouteFromAuthoritativeSources(
@@ -108,6 +129,20 @@ function resolveRouteFromAuthoritativeSources(
       provider: effectiveMain.provider,
       model: effectiveMain.model,
       effort: effectiveMain.effort || "",
+    };
+  }
+  if (
+    !context.sessionId &&
+    !routeFromSettings.provider &&
+    !routeFromSettings.model &&
+    context.runtimeRouteReady &&
+    context.runtimeProvider?.trim() &&
+    context.runtimeModel?.trim()
+  ) {
+    return {
+      provider: context.runtimeProvider.trim().toLowerCase(),
+      model: context.runtimeModel.trim(),
+      effort: "",
     };
   }
   return null;
@@ -208,4 +243,26 @@ export function resolveEffortForModel(
     || providerEntry?.settings?.reasoning_effort_default
     || "medium";
   return defaultModeForOptions(options, preferred);
+}
+
+/**
+ * Normalize stale persisted/display effort for a model-owned always-thinking
+ * contract.  This is intentionally limited to the singleton `always`
+ * option, so generic local, OpenAI, Qwen, and Strata routes keep their
+ * existing effort values and fallback behavior.
+ */
+export function normalizeAlwaysThinkingRoute(
+  catalog: LlmModelCatalogResponse | null | undefined,
+  route: ResolvedUnderlyingRoute | null,
+): ResolvedUnderlyingRoute | null {
+  if (!route) return null;
+  const options = getModelEffortOptionsFromCatalog(
+    catalog,
+    route.provider,
+    route.model,
+  );
+  if (options.length === 1 && options[0] === "always") {
+    return route.effort === "always" ? route : { ...route, effort: "always" };
+  }
+  return route;
 }

@@ -29,6 +29,7 @@ type CharacterSelectorProps = {
   session: ConversationSession | null;
   runState: RunState;
   onChange: (slug: string) => Promise<void>;
+  locked?: boolean;
 };
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -47,13 +48,16 @@ export function CharacterSelector({
   session,
   runState,
   onChange,
+  locked = false,
 }: CharacterSelectorProps) {
   const [visible, setVisible] = useState(false);
   const [characters, setCharacters] = useState<ManagedCharacter[]>([]);
   const [loading, setLoading] = useState(false);
   const [savingSlug, setSavingSlug] = useState<string | null>(null);
   const [dialogError, setDialogError] = useState<string | null>(null);
-  const availability = getCharacterChangeAvailability(session, runState);
+  const availability = locked
+    ? { allowed: false, reason: "AoiDots root のCharacterは固定されています。" }
+    : getCharacterChangeAvailability(session, runState);
   const currentSlug = session?.character_name?.trim() || "";
   const currentCharacter = useMemo(
     () => characters.find((character) => character.slug === currentSlug),
@@ -145,7 +149,7 @@ export function CharacterSelector({
           !availability.allowed ? styles.chipUnavailable : null,
         ]}
       >
-        <Text style={styles.chipLabel} numberOfLines={1}>
+        <Text style={styles.chipLabel}>
           {currentLabel}
         </Text>
         <Text style={styles.chevron}>⌄</Text>
@@ -253,11 +257,13 @@ export function CharacterSelector({
 
 const styles = StyleSheet.create({
   chip: {
+    width: "100%",
     maxWidth: "100%",
+    minWidth: 0,
     minHeight: 44,
     flexShrink: 1,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     borderRadius: 12,
     backgroundColor: "transparent",
     paddingHorizontal: 6,
@@ -265,13 +271,15 @@ const styles = StyleSheet.create({
   },
   chipUnavailable: { opacity: 0.72 },
   chipLabel: {
+    flex: 1,
     minWidth: 0,
     flexShrink: 1,
     color: "#cdd6f4",
     fontSize: 13,
     fontWeight: "600",
+    paddingVertical: 4,
   },
-  chevron: { color: "#a6adc8", fontSize: 12, marginLeft: 3 },
+  chevron: { color: "#a6adc8", fontSize: 12, marginLeft: 3, paddingTop: 4, flexShrink: 0 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
   reasonCard: {

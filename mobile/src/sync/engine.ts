@@ -1,6 +1,6 @@
-import { eq, like } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
-import { runBackgroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import { runBackgroundSqliteWrite, runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import {
   docsSqliteAsyncAvailable,
   encodeDocsBoolean,
@@ -11,15 +11,18 @@ import {
 } from "../db/docs-sync-async";
 import {
   hasPendingOutbox,
+  getOutboxState,
   listPendingOutbox,
   markOutboxConflict,
   markOutboxError,
   rebaseOutboxOp,
   recordOutboxServerSnapshot,
   removeOutboxOpIfSnapshot,
-  removeOutboxOp,
   randomId,
+  validateOutboxConflictServerScope,
 } from "../repositories/outbox";
+import { rebaseDocsWriteFollowups, rebaseLegacyBlankDocsUpdate, isDocsResultOlderThanRecordedConflict, matchesDocsCreateContent, compareDocsVersions } from "../repositories/docs-create-ack";
+import { isTaskCasStaleReason, matchesTaskUpdateReceipt } from "./task-update-receipt";
 import {
   applyRemoteTasks,
   applyTaskRestore,
@@ -96,20 +99,42 @@ import type {
   TimeEntry,
 } from "../types/api";
 import { canAttemptAoiTalkServer } from "../stores/network";
+import { useSyncStatusStore } from "../stores/sync-status";
+import type {
+  DocsProgressUpdate,
+  OutboxSyncState,
+  SyncDocsScope,
+  SyncStage,
+} from "../stores/sync-status";
 import { getCachedToken, getToken, getTokenAuthScope } from "../lib/auth";
-import { isApiConnectionError, isApiHttpError } from "../lib/api-client";
+import {
+  createApiRequestId,
+  isApiConnectionError,
+  isApiHttpError,
+  isApiTimeoutError,
+} from "../lib/api-client";
 import {
   enqueueAuthScopeExclusive,
-  runAuthScopeTransition,
+  runAuthScopeTransition as runQueuedAuthScopeTransition,
 } from "../lib/auth-scope-queue";
+import { registerMutationWakeListener } from "./task-mutation-wake";
+import { isMobileReadOnlyDiagnosticsEnabled } from "../lib/read-only-diagnostics";
 import {
   pullSync,
   pushSync,
   type DocsSyncScope,
+  type SyncPullLifecycle,
+  type SyncPullRequestOutcome,
   type SyncPullResponse,
   type SyncPushOperation,
+  type SyncPushResult,
   type SyncTable,
 } from "./api";
+
+import {
+  GENERAL_DIGEST_VERSION, generalDigestsForRequest, generalTableNeedsApply, reusableGeneralDigests,
+  validGeneralDigests, validateGeneralDigestPage,
+} from "./general-sync-digests";
 
 const TABLES: SyncTable[] = [
   "projects",
@@ -137,16 +162,18 @@ const DOCS_TABLES: SyncTable[] = [
 // Docsはページ単位で同一snapshotを検証するため、Web/PC側の編集がページ間に
 // 入るとサーバーが400でcursorを無効化する。短いバックオフを挟んで再取得し、
 // 一時的な競合で設定画面の強制同期が失敗しないようにする。
-const DOCS_PULL_MAX_ATTEMPTS = 3;
+const DOCS_PULL_MAX_ATTEMPTS = 4;
 const DOCS_PULL_RETRY_DELAY_MS = 80;
+const DOCS_PULL_TRANSPORT_RETRY_DELAY_MS = 750;
 /** Keep each staging write transaction small enough for production pages. */
 export const DOCS_STAGING_WRITE_BATCH_SIZE = 256;
 
 export type DocsResyncProgress = {
-  phase: "preparing" | "downloading" | "finalizing";
+  phase: "queued" | "preparing" | "downloading" | "retrying" | "finalizing";
   completed: number;
   total: number | null;
   page: number;
+  retryAttempt?: number;
   /** Bounded scale telemetry; UI callers may ignore these optional fields. */
   stagedRowsWritten?: number;
   stagedRowsRead?: number;
@@ -154,10 +181,141 @@ export type DocsResyncProgress = {
   stagedPromotionMaxBatchSize?: number;
 };
 
+export type SyncDiagnosticSkipReason =
+  | "no_token"
+  | "read_only_diagnostics"
+  | "not_active"
+  | "backend_unavailable"
+  | "auth_lookup_pending"
+  | "already_running"
+  | "auth_scope_changed"
+  | "active_scope_transition";
+
+export type SyncDiagnosticFailureReason = "auth_lookup_failed";
+
+export type SyncDiagnosticOutcome =
+  | "running"
+  | "success"
+  | "partial"
+  | "failed"
+  | "interrupted"
+  | "skipped";
+
+export type SyncDiagnosticScope = "general" | "personal" | "shared" | "project";
+
+export type SyncDiagnosticTable = {
+  table: SyncTable;
+  /** False means the response did not contain this table; zero is not inferred. */
+  received: boolean;
+  changes: number;
+  authoritativeCount: number | null;
+  hasMore: boolean | null;
+};
+
+export type DocsSyncDiagnosticStage =
+  | "load_saved_scopes"
+  | "load_last_pulled"
+  | "load_table_digests"
+  | "load_scope_digest"
+  | "load_scope_revision"
+  | "load_active_run"
+  | "create_run"
+  | "ready_resume"
+  | "http_pull"
+  | "reload_ready_run"
+  | "promoting";
+
+export type DocsSyncDiagnostic = {
+  stage: DocsSyncDiagnosticStage;
+  /** Total elapsed time since this flight's Docs watchdog budget began. */
+  elapsedMs: number;
+  runState: "downloading" | "ready" | null;
+  pendingTables: number | null;
+};
+
+export type SyncPullDiagnostic = {
+  requestId: string;
+  kind: "general" | "docs";
+  scope: SyncDiagnosticScope;
+  startedAt: number;
+  finishedAt: number | null;
+  status: number | null;
+  outcome: SyncPullRequestOutcome | "not_sent";
+  /** Number/statuses of HTTP attempts; retries retain the same requestId. */
+  attemptCount: number;
+  /** Null entries are attempts that ended without an HTTP response. */
+  attemptStatuses: Array<number | null>;
+  hasMore: boolean | null;
+  promotion: "not_applicable" | "staged" | "applied" | "promoted" | "failed" | "discarded";
+  promotionGeneration: number | null;
+  tables: SyncDiagnosticTable[];
+};
+
+export type SyncDiagnosticReceipt = {
+  requestId: string;
+  requestedAt: number;
+  authGeneration: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  outcome: SyncDiagnosticOutcome;
+  skipReason: SyncDiagnosticSkipReason | null;
+  failureReason: SyncDiagnosticFailureReason | null;
+  /** Set for a coalesced waiter; points at the actual running receipt. */
+  canonicalRequestId: string | null;
+  /** Current fixed Docs child checkpoint, independent of HTTP pull receipts. */
+  docsSubstage: DocsSyncDiagnostic | null;
+  /** Immutable copy of the Docs checkpoint captured by the 90s watchdog. */
+  docsWatchdog: DocsSyncDiagnostic | null;
+  pulls: SyncPullDiagnostic[];
+};
+
+/**
+ * Request-owned, read-only access to a diagnostic receipt.
+ *
+ * The request object remains authoritative after its bounded history entry is
+ * evicted.  Consumers receive a fresh clone on every read so diagnostics
+ * cannot mutate the live engine receipt.  A handle is scoped to the auth
+ * generation in which it was created and becomes unusable after a transition.
+ */
+export type SyncDiagnosticRequestHandle = {
+  requestId: string;
+  authGeneration: number;
+  getReceipt: () => SyncDiagnosticReceipt | null;
+};
+
+export type SyncDiagnosticSnapshot = {
+  requestCount: number;
+  executionCount: number;
+  runningScopes: number;
+  authGeneration: number;
+  latest: SyncDiagnosticReceipt | null;
+  recent: SyncDiagnosticReceipt[];
+  /** Canonical receipts retained outside the bounded request history. */
+  retained?: SyncDiagnosticReceipt[];
+};
+
+export type SyncDiagnosticListener = (snapshot: SyncDiagnosticSnapshot) => void;
+
 type DocsResyncProgressHandler = (progress: DocsResyncProgress) => void;
 
 type PendingOutbox = typeof schema.outbox.$inferSelect;
-type SyncExecutionContext = { epoch: number };
+type PendingOutboxSnapshot = Parameters<typeof removeOutboxOpIfSnapshot>[1];
+type SyncExecutionContext = {
+  epoch: number;
+  controller: AbortController;
+  /** Present only for a normal product sync; force Docs resync has its own UI. */
+  flightSequence?: number;
+  lastDocsProgressKey?: string;
+  docsLiveWriteState?: { started: boolean };
+  docsDiagnostic?: {
+    startedAt: number;
+    stage: DocsSyncDiagnosticStage | null;
+    runState: DocsSyncDiagnostic["runState"];
+    pendingTables: number | null;
+    frozen: boolean;
+  };
+  diagnostic?: SyncDiagnosticReceipt;
+};
 type DocsSyncRunRow = typeof schema.docsSyncRuns.$inferSelect;
 type DocsSyncAuthoritative = Record<
   string,
@@ -166,7 +324,18 @@ type DocsSyncAuthoritative = Record<
 type RunningSyncFlight = {
   epoch: number;
   promise: Promise<void>;
+  mutationWakeRequested: boolean;
+  diagnostic: SyncDiagnosticReceipt;
 };
+
+// Only a failed read request is automatically replayable. Local staging,
+// promotion and progress observers may also throw errors mentioning timeout.
+class DocsPullTransportError extends Error {
+  constructor(readonly originalError: unknown) {
+    super("Docs pull transport failed");
+    this.name = "DocsPullTransportError";
+  }
+}
 
 class SyncExecutionInterruptedError extends Error {
   constructor() {
@@ -177,31 +346,546 @@ class SyncExecutionInterruptedError extends Error {
 
 const completedSync = Promise.resolve();
 const runningByAuthScope = new Map<string, RunningSyncFlight>();
+type RunningDocsResyncFlight = {
+  promise: Promise<void>;
+  listeners: Set<DocsResyncProgressHandler>;
+  progress: DocsResyncProgress;
+};
+const docsResyncByAuthScope = new Map<string, RunningDocsResyncFlight>();
 let unresolvedAuthFlight: Promise<void> | null = null;
 let syncRequestCount = 0;
 let syncExecutionCount = 0;
+let syncFlightSequence = 0;
 let syncExecutionActive = true;
 let syncExecutionEpoch = 0;
+let syncDiagnosticGeneration = 0;
+let nextSyncDiagnosticPromotionGeneration = 0;
+const activeSyncContexts = new Set<SyncExecutionContext>();
+let nextAuthScopeTransitionToken = 0;
+const activeAuthScopeTransitions = new Set<number>();
+const deferredMutationWakeScopes = new Set<string>();
+
+const SYNC_DIAGNOSTIC_HISTORY_LIMIT = 8;
+const SYNC_DIAGNOSTIC_PULL_LIMIT = 32;
+const SYNC_DIAGNOSTIC_TABLE_LIMIT = 20;
+const syncDiagnosticHistory: SyncDiagnosticReceipt[] = [];
+const syncDiagnosticCanonicalReceipts = new Map<string, SyncDiagnosticReceipt>();
+let latestSyncDiagnosticCanonical: SyncDiagnosticReceipt | null = null;
+const syncDiagnosticListeners = new Set<SyncDiagnosticListener>();
+let syncDiagnosticNotifyQueued = false;
+
+function notifySyncDiagnosticListeners(): void {
+  if (syncDiagnosticNotifyQueued || syncDiagnosticListeners.size === 0) return;
+  syncDiagnosticNotifyQueued = true;
+  queueMicrotask(() => {
+    syncDiagnosticNotifyQueued = false;
+    if (syncDiagnosticListeners.size === 0) return;
+    const snapshot = getSyncDiagnosticSnapshot();
+    for (const listener of [...syncDiagnosticListeners]) {
+      try {
+        listener(snapshot);
+      } catch {
+        // A diagnostics observer must never affect the sync flight.
+      }
+    }
+  });
+}
+
+/** Subscribe to bounded, non-secret sync diagnostics without polling. */
+export function subscribeSyncDiagnostics(listener: SyncDiagnosticListener): () => void {
+  syncDiagnosticListeners.add(listener);
+  return () => syncDiagnosticListeners.delete(listener);
+}
+
+function trimSyncDiagnosticHistory(): void {
+  while (syncDiagnosticHistory.length > SYNC_DIAGNOSTIC_HISTORY_LIMIT) {
+    // Canonical receipts are retained separately below. The request history
+    // itself stays hard-bounded even while an old flight is still running.
+    syncDiagnosticHistory.shift();
+  }
+}
+
+function retainSyncDiagnosticCanonical(receipt: SyncDiagnosticReceipt): void {
+  if (receipt.authGeneration !== syncDiagnosticGeneration) return;
+  syncDiagnosticCanonicalReceipts.set(receipt.requestId, receipt);
+  latestSyncDiagnosticCanonical = receipt;
+  while (syncDiagnosticCanonicalReceipts.size > SYNC_DIAGNOSTIC_HISTORY_LIMIT) {
+    const oldest = syncDiagnosticCanonicalReceipts.keys().next().value as string | undefined;
+    if (!oldest) break;
+    syncDiagnosticCanonicalReceipts.delete(oldest);
+  }
+  notifySyncDiagnosticListeners();
+}
+
+function getActiveSyncDiagnosticCanonicals(): SyncDiagnosticReceipt[] {
+  const active = new Map<string, SyncDiagnosticReceipt>();
+  for (const flight of runningByAuthScope.values()) {
+    const receipt = flight.diagnostic;
+    if (
+      receipt.authGeneration === syncDiagnosticGeneration
+      && receipt.canonicalRequestId === null
+    ) {
+      active.set(receipt.requestId, receipt);
+    }
+  }
+  // A context can be active during the short hand-off before its flight is
+  // published in runningByAuthScope. Keep that canonical discoverable without
+  // growing the request history ring.
+  for (const context of activeSyncContexts) {
+    const receipt = context.diagnostic;
+    if (
+      receipt
+      && receipt.authGeneration === syncDiagnosticGeneration
+      && receipt.canonicalRequestId === null
+    ) {
+      active.set(receipt.requestId, receipt);
+    }
+  }
+  return [...active.values()];
+}
+
+function createSyncDiagnosticReceipt(): SyncDiagnosticReceipt {
+  const receipt: SyncDiagnosticReceipt = {
+    requestId: createApiRequestId("sync-run"),
+    requestedAt: Date.now(),
+    authGeneration: syncDiagnosticGeneration,
+    startedAt: null,
+    finishedAt: null,
+    outcome: "running",
+    skipReason: null,
+    failureReason: null,
+    canonicalRequestId: null,
+    docsSubstage: null,
+    docsWatchdog: null,
+    pulls: [],
+  };
+  syncDiagnosticHistory.push(receipt);
+  trimSyncDiagnosticHistory();
+  notifySyncDiagnosticListeners();
+  return receipt;
+}
+
+function markSyncDiagnosticStarted(receipt: SyncDiagnosticReceipt): void {
+  if (receipt.startedAt != null) return;
+  receipt.startedAt = Date.now();
+  notifySyncDiagnosticListeners();
+}
+
+function finishSyncDiagnostic(
+  receipt: SyncDiagnosticReceipt,
+  outcome: SyncDiagnosticOutcome,
+  skipReason: SyncDiagnosticSkipReason | null = null,
+  failureReason: SyncDiagnosticFailureReason | null = null,
+): void {
+  receipt.outcome = outcome;
+  receipt.skipReason = skipReason;
+  receipt.failureReason = failureReason;
+  receipt.finishedAt ??= Date.now();
+  trimSyncDiagnosticHistory();
+  notifySyncDiagnosticListeners();
+}
+
+function diagnosticScopeFor(
+  scopeId?: string,
+  projectId?: string | null,
+): SyncDiagnosticScope {
+  if (projectId) return "project";
+  if (scopeId) return "shared";
+  return "personal";
+}
+
+function beginPullDiagnostic(
+  receipt: SyncDiagnosticReceipt | undefined,
+  kind: "general" | "docs",
+  scope: SyncDiagnosticScope,
+  tables: SyncTable[],
+  promotion: SyncPullDiagnostic["promotion"],
+  promotionGeneration: number | null = null,
+): SyncPullDiagnostic | null {
+  if (!receipt) return null;
+  const pull: SyncPullDiagnostic = {
+    requestId: createApiRequestId("sync-pull"),
+    kind,
+    scope,
+    startedAt: Date.now(),
+    finishedAt: null,
+    status: null,
+    outcome: "not_sent",
+    attemptCount: 0,
+    attemptStatuses: [],
+    hasMore: null,
+    promotion,
+    promotionGeneration,
+    tables: tables.slice(0, SYNC_DIAGNOSTIC_TABLE_LIMIT).map((table) => ({
+      table,
+      received: false,
+      changes: 0,
+      authoritativeCount: null,
+      hasMore: null,
+    })),
+  };
+  receipt.pulls.push(pull);
+  while (receipt.pulls.length > SYNC_DIAGNOSTIC_PULL_LIMIT) receipt.pulls.shift();
+  notifySyncDiagnosticListeners();
+  return pull;
+}
+
+function pullDiagnosticLifecycle(
+  pull: SyncPullDiagnostic | null,
+): SyncPullLifecycle | undefined {
+  if (!pull) return undefined;
+  return {
+    onAttempt: () => {
+      pull.attemptCount += 1;
+      if (pull.attemptStatuses.length < 8) pull.attemptStatuses.push(null);
+      notifySyncDiagnosticListeners();
+    },
+    onResponse: ({ status }) => {
+      pull.status = status;
+      const last = pull.attemptStatuses.length - 1;
+      if (last >= 0 && pull.attemptStatuses[last] == null) {
+        pull.attemptStatuses[last] = status;
+      } else if (pull.attemptStatuses.length < 8) {
+        pull.attemptStatuses.push(status);
+      }
+      notifySyncDiagnosticListeners();
+    },
+    onFinish: ({ finishedAt, status, outcome }) => {
+      pull.finishedAt = finishedAt;
+      pull.status = status;
+      pull.outcome = outcome;
+      notifySyncDiagnosticListeners();
+    },
+  };
+}
+
+function recordPullResponse(
+  pull: SyncPullDiagnostic | null,
+  response: SyncPullResponse,
+  pendingTables: SyncTable[],
+  promotion: SyncPullDiagnostic["promotion"],
+): void {
+  if (!pull) return;
+  pull.promotion = promotion;
+  pull.hasMore = typeof response.has_more === "boolean"
+    ? response.has_more
+    : null;
+  pull.tables = pendingTables.slice(0, SYNC_DIAGNOSTIC_TABLE_LIMIT).map((table) => {
+    const payload = response.tables[table];
+    return {
+      table,
+      received: Boolean(payload),
+      changes: payload?.changes?.length ?? 0,
+      authoritativeCount: typeof payload?.authoritative_count === "number"
+        && Number.isFinite(payload.authoritative_count)
+        ? Math.max(0, payload.authoritative_count)
+        : null,
+      hasMore: payload ? payload.cursor != null : null,
+    };
+  });
+  if (pull.finishedAt == null) {
+    pull.finishedAt = Date.now();
+    pull.status ??= 200;
+    pull.outcome = "success";
+    pull.attemptCount = Math.max(1, pull.attemptCount);
+    if (pull.attemptStatuses.length === 0 && pull.status != null) {
+      pull.attemptStatuses = [pull.status];
+    }
+  }
+  notifySyncDiagnosticListeners();
+}
+
+function finishPullDiagnosticFromError(
+  pull: SyncPullDiagnostic | null,
+  error: unknown,
+): void {
+  if (!pull || pull.finishedAt != null) return;
+  pull.finishedAt = Date.now();
+  pull.status = isApiHttpError(error) ? error.status : null;
+  if (pull.status != null) {
+    pull.attemptCount = Math.max(1, pull.attemptCount);
+    if (pull.attemptStatuses.length === 0) pull.attemptStatuses = [pull.status];
+  }
+  pull.outcome = isApiHttpError(error)
+    ? "http_error"
+    : error instanceof Error && error.name === "AbortError"
+      ? "cancelled"
+      : isApiConnectionError(error) || isApiTimeoutError(error)
+        ? "transport_error"
+        : "parse_error";
+  notifySyncDiagnosticListeners();
+}
+
+function markDocsPromotion(
+  receipt: SyncDiagnosticReceipt | undefined,
+  scope: SyncDiagnosticScope,
+  promotion: "promoted" | "failed" | "discarded",
+  promotionGeneration: number | null = null,
+): void {
+  if (!receipt) return;
+  for (const pull of receipt.pulls) {
+    if (
+      pull.kind === "docs"
+      && pull.scope === scope
+      && (pull.promotion === "staged" || pull.promotion === "applied")
+      && (promotionGeneration == null || pull.promotionGeneration === promotionGeneration)
+    ) {
+      pull.promotion = promotion;
+    }
+  }
+  notifySyncDiagnosticListeners();
+}
+
+function markStagedDocsPromotionsFailed(receipt: SyncDiagnosticReceipt | undefined): void {
+  if (!receipt) return;
+  for (const pull of receipt.pulls) {
+    if (
+      pull.kind === "docs"
+      && pull.promotion === "staged"
+    ) {
+      pull.promotion = "failed";
+    }
+  }
+  notifySyncDiagnosticListeners();
+}
+
+function cloneSyncDiagnosticReceipt(
+  receipt: SyncDiagnosticReceipt,
+): SyncDiagnosticReceipt {
+  return {
+    ...receipt,
+    docsSubstage: receipt.docsSubstage ? { ...receipt.docsSubstage } : null,
+    docsWatchdog: receipt.docsWatchdog ? { ...receipt.docsWatchdog } : null,
+    pulls: receipt.pulls.map((pull) => ({
+      ...pull,
+      attemptStatuses: [...pull.attemptStatuses],
+      tables: pull.tables.map((table) => ({ ...table })),
+    })),
+  };
+}
+
+function docsRunDiagnosticFields(run: DocsSyncRunRow | null): {
+  runState: DocsSyncDiagnostic["runState"];
+  pendingTables: number | null;
+} {
+  if (!run) return { runState: null, pendingTables: null };
+  const pending = parseJsonRecord<unknown>(run.pendingJson, null);
+  return {
+    runState: run.state === "downloading" || run.state === "ready"
+      ? run.state
+      : null,
+    pendingTables: Array.isArray(pending) ? pending.length : null,
+  };
+}
+
+function publishDocsSubstage(context: SyncExecutionContext): void {
+  const runtime = context.docsDiagnostic;
+  if (!runtime || runtime.frozen || !runtime.stage || !context.diagnostic) return;
+  context.diagnostic.docsSubstage = {
+    stage: runtime.stage,
+    elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
+    runState: runtime.runState,
+    pendingTables: runtime.pendingTables,
+  };
+  notifySyncDiagnosticListeners();
+}
+
+function markDocsSubstage(
+  context: SyncExecutionContext,
+  stage: DocsSyncDiagnosticStage,
+  run?: DocsSyncRunRow | null,
+): void {
+  const runtime = context.docsDiagnostic;
+  if (!runtime || runtime.frozen) return;
+  runtime.stage = stage;
+  if (run !== undefined) {
+    const fields = docsRunDiagnosticFields(run);
+    runtime.runState = fields.runState;
+    runtime.pendingTables = fields.pendingTables;
+  }
+  publishDocsSubstage(context);
+}
+
+function updateDocsRunDiagnostic(
+  context: SyncExecutionContext,
+  run: DocsSyncRunRow | null,
+): void {
+  const runtime = context.docsDiagnostic;
+  if (!runtime || runtime.frozen) return;
+  const fields = docsRunDiagnosticFields(run);
+  runtime.runState = fields.runState;
+  runtime.pendingTables = fields.pendingTables;
+  publishDocsSubstage(context);
+}
+
+function resetDocsRunDiagnosticFields(context: SyncExecutionContext): void {
+  const runtime = context.docsDiagnostic;
+  if (!runtime || runtime.frozen) return;
+  runtime.runState = null;
+  runtime.pendingTables = null;
+}
+
+function captureDocsWatchdog(context: SyncExecutionContext): void {
+  const runtime = context.docsDiagnostic;
+  if (!runtime || runtime.frozen || !runtime.stage) return;
+  runtime.frozen = true;
+  if (!context.diagnostic || context.diagnostic.docsWatchdog) return;
+  const snapshot: DocsSyncDiagnostic = {
+    stage: runtime.stage,
+    elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
+    runState: runtime.runState,
+    pendingTables: runtime.pendingTables,
+  };
+  context.diagnostic.docsSubstage = { ...snapshot };
+  context.diagnostic.docsWatchdog = { ...snapshot };
+  notifySyncDiagnosticListeners();
+}
+
+/**
+ * Capture a request-owned diagnostic receipt before bounded history can evict
+ * it.  The closure intentionally holds the original receipt object rather
+ * than adding another global retention structure or decorating a shared
+ * single-flight promise.
+ */
+export function getSyncDiagnosticRequestHandle(
+  requestId: string | null | undefined,
+  authGeneration = syncDiagnosticGeneration,
+): SyncDiagnosticRequestHandle | null {
+  if (!requestId) return null;
+  const receipt = syncDiagnosticHistory.find((candidate) => candidate.requestId === requestId)
+    ?? syncDiagnosticCanonicalReceipts.get(requestId)
+    ?? getActiveSyncDiagnosticCanonicals().find((candidate) => candidate.requestId === requestId)
+    ?? null;
+  if (!receipt || receipt.authGeneration !== authGeneration) return null;
+  return {
+    requestId: receipt.requestId,
+    authGeneration,
+    getReceipt: () => (
+      syncDiagnosticGeneration === authGeneration
+      && receipt.authGeneration === authGeneration
+        ? cloneSyncDiagnosticReceipt(receipt)
+        : null
+    ),
+  };
+}
 
 export function setSyncExecutionActive(active: boolean): void {
   if (syncExecutionActive === active) return;
   syncExecutionActive = active;
   syncExecutionEpoch += 1;
+  if (!active) {
+    // Abort in-flight HTTP immediately.  The old epoch check still protects
+    // every SQLite/write boundary, while the signal releases the auth-scope
+    // queue without waiting for the 60s pull timeout or transport retries.
+    for (const context of activeSyncContexts) context.controller.abort();
+  }
 }
 
-function createSyncExecutionContext(): SyncExecutionContext {
-  return { epoch: syncExecutionEpoch };
+function createSyncExecutionContext(
+  flightSequence?: number,
+  diagnostic?: SyncDiagnosticReceipt,
+): SyncExecutionContext {
+  const context = {
+    epoch: syncExecutionEpoch,
+    controller: new AbortController(),
+    flightSequence,
+    diagnostic,
+  };
+  activeSyncContexts.add(context);
+  return context;
+}
+
+function releaseSyncExecutionContext(context: SyncExecutionContext): void {
+  activeSyncContexts.delete(context);
 }
 
 function assertSyncExecutionActive(context: SyncExecutionContext): void {
-  if (!syncExecutionActive || context.epoch !== syncExecutionEpoch) {
+  if (
+    !syncExecutionActive
+    || context.epoch !== syncExecutionEpoch
+    || context.controller.signal.aborted
+  ) {
     throw new SyncExecutionInterruptedError();
   }
+}
+
+function isSyncExecutionInterrupted(
+  context: SyncExecutionContext,
+): boolean {
+  return (
+    context.controller.signal.aborted
+    || !syncExecutionActive
+    || context.epoch !== syncExecutionEpoch
+  );
 }
 
 function enqueueExclusive(operation: () => Promise<void>): Promise<void> {
   return enqueueAuthScopeExclusive(operation);
 }
+
+function wakeMutationSync(authScope: string): void {
+  const start = (token: string | null): void => {
+    if (!token || getTokenAuthScope(token) !== authScope) return;
+    void runSyncForToken(token).catch(() => undefined);
+  };
+  const cached = getCachedToken();
+  if (cached !== undefined) {
+    start(cached);
+    return;
+  }
+  void getToken().then(start).catch(() => undefined);
+}
+
+function requestMutationSyncForToken(authScope: string, token: string): void {
+  if (isMobileReadOnlyDiagnosticsEnabled()) {
+    void runSyncForToken(token).catch(() => undefined);
+    return;
+  }
+  updateSyncStatus(() => useSyncStatusStore.getState().markOutboxQueued(authScope));
+  const running = runningByAuthScope.get(authScope);
+  if (running) {
+    // The outbox row is durable.  A single trailing run is enough even when
+    // several edits arrive during the same long general/Docs flight.
+    running.mutationWakeRequested = true;
+    return;
+  }
+  void runSyncForToken(token).catch(() => undefined);
+}
+
+function requestMutationSync(authScope: string): void {
+  if (activeAuthScopeTransitions.size > 0) {
+    // Keep the durable mutation's wake until the new token/scope is settled;
+    // otherwise an old-scope notification could mark the new UI as pending.
+    deferredMutationWakeScopes.add(authScope);
+    return;
+  }
+  const cached = getCachedToken();
+  if (cached !== undefined) {
+    if (!cached || getTokenAuthScope(cached) !== authScope) return;
+    requestMutationSyncForToken(authScope, cached);
+    return;
+  }
+  const lookupTransition = nextAuthScopeTransitionToken;
+  void getToken()
+    .then((token) => {
+      if (activeAuthScopeTransitions.size > 0) {
+        deferredMutationWakeScopes.add(authScope);
+        return;
+      }
+      // A lookup can finish after an entire account transition, not only
+      // while its callback is active. Re-evaluate against the current token.
+      if (lookupTransition !== nextAuthScopeTransitionToken) {
+        requestMutationSync(authScope);
+        return;
+      }
+      const currentToken = getCachedToken();
+      const resolvedToken = currentToken === undefined ? token : currentToken;
+      if (!resolvedToken || getTokenAuthScope(resolvedToken) !== authScope) return;
+      requestMutationSyncForToken(authScope, resolvedToken);
+    })
+    .catch(() => undefined);
+}
+
 
 function getSyncStateKey(authScope: string): string {
   return `__global__:${authScope.slice("auth:".length)}`;
@@ -220,11 +904,17 @@ type GeneralSyncCheckpoint = {
   state?: "in_progress" | "complete";
   since: string | null;
   serverTime: string | null;
-  /** Safe incremental watermark; null means replay from a full bootstrap. */
+  /** Safe time watermark; null retains a full projection, possibly digest-elided. */
   watermark: string | null;
   snapshotToken: string | null;
   pendingTables: SyncTable[];
   cursors: Record<string, string>;
+  /** Terminal receipts are public only after this complete run is applied. */
+  digests?: Record<string, string>;
+  /** Frozen previous receipts used to validate this run, including restart. */
+  requestDigests?: Record<string, string>;
+  fullReplayedAt?: number;
+  contentApplied?: boolean;
 };
 
 function getGeneralSyncStateKey(authScope: string): string {
@@ -288,6 +978,11 @@ async function getGeneralSyncCheckpoint(
       typeof parsed.snapshotToken === "string" ? parsed.snapshotToken : null,
     pendingTables,
     cursors,
+    digests: validGeneralDigests(parsed.digests, TABLES),
+    requestDigests: validGeneralDigests(parsed.requestDigests, TABLES),
+    fullReplayedAt: typeof parsed.fullReplayedAt === "number" && Number.isFinite(parsed.fullReplayedAt)
+      ? parsed.fullReplayedAt : undefined,
+    contentApplied: typeof parsed.contentApplied === "boolean" ? parsed.contentApplied : undefined,
   };
 }
 
@@ -315,13 +1010,15 @@ async function markGeneralSyncCheckpointComplete(
   authScope: string,
   serverTime: string,
   watermark: string | null,
+  receipt: Pick<GeneralSyncCheckpoint, "digests" | "fullReplayedAt"> = {},
 ): Promise<void> {
   const db = getDb();
   const tableName = getGeneralSyncStateKey(authScope);
   // Keep a durable completion marker instead of clearing the row.  A missing
   // marker means this account may still carry a legacy one-shot watermark that
   // truncated a large pull; the first v1 run must therefore bootstrap from
-  // since=null.  Subsequent runs can safely use the global incremental clock.
+  // since=null. Later runs keep the server's safe watermark (including null)
+  // and may reuse only the content receipts from this completed projection.
   const marker = JSON.stringify({
     version: GENERAL_SYNC_PAGINATION_VERSION,
     state: "complete",
@@ -331,6 +1028,7 @@ async function markGeneralSyncCheckpointComplete(
     snapshotToken: null,
     pendingTables: [],
     cursors: {},
+    ...receipt,
   });
   await db
     .insert(schema.syncState)
@@ -567,8 +1265,10 @@ async function createDocsSyncRun(
   scopeId: string | undefined,
   projectId: string | null | undefined,
   force: boolean,
+  assertActive?: () => void,
 ): Promise<DocsSyncRunRow | null> {
   if (!docsStagingAvailable()) return null;
+  assertActive?.();
   const now = new Date().toISOString();
   const runId = randomId();
   const values = {
@@ -592,6 +1292,7 @@ async function createDocsSyncRun(
     updatedAt: now,
   };
   await withDocsExclusiveTransaction(async (tx) => {
+    assertActive?.();
     await tx.runAsync(
       `INSERT INTO docs_sync_runs(
         run_id, auth_scope, scope_key, scope_id, project_id,
@@ -618,23 +1319,32 @@ async function createDocsSyncRun(
       values.createdAt,
       values.updatedAt,
     );
+    assertActive?.();
   });
   return values as DocsSyncRunRow;
 }
 
-async function deleteDocsSyncRun(runId: string, authScope: string): Promise<void> {
+async function deleteDocsSyncRun(
+  runId: string,
+  authScope: string,
+  assertActive?: () => void,
+): Promise<void> {
   if (!docsStagingAvailable()) return;
+  assertActive?.();
   await withDocsExclusiveTransaction(async (tx) => {
+    assertActive?.();
     await tx.runAsync(
       "DELETE FROM docs_sync_staging WHERE run_id = ? AND auth_scope = ?",
       runId,
       authScope,
     );
+    assertActive?.();
     await tx.runAsync(
       "DELETE FROM docs_sync_runs WHERE run_id = ? AND auth_scope = ?",
       runId,
       authScope,
     );
+    assertActive?.();
   });
 }
 
@@ -668,8 +1378,10 @@ async function persistDocsPage(
   response: SyncPullResponse,
   pendingTables: SyncTable[],
   nextCursors: Record<string, string>,
+  assertActive?: () => void,
 ): Promise<number> {
   if (!docsStagingAvailable()) return 0;
+  assertActive?.();
   const matchingScope = (response.docs_scopes ?? []).find(
     (scope) =>
       (scope.project_id ?? null) === (projectId ?? null)
@@ -701,7 +1413,9 @@ async function persistDocsPage(
   if (response.docs_snapshot_token) snapshotToken = response.docs_snapshot_token;
   if (response.docs_scope_revision) scopeRevision = response.docs_scope_revision;
   if (response.docs_scope_digest) scopeDigest = response.docs_scope_digest;
-  if (response.server_time) serverTime = response.server_time;
+  // Preserve the first page boundary across resume/pages: ACKed creates
+  // newer than this snapshot must not be reconciled as server deletions.
+  if (response.server_time && !serverTime) serverTime = response.server_time;
   if (response.docs_scopes?.length) scopesJson = response.docs_scopes;
   let stagedRowsWritten = 0;
   for (const table of pendingTables) {
@@ -752,6 +1466,7 @@ async function persistDocsPage(
       });
       if (!rows.length) continue;
       await withDocsExclusiveTransaction(async (tx: DocsSqliteAsyncTransaction) => {
+        assertActive?.();
         await executeDocsPreparedBatch(
           tx,
           `INSERT INTO docs_sync_staging(
@@ -763,6 +1478,7 @@ async function persistDocsPage(
              is_tombstone = excluded.is_tombstone`,
           rows,
         );
+        assertActive?.();
       });
       stagedRowsWritten += rows.length;
     }
@@ -786,6 +1502,7 @@ async function persistDocsPage(
   const updatedAt = new Date().toISOString();
   const nextPending = Object.keys(nextCursors);
   await withDocsExclusiveTransaction(async (tx) => {
+    assertActive?.();
     await tx.runAsync(
       `UPDATE docs_sync_runs SET
          scope_key = ?, scope_id = ?, project_id = ?,
@@ -810,6 +1527,7 @@ async function persistDocsPage(
       run.runId,
       authScope,
     );
+    assertActive?.();
   });
   // Keep the in-memory run used by the page loop in lockstep with the row we
   // just persisted.  A pull may span many pages; retaining the original
@@ -865,7 +1583,9 @@ async function saveDocsScopeDigest(
   digest: string,
   scopeId?: string,
   projectId?: string | null,
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const db = getDb();
   await db
     .insert(schema.syncState)
@@ -879,6 +1599,7 @@ async function saveDocsScopeDigest(
       target: schema.syncState.tableName,
       set: { cursor: digest },
     });
+  assertActive?.();
 }
 
 /** 保存済みの Docs digest を一括読みし、次回 pull でエコーする形へ整える。 */
@@ -954,23 +1675,29 @@ async function setLastPulledAt(
   docs = false,
   docsScopeId?: string,
   docsProjectId?: string | null,
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const tableName = docs
     ? getDocsSyncStateKey(authScope, docsScopeId, docsProjectId)
     : getSyncStateKey(authScope);
   const db = getDb();
-  await runBackgroundSqliteWrite(() => db
-    .insert(schema.syncState)
-    .values({
-      tableName,
-      lastPulledAt: value,
-      lastPushedAt: null,
-      cursor: null,
-    })
-    .onConflictDoUpdate({
-      target: schema.syncState.tableName,
-      set: { lastPulledAt: value },
-    }));
+  await runBackgroundSqliteWrite(() => {
+    assertActive?.();
+    return db
+      .insert(schema.syncState)
+      .values({
+        tableName,
+        lastPulledAt: value,
+        lastPushedAt: null,
+        cursor: null,
+      })
+      .onConflictDoUpdate({
+        target: schema.syncState.tableName,
+        set: { lastPulledAt: value },
+      });
+  });
+  assertActive?.();
 }
 
 async function applyPullResponse(
@@ -982,22 +1709,24 @@ async function applyPullResponse(
   options: { forceDocs?: boolean; stageDocs?: boolean } = {},
 ): Promise<void> {
   assertSyncExecutionActive(context);
+  // A Docs-only page has no general writes to enqueue.
+  if (TABLES.some((table) => generalTableNeedsApply(response.tables[table]))) {
   await runBackgroundSqliteWrite(async () => {
   const projects = response.tables.projects;
-  if (projects) {
+  if (projects && generalTableNeedsApply(projects)) {
     await applyRemoteProjects(projects.changes as unknown as Project[]);
     await applyProjectTombstones(projects.tombstones);
   }
 
   const tasks = response.tables.tasks;
-  if (tasks) {
+  if (tasks && generalTableNeedsApply(tasks)) {
     assertSyncExecutionActive(context);
     await applyRemoteTasks(tasks.changes as unknown as Task[]);
     await applyTaskTombstones(tasks.tombstones);
   }
 
   const occurrences = response.tables.task_occurrences;
-  if (occurrences) {
+  if (occurrences && generalTableNeedsApply(occurrences)) {
     assertSyncExecutionActive(context);
     await applyRemoteOccurrences(
       occurrences.changes as unknown as TaskOccurrence[],
@@ -1006,14 +1735,14 @@ async function applyPullResponse(
   }
 
   const timeEntries = response.tables.time_entries;
-  if (timeEntries) {
+  if (timeEntries && generalTableNeedsApply(timeEntries)) {
     assertSyncExecutionActive(context);
     await applyRemoteTimeEntries(timeEntries.changes as unknown as TimeEntry[]);
     await applyTimeEntryTombstones(timeEntries.tombstones);
   }
 
   const sessions = response.tables.conversation_sessions;
-  if (sessions) {
+  if (sessions && generalTableNeedsApply(sessions)) {
     assertSyncExecutionActive(context);
     await applyRemoteConversationSessions(
       sessions.changes as unknown as ConversationSession[],
@@ -1023,7 +1752,7 @@ async function applyPullResponse(
   }
 
   const messages = response.tables.conversation_messages;
-  if (messages) {
+  if (messages && generalTableNeedsApply(messages)) {
     assertSyncExecutionActive(context);
     await applyRemoteConversationMessages(
       messages.changes as unknown as ConversationMessage[],
@@ -1032,7 +1761,7 @@ async function applyPullResponse(
   }
 
   const recordTables = response.tables.record_tables;
-  if (recordTables) {
+  if (recordTables && generalTableNeedsApply(recordTables)) {
     assertSyncExecutionActive(context);
     await applyRemoteRecordTables(
       recordTables.changes as unknown as RecordTable[],
@@ -1041,7 +1770,7 @@ async function applyPullResponse(
   }
 
   const recordFields = response.tables.record_fields;
-  if (recordFields) {
+  if (recordFields && generalTableNeedsApply(recordFields)) {
     assertSyncExecutionActive(context);
     await applyRemoteRecordFields(
       recordFields.changes as unknown as RecordField[],
@@ -1050,13 +1779,14 @@ async function applyPullResponse(
   }
 
   const recordRows = response.tables.record_rows;
-  if (recordRows) {
+  if (recordRows && generalTableNeedsApply(recordRows)) {
     assertSyncExecutionActive(context);
     await applyRemoteRecordRows(recordRows.changes as unknown as RecordRow[]);
     await applyRecordRowTombstones(recordRows.tombstones);
   }
 
   });
+  }
 
   // ---------- Docs ----------
   // A staged Docs pull is committed by promoteDocsSyncRun only after all
@@ -1076,13 +1806,16 @@ async function applyPullResponse(
       } else {
         await applyRemoteDocsNodes(nodeChanges);
       }
+      assertSyncExecutionActive(context);
     }
     await applyDocsNodeTombstones(docsNodes.tombstones);
+    assertSyncExecutionActive(context);
     if (docsNodes.authoritative_ids != null) {
       await reconcileDocsNodesWithServer(
         docsNodes.authoritative_ids,
         docsNodes.authoritative_scope_id,
       );
+      assertSyncExecutionActive(context);
     }
     if (docsNodes.authoritative_scope_id) {
       await saveDocsWorkspaceId(
@@ -1091,6 +1824,7 @@ async function applyPullResponse(
         scopeId,
         projectId,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1099,6 +1833,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsSupertags = response.tables.knowledge_supertags;
@@ -1109,10 +1844,12 @@ async function applyPullResponse(
         docsSupertags.changes as unknown as DocsSupertag[],
       );
     }
+    assertSyncExecutionActive(context);
     await reconcileDocsSupertagsWithServer(
       docsSupertags.authoritative_ids,
       docsSupertags.authoritative_scope_id,
     );
+    assertSyncExecutionActive(context);
     await saveDocsDigest(
       authScope,
       "knowledge_supertags",
@@ -1120,6 +1857,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsFields = response.tables.knowledge_fields;
@@ -1127,11 +1865,13 @@ async function applyPullResponse(
     assertSyncExecutionActive(context);
     if (docsFields.changes?.length) {
       await applyRemoteDocsFields(docsFields.changes as unknown as DocsField[]);
+      assertSyncExecutionActive(context);
     }
     await reconcileDocsFieldsWithServer(
       docsFields.authoritative_ids,
       docsFields.authoritative_scope_id,
     );
+    assertSyncExecutionActive(context);
     await saveDocsDigest(
       authScope,
       "knowledge_fields",
@@ -1139,6 +1879,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsFieldValues = response.tables.knowledge_field_values;
@@ -1152,6 +1893,7 @@ async function applyPullResponse(
         docsFieldValues.changes as unknown as DocsFieldValue[],
         docsFieldValues.authoritative_ids,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1160,6 +1902,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   // 関連表は削除を取りこぼさないよう authoritative_ids で reconcile（省略時は据え置き）。
@@ -1174,6 +1917,7 @@ async function applyPullResponse(
         docsNodeSupertags.changes as unknown as DocsNodeSupertag[],
         docsNodeSupertags.authoritative_ids,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1182,6 +1926,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsSupertagFields = response.tables.knowledge_supertag_fields;
@@ -1195,6 +1940,7 @@ async function applyPullResponse(
         docsSupertagFields.changes as unknown as DocsSupertagField[],
         docsSupertagFields.authoritative_ids,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1203,6 +1949,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsPlacements = response.tables.knowledge_node_placements;
@@ -1216,6 +1963,7 @@ async function applyPullResponse(
         docsPlacements.changes as unknown as DocsNodePlacement[],
         docsPlacements.authoritative_ids,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1224,6 +1972,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
   const docsEdges = response.tables.knowledge_edges;
@@ -1234,6 +1983,7 @@ async function applyPullResponse(
         docsEdges.changes as unknown as DocsEdge[],
         docsEdges.authoritative_ids,
       );
+      assertSyncExecutionActive(context);
     }
     await saveDocsDigest(
       authScope,
@@ -1242,6 +1992,7 @@ async function applyPullResponse(
       scopeId,
       projectId,
     );
+    assertSyncExecutionActive(context);
   }
 
 }
@@ -1269,6 +2020,7 @@ async function applyDocsPullOnce(
     onProgress?: DocsResyncProgressHandler;
     run?: DocsSyncRunRow | null;
     previousScopes?: DocsSyncScope[];
+    diagnosticPromotionGeneration?: number;
   } = {},
 ): Promise<DocsSyncScope[]> {
   const persistedRun = options.run ?? null;
@@ -1291,8 +2043,44 @@ async function applyDocsPullOnce(
   let discoveredScopes: DocsSyncScope[] = [];
   let page = 0;
 
+  if (persistedRun?.state === "ready" && pendingTables.length === 0) {
+    markDocsSubstage(context, "ready_resume", persistedRun);
+  }
+
   while (pendingTables.length) {
     assertSyncExecutionActive(context);
+    if (options.onProgress) {
+      const hasAllCounts = DOCS_TABLES.every((table) =>
+        authoritativeCounts.has(table),
+      );
+      const total = hasAllCounts
+        ? DOCS_TABLES.reduce(
+            (sum, table) => sum + (authoritativeCounts.get(table) ?? 0),
+            0,
+          )
+        : null;
+      const completed = DOCS_TABLES.reduce(
+        (sum, table) => sum + (appliedCounts.get(table) ?? 0),
+        0,
+      );
+      options.onProgress({
+        phase: "downloading",
+        completed: total == null ? completed : Math.min(completed, total),
+        total,
+        page: page + 1,
+        stagedRowsWritten,
+      });
+    }
+    const useStaging = Boolean(persistedRun && docsStagingAvailable());
+    markDocsSubstage(context, "http_pull", persistedRun);
+    const pullDiagnostic = beginPullDiagnostic(
+      context.diagnostic,
+      "docs",
+      diagnosticScopeFor(scopeId, projectId),
+      pendingTables,
+      useStaging ? "staged" : "applied",
+      options.diagnosticPromotionGeneration ?? null,
+    );
     const docsResponse = await pullSync({
       since: docsSince,
       tables: pendingTables,
@@ -1314,6 +2102,19 @@ async function applyDocsPullOnce(
       ...(Object.keys(docsCursors).length
         ? { docs_cursors: docsCursors }
         : {}),
+      signal: context.controller.signal,
+      ...(pullDiagnostic
+        ? {
+            requestId: pullDiagnostic.requestId,
+            lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
+          }
+        : {}),
+    }).catch((error: unknown) => {
+      finishPullDiagnosticFromError(pullDiagnostic, error);
+      if (isApiConnectionError(error) || isApiTimeoutError(error)) {
+        throw new DocsPullTransportError(error);
+      }
+      throw error;
     });
     assertSyncExecutionActive(context);
     if (docsResponse.docs_pagination_version !== 2) {
@@ -1359,11 +2160,70 @@ async function applyDocsPullOnce(
         authoritativeCounts.set(table, Math.max(0, count));
       }
     }
-    const useStaging = Boolean(persistedRun && docsStagingAvailable());
-    await applyPullResponse(authScope, docsResponse, context, scopeId, projectId, {
-      forceDocs: options.forceDocs,
-      stageDocs: useStaging,
+    // A 200 response that omits a requested table is incomplete.  Do not
+    // persist a ready cursor or promote staging from that payload; HTTP status
+    // alone is not evidence that the Docs snapshot was applied.
+    for (const table of pendingTables) {
+      if (!docsResponse.tables[table]) {
+        markDocsPromotion(
+          context.diagnostic,
+          diagnosticScopeFor(scopeId, projectId),
+          "failed",
+          options.diagnosticPromotionGeneration ?? null,
+        );
+        throw new Error(`Docs同期ページにテーブルがありません: ${table}`);
+      }
+    }
+    // A first terminal root page with every table empty and no authoritative
+    // count/IDs/digest is indistinguishable from a truncated 200 response.
+    // Existing digest-resume pages are allowed to omit authority because their
+    // prior validated snapshot remains the proof of membership.
+    const allRequestedTablesEmpty = pendingTables.every((table) => {
+      const payload = docsResponse.tables[table]!;
+      return payload.changes.length === 0
+        && payload.tombstones.length === 0
+        && !payload.cursor;
     });
+    const hasAuthoritativeMetadata = pendingTables.some((table) => {
+      const payload = docsResponse.tables[table]!;
+      return (typeof payload.authoritative_count === "number" && Number.isFinite(payload.authoritative_count))
+        || payload.authoritative_ids != null
+        || Boolean(payload.authoritative_digest)
+        || Boolean(payload.docs_snapshot_revision);
+    });
+    if (
+      page === 0
+      && pendingTables.length === DOCS_TABLES.length
+      && allRequestedTablesEmpty
+      && !hasAuthoritativeMetadata
+      && Object.keys(docsDigests).length === 0
+    ) {
+      markDocsPromotion(
+        context.diagnostic,
+        diagnosticScopeFor(scopeId, projectId),
+        "failed",
+        options.diagnosticPromotionGeneration ?? null,
+      );
+      throw new Error("Docs同期のauthoritative metadataがありません");
+    }
+    recordPullResponse(
+      pullDiagnostic,
+      docsResponse,
+      pendingTables,
+      useStaging ? "staged" : "applied",
+    );
+    const liveWriteStartedForPage = !useStaging
+      && context.docsLiveWriteState
+      && DOCS_TABLES.some((table) => generalTableNeedsApply(docsResponse.tables[table]));
+    if (liveWriteStartedForPage) context.docsLiveWriteState!.started = true;
+    try {
+      await applyPullResponse(authScope, docsResponse, context, scopeId, projectId, {
+        forceDocs: options.forceDocs,
+        stageDocs: useStaging,
+      });
+    } finally {
+      if (liveWriteStartedForPage) context.docsLiveWriteState!.started = false;
+    }
     assertSyncExecutionActive(context);
     page += 1;
     for (const table of pendingTables) {
@@ -1376,6 +2236,7 @@ async function applyDocsPullOnce(
       if (cursor) nextCursors[table] = cursor;
     }
     if (useStaging && persistedRun) {
+      assertSyncExecutionActive(context);
       stagedRowsWritten += await persistDocsPage(
         persistedRun,
         authScope,
@@ -1384,6 +2245,7 @@ async function applyDocsPullOnce(
         docsResponse,
         pendingTables,
         nextCursors,
+        () => assertSyncExecutionActive(context),
       );
     }
     if (options.onProgress) {
@@ -1439,7 +2301,10 @@ async function applyDocsPullOnce(
       page,
     });
     if (persistedRun && docsStagingAvailable()) {
+      markDocsSubstage(context, "reload_ready_run", persistedRun);
       const currentRun = await getDocsSyncRun(persistedRun.runId, authScope);
+      updateDocsRunDiagnostic(context, currentRun);
+      assertSyncExecutionActive(context);
       if (!currentRun) throw new Error("Docs同期runが見つかりません");
       const authoritative = parseJsonRecord<DocsSyncAuthoritative>(
         currentRun.authoritativeJson,
@@ -1509,49 +2374,69 @@ async function applyDocsPullOnce(
       );
       const stateScopeId = scopeId;
       const stateProjectId = projectId;
-      const promotionTelemetry = await promoteDocsSyncRun({
-        runId: persistedRun.runId,
-        authScope,
-        scopeId: promotionScopeId,
-        projectId: promotionProjectId,
-        scopeKey: promotionScopeKey,
-        force: options.forceDocs,
-        authoritative,
-        scopes: runScopes,
-        finalize: {
-          scopeDigest: responseDocsScopeDigest,
-          serverTime: docsServerTime,
-          digestByTable: parseJsonRecord<Record<string, string>>(
-            currentRun.digestJson,
-            {},
-          ),
-          scopeDigestKey: getDocsScopeDigestKey(authScope, stateScopeId, stateProjectId),
-          scopeRevision,
-          scopeRevisionKey: getDocsScopeRevisionKey(authScope, stateScopeId, stateProjectId),
-          lastPulledKey: getDocsSyncStateKey(authScope, stateScopeId, stateProjectId),
-          digestKeys: Object.fromEntries(
-            Object.keys(
-              parseJsonRecord<Record<string, string>>(currentRun.digestJson, {}),
-            ).map((table) => [
-              table,
-              getDocsDigestKey(authScope, table, stateScopeId, stateProjectId),
-            ]),
-          ),
-          scopesKey: hasAuthoritativeScopeSet
-            ? getDocsScopesKey(authScope)
+      let promotionTelemetry: Awaited<ReturnType<typeof promoteDocsSyncRun>>;
+      try {
+        markDocsSubstage(context, "promoting", currentRun);
+        promotionTelemetry = await promoteDocsSyncRun({
+          assertActive: () => assertSyncExecutionActive(context),
+          runId: persistedRun.runId,
+          authScope,
+          scopeId: promotionScopeId,
+          projectId: promotionProjectId,
+          scopeKey: promotionScopeKey,
+          snapshotServerTime: docsServerTime,
+          force: options.forceDocs,
+          authoritative,
+          scopes: runScopes,
+          finalize: {
+            scopeDigest: responseDocsScopeDigest,
+            serverTime: docsServerTime,
+            digestByTable: parseJsonRecord<Record<string, string>>(
+              currentRun.digestJson,
+              {},
+            ),
+            scopeDigestKey: getDocsScopeDigestKey(authScope, stateScopeId, stateProjectId),
+            scopeRevision,
+            scopeRevisionKey: getDocsScopeRevisionKey(authScope, stateScopeId, stateProjectId),
+            lastPulledKey: getDocsSyncStateKey(authScope, stateScopeId, stateProjectId),
+            digestKeys: Object.fromEntries(
+              Object.keys(
+                parseJsonRecord<Record<string, string>>(currentRun.digestJson, {}),
+              ).map((table) => [
+                table,
+                getDocsDigestKey(authScope, table, stateScopeId, stateProjectId),
+              ]),
+            ),
+            scopesKey: hasAuthoritativeScopeSet
+              ? getDocsScopesKey(authScope)
+              : undefined,
+            workspaceKey: finalizedWorkspaceId
+              ? getDocsWorkspaceKey(authScope, finalizedWorkspaceId, promotionProjectId)
+              : undefined,
+            workspaceId: finalizedWorkspaceId,
+          },
+          scopeSet: options.previousScopes && hasAuthoritativeScopeSet
+            ? {
+                previousScopes: options.previousScopes,
+                newScopes: runScopes,
+              }
             : undefined,
-          workspaceKey: finalizedWorkspaceId
-            ? getDocsWorkspaceKey(authScope, finalizedWorkspaceId, promotionProjectId)
-            : undefined,
-          workspaceId: finalizedWorkspaceId,
-        },
-        scopeSet: options.previousScopes && hasAuthoritativeScopeSet
-          ? {
-              previousScopes: options.previousScopes,
-              newScopes: runScopes,
-            }
-          : undefined,
-      });
+        });
+      } catch (error) {
+        markDocsPromotion(
+          context.diagnostic,
+          diagnosticScopeFor(scopeId, projectId),
+          "failed",
+          options.diagnosticPromotionGeneration ?? null,
+        );
+        throw error;
+      }
+      markDocsPromotion(
+        context.diagnostic,
+        diagnosticScopeFor(scopeId, projectId),
+        "promoted",
+        options.diagnosticPromotionGeneration ?? null,
+      );
       if (promotionTelemetry) {
         options.onProgress?.({
           phase: "finalizing",
@@ -1570,12 +2455,33 @@ async function applyDocsPullOnce(
         });
       }
     } else {
-      await saveDocsScopeDigest(authScope, responseDocsScopeDigest, scopeId, projectId);
+      assertSyncExecutionActive(context);
+      await saveDocsScopeDigest(
+        authScope,
+        responseDocsScopeDigest,
+        scopeId,
+        projectId,
+        () => assertSyncExecutionActive(context),
+      );
       if (scopeRevision) {
-        await saveDocsScopeRevision(authScope, scopeRevision, scopeId, projectId);
+        assertSyncExecutionActive(context);
+        await saveDocsScopeRevision(
+          authScope,
+          scopeRevision,
+          scopeId,
+          projectId,
+          () => assertSyncExecutionActive(context),
+        );
       }
       assertSyncExecutionActive(context);
-      await setLastPulledAt(authScope, docsServerTime, true, scopeId, projectId);
+      await setLastPulledAt(
+        authScope,
+        docsServerTime,
+        true,
+        scopeId,
+        projectId,
+        () => assertSyncExecutionActive(context),
+      );
     }
   }
   return discoveredScopes;
@@ -1611,7 +2517,7 @@ function isGeneralCheckpointRestartError(error: unknown): boolean {
 async function applyGeneralPullOnce(
   authScope: string,
   context: SyncExecutionContext,
-): Promise<void> {
+): Promise<boolean> {
   assertSyncExecutionActive(context);
   const saved = await getGeneralSyncCheckpoint(authScope);
   // A terminal checkpoint means every page was committed but the final
@@ -1629,8 +2535,9 @@ async function applyGeneralPullOnce(
       authScope,
       saved.serverTime,
       saved.watermark,
+      { digests: saved.digests, fullReplayedAt: saved.fullReplayedAt },
     );
-    return;
+    return saved.contentApplied !== false;
   }
 
   // Never trust the legacy global watermark until one bounded v1 run has
@@ -1652,8 +2559,18 @@ async function applyGeneralPullOnce(
   let watermark = !hasCompletedMarker ? saved?.watermark ?? null : null;
   let watermarkInitialized = Boolean(
     saved
+    && !hasCompletedMarker
     && Object.prototype.hasOwnProperty.call(saved, "watermark"),
   );
+  const now = Date.now();
+  const requestDigests = since != null ? {} : hasCompletedMarker
+    ? reusableGeneralDigests(saved?.digests, TABLES, saved?.fullReplayedAt, now)
+    : generalDigestsForRequest(saved?.requestDigests, TABLES);
+  const digests = !hasCompletedMarker ? { ...(saved?.digests ?? {}) } : {};
+  const fullReplayedAt = !hasCompletedMarker && saved
+    ? saved.fullReplayedAt
+    : Object.keys(requestDigests).length ? saved?.fullReplayedAt : now;
+  let contentApplied = !hasCompletedMarker && Boolean(saved) && saved?.contentApplied !== false;
   const seenPageStates = new Set<string>();
   let pageCount = 0;
 
@@ -1672,14 +2589,39 @@ async function applyGeneralPullOnce(
       throw new Error("一般テーブル同期cursorが進みませんでした");
     }
     seenPageStates.add(pageState);
+    const pullDiagnostic = beginPullDiagnostic(
+      context.diagnostic,
+      "general",
+      "general",
+      pendingTables,
+      "not_applicable",
+    );
     const response = await pullSync({
       since,
       tables: pendingTables,
       general_pagination: true,
+      general_digest_version: GENERAL_DIGEST_VERSION,
+      ...(Object.keys(requestDigests).length ? { general_digests: requestDigests } : {}),
       ...(snapshotToken ? { general_snapshot_token: snapshotToken } : {}),
       ...(Object.keys(cursors).length ? { general_cursors: cursors } : {}),
+      signal: context.controller.signal,
+      ...(pullDiagnostic
+        ? {
+            requestId: pullDiagnostic.requestId,
+            lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
+          }
+        : {}),
+    }).catch((error: unknown) => {
+      finishPullDiagnosticFromError(pullDiagnostic, error);
+      throw error;
     });
     assertSyncExecutionActive(context);
+    recordPullResponse(
+      pullDiagnostic,
+      response,
+      pendingTables,
+      "not_applicable",
+    );
 
     const isBoundedResponse =
       response.general_pagination_version === GENERAL_SYNC_PAGINATION_VERSION
@@ -1728,7 +2670,13 @@ async function applyGeneralPullOnce(
         throw new Error(`一般テーブル同期ページが欠落しています: ${table}`);
       }
     }
+    const pageDigests = validateGeneralDigestPage(response, pendingTables, requestDigests, since);
+    // Retain the existing general-completion refresh for ordinary pages.
+    // Only a complete set of proven not-modified receipts suppresses it.
+    const pageHasChanges = pendingTables.some((table) => !response.tables[table]?.general_not_modified);
     await applyPullResponse(authScope, response, context);
+    contentApplied ||= pageHasChanges;
+    Object.assign(digests, pageDigests);
     assertSyncExecutionActive(context);
 
     const nextCursors: Record<string, string> = {};
@@ -1746,7 +2694,14 @@ async function applyGeneralPullOnce(
       snapshotToken,
       pendingTables: nextPendingTables,
       cursors: nextCursors,
+      digests, requestDigests, fullReplayedAt, contentApplied,
     });
+    reportGeneralSyncProgress(
+      authScope,
+      context,
+      pageCount,
+      nextPendingTables.length,
+    );
     pendingTables = nextPendingTables;
     cursors = nextCursors;
   }
@@ -1755,24 +2710,25 @@ async function applyGeneralPullOnce(
     throw new Error("一般テーブル同期server_timeがありません");
   }
   await setLastPulledAt(authScope, watermark);
-  await markGeneralSyncCheckpointComplete(authScope, serverTime, watermark);
+  await markGeneralSyncCheckpointComplete(authScope, serverTime, watermark, { digests, fullReplayedAt });
+  return contentApplied;
 }
 
 async function applyGeneralPull(
   authScope: string,
   context: SyncExecutionContext,
-): Promise<void> {
+): Promise<boolean> {
   // ACL membership can change between pages.  The server rejects a stale
   // scope-bound snapshot; discard that checkpoint and restart once from a
   // fresh, bounded run rather than leaving the account permanently stuck on
   // the same 409 response.
   try {
-    await applyGeneralPullOnce(authScope, context);
+    return await applyGeneralPullOnce(authScope, context);
   } catch (error) {
     if (!isGeneralCheckpointRestartError(error)) throw error;
     await resetGeneralSyncCheckpoint(authScope);
     assertSyncExecutionActive(context);
-    await applyGeneralPullOnce(authScope, context);
+    return await applyGeneralPullOnce(authScope, context);
   }
 }
 
@@ -1781,7 +2737,9 @@ async function saveDocsWorkspaceId(
   workspaceId: string,
   scopeId?: string,
   projectId?: string | null,
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const db = getDb();
   await db
     .insert(schema.syncState)
@@ -1795,6 +2753,7 @@ async function saveDocsWorkspaceId(
       target: schema.syncState.tableName,
       set: { cursor: workspaceId },
     });
+  assertActive?.();
 }
 
 async function getSavedDocsScopes(authScope: string): Promise<DocsSyncScope[]> {
@@ -1824,7 +2783,9 @@ async function getSavedDocsScopes(authScope: string): Promise<DocsSyncScope[]> {
 async function saveDocsScopes(
   authScope: string,
   scopes: DocsSyncScope[],
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const db = getDb();
   await db
     .insert(schema.syncState)
@@ -1838,6 +2799,7 @@ async function saveDocsScopes(
       target: schema.syncState.tableName,
       set: { cursor: JSON.stringify(scopes) },
     });
+  assertActive?.();
 }
 
 async function saveDocsScopeRevision(
@@ -1845,7 +2807,9 @@ async function saveDocsScopeRevision(
   revision: string,
   scopeId?: string,
   projectId?: string | null,
+  assertActive?: () => void,
 ): Promise<void> {
+  assertActive?.();
   const db = getDb();
   await db
     .insert(schema.syncState)
@@ -1859,6 +2823,7 @@ async function saveDocsScopeRevision(
       target: schema.syncState.tableName,
       set: { cursor: revision },
     });
+  assertActive?.();
 }
 
 async function applyDocsPull(
@@ -1870,38 +2835,76 @@ async function applyDocsPull(
   } = {},
 ): Promise<void> {
   assertSyncExecutionActive(context);
+  markDocsSubstage(context, "load_saved_scopes");
   const previousScopes = await getSavedDocsScopes(authScope);
+  assertSyncExecutionActive(context);
 
   const pullScope = async (
     scopeId?: string,
     projectId?: string | null,
   ): Promise<DocsSyncScope[]> => {
+    // Run metadata belongs to this exact Docs scope. A completed root/shared
+    // run must not decorate the next scope's pre-run local read diagnostics.
+    resetDocsRunDiagnosticFields(context);
     // Force rebuilds intentionally start without saved cursors/digests.  They
     // still stage into a new run and never clear live rows/outbox before a
     // validated promotion, but a digest-equal response must not short-circuit
     // the requested authoritative snapshot.
-    const docsSince = options.forceDocs
-      ? null
-      : await getLastPulledAt(authScope, true, scopeId, projectId);
-    let docsDigests = options.forceDocs
-      ? {}
-      : await getSavedDocsDigests(authScope, scopeId, projectId);
-    let savedDocsScopeDigest = options.forceDocs
-      ? null
-      : await getSavedDocsScopeDigest(authScope, scopeId, projectId);
-    let savedDocsScopeRevision = options.forceDocs
-      ? null
-      : await getSavedDocsScopeRevision(authScope, scopeId, projectId);
+    let docsSince: string | null = null;
+    if (!options.forceDocs) {
+      markDocsSubstage(context, "load_last_pulled");
+      docsSince = await getLastPulledAt(authScope, true, scopeId, projectId);
+    }
+    assertSyncExecutionActive(context);
+    let docsDigests: Record<string, string> = {};
+    if (!options.forceDocs) {
+      markDocsSubstage(context, "load_table_digests");
+      docsDigests = await getSavedDocsDigests(authScope, scopeId, projectId);
+    }
+    assertSyncExecutionActive(context);
+    let savedDocsScopeDigest: string | null = null;
+    if (!options.forceDocs) {
+      markDocsSubstage(context, "load_scope_digest");
+      savedDocsScopeDigest = await getSavedDocsScopeDigest(authScope, scopeId, projectId);
+    }
+    assertSyncExecutionActive(context);
+    let savedDocsScopeRevision: string | null = null;
+    if (!options.forceDocs) {
+      markDocsSubstage(context, "load_scope_revision");
+      savedDocsScopeRevision = await getSavedDocsScopeRevision(authScope, scopeId, projectId);
+    }
+    assertSyncExecutionActive(context);
+    markDocsSubstage(context, "load_active_run");
     let run = await getActiveDocsSyncRun(authScope, scopeId, projectId, options.forceDocs);
+    updateDocsRunDiagnostic(context, run);
+    assertSyncExecutionActive(context);
     if (!run) {
       // A force request starts a new staged snapshot, but never clears live
       // rows/outbox.  Any abandoned normal run is staging-only and safe to
       // discard before creating the explicit force run.
-      const otherRun = options.forceDocs
-        ? await getActiveDocsSyncRun(authScope, scopeId, projectId, false)
-        : null;
-      if (otherRun) await deleteDocsSyncRun(otherRun.runId, authScope);
-      run = await createDocsSyncRun(authScope, scopeId, projectId, Boolean(options.forceDocs));
+      let otherRun: DocsSyncRunRow | null = null;
+      if (options.forceDocs) {
+        markDocsSubstage(context, "load_active_run");
+        otherRun = await getActiveDocsSyncRun(authScope, scopeId, projectId, false);
+        updateDocsRunDiagnostic(context, otherRun);
+      }
+      assertSyncExecutionActive(context);
+      if (otherRun) await deleteDocsSyncRun(
+        otherRun.runId,
+        authScope,
+        () => assertSyncExecutionActive(context),
+      );
+      assertSyncExecutionActive(context);
+      markDocsSubstage(context, "create_run", null);
+      run = await createDocsSyncRun(
+        authScope,
+        scopeId,
+        projectId,
+        Boolean(options.forceDocs),
+        () => assertSyncExecutionActive(context),
+      );
+      updateDocsRunDiagnostic(context, run);
+      assertSyncExecutionActive(context);
     }
     if (run && !options.forceDocs) {
       docsDigests = {
@@ -1909,7 +2912,22 @@ async function applyDocsPull(
         ...parseJsonRecord<Record<string, string>>(run.digestJson, {}),
       };
     }
+    const reportProgress: DocsResyncProgressHandler = (progress) => {
+      reportDocsSyncProgress(
+        authScope,
+        context,
+        scopeId,
+        projectId,
+        progress.page,
+        progress.retryAttempt ?? null,
+      );
+      options.onProgress?.(progress);
+    };
+    let diagnosticPromotionGeneration: number | null = null;
     for (let attempt = 0; attempt < DOCS_PULL_MAX_ATTEMPTS; attempt += 1) {
+      if (diagnosticPromotionGeneration == null) {
+        diagnosticPromotionGeneration = ++nextSyncDiagnosticPromotionGeneration;
+      }
       try {
         return await applyDocsPullOnce(
           authScope,
@@ -1922,27 +2940,81 @@ async function applyDocsPull(
           projectId,
           {
             ...options,
+            onProgress: reportProgress,
             run,
             previousScopes: scopeId == null ? previousScopes : undefined,
+            diagnosticPromotionGeneration: diagnosticPromotionGeneration ?? undefined,
           },
         );
       } catch (error) {
+        if (
+          error instanceof DocsPullTransportError
+          && attempt < DOCS_PULL_MAX_ATTEMPTS - 1
+        ) {
+          assertSyncExecutionActive(context);
+          reportProgress({
+            phase: "retrying",
+            completed: 0,
+            total: null,
+            page: 0,
+            retryAttempt: attempt + 1,
+          });
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, DOCS_PULL_TRANSPORT_RETRY_DELAY_MS * (attempt + 1)),
+          );
+          assertSyncExecutionActive(context);
+          continue;
+        }
+        if (
+          isDocsSnapshotChanged(error)
+          && attempt >= DOCS_PULL_MAX_ATTEMPTS - 1
+        ) {
+          markDocsPromotion(
+            context.diagnostic,
+            diagnosticScopeFor(scopeId, projectId),
+            "discarded",
+            diagnosticPromotionGeneration,
+          );
+        }
         if (
           isDocsSnapshotChanged(error) &&
           attempt < DOCS_PULL_MAX_ATTEMPTS - 1
         ) {
           assertSyncExecutionActive(context);
+          markDocsPromotion(
+            context.diagnostic,
+            diagnosticScopeFor(scopeId, projectId),
+            "discarded",
+            diagnosticPromotionGeneration,
+          );
+          diagnosticPromotionGeneration = ++nextSyncDiagnosticPromotionGeneration;
+          reportProgress({
+            phase: "retrying",
+            completed: 0,
+            total: null,
+            page: 0,
+            retryAttempt: attempt + 1,
+          });
           if (run) {
             // Cursor/token rejection means the staged pages belong to an
             // invalid server snapshot.  Delete only staging/run metadata;
             // live cache, outbox and conflicts remain intact.
-            await deleteDocsSyncRun(run.runId, authScope);
+            await deleteDocsSyncRun(
+              run.runId,
+              authScope,
+              () => assertSyncExecutionActive(context),
+            );
+            assertSyncExecutionActive(context);
+            markDocsSubstage(context, "create_run", null);
             run = await createDocsSyncRun(
               authScope,
               scopeId,
               projectId,
               Boolean(options.forceDocs),
+              () => assertSyncExecutionActive(context),
             );
+            updateDocsRunDiagnostic(context, run);
+            assertSyncExecutionActive(context);
           }
           // A 400/409 snapshot change can be an ACL revision update.  Do not
           // resend the stale scope digest/revision into the fresh run; the
@@ -1951,13 +3023,16 @@ async function applyDocsPull(
           // have been applied before the failed cursor was rejected.
           savedDocsScopeDigest = null;
           savedDocsScopeRevision = null;
+          markDocsSubstage(context, "load_table_digests");
           docsDigests = await getSavedDocsDigests(authScope, scopeId, projectId);
+          assertSyncExecutionActive(context);
           await new Promise<void>((resolve) =>
             setTimeout(resolve, DOCS_PULL_RETRY_DELAY_MS * (attempt + 1)),
           );
           assertSyncExecutionActive(context);
           continue;
         }
+        if (error instanceof DocsPullTransportError) throw error.originalError;
         throw error;
       }
     }
@@ -1965,6 +3040,7 @@ async function applyDocsPull(
   };
 
   const discoveredScopes = await pullScope();
+  assertSyncExecutionActive(context);
   // Older servers omit docs_scopes and retain the v2 personal-only contract.
   if (!discoveredScopes.length) return;
   const activeIds = new Set(
@@ -1978,16 +3054,22 @@ async function applyDocsPull(
     for (const previous of previousScopes) {
       if (activeIds.has(getDocsScopeKey(previous.workspace_id, previous.project_id))) continue;
       if (typeof quarantineRevokedDocsScope === "function") {
+        assertSyncExecutionActive(context);
         await quarantineRevokedDocsScope(
           authScope,
           previous.workspace_id,
           previous.project_id,
           getDocsScopeKey(previous.workspace_id, previous.project_id),
+          "revoke",
+          () => assertSyncExecutionActive(context),
         );
       }
       if (!schema.docsScopeMembership) {
+        assertSyncExecutionActive(context);
         await reconcileDocsNodesWithServer([], previous.workspace_id);
+        assertSyncExecutionActive(context);
         await reconcileDocsSupertagsWithServer([], previous.workspace_id);
+        assertSyncExecutionActive(context);
         await reconcileDocsFieldsWithServer([], previous.workspace_id);
       }
     }
@@ -1999,20 +3081,42 @@ async function applyDocsPull(
           === getDocsScopeKey(scope.workspace_id, scope.project_id),
       );
       if (previous && !previous.read_only && scope.read_only) {
+        assertSyncExecutionActive(context);
         await quarantineRevokedDocsScope(
           authScope,
           scope.workspace_id,
           scope.project_id,
           getDocsScopeKey(scope.workspace_id, scope.project_id),
           "downgrade",
+          () => assertSyncExecutionActive(context),
         );
       }
     }
-    await saveDocsScopes(authScope, discoveredScopes);
+    assertSyncExecutionActive(context);
+    await saveDocsScopes(
+      authScope,
+      discoveredScopes,
+      () => assertSyncExecutionActive(context),
+    );
   }
   for (const scope of discoveredScopes) {
     if (scope.source === "personal" && scope.access === "owner") continue;
+    assertSyncExecutionActive(context);
     await pullScope(scope.workspace_id, scope.project_id);
+  }
+}
+
+function notifyDocsResyncProgress(
+  listener: DocsResyncProgressHandler,
+  progress: DocsResyncProgress,
+): void {
+  try {
+    listener(progress);
+  } catch (error) {
+    console.warn(
+      "[sync] Docs progress observer failed",
+      error instanceof Error ? error.name : "UnknownError",
+    );
   }
 }
 
@@ -2024,33 +3128,78 @@ async function applyDocsPull(
 export async function forceDocsResync(
   onProgress?: DocsResyncProgressHandler,
 ): Promise<void> {
-  if (!canAttemptAoiTalkServer()) {
-    throw new Error("サーバーに接続してからDocsを再構築してください");
+  if (isMobileReadOnlyDiagnosticsEnabled()) {
+    throw new Error("読み取り診断モードではDocs再構築を実行できません");
   }
+  const queued: DocsResyncProgress = {
+    phase: "queued",
+    completed: 0,
+    total: null,
+    page: 0,
+  };
+  if (onProgress) notifyDocsResyncProgress(onProgress, queued);
   const token = await getToken();
   if (!token) {
     throw new Error("サーバーログインが必要です");
   }
   const authScope = getTokenAuthScope(token);
-  await runAuthScopeTransition(async () => {
+  // Settings can unmount and reopen while the same full pull is running.
+  // Join it, even during a temporary connection failure, instead of queuing
+  // another snapshot and retaining its stale screen callbacks afterward.
+  const existing = docsResyncByAuthScope.get(authScope);
+  if (existing) {
+    if (onProgress) {
+      existing.listeners.add(onProgress);
+      notifyDocsResyncProgress(onProgress, existing.progress);
+    }
+    return existing.promise;
+  }
+  if (!canAttemptAoiTalkServer()) {
+    throw new Error("サーバーに接続してからDocsを再構築してください");
+  }
+  const flight: RunningDocsResyncFlight = {
+    promise: completedSync,
+    listeners: new Set(onProgress ? [onProgress] : []),
+    progress: queued,
+  };
+  const reportProgress: DocsResyncProgressHandler = (progress) => {
+    flight.progress = progress;
+    for (const listener of flight.listeners) notifyDocsResyncProgress(listener, progress);
+  };
+  flight.promise = runQueuedAuthScopeTransition(async () => {
     const context = createSyncExecutionContext();
-    assertSyncExecutionActive(context);
-    onProgress?.({
-      phase: "preparing",
-      completed: 0,
-      total: null,
-      page: 0,
-    });
-    const currentToken = await getToken();
-    if (!currentToken || getTokenAuthScope(currentToken) !== authScope) {
-      throw new Error("認証状態が変わったため、Docs再構築を中止しました");
+    try {
+      assertSyncExecutionActive(context);
+      reportProgress({
+        phase: "preparing",
+        completed: 0,
+        total: null,
+        page: 0,
+      });
+      const currentToken = await getToken();
+      if (!currentToken || getTokenAuthScope(currentToken) !== authScope) {
+        throw new Error("認証状態が変わったため、Docs再構築を中止しました");
+      }
+      if (!canAttemptAoiTalkServer()) {
+        throw new Error("サーバー接続が失われたため、Docs再構築を中止しました");
+      }
+      assertSyncExecutionActive(context);
+      await applyDocsPull(authScope, context, {
+        forceDocs: true,
+        onProgress: reportProgress,
+      });
+      assertSyncExecutionActive(context);
+    } finally {
+      releaseSyncExecutionContext(context);
     }
-    if (!canAttemptAoiTalkServer()) {
-      throw new Error("サーバー接続が失われたため、Docs再構築を中止しました");
+  }).finally(() => {
+    flight.listeners.clear();
+    if (docsResyncByAuthScope.get(authScope) === flight) {
+      docsResyncByAuthScope.delete(authScope);
     }
-    assertSyncExecutionActive(context);
-    await applyDocsPull(authScope, context, { forceDocs: true, onProgress });
   });
+  docsResyncByAuthScope.set(authScope, flight);
+  return flight.promise;
 }
 
 /**
@@ -2061,6 +3210,8 @@ async function applyDocsPushEntity(
   table: string | undefined,
   entity: Record<string, unknown> | undefined,
   authScope?: string,
+  preservePending = false,
+  insideForeground = false,
 ): Promise<void> {
   if (!table || !entity) return;
   // クリア/タグ削除時、サーバは { ..., "deleted": true } を返す。無条件 upsert すると
@@ -2068,11 +3219,54 @@ async function applyDocsPushEntity(
   const deleted = entity.deleted === true;
   switch (table) {
     case "knowledge_nodes":
-      if (await hasPendingOutbox(table, String(entity.id), authScope)) {
-        await recordOutboxServerSnapshot(table, String(entity.id), entity, authScope);
-        return;
-      }
-      await applyRemoteDocsNodes([entity as unknown as DocsNode], { force: true });
+      // A foreground edit owns its live-row write and outbox merge together.
+      // Keep the pending check and forced receipt projection in that same
+      // coordinator, rather than clearing a newer edit after a stale read.
+      const projectNode = async () => {
+        if (authScope && getTokenAuthScope(getCachedToken()) !== authScope) return;
+        if (await hasPendingOutbox(table, String(entity.id), authScope)) {
+          if (!preservePending) await recordOutboxServerSnapshot(table, String(entity.id), entity, authScope);
+          return;
+        }
+        let node = entity as unknown as DocsNode;
+        // Conflict receipts intentionally omit ACL fields. Preserve the
+        // same actor/composite projection; absence must not revoke a locally
+        // verified parent or silently invent write permission.
+        {
+          const db = getDb();
+          const [cached] = await db.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, String(entity.id)));
+          // A cleared live cache still has actor/composite memberships; do
+          // not bypass their revocation when a delayed ACK recreates a row.
+          const sameScope = !cached || (cached.workspaceId === entity.workspace_id
+            && (cached.projectId ?? null) === (entity.project_id ?? null));
+          const memberships = authScope && sameScope && schema.docsScopeMembership
+            ? await db.select().from(schema.docsScopeMembership).where(and(
+              eq(schema.docsScopeMembership.authScope, authScope),
+              eq(schema.docsScopeMembership.scopeKey, `${String(entity.workspace_id)}|project:${entity.project_id ?? ""}`),
+              eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+              eq(schema.docsScopeMembership.entityKey, String(entity.id)),
+            )) : [];
+          const membership = memberships[0];
+          const writable = membership?.state === "active" && membership.readOnly === false
+            && ["owner", "write"].includes(membership.access ?? "")
+            && cached?.readOnly !== true && cached?.access !== "read";
+          const has = (key: string) => Object.prototype.hasOwnProperty.call(entity, key);
+          const knownReadOnly = sameScope && (cached?.readOnly === true || cached?.access === "read"
+            || (membership != null && membership.state !== "active") || membership?.readOnly === true || membership?.access === "read");
+          // A delayed write receipt cannot grant permissions revoked locally
+          // while HTTP was in flight. A fresh pull owns permission upgrades.
+          const access = knownReadOnly ? "read" : has("access") ? node.access : writable ? membership.access as DocsNode["access"] : "read";
+          node = { ...node,
+            source: has("source") ? node.source : sameScope ? cached?.source as DocsNode["source"] : undefined,
+            access,
+            read_only: !["owner", "write"].includes(access ?? "")
+              || (has("read_only") ? entity.read_only !== false : !writable),
+          };
+        }
+        await applyRemoteDocsNodes([node], { force: true });
+      };
+      if (insideForeground) await projectNode();
+      else await runForegroundSqliteWrite(projectNode);
       break;
     case "knowledge_supertags":
       if (await hasPendingOutbox(table, String(entity.id), authScope)) {
@@ -2142,6 +3336,124 @@ function jsonEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
+const DOCS_CAS_STALE_REASON_CODE = "docs_cas_stale";
+const DOCS_BASE_MISSING_REASON_CODE = "docs_base_missing";
+const LEGACY_DOCS_MISSING_BASE_REASON = "Docs base_updated_at is required for an existing entity";
+
+function syncResultFailureReason(result: Pick<SyncPushResult, "reason" | "reason_code" | "status">): string {
+  // Keep the structured wire classification in the durable lastError field.
+  // A free-form reason is only a legacy fallback and is never used as an
+  // automatic-resolution authorization.
+  const reasonCode = typeof result.reason_code === "string" && result.reason_code.trim()
+    ? result.reason_code.trim()
+    : null;
+  const reason = typeof result.reason === "string" && result.reason.trim()
+    ? result.reason.trim()
+    : null;
+  if (reasonCode && reason && reason !== reasonCode) return `${reason} [${reasonCode}]`;
+  return reasonCode || reason || result.status;
+}
+
+function isDocsCasStaleReason(reasonCode: unknown): boolean {
+  return reasonCode === DOCS_CAS_STALE_REASON_CODE;
+}
+
+function isLegacyDocsBaseMissingResult(result: SyncPushResult): boolean {
+  // The legacy blank-paragraph repair is intentionally much narrower than a
+  // normal Docs merge. Require both the structured code and its exact legacy
+  // message so an old/code-less or newly classified business error is held.
+  return result.reason_code === DOCS_BASE_MISSING_REASON_CODE
+    && result.reason === LEGACY_DOCS_MISSING_BASE_REASON;
+}
+
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function docsEntityIdentityMatches(
+  operation: PendingOutbox,
+  entity: Record<string, unknown>,
+): boolean {
+  if (operation.tableName === "knowledge_nodes" || operation.tableName === "knowledge_supertags") {
+    return entity.id === operation.entityId;
+  }
+  const [first, second, ...rest] = operation.entityId.split(":");
+  if (rest.length || !first || !second) return false;
+  if (operation.tableName === "knowledge_node_supertags") {
+    return entity.node_id === first && entity.supertag_id === second;
+  }
+  if (operation.tableName === "knowledge_field_values") {
+    return entity.node_id === first && entity.field_id === second;
+  }
+  return false;
+}
+
+function docsEntityScopeMatches(
+  operation: PendingOutbox,
+  entity: Record<string, unknown>,
+): boolean {
+  if (!operation.docsScopeKey) return false;
+  const workspace = entity.workspace_id ?? entity.workspaceId
+    ?? entity.docs_library_id ?? entity.docsLibraryId;
+  const project = entity.project_id ?? entity.projectId ?? null;
+  if (!hasNonEmptyString(workspace)
+    || (entity.workspace_id !== undefined && entity.workspaceId !== undefined
+      && String(entity.workspace_id) !== String(entity.workspaceId))
+    || (entity.project_id !== undefined && entity.projectId !== undefined
+      && (entity.project_id ?? null) !== (entity.projectId ?? null))) return false;
+  return `${workspace}|project:${project ?? ""}` === operation.docsScopeKey;
+}
+
+async function removeAcknowledgedOutboxSnapshot(
+  opId: string,
+  snapshot: PendingOutboxSnapshot,
+  guard?: Parameters<typeof removeOutboxOpIfSnapshot>[2],
+  project?: () => Promise<void>,
+  expected?: PendingOutbox,
+  assertActive: () => void = () => {},
+): Promise<boolean> {
+  return runForegroundSqliteWrite(async () => {
+    assertActive();
+    if (expected?.tableName === "knowledge_nodes") {
+      if (getTokenAuthScope(getCachedToken()) !== expected.authScope) return false;
+      const current = getDb().select().from(schema.outbox).where(eq(schema.outbox.opId, opId)).get();
+      // A newer recorded conflict/block is part of the receipt snapshot too.
+      // Do not erase it after waiting behind another foreground mutation.
+      if (!current || current.blockedReason !== expected.blockedReason
+        || current.lastError !== expected.lastError || current.retryCount !== expected.retryCount
+        || !jsonEqual(current.conflictPayload, expected.conflictPayload)
+        || !jsonEqual(current.basePayload, expected.basePayload)) return false;
+    }
+    // Carry the complete durable row through the CAS predicate.  The compact
+    // operation fields alone cannot distinguish a newer conflict marker,
+    // retry/error state, or base snapshot merged under the same op id.
+    // A caller must pass the exact PendingOutbox row it read.  Prefer that
+    // durable snapshot over any reduced operation projection supplied by an
+    // older call site.
+    const fullSnapshot: PendingOutboxSnapshot = expected ?? snapshot;
+    const removed = await removeOutboxOpIfSnapshot(opId, fullSnapshot, guard);
+    // CAS removal and baseline projection are one unit. Otherwise an edit
+    // queued between them can inherit NULL even though create was confirmed.
+    if (removed && project) await project();
+    return removed;
+  });
+}
+
 async function getCurrentOutbox(
   operationId: string,
 ): Promise<PendingOutbox | null> {
@@ -2159,25 +3471,71 @@ function isOutboxSnapshotCurrent(
 ): boolean {
   return Boolean(
     current &&
+      current.opId === snapshot.opId &&
       current.tableName === snapshot.tableName &&
       current.action === snapshot.action &&
       current.entityId === snapshot.entityId &&
       current.payload === snapshot.payload &&
-      current.baseUpdatedAt === snapshot.baseUpdatedAt,
+      current.baseUpdatedAt === snapshot.baseUpdatedAt &&
+      current.authScope === snapshot.authScope &&
+      current.docsScopeKey === snapshot.docsScopeKey &&
+      current.blockedReason === snapshot.blockedReason &&
+      current.retryCount === snapshot.retryCount &&
+      jsonEqual(current.basePayload, snapshot.basePayload) &&
+      jsonEqual(current.conflictPayload, snapshot.conflictPayload) &&
+      current.lastError === snapshot.lastError,
   );
 }
 
-async function rebaseChangedDocsOutbox(
+async function rebaseChangedOutbox(
   operation: PendingOutbox,
   serverEntity: Record<string, unknown> | undefined,
   serverUpdatedAt: string | null | undefined,
+  sent?: PendingOutbox,
+  assertActive: () => void = () => {},
 ): Promise<void> {
-  if (!serverEntity || !operation.tableName.startsWith("knowledge_")) return;
-  await rebaseOutboxOp(
-    operation.opId,
-    serverUpdatedAt ?? (serverEntity.updated_at as string | null | undefined) ?? null,
-    serverEntity,
-  );
+  if (!serverEntity) return;
+  if (sent?.tableName === "knowledge_nodes" && sent.action === "create"
+    && operation.action === "create" && sent.authScope) {
+    // The edit can also win after the batch receipt pass but before ACK CAS.
+    // Re-run the proven same-op create→update conversion for that late edit.
+    await rebaseDocsWriteFollowups(sent.authScope, [sent], [{ op_id: sent.opId,
+      status: "ok", entity: serverEntity, server_updated_at: serverUpdatedAt }], assertActive);
+    return;
+  }
+  const isDocs = operation.tableName.startsWith("knowledge_");
+  const isConversation = operation.tableName === "conversation_sessions";
+  if (!isDocs && !isConversation) return;
+  const entityVersion = isConversation
+    ? (serverEntity.pin_updated_at as string | null | undefined)
+      ?? (serverEntity.updated_at as string | null | undefined)
+    : (serverEntity.updated_at as string | null | undefined);
+  const rebase = async () => {
+    assertActive();
+    if (operation.tableName === "knowledge_nodes") {
+      const current = await getCurrentOutbox(operation.opId);
+      if (!current || current.authScope !== operation.authScope || current.docsScopeKey !== operation.docsScopeKey
+        || current.blockedReason != null || !isOutboxSnapshotCurrent(current, operation)
+        // The response was sent for `sent`; never let a post-send lifecycle
+        // generation become the expected row for an old success ACK. The
+        // create payload-only continuation is handled by the dedicated exact
+        // receipt branch above before reaching this guard.
+        // A knowledge-node UPDATE must always have a sent lifecycle snapshot;
+        // a missing sent row is fail-closed and cannot become an expectation.
+        || (sent == null || !isOutboxSnapshotCurrent(current, sent))
+        || getTokenAuthScope(getCachedToken()) !== current.authScope
+        || isDocsResultOlderThanRecordedConflict(current, { op_id: current.opId, status: "ok",
+          entity: serverEntity, server_updated_at: serverUpdatedAt ?? entityVersion })) return;
+    }
+    await rebaseOutboxOp(
+      operation.opId,
+      serverUpdatedAt ?? entityVersion ?? null,
+      serverEntity,
+      operation,
+    );
+  };
+  if (operation.tableName === "knowledge_nodes") await runForegroundSqliteWrite(rebase);
+  else await rebase();
 }
 
 type DocsConflictResolution = "rebased" | "applied" | "unresolved";
@@ -2191,30 +3549,39 @@ async function resolveDocsConflict(
   operation: PendingOutbox,
   serverEntity: Record<string, unknown> | undefined,
   serverUpdatedAt: string | null | undefined,
+  reasonCode?: string,
 ): Promise<DocsConflictResolution> {
-  if (!serverEntity) return "unresolved";
-  const base = (operation.basePayload ?? {}) as Record<string, unknown>;
-  const payload = JSON.parse(operation.payload || "{}") as Record<string, unknown>;
-  const serverVersion = serverUpdatedAt ?? (serverEntity.updated_at as string | null | undefined) ?? null;
+  // Generic Docs resolution is authorized only by the explicit CAS-stale
+  // classification.  Business rules, scope/ACL, deletion, base-missing and
+  // legacy/unknown responses retain both values for user review.
+  if (!serverEntity || !operation.docsScopeKey || !operation.authScope
+    || !hasNonEmptyString(serverUpdatedAt)
+    || serverEntity.updated_at !== serverUpdatedAt) return "unresolved";
+  const payload = jsonObject(operation.payload);
+  if (!payload) return "unresolved";
+  const serverVersion = serverUpdatedAt;
 
   if (operation.tableName === "knowledge_nodes" && operation.action === "create") {
-    const createFields = [
-      "title",
-      "description",
-      "node_type",
-      "project_id",
-      "day_date",
-      "sort_order",
-    ];
-    if ("body_json" in payload) createFields.push("body_json");
-    if (
-      serverEntity.deleted === true ||
-      !createFields.every((key) => jsonEqual(serverEntity[key], payload[key]))
-    ) {
-      return "unresolved";
-    }
+    // A create has no common base. It may still be acknowledged by the
+    // existing exact create receipt when the server explicitly reports the
+    // missing-base condition and the complete canonical content matches.
+    const exactCreate = reasonCode === DOCS_BASE_MISSING_REASON_CODE
+      && docsEntityIdentityMatches(operation, serverEntity)
+      && docsEntityScopeMatches(operation, serverEntity)
+      && validateOutboxConflictServerScope(operation, serverEntity).ok
+      && serverEntity.created_by === operation.authScope.slice("auth:".length)
+      && matchesDocsCreateContent(payload, serverEntity);
+    if (!exactCreate) return "unresolved";
     return "applied";
   }
+  if (!isDocsCasStaleReason(reasonCode)
+    || !docsEntityIdentityMatches(operation, serverEntity)
+    || !docsEntityScopeMatches(operation, serverEntity)) return "unresolved";
+  if (operation.tableName === "knowledge_nodes"
+    && !validateOutboxConflictServerScope(operation, serverEntity).ok) return "unresolved";
+  const base = jsonObject(operation.basePayload);
+  if (!hasNonEmptyString(operation.baseUpdatedAt) || !base
+    || compareDocsVersions(operation.baseUpdatedAt, serverVersion) !== -1) return "unresolved";
 
   if (
     operation.tableName === "knowledge_nodes" &&
@@ -2226,8 +3593,8 @@ async function resolveDocsConflict(
     }
     const overlap = changed.some((key) => !jsonEqual(serverEntity[key], base[key]));
     if (overlap) return "unresolved";
-    await rebaseOutboxOp(operation.opId, serverVersion, serverEntity);
-    return "rebased";
+    const rebased = await rebaseOutboxOp(operation.opId, serverVersion, serverEntity, operation);
+    return rebased ? "rebased" : "unresolved";
   }
 
   if (operation.tableName === "knowledge_nodes" && operation.action === "delete") {
@@ -2245,8 +3612,8 @@ async function resolveDocsConflict(
     if (nodeFields.some((key) => !jsonEqual(serverEntity[key], base[key]))) {
       return "unresolved";
     }
-    await rebaseOutboxOp(operation.opId, serverVersion, serverEntity);
-    return "rebased";
+    const rebased = await rebaseOutboxOp(operation.opId, serverVersion, serverEntity, operation);
+    return rebased ? "rebased" : "unresolved";
   }
 
   if (operation.tableName === "knowledge_node_supertags") {
@@ -2434,7 +3801,7 @@ async function flushReorderOutbox(
     assertSyncExecutionActive(context);
     const decoded = decodeReorderPayload(operation);
     if (!decoded) {
-      await markOutboxError(operation.opId, "reorder:invalid_payload");
+      await markOutboxError(operation.opId, "reorder:invalid_payload", operation);
       continue;
     }
 
@@ -2468,33 +3835,37 @@ async function flushReorderOutbox(
           await markOutboxConflict(
             operation.opId,
             `reorder:conflict:${detail}`,
+            undefined,
+            operation,
           );
         } else if (error.status === 401) {
-          await markOutboxError(operation.opId, `reorder:auth:${detail}`);
+          await markOutboxError(operation.opId, `reorder:auth:${detail}`, operation);
         } else if (error.status >= 400 && error.status < 500) {
           await markOutboxError(
             operation.opId,
             `reorder:terminal_http_${error.status}:${detail}`,
+            operation,
           );
         } else {
-          await markOutboxError(operation.opId, `reorder:http_${error.status}:${detail}`);
+          await markOutboxError(operation.opId, `reorder:http_${error.status}:${detail}`, operation);
         }
         continue;
       }
       await markOutboxError(
         operation.opId,
         error instanceof Error ? `reorder:${error.message}` : "reorder:error",
+        operation,
       );
       continue;
     }
 
-    const removed = await removeOutboxOpIfSnapshot(operation.opId, {
-      table: operation.tableName,
-      action: operation.action,
-      entityId: operation.entityId,
-      payload: operation.payload,
-      baseUpdatedAt: operation.baseUpdatedAt,
-    });
+    const removed = await removeAcknowledgedOutboxSnapshot(
+      operation.opId,
+      operation,
+      undefined,
+      undefined,
+      operation,
+    );
     if (!removed) continue;
     // The local order is already optimistic.  A best-effort refresh reconciles
     // server canonical values without turning a refresh timeout into a blind
@@ -2559,7 +3930,11 @@ async function pushOutbox(
     base_updated_at: op.baseUpdatedAt ?? null,
   }));
 
-  const response = await pushSync(operations);
+  const response = await pushSync(operations, context.controller.signal);
+  assertSyncExecutionActive(context);
+  const docsCreateRebased = await rebaseDocsWriteFollowups(
+    authScope, pending, response.results, () => assertSyncExecutionActive(context),
+  );
   assertSyncExecutionActive(context);
   const operationsById = new Map(
     operations.map((operation) => [operation.op_id, operation]),
@@ -2571,8 +3946,15 @@ async function pushOutbox(
   >();
   for (const result of response.results) {
     assertSyncExecutionActive(context);
+    // This same-batch missing-base rejection was superseded by the exact
+    // create receipt. Its update is durable and will retry with that CAS base.
+    if (docsCreateRebased.updates.has(result.op_id)) continue;
     const operation = operationsById.get(result.op_id);
     const pendingOperation = pendingById.get(result.op_id);
+    // Every receipt mutation is scoped to the exact sent outbox row. An
+    // unknown/missing row has no snapshot and must not trigger a blind delete
+    // or cache adoption from a delayed/partial response.
+    if (!pendingOperation) continue;
     if (pendingOperation && isTaskPrerequisite(pendingOperation)) {
       regularResultStatuses.set(result.op_id, result.status);
     }
@@ -2596,14 +3978,27 @@ async function pushOutbox(
     // ローカルへ適用したりせず、応答時点のサーバー版を新しいoutboxの基準にする。
     if (pendingOperation) {
       const currentOperation = await getCurrentOutbox(result.op_id);
+      if (currentOperation && operation?.table === "knowledge_nodes") {
+        if (currentOperation.authScope !== pendingOperation.authScope
+          || currentOperation.docsScopeKey !== pendingOperation.docsScopeKey
+          || currentOperation.entityId !== pendingOperation.entityId
+          || isDocsResultOlderThanRecordedConflict(currentOperation, result)) continue;
+      }
+      if (operation?.table === "knowledge_nodes" && pendingOperation.docsScopeKey && result.status === "ok"
+        && !validateOutboxConflictServerScope(pendingOperation, result.entity).ok) {
+        await markOutboxError(result.op_id, "docs:invalid_ack_scope", pendingOperation);
+        continue;
+      }
       if (!isOutboxSnapshotCurrent(currentOperation, pendingOperation)) {
         if (result.status === "ok") {
           // 送信した古い版はサーバーに適用済みなので、最新outboxだけを
           // 応答版へ再baseする。ローカル値そのものは決して上書きしない。
-          await rebaseChangedDocsOutbox(
+          await rebaseChangedOutbox(
             currentOperation ?? pendingOperation,
             result.entity,
             result.server_updated_at,
+            pendingOperation,
+            () => assertSyncExecutionActive(context),
           );
           if (isTaskPrerequisite(pendingOperation)) {
             // The sent snapshot was acknowledged, but a newer task mutation
@@ -2615,55 +4010,16 @@ async function pushOutbox(
         if (
           currentOperation &&
           result.status === "conflict" &&
-          operation?.table?.startsWith("knowledge_")
+          operation?.table === "conversation_sessions"
         ) {
-          if (await rollbackRejectedDocsDelete(operation, pendingOperation, result)) {
-            await recordOutboxServerSnapshot(
-              currentOperation.tableName,
-              currentOperation.entityId,
-              result.entity ?? { deleted: true },
-              authScope,
-            );
-            await markOutboxConflict(
-              result.op_id,
-              result.reason ?? result.status,
-              result.entity,
-            );
-            continue;
-          }
-          const resolution = await resolveDocsConflict(
-            currentOperation,
-            result.entity,
-            result.server_updated_at,
+          await rebaseChangedOutbox(
+            currentOperation, result.entity, result.server_updated_at,
           );
-          if (resolution === "applied") {
-            const removed = await removeOutboxOpIfSnapshot(result.op_id, {
-              table: currentOperation.tableName,
-              action: currentOperation.action,
-              entityId: currentOperation.entityId,
-              payload: currentOperation.payload,
-              baseUpdatedAt: currentOperation.baseUpdatedAt,
-            });
-            if (!removed) continue;
-            if (isTaskPrerequisite(pendingOperation)) {
-              regularResultStatuses.set(result.op_id, "ok");
-            }
-            await applyDocsPushEntity(operation.table, result.entity, authScope);
-            continue;
-          }
-          if (resolution === "rebased") continue;
-          await recordOutboxServerSnapshot(
-            currentOperation.tableName,
-            currentOperation.entityId,
-            result.entity ?? { deleted: true },
-            authScope,
-          );
-          await markOutboxConflict(
-            result.op_id,
-            result.reason ?? result.status,
-            result.entity,
-          );
+          continue;
         }
+        // A conflict receipt belongs to the exact sent lifecycle snapshot.
+        // Once payload/error/retry/base state changed while HTTP was in flight,
+        // the old response cannot rebase or clear the newer Docs operation.
         // ネットワーク/サーバーエラーは、後から積まれた最新操作へ
         // 古い応答のエラー状態を引き継がせない。
         continue;
@@ -2686,80 +4042,124 @@ async function pushOutbox(
       if (result.entity && operation?.table === "time_entries") {
         await applyRemoteTimeEntries([result.entity as unknown as TimeEntry]);
       }
-      if (pendingOperation && operation) {
-        const removed = await removeOutboxOpIfSnapshot(result.op_id, {
-          table: pendingOperation.tableName,
-          action: pendingOperation.action,
-          entityId: pendingOperation.entityId,
-          payload: pendingOperation.payload,
-          baseUpdatedAt: pendingOperation.baseUpdatedAt,
-        });
+      if (operation) {
+        const removed = await removeAcknowledgedOutboxSnapshot(result.op_id,
+        pendingOperation, { authScope, docsScopeKey: pendingOperation.docsScopeKey },
+        operation.table === "knowledge_nodes" ? () => applyDocsPushEntity(operation.table, result.entity, authScope, true, true) : undefined, pendingOperation, () => assertSyncExecutionActive(context));
         if (!removed) {
           if (isTaskPrerequisite(pendingOperation)) {
             regularResultStatuses.set(result.op_id, "error");
           }
           const currentOperation = await getCurrentOutbox(result.op_id);
-          await rebaseChangedDocsOutbox(
+          await rebaseChangedOutbox(
             currentOperation ?? pendingOperation,
             result.entity,
             result.server_updated_at,
+            pendingOperation,
+            () => assertSyncExecutionActive(context),
           );
           continue;
         }
-      } else {
-        await removeOutboxOp(result.op_id);
       }
-      await applyDocsPushEntity(operation?.table, result.entity, authScope);
+      if (
+        result.entity &&
+        operation?.table === "conversation_sessions" &&
+        operation.action !== "delete"
+      ) {
+        await applyRemoteConversationSessions([
+          result.entity as unknown as ConversationSession,
+        ]);
+      }
+      if (operation?.table !== "knowledge_nodes" && !docsCreateRebased.receipts.has(result.op_id)) {
+        await applyDocsPushEntity(operation?.table, result.entity, authScope, true);
+      }
       continue;
     }
 
     if (result.status === "conflict") {
+      if (pendingOperation && operation?.table === "tasks" && operation.action === "update") {
+        const acknowledged = await runForegroundSqliteWrite(async () => {
+          assertSyncExecutionActive(context);
+          const current = await getCurrentOutbox(result.op_id);
+          assertSyncExecutionActive(context);
+          if (getTokenAuthScope(getCachedToken()) !== authScope
+            || current?.authScope !== authScope
+            || current.blockedReason != null
+            || !isOutboxSnapshotCurrent(current, pendingOperation)
+            || current.lastError !== pendingOperation.lastError
+            || current.retryCount !== pendingOperation.retryCount
+            || !jsonEqual(current.conflictPayload, pendingOperation.conflictPayload)) return false;
+          if (!isTaskCasStaleReason(result.reason_code)
+            || !hasNonEmptyString(pendingOperation.baseUpdatedAt)
+            || !hasNonEmptyString(result.server_updated_at)
+            || compareDocsVersions(pendingOperation.baseUpdatedAt, result.server_updated_at) !== -1
+            || result.entity?.updated_at !== result.server_updated_at
+            || !pendingOperation.authScope
+            || !matchesTaskUpdateReceipt(operation.entity_id, operation.payload, result.entity)) {
+            // Preserve both the exact device update and the returned server
+            // entity. A later flight must not blindly replay this conflict.
+            await markOutboxConflict(result.op_id, syncResultFailureReason(result),
+              result.entity?.id === operation.entity_id ? result.entity
+                : { id: operation.entity_id, unavailable: true }, pendingOperation);
+            return false;
+          }
+          const removed = await removeOutboxOpIfSnapshot(
+            result.op_id,
+            pendingOperation,
+            { authScope },
+          );
+          if (removed) await applyTaskPushEntity(operation, result.entity, result.server_updated_at);
+          return removed;
+        });
+        if (acknowledged) regularResultStatuses.set(result.op_id, "ok");
+        continue;
+      }
+      if (
+        pendingOperation &&
+        operation?.table === "conversation_sessions" &&
+        result.entity
+      ) {
+        await rebaseChangedOutbox(
+          pendingOperation, result.entity, result.server_updated_at,
+        );
+        continue;
+      }
       if (pendingOperation && operation?.table?.startsWith("knowledge_")) {
         if (await rollbackRejectedDocsDelete(operation, pendingOperation, result)) {
-          await recordOutboxServerSnapshot(
-            operation.table,
-            operation.entity_id,
-            result.entity ?? { deleted: true },
-            authScope,
-          );
           await markOutboxConflict(
             result.op_id,
-            result.reason ?? result.status,
+            syncResultFailureReason(result),
             result.entity,
+            pendingOperation,
           );
           continue;
         }
+        if (isLegacyDocsBaseMissingResult(result) && await rebaseLegacyBlankDocsUpdate(
+          pendingOperation, result, authScope, () => assertSyncExecutionActive(context),
+        )) continue;
         const resolution = await resolveDocsConflict(
           pendingOperation,
           result.entity,
           result.server_updated_at,
+          result.reason_code,
         );
         if (resolution === "applied") {
-          const removed = await removeOutboxOpIfSnapshot(result.op_id, {
-            table: pendingOperation.tableName,
-            action: pendingOperation.action,
-            entityId: pendingOperation.entityId,
-            payload: pendingOperation.payload,
-            baseUpdatedAt: pendingOperation.baseUpdatedAt,
-          });
+          const removed = await removeAcknowledgedOutboxSnapshot(result.op_id,
+          pendingOperation, { authScope, docsScopeKey: pendingOperation.docsScopeKey },
+          operation.table === "knowledge_nodes" ? () => applyDocsPushEntity(operation.table, result.entity, authScope, true, true) : undefined, pendingOperation, () => assertSyncExecutionActive(context));
           if (!removed) continue;
           if (isTaskPrerequisite(pendingOperation)) {
             regularResultStatuses.set(result.op_id, "ok");
           }
-          await applyDocsPushEntity(operation.table, result.entity, authScope);
+          if (operation.table !== "knowledge_nodes") await applyDocsPushEntity(operation.table, result.entity, authScope);
           continue;
         }
         if (resolution === "rebased") continue;
-        await recordOutboxServerSnapshot(
-          operation.table,
-          operation.entity_id,
-          result.entity ?? { deleted: true },
-          authScope,
-        );
         await markOutboxConflict(
           result.op_id,
-          result.reason ?? result.status,
+          syncResultFailureReason(result),
           result.entity,
+          pendingOperation,
         );
         continue;
       }
@@ -2780,13 +4180,15 @@ async function pushOutbox(
         await applyRemoteTimeEntries([result.entity as unknown as TimeEntry]);
       }
       await applyDocsPushEntity(operation?.table, result.entity, authScope);
-      await markOutboxConflict(result.op_id, result.reason ?? result.status);
+      if (!pendingOperation) continue;
+      await markOutboxConflict(result.op_id, syncResultFailureReason(result), undefined, pendingOperation);
       continue;
     }
 
     if (result.status === "error") {
       await rollbackRejectedDocsDelete(operation, pendingOperation, result);
-      await markOutboxError(result.op_id, result.reason ?? result.status);
+      if (!pendingOperation) continue;
+      await markOutboxError(result.op_id, syncResultFailureReason(result), pendingOperation);
     }
   }
   await flushReorderOutbox(
@@ -2798,81 +4200,448 @@ async function pushOutbox(
   );
 }
 
-async function performSync(
+// Status listeners are UI observers. A throwing subscriber must not turn a
+// committed pull into a failure, skip Docs, or strand the single-flight queue.
+function updateSyncStatus(update: () => void): void {
+  try {
+    update();
+  } catch (error) {
+    console.warn(
+      "[sync] status observer failed",
+      error instanceof Error ? error.name : "UnknownError",
+    );
+  }
+}
+
+function reportSyncStage(
+  authScope: string,
+  context: SyncExecutionContext,
+  stage: SyncStage,
+): void {
+  if (context.flightSequence == null) return;
+  updateSyncStatus(() => useSyncStatusStore.getState().setStage(
+    authScope,
+    context.flightSequence!,
+    stage,
+  ));
+}
+
+function reportGeneralSyncProgress(
+  authScope: string,
+  context: SyncExecutionContext,
+  page: number,
+  pendingTables: number,
+): void {
+  if (context.flightSequence == null) return;
+  updateSyncStatus(() => useSyncStatusStore.getState().setGeneralProgress(
+    authScope,
+    context.flightSequence!,
+    { page, pendingTables },
+  ));
+}
+
+function getDocsDiagnosticScope(
+  scopeId?: string,
+  projectId?: string | null,
+): SyncDocsScope {
+  if (projectId) return "project";
+  if (scopeId) return "shared";
+  return "personal";
+}
+
+function reportDocsSyncProgress(
+  authScope: string,
+  context: SyncExecutionContext,
+  scopeId: string | undefined,
+  projectId: string | null | undefined,
+  page: number,
+  retryAttempt: number | null = null,
+): void {
+  if (context.flightSequence == null) return;
+  const update: DocsProgressUpdate = {
+    scope: getDocsDiagnosticScope(scopeId, projectId),
+    page,
+    retryAttempt,
+  };
+  // applyDocsPullOnce reports before and after each page. Keep the product
+  // observer at page granularity so a large pull cannot cause row-like UI
+  // churn while retaining enough information to spot a stalled flight.
+  const key = `${scopeId ?? ""}:${projectId ?? ""}:${update.scope}:${update.page}:${update.retryAttempt ?? 0}`;
+  if (context.lastDocsProgressKey === key) return;
+  context.lastDocsProgressKey = key;
+  updateSyncStatus(() => useSyncStatusStore.getState().setDocsProgress(
+    authScope,
+    context.flightSequence!,
+    update,
+  ));
+}
+
+// Docs is first so a long general replay cannot starve it. A separate stage
+// budget keeps one stalled Docs stage from holding the whole auth queue forever;
+// the child signal prevents that stage from crossing another SQLite boundary
+// after the budget expires. The parent flight remains valid for general sync.
+const DOCS_STAGE_WATCHDOG_MS = 90_000;
+
+class DocsStageWatchdogError extends Error {
+  constructor() {
+    super("Docs同期が制限時間内に完了しませんでした");
+    this.name = "DocsStageWatchdogError";
+  }
+}
+
+async function applyDocsPullWithinFlightBudget(
   authScope: string,
   context: SyncExecutionContext,
 ): Promise<void> {
+  const controller = new AbortController();
+  const abortChild = () => controller.abort();
+  if (context.controller.signal.aborted) controller.abort();
+  else context.controller.signal.addEventListener("abort", abortChild, { once: true });
+  let timedOut = false;
+  let liveWriteAtTimeout = false;
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let parentAbort: (() => void) | null = null;
+  const docsLiveWriteState = { started: false };
+  const docsContext: SyncExecutionContext = {
+    ...context,
+    controller,
+    docsLiveWriteState,
+    docsDiagnostic: {
+      startedAt: Date.now(),
+      stage: null,
+      runState: null,
+      pendingTables: null,
+      frozen: false,
+    },
+  };
+  const docsFlight = applyDocsPull(authScope, docsContext);
+  // A raced promise may settle after the stage has moved on. Consume its
+  // rejection while child guards prevent any later local apply.
+  void docsFlight.catch(() => undefined);
+  try {
+    const deadline = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        liveWriteAtTimeout = docsLiveWriteState.started;
+        captureDocsWatchdog(docsContext);
+        controller.abort();
+        reject(new DocsStageWatchdogError());
+      }, DOCS_STAGE_WATCHDOG_MS);
+    });
+    const interrupted = new Promise<never>((_, reject) => {
+      parentAbort = () => {
+        controller.abort();
+        if (!docsLiveWriteState.started) reject(new SyncExecutionInterruptedError());
+      };
+      if (context.controller.signal.aborted) parentAbort();
+      else context.controller.signal.addEventListener("abort", parentAbort, { once: true });
+    });
+    await Promise.race([docsFlight, deadline, interrupted]);
+  } catch (error) {
+    if (timedOut && liveWriteAtTimeout) {
+      // A compatibility live write owns the queue until its transaction and
+      // rollback boundary settles. The child was already aborted, so its next
+      // guard will reject; wait for that settlement before general sync.
+      await docsFlight.catch(() => undefined);
+      throw new DocsStageWatchdogError();
+    }
+    if (timedOut && !isSyncExecutionInterrupted(context)) {
+      throw new DocsStageWatchdogError();
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    if (parentAbort) context.controller.signal.removeEventListener("abort", parentAbort);
+    context.controller.signal.removeEventListener("abort", abortChild);
+  }
+}
+
+async function performSync(
+  authScope: string,
+  context: SyncExecutionContext,
+): Promise<"success" | "partial" | "interrupted"> {
   syncExecutionCount += 1;
-  const steps: Array<[string, () => Promise<unknown>]> = [
-    ["outbox push", () => pushOutbox(authScope, context)],
-    // Docs表示の鮮度を、通常tableや保留conversation/clipの失敗へ連鎖させない。
-    // ローカルDocs編集のpush後、Docs pullを独立して先に収束させる。
-    ["Docs pull", () => applyDocsPull(authScope, context)],
-    ["general pull", () => applyGeneralPull(authScope, context)],
-    ["pending conversations", flushPendingConversations],
-    ["pending clip ingests", flushPendingClipIngests],
+  if (context.diagnostic) markSyncDiagnosticStarted(context.diagnostic);
+  let hadFailure = false;
+  const steps: Array<[SyncStage, string, () => Promise<unknown>, boolean?]> = [
+    ["outbox", "outbox push", () => pushOutbox(authScope, context)],
+    // 一般tableの全件replayが長引くと、アプリがbackgroundへ移る前にDocsへ
+    // 到達できない。Docsを先に一つのflightへ含め、HTTP200だけで完了扱いに
+    // せず、staging/promotionまで進めてから一般tableを収束させる。
+    // Docsのchildはparent abortと90秒stage期限のraceで解放し、期限後は
+    // partialとしてgeneralへ進む。低レイヤーDB/SecureStore awaitがsignalを
+    // 無視しても、進行中transactionは原子的に完了し、次のstaging/write
+    // 境界のguardでchild処理を止める。この自然終了待ちは残る実行上の限界である。
+    ["docs", "Docs pull", () => applyDocsPullWithinFlightBudget(authScope, context), true],
+    // Docsだけのtransport失敗でも後続の通常tableを試す。Docsの失敗は
+    // partialとして記録し、outboxやgeneralの結果を成功へ畳み込まない。
+    ["general", "general pull", async () => {
+      const changed = await applyGeneralPull(authScope, context);
+      assertSyncExecutionActive(context);
+      if (changed && getTokenAuthScope(getCachedToken()) === authScope) {
+        updateSyncStatus(() => useSyncStatusStore.getState().generalApplied(authScope));
+      }
+    }],
+    ["pending-conversations", "pending conversations", flushPendingConversations],
+    ["pending-clips", "pending clip ingests", flushPendingClipIngests],
     // サーバー未到達時にモバイルLLMだけで取り込めるよう、到達できたときに
     // 取り込み先設定のキャッシュを更新する。TTL 内は内部でスキップされる。
-    ["clip ingest targets", refreshClipIngestTargetsIfStale],
+    ["clip-targets", "clip ingest targets", refreshClipIngestTargetsIfStale],
     // オフライン中も最後に取得したsystem prompt等を使えるよう、
     // 接続できた同期のたびにサーバーの全プロフィールを更新する。
     // 既存の保留同期を、キャラクターAPIの一時的な断線で止めないため最後に行う。
-    ["character profiles", () => characterApi.refreshCache()],
+    ["profiles", "character profiles", () => characterApi.refreshCache()],
   ];
 
-  for (const [label, operation] of steps) {
+  for (const [stage, label, operation, continueAfterConnectionFailure] of steps) {
     try {
       assertSyncExecutionActive(context);
+      reportSyncStage(authScope, context, stage);
       await operation();
       assertSyncExecutionActive(context);
     } catch (error) {
-      if (error instanceof SyncExecutionInterruptedError) break;
+      if (
+        error instanceof SyncExecutionInterruptedError
+        || isSyncExecutionInterrupted(context)
+      ) {
+        if (label === "Docs pull") {
+          markStagedDocsPromotionsFailed(context.diagnostic);
+        }
+        return "interrupted";
+      }
+      hadFailure = true;
+      if (label === "Docs pull") {
+        markStagedDocsPromotionsFailed(context.diagnostic);
+      }
       console.warn(
-        `[sync] ${label} failed`,
+        "[sync] " + label + " failed",
         error instanceof Error ? error.name : "UnknownError",
       );
       // transport断では後続のAPIも同じ理由で失敗するため、このrunだけ打ち切る。
       // HTTP応答・認証・ローカルDB・個別機能の失敗では他領域の同期を継続する。
-      if (isApiConnectionError(error)) break;
+      if (isApiConnectionError(error) && !continueAfterConnectionFailure) {
+        break;
+      }
     }
   }
+
+  return hadFailure ? "partial" : "success";
 }
 
-function runSyncForToken(token: string | null): Promise<void> {
-  if (
-    !token ||
-    !syncExecutionActive ||
-    !canAttemptAoiTalkServer()
-  ) {
+function runSyncForToken(
+  token: string | null,
+  diagnostic = createSyncDiagnosticReceipt(),
+): Promise<void> {
+  if (isMobileReadOnlyDiagnosticsEnabled()) {
+    finishSyncDiagnostic(diagnostic, "skipped", "read_only_diagnostics");
+    return completedSync;
+  }
+  if (!token) {
+    finishSyncDiagnostic(diagnostic, "skipped", "no_token");
+    return completedSync;
+  }
+  if (!syncExecutionActive) {
+    finishSyncDiagnostic(diagnostic, "skipped", "not_active");
+    return completedSync;
+  }
+  if (!canAttemptAoiTalkServer()) {
+    finishSyncDiagnostic(diagnostic, "skipped", "backend_unavailable");
     return completedSync;
   }
 
   const authScope = getTokenAuthScope(token);
   const running = runningByAuthScope.get(authScope);
   if (running) {
-    if (running.epoch === syncExecutionEpoch) return running.promise;
-    return running.promise.then(() => runSyncForToken(token));
+    if (running.diagnostic.authGeneration !== syncDiagnosticGeneration) {
+      return running.promise.then(() => runSyncForToken(token, diagnostic));
+    }
+    if (running.epoch === syncExecutionEpoch) {
+      diagnostic.canonicalRequestId = running.diagnostic.requestId;
+      finishSyncDiagnostic(diagnostic, "skipped", "already_running");
+      return running.promise;
+    }
+    return running.promise.then(() => runSyncForToken(token, diagnostic));
   }
 
-  const context = createSyncExecutionContext();
+  const flightSequence = ++syncFlightSequence;
+  const context = createSyncExecutionContext(flightSequence, diagnostic);
+  const flightState: RunningSyncFlight = {
+    epoch: context.epoch,
+    promise: completedSync,
+    mutationWakeRequested: false,
+    diagnostic,
+  };
   const flight = enqueueExclusive(async () => {
+    const abortFlight = () => updateSyncStatus(() =>
+      useSyncStatusStore.getState().abort(authScope, flightSequence));
+    const scopeIsCurrent = () => activeAuthScopeTransitions.size === 0
+      && diagnostic.authGeneration === syncDiagnosticGeneration
+      && getTokenAuthScope(getCachedToken()) === authScope;
     try {
       assertSyncExecutionActive(context);
+      // A queued old-scope flight must not touch data or publish UI state
+      // after an account transition has been requested.
+      if (!scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          "skipped",
+          activeAuthScopeTransitions.size > 0
+            ? "active_scope_transition"
+            : "auth_scope_changed",
+        );
+        return;
+      }
+
+      const initialMutationRevision = useSyncStatusStore.getState().mutationRevision;
+      let initialOutboxState: OutboxSyncState = "retrying";
+      try {
+        initialOutboxState = await getOutboxState(authScope);
+      } catch {
+        // A durable summary failure cannot be represented as empty/success.
+        initialOutboxState = "retrying";
+      }
+      if (flightState.mutationWakeRequested && initialOutboxState === "empty") {
+        initialOutboxState = "pending";
+      }
+      assertSyncExecutionActive(context);
+      if (!scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          "skipped",
+          activeAuthScopeTransitions.size > 0
+            ? "active_scope_transition"
+            : "auth_scope_changed",
+        );
+        return;
+      }
+      updateSyncStatus(() => useSyncStatusStore.getState().begin(authScope, flightSequence));
+      updateSyncStatus(() => useSyncStatusStore.getState().setOutboxState(
+        authScope,
+        initialOutboxState,
+        flightSequence,
+        initialMutationRevision,
+      ));
+
+      const outcome = await performSync(authScope, context);
+      if (outcome === "interrupted" || !scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          outcome === "interrupted" ? "interrupted" : "skipped",
+          outcome === "interrupted"
+            ? null
+            : activeAuthScopeTransitions.size > 0
+              ? "active_scope_transition"
+              : "auth_scope_changed",
+        );
+        abortFlight();
+        return;
+      }
+      // A newer enqueue must win over a summary that was started earlier.
+      const terminalMutationRevision = useSyncStatusStore.getState().mutationRevision;
+      let outboxState: OutboxSyncState = "retrying";
+      try {
+        assertSyncExecutionActive(context);
+        outboxState = await getOutboxState(authScope);
+      } catch {
+        outboxState = "retrying";
+      }
+      // The read itself can span lifecycle/account changes. Its success or
+      // rejection never authorizes a terminal receipt for an obsolete flight.
+      assertSyncExecutionActive(context);
+      if (!scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          "skipped",
+          activeAuthScopeTransitions.size > 0
+            ? "active_scope_transition"
+            : "auth_scope_changed",
+        );
+        abortFlight();
+        return;
+      }
+      if (flightState.mutationWakeRequested && outboxState === "empty") {
+        outboxState = "pending";
+      }
+      updateSyncStatus(() => useSyncStatusStore.getState().setOutboxState(
+        authScope,
+        outboxState,
+        flightSequence,
+        terminalMutationRevision,
+      ));
+      const terminalState = useSyncStatusStore.getState();
+      const terminalApplied = terminalState.authScope === authScope
+        && terminalState.status === "syncing"
+        && terminalState.flightSequence === flightSequence
+        && terminalState.mutationRevision === terminalMutationRevision
+        && terminalState.outboxState === outboxState;
+      if (terminalApplied) {
+        updateSyncStatus(() => useSyncStatusStore.getState().complete(
+          authScope,
+          outcome === "partial",
+          flightSequence,
+          terminalMutationRevision,
+        ));
+      }
+      // CAS can lose to a later enqueue. Settle only our own flight while
+      // retaining its durable pending/failure state; a canceled/offline tail
+      // must not leave the UI permanently marked as actively syncing.
+      abortFlight();
+      // Terminal success/partial is the final diagnostic publication. Status
+      // observers may synchronously trigger a lifecycle or auth transition,
+      // so validate again after all tail/CAS/status work has settled.
+      assertSyncExecutionActive(context);
+      if (!scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          "skipped",
+          activeAuthScopeTransitions.size > 0
+            ? "active_scope_transition"
+            : "auth_scope_changed",
+        );
+        return;
+      }
+      finishSyncDiagnostic(diagnostic, outcome);
     } catch (error) {
-      if (error instanceof SyncExecutionInterruptedError) return;
+      if (isSyncExecutionInterrupted(context) || !scopeIsCurrent()) {
+        finishSyncDiagnostic(
+          diagnostic,
+          isSyncExecutionInterrupted(context) ? "interrupted" : "skipped",
+          isSyncExecutionInterrupted(context)
+            ? null
+            : activeAuthScopeTransitions.size > 0
+              ? "active_scope_transition"
+              : "auth_scope_changed",
+        );
+        abortFlight();
+        return;
+      }
+      finishSyncDiagnostic(diagnostic, "failed");
+      updateSyncStatus(() => useSyncStatusStore.getState().fail(authScope, flightSequence));
       throw error;
     }
-    // auth transition中に予約された旧scopeの同期は、DBへ触れる前に破棄する。
-    if (getTokenAuthScope(getCachedToken()) !== authScope) return;
-    await performSync(authScope, context);
   }).finally(() => {
-    if (runningByAuthScope.get(authScope)?.promise === flight) {
+    releaseSyncExecutionContext(context);
+    if (runningByAuthScope.get(authScope) === flightState) {
       runningByAuthScope.delete(authScope);
+      if (
+        flightState.mutationWakeRequested
+        && flightState.epoch === syncExecutionEpoch
+        && syncExecutionActive
+      ) {
+        // Do not await this from inside the auth-scope queue.  The new run is
+        // enqueued after the current queue tail and therefore cannot recurse
+        // into the operation that is still releasing the queue.
+        queueMicrotask(() => wakeMutationSync(authScope));
+      }
     }
   });
-  runningByAuthScope.set(authScope, { epoch: context.epoch, promise: flight });
+  flightState.promise = flight;
+  runningByAuthScope.set(authScope, flightState);
+  retainSyncDiagnosticCanonical(diagnostic);
   return flight;
 }
+
+registerMutationWakeListener(requestMutationSync);
 
 /**
  * 同じ認証スコープの同期要求を完全なsingle-flightとしてまとめる。
@@ -2880,17 +4649,34 @@ function runSyncForToken(token: string | null): Promise<void> {
  */
 export function runSync(): Promise<void> {
   syncRequestCount += 1;
+  const diagnostic = createSyncDiagnosticReceipt();
+  if (isMobileReadOnlyDiagnosticsEnabled()) {
+    finishSyncDiagnostic(diagnostic, "skipped", "read_only_diagnostics");
+    return completedSync;
+  }
   if (!syncExecutionActive || !canAttemptAoiTalkServer()) {
+    finishSyncDiagnostic(
+      diagnostic,
+      "skipped",
+      !syncExecutionActive ? "not_active" : "backend_unavailable",
+    );
     return completedSync;
   }
 
   const token = getCachedToken();
-  if (token !== undefined) return runSyncForToken(token);
-  if (unresolvedAuthFlight) return unresolvedAuthFlight;
+  if (token !== undefined) return runSyncForToken(token, diagnostic);
+  if (unresolvedAuthFlight) {
+    finishSyncDiagnostic(diagnostic, "skipped", "auth_lookup_pending");
+    return unresolvedAuthFlight;
+  }
 
   const tokenLookup = getToken();
   const flight = tokenLookup
-    .then((resolvedToken) => runSyncForToken(resolvedToken))
+    .then((resolvedToken) => runSyncForToken(resolvedToken, diagnostic))
+    .catch((error: unknown) => {
+      finishSyncDiagnostic(diagnostic, "failed", null, "auth_lookup_failed");
+      throw error;
+    })
     .finally(() => {
       if (unresolvedAuthFlight === flight) unresolvedAuthFlight = null;
     });
@@ -2902,7 +4688,25 @@ export function runSync(): Promise<void> {
  * 進行中の同期と排他的に認証scopeを切り替える。
  * callback中に届いたrunSyncは、token/cache更新完了後まで開始されない。
  */
-export { runAuthScopeTransition };
+export function runAuthScopeTransition<T>(
+  callback: () => T | PromiseLike<T>,
+): Promise<T> {
+  syncDiagnosticGeneration += 1;
+  syncDiagnosticHistory.length = 0;
+  syncDiagnosticCanonicalReceipts.clear();
+  latestSyncDiagnosticCanonical = null;
+  notifySyncDiagnosticListeners();
+  const transitionToken = ++nextAuthScopeTransitionToken;
+  activeAuthScopeTransitions.add(transitionToken);
+  updateSyncStatus(() => useSyncStatusStore.getState().reset());
+  return runQueuedAuthScopeTransition(callback).finally(() => {
+    activeAuthScopeTransitions.delete(transitionToken);
+    if (activeAuthScopeTransitions.size > 0) return;
+    const scopes = [...deferredMutationWakeScopes];
+    deferredMutationWakeScopes.clear();
+    for (const scope of scopes) requestMutationSync(scope);
+  });
+}
 
 export function getSyncDiagnostics(): {
   requestCount: number;
@@ -2916,7 +4720,54 @@ export function getSyncDiagnostics(): {
   };
 }
 
+/** Read-only bounded receipts for the opt-in development diagnostics surface. */
+export function getSyncDiagnosticSnapshot(): SyncDiagnosticSnapshot {
+  const recent = syncDiagnosticHistory
+    .filter((receipt) => receipt.authGeneration === syncDiagnosticGeneration)
+    .map(cloneSyncDiagnosticReceipt);
+  const activeEntries = getActiveSyncDiagnosticCanonicals();
+  const retainedById = new Map(
+    [...syncDiagnosticCanonicalReceipts.values()]
+      .map((receipt) => [receipt.requestId, receipt] as const),
+  );
+  for (const receipt of activeEntries) retainedById.set(receipt.requestId, receipt);
+  const retainedEntries = [...retainedById.values()]
+    .filter((receipt) => receipt.authGeneration === syncDiagnosticGeneration);
+  if (
+    latestSyncDiagnosticCanonical
+    && latestSyncDiagnosticCanonical.authGeneration === syncDiagnosticGeneration
+    && !retainedEntries.some((receipt) => receipt.requestId === latestSyncDiagnosticCanonical?.requestId)
+  ) {
+    retainedEntries.push(latestSyncDiagnosticCanonical);
+  }
+  const retained = retainedEntries
+    .slice(-SYNC_DIAGNOSTIC_HISTORY_LIMIT)
+    .map(cloneSyncDiagnosticReceipt);
+  const lookup = [...recent, ...retained];
+  let latest = recent[recent.length - 1] ?? retained[retained.length - 1] ?? null;
+  const canonicalIds = new Set<string>();
+  while (latest?.canonicalRequestId && !canonicalIds.has(latest.requestId)) {
+    canonicalIds.add(latest.requestId);
+    const canonical = lookup.find((receipt) => receipt.requestId === latest?.canonicalRequestId);
+    if (!canonical) break;
+    latest = canonical;
+  }
+  return {
+    requestCount: syncRequestCount,
+    executionCount: syncExecutionCount,
+    runningScopes: runningByAuthScope.size + (unresolvedAuthFlight ? 1 : 0),
+    authGeneration: syncDiagnosticGeneration,
+    latest,
+    recent,
+    retained,
+  };
+}
+
 export function resetSyncDiagnostics(): void {
   syncRequestCount = 0;
   syncExecutionCount = 0;
+  syncDiagnosticHistory.length = 0;
+  syncDiagnosticCanonicalReceipts.clear();
+  latestSyncDiagnosticCanonical = null;
+  notifySyncDiagnosticListeners();
 }

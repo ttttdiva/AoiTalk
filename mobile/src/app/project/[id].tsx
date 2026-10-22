@@ -115,7 +115,14 @@ export default function ProjectDetailScreen() {
         onBack={() => goBackOrReplace(router, '/projects')}
         right={
           canManageSettings ? (
-            <Button compact mode="outlined" textColor="#89b4fa" onPress={() => setDialogVisible(true)}>
+            <Button
+              compact
+              mode="outlined"
+              textColor="#89b4fa"
+              contentStyle={styles.headerButtonContent}
+              accessibilityLabel="プロジェクトを編集"
+              onPress={() => setDialogVisible(true)}
+            >
               Edit
             </Button>
           ) : null
@@ -288,6 +295,7 @@ const styles = StyleSheet.create({
   memberRole: { color: '#89b4fa', fontSize: 12, marginLeft: 8 },
   dialog: { backgroundColor: '#1e1e2e' },
   dialogTitle: { color: '#cdd6f4' },
+  headerButtonContent: { minHeight: 44, paddingHorizontal: 8 },
   input: { marginBottom: 12 },
   switchRow: {
     flexDirection: 'row',

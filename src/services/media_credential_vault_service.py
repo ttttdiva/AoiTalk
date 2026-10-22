@@ -7,11 +7,14 @@ this service owns encrypted payloads, verification state and immutable audit.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import hmac
 import time
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -71,7 +74,7 @@ _STATUS_TO_CONNECTION = {
     "disabled": "disabled",
     "key_unavailable": "key_unavailable",
 }
-_MEDIA_PLATFORMS = frozenset({"x", "pixiv", "patreon", "youtube", "instagram", "dlsite"})
+_MEDIA_PLATFORMS = frozenset({"x", "pixiv", "patreon", "youtube", "instagram", "dlsite", "fanza", "tiktok"})
 _SAFE_PROVIDER_CODES = frozenset(
     {
         "credential_type_unsupported",
@@ -309,6 +312,31 @@ def _normalize_verification_result(value: Any) -> CredentialVerificationResult:
             dict(_UNKNOWN_CAPABILITIES),
             provider_code="provider_response_unknown",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MediaCredentialExecutionHandle:
+    """Ephemeral, in-memory credential projection for a single provider attempt.
+
+    The decrypted payload is exposed through a read-only mapping and is never
+    serialised, logged, returned by an API, or attached to an ORM object.  The
+    backing dictionary is cleared by :meth:`execution_handle` as soon as the
+    provider attempt leaves the context.
+    """
+
+    platform: str
+    platform_account_id: UUID
+    account_ref: str
+    credential_id: UUID
+    credential_revision: int
+    connection_type: str
+    state_hash: str
+    payload: Mapping[str, Any]
+
+
+class MediaCredentialExecutionError(MediaOperationsConflictError):
+    """Safe execution-boundary error that never includes credential material."""
+
 
 
 class MediaCredentialVaultService(MediaOperationsSetupService):
@@ -580,6 +608,95 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
                 return dict(_safe_snapshot(dict(saved)))
         return self._safe_result(credential, account)
 
+    @asynccontextmanager
+    async def execution_handle(
+        self,
+        session: Any | None = None,
+        *,
+        platform_account_id: UUID | str,
+        expected_state_hash: str,
+        expected_platform: str | None = None,
+    ) -> AsyncIterator[MediaCredentialExecutionHandle]:
+        """Yield one verified credential only for the duration of an attempt.
+
+        This is an internal provider-execution boundary.  ExternalAction has
+        already checked policy/approval and its immutable authority tuple; the
+        vault independently re-checks account/connection/ciphertext integrity
+        and the exact credential state hash before decrypting.  No row lock is
+        held while a remote API call is in flight.
+        """
+
+        resolved = self._resolve(session)
+        account_uuid = _as_uuid(platform_account_id, "platform_account_id")
+        assert account_uuid is not None
+        account = await self._get_platform_account_row(resolved, account_uuid)
+        credential = await self._credential(resolved, account.id, lock=False)
+        if credential is None:
+            raise MediaCredentialExecutionError("verified platform credential is unavailable")
+        # The publication adapter re-enters this boundary between chunks.
+        # Refresh identity-map rows so a revoke/disable in another session wins.
+        await resolved.refresh(account)
+        await resolved.refresh(credential)
+        await self._assert_credential_binding(
+            resolved,
+            account,
+            credential,
+            lock_connection=False,
+        )
+        platform = str(account.platform or "").strip().lower()
+        requested_platform = str(expected_platform or platform).strip().lower()
+        if not platform or requested_platform != platform:
+            raise MediaCredentialExecutionError("platform credential binding does not match the action")
+        expected_hash = str(expected_state_hash or "").strip().lower()
+        current_hash = str(credential.state_hash or "").strip().lower()
+        if (
+            len(expected_hash) != 64
+            or not current_hash
+            or not hmac.compare_digest(expected_hash, current_hash)
+        ):
+            raise MediaCredentialExecutionError("platform credential state changed before execution")
+        if str(credential.status or "").strip().lower() != "verified":
+            raise MediaCredentialExecutionError("platform credential is not verified")
+
+        secret_payload: dict[str, Any] | None = None
+        try:
+            decrypted = decrypt_media_credential(
+                credential.encrypted_payload,
+                credential_id=credential.id,
+                platform_account_id=account.id,
+            )
+            if not isinstance(decrypted, dict):
+                raise MediaCredentialCryptoError("credential payload is not an object")
+            digest = hashlib.sha256(canonical_payload(decrypted)).hexdigest()
+            if not hmac.compare_digest(digest, str(credential.payload_digest or "")):
+                raise MediaCredentialCryptoError("credential payload integrity is invalid")
+            if _credential_payload_expired(decrypted):
+                raise MediaCredentialExecutionError("platform credential is expired")
+            secret_payload = dict(decrypted)
+            yield MediaCredentialExecutionHandle(
+                platform=platform,
+                platform_account_id=account.id,
+                account_ref=str(account.account_ref or ""),
+                credential_id=credential.id,
+                credential_revision=int(credential.revision or 0),
+                connection_type=str(credential.connection_type or ""),
+                state_hash=current_hash,
+                payload=MappingProxyType(secret_payload),
+            )
+        except MediaCredentialExecutionError:
+            raise
+        except MediaCredentialKeyUnavailable:
+            raise MediaCredentialVaultUnavailableError(
+                "credential encryption key is unavailable"
+            ) from None
+        except MediaCredentialCryptoError:
+            raise MediaCredentialExecutionError(
+                "platform credential cannot be decrypted safely"
+            ) from None
+        finally:
+            if secret_payload is not None:
+                secret_payload.clear()
+
     async def get_credential(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None) -> dict[str, Any]:
         session = self._resolve(session)
         if actor is None or account_id is None:
@@ -610,6 +727,11 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
             raise MediaOperationsValidationError("actor and platform_account_id are required")
         await self._assert_human(actor)
         account = await self._account(session, actor, account_id, write=True, lock=True)
+        if account.connection_id:
+            from .media_bridge_connection import manual_bridge
+            current_connection = await self._scalar(session, select(ExternalConnection).where(ExternalConnection.id == account.connection_id))
+            if manual_bridge(current_connection):
+                raise MediaOperationsConflictError("Bridge manual connections cannot acquire provider credentials")
         raw = package if package is not None else credential_bytes
         if raw is None:
             raise MediaOperationsValidationError("credential package is required")
@@ -750,7 +872,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         idempotency_key: Any,
         project_id: UUID | str | None = None,
     ) -> dict[str, Any]:
-        """Atomically create a Character-owned PlatformAccount + vault row."""
+        """Attach to an unused SNS intake slot, or create a new account, atomically."""
 
         session = self._resolve(session)
         if actor is None:
@@ -795,7 +917,8 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         if existing_audit is not None:
             if existing_audit.request_hash != request_hash:
                 raise MediaOperationsConflictError("idempotency key was already used with a different credential command")
-            account_replay = await self._find_platform_account_by_idempotency(session, owner_user_id=account_owner_id, project_id=persona.project_id, idempotency_key=key)
+            account_replay = await self._get_platform_account_row(session, existing_audit.platform_account_id)
+            await self._assert_entity_access(session, actor, account_replay, permission="read")
             credential_replay = await self._credential(session, account_replay.id) if account_replay is not None else None
             if account_replay is None or credential_replay is None:
                 raise MediaOperationsConflictError("credential idempotency record is incomplete")
@@ -816,6 +939,44 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         existing = await self._find_platform_account_identity(session, owner_user_id=account_owner_id, project_id=persona.project_id, platform=platform_value, account_ref=account_ref_value)
         if existing is not None:
             raise MediaOperationsConflictError("PlatformAccount identity already exists")
+        # The portfolio already owns one paused, credential-less slot for
+        # each supported medium. Preserve that UUID and its original create
+        # hash so readback, initial setup replay and existing references stay
+        # bound to the same account. The locked Persona serializes uploads.
+        brand_ref = str(persona.parent_brand_ref or "")
+        if brand_ref.startswith("sns-v6:"):
+            reserved = list((await session.scalars(select(PlatformAccount).where(
+                PlatformAccount.owner_user_id == account_owner_id,
+                PlatformAccount.project_id == persona.project_id,
+                PlatformAccount.persona_id == persona.id,
+                PlatformAccount.platform == platform_value,
+                PlatformAccount.account_ref == f"{brand_ref}:{platform_value}",
+                PlatformAccount.status == "paused",
+                PlatformAccount.connection_id.is_(None),
+            ).with_for_update().limit(2))).all())
+            if len(reserved) > 1:
+                raise MediaOperationsConflictError("SNS platform slot is ambiguous")
+            if reserved:
+                account = reserved[0]
+                if await self._credential(session, account.id) is not None:
+                    raise MediaOperationsConflictError("SNS platform slot already owns a credential")
+                latest = await self._latest_revision(session, account.id, lock=True)
+                content = self._account_revision_content(latest)
+                content["display_name"] = name
+                try:
+                    account.account_ref = account_ref_value
+                    account.status = "active"
+                    session.add(self._build_platform_revision(account=account, version=int(latest.version) + 1,
+                        content=content, created_by=actor_uuid, idempotency_key=None))
+                    await self._flush_only(session)
+                    snapshot = await self._platform_detail(session, account)
+                    result = await self.create_credential(session, actor, account.id, package=package,
+                        connection_type=connection_type, idempotency_key=key, request_hash_override=request_hash,
+                        credential_id=credential_id, audit_platform_account=snapshot)
+                except Exception:
+                    await self._rollback(session)
+                    raise
+                return {"platform_account": snapshot, "credential": result}
         # Construct the identity and initial unknown revision without invoking
         # the legacy service's commit boundary, preserving atomicity.
         account = PlatformAccount(
