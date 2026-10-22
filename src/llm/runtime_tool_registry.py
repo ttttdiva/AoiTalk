@@ -2927,6 +2927,8 @@ def _register_agent_team_delegate_tool(
             )
             if any(text == marker or text.startswith(marker + " ") for marker in failure_prefixes):
                 return "failed"
+            if parse_structured_tool_failure(result) is not None:
+                return "failed"
             return "succeeded"
 
         result_statuses = [
@@ -3028,6 +3030,10 @@ def _register_agent_team_delegate_tool(
             result
             for result, status in zip(results, result_statuses)
             if status == "failed"
+            and (
+                isinstance(result, BaseException)
+                or parse_structured_tool_failure(result) is None
+            )
         ]
         if failures:
             first_failure = failures[0]
@@ -3059,6 +3065,33 @@ def _register_agent_team_delegate_tool(
             return successful_results[0]
         if explicit_docs_root_request and not structured_internal_failure:
             _DOCS_ROOT_DELEGATION_COMPLETED.set(True)
+        first_structured_failure = next(
+            (
+                failure
+                for result in successful_results
+                if (failure := parse_structured_tool_failure(result)) is not None
+            ),
+            None,
+        )
+        if first_structured_failure is not None:
+            # Markdown concatenation hides the failure from the parent
+            # parser/breaker; return a machine-readable envelope that keeps
+            # every child's result alongside the first failure's contract.
+            return json.dumps(
+                {
+                    **first_structured_failure,
+                    "success": False,
+                    "results": [
+                        {
+                            "index": index + 1,
+                            "status": result_statuses[index],
+                            "result": result,
+                        }
+                        for index, result in enumerate(successful_results)
+                    ],
+                },
+                ensure_ascii=False,
+            )
         return "\n\n".join(
             f"## {label}-{index + 1}\n{result}"
             for index, result in enumerate(successful_results)

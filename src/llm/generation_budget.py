@@ -80,7 +80,13 @@ current_generation_budget: ContextVar[GenerationBudget | None] = ContextVar(
 
 def record_bounded_model_request(payload: dict[str, Any]) -> GenerationBudget | None:
     budget = current_generation_budget.get()
-    if budget is None or budget.max_requests is None:
+    if budget is None:
+        return None
+    # A child without its own limit still counts against a limited parent.
+    node = budget
+    while node is not None and node.max_requests is None:
+        node = node.parent
+    if node is None:
         return None
     budget.record_request(payload)
     return budget

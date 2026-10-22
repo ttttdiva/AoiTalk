@@ -836,6 +836,28 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     intent_digest = value("arguments_digest", default=None)
     if isinstance(intent_digest, str) and intent_digest.strip():
         metadata.setdefault("arguments_digest", intent_digest.strip())
+    rejection = value("argument_rejection", default=None)
+    if isinstance(rejection, dict) and rejection:
+        metadata.setdefault(
+            "argument_rejection",
+            {
+                str(key)[:40]: str(item)[:100]
+                for key, item in rejection.items()
+                if key
+                in {
+                    "code",
+                    "target_digest",
+                    "query_digest",
+                    "start_digest",
+                    "end_digest",
+                    "offset_digest",
+                    "max_chars_digest",
+                }
+            },
+        )
+        rejection_code = str(rejection.get("code") or "").strip()
+        if re.fullmatch(r"tool_argument_[a-z]{3,16}", rejection_code):
+            metadata.setdefault("error_code", rejection_code)
     if error:
         metadata.setdefault("error", error)
     if blocked_reason:

@@ -51,6 +51,7 @@ _SAFE_EXECUTION_MANIFEST_KEYS = frozenset(
         "authority_hash",
         "source",
         "route_snapshot",
+        "execution_selection",
     }
 )
 
@@ -74,6 +75,16 @@ def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
                 snapshot = {}
             if snapshot:
                 result[name] = snapshot
+            continue
+        if name == "execution_selection":
+            try:
+                from ...services.agent_model_routing import safe_execution_selection
+
+                selection = safe_execution_selection(item)
+            except Exception:
+                selection = None
+            if selection:
+                result[name] = selection
             continue
         if isinstance(item, str):
             if len(item) > 512 or "/" in item or "\\" in item:

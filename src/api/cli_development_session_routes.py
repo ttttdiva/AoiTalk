@@ -64,6 +64,9 @@ class CLIDevelopmentSessionCreateRequest(BaseModel):
     permission_mode: PermissionMode = "native_default"
     # Omitted keeps the legacy full ceiling; an explicit list may only narrow it.
     allowed_capabilities: list[CLICapability] | None = Field(default=None, min_length=1, max_length=3)
+    # Omitted/null keeps the AgentRevision default runtime; an explicit id
+    # selects a server-validated ExecutionProfile (never a role change).
+    execution_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class CLIDevelopmentSessionMessageRequest(BaseModel):

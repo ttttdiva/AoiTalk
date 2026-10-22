@@ -58,6 +58,9 @@ openai_compatible_local:
   context_budget:
     probe_server: true
     response_reserve_tokens: 1024
+    # Opt-in: lets uncapped tool requests use the bounded allowance even with a
+    # legacy response_reserve_tokens (which otherwise stays a hard cap).
+    tool_generation_max_tokens: null
     chars_per_token: 1.15
   enable_tools: false
   enable_response_format: false

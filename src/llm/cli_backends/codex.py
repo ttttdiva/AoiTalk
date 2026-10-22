@@ -801,15 +801,72 @@ class CodexCLIBackend(CLIBackendBase):
                 error_code="codex_missing_final_message",
             )
             return "Codex CLI did not return a structured final message"
+        # A tool item can fail while Codex continues and finishes the turn.
+        # Only a later final message AND explicit turn completion establish
+        # recovery; turn/protocol errors below always remain failures.
+        completed_indexes = [
+            index
+            for index, event in enumerate(events)
+            if str(event.get("type") or "").lower() == "turn.completed"
+        ]
+        message_indexes = [
+            index
+            for index, event in enumerate(events)
+            if str(event.get("type") or "").lower() == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and str(event["item"].get("type") or "").lower() == "agent_message"
+            and isinstance(event["item"].get("text"), str)
+            and event["item"]["text"].strip()
+        ]
+        tool_failure_types: list[str] = []
+        recovered_tool_failure_types: list[str] = []
         saw_agent_message = False
-        for event in events:
+        for event_index, event in enumerate(events):
             event_type = str(event.get("type") or "").lower()
             item = event.get("item") if isinstance(event.get("item"), dict) else {}
             item_type = str(item.get("type") or "").lower()
             failed = event_type in {"error", "turn.failed", "turn_failure", "failed"}
             failed = failed or item_type in {"error", "failure", "failed"}
             failed = failed or str(item.get("status") or "").lower() in {"error", "failed", "failure"}
-            failed = failed or bool(event.get("error")) or bool(item.get("error"))
+            top_level_error = "error" in event and event.get("error") is not None
+            item_error = "error" in item and item.get("error") is not None
+            failed = failed or top_level_error or item_error
+            is_failed_tool_item = (
+                failed
+                and event_type == "item.completed"
+                and item_type not in {"", "agent_message", "error", "failure", "failed"}
+            )
+            if is_failed_tool_item:
+                tool_failure_types.append(item_type)
+                self._last_cli_diagnostics["tool_failure_count"] = len(
+                    tool_failure_types
+                )
+                self._last_cli_diagnostics["tool_failure_types"] = list(
+                    tool_failure_types
+                )
+            recovered_tool_failure = (
+                failed
+                and event_type == "item.completed"
+                and item_type in {"command_execution", "mcp_tool_call"}
+                and not top_level_error
+                and any(
+                    event_index < message_index < completed_index
+                    for message_index in message_indexes
+                    for completed_index in completed_indexes
+                )
+            )
+            if recovered_tool_failure:
+                recovered_tool_failure_types.append(item_type)
+                self._last_cli_diagnostics["recovered_tool_failure_count"] = len(
+                    recovered_tool_failure_types
+                )
+                self._last_cli_diagnostics["recovered_tool_failure_types"] = list(
+                    recovered_tool_failure_types
+                )
+                self._last_cli_diagnostics["recovered_command_failure_count"] = (
+                    recovered_tool_failure_types.count("command_execution")
+                )
+                continue
             if failed:
                 self._set_cli_diagnostic(
                     status="failed",
@@ -823,7 +880,12 @@ class CodexCLIBackend(CLIBackendBase):
                     else event.get("error")
                 ) or item.get("error") or "Codex CLI reported a failed turn"
                 return f"Codex CLI reported a failed turn: {str(detail)[:1000]}"
-            if item_type == "agent_message" and isinstance(item.get("text"), str) and item.get("text", "").strip():
+            if (
+                event_type == "item.completed"
+                and item_type == "agent_message"
+                and isinstance(item.get("text"), str)
+                and item.get("text", "").strip()
+            ):
                 saw_agent_message = True
         if events and not saw_agent_message:
             self._set_cli_diagnostic(

@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -96,10 +97,12 @@ OPERATIONS_WORK_ROLES: dict[str, tuple[str, ...]] = {
     # ``docs_operator`` is a text-capable Operations actor as well.  Keeping
     # it at the end preserves the normal operator preference while allowing a
     # Docs-only AgentRevision to receive a frozen Chat route.
-    # ``workspace_operator`` is last for the same reason: a revision scoped
+    # ``workspace_operator`` follows for the same reason: a revision scoped
     # only to Workspace operation (for example a dedicated local-agent task
     # Agent) still has an operator.  Authority remains the revision ceiling.
-    "operator": ("employee_operator", "general_worker", "docs_operator", "workspace_operator"),
+    # App Development can use its already-allowed implementer as the doing actor.
+    # Existing operator preference and revision authority remain unchanged.
+    "operator": ("employee_operator", "general_worker", "docs_operator", "workspace_operator", "code_implementer"),
 }
 
 ROUTE_SOURCE_LABELS = {
@@ -132,6 +135,27 @@ class AgentRoutingPins:
     # A durable AgentRun may carry the route snapshot captured at WorkItem
     # start.  Once present, resolution must use it instead of App Config.
     route_snapshot: Mapping[str, Any] | None = None
+    # Server-owned explicit ExecutionProfile selection (safe selection
+    # record).  ``None`` means the revision default; then
+    # ``execution_profile_id`` is the revision's own value.
+    execution_selection: Mapping[str, Any] | None = None
+
+    def with_execution_selection(
+        self, selection: "AgentExecutionSelection"
+    ) -> "AgentRoutingPins":
+        """Apply a validated selection without touching role identity."""
+
+        if self.execution_selection is not None or (
+            selection.default_execution_profile_id != self.execution_profile_id
+        ):
+            raise AgentModelRouteError("agent_route_selection_invalid")
+        if not selection.is_explicit:
+            return self
+        return replace(
+            self,
+            execution_profile_id=selection.selected_execution_profile_id,
+            execution_selection=selection.to_dict(),
+        )
 
     @classmethod
     def from_revision(cls, revision: Any) -> "AgentRoutingPins":
@@ -340,10 +364,12 @@ def _raw_persisted_route_spec(
         return None, False
     teams = section.get("teams")
     team = teams.get(pins.agent_team_id) if isinstance(teams, Mapping) else None
-    profiles = team.get("execution_profiles") if isinstance(team, Mapping) else None
-    profile = profiles.get(pins.execution_profile_id) if isinstance(profiles, Mapping) else None
-    if not isinstance(profile, Mapping):
+    profile, present = _raw_team_profile(config, pins.agent_team_id, pins.execution_profile_id)
+    if not present:
         return None, False
+    if not isinstance(profile, Mapping) or not _raw_profile_is_well_formed(profile):
+        # Non-mapping marker: the caller rejects it instead of normalizing.
+        return "corrupt-profile", True
     overrides = profile.get("overrides")
     if isinstance(overrides, Mapping) and subagent_id in overrides:
         return overrides.get(subagent_id), True
@@ -465,6 +491,315 @@ def resolve_agent_role_route(
         role=role,
         main_route_override=main_route_override,
     )
+
+
+EXECUTION_SELECTION_SOURCE_DEFAULT = "revision_default"
+EXECUTION_SELECTION_SOURCE_EXPLICIT = "explicit"
+# Formal system ExecutionProfiles selectable for any Team.  Legacy
+# pre-Team-profile ids (heavy/light/coding) are deliberately excluded: an
+# explicit selection never takes a legacy fallback.
+SYSTEM_EXECUTION_PROFILE_IDS = frozenset({MANUAL_EXECUTION_PROFILE_ID, FREE_TEAM_PROFILE_ID})
+_SELECTION_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class AgentExecutionSelection:
+    """Server-owned runtime selection, independent of the Agent role.
+
+    ``default_execution_profile_id`` is the pinned revision's own value;
+    ``selected_execution_profile_id`` is what routes this invocation.
+    ``source`` is ``revision_default`` or ``explicit``.
+    """
+
+    default_execution_profile_id: str
+    selected_execution_profile_id: str
+    source: str = EXECUTION_SELECTION_SOURCE_DEFAULT
+
+    @property
+    def is_explicit(self) -> bool:
+        return self.source == EXECUTION_SELECTION_SOURCE_EXPLICIT
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "source": self.source,
+            "default_execution_profile_id": self.default_execution_profile_id,
+            "selected_execution_profile_id": self.selected_execution_profile_id,
+        }
+
+
+def _raw_team_profile(config: Any, team_id: str, profile_id: str) -> tuple[Any, bool]:
+    """Find the raw stored profile by storage key or embedded ``profile_id``.
+
+    A key/id mismatch or an ambiguous match is returned as a non-mapping so
+    callers treat it as corruption instead of normalizing it away.
+    """
+
+    if isinstance(config, Mapping):
+        section = config.get("agent_team", {})
+    else:
+        getter = getattr(config, "get", None)
+        section = getter("agent_team", {}) if callable(getter) else {}
+    teams = section.get("teams") if isinstance(section, Mapping) else None
+    team = teams.get(team_id) if isinstance(teams, Mapping) else None
+    profiles = team.get("execution_profiles") if isinstance(team, Mapping) else None
+    if not isinstance(profiles, Mapping):
+        return None, False
+    matches = []
+    for key, raw in profiles.items():
+        embedded = _clean(raw.get("profile_id")) if isinstance(raw, Mapping) else ""
+        if key == profile_id or embedded == profile_id:
+            if isinstance(raw, Mapping) and embedded and embedded != key:
+                return None, True
+            matches.append(raw)
+    if not matches:
+        return None, False
+    if len(matches) > 1:
+        return None, True
+    return matches[0], True
+
+
+def _raw_profile_is_well_formed(raw: Any) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    if not isinstance(raw.get("enabled", True), bool):
+        return False
+    default_route = raw.get("default_route")
+    if default_route is not None and (
+        not isinstance(default_route, Mapping) or not _route_spec_is_well_formed(default_route)
+    ):
+        return False
+    overrides = raw.get("overrides")
+    if overrides is None:
+        return True
+    if not isinstance(overrides, Mapping):
+        return False
+    return all(
+        isinstance(spec, Mapping) and _route_spec_is_well_formed(spec)
+        for spec in overrides.values()
+    )
+
+
+def resolve_agent_execution_selection(
+    config: Any,
+    pins: AgentRoutingPins,
+    execution_profile_id: Any = None,
+) -> AgentExecutionSelection:
+    """Validate an optional per-invocation ExecutionProfile selection.
+
+    ``None`` keeps the revision default (legacy behavior).  An explicit value
+    must be a formal system Profile or an enabled, well-formed Profile of the
+    pinned revision's own Team.  Empty/unknown/disabled/foreign/corrupt
+    values raise ``AgentModelRouteError`` and never fall back.
+    """
+
+    _require_pins(pins)
+    if pins.execution_selection is not None:
+        raise AgentModelRouteError("agent_route_selection_invalid")
+    default_id = pins.execution_profile_id
+    if execution_profile_id is None:
+        return AgentExecutionSelection(default_id, default_id)
+    if not isinstance(execution_profile_id, str):
+        raise AgentModelRouteError("agent_execution_profile_invalid")
+    selected = execution_profile_id
+    if not _SELECTION_PROFILE_ID_RE.fullmatch(selected):
+        raise AgentModelRouteError("agent_execution_profile_invalid")
+    _team_for(config, pins)
+    if selected not in SYSTEM_EXECUTION_PROFILE_IDS:
+        profile = next(
+            (
+                item
+                for item in list_team_execution_profiles(config, pins.agent_team_id)
+                if _clean(item.get("profile_id")) == selected
+            ),
+            None,
+        )
+        if profile is None or profile.get("enabled", True) is not True:
+            raise AgentModelRouteError("agent_execution_profile_unavailable")
+        raw, present = _raw_team_profile(config, pins.agent_team_id, selected)
+        if present and not _raw_profile_is_well_formed(raw):
+            raise AgentModelRouteError("agent_execution_profile_unavailable")
+    return AgentExecutionSelection(default_id, selected, EXECUTION_SELECTION_SOURCE_EXPLICIT)
+
+
+def _roles_digest(roles: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        safe_route_snapshot(roles), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _role_backends(roles: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        role: route["backend"]
+        for role, route in safe_route_snapshot(roles).items()
+        if isinstance(route.get("backend"), str)
+    }
+
+
+def _selection_record(
+    selection: Mapping[str, Any],
+    *,
+    team_id: str,
+    roles: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Durable selection block: ids, per-role backend and a roles digest."""
+
+    return {
+        "schema_version": 1,
+        "source": EXECUTION_SELECTION_SOURCE_EXPLICIT,
+        "agent_team_id": team_id,
+        "default_execution_profile_id": _clean(selection.get("default_execution_profile_id")),
+        "selected_execution_profile_id": _clean(selection.get("selected_execution_profile_id")),
+        "role_backends": _role_backends(roles),
+        "roles_sha256": _roles_digest(roles),
+    }
+
+
+def safe_execution_selection(value: Any) -> dict[str, Any] | None:
+    """Whitelist a durable selection block (identifiers and digests only)."""
+
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("schema_version") != 1 or value.get("source") != EXECUTION_SELECTION_SOURCE_EXPLICIT:
+        return None
+    team_id = value.get("agent_team_id")
+    if (
+        not isinstance(team_id, str)
+        or not team_id
+        or len(team_id) > 128
+        or team_id != team_id.strip()
+        or "/" in team_id
+        or "\\" in team_id
+    ):
+        return None
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "source": EXECUTION_SELECTION_SOURCE_EXPLICIT,
+        "agent_team_id": team_id,
+    }
+    for key in ("default_execution_profile_id", "selected_execution_profile_id"):
+        item = value.get(key)
+        if not isinstance(item, str) or not _SELECTION_PROFILE_ID_RE.fullmatch(item):
+            return None
+        result[key] = item
+    digest = value.get("roles_sha256")
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        return None
+    backends = value.get("role_backends")
+    if not isinstance(backends, Mapping) or len(backends) > len(OPERATIONS_WORK_ROLES):
+        return None
+    clean_backends: dict[str, str] = {}
+    for role, backend in backends.items():
+        if role not in OPERATIONS_WORK_ROLES or backend not in {"api", "cli"}:
+            return None
+        clean_backends[str(role)] = str(backend)
+    result["role_backends"] = clean_backends
+    result["roles_sha256"] = digest
+    return result
+
+
+def verify_execution_selection(
+    *,
+    default_execution_profile_id: str,
+    agent_team_id: str,
+    roles: Any,
+    selection: Any = None,
+    snapshot_execution_profile_id: Any = None,
+) -> AgentExecutionSelection:
+    """Rebuild a stored selection and reject any missing/inconsistent part.
+
+    Without a selection block the snapshot must be a revision-default one:
+    every role (and the snapshot header, when present) names the revision
+    default Profile.  With a block, team/default must match the pinned
+    revision, every role names the selected Profile and the roles digest and
+    backends are unchanged.
+    """
+
+    default_id = _clean(default_execution_profile_id)
+    team_id = _clean(agent_team_id)
+    role_routes = safe_route_snapshot(roles if isinstance(roles, Mapping) else {})
+    if selection is None:
+        expected = default_id
+        result = AgentExecutionSelection(default_id, default_id)
+    else:
+        record = safe_execution_selection(selection)
+        if (
+            record is None
+            or _thaw(selection) != record
+            or record["agent_team_id"] != team_id
+            or record["default_execution_profile_id"] != default_id
+            or record["roles_sha256"] != _roles_digest(role_routes)
+            or record["role_backends"] != _role_backends(role_routes)
+        ):
+            raise AgentModelRouteError("agent_route_selection_invalid")
+        expected = record["selected_execution_profile_id"]
+        result = AgentExecutionSelection(default_id, expected, EXECUTION_SELECTION_SOURCE_EXPLICIT)
+    header = _clean(snapshot_execution_profile_id)
+    if header and header != expected:
+        raise AgentModelRouteError("agent_route_selection_invalid")
+    for route in role_routes.values():
+        profile = route.get("execution_profile_id")
+        if profile is not None and profile != expected:
+            raise AgentModelRouteError("agent_route_selection_invalid")
+        team = route.get("agent_team_id")
+        if team is not None and team != team_id:
+            raise AgentModelRouteError("agent_route_selection_invalid")
+    return result
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def pins_with_verified_selection(
+    pins: AgentRoutingPins,
+    *,
+    roles: Any,
+    selection: Any = None,
+    snapshot_execution_profile_id: Any = None,
+) -> AgentRoutingPins:
+    """Return revision pins carrying a verified stored selection and roles."""
+
+    if pins.execution_selection is not None:
+        raise AgentModelRouteError("agent_route_selection_invalid")
+    verified = verify_execution_selection(
+        default_execution_profile_id=pins.execution_profile_id,
+        agent_team_id=pins.agent_team_id,
+        roles=roles,
+        selection=selection,
+        snapshot_execution_profile_id=snapshot_execution_profile_id,
+    )
+    frozen = replace(pins, route_snapshot=safe_route_snapshot(roles))
+    if not verified.is_explicit:
+        return frozen
+    return replace(
+        frozen,
+        execution_profile_id=verified.selected_execution_profile_id,
+        execution_selection=safe_execution_selection(selection),
+    )
+
+
+def execution_manifest_route_fields(route_snapshot: Any) -> dict[str, Any]:
+    """Run-manifest fields carrying frozen roles plus an explicit selection.
+
+    Revision-default snapshots yield only ``route_snapshot`` (the historical
+    manifest shape); explicit selections also carry the selection block and
+    the selected ``execution_profile_id`` so the manifest hash binds them.
+    """
+
+    snapshot = route_snapshot if isinstance(route_snapshot, Mapping) else {}
+    fields: dict[str, Any] = {"route_snapshot": safe_route_snapshot(snapshot.get("roles", snapshot))}
+    record = safe_execution_selection(snapshot.get("execution_selection"))
+    if record is not None:
+        fields["execution_selection"] = record
+        fields["execution_profile_id"] = record["selected_execution_profile_id"]
+    return fields
 
 
 def preview_execution_profile_routes(
@@ -624,7 +959,7 @@ def build_agent_routing_snapshot(
             ).provenance()
         except AgentModelRouteError as exc:
             raw_routes[role] = {"error": exc.code}
-    return {
+    snapshot: dict[str, Any] = {
         "schema_version": 1,
         "agent_id": pins.agent_id,
         "agent_revision_id": pins.agent_revision_id,
@@ -632,6 +967,15 @@ def build_agent_routing_snapshot(
         "execution_profile_id": pins.execution_profile_id,
         "roles": safe_route_snapshot(raw_routes),
     }
+    if pins.execution_selection is not None:
+        # Only explicit selections add a block, so revision-default snapshots
+        # keep exactly their historical hash material.
+        snapshot["execution_selection"] = _selection_record(
+            pins.execution_selection,
+            team_id=pins.agent_team_id,
+            roles=snapshot["roles"],
+        )
+    return snapshot
 
 
 def _snapshot_roles(value: Any) -> dict[str, dict[str, Any]]:
@@ -690,7 +1034,9 @@ def _resolve_snapshot_role_route(
     )
 
 
-def _run_route_snapshot(run: Mapping[str, Any] | None) -> dict[str, dict[str, Any]] | None:
+def _run_route_snapshot(
+    run: Mapping[str, Any] | None,
+) -> tuple[dict[str, dict[str, Any]], Any, Any] | None:
     if not isinstance(run, Mapping):
         return None
     manifest = run.get("resolved_execution_manifest")
@@ -716,7 +1062,7 @@ def _run_route_snapshot(run: Mapping[str, Any] | None) -> dict[str, dict[str, An
     roles = safe_route_snapshot(snapshot.get("roles", snapshot))
     if not roles:
         raise AgentModelRouteError("agent_route_snapshot_invalid")
-    return roles
+    return roles, manifest.get("execution_selection"), manifest.get("execution_profile_id")
 
 
 async def load_pinned_agent_pins(
@@ -750,16 +1096,79 @@ async def load_pinned_agent_pins(
     if agent_id and str(revision.agent_id) != _clean(agent_id):
         raise AgentModelRouteError("agent_route_revision_mismatch")
     pins = AgentRoutingPins.from_revision(revision)
-    route_snapshot = _run_route_snapshot(run)
-    return replace(pins, route_snapshot=route_snapshot) if route_snapshot is not None else pins
+    stored = _run_route_snapshot(run)
+    if stored is None:
+        return pins
+    roles, selection, header = stored
+    # The stored selection/routes win over the revision default; a missing,
+    # inconsistent or tampered selection fails closed.
+    return pins_with_verified_selection(
+        pins,
+        roles=roles,
+        selection=selection,
+        snapshot_execution_profile_id=header,
+    )
+
+
+def registered_route_backend(provider: Any) -> str:
+    """Return the backend whose *registered* adapter executes ``provider``.
+
+    The answer comes from the real adapter registries, never from a provider
+    name suffix: ``cli`` only for providers the CLI session adapter accepts
+    (``CLI_PROVIDER_PERMISSION_MODES``), ``api`` only for tool-capable API
+    clients (``PROVIDER_CAPABILITIES``).  Anything else (e.g. ``foo-cli`` or
+    ``routing-profile``) fails closed.  Imports stay lazy so route resolution
+    never loads provider SDKs or DB models at import time.
+    """
+
+    from .cli_development_sessions import CLI_PROVIDER_PERMISSION_MODES
+    from .llm_model_catalog import PROVIDER_CAPABILITIES
+
+    key = _clean(provider).lower()
+    if key and key in CLI_PROVIDER_PERMISSION_MODES:
+        return "cli"
+    capability = PROVIDER_CAPABILITIES.get(key) if key else None
+    if capability is not None and getattr(capability, "supports_tools", False) is True:
+        return "api"
+    raise AgentModelRouteError("agent_route_provider_unsupported")
+
+
+def assert_registered_route_backend(provider: Any, backend: Any, *, ingress: str) -> str:
+    """Fail closed unless the declared backend, registry and ingress agree.
+
+    Used for explicit ExecutionProfile selections.  An empty backend is not
+    implied; an API-only provider at the CLI ingress (or the reverse) is
+    rejected with the ingress' fixed code.
+    """
+
+    registered = registered_route_backend(provider)
+    declared = _clean(backend).lower()
+    if declared != registered:
+        raise AgentModelRouteError("agent_route_backend_mismatch")
+    if registered != ingress:
+        raise AgentModelRouteError(
+            "cli_route_not_supported" if ingress == "api" else "agent_route_backend_mismatch"
+        )
+    return registered
 
 
 __all__ = [
+    "AgentExecutionSelection",
     "AgentModelRoute",
     "AgentModelRouteError",
     "AgentRoutingPins",
+    "assert_registered_route_backend",
     "build_agent_routing_snapshot",
+    "EXECUTION_SELECTION_SOURCE_DEFAULT",
+    "EXECUTION_SELECTION_SOURCE_EXPLICIT",
+    "execution_manifest_route_fields",
     "OPERATIONS_WORK_ROLES",
+    "pins_with_verified_selection",
+    "registered_route_backend",
+    "resolve_agent_execution_selection",
+    "safe_execution_selection",
+    "SYSTEM_EXECUTION_PROFILE_IDS",
+    "verify_execution_selection",
     "ROUTABLE_PROVIDERS",
     "ROUTE_SOURCE_LABELS",
     "known_agent_teams",

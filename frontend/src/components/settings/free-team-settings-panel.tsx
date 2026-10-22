@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { pyFetch } from "./llm-model-section-types";
 import { HelpPopover } from "@/components/ui/help-popover";
 import { OpenAIConfirmationPanel } from "./openai-confirmation-panel";
+import { OpenRouterQuotaObservation } from "./openrouter-quota-observation";
 
 type Credential = {
   id: string;
@@ -313,6 +314,8 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
         <p>{data.verification?.status === "verified" && !data.verification.stop_reason ? "対象組織・Projectの確認情報に基づき最大予約量を確認します" : stopReasonLabels[data.verification?.stop_reason || "complimentary_unverified"] || data.verification?.stop_reason}</p>
         <p className="text-muted-foreground">残量はこの台帳と確認済み観測値に基づきます。同じ組織の他アプリによる同時消費は見えず、無課金を完全には保証できません。使用量不明の予約は解放せず保持します。</p>
       </div>
+
+      <OpenRouterQuotaObservation />
 
       <OpenAIConfirmationPanel onChanged={async () => {
         const usage = await pyFetch<Pick<FreeTeamResponse, "quota_pools" | "verification">>("/free-team/usage");

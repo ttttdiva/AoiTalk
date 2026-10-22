@@ -573,11 +573,22 @@ async def _pin_session_agent_binding(
     requested_agent_id: str | None = None,
     requested_revision_id: str | None = None,
     config: Any | None = None,
+    execution_profile_id: str | None = None,
 ) -> tuple[uuid.UUID | None, uuid.UUID | None, Any | None]:
-    """Create one exact immutable turn snapshot in the caller transaction."""
+    """Create one exact immutable turn snapshot in the caller transaction.
+
+    ``execution_profile_id`` (``None`` = revision default) is the optional
+    server-validated runtime selection for this turn only.
+    """
 
     canonical_agent_id = getattr(conversation, "agent_id", None)
     if canonical_agent_id is None:
+        if execution_profile_id is not None:
+            # A runtime selection needs a canonical Agent; never ignore it.
+            raise AgentChatAdmissionError(
+                "ExecutionProfile selection requires a session Agent",
+                code="agent_execution_profile_unavailable",
+            )
         if requested_agent_id:
             raise DispatchConflictError(
                 "session Agent binding is required for chat execution",
@@ -645,6 +656,7 @@ async def _pin_session_agent_binding(
         actor_user_id=actor_uuid,
         actor_role=actor_role,
         config=config,
+        **({} if execution_profile_id is None else {"execution_profile_id": execution_profile_id}),
     )
     if not getattr(binding, "binding_id", None) or not getattr(binding, "snapshot_hash", None):
         raise AgentChatAdmissionError(
@@ -658,6 +670,17 @@ async def _pin_session_agent_binding(
             "conversation Agent binding snapshot is incomplete",
             code="agent_binding_changed",
         )
+    if execution_profile_id is not None:
+        selection = getattr(binding, "execution_selection", None)
+        if (
+            selection is None
+            or not selection.is_explicit
+            or selection.selected_execution_profile_id != execution_profile_id
+        ):
+            raise AgentChatAdmissionError(
+                "conversation Agent binding selection is inconsistent",
+                code="agent_binding_changed",
+            )
     return resolved_agent, resolved_revision, binding
 
 
@@ -1108,6 +1131,7 @@ _EXECUTION_MANIFEST_ALLOWED_KEYS = frozenset(
         "authority_hash",
         "source",
         "route_snapshot",
+        "execution_selection",
     }
 )
 _EXECUTION_MANIFEST_SECRET_MARKERS = frozenset(
@@ -1140,6 +1164,14 @@ def _bounded_execution_manifest(value: Any) -> dict[str, Any] | None:
             if not snapshot:
                 return None
             clean[key] = snapshot
+            continue
+        if key == "execution_selection":
+            from .agent_model_routing import safe_execution_selection
+
+            selection = safe_execution_selection(raw_item)
+            if selection is None:
+                return None
+            clean[key] = selection
             continue
         if isinstance(raw_item, (str, int, bool)) or raw_item is None:
             text_value = str(raw_item) if isinstance(raw_item, str) else raw_item
@@ -3314,12 +3346,14 @@ class AgentRunService:
             # binding ID/hash remain audit metadata so the manifest stays a
             # reproducibility projection rather than a second authority.
             if binding_projection.get("route_snapshot"):
-                route_snapshot = binding_projection["route_snapshot"]
-                if isinstance(route_snapshot, Mapping) and isinstance(
-                    route_snapshot.get("roles"), Mapping
-                ):
-                    route_snapshot = route_snapshot["roles"]
-                manifest["route_snapshot"] = route_snapshot
+                from .agent_model_routing import execution_manifest_route_fields
+
+                # Roles plus, for an explicit ExecutionProfile selection, the
+                # selection block and selected profile id: the manifest hash
+                # then binds role identity and runtime selection together.
+                manifest.update(
+                    execution_manifest_route_fields(binding_projection["route_snapshot"])
+                )
             manifest.update(
                 {
                     "agent_id": str(resolved_agent),
@@ -10289,6 +10323,7 @@ class AgentRunService:
         execution_manifest: Dict[str, Any] | None = None,
         execution_manifest_hash: str | None = None,
         session: Any | None = None,
+        execution_profile_id: str | None = None,
     ) -> tuple[Dict[str, Any], str, bool]:
         """Create message, run and durable outbox in one transaction.
 
@@ -10368,6 +10403,7 @@ class AgentRunService:
                     requested_agent_id=agent_id,
                     requested_revision_id=agent_revision_id,
                     config=self.config,
+                    execution_profile_id=execution_profile_id,
                 )
                 if resolved_agent_uuid is not None:
                     agent_id = str(resolved_agent_uuid)

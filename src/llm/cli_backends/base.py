@@ -1397,7 +1397,17 @@ class CLIBackendBase(ABC):
                 f"({direct_prompt_max_length} characters); stdin is unavailable",
             )
 
-        if system_context:
+        if (
+            raw_prompt
+            and prompt_stdin_supported
+            and self.provider_name == "Codex CLI"
+            and ("\n" in prompt or "\r" in prompt)
+        ):
+            # Windows npm .cmd launchers can truncate multiline argv prompts.
+            # Preserve the complete raw turn through the existing stdin path.
+            cmd = self.get_cli_command("")
+            stdin_input = f"{system_context}\n\n{prompt}" if system_context else prompt
+        elif system_context:
             # system_context → stdin, prompt → -p
             if not prompt_stdin_supported:
                 combined_prompt = f"{system_context}\n\n{prompt}" if prompt else system_context

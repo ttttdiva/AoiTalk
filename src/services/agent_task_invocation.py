@@ -32,6 +32,7 @@ from sqlalchemy import desc, func, select
 
 from ..tools.core import ToolPolicyDeniedError
 from .agent_work_runtime import ExecutionOutcome, WorkCandidate
+from ..llm.provider_rate_governor import is_temporary_429_failure
 from .provider_failure_metadata import extract_provider_failure, safe_usage_snapshot, terminal_failure_event_fields
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,18 @@ def _agent_selection_errors() -> Iterator[None]:
     except ConversationAgentError:
         raise AgentTaskInvocationError(
             "invalid_input", "The selected Agent is invalid", 422
+        ) from None
+
+
+def _resolve_task_operator_route(config: Any, pins: Any) -> Any:
+    """Keep canonical role selection failures inside the task API contract."""
+    from .agent_model_routing import AgentModelRouteError, resolve_agent_role_route
+
+    try:
+        return resolve_agent_role_route(config, pins, "operator")
+    except AgentModelRouteError as exc:
+        raise AgentTaskInvocationError(
+            exc.code, "The selected Agent has no usable API task operator route", 422
         ) from None
 
 
@@ -357,10 +370,23 @@ def _normalise_request(payload: Mapping[str, Any], config: Any) -> dict[str, Any
         # Present (even empty) is part of the request identity; omitted keeps
         # every pre-existing request fingerprint.
         normalized["edit_targets"] = list(edit_targets)
+    execution_profile_id = payload.get("execution_profile_id")
+    if execution_profile_id is not None:
+        if not isinstance(execution_profile_id, str) or not execution_profile_id:
+            raise AgentTaskInvocationError("agent_execution_profile_invalid", "execution_profile_id is invalid", 422)
+        # Only an explicit selection joins the request identity; omitted/null
+        # keeps every pre-existing request fingerprint byte-identical.
+        normalized["execution_profile_id"] = execution_profile_id
     if allow_git_commit:
         normalized["allow_git_commit"] = True
     if allow_git_push:
         normalized["allow_git_push"] = True
+    tool_generation = payload.get("tool_generation_max_tokens")
+    if tool_generation is not None:
+        if isinstance(tool_generation, bool) or not isinstance(tool_generation, int) or not 1 <= tool_generation <= 4096:
+            raise AgentTaskInvocationError("invalid_input", "tool_generation_max_tokens must be an integer between 1 and 4096", 422)
+        # Explicit per-task opt-in; only a present value joins the identity.
+        normalized["tool_generation_max_tokens"] = tool_generation
     return normalized
 
 
@@ -576,8 +602,99 @@ def _receipt_command_nonzero_exit(receipt: Any) -> int | None:
     return return_code
 
 
+_ARGUMENT_REJECTION_MESSAGE = "Tool arguments were rejected by the server contract."
+_ARGUMENT_REJECTION_KEY = "<argument-rejected>"
+_ARGUMENT_REJECTION_CODES = frozenset({
+    "tool_argument_invalid",
+    "tool_argument_unknown",
+    "tool_argument_conflict",
+    "tool_argument_missing",
+})
+
+
+def _argument_rejected_before_execution(receipt: Any) -> bool:
+    """True only for a server-authored schema rejection of a read-only call.
+
+    Authority/policy/approval/circuit refusals, synthetic results, writes and
+    commands are never classified here, so they stay unresolved.
+    """
+
+    if bool(getattr(receipt, "success", False)) or _receipt_was_blocked(receipt):
+        return False
+    metadata = _receipt_mapping(receipt, "result_metadata")
+    if metadata.get("executed") is not False or metadata.get("synthetic") is not False:
+        return False
+    if metadata.get("blocked_reason"):
+        return False
+    tool_name = str(getattr(receipt, "tool_name", "") or "").rsplit(".", 1)[-1].casefold()
+    if tool_name not in _recoverable_read_tool_names():
+        return False
+    codes = {
+        str(metadata.get("error_code") or "").strip(),
+        str(_receipt_result_payload(receipt).get("error_code") or "").strip(),
+    } - {""}
+    if codes and not codes <= _ARGUMENT_REJECTION_CODES:
+        return False
+    # The persisted projection wraps the fixed server text as ``Error: <text>``.
+    # Only that exact known wrapper is normalised; free-form text never matches.
+    known = {_ARGUMENT_REJECTION_MESSAGE, f"Error: {_ARGUMENT_REJECTION_MESSAGE}"}
+    return any(
+        str(text or "").strip() in known
+        for text in (metadata.get("error"), _receipt_result_text(receipt))
+    )
+
+
+def _argument_rejection_target(receipt: Any) -> str:
+    """Safe target digest recorded with the rejection ("" for older receipts)."""
+
+    return str(_argument_rejection_provenance(receipt).get("target_digest") or "").strip()
+
+
+def _argument_rejection_provenance(receipt: Any) -> Mapping[str, Any]:
+    provenance = _receipt_mapping(receipt, "result_metadata").get("argument_rejection")
+    return provenance if isinstance(provenance, Mapping) else {}
+
+
+_CORRELATION_FIELDS = (
+    "query_digest",
+    "start_digest",
+    "end_digest",
+    "offset_digest",
+    "max_chars_digest",
+)
+
+
+def _rejection_scope_signature(receipt: Any) -> tuple[str, ...]:
+    provenance = _argument_rejection_provenance(receipt)
+    return tuple(str(provenance.get(field) or "") for field in _CORRELATION_FIELDS)
+
+
+def _retry_answers_rejection(
+    rejected: Any, retry_arguments: Mapping[str, Any], tool_name: str = ""
+) -> bool:
+    """A same-target success corrects the rejection only for the same request.
+
+    A rejected search query or line range must be answered by a success with
+    that same query/range; a different search is not a correction.
+    """
+
+    from ..tools.core import argument_correlation
+
+    wanted = _argument_rejection_provenance(rejected)
+    actual = argument_correlation(retry_arguments, tool_name)
+    return all(
+        not wanted.get(field) or wanted.get(field) == actual.get(field)
+        for field in _CORRELATION_FIELDS
+    )
+
+
 def _receipt_action_key(receipt: Any) -> tuple[str, str]:
     tool_name = str(getattr(receipt, "tool_name", "") or "").rsplit(".", 1)[-1].casefold()
+    if _argument_rejected_before_execution(receipt):
+        # Without recorded target provenance nothing can prove a later call
+        # corrected this one, so the key is unique to the receipt.
+        target = _argument_rejection_target(receipt) or f"unproven:{id(receipt)}"
+        return tool_name, f"{_ARGUMENT_REJECTION_KEY}{target}"
     arguments = dict(_receipt_mapping(receipt, "arguments"))
     if tool_name == "execute_command":
         evidence = {key: arguments.get(key) for key in ("command", "working_directory")}
@@ -1672,7 +1789,13 @@ def _tool_failure_entry(receipt: Any, tool_name: str) -> dict[str, Any]:
     elif metadata.get("executed") is False:
         # Refused before execution, e.g. ``agent_authority_denied``.
         entry["denied"] = True
-        entry["reason"] = code or "tool_not_executed"
+        provenance = metadata.get("argument_rejection")
+        recorded = str(provenance.get("code") or "") if isinstance(provenance, Mapping) else ""
+        entry["reason"] = code or (
+            (recorded if _SAFE_FAILURE_CODE_RE.fullmatch(recorded) else "tool_argument_rejected")
+            if _argument_rejected_before_execution(receipt)
+            else "tool_not_executed"
+        )
     else:
         nonzero = "command_nonzero_exit" if _receipt_command_nonzero_exit(receipt) is not None else ""
         entry["reason"] = code or nonzero or "tool_execution_failed"
@@ -1929,7 +2052,22 @@ def _tool_failure_ledger(
         key = _receipt_action_key(receipt)
         if bool(getattr(receipt, "success", False)):
             successful.append(receipt)
-            for earlier_index, earlier in pending.pop(key, []):
+            from ..tools.core import argument_target_digest
+
+            retry_target = argument_target_digest(_receipt_mapping(receipt, "arguments"))
+            rejected = []
+            rejection_key = (key[0], f"{_ARGUMENT_REJECTION_KEY}{retry_target}")
+            if retry_target:
+                retry_arguments = _receipt_mapping(receipt, "arguments")
+                candidates = pending.pop(rejection_key, [])
+                rejected = [
+                    item for item in candidates
+                    if _retry_answers_rejection(item[1], retry_arguments, key[0])
+                ]
+                kept = [item for item in candidates if item not in rejected]
+                if kept:
+                    pending[rejection_key] = kept
+            for earlier_index, earlier in [*pending.pop(key, []), *rejected]:
                 recovered.append((earlier_index, earlier, key[0]))
                 pending_existing_creates = [
                     item for item in pending_existing_creates if item[0] != earlier_index
@@ -1972,11 +2110,18 @@ def _tool_failure_ledger(
             create_paths = _existing_file_create_paths(receipt, key[0])
             if create_paths:
                 pending_existing_creates.append((index, receipt, create_paths))
+    def _latest_per_scope(items: list) -> list:
+        # Distinct rejected scopes (query/range) stay separately unresolved.
+        latest: dict[tuple[str, ...], tuple[int, Any]] = {}
+        for index, receipt in items:
+            latest[_rejection_scope_signature(receipt)] = (index, receipt)
+        return list(latest.values())
+
     unresolved = sorted(
         (
             (index, receipt, key[0])
             for key, items in pending.items()
-            for index, receipt in items[-1:]
+            for index, receipt in _latest_per_scope(items)
         ),
         key=lambda item: item[0],
     )
@@ -2049,10 +2194,32 @@ def _route_projection(route: Any) -> dict[str, str]:
     return {name: str(getattr(route, name, "") or "") for name in ("provider", "model", "effort")}
 
 
-def _assert_api_route(route: Any, expected: Mapping[str, str]) -> dict[str, str]:
+def _pins_with_execution_selection(config: Any, pins: Any, execution_profile_id: Any) -> Any:
+    """Apply the shared server ExecutionProfile selection to revision pins."""
+
+    from .agent_model_routing import AgentModelRouteError, resolve_agent_execution_selection
+
+    try:
+        return pins.with_execution_selection(
+            resolve_agent_execution_selection(config, pins, execution_profile_id)
+        )
+    except AgentModelRouteError as exc:
+        raise AgentTaskInvocationError(exc.code, "The requested ExecutionProfile is not allowed", 422) from None
+
+
+def _assert_api_route(route: Any, expected: Mapping[str, str], *, explicit: bool = False) -> dict[str, str]:
     values = _route_projection(route)
     provider = values["provider"].casefold()
     backend = str(getattr(route, "backend", "") or "").casefold()
+    if explicit:
+        # An explicit ExecutionProfile must land on a registered API adapter;
+        # the provider-name suffix alone is never trusted.
+        from .agent_model_routing import AgentModelRouteError, assert_registered_route_backend
+
+        try:
+            assert_registered_route_backend(provider, backend, ingress="api")
+        except AgentModelRouteError as exc:
+            raise AgentTaskInvocationError(exc.code, "The selected route has no registered API adapter", 409) from None
     if backend != "api" or provider.endswith("-cli"):
         raise AgentTaskInvocationError("cli_route_not_supported", "CLI provider routes are owned by the CLI session API", 409)
     if not values["provider"] or not values["model"]:
@@ -2236,6 +2403,29 @@ _ABSENT_FILE_DIGEST = "absent"
 # Marks where a restart continuation attempt begins in the Run's events; re-marking
 # a running Run emits no second ``run.started``.
 _RESTART_ATTEMPT_EVENT = "api_agent_task.restart_attempt"
+
+
+def _llm_timing_run_usage(run_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+    """AgentRun usage carried by one completed provider request's timing event.
+
+    Only a finished generation request with real counters yields usage.  The
+    key is stable per request/round/attempt, so a replayed event is merged once
+    by ``AgentRunService.record_event`` while a retried request stays distinct.
+    """
+
+    if raw.get("phase") != "end" or raw.get("stage") != "generation":
+        return {}
+    usage = safe_usage_snapshot(
+        {key: raw.get(key) for key in ("input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens")}
+    )
+    if not usage:
+        return {}
+    request_id = str(raw.get("request_id") or "").strip()
+    if not request_id:
+        return {}
+    ordinal = raw.get("sender_attempt_ordinal", raw.get("request_ordinal"))
+    key = f"timing:{run_id}:{request_id}:{raw.get('round')}:{ordinal}"
+    return {"usage": {k: int(v) for k, v in usage.items()}, "usage_key": key[:255]}
 
 
 def _file_digest(path: Path) -> str:
@@ -3134,7 +3324,7 @@ class AgentTaskInvocationService:
                     raise AgentTaskInvocationError("idempotency_conflict", "Idempotency-Key was already used for a different request", 409)
                 return await self._task_projection(task_id, owner=owner_id), False
 
-            from .agent_model_routing import AgentRoutingPins, resolve_agent_role_route
+            from .agent_model_routing import AgentRoutingPins
             from .agent_run_service import AgentRunService, _binding_audit_projection
             from .conversation_agent_service import ConversationAgentService
 
@@ -3145,9 +3335,13 @@ class AgentTaskInvocationService:
                     actor_user_id=owner_id,
                     actor_role=actor_role,
                 )
-            pins = AgentRoutingPins.from_revision(revision)
-            route = resolve_agent_role_route(self.config, pins, "operator")
-            resolved_route = _assert_api_route(route, request["expected_route"])
+            pins = _pins_with_execution_selection(
+                self.config,
+                AgentRoutingPins.from_revision(revision),
+                request.get("execution_profile_id"),
+            )
+            route = _resolve_task_operator_route(self.config, pins)
+            resolved_route = _assert_api_route(route, request["expected_route"], explicit=request.get("execution_profile_id") is not None)
             ceiling = set(getattr(revision, "capability_ceiling_json", None) or ())
             if not ceiling:
                 ceiling = set(getattr(revision, "capability_ceiling", None) or ())
@@ -3262,6 +3456,7 @@ class AgentTaskInvocationService:
                     "allow_commands": request["allow_commands"],
                     "allow_git_commit": bool(request.get("allow_git_commit", False)),
                     "allow_git_push": bool(request.get("allow_git_push", False)),
+                    **({"tool_generation_max_tokens": request["tool_generation_max_tokens"]} if request.get("tool_generation_max_tokens") else {}),
                     "requires_command_verification": _requires_command_verification(request),
                     **({"required_outputs": list(request["required_outputs"])} if request.get("required_outputs") else {}),
                     **({"edit_scope": edit_scope_payload} if edit_scope_payload is not None else {}),
@@ -3296,6 +3491,9 @@ class AgentTaskInvocationService:
                 if stored.get("workspace") != request["workspace"]:
                     # A clipped or dropped workspace must never reach execution.
                     raise AgentTaskInvocationError("invalid_workspace", "workspace could not be stored intact", 422)
+                if stored.get("tool_generation_max_tokens") != request.get("tool_generation_max_tokens"):
+                    # An admitted execution control must survive durable storage intact.
+                    raise AgentTaskInvocationError("invalid_input", "tool_generation_max_tokens could not be stored intact", 422)
                 await work_session.commit()
             except BaseException:
                 await work_session.rollback()
@@ -3325,14 +3523,22 @@ class AgentTaskInvocationService:
                     actor_user_id=owner_id,
                     actor_role=actor_role,
                     expected_agent_id=None,
+                    execution_profile_id=request.get("execution_profile_id"),
                 )
             binding = bound.binding
             if binding is None:
                 raise AgentTaskInvocationError("agent_revision_missing", "The selected Agent has no immutable binding", 409)
-            pinned_route = resolve_agent_role_route(self.config, binding.routing_pins(), "operator")
-            pinned_projection = _assert_api_route(pinned_route, request["expected_route"])
+            pinned_route = _resolve_task_operator_route(self.config, binding.routing_pins())
+            pinned_projection = _assert_api_route(
+                pinned_route,
+                request["expected_route"],
+                explicit=bool(binding.execution_selection.is_explicit),
+            )
             if pinned_projection != resolved_route or str(binding.agent_revision_id) != str(revision.id):
                 raise AgentTaskInvocationError("agent_route_mismatch", "The pinned route changed during task admission", 409)
+            if binding.execution_selection.selected_execution_profile_id != pins.execution_profile_id:
+                # The immutable binding must carry exactly the preflighted selection.
+                raise AgentTaskInvocationError("agent_route_mismatch", "The pinned ExecutionProfile changed during task admission", 409)
             await self._authorise_caps(request["agent_id"], binding.agent_revision_id, caps)
 
             binding_session = await self._session()
@@ -3377,6 +3583,11 @@ class AgentTaskInvocationService:
                 "capabilities": list(caps),
                 "route_snapshot": binding.routing_pins().route_snapshot.get("roles", binding.routing_pins().route_snapshot),
             }
+            if binding.execution_selection.is_explicit:
+                from .agent_model_routing import execution_manifest_route_fields
+
+                # Revision-default tasks keep the historical manifest/hash.
+                manifest.update(execution_manifest_route_fields(binding.routing_pins().route_snapshot))
             run = await AgentRunService(self.db, config=self.config).create_run(
                 session_id=session_id,
                 user_id=owner_id,
@@ -3523,6 +3734,7 @@ class AgentTaskInvocationService:
             "allow_commands": bool(stored.get("allow_commands")),
             "allow_git_commit": bool(stored.get("allow_git_commit")),
             "allow_git_push": bool(stored.get("allow_git_push")),
+            **({"tool_generation_max_tokens": int(stored["tool_generation_max_tokens"])} if stored.get("tool_generation_max_tokens") else {}),
             "requires_command_verification": bool(stored.get("requires_command_verification")),
             "required_outputs": [str(item) for item in stored.get("required_outputs") or ()],
             # Captured once at first execution (a Run event), never at admission.
@@ -3905,7 +4117,11 @@ class AgentTaskInvocationService:
             )
             if execution is None or execution.binding.binding_id != request["binding_id"] or execution.binding.snapshot_hash != request["binding_snapshot_hash"]:
                 raise AgentTaskInvocationError("agent_binding_mismatch", "The immutable Agent binding changed", 409)
-            route = _assert_api_route(execution.route, request["route"])
+            route = _assert_api_route(
+                execution.route,
+                request["route"],
+                explicit=bool(getattr(getattr(execution.binding, "execution_selection", None), "is_explicit", False)),
+            )
             if route != request["route"]:
                 raise AgentTaskInvocationError("agent_route_mismatch", "The pinned Agent route changed", 409)
             _require_model_registry_entry(self.config, route["provider"], route["model"])
@@ -4014,8 +4230,13 @@ class AgentTaskInvocationService:
                                     allowed_subagent_ids=execution.binding.allowed_subagent_ids,
                                     revalidate=revalidate_task_tool,
                                 )
+                                task_build_options = (
+                                    {"tool_generation_max_tokens": request["tool_generation_max_tokens"]}
+                                    if request.get("tool_generation_max_tokens")
+                                    else {}
+                                )
                                 if self.client_builder is not None:
-                                    client = client_builder(source_client, self.config, execution, workspace=workspace, session_id=request["session_id"], project_id=None, run_id=run_id)
+                                    client = client_builder(source_client, self.config, execution, workspace=workspace, session_id=request["session_id"], project_id=None, run_id=run_id, **task_build_options)
                                     if inspect.isawaitable(client):
                                         build_task = asyncio.ensure_future(client)
                                         client = None
@@ -4031,6 +4252,7 @@ class AgentTaskInvocationService:
                                         session_id=request["session_id"],
                                         project_id=None,
                                         run_id=run_id,
+                                        **task_build_options,
                                     ))
                                 if build_task is not None:
                                     build_cancelled = False
@@ -4276,7 +4498,11 @@ class AgentTaskInvocationService:
                                     run_event = await run_service.record_event(
                                         run_id,
                                         event_type=f"api_agent_task.{event_type}"[:160],
-                                        payload=safe,
+                                        payload=(
+                                            {**safe, **_llm_timing_run_usage(run_id, raw)}
+                                            if event_type == "llm_timing"
+                                            else safe
+                                        ),
                                     )
                                     if run_event is None:
                                         raise AgentTaskInvocationError("audit_write_failed", "The AgentRun event could not be durably recorded", 409)
@@ -4484,7 +4710,9 @@ class AgentTaskInvocationService:
                     run_id, safe_failure, usage_records=getattr(client, "_last_usage_records", None)
                 )
                 return ExecutionOutcome(
-                    classification="permanent",
+                    # An exhausted temporary 429 is blocked, never transient: a
+                    # transient outcome would re-run the whole task.
+                    classification="blocked" if is_temporary_429_failure(safe_failure) else "permanent",
                     error_code=evidence_code,
                     error_message="The provider did not complete the task response",
                     result={
@@ -4543,7 +4771,13 @@ class AgentTaskInvocationService:
                     ),
                     **({"corrective_turns": corrective_turns} if corrective_turns else {}),
                 },
-                metadata={"task_id": claim.source_id, "provider": route["provider"], "model": route["model"]},
+                # The Run already holds this usage (summed live from the
+                # provider timing events); Work only mirrors it.
+                usage=(success_usage := await self._safe_prior_run_usage(run_id)),
+                metadata={
+                    "task_id": claim.source_id, "provider": route["provider"], "model": route["model"],
+                    **({"usage_state": "known"} if success_usage else {}),
+                },
             )
         except asyncio.CancelledError:
             if scope is not None and issued_harness_scope is not None:
@@ -4624,6 +4858,9 @@ class AgentTaskInvocationService:
 
         receipts = await self._safe_receipts_for_run(run_id)
         persisted_usage = await self._safe_prior_run_usage(run_id)
+        if await self._run_has_timing_usage(run_id):
+            # Completed requests were persisted live from their timing events.
+            usage_records = None
         current_usage = None
         if isinstance(usage_records, (list, tuple)):
             # Requests this attempt already answered but did not yet persist on
@@ -4653,6 +4890,7 @@ class AgentTaskInvocationService:
             "usage": prior_usage,
             "metadata": {
                 **({"provider_failure": dict(provider_failure)} if provider_failure is not None else {}),
+                **({"retryable": True} if is_temporary_429_failure(provider_failure) else {}),
                 "usage_state": "known" if prior_usage else "unknown",
                 # Only this attempt's unsaved usage is added to the Run; the
                 # persisted part must not be merged twice.
@@ -4671,7 +4909,7 @@ class AgentTaskInvocationService:
         # authoritative receipts and mark usage unknown, never zero.
         extra = await self._provider_failure_evidence(run_id, provider_failure)
         return ExecutionOutcome(
-            classification="permanent",
+            classification="blocked" if is_temporary_429_failure(provider_failure) else "permanent",
             error_code="provider_rate_limited" if provider_failure["http_status"] == 429 else "provider_http_error",
             error_message="The provider rejected the request",
             result={
@@ -4687,6 +4925,17 @@ class AgentTaskInvocationService:
         except Exception:
             logger.warning("API Agent task receipts unavailable for provider failure")
             return None
+
+    async def _run_has_timing_usage(self, run_id: str) -> bool:
+        from .agent_run_service import AgentRunService
+
+        try:
+            run = await AgentRunService(self.db, config=self.config).get_run(run_id)
+        except Exception:
+            return False
+        metadata = run.get("metadata") if isinstance(run, Mapping) else None
+        keys = metadata.get("_usage_event_keys") if isinstance(metadata, Mapping) else None
+        return any(str(key).startswith("timing:") for key in keys or ())
 
     async def _safe_prior_run_usage(self, run_id: str) -> dict[str, Any] | None:
         """Authoritative usage already persisted on the Run, or None when unavailable."""

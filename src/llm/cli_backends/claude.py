@@ -366,6 +366,59 @@ def _block_text(value: Any) -> str:
     return ""
 
 
+_DENIAL_SECRET_RE = re.compile(
+    r"(?i)(bearer\s+\S+|(?:token|secret|password|passwd|api[_-]?key|authorization)\s*[=:]\s*\S+|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{12,})"
+)
+_DENIAL_MAX_ITEMS = 10
+_DENIAL_EXECUTABLE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,63}")
+# userinfo/port/pathを許さず scheme://host だけを受理する。
+_DENIAL_URL_RE = re.compile(r"https?://([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?:/[^@\s]*)?")
+
+
+def _summarize_denial_target(tool_input: Any) -> str:
+    """拒否対象の短い要約。tool_input全量は保持せず、秘密を含み得る部分は落とす。"""
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("file_path", "path", "notebook_path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            parts = [part for part in re.split(r"[\\/]+", value.strip()) if part]
+            target = "/".join(parts[-2:])
+            break
+    else:
+        command = tool_input.get("command")
+        url = tool_input.get("url")
+        if isinstance(command, str) and command.strip():
+            # 先頭tokenが素の実行ファイル名と確定できる場合だけ残す。
+            # VAR=value代入・演算子・引用・パス・URLなど解析不能なものは固定placeholder。
+            first = command.strip().split()[0]
+            target = first if _DENIAL_EXECUTABLE_RE.fullmatch(first) else "[command]"
+        elif isinstance(url, str) and url.strip():
+            match = _DENIAL_URL_RE.fullmatch(url.strip().split("?")[0].split("#")[0])
+            target = match.group(0).split("/")[0] + "//" + match.group(1) if match else "[url]"
+        else:
+            return ""
+    return _DENIAL_SECRET_RE.sub("[redacted]", target)[:120]
+
+
+def _summarize_permission_denials(denials: Any) -> Dict[str, Any]:
+    """permission_denialsを件数 + tool_name/tool_use_id/対象要約へ縮約する。"""
+    items_in = denials if isinstance(denials, list) else [denials]
+    items: List[Dict[str, str]] = []
+    for denial in items_in[:_DENIAL_MAX_ITEMS]:
+        if not isinstance(denial, dict):
+            items.append({"tool_name": "", "tool_use_id": "", "target": ""})
+            continue
+        items.append(
+            {
+                "tool_name": str(denial.get("tool_name") or denial.get("tool") or "")[:80],
+                "tool_use_id": str(denial.get("tool_use_id") or "")[:80],
+                "target": _summarize_denial_target(denial.get("tool_input")),
+            }
+        )
+    return {"count": len(items_in), "items": items}
+
+
 class ClaudeCLIBackend(CLIBackendBase):
     """Claude Code CLI backend implementation"""
 
@@ -568,6 +621,17 @@ class ClaudeCLIBackend(CLIBackendBase):
             )
             return
 
+    def _observe_native_permission_denied_events(self, events: List[Dict[str, Any]]) -> None:
+        """system/permission_deniedを承認待ち(permission_event_count)と区別して数える。"""
+        count = 0
+        for event in events:
+            if str(event.get("type") or "").lower() != "system":
+                continue
+            if str(event.get("subtype") or event.get("event") or "").lower().replace("-", "_") == "permission_denied":
+                count += 1
+        if count:
+            self._last_cli_diagnostics["native_permission_denied_event_count"] = count
+
     def validate_success_output(self, raw_output: str, stderr: str) -> Optional[str]:
         """Reject structured Claude failures even when the CLI exits zero."""
 
@@ -576,6 +640,7 @@ class ClaudeCLIBackend(CLIBackendBase):
         events = list(self._iter_json_events(str(raw_output or "")))
         if not events:
             return None
+        self._observe_native_permission_denied_events(events)
         result_seen = False
         for event in events:
             if str(event.get("type") or "").lower() != "result":
@@ -591,6 +656,12 @@ class ClaudeCLIBackend(CLIBackendBase):
             if is_error or bool(denials):
                 code = "claude_permission_denied" if denials else "claude_result_error"
                 self._set_cli_diagnostic(status="failed", state="failed", error_code=code)
+                if denials:
+                    summary = _summarize_permission_denials(denials)
+                    self._last_cli_diagnostics["permission_denial_count"] = summary["count"]
+                    self._last_cli_diagnostics["permission_denial_summary"] = summary["items"]
+                    detail = f"denied_count={summary['count']} denied={json.dumps(summary['items'], ensure_ascii=False)}"
+                    return f"Claude Code CLI reported {code}: {detail[:1000]}"
                 detail = event.get("error") or result_payload.get("error") or event.get("result") or "Claude Code result reported an error"
                 return f"Claude Code CLI reported {code}: {str(detail)[:1000]}"
         if not result_seen:

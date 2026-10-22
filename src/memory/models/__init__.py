@@ -8,6 +8,8 @@ from sqlalchemy.orm import configure_mappers
 
 from .base import Base
 from .personal_draft import PersonalDraftEvent
+from .personal_reminder import PersonalReminderEvent
+from .personal_finance_receipt import PersonalFinanceReceiptCandidate
 from .auth_handoff import (
     AuthHandoffClientTransaction,
     AuthHandoffRateLimit,
@@ -172,6 +174,17 @@ from .personal_ledger import (
     PERSONAL_LEDGER_KINDS,
     PERSONAL_LEDGER_USER_ONLY_ENTRY_TYPES,
     PersonalLedgerEntry,
+)
+from .personal_career import (
+    PersonalCareerProfileConfirmation,
+    PersonalCareerProfileVersion,
+    PersonalCareerSource,
+    PersonalCareerSourceSelection,
+)
+from .personal_finance import (
+    PersonalFinanceDataset,
+    PersonalFinanceDatasetMember,
+    PersonalFinanceEntry,
 )
 from .records import (
     RecordTable,
@@ -634,6 +647,14 @@ __all__ = [
     "PERSONAL_LEDGER_KINDS",
     "PERSONAL_LEDGER_USER_ONLY_ENTRY_TYPES",
     "PersonalLedgerEntry",
+    "PersonalCareerProfileConfirmation",
+    "PersonalCareerProfileVersion",
+    "PersonalCareerSource",
+    "PersonalCareerSourceSelection",
+    "PersonalFinanceDataset",
+    "PersonalFinanceDatasetMember",
+    "PersonalFinanceEntry",
+    "PersonalFinanceReceiptCandidate",
     "RecordAttachment",
     "RecordEvent",
     "RecordField",

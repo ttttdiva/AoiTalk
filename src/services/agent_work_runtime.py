@@ -55,6 +55,7 @@ from ..memory.models import (
 )
 from ..memory.project_repository import ProjectRepository
 
+from ..memory.models.agent_work import is_execution_control_value
 from .provider_failure_metadata import USAGE_COUNTER_KEYS, safe_usage_snapshot, terminal_failure_event_fields
 
 logger = logging.getLogger(__name__)
@@ -185,7 +186,11 @@ def _safe_json(value: Any, *, depth: int = 0) -> Any:
                 and isinstance(item, (int, float))
                 and not isinstance(item, bool)
             )
-            if not numeric_counter and any(marker in normalized for marker in _SECRET_KEY_MARKERS):
+            if (
+                not numeric_counter
+                and not is_execution_control_value(name, item)
+                and any(marker in normalized for marker in _SECRET_KEY_MARKERS)
+            ):
                 continue
             output[name] = _safe_json(item, depth=depth + 1)
         return output
@@ -4803,7 +4808,7 @@ class AgentWorkCoordinator:
                     await AgentRunService(
                         self._db_manager,
                         config=self.config,
-                    ).complete_run(str(run_payload["id"]), result=dict(outcome.result or {}), message=outcome.result_summary, metadata={"work_item_id": claim.work_item_id, "classification": outcome.normalized_classification(), "domain_ref": outcome.domain_ref, "domain_status": outcome.domain_status, "usage": dict(outcome.usage or {}), **route_metadata}, **route_kwargs)
+                    ).complete_run(str(run_payload["id"]), result=dict(outcome.result or {}), message=outcome.result_summary, metadata={"work_item_id": claim.work_item_id, "classification": outcome.normalized_classification(), "domain_ref": outcome.domain_ref, "domain_status": outcome.domain_status, **({} if outcome.metadata.get("usage_state") == "known" else {"usage": dict(outcome.usage or {})}), **route_metadata}, **route_kwargs)
                 elif outcome.normalized_classification() in {"permanent", "blocked", "cancelled", "transient", "awaiting_approval", "uncertain"}:
                     classification = outcome.normalized_classification()
                     await AgentRunService(

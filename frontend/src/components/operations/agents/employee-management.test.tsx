@@ -34,7 +34,9 @@ let policyRows: object[];
 let ruleRows: object[];
 let revisionRows: EmployeeRevision[];
 let assignmentRows: object[];
-let currentEmployee: { id: string; display_name: string; slug: string; state: string };
+let currentEmployee: { id: string; display_name: string; slug: string; state: string; character_id?: string | null };
+const CHARACTER_ID = "7d0c2f3e-5b1a-4c8e-9a64-1f2e3d4c5b6a";
+let characterRows: object[];
 let fail: ((request: RequestRecord) => number | undefined) | null;
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 async function backend(url: string, init?: RequestInit) {
@@ -44,7 +46,9 @@ async function backend(url: string, init?: RequestInit) {
   const status = fail?.(request); if (status) return response({ detail: "echoed-secret-must-never-render" }, status);
   if (path === "/api/agents/catalog") return response({ ...catalog, can_manage: mocks.manage });
   if (path === "/api/operations/command-center") return response({ summary: { working: 0, awaiting_approval: 0, uncertain: 0 }, agents: [] });
-  if (path === "/api/agents") return response(method === "POST" ? { agent: currentEmployee } : { agents: [currentEmployee] });
+  if (path === "/api/characters/manage") return response({ success: true, characters: characterRows });
+  if (path === "/api/agents" && method === "POST") { currentEmployee = { ...currentEmployee, ...(body?.character_id ? { character_id: String(body.character_id) } : {}) }; return response({ agent: currentEmployee }); }
+  if (path === "/api/agents") return response({ agents: [currentEmployee] });
   if (path === "/api/agents/agent") return response({ agent: currentEmployee });
   if (path.endsWith("/organization-profile")) return response({ organization_profile: { job_title: "備品", employment_state: "active", autonomy_level: "supervised" } });
   if (path === "/api/agents/agent/revisions") return response(method === "POST" ? { revision: { ...revision, ...body } } : { revisions: revisionRows });
@@ -81,6 +85,7 @@ async function openHelp(user: ReturnType<typeof userEvent.setup>, label: string)
 beforeEach(() => {
   vi.restoreAllMocks(); mocks.push.mockReset(); mocks.query = new URLSearchParams("tab=agents"); mocks.enabled = true; mocks.manage = true;
   mocks.characters.mockResolvedValue([]);
+  characterRows = [{ id: CHARACTER_ID, name: "葵", slug: "aoi", is_enabled: true, system_prompt: "x" }, { id: "off-char", name: "休止中", is_enabled: false }];
   requests = []; policyRows = []; ruleRows = []; revisionRows = [revision]; assignmentRows = []; fail = null; currentEmployee = { ...employee };
   mocks.fetch.mockImplementation(backend); vi.stubGlobal("fetch", mocks.fetch);
 });
@@ -99,18 +104,40 @@ describe("Agent管理と API 境界", () => {
     await user.click(await screen.findByRole("button", { name: /備品担当.*下書きの設定を再開/ }));
     expect(mocks.push).toHaveBeenCalledWith("/operations?tab=agents&agent=agent&panel=overview", { scroll: false });
   });
-  it("labels the current Media Persona source without changing character_id or employment state payloads", async () => {
+  it("lists conversation Characters, POSTs the selected Character UUID (never a Media Persona) and reads it back", async () => {
     mocks.characters.mockResolvedValue([{ id: "media-persona-1", current_revision: { display_name: "発信用Persona" } }]);
     const user = userEvent.setup(); mount(<EmployeeWorkspace />);
     await user.click(await screen.findByRole("button", { name: "＋ Agentを追加" }));
     await user.type(screen.getByLabelText("Agent名"), "制作担当");
-    await select(user, "Persona（発信人格・任意）", "発信用Persona");
+    await user.click(screen.getByRole("combobox", { name: "Character（会話人格・任意）" }));
+    expect(await screen.findByRole("option", { name: "葵" })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "発信用Persona" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "休止中" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("option", { name: "葵" }));
     await select(user, "雇用状態", "業務委託");
     await user.click(screen.getByRole("button", { name: "下書きを保存して職務設定へ" }));
     await waitFor(() => expect(mocks.push).toHaveBeenCalledWith(employeeHref("agent", "role"), { scroll: false }));
-    expect(requests.find(r => r.path === "/api/agents" && r.method === "POST")?.body).toMatchObject({ display_name: "制作担当", character_id: "media-persona-1" });
+    expect(requests.find(r => r.path === "/api/agents" && r.method === "POST")?.body).toMatchObject({ display_name: "制作担当", character_id: CHARACTER_ID });
+    expect(requests.some(r => r.path === "/api/characters/manage")).toBe(true);
+    expect(mocks.characters).not.toHaveBeenCalled();
     expect(requests.find(r => r.path.endsWith("organization-profile") && r.method === "PATCH")?.body).toMatchObject({ employment_state: "contractor" });
     expect(requests.some(r => r.path.endsWith("/state") && r.method === "PATCH")).toBe(false);
+  });
+  it("allows creating an Agent without a Character and omits character_id", async () => {
+    const user = userEvent.setup(); mount(<EmployeeWorkspace />);
+    await user.click(await screen.findByRole("button", { name: "＋ Agentを追加" }));
+    await user.type(screen.getByLabelText("Agent名"), "未指定担当");
+    await user.click(screen.getByRole("button", { name: "下書きを保存して職務設定へ" }));
+    await waitFor(() => expect(mocks.push).toHaveBeenCalledWith(employeeHref("agent", "role"), { scroll: false }));
+    expect(requests.find(r => r.path === "/api/agents" && r.method === "POST")?.body).not.toHaveProperty("character_id");
+  });
+  it.each([
+    [CHARACTER_ID, "葵"], [null, "未選択"], ["media-persona-1", "未解決"],
+  ])("shows the saved character_id %s as %s without rewriting it", async (id, text) => {
+    currentEmployee = { ...employee, character_id: id }; mocks.query = new URLSearchParams("tab=agents&agent=agent&panel=overview");
+    mount(<EmployeeWorkspace />);
+    expect(await screen.findByTestId("employee-character")).toHaveTextContent(text);
+    expect(requests.some(r => r.path.startsWith("/api/agents") && r.method !== "GET")).toBe(false);
   });
   it("hides administrator writes when the catalog cannot manage", async () => {
     mocks.manage = false; mount(<EmployeeWorkspace />); await screen.findByRole("button", { name: /備品担当/ });
@@ -120,9 +147,9 @@ describe("Agent管理と API 境界", () => {
     const user = userEvent.setup(); let failed = false;
     fail = r => { if (!failed && r.method === "PATCH" && r.path.endsWith("organization-profile")) { failed = true; return 503; } };
     mount(<EmployeeWorkspace />); await user.click(await screen.findByRole("button", { name: "＋ Agentを追加" }));
-    expect(screen.getByRole("combobox", { name: "Persona（発信人格・任意）" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Character（会話人格・任意）" })).toBeVisible();
     await openHelp(user, "Agentを追加");
-    expect(await screen.findByText(/候補は発信・制作のPersona/)).toHaveTextContent("会話用Characterとは別");
+    expect(await screen.findByText(/候補は会話用Character/)).toHaveTextContent("Personaとは別");
     expect(screen.getByText(/雇用状態は組織上の在籍・契約状態/)).toHaveTextContent("実行状態");
     await user.type(screen.getByLabelText("Agent名"), "備品担当"); await user.type(screen.getByLabelText("役職"), "調達");
     await user.click(screen.getByRole("button", { name: "下書きを保存して職務設定へ" }));

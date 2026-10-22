@@ -1873,6 +1873,11 @@ class ChatMessageMixin:
             nonlocal agent_run_id
             if not session_id or agent_run_id:
                 return True
+            if data.get("execution_profile_id") is not None:
+                # An explicit execution profile is only honoured by HTTP
+                # admission, which pins it into the immutable binding.  The
+                # direct-WS fallback never silently falls back to the default.
+                raise RuntimeError("agent_admission_execution_profile_unsupported")
             try:
                 from ...services.agent_run_service import AgentRunService
 

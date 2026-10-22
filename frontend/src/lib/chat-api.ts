@@ -1216,6 +1216,8 @@ export const chatApi = {
     > & {
       /** Optional CAS token checked against the canonical session binding. */
       expected_agent_id?: string | null;
+      /** Admission-time runtime for the bound Agent; omitted = role revision default. */
+      execution_profile_id?: string | null;
     },
   ) =>
     request<{

@@ -120,6 +120,7 @@ from .specialist_delegate import (
     set_runtime_specialist_provider,
 )
 from .context_budget import (
+    TOOL_GENERATION_ALLOWANCE_TOKENS,
     ContextBudget,
     clip_text,
     clip_text_preserve_tail,
@@ -4232,22 +4233,43 @@ class OpenAICompatibleLocalClient:
         runtime or planner cap, an operator-configured reserve or a curator
         override, allow up to the generic bounded allowance that still fits
         the actual messages + tool schemas in the context window.
+
+        A legacy ``response_reserve_tokens`` stays a hard cap (it may be an
+        intentional operator limit).  Only the explicit opt-in
+        ``context_budget.tool_generation_max_tokens`` (positive int, default
+        null) lets uncapped tool requests use the bounded allowance despite a
+        legacy reserve; it is also the ceiling of that allowance.  A scoped
+        curator override still wins.
         """
 
         current = int(api_kwargs.get("max_tokens") or budget.response_tokens)
         config = getattr(self, "config", None)
         getter = getattr(config, "get", None)
-        if (
-            callable(getter)
-            and getter(
+        if self._scoped_response_tokens_override() is not None:
+            return current
+        optin = None
+        reserve = None
+        if callable(getter):
+            optin = getter(
+                "openai_compatible_local.context_budget.tool_generation_max_tokens",
+                None,
+            )
+            reserve = getter(
                 "openai_compatible_local.context_budget.response_reserve_tokens",
                 None,
             )
-            not in (None, "")
-        ) or self._scoped_response_tokens_override() is not None:
+        try:
+            optin = int(optin) if optin not in (None, "", False) else None
+        except (TypeError, ValueError):
+            optin = None
+        if optin is not None and optin <= 0:
+            optin = None
+        if optin is None and reserve not in (None, ""):
             return current
         allowance = completion_allowance_tokens(
-            budget, self._payload_prompt_tokens(api_kwargs)
+            budget,
+            self._payload_prompt_tokens(api_kwargs),
+            **({"ceiling": min(optin, TOOL_GENERATION_ALLOWANCE_TOKENS)} if optin else {}),
         )
         return allowance if allowance < current else max(current, allowance)
 
@@ -5601,6 +5623,13 @@ class OpenAICompatibleLocalClient:
                 self._catalog_capture_role_and_controls()
             )
             run_id = self._current_agent_run_id_for_preprovider_proof()
+            # The integer cap actually on the wire (no prompt/secret content).
+            wire_max_tokens = None
+            for cap_key in ("max_tokens", "max_completion_tokens"):
+                cap = final_payload.get(cap_key) if isinstance(final_payload, Mapping) else None
+                if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+                    wire_max_tokens = cap
+                    break
 
             def emit_channel(
                 channel: str,
@@ -5660,6 +5689,7 @@ class OpenAICompatibleLocalClient:
                     missing_control_names=missing_controls,
                     actual_sender_entered=True,
                     sdk_call_boundary_reached=True,
+                    wire_max_tokens=wire_max_tokens,
                 )
 
             if native_present:
@@ -5802,7 +5832,43 @@ class OpenAICompatibleLocalClient:
             model=self.model_name,
         )
 
+        from .provider_rate_governor import (
+            GOVERNOR, budget_exhausted_after_429, governor_key, is_loopback_endpoint, should_retry_429,
+        )
+        from ..services.free_team_service import openai_credential_identity
+
+        governor_endpoint = str(self.base_url or "")
+        governed = not is_loopback_endpoint(governor_endpoint)
+        governor_id = governor_key(
+            "openai_compatible_local", governor_endpoint, self.model_name,
+            openai_credential_identity(self.client).get("api_key_sha256"),
+        )
+
+        def checkpoint() -> float | None:
+            active = current_generation_budget.get()
+            return active.checkpoint() if active is not None else None
+
+        lease_box: dict[str, Any] = {}
+
         def sender(final_payload: Any) -> Any:
+            # The slot follows the actual request; a stream hands it to the
+            # stream object, which releases it only once cleanup is verified.
+            lease = GOVERNOR.acquire(governor_id, checkpoint) if governed else None
+            lease_box["lease"] = lease
+            lease_box["handed"] = False
+            try:
+                result = raw_sender(final_payload)
+            except BaseException:
+                # An InterruptibleStream (or its reaper) owns a handed-over
+                # lease; only an unowned or plain-wrapper lease is released here.
+                if lease is not None and lease_box["handed"] != "interruptible":
+                    lease.release()
+                raise
+            if lease is not None and not lease_box["handed"]:
+                lease.release()
+            return result
+
+        def raw_sender(final_payload: Any) -> Any:
             if not isinstance(final_payload, dict):
                 raise PrivacyError("OpenAI-compatible outbound payload is malformed")
             self._validate_required_tool_contract(final_payload, required_tool_schema)
@@ -5820,6 +5886,10 @@ class OpenAICompatibleLocalClient:
                         if final_payload.get("stream")
                         else execute_interruptible_completion
                     )
+                    extra_args: dict[str, Any] = {}
+                    if final_payload.get("stream"):
+                        extra_args["lease"] = lease_box.get("lease")
+                        lease_box["handed"] = "interruptible"
                     response = execute(
                         client,
                         final_payload,
@@ -5828,6 +5898,7 @@ class OpenAICompatibleLocalClient:
                             final_payload,
                             sender_attempt_ordinal=sender_attempt_ordinal,
                         ),
+                        **extra_args,
                     )
                     try:
                         self._last_provider_response_shape = (
@@ -5852,7 +5923,18 @@ class OpenAICompatibleLocalClient:
                 final_payload,
                 sender_attempt_ordinal=sender_attempt_ordinal,
             )
+            if governed and budget is None:
+                # SDK retries would multiply the governor's 3-attempt bound and
+                # skip the privacy/budget boundary; retries stay explicit.
+                client = client.with_options(max_retries=0)
             response = client.chat.completions.create(**final_payload)
+            if final_payload.get("stream") and lease_box.get("lease") is not None:
+                # The slot must outlive the handshake: the wrapper releases it
+                # when the real stream ends, errors or is closed.
+                from .provider_rate_governor import LeasedSyncStream
+
+                response = LeasedSyncStream(response, lease_box["lease"])
+                lease_box["handed"] = True
             try:
                 self._last_provider_response_shape = _safe_completion_response_shape(
                     response
@@ -5871,15 +5953,30 @@ class OpenAICompatibleLocalClient:
             return response
 
         self._last_privacy_payload = dict(payload)
-        return gateway.execute_sync(
-            payload,
-            provider="openai_compatible_local",
-            descriptor=descriptor,
-            sender=sender,
-            base_url=self.base_url,
-            source_kind=request_type,
-            model=self.model_name,
-        )
+        physical = 0
+        prior_429: BaseException | None = None
+        while True:
+            physical += 1
+            try:
+                if governed:
+                    GOVERNOR.wait_cooldown(governor_id, checkpoint)
+                # Each physical attempt re-enters the privacy gateway and the
+                # request budget once; only a handshake-time temporary 429 repeats.
+                return gateway.execute_sync(
+                    payload,
+                    provider="openai_compatible_local",
+                    descriptor=descriptor,
+                    sender=sender,
+                    base_url=self.base_url,
+                    source_kind=request_type,
+                    model=self.model_name,
+                )
+            except Exception as error:
+                if budget_exhausted_after_429(error, prior_429):
+                    raise prior_429 from None
+                if not (governed and should_retry_429(error, physical, governor_id, checkpoint)):
+                    raise
+                prior_429 = error
 
     def _execute_retry_request(
         self,

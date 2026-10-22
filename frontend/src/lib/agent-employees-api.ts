@@ -74,10 +74,17 @@ export type CrowdWorksConstraints = { search_urls: string[]; scan_interval_minut
 export type PolicyRevision = { id: string; version: number; action_type: string; connection_id: string; authorization_mode: "human_approval" | "bounded_auto"; constraints: Partial<ProcurementConstraints & CrowdWorksConstraints> & { route_id?: string; allowed_destination_keys?: string[] }; rate_limit: { window_seconds: number; max_actions: number }; dedupe_window_seconds: number; fallback_behavior: string; active_from?: string | null; active_until?: string | null };
 export type EmployeePolicy = { id: string; display_name: string; state: string; version: number; current_revision: PolicyRevision | null };
 export const assignmentEnvelope: Record<AssignmentKind, string> = { "space-assignments": "space_assignments", "project-grants": "project_grants", "task-assignments": "task_assignments", "persona-operator-assignments": "persona_operator_assignments" };
+/** 会話Character（characters テーブル）。Agent.character_id の参照先と同一identity。Media Persona ではない。 */
+export type ConversationCharacter = { id: string; name: string; slug?: string; is_enabled: boolean };
 export const employeePath = (id: string) => `/api/agents/${encodeURIComponent(id)}`;
 export const employeeApi = {
   list: () => employeeRequest<{ agents: Employee[] }>("/api/agents"),
   catalog: () => employeeRequest<EmployeeCatalog>("/api/agents/catalog"),
+  characters: async (): Promise<ConversationCharacter[]> => {
+    const body = await employeeRequest<{ characters?: { id?: unknown; name?: unknown; slug?: unknown; is_enabled?: unknown }[] }>("/api/characters/manage");
+    return (body.characters ?? []).flatMap(c => typeof c.id === "string" && c.id
+      ? [{ id: c.id, name: typeof c.name === "string" && c.name ? c.name : c.id, ...(typeof c.slug === "string" ? { slug: c.slug } : {}), is_enabled: c.is_enabled !== false }] : []);
+  },
   get: (id: string) => employeeRequest<{ agent: Employee }>(employeePath(id)),
   revisions: (id: string) => employeeRequest<{ revisions: EmployeeRevision[] }>(`${employeePath(id)}/revisions`),
   profile: (id: string) => employeeRequest<{ organization_profile: EmployeeProfile }>(`${employeePath(id)}/organization-profile`),

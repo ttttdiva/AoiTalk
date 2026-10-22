@@ -33,7 +33,7 @@ def upgrade() -> None:
             UPDATE scenarios
             SET gm_instructions = CASE
                 WHEN COALESCE(gm_instructions, '') LIKE '%AI NPC作戦運用:%' THEN gm_instructions
-                ELSE CONCAT(COALESCE(gm_instructions, ''), E'\n\n', :note)
+                ELSE CONCAT(COALESCE(gm_instructions, ''), E'\n\n', CAST(:note AS TEXT))
             END
             WHERE id IN (
                 CAST(:hyosu_id AS UUID),

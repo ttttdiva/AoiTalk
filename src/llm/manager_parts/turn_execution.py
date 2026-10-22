@@ -222,6 +222,7 @@ _OWNER_PROGRESS_EVENT_KEYS: dict[str, frozenset[str]] = {
             "expected_controls_known",
             "actual_sender_entered",
             "sdk_call_boundary_reached",
+            "wire_max_tokens",
             "round",
             "tool_count",
             "input_chars",

@@ -543,7 +543,7 @@ class CLISessionWorkAdapter:
                     },
                     "observed": observed_config,
                     "applied": applied_config,
-                    "diagnostics": {str(key): value for key, value in diagnostics.items() if key in {"status", "state", "error_code", "wait_state", "wait_kind", "permission_event_count", "input_event_count", "effective_model", "cwd", "permission_mode", "stderr_present"}},
+                    "diagnostics": {str(key): value for key, value in diagnostics.items() if key in {"status", "state", "error_code", "wait_state", "wait_kind", "permission_event_count", "native_permission_denied_event_count", "permission_denial_count", "permission_denial_summary", "input_event_count", "effective_model", "cwd", "permission_mode", "stderr_present"}},
                 },
             )
             if not native_id:

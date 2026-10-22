@@ -1659,6 +1659,8 @@ export function createOutboxResolutionFacade(
     confirmation: OutboxResolutionOpaqueTicket;
     targetLabel: string;
     operationOrigin: 'unrecorded';
+    serverHost: string;
+    serverPort: number;
   }>> => {
     try {
       if (!opId.trim() || !authScope.trim() || authScope === 'anonymous') {
@@ -1674,9 +1676,16 @@ export function createOutboxResolutionFacade(
         return { ok: false, reason: 'origin_confirmation_required' };
       }
       const label = `${captured.value.operation.tableName === DOCS_TABLE ? 'Docs' : 'Task'} @${serverLabel}`;
+      const endpoint = new URL(captured.value.context.serverFingerprint);
       return {
         ok: true,
-        value: { confirmation: ticket, targetLabel: label, operationOrigin: 'unrecorded' },
+        value: {
+          confirmation: ticket,
+          targetLabel: label,
+          operationOrigin: 'unrecorded',
+          serverHost: endpoint.hostname,
+          serverPort: Number(endpoint.port) || (endpoint.protocol === 'http:' ? 80 : 443),
+        },
       };
     } catch {
       return { ok: false, reason: 'local_snapshot_unavailable' };

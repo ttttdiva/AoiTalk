@@ -151,14 +151,16 @@ class PersonalDraftService:
         finally:
             await session.close()
 
-    async def _evidence(self, session, owner, ref):
+    async def _evidence(self, session, owner, ref, guard=None):
         row = await self._owned(session, owner, ref, "evidence")
+        if guard is not None:
+            guard()  # right after the DB await, before the payload is read/decrypted
         evidence = row.payload["evidence"]
         if evidence != _manual_evidence(evidence["proposal"], evidence["source_text"]):
             raise LedgerConflictError("source integrity mismatch")
         return evidence
 
-    async def propose(self, *, actor, evidence_ref, proposal, idempotency_key):
+    async def propose(self, *, actor, evidence_ref, proposal, idempotency_key, guard=None):
         _actor(actor)
         proposal = normalize_proposal(proposal)
         evidence_ref = _uuid(evidence_ref, "evidence_ref")
@@ -166,17 +168,27 @@ class PersonalDraftService:
         request = {"evidence_ref": str(evidence_ref), "proposal": proposal, "actor_kind": actor.kind}
         session = await self.ledger._open()
         try:
+            if guard is not None:
+                guard()  # after _open, before the first DB read
             async with session.begin():
+                if guard is not None:
+                    guard()  # after transaction enter
                 await self._lock(session, actor.user_id)
+                if guard is not None:
+                    guard()  # after the advisory lock, before the next DB read
                 existing = await self._by_key(session, actor.user_id, key)
+                if guard is not None:
+                    guard()
                 if existing:
                     return self._replay(existing, request)["result"]
-                evidence = await self._evidence(session, actor.user_id, evidence_ref)
+                evidence = await self._evidence(session, actor.user_id, evidence_ref, guard)
                 if evidence["proposal"] != proposal:
                     raise LedgerValidationError("proposal does not match evidence")
                 duplicate = (await session.execute(select(Event.id).where(
                     Event.owner_user_id == actor.user_id, Event.evidence_ref == evidence_ref,
                 ))).first()
+                if guard is not None:
+                    guard()  # raising here rolls the transaction back before any write
                 if duplicate:
                     raise LedgerConflictError("evidence already has a draft")
                 draft_id = uuid4()
@@ -192,6 +204,8 @@ class PersonalDraftService:
                                "proposal": proposal, "evidence_digest": digest(evidence)}
                 session.add(row)
                 await session.flush()
+                if guard is not None:
+                    guard()  # raising here rolls back the flushed audit row before COMMIT
                 return result
         finally:
             await session.close()

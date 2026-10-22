@@ -13,6 +13,7 @@ therefore keeps reversible aliases consistent for the duration of a turn.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import copy
@@ -192,6 +193,167 @@ LOCAL_PROVIDER_IDS = frozenset(
 CLI_PROVIDER_IDS = frozenset(
     {"codex-cli", "claude-cli", "antigravity-cli", "grok-cli"}
 )
+
+
+def _decode_tool_result_container(text: str) -> tuple[Any, str] | None:
+    """Decode only bounded literal tool envelopes; never execute expressions."""
+    if len(text) > 262144 or not text.lstrip().startswith(("{", "[")):
+        return None
+    try:
+        def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        def no_constant(_value: str) -> Any:
+            raise ValueError("non-finite number")
+
+        decoded = json.loads(text, object_pairs_hook=unique_pairs, parse_constant=no_constant)
+        if isinstance(decoded, (dict, list)):
+            return decoded, "json"
+    except (ValueError, TypeError, RecursionError):
+        pass
+    try:
+        tree = ast.parse(text, mode="eval")
+        count = 0
+
+        def literal(node: ast.AST, depth: int = 0) -> Any:
+            nonlocal count
+            count += 1
+            if count > 10000 or depth > 24:
+                raise ValueError("literal budget")
+            if isinstance(node, ast.Constant) and type(node.value) in (str, int, float, bool, type(None)):
+                if isinstance(node.value, float) and not math.isfinite(node.value):
+                    raise ValueError("non-finite number")
+                return node.value
+            if isinstance(node, (ast.List, ast.Tuple)):
+                values = [literal(item, depth + 1) for item in node.elts]
+                return tuple(values) if isinstance(node, ast.Tuple) else values
+            if isinstance(node, ast.Dict):
+                result = {}
+                for key_node, value_node in zip(node.keys, node.values):
+                    key = literal(key_node, depth + 1)
+                    if not isinstance(key, str) or key in result:
+                        raise ValueError("unsupported or duplicate key")
+                    result[key] = literal(value_node, depth + 1)
+                return result
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+                value = literal(node.operand, depth + 1)
+                if type(value) not in (int, float):
+                    raise ValueError("unsupported unary literal")
+                return -value
+            raise ValueError("not a literal")
+
+        decoded = literal(tree.body)
+        if isinstance(decoded, (dict, list)):
+            return decoded, "repr"
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        pass
+    return None
+
+
+def _encode_tool_result_container(value: Any, encoding: str) -> str:
+    return json.dumps(value, ensure_ascii=False) if encoding == "json" else repr(value)
+
+
+def _is_serialized_tool_slot(value: Mapping[str, Any], key: Any) -> bool:
+    return (
+        key == "content" and value.get("role") in ("tool", "function")
+    ) or (
+        key == "output" and value.get("type") == "function_call_output"
+    ) or (
+        key == "content" and value.get("type") == "tool_result"
+    )
+
+
+def _contextvar_token_value_spans(text: str) -> frozenset[tuple[int, int]]:
+    """Recognize a narrow, statically bound ContextVar set/reset token pair."""
+    if len(text) > 262144 or "ContextVar" not in text or ".set(" not in text:
+        return frozenset()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return frozenset()
+    names: dict[str, int] = {}
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            name = node.id
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.split(".", 1)[0]
+        elif isinstance(node, ast.ExceptHandler):
+            name = node.name
+        if name:
+            names[name] = names.get(name, 0) + 1
+    constructors = {
+        alias.asname or alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "contextvars" and node.level == 0
+        for alias in node.names
+        if alias.name == "ContextVar" and names.get(alias.asname or alias.name) == 1
+    }
+    variables: set[str] = set()
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        value = getattr(node, "value", None)
+        if (
+            len(targets) == 1 and isinstance(targets[0], ast.Name)
+            and names.get(targets[0].id) == 1 and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name) and value.func.id in constructors
+        ):
+            variables.add(targets[0].id)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    def position(line: int, column: int) -> int:
+        return offsets[line - 1] + len(lines[line - 1].encode("utf-8")[:column].decode("utf-8"))
+
+    def scope_for(node: ast.AST) -> ast.AST:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return node
+        return tree
+
+    spans = set()
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        value = getattr(node, "value", None)
+        if not (len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "token"):
+            continue
+        if not (
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "set" and isinstance(value.func.value, ast.Name)
+            and value.func.value.id in variables and len(value.args) == 1 and not value.keywords
+            and (isinstance(value.args[0], ast.Name) or isinstance(value.args[0], ast.Constant) and value.args[0].value is None)
+        ):
+            continue
+        expression = ast.get_source_segment(text, value) or ""
+        if HIGH_CONFIDENCE_API_TOKEN_RE.search(expression):
+            continue
+        scope = scope_for(node)
+        reset = any(
+            isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "reset" and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == value.func.value.id and len(call.args) == 1
+            and isinstance(call.args[0], ast.Name) and call.args[0].id == "token"
+            and not call.keywords and scope_for(call) is scope
+            for call in ast.walk(scope)
+        )
+        if reset:
+            spans.add((position(value.lineno, value.col_offset), position(value.end_lineno, value.end_col_offset)))
+    return frozenset(spans)
+
 
 _SECRET_RE = re.compile(
     r"(?i)(?P<prefix>\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|auth[_ -]?token|session[_ -]?token|client[_ -]?secret|saml[_ -]?response|relay[_ -]?state|secret|token|password|passwd|credential|authorization|cookie)\s*[\"']?\s*[:=]\s*)"
@@ -2029,9 +2191,12 @@ class OutboundPrivacyGateway:
 
     def _replace_pattern(self, text: str, pattern: re.Pattern[str], category: str, findings: list[RedactionFinding]) -> str:
         count = 0
+        benign_spans = _contextvar_token_value_spans(text) if pattern is _SECRET_RE else frozenset()
 
         def replace(match: re.Match[str]) -> str:
             nonlocal count
+            if benign_spans and match.span("value") in benign_spans:
+                return match.group(0)
             count += 1
             value = match.group(0)
             if category == "SECRET" and match.groupdict().get("prefix"):
@@ -2046,6 +2211,8 @@ class OutboundPrivacyGateway:
                     raw_value = raw_value[1:-1]
                 alias = self._placeholder(category, raw_value)
                 return f"{prefix}{quote}{alias}{quote}"
+            if pattern is _WINDOWS_PATH_RE and value.endswith(":"):
+                return self._placeholder(category, value[:-1]) + ":"
             return self._placeholder(category, value)
 
         result = pattern.sub(replace, text)
@@ -2069,6 +2236,7 @@ class OutboundPrivacyGateway:
             (_BEARER_RE, "SECRET"),
             (_JWT_RE, "JWT"),
             (_AWS_ACCESS_KEY_RE, "AWS_ACCESS_KEY"),
+            (HIGH_CONFIDENCE_API_TOKEN_RE, "SECRET"),
             (_SECRET_RE, "SECRET"),
             (_EMAIL_RE, "EMAIL"),
             (_PRIVATE_IP_RE, "INTERNAL_HOST"),
@@ -2397,7 +2565,7 @@ class OutboundPrivacyGateway:
                 result = result.replace(marker, alias)
             return result
 
-        async def walk(value: Any, *, depth: int = 0) -> Any:
+        async def walk(value: Any, *, depth: int = 0, serialized_tool_result: bool = False, logical_tool_data: bool = False) -> Any:
             nonlocal nodes
             nodes += 1
             if nodes > _MAX_PAYLOAD_NODES:
@@ -2413,6 +2581,11 @@ class OutboundPrivacyGateway:
                     "external egress final payload contains raw media"
                 )
             if isinstance(value, str):
+                if serialized_tool_result and value not in semantic_exempt_values:
+                    container = _decode_tool_result_container(value)
+                    if container is not None:
+                        await walk(container[0], depth=depth + 1, logical_tool_data=True)
+                        return value
                 if value in semantic_exempt_values:
                     # Workflow-attested protocol strings (including the exact
                     # serialized query) already contain opaque aliases.  Do
@@ -2451,6 +2624,8 @@ class OutboundPrivacyGateway:
                 try:
                     checked: dict[Any, Any] = {}
                     for key, item in value.items():
+                        if logical_tool_data and isinstance(key, str):
+                            await walk(key, depth=depth + 1)
                         key_text = str(key)
                         # Credential-labelled fields are never accepted as a
                         # newly edited value.  A placeholder produced by this
@@ -2480,7 +2655,7 @@ class OutboundPrivacyGateway:
                                 raise PrivacyReviewDenied(
                                     "external egress final payload contains credential material"
                                 )
-                        checked[key] = await walk(item, depth=depth + 1)
+                        checked[key] = await walk(item, depth=depth + 1, serialized_tool_result=_is_serialized_tool_slot(value, key), logical_tool_data=logical_tool_data)
                     return checked
                 finally:
                     ancestors.discard(identity)
@@ -2492,7 +2667,7 @@ class OutboundPrivacyGateway:
                     )
                 ancestors.add(identity)
                 try:
-                    items = [await walk(item, depth=depth + 1) for item in value]
+                    items = [await walk(item, depth=depth + 1, logical_tool_data=logical_tool_data) for item in value]
                     if isinstance(value, tuple):
                         return tuple(items)
                     if isinstance(value, frozenset):
@@ -2867,6 +3042,8 @@ class OutboundPrivacyGateway:
             *,
             media_context: bool = False,
             depth: int = 0,
+            serialized_tool_result: bool = False,
+            logical_tool_data: bool = False,
         ) -> Any:
             nonlocal raw_media_found, semantic_status, transform_nodes
             transform_nodes += 1
@@ -2893,6 +3070,12 @@ class OutboundPrivacyGateway:
                     raise RawMediaBlocked("raw media is blocked in protected privacy mode")
                 return value
             if isinstance(value, str):
+                if serialized_tool_result and value not in semantic_exempt:
+                    container = _decode_tool_result_container(value)
+                    if container is not None:
+                        logical, encoding = container
+                        protected = await transform(logical, depth=depth + 1, logical_tool_data=True)
+                        return _encode_tool_result_container(protected, encoding)
                 if value in semantic_exempt:
                     # The exact value has passed the Cloud workflow's strict
                     # projection/digest attestation; preserve its opaque
@@ -2943,6 +3126,9 @@ class OutboundPrivacyGateway:
                 try:
                     transformed: dict[Any, Any] = {}
                     for key, item in value.items():
+                        output_key = await transform(key, depth=depth + 1) if logical_tool_data and isinstance(key, str) else key
+                        if output_key in transformed:
+                            raise PrivacyError("tool result key collision after redaction")
                         normalized_key = str(key or "").strip().lower().replace("-", "_")
                         child_media_context = media_context or normalized_key in _MEDIA_CONTAINER_KEYS
                         if normalized_key in _MEDIA_BASE64_KEYS or normalized_key == "data":
@@ -2968,7 +3154,7 @@ class OutboundPrivacyGateway:
                                 # is already non-sensitive and carries no
                                 # reversible alias that this gateway needs to
                                 # restore.
-                                transformed[key] = item
+                                transformed[output_key] = item
                                 continue
                             if isinstance(item, str):
                                 # Authorization values often carry a scheme
@@ -2984,7 +3170,7 @@ class OutboundPrivacyGateway:
                                     scheme, separator, credential = item.partition(" ")
                                     if separator and scheme.casefold() in {"bearer", "basic"} and credential:
                                         alias = self._placeholder("SECRET", credential)
-                                        transformed[key] = f"{scheme} {alias}"
+                                        transformed[output_key] = f"{scheme} {alias}"
                                         findings.append(RedactionFinding("SECRET", alias))
                                         continue
                                 labelled_value = f"{key}={item}"
@@ -2998,17 +3184,17 @@ class OutboundPrivacyGateway:
                                     )
                                 except (TypeError, ValueError):
                                     labelled_value = "<unsupported-secret-value>"
-                            redacted_labelled, deterministic = self._deterministic_redact(labelled_value)
-                            findings.extend(deterministic)
-                            if isinstance(item, str) and "=" in redacted_labelled:
-                                transformed[key] = redacted_labelled.split("=", 1)[1]
-                            else:
-                                transformed[key] = redacted_labelled
+                            raw_secret = item if isinstance(item, str) else labelled_value
+                            alias = self._placeholder("SECRET", raw_secret)
+                            transformed[output_key] = alias
+                            findings.append(RedactionFinding("SECRET", alias))
                             continue
-                        transformed[key] = await transform(
+                        transformed[output_key] = await transform(
                             item,
                             media_context=child_media_context,
                             depth=depth + 1,
+                            serialized_tool_result=_is_serialized_tool_slot(value, key),
+                            logical_tool_data=logical_tool_data,
                         )
                     return transformed
                 finally:
@@ -3024,6 +3210,7 @@ class OutboundPrivacyGateway:
                             item,
                             media_context=media_context,
                             depth=depth + 1,
+                            logical_tool_data=logical_tool_data,
                         )
                         for item in value
                     ]
@@ -3041,6 +3228,7 @@ class OutboundPrivacyGateway:
                                 item,
                                 media_context=media_context,
                                 depth=depth + 1,
+                                logical_tool_data=logical_tool_data,
                             )
                             for item in value
                         ]
@@ -3059,6 +3247,7 @@ class OutboundPrivacyGateway:
                                 item,
                                 media_context=media_context,
                                 depth=depth + 1,
+                                logical_tool_data=logical_tool_data,
                             )
                             for item in value
                         ]
@@ -3744,7 +3933,9 @@ class OutboundPrivacyGateway:
         """Restore aliases only for local execution/final user display."""
         if isinstance(value, str):
             restored = value
-            for alias, raw in sorted(self._alias_to_raw.items(), key=lambda pair: len(pair[0]), reverse=True):
+            # Later redaction layers can contain earlier, gateway-owned aliases.
+            # Restore newest first so one bounded pass expands those layers.
+            for alias, raw in reversed(tuple(self._alias_to_raw.items())):
                 restored = restored.replace(alias, raw)
             return restored
         if isinstance(value, Mapping):

@@ -59,6 +59,21 @@ AGENT_WORK_OUTCOME_CLASSES = frozenset(
 AGENT_WORK_ACTOR_KINDS = frozenset({"human", "agent", "service"})
 
 # Numeric usage counters are not secrets even though their names contain "token".
+# Non-secret execution controls whose names contain a secret marker ("token").
+# Exact key + strict integer (not bool) in range only; nothing else is exempt.
+EXECUTION_CONTROL_INT_RANGES = {"tool_generation_max_tokens": (1, 4096)}
+
+
+def is_execution_control_value(key: str, value: Any) -> bool:
+    bounds = EXECUTION_CONTROL_INT_RANGES.get(key)
+    return (
+        bounds is not None
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and bounds[0] <= value <= bounds[1]
+    )
+
+
 USAGE_COUNTER_KEYS = frozenset((
     "input_tokens",
     "output_tokens",
@@ -179,7 +194,7 @@ def _safe_json(value: Any, *, depth: int = 0, keep_paths: bool = False) -> Any:
                 and isinstance(item, (int, float))
                 and not isinstance(item, bool)
             )
-            if not numeric_counter and any(marker in lowered for marker in _SAFE_KEY_MARKERS):
+            if not numeric_counter and not is_execution_control_value(key, item) and any(marker in lowered for marker in _SAFE_KEY_MARKERS):
                 continue
             projected = _safe_json(item, depth=depth + 1, keep_paths=keep_paths)
             if projected is not None:

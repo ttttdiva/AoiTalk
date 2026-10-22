@@ -5305,6 +5305,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/free-team/openrouter/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Openrouter Quota */
+        get: operations["get_openrouter_quota_api_free_team_openrouter_quota_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/free-team/openrouter/quota/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Refresh Openrouter Quota */
+        post: operations["refresh_openrouter_quota_api_free_team_openrouter_quota_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/free-team/openrouter/refresh": {
         parameters: {
             query?: never;
@@ -15462,6 +15496,11 @@ export interface components {
             edit_targets?: string[] | null;
             /** Effort */
             effort?: string | null;
+            /**
+             * Execution Profile Id
+             * @description Optional runtime ExecutionProfile for this task. Omitted/null keeps the pinned AgentRevision default. An explicit id must be a formal system Profile or an enabled Profile of the Agent's own Team; it never changes the Agent role and never falls back. provider/model/effort remain assertions against the selected route.
+             */
+            execution_profile_id?: string | null;
             /** Goal */
             goal: string;
             /** Mode */
@@ -15482,6 +15521,11 @@ export interface components {
              * @description Require successful command evidence after the last mutation point: a file-tool edit, or any command whose bounded before/after workspace content observation did not prove the workspace unchanged (changed, unknown, partial/over-limit, background launch, or no evidence; success does not matter). The last unproven command cannot verify itself. Observation is whole-workspace and bounded (excludes .git; unobservable links/reparse points or limits fail closed), not a per-path change list. An explicit boolean overrides language inference; omitted/null infers from the goal and completion criteria.
              */
             requires_command_verification?: boolean | null;
+            /**
+             * Tool Generation Max Tokens
+             * @description Omitted/null keeps the model's legacy output reserve. Explicit per-task opt-in: uncapped tool generation may use a bounded allowance up to this many tokens (never above 4096 or the remaining context window); explicit caller/runtime caps still win.
+             */
+            tool_generation_max_tokens?: number | null;
             /** Workspace */
             workspace: string;
         };
@@ -17203,6 +17247,8 @@ export interface components {
             allowed_capabilities?: ("command_execute" | "workspace_read" | "workspace_write")[] | null;
             /** Effort */
             effort?: string | null;
+            /** Execution Profile Id */
+            execution_profile_id?: string | null;
             /** Idempotency Key */
             idempotency_key: string;
             /** Model */
@@ -19036,6 +19082,8 @@ export interface components {
             context_project_hint_id?: string | null;
             /** Edit Message Id */
             edit_message_id?: string | null;
+            /** Execution Profile Id */
+            execution_profile_id?: string | null;
             /** Expected Agent Id */
             expected_agent_id?: string | null;
             /** Generation Profile */
@@ -25933,6 +25981,44 @@ export interface components {
         OpenAIConfirmationRevokeRequest: {
             /** Expected Record Id */
             expected_record_id: string;
+        };
+        /** OpenRouterLocalQuota */
+        OpenRouterLocalQuota: {
+            /** Configured Limit */
+            configured_limit: number;
+            /** Effective Cap */
+            effective_cap: number;
+            /** Reserved */
+            reserved: number;
+            /** Safety Margin */
+            safety_margin: number;
+            /** Used */
+            used: number;
+        };
+        /** OpenRouterProviderObservation */
+        OpenRouterProviderObservation: {
+            /** Failure */
+            failure: string;
+            /** Limit */
+            limit: number | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Remaining */
+            remaining: number | null;
+            /** Source */
+            source: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "unverified" | "observed" | "stale" | "failed";
+            /** Used */
+            used: number | null;
+        };
+        /** OpenRouterQuotaResponse */
+        OpenRouterQuotaResponse: {
+            local: components["schemas"]["OpenRouterLocalQuota"] | null;
+            provider_observed: components["schemas"]["OpenRouterProviderObservation"];
         };
         /**
          * OperationsCanonicalSourceRef
@@ -42047,6 +42133,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_openrouter_quota_api_free_team_openrouter_quota_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OpenRouterQuotaResponse"];
+                };
+            };
+        };
+    };
+    refresh_openrouter_quota_api_free_team_openrouter_quota_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OpenRouterQuotaResponse"];
                 };
             };
         };

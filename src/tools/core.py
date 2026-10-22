@@ -61,6 +61,72 @@ class ToolParam:
     schema: Optional[Dict[str, Any]] = None
 
 
+def argument_target_digest(arguments: Any) -> str:
+    """Digest (never the value) of the file/path target a call names.
+
+    Rejected arguments are redacted, so this is the only safe key that lets a
+    corrected retry of the same target be matched to the rejection.
+    """
+
+    if not isinstance(arguments, Mapping):
+        return ""
+    for key in ("path", "file_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            import hashlib
+            import re
+
+            text = value.strip().strip("`'\"").replace("\\", "/")
+            while text.startswith("./"):
+                text = text[2:]
+            text = re.sub(r"/{2,}", "/", text).rstrip("/").casefold()
+            return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return ""
+
+
+_SCOPE_FIELDS = (
+    ("start_line", "start_digest", None),
+    ("end_line", "end_digest", None),
+    ("offset", "offset_digest", 0),
+    ("max_chars", "max_chars_digest", 5000),
+)
+
+
+def argument_correlation(arguments: Any, tool_name: str = "") -> Dict[str, str]:
+    """Digests (never values) of the fields identifying what a read call asks for.
+
+    Only well-typed fields are included, so a retry may correct a field that
+    was the reason for the rejection without losing the correlation. For
+    ``read_file`` each scope field (independent optional endpoints plus the
+    character window) is recorded with its default when omitted, so
+    "omitted" and an explicit different value stay distinguishable.
+    """
+
+    import hashlib
+
+    def digest(value: Any) -> str:
+        return "sha256:" + hashlib.sha256(repr(value).encode("utf-8")).hexdigest()
+
+    result: Dict[str, str] = {}
+    target = argument_target_digest(arguments)
+    if target:
+        result["target_digest"] = target
+    if not isinstance(arguments, Mapping):
+        return result
+    query = arguments.get("query")
+    if isinstance(query, str) and query.strip():
+        result["query_digest"] = "sha256:" + hashlib.sha256(query.encode("utf-8")).hexdigest()
+    for field, key, default in _SCOPE_FIELDS:
+        value = arguments.get(field)
+        if value is None:
+            if tool_name == "read_file":
+                result[key] = digest(default)
+        elif type(value) is int:
+            # -1 and omission both mean "to end of file".
+            result[key] = digest(None if field == "end_line" and value == -1 else value)
+    return result
+
+
 class ToolArgumentValidationError(ValueError):
     """Safe deterministic failure raised before a tool callable is invoked."""
 

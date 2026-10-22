@@ -153,6 +153,24 @@ export const conversationAgentApi = {
       }),
     }),
 
+  /** Role runtime defaults only; never used to mutate the Agent revision. */
+  getAgent: (agentId: string, signal?: AbortSignal) =>
+    request<{ success?: boolean; agent?: ConversationAgent | null }>(
+      `/agents/${encoded(agentId)}`,
+      { signal },
+    ),
+
+  getAgentRevision: (revisionId: string, signal?: AbortSignal) =>
+    request<{
+      success?: boolean;
+      revision?: {
+        id?: string;
+        agent_id?: string;
+        agent_team_id?: string | null;
+        execution_profile_id?: string | null;
+      } | null;
+    }>(`/agent-revisions/${encoded(revisionId)}`, { signal }),
+
   listAgentConversations: (agentId: string, signal?: AbortSignal) =>
     request<{
       success?: boolean;

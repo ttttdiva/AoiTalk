@@ -116,20 +116,34 @@ class InterruptibleStream:
 
     _END = object()
 
-    def __init__(self, client: Any, payload: dict[str, Any], budget: GenerationBudget, on_send: Any = None) -> None:
+    def __init__(
+        self, client: Any, payload: dict[str, Any], budget: GenerationBudget, on_send: Any = None,
+        lease: Any = None,
+    ) -> None:
         self._budget = budget
         self._closed = False
+        # Provider slot: released only once cleanup is verified (or the reaper finishes).
+        self._lease = lease
         self._transport: Any = None
         self._stream: Any = None
         self.cleanup_problems: list[str] = []
         self._closed_resources: set[str] = set()
         self._reaper_started = False
-        budget.checkpoint()
-        _announce_send(on_send)
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, name="interruptible-stream", daemon=True)
-        self._thread.start()
+        try:
+            budget.checkpoint()
+            _announce_send(on_send)
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(target=self._run_loop, name="interruptible-stream", daemon=True)
+            self._thread.start()
+        except BaseException:
+            self._release_lease()
+            raise
         self._await(lambda: self._open(client, payload))
+
+    def _release_lease(self) -> None:
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            lease.release()
 
     def _run_loop(self) -> None:
         try:
@@ -190,6 +204,7 @@ class InterruptibleStream:
 
         if self._closed or not self._thread.is_alive():
             self._closed = True
+            self._release_lease()
             return list(self.cleanup_problems)
         if self._reaper_started:
             # The reaper owns cleanup: cancelling it would leave nobody to stop the loop.
@@ -197,6 +212,7 @@ class InterruptibleStream:
             if self._thread.is_alive():
                 return ["cleanup still pending (owned by the stream reaper)"]
             self._closed = True
+            self._release_lease()
             return list(self.cleanup_problems)
         problems: list[str] = []
         busy: list[bool] = []  # the loop still owns unfinished work: keep it for a retry
@@ -246,6 +262,7 @@ class InterruptibleStream:
                 problems.append("stream loop thread still alive")
             else:
                 self._closed = True
+                self._release_lease()
         else:
             self._start_reaper()
         self.cleanup_problems = problems
@@ -279,6 +296,7 @@ class InterruptibleStream:
                     failures.append(f"closure failed (terminal, not retried): {name}: {type(exc).__name__}")
             self.cleanup_problems = failures
             self._closed = True
+            self._release_lease()
             self._loop.stop()
 
         try:
@@ -294,7 +312,8 @@ class InterruptibleStream:
 
 def execute_interruptible_stream(
     client: Any, payload: dict[str, Any], budget: GenerationBudget, on_send: Any = None,
+    lease: Any = None,
 ) -> InterruptibleStream:
     """Open a streaming completion that the task budget can interrupt."""
 
-    return InterruptibleStream(client, payload, budget, on_send)
+    return InterruptibleStream(client, payload, budget, on_send, lease)

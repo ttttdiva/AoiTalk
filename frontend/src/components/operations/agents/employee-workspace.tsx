@@ -5,8 +5,7 @@ import { ArrowLeft } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import useSWR, { useSWRConfig } from "swr";
 import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
-import { mediaOperationsApi } from "@/lib/media-operations-api";
-import { employeeApi, employeeKey, employeePath, employeeRequest, EmployeeApiError, type Employee, type EmployeeCatalog } from "@/lib/agent-employees-api";
+import { employeeApi, employeeKey, employeePath, employeeRequest, EmployeeApiError, type ConversationCharacter, type Employee, type EmployeeCatalog } from "@/lib/agent-employees-api";
 import { OperationsCommandCenter } from "../operations-command-center";
 import { Button } from "@/components/ui/button";
 import { HelpPopover } from "@/components/ui/help-popover";
@@ -93,8 +92,8 @@ function EmployeeCreate({ onCreated, onClose }: { onCreated: (id: string) => Pro
   const [character, setCharacter] = useState(""); const [employment, setEmployment] = useState("active");
   const [key, setKey] = useState(employeeKey); const [draft, setDraft] = useState<Employee | null>(null);
   const [createIntent, setCreateIntent] = useState<Parameters<typeof employeeApi.create>[0] | null>(null);
-  const characters = useSWR("employee-characters", () => mediaOperationsApi.listCharacters(), { shouldRetryOnError: false });
-  return <section className="space-y-3 rounded-lg border p-4"><h2 className="inline-flex items-center gap-1 font-semibold">Agentを追加 — 1. 基本情報<HelpPopover label="Agentを追加"><p>下書き → 職務 → 所属 → 自動化（任意） → 確認・有効化。途中で閉じても保存済みの下書きは一覧から再開できます。</p><p>候補は発信・制作のPersonaです。会話用Characterとは別のデータです。会話用Characterの設定ではありません。</p><p>雇用状態は組織上の在籍・契約状態です。Agentの実行状態（下書き・有効・一時停止・退職）とは別に保存されます。</p></HelpPopover></h2>
+  const characters = useSWR("employee-characters", employeeApi.characters, { shouldRetryOnError: false });
+  return <section className="space-y-3 rounded-lg border p-4"><h2 className="inline-flex items-center gap-1 font-semibold">Agentを追加 — 1. 基本情報<HelpPopover label="Agentを追加"><p>下書き → 職務 → 所属 → 自動化（任意） → 確認・有効化。途中で閉じても保存済みの下書きは一覧から再開できます。</p><p>候補は会話用Characterです。Characterは会話の人格・表示を決めるだけで、Agentの職務・権限・実行Profileは変わりません。発信・制作のPersonaとは別のデータです。</p><p>雇用状態は組織上の在籍・契約状態です。Agentの実行状態（下書き・有効・一時停止・退職）とは別に保存されます。</p></HelpPopover></h2>
     <EmployeeForm label="下書きを保存して職務設定へ" onSave={async () => {
       const body = createIntent ?? { display_name: name.trim(), ...(slug.trim() ? { slug: slug.trim() } : {}), ...(character ? { character_id: character } : {}), idempotency_key: key };
       let agent = draft;
@@ -109,7 +108,7 @@ function EmployeeCreate({ onCreated, onClose }: { onCreated: (id: string) => Pro
         <EmployeeField label="slug（任意）"><input className={employeeInputClass} maxLength={100} value={slug} disabled={!!draft || !!createIntent} onChange={e => setSlug(e.target.value)} /></EmployeeField>
         <EmployeeField label="役職"><input className={employeeInputClass} maxLength={160} value={job} onChange={e => setJob(e.target.value)} /></EmployeeField>
         <EmployeeField label="責務の概要"><textarea className={employeeInputClass} maxLength={10000} value={summary} onChange={e => setSummary(e.target.value)} /></EmployeeField>
-        <EmployeeSelect label="Persona（発信人格・任意）" value={character} disabled={!!draft || !!createIntent} onChange={setCharacter} options={(characters.data ?? []).map(c => ({ value: c.id, label: c.current_revision?.display_name ?? c.id }))} />
+        <EmployeeSelect label="Character（会話人格・任意）" value={character} disabled={!!draft || !!createIntent} onChange={setCharacter} options={(characters.data ?? []).filter(c => c.is_enabled).map(c => ({ value: c.id, label: c.name }))} />
         <EmployeeSelect label="雇用状態" value={employment} required onChange={setEmployment} options={[{ value: "active", label: "在籍" }, { value: "contractor", label: "業務委託" }, { value: "on_leave", label: "休職" }, { value: "suspended", label: "停止" }]} /></div>
     </EmployeeForm><EmployeeNotice error={characters.error} reload={() => void characters.mutate()} />
     {draft && <p className="text-sm">下書き {draft.display_name} は保存済みです。後続の保存に失敗した場合も同じAgentの設定を再開できます。</p>}
@@ -117,11 +116,19 @@ function EmployeeCreate({ onCreated, onClose }: { onCreated: (id: string) => Pro
     <Button type="button" variant="ghost" onClick={onClose}>閉じる</Button>
   </section>;
 }
+/** 保存済みの character_id は会話Character一覧に対して解決する。一覧に無い値は書き換えず未解決と表示する。 */
+function characterLabel(id: string | null | undefined, list: ConversationCharacter[] | undefined, failed: boolean) {
+  if (!id) return "未選択";
+  const found = list?.find(c => c.id === id);
+  if (found) return found.is_enabled ? found.name : `${found.name}（無効）`;
+  return list ? "未解決（保存済みのIDに対応する会話Characterが見つかりません）" : failed ? "確認できません" : "確認中…";
+}
 function EmployeeDetail({ id, panel, catalog, canManage, projection, navigate, onChanged, onThumbnailChanged }: { id: string; panel: EmployeePanel; catalog?: EmployeeCatalog; canManage: boolean; projection?: EmployeeProjection; navigate: (panel: EmployeePanel) => void; onChanged: () => Promise<unknown>; onThumbnailChanged: (id: string, artifactId: string | null) => Promise<void> }) {
   const agent = useSWR(["employee", id], () => employeeApi.get(id), { shouldRetryOnError: false });
   const revisions = useSWR(["employee-revisions", id], () => employeeApi.revisions(id), { shouldRetryOnError: false });
   const [error, setError] = useState<unknown>(null); const [busy, setBusy] = useState(false);
   const current = [...(revisions.data?.revisions ?? [])].sort((a, b) => b.version - a.version)[0];
+  const characters = useSWR(panel === "overview" ? "employee-characters" : null, employeeApi.characters, { shouldRetryOnError: false });
   const authority = useSWR(canManage && panel === "overview" ? ["employee-authority", id, current?.id] : null, () => employeeRequest<{ authority: { allowed?: boolean; reason?: string; reason_code?: string; effective_capabilities?: string[]; reasons?: string[] } }>(`${employeePath(id)}/effective-authority${current ? `?revision_id=${encodeURIComponent(current.id)}` : ""}`), { shouldRetryOnError: false });
   const reload = async () => { await Promise.all([agent.mutate(), revisions.mutate(), authority.mutate(), onChanged()]); };
   async function transition(state: Employee["state"]) { if (!agent.data) return; setError(null); setBusy(true); try { await employeeApi.state(id, state, agent.data.agent.state); await reload(); } catch (e) { setError(e); } finally { setBusy(false); } }
@@ -136,6 +143,7 @@ function EmployeeDetail({ id, panel, catalog, canManage, projection, navigate, o
     <EmployeeNotice error={agent.error || revisions.error || error} reload={() => void reload()} />
     {panel === "overview" && <>
       {current && <p className="max-w-3xl whitespace-pre-wrap text-sm leading-relaxed">{current.responsibility_summary || current.mission}</p>}
+      <p className="text-sm text-muted-foreground" data-testid="employee-character">Character（会話人格）: {characterLabel(agent.data.agent.character_id, characters.data, !!characters.error)}</p>
       {!current && <p role="status" className="text-sm text-amber-700 dark:text-amber-300">有効化するには「職務・モデル」を設定してください。</p>}
       <EmployeeNotice error={authority.error} reload={() => void authority.mutate()} />
       {canManage && mutable && <div className="flex flex-wrap gap-2">{agent.data.agent.state === "active" ? <Button type="button" size="sm" variant="secondary" disabled={busy} onClick={() => void transition("paused")}>Agentを一時停止</Button> : <Button type="button" size="sm" disabled={busy || !current} onClick={() => void transition("active")}>Agentを有効化</Button>}<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => { if (window.confirm("このAgentを退職にします。この操作は取り消せず、再有効化できません。履歴は保持されます。続行しますか？")) void transition("retired"); }}>退職</Button></div>}

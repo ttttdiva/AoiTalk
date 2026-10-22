@@ -450,6 +450,7 @@ export function useWebSocket(
       toolsRequired?: boolean,
       appContext?: { appId: string; targetId: string } | null,
       signal?: AbortSignal,
+      executionProfileId?: string | null,
     ) => {
       const ws = wsRef.current;
       if (signal?.aborted || ws?.readyState !== WebSocket.OPEN) return Promise.resolve(false);
@@ -492,6 +493,7 @@ export function useWebSocket(
         const payloadSessionId = targetSessionId ?? sessionIdRef.current;
         if (payloadSessionId) data.session_id = payloadSessionId;
         if (expectedAgentId) data.expected_agent_id = expectedAgentId;
+        if (executionProfileId?.trim()) data.execution_profile_id = executionProfileId.trim();
 
         if (files && files.length > 0) {
           const prepared = await prepareChatAttachmentPayload(

@@ -21,7 +21,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from ..tools.core import ToolArgumentValidationError, ToolPolicyDeniedError
+from ..tools.core import (
+    ToolArgumentValidationError,
+    ToolPolicyDeniedError,
+    argument_correlation,
+)
 from ..tools.registry import ToolRegistry
 from ..services.agent_team_service import (
     ToolFailureCircuitBreaker,
@@ -858,6 +862,9 @@ class UnifiedToolResult:
     # Digest (never the value) of the restored raw intent, so durable receipts
     # recorded from the observable projection stay comparable by identity.
     intent_digest: str = ""
+    # Safe, framework-authored provenance of a server-contract argument
+    # rejection (code and target digest only; never argument values).
+    argument_rejection: Mapping[str, str] | None = None
 
     @property
     def model_output(self) -> str:
@@ -1935,6 +1942,10 @@ class RegistryToolRouter:
             error=payload["error"],
             elapsed_ms=elapsed_ms,
             executed=False,
+            argument_rejection={
+                "code": exc.code,
+                **argument_correlation(call.arguments, call.tool),
+            },
         )
         if self.no_progress_guard is not None:
             terminal_failure = self.no_progress_guard.observe_failure(

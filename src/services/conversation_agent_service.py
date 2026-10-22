@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping, Optional
 from uuid import UUID
@@ -34,8 +34,13 @@ from ..memory.models import (
 )
 from ..memory.project_repository import ProjectRepository
 from ..services.agent_model_routing import (
+    AgentExecutionSelection,
+    AgentModelRouteError,
     AgentRoutingPins,
     build_agent_routing_snapshot,
+    pins_with_verified_selection,
+    resolve_agent_execution_selection,
+    verify_execution_selection,
 )
 
 
@@ -242,6 +247,9 @@ class AgentExecutionBindingSnapshot:
                     "Conversation Agent binding integrity check failed",
                     code="agent_binding_hash_mismatch",
                 )
+        # Reject a stored ExecutionProfile selection that does not match the
+        # role identity or its own routes even when the row hash is intact.
+        snapshot.execution_selection
         return snapshot
 
     @classmethod
@@ -256,8 +264,24 @@ class AgentExecutionBindingSnapshot:
         binding_id: UUID | str | None = None,
         created_at: datetime | None = None,
         main_route_override: Mapping[str, Any] | None = None,
+        execution_profile_id: Any = None,
     ) -> "AgentExecutionBindingSnapshot":
+        """Snapshot one exact revision, optionally with an explicit runtime.
+
+        ``execution_profile_id`` is a separate invocation input; ``None``
+        keeps the revision default and the historical snapshot shape.  The
+        role identity fields (including ``execution_profile_id`` of the
+        snapshot, the revision default) never change.
+        """
+
         pins = AgentRoutingPins.from_revision(revision)
+        try:
+            selection = resolve_agent_execution_selection(config, pins, execution_profile_id)
+        except AgentModelRouteError as exc:
+            raise ConversationAgentValidationError(
+                "ExecutionProfile selection is not allowed", code=exc.code
+            ) from exc
+        pins = pins.with_execution_selection(selection)
         route_snapshot = build_agent_routing_snapshot(
             config,
             pins,
@@ -301,8 +325,27 @@ class AgentExecutionBindingSnapshot:
             "content_hash": self.revision_content_hash,
         }
 
+    @property
+    def execution_selection(self) -> AgentExecutionSelection:
+        """Verified default/selected ExecutionProfile of this snapshot."""
+
+        snapshot = _thaw_json(self.route_snapshot)
+        try:
+            return verify_execution_selection(
+                default_execution_profile_id=self.execution_profile_id,
+                agent_team_id=self.agent_team_id,
+                roles=snapshot.get("roles", snapshot),
+                selection=snapshot.get("execution_selection"),
+                snapshot_execution_profile_id=snapshot.get("execution_profile_id"),
+            )
+        except AgentModelRouteError as exc:
+            raise ConversationAgentConflictError(
+                "Conversation Agent execution selection is inconsistent",
+                code="agent_binding_selection_invalid",
+            ) from exc
+
     def routing_pins(self) -> AgentRoutingPins:
-        return AgentRoutingPins(
+        base = AgentRoutingPins(
             agent_id=self.agent_id,
             agent_revision_id=self.agent_revision_id,
             agent_team_id=self.agent_team_id,
@@ -313,6 +356,18 @@ class AgentExecutionBindingSnapshot:
             # snapshot itself remains immutable.
             route_snapshot=_thaw_json(self.route_snapshot),
         )
+        if not self.execution_selection.is_explicit:
+            return base
+        snapshot = _thaw_json(self.route_snapshot)
+        selected = pins_with_verified_selection(
+            replace(base, route_snapshot=None),
+            roles=snapshot.get("roles", {}),
+            selection=snapshot.get("execution_selection"),
+            snapshot_execution_profile_id=snapshot.get("execution_profile_id"),
+        )
+        # Keep the full binding snapshot (roles + selection block) for
+        # manifest serializers; routing reads its ``roles``.
+        return replace(selected, route_snapshot=snapshot)
 
     def to_dict(self, *, include_prose: bool = False) -> dict[str, Any]:
         payload = {
@@ -565,6 +620,7 @@ class ConversationAgentService:
         revision: AgentRevision,
         actor_id: UUID | None,
         config: Any | None = None,
+        execution_profile_id: Any = None,
     ) -> AgentExecutionBindingSnapshot:
         # A conversation's explicit Main route (its model picker) is the
         # Main that an Agent profile inheriting Main resolves to.  Read the
@@ -584,6 +640,7 @@ class ConversationAgentService:
             main_route_override=session_main_route_override_for_binding(
                 read_session_llm_settings(row.context)
             ),
+            execution_profile_id=execution_profile_id,
         )
         # ``content_hash`` is a revision identity, while the binding hash is
         # derived from the complete trusted snapshot.  Keep the latter in the
@@ -626,8 +683,14 @@ class ConversationAgentService:
         actor_user_id: Any,
         actor_role: Any = None,
         expected_agent_id: Any | None = None,
+        execution_profile_id: Any = None,
     ) -> ConversationAgentBindingResult:
-        """CAS-bind or unbind the canonical Agent for one conversation."""
+        """CAS-bind or unbind the canonical Agent for one conversation.
+
+        ``execution_profile_id`` (``None`` = revision default) selects the
+        runtime of a newly persisted snapshot; an explicit selection never
+        reuses a revision-default binding.
+        """
 
         sid = _uuid(session_id, "session_id")
         target = _uuid(agent_id, "agent_id", required=False)
@@ -743,6 +806,8 @@ class ConversationAgentService:
                     agent_id=agent.id,
                     agent_revision_id=revision.id,
                 )
+                if execution_profile_id is not None:
+                    existing_binding = None
                 binding = (
                     AgentExecutionBindingSnapshot.from_row(existing_binding)
                     if existing_binding is not None
@@ -752,6 +817,7 @@ class ConversationAgentService:
                         agent=agent,
                         revision=revision,
                         actor_id=actor,
+                        execution_profile_id=execution_profile_id,
                     )
                 )
                 root_same_binding_noop = (
@@ -960,8 +1026,14 @@ class ConversationAgentService:
         actor_role: Any = None,
         config: Any | None = None,
         allow_legacy: bool = False,
+        execution_profile_id: Any = None,
     ) -> AgentExecutionBindingSnapshot:
         """Create one immutable turn snapshot inside the caller's transaction.
+
+        ``execution_profile_id`` optionally selects this turn's runtime
+        independently of the Agent role; ``None`` keeps the revision default.
+        The current human/Project/grant ACL is re-validated either way: a
+        stored snapshot never grants authority.
 
         The caller must commit this transaction together with the AgentRun.
         Every invocation creates a fresh binding row, even for the same
@@ -1057,6 +1129,7 @@ class ConversationAgentService:
             revision=revision,
             actor_id=actor,
             config=config,
+            execution_profile_id=execution_profile_id,
         )
 
     async def list_available_agents(
@@ -1235,6 +1308,7 @@ async def pin_conversation_agent_turn(
     actor_role: Any = None,
     config: Any | None = None,
     allow_legacy: bool = False,
+    execution_profile_id: Any = None,
 ) -> AgentExecutionBindingSnapshot:
     """Typed module API for Run creation's transaction-local turn pin."""
 
@@ -1247,6 +1321,7 @@ async def pin_conversation_agent_turn(
         actor_role=actor_role,
         config=config,
         allow_legacy=allow_legacy,
+        execution_profile_id=execution_profile_id,
     )
 
 

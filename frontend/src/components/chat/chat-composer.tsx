@@ -157,6 +157,14 @@ import {
 } from "@/components/chat/chat-model-settings-fields";
 import { characterOptionLabel } from "@/lib/character-options";
 import {
+  agentRuntimeScope,
+  normalizeRuntimeProfileId,
+  runtimeProfileOptionsForTeam,
+  selectedRuntimeProfileId,
+  type AgentRuntimeSelection,
+} from "@/lib/agent-runtime-selection";
+import { useAgentRoleRuntime } from "@/hooks/use-agent-role-runtime";
+import {
   useOptionalRuntimeContext,
   type RuntimeContextValue,
   type RuntimeLlmEngine,
@@ -232,6 +240,8 @@ export type ChatComposerSendOptions = {
   clientMessageId?: string;
   /** Replay the route selected when an uncertain draft was first submitted. */
   dispatchMode?: ChatComposerDispatchMode;
+  /** Runtime for the bound Agent; null/omitted keeps the role revision default. */
+  executionProfileId?: string | null;
 };
 
 const intentAttachmentIds = new WeakMap<File, number>();
@@ -369,6 +379,9 @@ type QueuedChatMessage = {
   mentions: MentionItem[];
   capabilities: ChatCommandCapability[];
   toolsRequired?: boolean;
+  // Runtime captured when the request was queued (null = role default);
+  // undefined for a Chat without an Agent, which sends no runtime at all.
+  executionProfileId?: string | null;
   appContext: ChatAppContextSelection | null;
   draftSnapshot: ChatComposerDraft;
   // enqueue 中も下書きを localStorage に保持するための専用スコープ。
@@ -637,6 +650,8 @@ function ContextWindowDetails({
   );
 }
 
+const ROLE_DEFAULT_RUNTIME_VALUE = "__role_default__";
+
 type ChatSettingsItem =
   | "provider"
   | "model"
@@ -674,6 +689,8 @@ function ModelControl({
   onComposerFocusRequest,
   onLlmModeRefresh,
   agentId,
+  runtimeProfileId = null,
+  onRuntimeProfileChange,
 }: {
   runtime: RuntimeContextValue;
   userSettings: UserSettings | null | undefined;
@@ -692,6 +709,8 @@ function ModelControl({
   onComposerFocusRequest?: () => void;
   onLlmModeRefresh?: () => Promise<void>;
   agentId?: string | null;
+  runtimeProfileId?: string | null;
+  onRuntimeProfileChange?: (profileId: string | null) => void;
 }) {
   const normalizedAgentId = agentId?.trim() || null;
   const agentBound = Boolean(normalizedAgentId);
@@ -720,6 +739,22 @@ function ModelControl({
     ...routeFields
   } = routeState;
   const [modeRefreshing] = useState(false);
+  const { runtime: roleRuntime, error: roleRuntimeError } = useAgentRoleRuntime(
+    agentBound && open ? normalizedAgentId : null,
+  );
+  const runtimeProfileOptions = useMemo(
+    () => runtimeProfileOptionsForTeam(roleRuntime?.teamId, routeFields.agentTeamOptions),
+    [roleRuntime?.teamId, routeFields.agentTeamOptions],
+  );
+  const roleDefaultProfile = roleRuntime?.defaultProfileId ?? null;
+  const roleDefaultLabel = !roleRuntime
+    ? "取得中"
+    : roleDefaultProfile
+    ? (routeFields.agentTeamOptions
+        .find((team) => team.team_id === roleRuntime?.teamId)
+        ?.execution_profiles?.find((profile) => profile.profile_id === roleDefaultProfile)
+        ?.name || roleDefaultProfile)
+    : "なし";
 
   const available = filterAvailableProviders(
     runtime.llmEngines,
@@ -1626,8 +1661,48 @@ function ModelControl({
             >
               <p className="font-medium">このChatはAgentに紐づいています</p>
               <p className="text-muted-foreground">
-                職務・モデル・Execution Team・ProfileはAgent管理が正本です。変更は次の依頼から反映されます。
+                職務・モデル・Execution TeamはAgent管理が正本です。下の実行環境は、この会話の次の依頼だけに使うruntimeで、Agent自体は変更しません。
               </p>
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                <span>実行環境（Execution Profile）</span>
+                <AppSelect
+                  aria-label="実行環境 Execution Profile"
+                  data-testid="agent-runtime-profile-select"
+                  value={runtimeProfileId ?? ROLE_DEFAULT_RUNTIME_VALUE}
+                  onChange={(event) => {
+                    // A stray empty value must not reset the choice; only the
+                    // explicit role-default option may reset the choice.
+                    const next = event.target.value;
+                    if (next === ROLE_DEFAULT_RUNTIME_VALUE) onRuntimeProfileChange?.(null);
+                    else if (normalizeRuntimeProfileId(next)) {
+                      onRuntimeProfileChange?.(normalizeRuntimeProfileId(next));
+                    }
+                  }}
+                  disabled={
+                    routeSettingsLoading || (!roleRuntime && !runtimeProfileId)
+                  }
+                  className={cn(runtimeSelectClassName, "w-full")}
+                  container={selectPortalHostRef}
+                >
+                  <option value={ROLE_DEFAULT_RUNTIME_VALUE}>{`Agent既定（${roleDefaultLabel}）`}</option>
+                  {runtimeProfileId &&
+                  !runtimeProfileOptions.some((profile) => profile.profile_id === runtimeProfileId) ? (
+                    <option value={runtimeProfileId}>{runtimeProfileId}</option>
+                  ) : null}
+                  {runtimeProfileOptions.map((profile) => (
+                    <option key={profile.profile_id} value={profile.profile_id}>
+                      {profile.name || profile.profile_id}
+                    </option>
+                  ))}
+                </AppSelect>
+              </label>
+              {roleRuntimeError ? (
+                <p role="alert" className="text-[10px] text-destructive">
+                  {runtimeProfileId
+                    ? `実行環境の候補を取得できませんでした。選択中の「${runtimeProfileId}」で送信されます(サーバーが検証します)。`
+                    : "実行環境の候補を取得できませんでした。Agent既定で実行されます。"}
+                </p>
+              ) : null}
               {normalizedAgentId ? (
                 <Link
                   className="inline-block text-primary underline-offset-2 hover:underline"
@@ -2169,7 +2244,7 @@ function LlmModeIcon({
 }
 
 export function ChatComposer({
-  onSend,
+  onSend: onSendProp,
   onSteer,
   onStop,
   disabled,
@@ -2211,6 +2286,30 @@ export function ChatComposer({
   // AppLayout の getSession() で確定した ID を使い、認証状態の再取得待ちで
   // 新規チャット下書きが別スコープへ移る競合を避ける。
   const draftUserId = useCurrentUserId();
+  // Runtime (ExecutionProfile) chosen for an Agent-bound Chat. The selection is
+  // scoped to user/session/agent, so another Chat or account never inherits it.
+  const runtimeScope = agentRuntimeScope(draftUserId, sessionId, agentId?.trim() || null);
+  const [runtimeSelection, setRuntimeSelection] = useState<AgentRuntimeSelection | null>(null);
+  const runtimeProfileId = agentId?.trim()
+    ? selectedRuntimeProfileId(runtimeSelection, runtimeScope)
+    : null;
+  const handleRuntimeProfileChange = (profileId: string | null) => {
+    setRuntimeSelection(profileId ? { scope: runtimeScope, profileId } : null);
+  };
+  // Every submit path funnels through here so the choice is captured once, at
+  // first submit; later retries replay the outbox value instead.
+  const onSend = useCallback<ChatComposerProps["onSend"]>(
+    (...args) => {
+      const profileId = runtimeProfileId;
+      if (!profileId || (args[7] && "executionProfileId" in args[7])) {
+        return onSendProp(...args);
+      }
+      const sendArgs = [...args] as Parameters<ChatComposerProps["onSend"]>;
+      sendArgs[7] = { ...args[7], executionProfileId: profileId };
+      return onSendProp(...sendArgs);
+    },
+    [onSendProp, runtimeProfileId],
+  );
   const composerDraftKey =
     draftKey ?? sessionId ?? NEW_CHAT_COMPOSER_DRAFT_KEY;
   const composerDraft = useSyncExternalStore(
@@ -2235,7 +2334,7 @@ export function ChatComposer({
           ...current,
           content,
           ...(content !== current.content
-            ? { clientMessageId: undefined, dispatchMode: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
             : {}),
         };
       }),
@@ -2260,7 +2359,7 @@ export function ChatComposer({
           ...current,
           mentions,
           ...(changed
-            ? { clientMessageId: undefined, dispatchMode: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
             : {}),
         };
       }),
@@ -2278,7 +2377,7 @@ export function ChatComposer({
           ...current,
           activeCommand,
           ...(changed
-            ? { clientMessageId: undefined, dispatchMode: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
             : {}),
         };
       }),
@@ -2293,7 +2392,7 @@ export function ChatComposer({
           ...current,
           toolFreeMode,
           ...(toolFreeMode !== current.toolFreeMode
-            ? { clientMessageId: undefined, dispatchMode: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
             : {}),
         };
       }),
@@ -2311,7 +2410,7 @@ export function ChatComposer({
           ...current,
           dispatchMode,
           ...(currentMode !== dispatchMode
-            ? { clientMessageId: undefined }
+            ? { clientMessageId: undefined, executionProfileId: undefined }
             : {}),
         };
       });
@@ -2415,6 +2514,7 @@ export function ChatComposer({
                 ...current,
                 clientMessageId: undefined,
                 dispatchMode: undefined,
+                executionProfileId: undefined,
               }
             : current,
       );
@@ -2811,9 +2911,16 @@ export function ChatComposer({
       ] as const;
       let result: ReturnType<ChatComposerProps["onSend"]>;
       try {
-        result = next.appContext
-          ? onSend(...args, next.appContext)
-          : onSend(...args);
+        // The queued request replays its own captured runtime (explicit null
+        // included); the composer's current selection must not leak in.
+        result =
+          next.executionProfileId !== undefined
+            ? onSend(...args, next.appContext ?? undefined, {
+                executionProfileId: next.executionProfileId,
+              })
+            : next.appContext
+              ? onSend(...args, next.appContext)
+              : onSend(...args);
       } catch {
         result = false;
       }
@@ -3056,6 +3163,9 @@ export function ChatComposer({
       if (submittedDraft?.clientMessageId) {
         sendOptions.clientMessageId = submittedDraft.clientMessageId;
       }
+      if (submittedDraft?.executionProfileId !== undefined) {
+        sendOptions.executionProfileId = submittedDraft.executionProfileId;
+      }
       if (
         submittedDraft?.dispatchMode ||
         preparedDispatch.dispatchMode === "deep_research"
@@ -3233,6 +3343,8 @@ export function ChatComposer({
       mentions: [...mentions],
       activeCommand,
       toolFreeMode,
+      // A restored failed queue item keeps the runtime it was submitted with.
+      ...(agentId?.trim() ? { executionProfileId: runtimeProfileId } : {}),
     };
     const draftStorageKey = `${composerDraftKey}::queued:${id}`;
     // 通常の composer draft を空にしても、送信完了までは専用スコープへ
@@ -3252,6 +3364,7 @@ export function ChatComposer({
           submission.capabilities,
           toolFreeMode,
         ),
+        executionProfileId: agentId?.trim() ? runtimeProfileId : undefined,
         appContext,
         draftSnapshot,
         draftStorageKey,
@@ -3283,6 +3396,8 @@ export function ChatComposer({
     mentions,
     onAttachedFilesChange,
     sessionId,
+    agentId,
+    runtimeProfileId,
     toolFreeMode,
     setActiveCommand,
     setMentions,
@@ -3313,6 +3428,7 @@ export function ChatComposer({
       toolFreeMode,
       clientMessageId: composerDraft.clientMessageId,
       dispatchMode: composerDraft.dispatchMode,
+      executionProfileId: composerDraft.executionProfileId,
     };
     const preparedDispatch = prepareComposerDispatch(
       currentSubmittedDraft,
@@ -3329,6 +3445,9 @@ export function ChatComposer({
       const options: ChatComposerSendOptions = {
         ...(submittedDraft.clientMessageId
           ? { clientMessageId: submittedDraft.clientMessageId }
+          : {}),
+        ...(submittedDraft.executionProfileId !== undefined
+          ? { executionProfileId: submittedDraft.executionProfileId }
           : {}),
         ...(submittedDraft.dispatchMode
           ? { dispatchMode: submittedDraft.dispatchMode }
@@ -3429,7 +3548,7 @@ export function ChatComposer({
       }
     } finally { intentSubmissionRef.current = false; }
   }, [activeCommand, appContext, attachedFiles, clearComposerAfterSendStart,
-    composerDraft.clientMessageId, composerDraft.dispatchMode, disabled, enqueue,
+    composerDraft.clientMessageId, composerDraft.dispatchMode, composerDraft.executionProfileId, disabled, enqueue,
     generationProfile, isSteeringMode, mentions, onAttachedFilesChange, onSend,
     onAttachmentsPromoted, prepareComposerDispatch, projectId, projectScopeReady,
     composerDraftKey, draftUserId, sessionId, toolFreeMode, value]);
@@ -3519,6 +3638,7 @@ export function ChatComposer({
         toolFreeMode,
         clientMessageId: composerDraft.clientMessageId,
         dispatchMode: composerDraft.dispatchMode,
+      executionProfileId: composerDraft.executionProfileId,
       };
       if (appContext) {
         invokeSend(submittedDraft, true, ...args, appContext);
@@ -3539,6 +3659,7 @@ export function ChatComposer({
       attachedFiles,
       composerDraft.clientMessageId,
       composerDraft.dispatchMode,
+      composerDraft.executionProfileId,
       mentions,
       generationProfile,
       activeCommand,
@@ -4568,6 +4689,8 @@ export function ChatComposer({
               onComposerFocusRequest={() => textareaRef.current?.focus()}
               onLlmModeRefresh={refreshLlmMode}
               agentId={agentId}
+              runtimeProfileId={runtimeProfileId}
+              onRuntimeProfileChange={handleRuntimeProfileChange}
             />
           )}
 

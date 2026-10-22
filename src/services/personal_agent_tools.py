@@ -133,14 +133,26 @@ class PersonalAgentTools:
         _check_local(binding)  # Re-check before any DB read or decryption.
         return agent_actor_from_turn_context()
 
+    def _pinned_guard(self, name, kind, actor):
+        """Guard pinned to the binding/turn/actor active at call start; run right after every await."""
+        started, turn = _binding.get(), get_turn_context()
+
+        def guard():
+            current = self._authorize(name, kind)
+            if _binding.get() is not started or get_turn_context() is not turn or current != actor:
+                raise LedgerPermissionError("turn binding changed during call")
+
+        return guard
+
     async def ledger_state(self, *, ledger, subject_key=None):
         actor = self._authorize("private.ledger.state", ledger)
         if subject_key is not None and (not isinstance(subject_key, str) or not _SLUG_RE.fullmatch(subject_key)):
             raise LedgerValidationError("invalid subject key")
         # SQL filters kind and subject before decrypting, and refuses truncation.
+        guard = self._pinned_guard("private.ledger.state", ledger, actor)
         entries = await self.ledger.list_entries(actor=actor, ledger=ledger, subject_key=subject_key,
-                                                limit=MAX_STATE_ENTRIES)
-        self._authorize("private.ledger.state", ledger)  # Policy may change during the awaited DB read.
+                                                limit=MAX_STATE_ENTRIES, guard=guard)
+        guard()  # Policy/owner may change during the awaited DB read.
         state = derive_state(entries)
         result = {
             "deadlines": [{
@@ -161,7 +173,8 @@ class PersonalAgentTools:
     async def propose(self, *, evidence_ref, proposal, idempotency_key):
         kind = proposal.get("kind") if isinstance(proposal, dict) else None
         actor = self._authorize("private.draft.propose", kind)
+        guard = self._pinned_guard("private.draft.propose", kind, actor)
         result = await self.drafts.propose(actor=actor, evidence_ref=evidence_ref,
-            proposal=normalize_proposal(proposal), idempotency_key=idempotency_key)
-        self._authorize("private.draft.propose", kind)
+            proposal=normalize_proposal(proposal), idempotency_key=idempotency_key, guard=guard)
+        guard()
         return result

@@ -11,7 +11,7 @@ import {
   type SetStateAction,
 } from "react";
 import type { useRouter } from "next/navigation";
-import { chatApi } from "@/lib/chat-api";
+import { ChatApiError, chatApi } from "@/lib/chat-api";
 import type {
   ChatCommandCapability,
   ChatResponseModelSelection,
@@ -24,6 +24,7 @@ import {
   createLocalUserMessage,
 } from "@/lib/chat-local-messages";
 import { getMessageClientId } from "@/lib/chat-state";
+import { normalizeRuntimeProfileId } from "@/lib/agent-runtime-selection";
 import {
   createChatSendOutboxRecord,
   deleteChatSendOutboxRecord,
@@ -83,6 +84,17 @@ const DISPATCH_FAILURE_MESSAGE =
 const LLM_HANDOFF_FAILURE_MESSAGE =
   "選択した Provider / Model 設定を会話へ適用できなかったため、応答生成を開始しませんでした。Chat settings を確認してからもう一度送信してください。";
 
+/**
+ * Surface the server's sanitized 4xx envelope when an explicit runtime was
+ * rejected. The caller keeps the original outbox record: no other profile and
+ * no legacy fallback is ever dispatched on the user's behalf.
+ */
+function notifyRuntimeRejection(err: unknown, executionProfileId: string | null | undefined) {
+  if (!executionProfileId || !(err instanceof ChatApiError)) return;
+  if (err.status == null || err.status < 400 || err.status >= 500) return;
+  toast.error(err.message || "選択した実行環境で開始できませんでした");
+}
+
 type ChatTimelineAction = Parameters<typeof chatTimelineReducer>[1];
 
 type SendFlight = {
@@ -107,6 +119,8 @@ export type PendingMessage = {
   appContext?: ChatAppContextSelection | null;
   commandCapabilities?: ChatCommandCapability[];
   toolsRequired?: boolean;
+  /** Runtime chosen when this request was first submitted. */
+  executionProfileId?: string | null;
   /** WebSocket 再接続後の最終 dispatch 結果を composer へ通知する。 */
   settle?: (result: ChatComposerSendResult) => void;
   signal?: AbortSignal;
@@ -135,6 +149,7 @@ function createSendFingerprint(input: {
   appContext?: ChatAppContextSelection | null;
   effectiveProjectId?: string;
   includeProjectContext: boolean;
+  executionProfileId?: string | null;
 }): string {
   return JSON.stringify({
     content: input.content,
@@ -151,6 +166,7 @@ function createSendFingerprint(input: {
     appContext: input.appContext ?? null,
     effectiveProjectId: input.effectiveProjectId ?? null,
     includeProjectContext: input.includeProjectContext,
+    executionProfileId: input.executionProfileId ?? null,
   });
 }
 
@@ -436,6 +452,7 @@ export function useChatMessaging({
       includeProjectContext?: boolean,
       appContext?: ChatAppContextSelection | null,
       toolsRequired?: boolean,
+      executionProfileId?: string | null,
     ) => {
       const userId = draftUserIdRef.current;
       if (!userId) return;
@@ -452,6 +469,7 @@ export function useChatMessaging({
         includeProjectContext,
         appContext,
         toolsRequired,
+        executionProfileId,
       });
       outboxRecordsRef.current.set(clientMessageId, record);
       // Persist without delaying the optimistic append or route lookup.
@@ -704,6 +722,7 @@ export function useChatMessaging({
       appContext?: ChatAppContextSelection | null,
       mentions?: MentionItem[],
       includeProjectContextOverride?: boolean,
+      executionProfileId?: string | null,
     ) => {
       const helpSubmission = commandCapabilities?.includes("aoitalk_help") === true;
       const result = await chatApi.dispatchMessage(sessionId, {
@@ -725,6 +744,7 @@ export function useChatMessaging({
         skip_user_persistence: persistence?.skipUserPersistence,
         persisted_user_message_id: persistence?.persistedUserMessageId,
         mentions,
+        ...(executionProfileId?.trim() ? { execution_profile_id: executionProfileId.trim() } : {}),
         ...(currentSession?.agent_id || normalizedNewSessionAgentId
           ? { expected_agent_id: currentSession?.agent_id ?? normalizedNewSessionAgentId }
           : {}),
@@ -792,7 +812,7 @@ export function useChatMessaging({
           pending.sessionId, pending.clientMessageId, pending.commandCapabilities,
           pending.toolsRequired,
           pending.appContext ? { appId: pending.appContext.appId, targetId: pending.appContext.targetId } : null,
-          pending.signal,
+          pending.signal, pending.executionProfileId,
         );
         if (!accepted || pending.signal?.aborted || pendingMessageRef.current !== pending) return;
         pendingMessageRef.current = null;
@@ -898,6 +918,7 @@ export function useChatMessaging({
         appContext,
         effectiveProjectId,
         includeProjectContext,
+        executionProfileId: normalizeRuntimeProfileId(options?.executionProfileId),
       });
       const submittedPendingSnapshot = sendSessionId
         ? null
@@ -939,6 +960,11 @@ export function useChatMessaging({
       // its record, so a current composer mode/project cannot change the
       // meaning of a retry.
       const restoredOutboxRecord = outboxRecordsRef.current.get(clientMessageId);
+      // The runtime is frozen at the first submit: a retry replays the stored
+      // value and never reads the composer's current selection.
+      const executionProfileId = restoredOutboxRecord
+        ? normalizeRuntimeProfileId(restoredOutboxRecord.executionProfileId)
+        : normalizeRuntimeProfileId(options?.executionProfileId);
       if (restoredOutboxRecord) {
         content = restoredOutboxRecord.content;
         files = files?.length ? files : restoredOutboxRecord.files;
@@ -1061,6 +1087,7 @@ export function useChatMessaging({
         messageIncludeProjectContext,
         messageAppContext,
         toolsRequired,
+        executionProfileId,
       );
 
       // 送信処理が REST / WebSocket / 設定保存のいずれを選ぶ場合でも、
@@ -1337,6 +1364,8 @@ export function useChatMessaging({
                 messageAppContext
                   ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
                   : null,
+                undefined,
+                executionProfileId,
               );
               if (accepted) {
                 bumpSession(sessionId);
@@ -1363,6 +1392,7 @@ export function useChatMessaging({
               includeProjectContext: messageIncludeProjectContext,
               commandCapabilities,
               toolsRequired,
+              executionProfileId,
               appContext: messageAppContext,
             });
           } else {
@@ -1385,10 +1415,12 @@ export function useChatMessaging({
                 messageAppContext,
                 mentions,
                 messageIncludeProjectContext,
+                executionProfileId,
               );
               markWaitingResponse(sessionId, clientMessageId);
             } catch (err) {
               console.error("新規セッションのREST送信失敗:", err);
+              notifyRuntimeRejection(err, executionProfileId);
               // createSession already committed the user row. A later
               // generation-dispatch failure must not downgrade that row to an
               // uncertain/retryable send after its outbox key was deleted.
@@ -1503,6 +1535,7 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
+            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1520,6 +1553,7 @@ export function useChatMessaging({
               messageAppContext,
               mentions,
               messageIncludeProjectContext,
+              executionProfileId,
             );
             markWaitingResponse(sessionId, clientMessageId);
             void waitForPersistedAssistantResponse(
@@ -1529,6 +1563,7 @@ export function useChatMessaging({
             );
           } catch (err) {
             console.error("WebSocket未接続時のREST送信失敗:", err);
+            notifyRuntimeRejection(err, executionProfileId);
             settleOutbox(
               optimisticSessionId,
               clientMessageId,
@@ -1575,6 +1610,8 @@ export function useChatMessaging({
             messageAppContext
               ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
+            undefined,
+            executionProfileId,
           );
         } catch (err) {
           console.error("グループチャットのWebSocket送信失敗:", err);
@@ -1612,6 +1649,7 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
+            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1651,6 +1689,8 @@ export function useChatMessaging({
             messageAppContext
               ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
+            undefined,
+            executionProfileId,
           );
         } catch (err) {
           console.error("添付/メンションのWebSocket送信失敗:", err);
@@ -1686,6 +1726,7 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
+            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1714,6 +1755,7 @@ export function useChatMessaging({
             messageAppContext,
             mentions,
             messageIncludeProjectContext,
+            executionProfileId,
           );
           markWaitingResponse(sessionId, clientMessageId);
           void waitForPersistedAssistantResponse(
@@ -1724,6 +1766,7 @@ export function useChatMessaging({
           return "accepted" as ChatComposerSendResult;
         } catch (err) {
           console.error("メッセージ送信失敗:", err);
+          notifyRuntimeRejection(err, executionProfileId);
           settleOutbox(
             optimisticSessionId,
             clientMessageId,
@@ -1825,6 +1868,7 @@ export function useChatMessaging({
         {
           clientMessageId: record.clientMessageId,
           dispatchMode: "chat",
+          executionProfileId: record.executionProfileId ?? null,
         },
       );
       if (result === "failed") {

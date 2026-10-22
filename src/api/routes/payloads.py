@@ -76,6 +76,10 @@ class ConversationDispatchRequest(BaseModel):
     # consultation.  This is a request-boundary intent flag, never a model
     # tool argument or automatic-escalation signal.
     cloud_advisor_explicit: bool = False
+    # Optional runtime ExecutionProfile for this turn.  Omitted/null keeps the
+    # pinned AgentRevision default; an explicit id is validated by the server
+    # against the session Agent's Team and never changes the Agent role.
+    execution_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
     skip_user_persistence: bool = False
     persisted_user_message_id: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = Field(

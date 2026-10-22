@@ -8,10 +8,11 @@ import re
 from contextlib import suppress
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from ...memory.database import get_db_session
@@ -31,15 +32,40 @@ from ...services.free_team_service import (
     seed_free_team_defaults,
     complimentary_model_group,
     _reset_quota_if_needed,
+    _credential_api_key as credential_api_key,
     sync_provider_observation,
     FreeTeamUnavailableError,
 )
+from ...services import free_team_provider_observer as provider_observer
 from ...services.llm_model_catalog import default_fetch_json
 from ...llm.deployment_resolver import is_retired_model
 from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
     from ..server import WebChatServer
+
+
+class OpenRouterLocalQuota(BaseModel):
+    configured_limit: float
+    safety_margin: float
+    effective_cap: float
+    used: float
+    reserved: float
+
+
+class OpenRouterProviderObservation(BaseModel):
+    source: str
+    status: Literal["unverified", "observed", "stale", "failed"]
+    used: int | None
+    limit: int | None
+    remaining: int | None
+    observed_at: str | None
+    failure: str
+
+
+class OpenRouterQuotaResponse(BaseModel):
+    local: OpenRouterLocalQuota | None
+    provider_observed: OpenRouterProviderObservation
 
 
 def _save_config(server: "WebChatServer", key: str, value: Any) -> None:
@@ -669,6 +695,71 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
             return {"success": True, "count": len(items)}
         finally:
             await session.close()
+
+    observation_store = provider_observer.ObservationStore()
+
+    async def _openrouter_credential() -> tuple[str | None, str, str]:
+        """(現在のbinding, キー, 送信不可理由)。キーは明示refreshの送信にだけ使い、応答へ出さない。"""
+
+        session = await get_db_session()
+        try:
+            profile = await session.get(FreeTeamCredentialProfile, "openrouter-free")
+            api_key = credential_api_key(profile) if profile else ""
+            enabled = bool(profile and profile.enabled)
+            base_url = profile.base_url if profile else ""
+        finally:
+            await session.close()
+        reason = observation_store.unusable_reason(enabled, api_key, base_url)
+        binding = observation_store.binding("openrouter-free", enabled, api_key, base_url)
+        return binding, api_key, reason
+
+    async def _openrouter_local_quota() -> dict[str, Any] | None:
+        state = await get_free_team_state(include_reservations=False, config=server.config)
+        pool = next(
+            (item for item in state["quota_pools"] if item["id"] == "openrouter-free-rpd"), None
+        )
+        if not pool:
+            return None
+        limit = pool["limit"]
+        margin = max(pool["safety_margin_units"], limit * pool["safety_margin_ratio"])
+        return {
+            "configured_limit": limit,
+            "safety_margin": margin,
+            "effective_cap": pool.get("configured_daily_cap", max(0, limit - margin)),
+            "used": pool["consumed"],
+            "reserved": pool["reserved"],
+        }
+
+    async def _openrouter_quota_view(
+        refused_unusable: bool = False,
+    ) -> OpenRouterQuotaResponse:
+        """応答直前（最後のawaitの後）に現在のcredential bindingで観測を確定する。
+
+        refresh中にcredential・有効状態・endpointが変わっていた場合、古い取得結果は
+        破棄して現在bindingの状態（通常はunverified）を返す。Providerは再呼び出ししない。
+        """
+
+        local = await _openrouter_local_quota()
+        current, _key, reason = await _openrouter_credential()
+        # 以降にawaitを置かない。観測は常に現在bindingのstoreから同期的に選ぶ
+        # （同bindingでも、取得中に確定した新しいrefreshを古い結果で上書きしない）。
+        observation = observation_store.status(current)
+        if refused_unusable and current is None and reason:
+            # 送信不可のcredentialへ明示refreshした場合のみ。キャッシュはなく、理由だけ固定コードで返す。
+            observation = {**observation, "status": "failed", "failure": reason}
+        return OpenRouterQuotaResponse(local=local, provider_observed=observation)
+
+    @app.get("/api/free-team/openrouter/quota", response_model=OpenRouterQuotaResponse)
+    async def get_openrouter_quota(_: None = Depends(require_auth)):
+        return await _openrouter_quota_view()
+
+    @app.post("/api/free-team/openrouter/quota/refresh", response_model=OpenRouterQuotaResponse)
+    async def refresh_openrouter_quota(_: None = Depends(require_auth)):
+        binding, api_key, reason = await _openrouter_credential()
+        await asyncio.to_thread(
+            lambda: observation_store.refresh(binding, api_key, reason=reason)
+        )
+        return await _openrouter_quota_view(refused_unusable=binding is None)
 
     @app.post("/api/free-team/usage/sync")
     async def sync_usage(request: Request, _: None = Depends(require_auth)):

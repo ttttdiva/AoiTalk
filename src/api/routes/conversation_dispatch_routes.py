@@ -50,7 +50,12 @@ def _admission_http_exception(error: BaseException) -> HTTPException | None:
         code = text if len(text) <= 96 else ""
     if not code:
         return None
-    if any(
+    if "execution_profile" in code or code in {
+        "agent_route_selection_invalid",
+        "agent_binding_selection_invalid",
+    }:
+        status = 422
+    elif any(
         marker in code
         for marker in (
             "authorization",
@@ -982,6 +987,10 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             bool(payload.client_message_id)
             or callable(getattr(agent_run_service, "create_server_dispatch_turn", None))
         )
+        if payload.execution_profile_id is not None and not atomic_dispatch:
+            # Only the atomic Run admission pins a validated selection; a
+            # legacy path must never silently drop an explicit runtime.
+            raise HTTPException(status_code=422, detail="agent_execution_profile_unavailable")
         if atomic_dispatch:
             message_metadata["client_message_id"] = payload.client_message_id
         if payload.attachments:
@@ -1148,6 +1157,13 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "expected_agent_id": (
                         expected_agent_id if expected_agent_provided else "__omitted__"
                     ),
+                    # Only an explicit runtime selection joins the identity;
+                    # omitted/null keeps the historical fingerprint material.
+                    **(
+                        {"execution_profile_id": payload.execution_profile_id}
+                        if payload.execution_profile_id is not None
+                        else {}
+                    ),
                 }
             )
             try:
@@ -1177,6 +1193,8 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "expected_agent_id": expected_agent_id,
                     "expected_agent_provided": expected_agent_provided,
                 }
+                if payload.execution_profile_id is not None:
+                    dispatch_kwargs["execution_profile_id"] = payload.execution_profile_id
                 if payload.client_message_id:
                     dispatch_result = await agent_run_service.create_or_get_dispatch_turn(
                         client_message_id=payload.client_message_id,

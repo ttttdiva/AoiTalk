@@ -2295,6 +2295,20 @@
             ],
             "title": "Effort"
           },
+          "execution_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional runtime ExecutionProfile for this task. Omitted/null keeps the pinned AgentRevision default. An explicit id must be a formal system Profile or an enabled Profile of the Agent's own Team; it never changes the Agent role and never falls back. provider/model/effort remain assertions against the selected route.",
+            "title": "Execution Profile Id"
+          },
           "goal": {
             "maxLength": 8000,
             "minLength": 1,
@@ -2367,6 +2381,20 @@
             ],
             "description": "Require successful command evidence after the last mutation point: a file-tool edit, or any command whose bounded before/after workspace content observation did not prove the workspace unchanged (changed, unknown, partial/over-limit, background launch, or no evidence; success does not matter). The last unproven command cannot verify itself. Observation is whole-workspace and bounded (excludes .git; unobservable links/reparse points or limits fail closed), not a per-path change list. An explicit boolean overrides language inference; omitted/null infers from the goal and completion criteria.",
             "title": "Requires Command Verification"
+          },
+          "tool_generation_max_tokens": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omitted/null keeps the model's legacy output reserve. Explicit per-task opt-in: uncapped tool generation may use a bounded allowance up to this many tokens (never above 4096 or the remaining context window); explicit caller/runtime caps still win.",
+            "title": "Tool Generation Max Tokens"
           },
           "workspace": {
             "maxLength": 1024,
@@ -7827,6 +7855,19 @@
               }
             ],
             "title": "Effort"
+          },
+          "execution_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Id"
           },
           "idempotency_key": {
             "maxLength": 128,
@@ -13961,6 +14002,19 @@
               }
             ],
             "title": "Edit Message Id"
+          },
+          "execution_profile_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Id"
           },
           "expected_agent_id": {
             "anyOf": [
@@ -35275,6 +35329,139 @@
           "expected_record_id"
         ],
         "title": "OpenAIConfirmationRevokeRequest",
+        "type": "object"
+      },
+      "OpenRouterLocalQuota": {
+        "properties": {
+          "configured_limit": {
+            "title": "Configured Limit",
+            "type": "number"
+          },
+          "effective_cap": {
+            "title": "Effective Cap",
+            "type": "number"
+          },
+          "reserved": {
+            "title": "Reserved",
+            "type": "number"
+          },
+          "safety_margin": {
+            "title": "Safety Margin",
+            "type": "number"
+          },
+          "used": {
+            "title": "Used",
+            "type": "number"
+          }
+        },
+        "required": [
+          "configured_limit",
+          "safety_margin",
+          "effective_cap",
+          "used",
+          "reserved"
+        ],
+        "title": "OpenRouterLocalQuota",
+        "type": "object"
+      },
+      "OpenRouterProviderObservation": {
+        "properties": {
+          "failure": {
+            "title": "Failure",
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "remaining": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "unverified",
+              "observed",
+              "stale",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "used": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Used"
+          }
+        },
+        "required": [
+          "source",
+          "status",
+          "used",
+          "limit",
+          "remaining",
+          "observed_at",
+          "failure"
+        ],
+        "title": "OpenRouterProviderObservation",
+        "type": "object"
+      },
+      "OpenRouterQuotaResponse": {
+        "properties": {
+          "local": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpenRouterLocalQuota"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_observed": {
+            "$ref": "#/components/schemas/OpenRouterProviderObservation"
+          }
+        },
+        "required": [
+          "local",
+          "provider_observed"
+        ],
+        "title": "OpenRouterQuotaResponse",
         "type": "object"
       },
       "OperationsCanonicalSourceRef": {
@@ -69337,6 +69524,42 @@
           }
         },
         "summary": "Save Confirmation"
+      }
+    },
+    "/api/free-team/openrouter/quota": {
+      "get": {
+        "operationId": "get_openrouter_quota_api_free_team_openrouter_quota_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenRouterQuotaResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Openrouter Quota"
+      }
+    },
+    "/api/free-team/openrouter/quota/refresh": {
+      "post": {
+        "operationId": "refresh_openrouter_quota_api_free_team_openrouter_quota_refresh_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenRouterQuotaResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Refresh Openrouter Quota"
       }
     },
     "/api/free-team/openrouter/refresh": {

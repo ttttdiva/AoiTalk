@@ -43,6 +43,7 @@ from .agent_authority import AgentAuthorityResolver
 from .conversation_agent_service import (
     AgentExecutionBindingSnapshot,
     ConversationAgentService,
+    ConversationAgentValidationError,
 )
 
 
@@ -472,6 +473,7 @@ def _assert_route(binding: Any, *, provider: str, model: str, effort: str) -> di
         raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable")
     want = (provider.strip().lower(), model.strip(), effort.strip())
     matches: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    declared_backends: dict[tuple[str, str, str, str], str] = {}
     for route in routes:
         actual = (
             str(route.get("provider") or "").strip().lower(),
@@ -482,6 +484,7 @@ def _assert_route(binding: Any, *, provider: str, model: str, effort: str) -> di
             continue
         backend = str(route.get("backend") or "").strip().lower()
         kind = "cli" if not backend or backend in _CLI_BACKEND_ALIASES else backend
+        declared_backends.setdefault((*actual, kind), backend)
         matches.setdefault(
             (*actual, kind),
             {
@@ -502,7 +505,62 @@ def _assert_route(binding: Any, *, provider: str, model: str, effort: str) -> di
     (key, result), = matches.items()
     if key[3] != "cli":
         raise CLIDevelopmentSessionConflict("Agent route is not a CLI route", code="agent_route_backend_mismatch")
+    if _binding_selected_profile(binding) is not None:
+        # Explicit ExecutionProfile: an empty backend is not implied CLI and
+        # the provider must have a registered CLI session adapter.
+        from .agent_model_routing import AgentModelRouteError, assert_registered_route_backend
+
+        raw_backend = declared_backends.get(key, "")
+        declared = "cli" if raw_backend in _CLI_BACKEND_ALIASES else raw_backend
+        try:
+            assert_registered_route_backend(key[0], declared, ingress="cli")
+        except AgentModelRouteError as exc:
+            code = "cli_route_not_supported" if exc.code == "agent_route_provider_unsupported" else exc.code
+            raise CLIDevelopmentSessionConflict("Agent route has no registered CLI adapter", code=code) from None
     return result
+
+
+def _execution_profile_kwargs(execution_profile_id: Any) -> dict[str, Any]:
+    # Revision-default sessions keep the historical bind call shape.
+    return {} if execution_profile_id is None else {"execution_profile_id": execution_profile_id}
+
+
+def _binding_selected_profile(binding: Any) -> str | None:
+    selection = getattr(binding, "execution_selection", None)
+    if selection is None or not getattr(selection, "is_explicit", False):
+        return None
+    return str(selection.selected_execution_profile_id)
+
+
+def _assert_binding_selection(binding: Any, execution_profile_id: Any) -> None:
+    """The immutable binding must carry exactly the admitted selection."""
+
+    try:
+        selected = _binding_selected_profile(binding)
+    except Exception:
+        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid") from None
+    if selected != (str(execution_profile_id) if execution_profile_id is not None else None):
+        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid")
+
+
+def _binding_selection_manifest_fields(binding: Any, execution_profile_id: Any) -> dict[str, Any]:
+    """Selection block for a Run manifest; empty for revision defaults.
+
+    An explicit selection replaces the manifest ``route_snapshot`` with the
+    binding's full frozen roles: the selection's ``role_backends`` digest
+    covers every role, so routes, selection and header must come from the
+    same immutable binding (``execution_manifest_route_fields``).
+    """
+
+    _assert_binding_selection(binding, execution_profile_id)
+    if execution_profile_id is None:
+        return {}
+    from .agent_model_routing import execution_manifest_route_fields
+
+    fields = execution_manifest_route_fields(getattr(binding, "route_snapshot", None))
+    if not fields.get("route_snapshot") or fields.get("execution_profile_id") != execution_profile_id:
+        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid")
+    return fields
 
 
 def _decision_allowed(decision: Any) -> bool:
@@ -525,12 +583,16 @@ class CreateCLIDevelopmentSessionRequest:
     project_id: str | None = None
     permission_mode: str = "native_default"
     allowed_capabilities: tuple[str, ...] = CLI_DEVELOPMENT_CAPABILITIES
+    execution_profile_id: str | None = None
 
     @classmethod
     def from_value(cls, value: Any = None, **kwargs: Any) -> "CreateCLIDevelopmentSessionRequest":
         source = dict(value) if isinstance(value, Mapping) else {}
         source.update(kwargs)
         caps = normalize_cli_capabilities(source.get("allowed_capabilities"))
+        execution_profile_id = source.get("execution_profile_id")
+        if execution_profile_id is not None and (not isinstance(execution_profile_id, str) or not execution_profile_id):
+            raise CLIDevelopmentSessionInvalid("execution_profile_id is invalid", code="agent_execution_profile_invalid")
         return cls(
             owner_id=_identifier(source.get("owner_id", source.get("user_id")), field_name="owner_id"),
             agent_id=_identifier(source.get("agent_id"), field_name="agent_id"),
@@ -544,6 +606,7 @@ class CreateCLIDevelopmentSessionRequest:
             project_id=str(source.get("project_id")) if source.get("project_id") not in (None, "") else None,
             permission_mode=str(source.get("permission_mode") or "native_default").strip().lower(),
             allowed_capabilities=caps,
+            execution_profile_id=execution_profile_id,
         )
 
 
@@ -720,7 +783,7 @@ class CLIDevelopmentSessionService:
         config reload; they remain pinned in the session context separately.
         """
 
-        return _json_hash({
+        material = {
             "owner_id": request.owner_id,
             "agent_id": request.agent_id,
             "provider": request.provider,
@@ -731,7 +794,12 @@ class CLIDevelopmentSessionService:
             "permission_mode": request.permission_mode,
             "title": request.title,
             "allowed_capabilities": list(request.allowed_capabilities),
-        })
+        }
+        if request.execution_profile_id is not None:
+            # Only an explicit runtime selection joins the identity; omitted
+            # keeps every historical fingerprint byte-identical.
+            material["execution_profile_id"] = request.execution_profile_id
+        return _json_hash(material)
 
     @staticmethod
     def _context_tuple(
@@ -912,10 +980,16 @@ class CLIDevelopmentSessionService:
                 revision=revision,
                 config=self.config,
                 created_by=req.owner_id,
+                execution_profile_id=req.execution_profile_id,
             )
             route = _assert_route(expected_snapshot, provider=req.provider, model=req.model, effort=req.effort)
         except CLIDevelopmentSessionError:
             raise
+        except ConversationAgentValidationError as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if req.execution_profile_id is not None and code.startswith("agent_execution_profile_"):
+                raise CLIDevelopmentSessionInvalid("ExecutionProfile selection is not allowed", code=code) from None
+            raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
         except Exception as exc:
             raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
         if req.allowed_capabilities != CLI_DEVELOPMENT_CAPABILITIES and req.provider not in {"claude", "claude-cli", "claudecode"}:
@@ -924,7 +998,7 @@ class CLIDevelopmentSessionService:
         context_tuple = self._context_tuple(owner_id=req.owner_id, agent_id=agent_id, provider=req.provider, model=req.model, effort=req.effort, working_directory=cwd, idempotency_key=req.idempotency_key, project_id=req.project_id, permission_mode=permission_mode, title=req.title, allowed_capabilities=req.allowed_capabilities)
         context_tuple["provider_cache_root"] = self._provider_cache_root(policy, req.provider)
         context_tuple["wire_request_fingerprint"] = wire_fingerprint
-        context_tuple["deployment_fingerprint"] = _json_hash({
+        deployment_material = {
             "owner_id": req.owner_id,
             "agent_id": agent_id,
             "provider": req.provider,
@@ -936,7 +1010,11 @@ class CLIDevelopmentSessionService:
             "title": req.title,
             "allowed_capabilities": list(req.allowed_capabilities),
             "provider_cache_root": context_tuple["provider_cache_root"],
-        })
+        }
+        if req.execution_profile_id is not None:
+            context_tuple["execution_profile_id"] = req.execution_profile_id
+            deployment_material["execution_profile_id"] = req.execution_profile_id
+        context_tuple["deployment_fingerprint"] = _json_hash(deployment_material)
         context_tuple["route"] = route
         context_tuple["policy"] = policy.to_diagnostic(cwd=cwd, owner_id=req.owner_id)
         context_tuple["authority"] = authority
@@ -949,7 +1027,7 @@ class CLIDevelopmentSessionService:
                 current = self._context(existing)
                 if str(getattr(existing, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or current.get("wire_request_fingerprint") != wire_fingerprint:
                     raise CLIDevelopmentSessionConflict("session idempotency key belongs to another request", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
                 binding = None
@@ -972,6 +1050,7 @@ class CLIDevelopmentSessionService:
                         actor_user_id=req.owner_id,
                         actor_role=req.actor_role,
                         expected_agent_id=str(existing.agent_id) if existing.agent_id else None,
+                        **_execution_profile_kwargs(current.get("execution_profile_id")),
                     )
                     binding = getattr(bind_result, "binding", None)
                     await self._close(db)
@@ -982,6 +1061,7 @@ class CLIDevelopmentSessionService:
                     if binding is None:
                         raise CLIDevelopmentSessionConflict("immutable Agent binding is unavailable", code="agent_binding_required")
                 _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
+                _assert_binding_selection(binding, current.get("execution_profile_id"))
                 binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
                 binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
                 if not binding_id or not binding_hash:
@@ -1028,7 +1108,7 @@ class CLIDevelopmentSessionService:
                 current = self._context(winner)
                 if str(getattr(winner, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or current.get("wire_request_fingerprint") != wire_fingerprint:
                     raise CLIDevelopmentSessionConflict("session idempotency key conflict", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
                 return await self._session_projection(winner_db, winner, policy=policy, owner_id=req.owner_id, created=False)
@@ -1042,6 +1122,7 @@ class CLIDevelopmentSessionService:
         try:
             result = await self.agent_service.bind_session_agent(
                 session_id=str(session_id), agent_id=agent_id, actor_user_id=req.owner_id, actor_role=req.actor_role, expected_agent_id=None,
+                **_execution_profile_kwargs(req.execution_profile_id),
             )
         except Exception as exc:
             raise CLIDevelopmentSessionForbidden("Agent binding could not be persisted", code="agent_binding_denied") from exc
@@ -1049,6 +1130,7 @@ class CLIDevelopmentSessionService:
         if binding is None:
             raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
         bound_route = _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
+        _assert_binding_selection(binding, req.execution_profile_id)
         binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
         binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
         if not binding_id or not binding_hash:
@@ -1185,6 +1267,7 @@ class CLIDevelopmentSessionService:
                 row.development_status = "working"
             run_id = uuid.uuid4()
             manifest = {"schema_version": 2, "agent_id": str(context.get("agent_id") or row.agent_id), "agent_revision_id": str(context.get("agent_revision_id") or ""), "work_item_id": None, "source": CLI_SESSION_SOURCE_TYPE, "capabilities": list(pinned_caps), "route_snapshot": {"operator": dict(route)}}
+            manifest.update(_binding_selection_manifest_fields(binding, context.get("execution_profile_id")))
             manifest_hash = _json_hash(manifest)
             run = AgentRun(id=run_id, root_run_id=run_id, session_id=row.id, trigger_message_id=trigger_message_id, agent_id=uuid.UUID(str(context.get("agent_id") or row.agent_id)), agent_revision_id=uuid.UUID(str(context.get("agent_revision_id"))), user_id=req.owner_id, client_message_id=send_key, client_message_key=key_digest, request_fingerprint=request_fingerprint, run_type=CLI_SESSION_SOURCE_TYPE, status="queued", provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), generation_profile="assisted_work", work_item_attempt=1, objective="", title="", result={}, validation={}, run_metadata={"cli_development": {"schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION, "send_key_digest": key_digest, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "approval_policy_source": "provider_native_default_unknown" if str(context.get("permission_mode") or "native_default") == "native_default" else "explicit_deployment_policy", "execution_lane": policy.execution_lane, "working_directory_fingerprint": _sha256(cwd), "provider_cache_root_fingerprint": _sha256(str(context.get("provider_cache_root") or "")), "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}}, resolved_execution_manifest=manifest, execution_manifest_hash=manifest_hash, created_at=self._clock(), updated_at=self._clock(), last_event_at=self._clock())
             db.add(run)

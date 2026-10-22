@@ -1205,8 +1205,14 @@ def build_agent_chat_turn_client(
     session_id: str | None = None,
     project_id: str | None = None,
     run_id: str | None = None,
+    tool_generation_max_tokens: int | None = None,
 ) -> Any:
-    """Create a provider client isolated from the long-lived Character client."""
+    """Create a provider client isolated from the long-lived Character client.
+
+    ``tool_generation_max_tokens`` is a per-task explicit opt-in (persisted
+    with the admitted task); it is projected only onto this request-local
+    target config and never read from global settings.
+    """
 
     from ..llm.manager import create_llm_client_for_target
     from .pricing.providers import is_cli_provider
@@ -1323,6 +1329,12 @@ def build_agent_chat_turn_client(
                 "Agent workspace model does not match the pinned route"
             )
 
+    tool_generation_optin = (
+        int(tool_generation_max_tokens)
+        if tool_generation_max_tokens is not None and int(tool_generation_max_tokens) > 0
+        else None
+    )
+
     client = create_llm_client_for_target(
         config,
         provider=execution.route.provider,
@@ -1334,6 +1346,11 @@ def build_agent_chat_turn_client(
                 {"max_output_tokens": target_output_cap}
                 if target_output_cap is not None
                 and target_output_cap > 0
+                else {}
+            ),
+            **(
+                {"tool_generation_max_tokens": tool_generation_optin}
+                if tool_generation_optin is not None
                 else {}
             ),
         },

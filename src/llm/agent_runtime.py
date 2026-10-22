@@ -874,6 +874,8 @@ class OpenAIToolCallRecord:
     synthetic: bool = False
     # Digest of the restored raw intent (not the value) for durable identity.
     arguments_digest: str = ""
+    # Safe provenance (code, target digest) of a server-contract argument rejection.
+    argument_rejection: dict[str, str] | None = None
 
     @property
     def call_id(self) -> str:
@@ -1560,6 +1562,11 @@ def _openai_tool_call_record_from_unified(tool_result: Any) -> OpenAIToolCallRec
         executed=executed if isinstance(executed, bool) else None,
         synthetic=synthetic,
         arguments_digest=str(getattr(tool_result, "intent_digest", "") or ""),
+        argument_rejection=(
+            dict(getattr(tool_result, "argument_rejection"))
+            if getattr(tool_result, "argument_rejection", None)
+            else None
+        ),
     )
 
 

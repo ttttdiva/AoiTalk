@@ -10,7 +10,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 from .operations_routes import _authenticated_human_actor
 from ..services.agent_task_invocation import (
@@ -49,10 +49,20 @@ class AgentTaskCreateRequest(BaseModel):
     allow_git_push: StrictBool | None = Field(
         None, description="Omitted/null denies. Allow a normal non-force branch push; requires mutate and commands"
     )
+    tool_generation_max_tokens: StrictInt | None = Field(
+        None, ge=1, le=4096,
+        description="Omitted/null keeps the model's legacy output reserve. Explicit per-task opt-in: uncapped tool generation may use a bounded allowance up to this many tokens (never above 4096 or the remaining context window); explicit caller/runtime caps still win.",
+    )
     agent_id: UUID
     provider: str | None = Field(None, min_length=1, max_length=200)
     model: str | None = Field(None, min_length=1, max_length=200)
     effort: str | None = Field(None, min_length=1, max_length=40)
+    execution_profile_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description="Optional runtime ExecutionProfile for this task. Omitted/null keeps the pinned AgentRevision default. An explicit id must be a formal system Profile or an enabled Profile of the Agent's own Team; it never changes the Agent role and never falls back. provider/model/effort remain assertions against the selected route.",
+    )
     required_capabilities: list[str] = Field(default_factory=list, max_length=20)
 
 

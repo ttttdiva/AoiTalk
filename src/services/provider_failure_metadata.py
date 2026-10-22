@@ -161,6 +161,8 @@ def terminal_failure_event_fields(metadata: Any) -> dict[str, Any]:
         value = metadata.get(key)
         if isinstance(value, str) and value in _STATES:
             fields[key] = value
+    if metadata.get("retryable") is True:
+        fields["retryable"] = True
     for key in ("tool_receipt_count", "tool_receipt_success_count"):
         value = metadata.get(key)
         if (isinstance(value, int) and not isinstance(value, bool) and value >= 0) or value == "unknown":

@@ -775,6 +775,11 @@ def create_llm_client_for_target(
         overrides["runtime.target_max_output_tokens"] = max(
             1, int(options["max_output_tokens"])
         )
+    if options.get("tool_generation_max_tokens") is not None:
+        # Request-local explicit opt-in; never persisted.
+        overrides[
+            "openai_compatible_local.context_budget.tool_generation_max_tokens"
+        ] = max(1, int(options["tool_generation_max_tokens"]))
     if options.get("ephemeral_session_client"):
         overrides["runtime.ephemeral_session_client"] = True
         overrides["memory.enabled"] = False

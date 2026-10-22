@@ -37,6 +37,8 @@ export type ChatSendOutboxRecord = {
   projectId?: string | null;
   appContext?: ChatAppContextSelection | null;
   toolsRequired?: boolean;
+  /** Runtime chosen at first submit; replayed unchanged by every retry. */
+  executionProfileId?: string | null;
   attachments: ChatSendAttachmentMetadata[];
   /** File objects are persisted in IndexedDB when structured clone supports them. */
   files?: File[];
@@ -136,6 +138,7 @@ function parseRecord(value: unknown): ChatSendOutboxRecord | null {
     projectId: typeof value.projectId === "string" || value.projectId === null ? value.projectId : undefined,
     appContext: isRecord(value.appContext) ? value.appContext as unknown as ChatAppContextSelection : value.appContext === null ? null : undefined,
     toolsRequired: typeof value.toolsRequired === "boolean" ? value.toolsRequired : undefined,
+    executionProfileId: typeof value.executionProfileId === "string" && value.executionProfileId.trim() ? value.executionProfileId.trim() : undefined,
     attachments,
     files: Array.isArray(value.files) ? value.files.filter((file): file is File => typeof File !== "undefined" && file instanceof File) : undefined,
     status: value.status,
@@ -209,6 +212,7 @@ export function createChatSendOutboxRecord(input: {
   projectId?: string | null;
   appContext?: ChatAppContextSelection | null;
   toolsRequired?: boolean;
+  executionProfileId?: string | null;
 }): ChatSendOutboxRecord {
   const now = Date.now();
   const files = input.files?.length ? [...input.files] : undefined;
@@ -225,6 +229,7 @@ export function createChatSendOutboxRecord(input: {
     projectId: input.projectId,
     appContext: input.appContext ?? null,
     toolsRequired: input.toolsRequired,
+    executionProfileId: input.executionProfileId?.trim() || undefined,
     attachments: files?.map(toMetadata) ?? [],
     files,
     status: "pending",

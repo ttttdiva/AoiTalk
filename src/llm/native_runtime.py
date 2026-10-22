@@ -1063,29 +1063,191 @@ class AgentTurnRunner:
             model=str(model or ""),
         )
 
+    @staticmethod
+    def _buffered_chat_retry_safe(payload: Any) -> bool:
+        """Prove the final wire shape has only buffered, local function tools."""
+        if not isinstance(payload, dict):
+            return False
+        allowed = {
+            "model", "messages", "tools", "tool_choice", "parallel_tool_calls",
+            "temperature", "top_p", "max_tokens", "max_completion_tokens",
+            "frequency_penalty", "presence_penalty", "stop", "seed",
+            "response_format", "user", "reasoning_effort", "service_tier",
+            "logprobs", "top_logprobs", "logit_bias", "n", "store", "stream",
+            "extra_body",
+        }
+        if set(payload) - allowed or payload.get("stream", False) is not False:
+            return False
+        if payload.get("store", False) is not False:
+            return False
+        tools = payload.get("tools", [])
+        if not isinstance(tools, list):
+            return False
+        for tool in tools:
+            if not isinstance(tool, dict) or set(tool) - {"type", "function"} or tool.get("type") != "function":
+                return False
+            function = tool.get("function")
+            if not isinstance(function, dict) or set(function) - {"name", "description", "parameters", "strict"}:
+                return False
+            if not isinstance(function.get("name"), str) or not function["name"]:
+                return False
+        choice = payload.get("tool_choice", "auto")
+        if isinstance(choice, str):
+            if choice not in ("none", "auto", "required"):
+                return False
+        elif isinstance(choice, dict):
+            function = choice.get("function")
+            if set(choice) != {"type", "function"} or choice.get("type") != "function":
+                return False
+            if not isinstance(function, dict) or set(function) != {"name"}:
+                return False
+            if function.get("name") not in [tool["function"]["name"] for tool in tools]:
+                return False
+        else:
+            return False
+        extra = payload.get("extra_body", {})
+        if not isinstance(extra, dict) or set(extra) - {"usage", "provider", "reasoning"}:
+            return False
+        usage = extra.get("usage", {})
+        if not isinstance(usage, dict) or set(usage) - {"include"} or any(type(v) is not bool for v in usage.values()):
+            return False
+        routing = extra.get("provider", {})
+        if not isinstance(routing, dict) or set(routing) - {"only", "order", "allow_fallbacks", "require_parameters", "zdr", "max_price"}:
+            return False
+        for key, value in routing.items():
+            if key in {"only", "order"}:
+                if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                    return False
+            elif key == "max_price":
+                if not isinstance(value, dict) or set(value) - {"prompt", "completion"}:
+                    return False
+                if any(type(item) not in (int, float) or item != 0 for item in value.values()):
+                    return False
+            elif type(value) is not bool:
+                return False
+        reasoning = extra.get("reasoning", {})
+        if not isinstance(reasoning, dict) or set(reasoning) - {"effort", "max_tokens", "enabled", "exclude"}:
+            return False
+        for key, value in reasoning.items():
+            if key == "effort":
+                if value not in ("none", "minimal", "low", "medium", "high", "xhigh"):
+                    return False
+            elif key == "max_tokens":
+                if type(value) is not int or value < 0:
+                    return False
+            elif type(value) is not bool:
+                return False
+        return True
+
+    @staticmethod
+    def _safe_transport_causes(error: BaseException) -> list[dict[str, Any]]:
+        known = {
+            "APIConnectionError", "APITimeoutError", "ReadError", "WriteError",
+            "ConnectError", "CloseError", "RemoteProtocolError", "LocalProtocolError",
+            "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+            "ConnectionError", "ConnectionResetError", "ConnectionAbortedError",
+            "BrokenPipeError", "TimeoutError", "OSError", "SSLError",
+        }
+        result, seen = [], set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen and len(result) < 4:
+            seen.add(id(current))
+            name = type(current).__name__
+            entry: dict[str, Any] = {"type": name if name in known else "OtherError"}
+            for key in ("errno", "winerror"):
+                number = getattr(current, key, None)
+                if type(number) is int and -(2**31) <= number < 2**31:
+                    entry[key] = number
+            result.append(entry)
+            current = current.__cause__
+        return result
+
+    def _single_attempt_client(self) -> Any:
+        """Client whose SDK never retries a governed endpoint on its own.
+
+        SDK retries would multiply the governor's physical-attempt bound and
+        skip the privacy gateway and request budget.
+        """
+        from .provider_rate_governor import is_loopback_endpoint
+
+        client = self.client
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options) and not is_loopback_endpoint(getattr(client, "base_url", "")):
+            return with_options(max_retries=0)
+        return client
+
     async def _execute_model_request(
         self, payload: dict[str, Any], *, allow_connection_retry: bool = True,
+        allow_buffered_chat_retry: bool = False,
+        transport_failure_callback: Any = None,
         **options: Any,
     ) -> Any:
-        """Retry a connection once only before any tool has executed.
+        """Retry one current request, never replay already settled tool effects.
 
-        A post-tool model request can have an uncertain outcome even though it
-        does not execute the tools itself. Preserve that first interruption;
-        a successful retry must not conceal it from task settlement. SDK
-        retries stay disabled and every allowed send re-enters the gateway.
+        Post-tool retries require an explicit Chat sender boundary and a proven
+        buffered/function-only final payload. Every send re-enters privacy,
+        request budgets and the provider governor with hidden SDK retries off.
         """
-        for attempt in range(2):
+        from ..services.free_team_service import openai_credential_identity
+        from .generation_budget import current_generation_budget
+        from .provider_rate_governor import (
+            GOVERNOR, MAX_PHYSICAL_ATTEMPTS, budget_exhausted_after_429, governor_key,
+            is_loopback_endpoint, should_retry_429,
+        )
+
+        identity = openai_credential_identity(self.client, self.config)
+        base_url = str(getattr(self.client, "base_url", "") or "")
+        key = governor_key(self.provider_label, base_url, options.get("model"), identity.get("api_key_sha256"))
+        governed = not is_loopback_endpoint(base_url)
+
+        def checkpoint() -> float | None:
+            budget = current_generation_budget.get()
+            return budget.checkpoint() if budget is not None else None
+
+        original_sender = options.get("sender") or options.get("send")
+        attempt_state: dict[str, Any] = {}
+        if callable(original_sender):
+            async def guarded_sender(final_payload: Any) -> Any:
+                checkpoint()
+                lease = await GOVERNOR.acquire_async(key, checkpoint) if governed else None
+                try:
+                    attempt_state["buffered"] = allow_buffered_chat_retry and self._buffered_chat_retry_safe(final_payload)
+                    attempt_state["entered"] = True
+                    attempt_state["started"] = time.monotonic()
+                    sent = original_sender(final_payload)
+                    response = await sent if inspect.isawaitable(sent) else sent
+                    attempt_state["response_returned"] = True
+                    return response
+                finally:
+                    if lease is not None:
+                        lease.release()
+
+            options = {k: v for k, v in options.items() if k not in {"sender", "send"}}
+            options["sender"] = guarded_sender
+
+        physical = 0
+        connection_retried = False
+        prior_429: BaseException | None = None
+        while True:
+            checkpoint()
+            physical += 1
+            attempt_state.clear()
+            attempt_started = time.monotonic()
             try:
-                from ..services.free_team_service import openai_credential_identity
+                if governed:
+                    await GOVERNOR.wait_cooldown_async(key, checkpoint)
                 return await self.privacy_gateway.execute(payload, **options,
-                    credential_identity=openai_credential_identity(self.client, self.config))
+                    credential_identity=identity)
             except APIConnectionError as error:
                 cause = error.__cause__
                 retry = (
-                    allow_connection_retry
-                    and attempt == 0
+                    (allow_connection_retry or bool(attempt_state.get("entered") and attempt_state.get("buffered")))
+                    and not attempt_state.get("response_returned", False)
+                    and not connection_retried
+                    and physical < MAX_PHYSICAL_ATTEMPTS
                     and not isinstance(error, APITimeoutError)
                 )
+                connection_retried = connection_retried or retry
                 logger.warning(
                     "Native model transport failed: provider=%s model=%s "
                     "exception_type=%s cause_type=%s retry=%s",
@@ -1095,9 +1257,35 @@ class AgentTurnRunner:
                     type(cause).__name__ if cause is not None else "none",
                     retry,
                 )
+                details = {
+                    "physical_attempt": physical,
+                    "cause_chain": self._safe_transport_causes(error),
+                    "elapsed_ms": max(0, int((time.monotonic() - attempt_state.get("started", attempt_started)) * 1000)),
+                    "retry_eligible": retry,
+                    "retry_proof": "buffered_functions" if attempt_state.get("buffered") else "pre_tool_legacy" if allow_connection_retry else "unproved",
+                    "response_returned": bool(attempt_state.get("response_returned")),
+                }
+                if callable(transport_failure_callback):
+                    await transport_failure_callback(details)
                 if not retry:
                     raise
+                remaining = checkpoint()
+                if remaining is not None and remaining <= 0.5:
+                    raise
                 await asyncio.sleep(0.5)
+                checkpoint()
+            except Exception as error:
+                # Temporary 429 only: raised by the handshake, so no response
+                # output exists. The shared cooldown is waited at the loop top.
+                if budget_exhausted_after_429(error, prior_429):
+                    raise prior_429 from None
+                if not (governed and should_retry_429(error, physical, key, checkpoint)):
+                    raise
+                prior_429 = error
+                logger.warning(
+                    "Native model request rate limited: provider=%s model=%s attempt=%d; retrying",
+                    self.provider_label, options.get("model", ""), physical,
+                )
 
     async def run(
         self,
@@ -1489,12 +1677,20 @@ class AgentTurnRunner:
                 # transaction.  It can therefore receive only the final
                 # reviewed payload and cannot accidentally send ``kwargs``
                 # captured before redaction.
-                return await self.client.chat.completions.create(**outbound_kwargs)
+                return await self._single_attempt_client().chat.completions.create(**outbound_kwargs)
+
+            async def record_transport_failure(details: dict[str, Any]) -> None:
+                await emit_timing_event(
+                    stream_callback, "generation_transport", "error",
+                    model=agent.model, round=round_index, **details,
+                )
 
             try:
                 response = await self._execute_model_request(
                     kwargs,
                     allow_connection_retry=not bool(tool_records),
+                    allow_buffered_chat_retry=True,
+                    transport_failure_callback=record_transport_failure,
                     provider=self.provider_label,
                     descriptor=descriptor,
                     sender=send_chat_request,
@@ -2389,7 +2585,7 @@ class AgentTurnRunner:
                 record_bounded_model_request(outbound_kwargs)
                 # Keep the provider sender inside the privacy transaction so
                 # approval/redaction is applied to the exact request sent.
-                return await self.client.responses.create(**outbound_kwargs)
+                return await self._single_attempt_client().responses.create(**outbound_kwargs)
 
             try:
                 return await self._execute_model_request(
