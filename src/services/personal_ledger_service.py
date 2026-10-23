@@ -37,6 +37,8 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 
+from .personal_async_guard import run_personal_guard
+
 from ..memory.models.personal_ledger import (
     PERSONAL_LEDGER_ENTRY_TYPES,
     PERSONAL_LEDGER_KINDS,
@@ -662,7 +664,7 @@ class PersonalLedgerService:
     @staticmethod
     async def _select_entries(
         session, owner: UUID, *, ledger: str | None, subject_key: str | None, limit: int,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> list[LedgerEntryView]:
         stmt = select(PersonalLedgerEntry).where(PersonalLedgerEntry.owner_user_id == owner)
         if ledger is not None:
@@ -670,8 +672,7 @@ class PersonalLedgerService:
         if subject_key is not None:
             stmt = stmt.where(PersonalLedgerEntry.subject_key == subject_key)
         rows = (await session.execute(stmt.order_by(PersonalLedgerEntry.seq).limit(limit))).scalars().all()
-        if guard is not None:
-            guard()  # right after the DB await, before payloads are read/decrypted
+        await run_personal_guard(guard)  # right after the DB await, before payloads are read/decrypted
         return [_view(row) for row in rows]
 
     async def list_entries(
@@ -681,7 +682,7 @@ class PersonalLedgerService:
         ledger: str | None = None,
         subject_key: str | None = None,
         limit: int = 500,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> list[LedgerEntryView]:
         """行を seq 昇順に返す。該当行が ``limit`` を超える場合は切り詰めずエラーにする。
 
@@ -695,8 +696,7 @@ class PersonalLedgerService:
         safe_limit = min(max(int(limit), 1), MAX_STATE_ENTRIES)
         session = await self._open()
         try:
-            if guard is not None:
-                guard()  # after _open, before the DB read
+            await run_personal_guard(guard)  # after _open, before the DB read
             views = await self._select_entries(
                 session, actor.user_id, ledger=ledger, subject_key=subject_key, limit=safe_limit + 1,
                 guard=guard,

@@ -7,6 +7,7 @@ state, and Docs mutations. Remaining tables are pull-only local caches on mobile
 from __future__ import annotations
 
 import base64
+import functools
 import binascii
 import hashlib
 import json
@@ -17,13 +18,13 @@ import secrets
 import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -53,6 +54,7 @@ from ..memory.models import (
     public_session_context,
 )
 from ..memory.project_repository import ProjectRepository
+from ..services.app_storage import get_workspaces_root
 from ..services.docs_graph_service import DocsGraphService
 from ..services.docs_acl import (
     accessible_project_ids as docs_accessible_project_ids,
@@ -76,6 +78,7 @@ from ..services.agent_root_lifecycle import (
 from ..services.docs_library_compat import read_docs_library_id
 from ..services.docs_library_compat import with_legacy_docs_library_aliases
 from ..services.docs_workspace import get_project_docs_library
+from ..task_time import DEFAULT_TASK_TIMEZONE
 from .docs_sync import (
     DOCS_PULL_LIMITS,
     DOCS_SYNC_TABLES,
@@ -83,18 +86,21 @@ from .docs_sync import (
     apply_docs_operation,
     docs_scope_digest as calculate_docs_scope_digest,
     docs_scope_revision as calculate_docs_scope_revision,
+    docs_composite_response_readable,
     load_current_docs_entity,
     normalize_docs_body_json,
     pull_cursor_envelope,
     pull_docs_table,
+    resolve_docs_conflict_library,
 )
-from .routes.tasks._shared import _parse_timer_datetime
+from .routes.tasks._shared import CreateTaskPayload, _parse_timer_datetime
 from .general_sync_digest import (
     GENERAL_DIGEST_VERSION,
     pull_general_digest_page,
     valid_general_digest,
 )
 from .uuid_http import parse_uuid_or_400
+from .datetime_utils import parse_utc_naive_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -463,13 +469,7 @@ def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]
     if value in (None, ""):
         return None
     try:
-        normalized = value.strip()
-        if normalized.endswith("Z"):
-            normalized = f"{normalized[:-1]}+00:00"
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        return parse_utc_naive_datetime(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 
@@ -2353,7 +2353,11 @@ async def _apply_task_operation(
     *,
     user_id: UUID,
     operation: SyncOperation,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
 ) -> dict[str, Any]:
+    if not commit and after_commit is None:
+        raise ValueError("after_commit is required when commit=False")
     task_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if task_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
@@ -2391,7 +2395,7 @@ async def _apply_task_operation(
             reason_code="task_cas_stale",
         )
         return await service.delete_task(
-            session, user_id=user_id, task_id=task_id
+            session, user_id=user_id, task_id=task_id, commit=commit
         )
 
     if operation.action == "restore":
@@ -2406,6 +2410,7 @@ async def _apply_task_operation(
             user_id=user_id,
             task_id=task_id,
             deletion_batch_id=batch_id,
+            commit=commit,
         )
 
     if operation.action == "create":
@@ -2451,7 +2456,23 @@ async def _apply_task_operation(
                 user_id=user_id,
                 task_id=task_id,
                 updates=_task_updates_from_payload(payload),
+                commit=commit,
             )
+        try:
+            task_create_payload = CreateTaskPayload.model_validate(
+                {
+                    "title": title,
+                    "recurrence_rrule": payload.get("recurrence_rrule"),
+                    "recurrence_timezone": payload.get(
+                        "recurrence_timezone", DEFAULT_TASK_TIMEZONE
+                    ),
+                }
+            )
+        except ValidationError as exc:
+            raise TaskManagementError(
+                "Invalid task recurrence payload", status_code=400
+            ) from exc
+
         created = await service.create_task(
             session,
             user_id=user_id,
@@ -2481,8 +2502,11 @@ async def _apply_task_operation(
                 parse_uuid_or_400(value, "assignee_id")
                 for value in (payload.get("assignee_ids") or [])
             ],
+            recurrence_rrule=task_create_payload.recurrence_rrule,
+            recurrence_timezone=task_create_payload.recurrence_timezone,
             task_metadata=_task_metadata_from_payload(payload),
             source=str(payload.get("source") or "mobile"),
+            commit=commit,
         )
         return created
 
@@ -2498,6 +2522,7 @@ async def _apply_task_operation(
             user_id=user_id,
             task_id=task_id,
             updates=_task_updates_from_payload(operation.payload),
+            commit=commit,
         )
 
     raise TaskManagementError("Unsupported task sync action", status_code=400)
@@ -2509,8 +2534,12 @@ async def _apply_conversation_session_operation(
     user_id: UUID,
     user_info: dict[str, Any],
     operation: SyncOperation,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
 ) -> dict[str, Any]:
     """Apply native conversation pin updates and durable offline deletes."""
+    if not commit and after_commit is None:
+        raise ValueError("after_commit is required when commit=False")
 
     conversation_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if conversation_id is None:
@@ -2601,12 +2630,23 @@ async def _apply_conversation_session_operation(
     if operation.action == "delete":
         if existing.deleted_at is None:
             existing.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            await session.commit()
-            await session.refresh(existing)
-            release_session_agent_team_registry(
-                str(existing.user_id) if existing.user_id is not None else None,
-                str(existing.id),
-            )
+            if commit:
+                await session.commit()
+                await session.refresh(existing)
+                release_session_agent_team_registry(
+                    str(existing.user_id) if existing.user_id is not None else None,
+                    str(existing.id),
+                )
+            else:
+                await session.flush()
+                await session.refresh(existing)
+                after_commit.append(
+                    functools.partial(
+                        release_session_agent_team_registry,
+                        str(existing.user_id) if existing.user_id is not None else None,
+                        str(existing.id),
+                    )
+                )
         payload = _conversation_session_payload(existing)
         payload["idempotent"] = True
         return payload
@@ -2616,7 +2656,10 @@ async def _apply_conversation_session_operation(
     existing.is_pinned = is_pinned
     existing.pinned_at = changed_at if is_pinned else None
     existing.pin_updated_at = changed_at
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(existing)
     return _conversation_session_payload(existing)
 
@@ -2627,7 +2670,11 @@ async def _apply_time_entry_operation(
     *,
     user_id: UUID,
     operation: SyncOperation,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
 ) -> dict[str, Any]:
+    if not commit and after_commit is None:
+        raise ValueError("after_commit is required when commit=False")
     entry_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if entry_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
@@ -2663,7 +2710,9 @@ async def _apply_time_entry_operation(
                 "idempotent": True,
             }
         _ensure_not_stale(existing.updated_at, operation.base_updated_at)
-        await service.delete_time_entry(session, user_id=user_id, entry_id=entry_id)
+        await service.delete_time_entry(
+            session, user_id=user_id, entry_id=entry_id, commit=commit
+        )
         # The deleted row is intentionally hidden by the live serializer, so
         # return the exact in-memory tombstone rather than reloading it with a
         # ``deleted_at IS NULL`` predicate.
@@ -2737,7 +2786,10 @@ async def _apply_time_entry_operation(
         session.add(entry)
         if values["ended_at"] is None:
             task.status = "in_progress"
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
         return await service._serialize_time_entry(session, entry.id)
 
     if operation.action == "update":
@@ -2751,6 +2803,7 @@ async def _apply_time_entry_operation(
             started_at=values["started_at"],
             ended_at=values["ended_at"] if "ended_at" in operation.payload else None,
             note=values["note"] if "note" in operation.payload else None,
+            commit=commit,
         )
 
     raise TaskManagementError("Unsupported time entry sync action", status_code=400)
@@ -2764,7 +2817,16 @@ async def _apply_project_operation(
     user_info: Optional[dict[str, Any]] = None,
     operation: SyncOperation,
     workspace_root: str | os.PathLike[str] | None = None,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
 ) -> dict[str, Any]:
+    """Project sync operation を適用する。
+
+    ``commit=False`` の delete は、呼出元が同じ実効rootで
+    ``project_operation_lock`` を保持していること。
+    """
+    if not commit and after_commit is None:
+        raise ValueError("after_commit is required when commit=False")
     project_id = parse_uuid_or_400(operation.entity_id, "entity_id")
     if project_id is None:
         raise TaskManagementError("entity_id is required", status_code=400)
@@ -2779,12 +2841,22 @@ async def _apply_project_operation(
             session, project_id=project_id, user_id=user_id, permission="delete"
         )
         _ensure_not_stale(existing.updated_at, operation.base_updated_at)
-        await ProjectRepository.delete_project(
-            session,
-            project_id,
-            delete_workspace=True,
-            workspace_root=workspace_root,
-        )
+        if commit:
+            await ProjectRepository.delete_project(
+                session,
+                project_id,
+                delete_workspace=True,
+                workspace_root=workspace_root,
+            )
+        else:
+            await ProjectRepository._delete_project_unlocked(
+                session,
+                project_id,
+                delete_workspace=True,
+                workspace_root=get_workspaces_root(workspace_root),
+                commit=False,
+                after_commit=after_commit,
+            )
         return {"id": str(project_id), "deleted_at": datetime.utcnow().isoformat()}
 
     if operation.action == "create":
@@ -2822,7 +2894,7 @@ async def _apply_project_operation(
             updated = await ProjectRepository.update_project(
                 session,
                 project_id,
-                commit=("name" not in values),
+                commit=commit and ("name" not in values),
                 **{
                     key: value
                     for key, value in values.items()
@@ -2840,7 +2912,10 @@ async def _apply_project_operation(
                         project=updated,
                         user_id=user_id,
                     )
-                await session.commit()
+                if commit:
+                    await session.commit()
+                else:
+                    await session.flush()
             return updated.to_dict() if updated else {"id": str(project_id)}
         space_id = values.get("space_id")
         if space_id is not None:
@@ -2889,7 +2964,10 @@ async def _apply_project_operation(
                 project=created,
                 user_id=user_id,
             )
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
         await session.refresh(created)
         return created.to_dict()
 
@@ -2933,7 +3011,7 @@ async def _apply_project_operation(
         updated = await ProjectRepository.update_project(
             session,
             project_id,
-            commit=("name" not in update_values),
+            commit=commit and ("name" not in update_values),
             **update_values,
         )
         if updated is not None and "name" in update_values:
@@ -2947,7 +3025,10 @@ async def _apply_project_operation(
                     project=updated,
                     user_id=user_id,
                 )
-            await session.commit()
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
         return updated.to_dict() if updated else {"id": str(project_id)}
 
     raise TaskManagementError("Unsupported project sync action", status_code=400)
@@ -2959,8 +3040,14 @@ async def _apply_docs_push_operation(
     user_id: UUID,
     operation: SyncOperation,
     workspace_root: str | os.PathLike[str] | None = None,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
+    held_app_lock: UUID | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Docs push をRESTと同一の処理へ委譲し、サーバー版を検証する。"""
+    if not commit and after_commit is None:
+        raise ValueError("after_commit is required when commit=False")
     if operation.table == "knowledge_nodes" and "body_json" in operation.payload and operation.payload.get("body_json") is not None:
         try:
             operation.payload["body_json"] = normalize_docs_body_json(operation.payload["body_json"])
@@ -3057,7 +3144,81 @@ async def _apply_docs_push_operation(
         payload=operation.payload,
         base_updated_at=operation.base_updated_at,
         require_base_version=True,
+        commit=commit,
+        held_app_lock=held_app_lock,
+        outcome=outcome,
     )
+
+
+async def _dispatch_sync_operation(
+    service,
+    session,
+    *,
+    user_id,
+    user_info,
+    operation,
+    workspace_root,
+    commit: bool = True,
+    after_commit: list[Callable[[], None]] | None = None,
+    held_app_lock: UUID | None = None,
+    outcome: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """push operation を table ごとの適用関数へ振り分ける。"""
+    if operation.table == "projects":
+        entity = await _apply_project_operation(
+            service,
+            session,
+            user_id=user_id,
+            user_info=user_info,
+            operation=operation,
+            workspace_root=workspace_root,
+            commit=commit,
+            after_commit=after_commit,
+        )
+    elif operation.table == "tasks":
+        entity = await _apply_task_operation(
+            service,
+            session,
+            user_id=user_id,
+            operation=operation,
+            commit=commit,
+            after_commit=after_commit,
+        )
+    elif operation.table == "time_entries":
+        entity = await _apply_time_entry_operation(
+            service,
+            session,
+            user_id=user_id,
+            operation=operation,
+            commit=commit,
+            after_commit=after_commit,
+        )
+    elif operation.table == "conversation_sessions":
+        entity = await _apply_conversation_session_operation(
+            session,
+            user_id=user_id,
+            user_info=user_info,
+            operation=operation,
+            commit=commit,
+            after_commit=after_commit,
+        )
+    elif operation.table in DOCS_PUSH_TABLES:
+        entity = await _apply_docs_push_operation(
+            session,
+            user_id=user_id,
+            operation=operation,
+            workspace_root=workspace_root,
+            commit=commit,
+            after_commit=after_commit,
+            held_app_lock=held_app_lock,
+            outcome=outcome,
+        )
+    else:
+        raise TaskManagementError(
+            f"Unsupported push table: {operation.table}",
+            status_code=400,
+        )
+    return entity
 
 
 def create_sync_router(
@@ -3718,50 +3879,44 @@ def create_sync_router(
         try:
             for operation in payload.operations:
                 try:
-                    if operation.table == "projects":
-                        entity = await _apply_project_operation(
-                            service,
-                            session,
-                            user_id=user_id,
-                            user_info=user_info,
-                            operation=operation,
-                            workspace_root=workspace_root,
-                        )
-                    elif operation.table == "tasks":
-                        entity = await _apply_task_operation(
-                            service, session, user_id=user_id, operation=operation
-                        )
-                    elif operation.table == "time_entries":
-                        entity = await _apply_time_entry_operation(
-                            service, session, user_id=user_id, operation=operation
-                        )
-                    elif operation.table == "conversation_sessions":
-                        entity = await _apply_conversation_session_operation(
-                            session,
-                            user_id=user_id,
-                            user_info=user_info,
-                            operation=operation,
-                        )
-                    elif operation.table in DOCS_PUSH_TABLES:
-                        entity = await _apply_docs_push_operation(
-                            session,
-                            user_id=user_id,
-                            operation=operation,
-                            workspace_root=workspace_root,
-                        )
+                    outcome: dict[str, Any] = {}
+                    entity = await _dispatch_sync_operation(
+                        service,
+                        session,
+                        user_id=user_id,
+                        user_info=user_info,
+                        operation=operation,
+                        workspace_root=workspace_root,
+                        outcome=outcome,
+                    )
+                    archive_rejected_status = outcome.get("archive_rejected_status")
+                    if archive_rejected_status:
+                        # README 更新は commit 済み。archive 部分だけが拒否された。
+                        result_payload = {
+                            "op_id": operation.op_id,
+                            "status": "conflict"
+                            if archive_rejected_status == 409
+                            else "error",
+                            "reason": "Docs README は更新済みのため、アーカイブのみ拒否されました",
+                            "entity": entity,
+                            "server_updated_at": entity.get("updated_at")
+                            if isinstance(entity, dict)
+                            else None,
+                        }
+                        if (
+                            archive_rejected_status == 409
+                            and "docs_business_conflict" in _SYNC_REASON_CODE_ALLOWLIST
+                        ):
+                            result_payload["reason_code"] = "docs_business_conflict"
                     else:
-                        raise TaskManagementError(
-                            f"Unsupported push table: {operation.table}",
-                            status_code=400,
-                        )
-                    result_payload = {
-                        "op_id": operation.op_id,
-                        "status": "ok",
-                        "entity": entity,
-                        "server_updated_at": entity.get("updated_at")
-                        if isinstance(entity, dict)
-                        else None,
-                    }
+                        result_payload = {
+                            "op_id": operation.op_id,
+                            "status": "ok",
+                            "entity": entity,
+                            "server_updated_at": entity.get("updated_at")
+                            if isinstance(entity, dict)
+                            else None,
+                        }
                     results.append(result_payload)
                     if operation.table == "conversation_sessions" and isinstance(entity, dict):
                         conversation_result_refs.append((result_payload, entity))
@@ -3779,35 +3934,43 @@ def create_sync_router(
                         entity_id = None
                     try:
                         if status == "conflict" and operation.table in DOCS_PUSH_TABLES:
-                            docs_service = DocsGraphService(session)
-                            conflict_project = operation.payload.get("project_id")
-                            if conflict_project:
-                                try:
-                                    docs_workspace = await docs_service.ensure_project_information_library(
-                                        UUID(str(conflict_project)), user_id
-                                    )
-                                except Exception:
-                                    docs_workspace = await docs_service.ensure_library(user_id)
-                            else:
-                                conflict_ref = operation.payload.get("node_id") or str(
-                                    operation.entity_id
-                                ).split(":", 1)[0]
-                                try:
-                                    conflict_node = await session.get(KnowledgeNode, UUID(str(conflict_ref)))
-                                except (TypeError, ValueError):
-                                    conflict_node = None
-                                docs_workspace = (
-                                    await session.get(DocsLibrary, conflict_node.docs_library_id)
-                                    if conflict_node is not None
-                                    else await docs_service.ensure_library(user_id)
-                                )
-                            conflict_entity = await load_current_docs_entity(
+                            docs_workspace = await resolve_docs_conflict_library(
                                 session,
-                                docs_library_id=docs_workspace.id,
-                                table=operation.table,
-                                entity_id=operation.entity_id,
                                 user_id=user_id,
+                                entity_id=operation.entity_id,
+                                payload=operation.payload,
                             )
+                            if docs_workspace is not None:
+                                composite = operation.table in {
+                                    "knowledge_node_supertags",
+                                    "knowledge_field_values",
+                                }
+                                readable = (
+                                    not composite
+                                    or await docs_composite_response_readable(
+                                        session,
+                                        user_id=user_id,
+                                        table=operation.table,
+                                        entity_id=operation.entity_id,
+                                        docs_library_id=docs_workspace.id,
+                                    )
+                                )
+                                if readable:
+                                    conflict_entity = await load_current_docs_entity(
+                                        session,
+                                        docs_library_id=docs_workspace.id,
+                                        table=operation.table,
+                                        entity_id=operation.entity_id,
+                                        user_id=user_id,
+                                    )
+                                    # A versionless tombstone is only a failed
+                                    # lookup, not an authoritative conflict snapshot.
+                                    if (
+                                        isinstance(conflict_entity, dict)
+                                        and conflict_entity.get("deleted") is True
+                                        and conflict_entity.get("updated_at") is None
+                                    ):
+                                        conflict_entity = None
                         elif status == "conflict" and entity_id is not None:
                             if operation.table == "tasks":
                                 conflict_entity = await _load_current_task_payload(

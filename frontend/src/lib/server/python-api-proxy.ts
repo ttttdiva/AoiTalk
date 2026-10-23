@@ -374,6 +374,8 @@ export async function proxyRequestToPythonApi(
     maxRequestBytes?: number;
     /** Exact immutable preview route: downstream cancellation owns the stream. */
     downstreamResponseLifetime?: boolean;
+    /** Exact download routes may reject upstream redirects instead of following them. */
+    rejectRedirects?: boolean;
   },
 ): Promise<NextResponse> {
   const startedAt = Date.now();
@@ -469,6 +471,7 @@ export async function proxyRequestToPythonApi(
     headers: internalHeaders,
     cache: "no-store",
     signal: request.signal,
+    ...(options.rejectRedirects ? { redirect: "manual" as const } : {}),
   };
   let requestTooLarge = false;
   const responseLifetime = options.downstreamResponseLifetime

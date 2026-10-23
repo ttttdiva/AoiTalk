@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from os import PathLike
 from typing import Any, Callable, Literal, Optional
 
@@ -23,6 +23,7 @@ from ....services.task_management._shared import (
 )
 from ....task_time import DEFAULT_TASK_TIMEZONE, timer_db_datetime
 from ...uuid_http import parse_uuid_or_400
+from ...datetime_utils import parse_utc_naive_datetime
 
 
 class CreateTaskPayload(BaseModel):
@@ -229,13 +230,7 @@ def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]
     if value in (None, ""):
         return None
     try:
-        normalized = value.strip()
-        if normalized.endswith("Z"):
-            normalized = f"{normalized[:-1]}+00:00"
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        return parse_utc_naive_datetime(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
 

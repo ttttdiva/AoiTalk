@@ -1,15 +1,23 @@
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import {
+  assertActiveWriter,
+  type SqliteHandle,
+  type SqliteWriter,
+} from "../db/sqlite-writer";
 import type { RecordField, RecordRow, RecordTable } from "../types/api";
 
-export async function applyRemoteRecordTables(
+export function applyRemoteRecordTablesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
   list: RecordTable[],
-): Promise<void> {
+): void {
+  assertActiveWriter(writer);
   if (!list.length) return;
-  const db = getDb();
   const now = new Date().toISOString();
   for (const table of list) {
-    await db
+    tx
       .insert(schema.recordTables)
       .values({
         id: table.id,
@@ -43,31 +51,53 @@ export async function applyRemoteRecordTables(
           updatedAt: table.updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
+  }
+}
+
+export async function applyRemoteRecordTables(
+  list: RecordTable[],
+): Promise<void> {
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRemoteRecordTablesInWriter(writer, tx, list)),
+  );
+}
+
+export function applyRecordTableTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(writer);
+  for (const item of tombstones) {
+    const deletedAt = item.deleted_at ?? new Date().toISOString();
+    tx
+      .update(schema.recordTables)
+      .set({ deletedAt, updatedAt: deletedAt })
+      .where(eq(schema.recordTables.id, item.id))
+      .run();
   }
 }
 
 export async function applyRecordTableTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
-  const db = getDb();
-  for (const item of tombstones) {
-    const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
-      .update(schema.recordTables)
-      .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.recordTables.id, item.id));
-  }
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRecordTableTombstonesInWriter(writer, tx, tombstones)),
+  );
 }
 
-export async function applyRemoteRecordFields(
+export function applyRemoteRecordFieldsInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
   list: RecordField[],
-): Promise<void> {
+): void {
+  assertActiveWriter(writer);
   if (!list.length) return;
-  const db = getDb();
   const now = new Date().toISOString();
   for (const field of list) {
-    await db
+    tx
       .insert(schema.recordFields)
       .values({
         id: field.id,
@@ -105,29 +135,53 @@ export async function applyRemoteRecordFields(
           updatedAt: field.updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
+  }
+}
+
+export async function applyRemoteRecordFields(
+  list: RecordField[],
+): Promise<void> {
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRemoteRecordFieldsInWriter(writer, tx, list)),
+  );
+}
+
+export function applyRecordFieldTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(writer);
+  for (const item of tombstones) {
+    const deletedAt = item.deleted_at ?? new Date().toISOString();
+    tx
+      .update(schema.recordFields)
+      .set({ deletedAt, updatedAt: deletedAt })
+      .where(eq(schema.recordFields.id, item.id))
+      .run();
   }
 }
 
 export async function applyRecordFieldTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
-  const db = getDb();
-  for (const item of tombstones) {
-    const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
-      .update(schema.recordFields)
-      .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.recordFields.id, item.id));
-  }
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRecordFieldTombstonesInWriter(writer, tx, tombstones)),
+  );
 }
 
-export async function applyRemoteRecordRows(list: RecordRow[]): Promise<void> {
+export function applyRemoteRecordRowsInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  list: RecordRow[],
+): void {
+  assertActiveWriter(writer);
   if (!list.length) return;
-  const db = getDb();
   const now = new Date().toISOString();
   for (const row of list) {
-    await db
+    tx
       .insert(schema.recordRows)
       .values({
         id: row.id,
@@ -161,19 +215,39 @@ export async function applyRemoteRecordRows(list: RecordRow[]): Promise<void> {
           updatedAt: row.updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
+  }
+}
+
+export async function applyRemoteRecordRows(
+  list: RecordRow[],
+): Promise<void> {
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRemoteRecordRowsInWriter(writer, tx, list)),
+  );
+}
+
+export function applyRecordRowTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(writer);
+  for (const item of tombstones) {
+    const deletedAt = item.deleted_at ?? new Date().toISOString();
+    tx
+      .update(schema.recordRows)
+      .set({ deletedAt, updatedAt: deletedAt })
+      .where(eq(schema.recordRows.id, item.id))
+      .run();
   }
 }
 
 export async function applyRecordRowTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
-  const db = getDb();
-  for (const item of tombstones) {
-    const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
-      .update(schema.recordRows)
-      .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.recordRows.id, item.id));
-  }
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRecordRowTombstonesInWriter(writer, tx, tombstones)),
+  );
 }

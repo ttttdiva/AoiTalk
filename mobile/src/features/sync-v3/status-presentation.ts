@@ -44,7 +44,7 @@ export function describeSyncStatus(status: SyncV3Status | null): SyncStatusPrese
         label: "同期が遅れています",
         tone: "warn",
         detail:
-          status.push.lastErrorCode ?? status.changes.lastErrorCode ?? status.bootstrap.lastErrorCode,
+          status.disabledReason ?? status.push.lastErrorCode ?? status.changes.lastErrorCode ?? status.bootstrap.lastErrorCode,
       };
   }
 }

@@ -9,6 +9,7 @@ import {
   executionRoutePresentation,
   isJevRoute,
   reasoningEffortOptionsForModel,
+  REMOTE_EXECUTION_PROVIDER,
   type ExecutionRoute,
   type LlmModelCatalogResponse,
   type TeamExecutionProfile,
@@ -116,7 +117,7 @@ function explicitModelRoute(
     });
   }
 
-  const options = routeEffortOptions(catalog, provider, model);
+  const options = model ? routeEffortOptions(catalog, provider, model) : [];
   if (patch.effort !== undefined) {
     const requested = String(patch.effort || "").trim();
     if (requested && options.includes(requested)) {
@@ -276,13 +277,26 @@ export function ExecutionRouteEditor({
   mainModel: string;
 }) {
   const availableProviders = useMemo(
-    () => catalog.providers.filter((item) => item.selection_kind !== "routing_profile" && item.disabled !== true && item.unavailable !== true && !isJevRoute({ provider: item.id, model: item.label })),
+    () => {
+      const providers = catalog.providers.filter((item) => item.selection_kind !== "routing_profile" && item.disabled !== true && item.unavailable !== true && !isJevRoute({ provider: item.id, model: item.label }));
+      if (!providers.some((item) => item.id === REMOTE_EXECUTION_PROVIDER)) {
+        providers.push({
+          id: REMOTE_EXECUTION_PROVIDER,
+          label: "Muse Remote",
+          models: [],
+          supports_custom_model: false,
+          source: "static",
+        });
+      }
+      return providers;
+    },
     [catalog.providers],
   );
   const providerCatalog = availableProviders.find((item) => item.id === route.provider);
   const modelCatalog = (providerCatalog?.models ?? []).filter((item) => !isJevRoute({ provider: route.provider, model: item.id }));
+  const providerOwnsModel = route.provider === REMOTE_EXECUTION_PROVIDER;
   const inheritEffortValues = useMemo(
-    () => inheritEffortChoices(catalog, route.effort, mainProvider, mainModel),
+    () => inheritEffortChoices(catalog, String(route.effort || ""), mainProvider, mainModel),
     [catalog, mainModel, mainProvider, route.effort],
   );
   const routeEffortValues = route.model
@@ -290,7 +304,7 @@ export function ExecutionRouteEditor({
     : [];
   const hiddenProviderRoute = isJevRoute({ provider: route.provider });
   const hiddenModelRoute = isJevRoute({ provider: route.provider, model: route.model });
-  const modelKnown = modelHasCatalogEntry(catalog, route.provider, route.model);
+  const modelKnown = modelHasCatalogEntry(catalog, route.provider, route.model ?? "");
   const effortChoices = route.inherit_model ? inheritEffortValues : routeEffortValues;
   const preset = routePreset(route);
   const showModelFields = preset === "explicit_model";
@@ -347,20 +361,26 @@ export function ExecutionRouteEditor({
               {route.provider && !isJevRoute({ provider: route.provider }) && !availableProviders.some((item) => item.id === route.provider) && <option value={route.provider}>現在の設定</option>}
             </AppSelect>
           </label>
-          <label className="space-y-1 text-[10px] text-muted-foreground">
-            <span>モデル</span>
-            <AppSelect
-              aria-label={`${ariaPrefix}のモデル`}
-              value={hiddenModelRoute ? "" : route.model}
-              onChange={(event) => onChange(explicitModelRoute(route, { model: event.target.value }, catalog))}
-              disabled={disabled || !route.provider}
-              className="h-8 w-full"
-            >
-              <option value="">モデルを選択</option>
-              {modelCatalog.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-              {route.model && !isJevRoute({ provider: route.provider, model: route.model }) && !modelCatalog.some((item) => item.id === route.model) && <option value={route.model}>現在の設定</option>}
-            </AppSelect>
-          </label>
+          {providerOwnsModel ? (
+            <p className="self-end pb-2 text-[10px] text-muted-foreground">
+              Muse Remoteがモデルと実行環境を管理します。
+            </p>
+          ) : (
+            <label className="space-y-1 text-[10px] text-muted-foreground">
+              <span>モデル</span>
+              <AppSelect
+                aria-label={`${ariaPrefix}のモデル`}
+                value={hiddenModelRoute ? "" : route.model ?? ""}
+                onChange={(event) => onChange(explicitModelRoute(route, { model: event.target.value }, catalog))}
+                disabled={disabled || !route.provider}
+                className="h-8 w-full"
+              >
+                <option value="">モデルを選択</option>
+                {modelCatalog.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+                {route.model && !isJevRoute({ provider: route.provider, model: route.model }) && !modelCatalog.some((item) => item.id === route.model) && <option value={route.model}>現在の設定</option>}
+              </AppSelect>
+            </label>
+          )}
         </div>
       )}
       {showExplicitEffort && (

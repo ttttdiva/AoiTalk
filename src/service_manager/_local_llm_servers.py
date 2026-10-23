@@ -4364,6 +4364,7 @@ def _start_logged_openai_compatible_process(
     log_path: Path,
     mirror_to_parent_console: bool = False,
     create_new_console_on_windows: bool = True,
+    console_title: str | None = None,
 ) -> subprocess.Popen:
     from src.utils.log_housekeeping import rotate_log_if_over_size
 
@@ -4427,6 +4428,17 @@ def _start_logged_openai_compatible_process(
         # that do not opt into mirroring.
         log_file.close()
     _track_child_process(proc, openai_compatible_local=True)
+    if (
+        console_title
+        and _IS_WINDOWS
+        and not popen_kwargs.get("creationflags")
+        and isinstance(proc, subprocess.Popen)
+    ):
+        from src.utils.process_identity import label_child_console_async
+
+        label_child_console_async(
+            proc.pid, console_title.replace("{pid}", str(proc.pid))
+        )
     return proc
 
 

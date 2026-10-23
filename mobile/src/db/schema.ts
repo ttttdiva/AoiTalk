@@ -842,6 +842,11 @@ export const outbox = sqliteTable(
     conflictPayload: text('conflict_payload', { mode: 'json' }),
     retryCount: integer('retry_count').notNull().default(0),
     lastError: text('last_error'),
+    // Sync v3 send identity. Not part of the mutation snapshot: a changed
+    // digest re-allocates the id/seq instead of comparing these columns.
+    v3OpId: text('v3_op_id'),
+    v3OpSeq: integer('v3_op_seq'),
+    v3SentDigest: text('v3_sent_digest'),
   },
   (t) => ({
     byCreatedAt: index('idx_outbox_created_at').on(t.createdAt),
@@ -917,6 +922,96 @@ export const syncState = sqliteTable('sync_state', {
   lastPushedAt: text('last_pushed_at'),
   cursor: text('cursor'),
 });
+
+// ---------- sync_v3_membership ----------
+// Which server scope (generation) currently delivers each local entity for an
+// account. An entity with no membership left is evicted from the live tables.
+export const syncV3Membership = sqliteTable(
+  'sync_v3_membership',
+  {
+    authScope: text('auth_scope').notNull(),
+    tableName: text('table_name').notNull(),
+    entityId: text('entity_id').notNull(),
+    scopeKey: text('scope_key').notNull(),
+    generation: integer('generation').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      columns: [t.authScope, t.tableName, t.entityId, t.scopeKey],
+    }),
+    byScope: index('idx_sync_v3_membership_scope').on(
+      t.authScope,
+      t.scopeKey,
+      t.generation,
+    ),
+  }),
+);
+
+// One durable, user-confirmed migration snapshot for pre-v3 outbox/Docs
+// state.  The export remains on device after account cache transitions so an
+// unknown owner is never rebound to the currently signed-in user.
+export const syncV3LegacyCapture = sqliteTable('sync_v3_legacy_capture', {
+  id: text('id').primaryKey(),
+  generation: integer('generation').notNull().default(1),
+  captureSha256: text('capture_sha256').notNull(),
+  snapshotJson: text('snapshot_json').notNull(),
+  captureCount: integer('capture_count').notNull().default(0),
+  opCount: integer('op_count').notNull().default(0),
+  dirtyCount: integer('dirty_count').notNull().default(0),
+  ownerUnknownCount: integer('owner_unknown_count').notNull().default(0),
+  state: text('state').notNull().default('awaiting_confirm'),
+  sourceCleared: integer('source_cleared', { mode: 'boolean' }).notNull().default(false),
+  confirmedSha256: text('confirmed_sha256'),
+  updatedAt: integer('updated_at').notNull(),
+  errorCode: text('error_code'),
+});
+
+// Durable conflict projection.  Payloads are private local recovery data;
+// request diagnostics below never copy any of these bodies.
+export const syncV3Conflicts = sqliteTable(
+  'sync_v3_conflicts',
+  {
+    id: text('id').primaryKey(),
+    authScope: text('auth_scope').notNull(),
+    tableName: text('table_name').notNull(),
+    entityId: text('entity_id').notNull(),
+    scopeKey: text('scope_key'),
+    kind: text('kind').notNull(),
+    localJson: text('local_json').notNull(),
+    baseJson: text('base_json'),
+    serverJson: text('server_json'),
+    fieldsJson: text('fields_json').notNull().default('[]'),
+    sourceOpId: text('source_op_id'),
+    sourceSnapshotJson: text('source_snapshot_json').notNull(),
+    titleHint: text('title_hint'),
+    createdAt: integer('created_at').notNull(),
+    state: text('state').notNull().default('open'),
+    reappliedOpId: text('reapplied_op_id'),
+  },
+  (t) => ({
+    byScopeState: index('idx_sync_v3_conflicts_scope_state').on(t.authScope, t.state, t.createdAt),
+    byEntity: index('idx_sync_v3_conflicts_entity').on(t.authScope, t.tableName, t.entityId, t.state),
+  }),
+);
+
+// Bounded, value-free request outcomes.  Keep only the canonical request id,
+// lane, HTTP status, duration and safe outcome code.
+export const syncV3RequestLogs = sqliteTable(
+  'sync_v3_request_logs',
+  {
+    requestId: text('request_id').primaryKey(),
+    authScope: text('auth_scope').notNull(),
+    lane: text('lane').notNull(),
+    outcome: text('outcome').notNull(),
+    status: integer('status'),
+    occurredAt: integer('occurred_at').notNull(),
+    durationMs: integer('duration_ms').notNull(),
+    errorCode: text('error_code'),
+  },
+  (t) => ({
+    byScopeTime: index('idx_sync_v3_request_logs_scope_time').on(t.authScope, t.occurredAt),
+  }),
+);
 
 // ---------- Docs staged sync runs ----------
 // A run is scoped by account + Docs workspace.  Pages are downloaded into
@@ -1151,6 +1246,10 @@ export type ConversationContextSnapshot =
 export type OutboxOp = typeof outbox.$inferSelect;
 export type OutboxResolutionRecord = typeof outboxResolutionRecords.$inferSelect;
 export type SyncState = typeof syncState.$inferSelect;
+export type SyncV3Membership = typeof syncV3Membership.$inferSelect;
+export type SyncV3LegacyCapture = typeof syncV3LegacyCapture.$inferSelect;
+export type SyncV3Conflict = typeof syncV3Conflicts.$inferSelect;
+export type SyncV3RequestLog = typeof syncV3RequestLogs.$inferSelect;
 export type DocsSyncRun = typeof docsSyncRuns.$inferSelect;
 export type DocsSyncStaging = typeof docsSyncStaging.$inferSelect;
 export type DocsScopeMembership = typeof docsScopeMembership.$inferSelect;

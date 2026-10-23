@@ -127,6 +127,57 @@ workspace boundary and report concise evidence.
 """
 
 
+def _codex_text(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _codex_failure_detail(event: dict[str, Any]) -> Optional[str]:
+    """Extract a failure message from known event shapes without raising."""
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    def error_texts(container: dict[str, Any]) -> list[Any]:
+        error = container.get("error")
+        if isinstance(error, dict):
+            return [error.get("message")]
+        return [error]
+
+    candidates: list[Any] = [
+        event.get("message"),
+        *error_texts(event),
+        item.get("message"),
+        *error_texts(item),
+    ]
+    for candidate in candidates:
+        text = _codex_text(candidate)
+        if text is not None:
+            return text
+    return None
+
+
+def _codex_masked_warning(value: Any) -> Optional[str]:
+    text = _codex_text(value)
+    if text is None:
+        return None
+    try:
+        from ...services.outbound_privacy_service import redact_secret_for_local_display
+
+        return str(redact_secret_for_local_display(text))[:200]
+    except Exception:
+        return None
+
+
+def _codex_event_failed(event: dict[str, Any]) -> bool:
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    return (
+        str(event.get("type") or "").lower() in {"error", "turn.failed", "turn_failure", "failed"}
+        or str(item.get("type") or "").lower() in {"error", "failure", "failed"}
+        or str(item.get("status") or "").lower() in {"error", "failed", "failure"}
+        or event.get("error") is not None
+        or item.get("error") is not None
+    )
+
+
 class CodexCLIBackend(CLIBackendBase):
     """Codex CLI backend implementation."""
 
@@ -763,15 +814,11 @@ class CodexCLIBackend(CLIBackendBase):
             except json.JSONDecodeError:
                 continue
 
-            if event.get("type") == "error" and isinstance(event.get("message"), str):
-                error_message = event["message"].strip()
+            if not isinstance(event, dict) or not _codex_event_failed(event):
                 continue
-
-            if event.get("type") == "turn.failed":
-                error = event.get("error") or {}
-                message = error.get("message")
-                if isinstance(message, str) and message.strip():
-                    error_message = message.strip()
+            detail = _codex_failure_detail(event)
+            if detail is not None:
+                error_message = detail
 
         if not error_message:
             return None
@@ -820,11 +867,30 @@ class CodexCLIBackend(CLIBackendBase):
         ]
         tool_failure_types: list[str] = []
         recovered_tool_failure_types: list[str] = []
-        saw_agent_message = False
+        warning_samples: list[str] = []
+        warning_count = 0
         for event_index, event in enumerate(events):
             event_type = str(event.get("type") or "").lower()
             item = event.get("item") if isinstance(event.get("item"), dict) else {}
             item_type = str(item.get("type") or "").lower()
+            # Native ErrorItem (item.completed/item.type=error) is a non-fatal
+            # warning only when it carries no error payload and no status.
+            if (
+                event_type == "item.completed"
+                and item_type == "error"
+                and event.get("error") is None
+                and item.get("error") is None
+                and not str(item.get("status") or "").strip()
+            ):
+                warning_count += 1
+                self._last_cli_diagnostics["non_fatal_error_item_count"] = warning_count
+                sample = _codex_masked_warning(item.get("message"))
+                if sample and len(warning_samples) < 3:
+                    warning_samples.append(sample)
+                    self._last_cli_diagnostics["non_fatal_error_item_samples"] = list(
+                        warning_samples
+                    )
+                continue
             failed = event_type in {"error", "turn.failed", "turn_failure", "failed"}
             failed = failed or item_type in {"error", "failure", "failed"}
             failed = failed or str(item.get("status") or "").lower() in {"error", "failed", "failure"}
@@ -873,21 +939,32 @@ class CodexCLIBackend(CLIBackendBase):
                     state="failed",
                     error_code="codex_turn_failed",
                 )
-                detail = (
-                    event.get("message")
-                    or (event.get("error") or {}).get("message")
-                    if isinstance(event.get("error"), dict)
-                    else event.get("error")
-                ) or item.get("error") or "Codex CLI reported a failed turn"
+                detail = _codex_failure_detail(event)
+                if detail is None:
+                    for later in events[event_index + 1:]:
+                        if _codex_event_failed(later):
+                            detail = _codex_failure_detail(later)
+                            if detail is not None:
+                                break
+                detail = detail or "Codex CLI reported a failed turn"
                 return f"Codex CLI reported a failed turn: {str(detail)[:1000]}"
-            if (
-                event_type == "item.completed"
-                and item_type == "agent_message"
-                and isinstance(item.get("text"), str)
-                and item.get("text", "").strip()
-            ):
-                saw_agent_message = True
-        if events and not saw_agent_message:
+        # A successful turn needs a non-empty agent_message that precedes the
+        # last turn.completed within the current turn (after the last
+        # turn.started); earlier turns never satisfy this invocation.
+        last_started = max(
+            (
+                index
+                for index, event in enumerate(events)
+                if str(event.get("type") or "").lower() == "turn.started"
+            ),
+            default=-1,
+        )
+        last_completed = max(completed_indexes, default=-1)
+        has_final_message = last_completed > last_started and any(
+            last_started < message_index < last_completed
+            for message_index in message_indexes
+        )
+        if events and not has_final_message:
             self._set_cli_diagnostic(
                 status="failed",
                 state="failed",

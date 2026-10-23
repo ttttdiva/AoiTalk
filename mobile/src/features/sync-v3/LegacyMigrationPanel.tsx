@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Alert, StyleSheet, View } from "react-native";
 import { Button, Text } from "react-native-paper";
 import { getSyncV3Engine } from "../../sync-v3/contract";
+import { getSyncV3LegacyExport } from "../../sync-v3/legacy-migration";
 import type { SyncV3Status } from "../../sync-v3/contract";
 
 export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => void }) {
@@ -39,7 +40,19 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
     return <Text variant="bodyMedium">旧版データを移行しています…</Text>;
   }
   if (legacy.state === "migrated") {
-    return <Text variant="bodyMedium">旧版データの移行が完了しました。</Text>;
+    return (
+      <View style={styles.root}>
+        <Text variant="bodyMedium">旧版データの移行が完了しました。</Text>
+        <Text variant="bodySmall">所有者不明: {legacy.ownerUnknownCount ?? 0}件（別ユーザーへ割り当てず保持）</Text>
+        {onCopy ? (
+          <Button onPress={() => {
+            void getSyncV3LegacyExport().then((value) => { if (value) onCopy(value); });
+          }}>
+            退避データをコピー
+          </Button>
+        ) : null}
+      </View>
+    );
   }
 
   const sha = legacy.captureSha256;
@@ -80,6 +93,13 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
         <Text variant="bodySmall" selectable>
           退避ファイル: {legacy.captureFile}
         </Text>
+      ) : null}
+      {onCopy ? (
+        <Button onPress={() => {
+          void getSyncV3LegacyExport().then((value) => { if (value) onCopy(value); });
+        }}>
+          退避データをコピー
+        </Button>
       ) : null}
       <Button mode="contained" disabled={!sha} onPress={confirmMigration}>
         移行を実行

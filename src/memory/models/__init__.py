@@ -10,6 +10,7 @@ from .base import Base
 from .personal_draft import PersonalDraftEvent
 from .personal_reminder import PersonalReminderEvent
 from .personal_finance_receipt import PersonalFinanceReceiptCandidate
+from .task_api_receipts import TaskApiOperationReceipt
 from .auth_handoff import (
     AuthHandoffClientTransaction,
     AuthHandoffRateLimit,

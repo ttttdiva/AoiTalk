@@ -8,7 +8,7 @@
 
 | 用途 | 正式な物理パス | 運用 |
 | --- | --- | --- |
-| llama.cppモデルroot | `F:\AI\models\Cold_F\llm` | 通常は必ずここを使う |
+| llama.cppモデルroot | `<configured-model-root>` | 通常は必ずここを使う |
 | 代替model root | `E:\AI\models\Cold_E\llm` | Fを使えない理由と空き容量を確認し、利用者が明示した場合だけ使う |
 | AoiTalk checkout内 | `<repository>/.aoitalk-local-llm/models` | GGUF等の重みを置かない |
 | 検証済みruntime cache | `<repository>/cache/local-llm-runtime` | Strata等の固定revision runtime専用。モデルを置かない |
@@ -28,7 +28,7 @@ runtimeも外部化するときは、保存先を別途決めて
 この端末の追跡しない`.env`には次を保持します。
 
 ```dotenv
-LLAMA_CPP_MODEL_ROOT=F:\AI\models\Cold_F\llm
+LLAMA_CPP_MODEL_ROOT=<configured-model-root>
 AOITALK_REQUIRE_EXTERNAL_LLM_MODEL_ROOT=true
 ```
 

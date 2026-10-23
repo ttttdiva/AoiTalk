@@ -5,7 +5,8 @@ import {
   isSqliteDiagnosticsEnabled,
   logSqliteErrorDiagnostic,
 } from "../db/sqlite-errors";
-import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import { runBackgroundSqliteWrite, runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import { assertActiveWriter, type SqliteHandle, type SqliteWriter } from "../db/sqlite-writer";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import { isMobileReadOnlyDiagnosticsEnabled } from "../lib/read-only-diagnostics";
 import { getConfiguredApiServerFingerprint, isApiConnectionError, isApiHttpError, isApiTimeoutError } from "../lib/api-client";
@@ -797,17 +798,61 @@ async function deleteConversationSessionOnce(sessionId: string): Promise<void> {
   if (queuedDelete) notifyMutationQueued(authScope);
 }
 
+/**
+ * Async preparation for applyRemoteConversationSessionsInWriter: the pending
+ * pin check reads the auth token, so it cannot run inside the sync write unit.
+ */
+export async function prepareRemoteConversationSessions(
+  list: ConversationSession[],
+): Promise<ReadonlySet<string>> {
+  const pendingPinSessionIds = new Set<string>();
+  for (const session of list) {
+    if (await hasPendingOutbox("conversation_sessions", session.id)) {
+      pendingPinSessionIds.add(session.id);
+    }
+  }
+  return pendingPinSessionIds;
+}
+
+/**
+ * Auth scope for the in-writer pending-pin re-check. Resolved before the write
+ * unit because reading the token is async; the outbox read itself is sync.
+ */
+async function resolvePendingPinOutboxScope(): Promise<string | null> {
+  const token = await getToken();
+  return token && typeof getTokenAuthScope === "function"
+    ? getTokenAuthScope(token)
+    : null;
+}
+
 export async function applyRemoteConversationSessions(
   list: ConversationSession[],
 ): Promise<void> {
   if (!list.length) return;
-  const db = getDb();
+  const pendingPinSessionIds = await prepareRemoteConversationSessions(list);
+  const outboxAuthScope = await resolvePendingPinOutboxScope();
+  await runBackgroundSqliteWrite((w) =>
+    getDb().transaction((tx) =>
+      applyRemoteConversationSessionsInWriter(
+        w, tx, list, pendingPinSessionIds, outboxAuthScope)));
+}
+
+export function applyRemoteConversationSessionsInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  list: ConversationSession[],
+  pendingPinSessionIds: ReadonlySet<string>,
+  outboxAuthScope: string | null = null,
+): void {
+  assertActiveWriter(w);
+  if (!list.length) return;
   const now = new Date().toISOString();
   for (const session of list) {
-    const existingRows = await db
+    const existingRows = tx
       .select()
       .from(schema.conversationSessions)
-      .where(eq(schema.conversationSessions.id, session.id));
+      .where(eq(schema.conversationSessions.id, session.id))
+      .all();
     const existing = existingRows.find((row) => row.id === session.id);
     if (isUserDeletedSession(existing)) continue;
     const existingMetadata =
@@ -837,10 +882,23 @@ export async function applyRemoteConversationSessions(
       : preservePendingAgent
         ? pendingAgent.targetAgentId
         : remoteAgentId;
-    const preservePendingPin = await hasPendingOutbox(
-      "conversation_sessions",
-      session.id,
-    );
+    // The prepared set can predate a foreground pin queued while this write
+    // waited behind another writer, so re-read the same actor's outbox here.
+    const preservePendingPin =
+      pendingPinSessionIds.has(session.id) ||
+      (outboxAuthScope !== null &&
+        tx
+          .select({ opId: schema.outbox.opId })
+          .from(schema.outbox)
+          .where(
+            and(
+              eq(schema.outbox.authScope, outboxAuthScope),
+              eq(schema.outbox.tableName, "conversation_sessions"),
+              eq(schema.outbox.entityId, session.id),
+            ),
+          )
+          .limit(1)
+          .all().length > 0);
     const isPinned = preservePendingPin
       ? Boolean(existing?.isPinned)
       : session.is_pinned === true;
@@ -986,7 +1044,7 @@ export async function applyRemoteConversationSessions(
         ? { [PENDING_CHARACTER_SLUG_KEY]: pendingSlug }
         : {}),
     };
-    await db
+    tx
       .insert(schema.conversationSessions)
       .values({
         id: session.id,
@@ -1022,7 +1080,8 @@ export async function applyRemoteConversationSessions(
           deletedAt: null,
           sessionMetadata: remoteMetadata,
         },
-      });
+      })
+      .run();
   }
   notifyConversationChanges();
 }
@@ -1034,21 +1093,37 @@ export async function applyRemoteConversationSessions(
 export async function applyForegroundConversationSessions(
   list: ConversationSession[],
 ): Promise<void> {
-  await runForegroundSqliteWrite(() => applyRemoteConversationSessions(list));
+  if (!list.length) return;
+  const pendingPinSessionIds = await prepareRemoteConversationSessions(list);
+  const outboxAuthScope = await resolvePendingPinOutboxScope();
+  await runForegroundSqliteWrite((w) =>
+    getDb().transaction((tx) =>
+      applyRemoteConversationSessionsInWriter(
+        w, tx, list, pendingPinSessionIds, outboxAuthScope)));
 }
 
-export async function applyConversationSessionTombstones(
+export function applyConversationSessionTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
+  return runBackgroundSqliteWrite((w) =>
+    getDb().transaction((tx) => applyConversationSessionTombstonesInWriter(w, tx, tombstones)));
+}
+
+export function applyConversationSessionTombstonesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(w);
   if (!tombstones.length) return;
-  const db = getDb();
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
+    tx
       .update(schema.conversationSessions)
       .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.conversationSessions.id, item.id));
-    await db
+      .where(eq(schema.conversationSessions.id, item.id))
+      .run();
+    tx
       .update(schema.conversationMessages)
       .set({ deletedAt, updatedAt: deletedAt })
       .where(
@@ -1056,14 +1131,14 @@ export async function applyConversationSessionTombstones(
           eq(schema.conversationMessages.sessionId, item.id),
           isNull(schema.conversationMessages.deletedAt),
         ),
-      );
+      )
+      .run();
   }
   notifyConversationChanges();
 }
 
-async function hasLocalOnlyMessages(sessionId: string): Promise<boolean> {
-  const db = getDb();
-  const rows = await db
+function hasLocalOnlyMessages(db: SqliteHandle, sessionId: string): boolean {
+  const rows = db
     .select({ metadata: schema.conversationMessages.messageMetadata })
     .from(schema.conversationMessages)
     .where(
@@ -1071,7 +1146,8 @@ async function hasLocalOnlyMessages(sessionId: string): Promise<boolean> {
         eq(schema.conversationMessages.sessionId, sessionId),
         isNull(schema.conversationMessages.deletedAt),
       ),
-    );
+    )
+    .all();
   return rows.some((row) =>
     Boolean((row.metadata as Record<string, unknown> | null)?.local_only),
   );
@@ -1468,7 +1544,8 @@ async function dispatchPendingConversationMessageOnce(
   // first: a retry of an accepted message must not stop its own response.
   const stoppedMessages = await interruptConversationForSend(sessionId);
   if (stoppedMessages.length) {
-    await runForegroundSqliteWrite(() => applyRemoteConversationMessages(stoppedMessages));
+    await runForegroundSqliteWrite((w) =>
+      getDb().transaction((tx) => applyRemoteConversationMessagesInWriter(w, tx, stoppedMessages)));
   }
   onHandoff?.();
   const currentPayload = pendingDispatchPayload(current, {
@@ -1550,7 +1627,6 @@ async function flushPendingCharacterUpdate(
 async function promoteLocalSession(
   session: DbSession,
 ): Promise<ConversationSession> {
-  const db = getDb();
   const pending = pendingAgentBinding(session);
   if (pending) {
     const token = await getToken();
@@ -1586,26 +1662,32 @@ async function promoteLocalSession(
   // rather than nesting coordinator callbacks. Keep all promotion writes in
   // that one slot so a Docs background transaction cannot start between the
   // remote-session upsert and the local-session reassignment/tombstone.
-  await runForegroundSqliteWrite(async () => {
-    await applyRemoteConversationSessions([remote]);
+  const pendingPinSessionIds = await prepareRemoteConversationSessions([remote]);
+  const outboxAuthScope = await resolvePendingPinOutboxScope();
+  await runForegroundSqliteWrite((w) =>
+    getDb().transaction((tx) => {
+      applyRemoteConversationSessionsInWriter(
+        w, tx, [remote], pendingPinSessionIds, outboxAuthScope);
 
-    const now = new Date().toISOString();
-    await db
-      .update(schema.conversationMessages)
-      .set({ sessionId: remote.id, updatedAt: now })
-      .where(eq(schema.conversationMessages.sessionId, session.id));
-    await db
-      .update(schema.conversationSessions)
-      .set({
-        deletedAt: now,
-        updatedAt: now,
-        sessionMetadata: {
-          local_only: true,
-          promoted_to_session_id: remote.id,
-        },
-      })
-      .where(eq(schema.conversationSessions.id, session.id));
-  });
+      const now = new Date().toISOString();
+      tx
+        .update(schema.conversationMessages)
+        .set({ sessionId: remote.id, updatedAt: now })
+        .where(eq(schema.conversationMessages.sessionId, session.id))
+        .run();
+      tx
+        .update(schema.conversationSessions)
+        .set({
+          deletedAt: now,
+          updatedAt: now,
+          sessionMetadata: {
+            local_only: true,
+            promoted_to_session_id: remote.id,
+          },
+        })
+        .where(eq(schema.conversationSessions.id, session.id))
+        .run();
+    }));
 
   notifyConversationChanges();
   return remote;
@@ -1806,20 +1888,25 @@ async function uploadLocalSessionOnce(
     }
     remoteId = remote.id;
     // 付替え・tombstone 前の中間状態マーカーを保存（再開の起点）。
-    await runForegroundSqliteWrite(async () => {
-    await db
-      .update(schema.conversationSessions)
-      .set({
-        sessionMetadata: {
-          ...metadata,
-          upload_target_session_id: remote.id,
-          upload_resume_version: 2,
-        },
-        updatedAt: new Date().toISOString(),
-      })
-      .where(eq(schema.conversationSessions.id, row.id));
-    await applyRemoteConversationSessions([remote]);
-    });
+    const pendingPinSessionIds = await prepareRemoteConversationSessions([remote]);
+    const outboxAuthScope = await resolvePendingPinOutboxScope();
+    await runForegroundSqliteWrite((w) =>
+      getDb().transaction((tx) => {
+        tx
+          .update(schema.conversationSessions)
+          .set({
+            sessionMetadata: {
+              ...metadata,
+              upload_target_session_id: remote.id,
+              upload_resume_version: 2,
+            },
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(schema.conversationSessions.id, row.id))
+          .run();
+        applyRemoteConversationSessionsInWriter(
+          w, tx, [remote], pendingPinSessionIds, outboxAuthScope);
+      }));
   }
 
   for (let index = 0; index < uploads.length; index += 1) {
@@ -1985,27 +2072,38 @@ export async function flushPendingConversations(): Promise<void> {
   }
 }
 
-export async function reconcileConversationSessionsWithServer(
+export function reconcileConversationSessionsWithServer(
   authoritativeIds?: string[],
 ): Promise<void> {
+  return runBackgroundSqliteWrite((w) =>
+    getDb().transaction((tx) => reconcileConversationSessionsWithServerInWriter(w, tx, authoritativeIds)));
+}
+
+export function reconcileConversationSessionsWithServerInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  authoritativeIds?: string[],
+): void {
+  assertActiveWriter(w);
   if (!authoritativeIds) return;
   const remoteIds = new Set(authoritativeIds);
-  const db = getDb();
-  const rows = await db
+  const rows = tx
     .select()
     .from(schema.conversationSessions)
-    .where(isNull(schema.conversationSessions.deletedAt));
+    .where(isNull(schema.conversationSessions.deletedAt))
+    .all();
   const deletedAt = new Date().toISOString();
   let changed = false;
   for (const row of rows) {
     if (remoteIds.has(row.id)) continue;
     if (!isServerBackedSession(row)) continue;
-    if (await hasLocalOnlyMessages(row.id)) continue;
-    await db
+    if (hasLocalOnlyMessages(tx, row.id)) continue;
+    tx
       .update(schema.conversationSessions)
       .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.conversationSessions.id, row.id));
-    await db
+      .where(eq(schema.conversationSessions.id, row.id))
+      .run();
+    tx
       .update(schema.conversationMessages)
       .set({ deletedAt, updatedAt: deletedAt })
       .where(
@@ -2013,7 +2111,8 @@ export async function reconcileConversationSessionsWithServer(
           eq(schema.conversationMessages.sessionId, row.id),
           isNull(schema.conversationMessages.deletedAt),
         ),
-      );
+      )
+      .run();
     changed = true;
   }
   if (changed) notifyConversationChanges();
@@ -2115,8 +2214,15 @@ async function loadReconciledLocalMessageIds(
   sessionId: string,
   remoteMessages: ConversationMessage[],
 ): Promise<string[]> {
-  const db = getDb();
-  const rows = await db
+  return loadReconciledLocalMessageIdsSync(getDb(), sessionId, remoteMessages);
+}
+
+function loadReconciledLocalMessageIdsSync(
+  db: SqliteHandle,
+  sessionId: string,
+  remoteMessages: ConversationMessage[],
+): string[] {
+  const rows = db
     .select()
     .from(schema.conversationMessages)
     .where(
@@ -2125,14 +2231,27 @@ async function loadReconciledLocalMessageIds(
         isNull(schema.conversationMessages.deletedAt),
       ),
     )
-    .orderBy(asc(schema.conversationMessages.createdAt));
+    .orderBy(asc(schema.conversationMessages.createdAt))
+    .all();
   return reconciledLocalMessageIds(sessionId, rows, remoteMessages);
 }
 
-export async function applyRemoteConversationMessages(
+export function applyRemoteConversationMessages(
   list: ConversationMessage[],
   options: ApplyRemoteConversationMessagesOptions = {},
 ): Promise<ApplyRemoteConversationMessagesResult> {
+  return runBackgroundSqliteWrite((w) =>
+    getDb().transaction((tx) => applyRemoteConversationMessagesInWriter(w, tx, list, options)));
+}
+
+/** Synchronous body: runs inside one coordinator write unit and the caller's transaction. */
+export function applyRemoteConversationMessagesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  list: ConversationMessage[],
+  options: ApplyRemoteConversationMessagesOptions = {},
+): ApplyRemoteConversationMessagesResult {
+  assertActiveWriter(w);
   if (!list.length) {
     return {
       receivedCount: 0,
@@ -2146,9 +2265,8 @@ export async function applyRemoteConversationMessages(
       transactionDurationMs: 0,
     };
   }
-  const db = getDb();
   const now = new Date().toISOString();
-  const existingRows = await db
+  const existingRows = tx
     .select()
     .from(schema.conversationMessages)
     .where(
@@ -2156,17 +2274,18 @@ export async function applyRemoteConversationMessages(
         schema.conversationMessages.id,
         [...new Set(list.map((message) => message.id))],
       ),
-    );
+    )
+    .all();
   const existingById = new Map(existingRows.map((row) => [row.id, row]));
   const reconciledLocalIds = options.reconcileSessionId
-    ? await loadReconciledLocalMessageIds(options.reconcileSessionId, list)
+    ? loadReconciledLocalMessageIdsSync(tx, options.reconcileSessionId, list)
     : [];
   // Synchronous reads after the final await: no deletion can interleave before the transaction.
   const parentIds = [...new Set(list.map((message) => message.session_id))];
   const deletedParents = new Set<string>();
   let parentReadStatements = 0;
   for (let offset = 0; offset < parentIds.length; offset += 500) {
-    const parents = db.select().from(schema.conversationSessions)
+    const parents = tx.select().from(schema.conversationSessions)
       .where(inArray(schema.conversationSessions.id, parentIds.slice(offset, offset + 500))).all();
     parentReadStatements += 1;
     for (const parent of parents) {
@@ -2218,7 +2337,7 @@ export async function applyRemoteConversationMessages(
       "conversation-message-apply",
     );
     try {
-      db.transaction((tx) => {
+      {
         if (reconciledLocalIds.length) {
           tx
             .delete(schema.conversationMessages)
@@ -2256,7 +2375,7 @@ export async function applyRemoteConversationMessages(
             })
             .run();
         }
-      });
+      }
     } finally {
       transactionDurationMs = stop();
     }
@@ -2289,17 +2408,27 @@ export async function applyRemoteConversationMessages(
   };
 }
 
-export async function applyConversationMessageTombstones(
+export function applyConversationMessageTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
+  return runBackgroundSqliteWrite((w) =>
+    getDb().transaction((tx) => applyConversationMessageTombstonesInWriter(w, tx, tombstones)));
+}
+
+export function applyConversationMessageTombstonesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(w);
   if (!tombstones.length) return;
-  const db = getDb();
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
+    tx
       .update(schema.conversationMessages)
       .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.conversationMessages.id, item.id));
+      .where(eq(schema.conversationMessages.id, item.id))
+      .run();
   }
 }
 
@@ -2333,14 +2462,16 @@ async function readConversationMessageCursor(
   return rows[0]?.cursor ?? null;
 }
 
-function writeConversationMessageCursor(
+function writeConversationMessageCursorInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
   authScope: string,
   sessionId: string,
   cursor: string,
 ): void {
-  const db = getDb();
+  assertActiveWriter(w);
   const tableName = conversationMessageSyncStateKey(authScope, sessionId);
-  db
+  tx
     .insert(schema.syncState)
     .values({ tableName, cursor, lastPulledAt: cursor })
     .onConflictDoUpdate({
@@ -2422,10 +2553,13 @@ function mergeConversationMessageDelta(
   }
 }
 
-function reconcileFullActiveMessages(
+function reconcileFullActiveMessagesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
   local: ConversationMessage[],
   remote: ConversationMessage[],
 ): number {
+  assertActiveWriter(w);
   const activeRemoteIds = new Set(
     remote
       .filter(remoteActiveBranch)
@@ -2437,39 +2571,36 @@ function reconcileFullActiveMessages(
         !isLocalOnlyMessage(message) && !activeRemoteIds.has(message.id),
     )
     .map((message) => message.id);
-  if (!staleIds.length) return 0;
-
-  const db = getDb();
-  db.transaction((tx) => {
-    for (const id of staleIds) {
-      tx
-        .update(schema.conversationMessages)
-        .set({ isActiveBranch: false })
-        .where(eq(schema.conversationMessages.id, id))
-        .run();
-    }
-  });
+  for (const id of staleIds) {
+    tx
+      .update(schema.conversationMessages)
+      .set({ isActiveBranch: false })
+      .where(eq(schema.conversationMessages.id, id))
+      .run();
+  }
   return staleIds.length;
 }
 
-async function updateSessionMessageStatsIfChanged(
+/** Returns true when the session row changed; the caller notifies after commit. */
+function updateSessionMessageStatsIfChangedInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
   sessionId: string,
   messageCount: number,
-): Promise<boolean> {
-  const db = getDb();
-  const session = (
-    await db
-      .select()
-      .from(schema.conversationSessions)
-      .where(eq(schema.conversationSessions.id, sessionId))
-  )[0];
+): boolean {
+  assertActiveWriter(w);
+  const session = tx
+    .select()
+    .from(schema.conversationSessions)
+    .where(eq(schema.conversationSessions.id, sessionId))
+    .all()[0];
   if (!session) return false;
   const metadata =
     (session.sessionMetadata as Record<string, unknown> | null) ?? {};
   const currentCount = Number(metadata.message_count ?? 0);
   const currentActive = Boolean(metadata.is_active ?? true);
   if (currentCount === messageCount && currentActive) return false;
-  await db
+  tx
     .update(schema.conversationSessions)
     .set({
       sessionMetadata: {
@@ -2479,9 +2610,30 @@ async function updateSessionMessageStatsIfChanged(
       },
       updatedAt: new Date().toISOString(),
     })
-    .where(eq(schema.conversationSessions.id, sessionId));
-  notifyConversationChanges();
+    .where(eq(schema.conversationSessions.id, sessionId))
+    .run();
   return true;
+}
+
+function listActiveMessagesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  sessionId: string,
+): ConversationMessage[] {
+  assertActiveWriter(w);
+  return tx
+    .select()
+    .from(schema.conversationMessages)
+    .where(
+      and(
+        eq(schema.conversationMessages.sessionId, sessionId),
+        isNull(schema.conversationMessages.deletedAt),
+      ),
+    )
+    .orderBy(schema.conversationMessages.createdAt)
+    .all()
+    .filter((row) => row.isActiveBranch !== false)
+    .map(toMessage);
 }
 
 async function fetchConversationMessageDelta(
@@ -2856,59 +3008,64 @@ export const conversationsRepo = {
 
     // Keep message writes, reconciliation, stats and the cursor in one queued
     // unit so they cannot overlap a native Docs promotion transaction.
-    return runForegroundSqliteWrite(async () => {
-      const session = getDb().select().from(schema.conversationSessions)
-        .where(eq(schema.conversationSessions.id, sessionId)).get();
-      if (isUserDeletedSession(session)) {
-        return {
-          messages: [], mode, receivedCount: response.messages.length,
-          upsertedCount: 0, inactiveCount: 0, cursor: response.server_time,
-        };
-      }
-      const local = await this.listMessagesLocal(sessionId);
-      const applyResult = await applyRemoteConversationMessages(
-        response.messages,
-        { reconcileSessionId: sessionId },
-      );
-      const isFull = mode !== "delta";
-      const reconciledInactiveCount = isFull
-        ? reconcileFullActiveMessages(local, response.messages)
-        : 0;
-      const messages = mergeConversationMessageDelta(
-        local,
-        response.messages,
-        isFull,
-      );
-      await updateSessionMessageStatsIfChanged(sessionId, messages.length);
-
-      // cursorはremote適用・reconcile・session statsがすべて成功した後だけ進める。
-      // overlapで同じcursorが返った場合はsync_state自体も書き換えない。
-      if (response.server_time !== previousCursor) {
-        writeConversationMessageCursor(
-          authScope,
-          sessionId,
-          response.server_time,
+    const outcome = await runForegroundSqliteWrite((w) =>
+      getDb().transaction((tx) => {
+        const session = tx.select().from(schema.conversationSessions)
+          .where(eq(schema.conversationSessions.id, sessionId)).all()[0];
+        if (isUserDeletedSession(session)) {
+          return {
+            changed: false,
+            result: {
+              messages: [], mode, receivedCount: response.messages.length,
+              upsertedCount: 0, inactiveCount: 0, cursor: response.server_time,
+            } satisfies RefreshConversationMessagesResult,
+          };
+        }
+        const local = listActiveMessagesInWriter(w, tx, sessionId);
+        const applyResult = applyRemoteConversationMessagesInWriter(
+          w, tx, response.messages, { reconcileSessionId: sessionId });
+        const isFull = mode !== "delta";
+        const reconciledInactiveCount = isFull
+          ? reconcileFullActiveMessagesInWriter(w, tx, local, response.messages)
+          : 0;
+        const messages = mergeConversationMessageDelta(
+          local,
+          response.messages,
+          isFull,
         );
-      }
+        const statsChanged = updateSessionMessageStatsIfChangedInWriter(
+          w, tx, sessionId, messages.length);
 
-      const inactiveCount =
-        response.messages.filter((message) => !remoteActiveBranch(message)).length +
-        reconciledInactiveCount;
-      conversationPerformanceDiagnostics.increment(
-        "merge",
-        "conversation-message-inactive",
-        inactiveCount,
-      );
-      return {
-        messages,
-        mode,
-        receivedCount: applyResult.receivedCount,
-        upsertedCount: applyResult.upsertedCount,
-        inactiveCount,
-        cursor: response.server_time,
-        ...(fallbackReason ? { fallbackReason } : {}),
-      };
-    });
+        // cursorはremote適用・reconcile・session statsがすべて成功した後だけ進める。
+        // overlapで同じcursorが返った場合はsync_state自体も書き換えない。
+        if (response.server_time !== previousCursor) {
+          writeConversationMessageCursorInWriter(
+            w, tx, authScope, sessionId, response.server_time);
+        }
+
+        const inactiveCount =
+          response.messages.filter((message) => !remoteActiveBranch(message)).length +
+          reconciledInactiveCount;
+        conversationPerformanceDiagnostics.increment(
+          "merge",
+          "conversation-message-inactive",
+          inactiveCount,
+        );
+        return {
+          changed: statsChanged,
+          result: {
+            messages,
+            mode,
+            receivedCount: applyResult.receivedCount,
+            upsertedCount: applyResult.upsertedCount,
+            inactiveCount,
+            cursor: response.server_time,
+            ...(fallbackReason ? { fallbackReason } : {}),
+          } satisfies RefreshConversationMessagesResult,
+        };
+      }));
+    if (outcome.changed) notifyConversationChanges();
+    return outcome.result;
   },
 
   async getSessionLocal(
@@ -3295,10 +3452,13 @@ export const conversationsRepo = {
     sessionId: string,
     messages: ConversationMessage[],
   ): Promise<void> {
-    await runForegroundSqliteWrite(async () => {
-      await applyRemoteConversationMessages(messages);
-      await updateSessionMessageStatsIfChanged(sessionId, messages.length);
-    });
+    const changed = await runForegroundSqliteWrite((w) =>
+      getDb().transaction((tx) => {
+        applyRemoteConversationMessagesInWriter(w, tx, messages);
+        return updateSessionMessageStatsIfChangedInWriter(
+          w, tx, sessionId, messages.length);
+      }));
+    if (changed) notifyConversationChanges();
   },
 
   async appendLocalMessage(
@@ -3670,7 +3830,8 @@ export const conversationsRepo = {
     messageId: string,
   ): Promise<ConversationMessage[]> {
     const branches = await chatApi.getMessageBranches(sessionId, messageId);
-    await runForegroundSqliteWrite(() => applyRemoteConversationMessages(branches));
+    await runForegroundSqliteWrite((w) =>
+      getDb().transaction((tx) => applyRemoteConversationMessagesInWriter(w, tx, branches)));
     return branches;
   },
 

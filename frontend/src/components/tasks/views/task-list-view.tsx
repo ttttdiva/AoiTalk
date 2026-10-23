@@ -17,6 +17,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -99,9 +101,10 @@ import {
 } from "@/components/tasks/task-list-rows";
 import {
   TaskProposalList,
+  TaskProposalIndicators,
 } from "@/components/tasks/task-proposal-card";
 import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
-import type { TaskProposal } from "@/lib/task-proposals-api";
+import { taskProposalChatPath, type TaskProposal } from "@/lib/task-proposals-api";
 import {
   DEFAULT_TASK_COLUMN_WIDTHS,
   DEFAULT_TASK_COLUMN_VISIBILITY,
@@ -129,8 +132,10 @@ export const TASK_LIST_STATIC_COLUMN_WIDTH =
   TASK_LIST_EXPAND_COLUMN_WIDTH +
   TASK_LIST_STATUS_COLUMN_WIDTH;
 
-export function taskProposalChatHref(sessionId: string): string {
-  return withBasePath(`/chat?s=${encodeURIComponent(sessionId)}`);
+export function taskProposalChatHref(
+  proposal: Pick<TaskProposal, "id" | "session_id">,
+): string {
+  return withBasePath(taskProposalChatPath(proposal));
 }
 
 export type TaskListTableLayoutInput = {
@@ -195,6 +200,9 @@ type MobileTaskCardProps = {
   wbsMetadata: Record<string, unknown> | null;
   selected: boolean;
   focused: boolean;
+  pendingProposalCount: number;
+  pendingSubtaskProposalCount: number;
+  pendingSubtasks: Task[];
   showPriority: boolean;
   readOnly: boolean;
   now: number;
@@ -209,7 +217,61 @@ type MobileTaskCardProps = {
   onTagUpdated: () => void;
   onTagFilter: (tagName: string) => void;
   onTimer: (event: React.MouseEvent) => void;
+  onOpenSubtask: (subtask: Task) => void;
 };
+
+function PendingSubtaskAccess({
+  subtasks,
+  onOpen,
+  compact = false,
+}: {
+  subtasks: Task[];
+  onOpen: (subtask: Task) => void;
+  compact?: boolean;
+}) {
+  if (subtasks.length === 0) return null;
+
+  const label = compact
+    ? `子を開く (${subtasks.length})`
+    : `承認待ちの子タスクを開く (${subtasks.length})`;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        type="button"
+        aria-label={`承認待ちの子タスクを開く ${subtasks.length}件`}
+        data-no-drag="true"
+        className={cn(
+          "shrink-0 rounded px-1.5 py-1 text-[10px] font-medium text-amber-900 underline decoration-amber-500/50 underline-offset-2 hover:bg-amber-100 dark:text-amber-200 dark:hover:bg-amber-950/50",
+          compact && "h-5 py-0",
+        )}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        {label}
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="w-64 max-w-[calc(100vw-2rem)]"
+      >
+        <DropdownMenuLabel>承認待ちの子タスク</DropdownMenuLabel>
+        {subtasks.map((subtask) => (
+          <DropdownMenuItem
+            key={subtask.id}
+            className="cursor-pointer"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpen(subtask);
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <span className="min-w-0 truncate">{subtask.title}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 function MobileTaskCard({
   task,
@@ -218,6 +280,9 @@ function MobileTaskCard({
   wbsMetadata,
   selected,
   focused,
+  pendingProposalCount,
+  pendingSubtaskProposalCount,
+  pendingSubtasks,
   showPriority,
   readOnly,
   now,
@@ -232,6 +297,7 @@ function MobileTaskCard({
   onTagUpdated,
   onTagFilter,
   onTimer,
+  onOpenSubtask,
 }: MobileTaskCardProps) {
   const startAt = getTaskDisplayStartAt(task);
   const endAt = getTaskDisplayEndAt(task);
@@ -253,6 +319,8 @@ function MobileTaskCard({
       className={cn(
         "ao-task-card group rounded border border-transparent bg-card/40 px-3 py-3 transition-colors",
         "hover:border-border hover:bg-muted/60",
+        (pendingProposalCount > 0 || pendingSubtaskProposalCount > 0) &&
+          "border-amber-400/70 bg-amber-50/60 dark:border-amber-500/40 dark:bg-amber-950/20",
         focused && "is-focused ring-1 ring-primary/60",
         selected && "is-selected border-primary/60 bg-primary/5",
         displayStatus === "closed" && "opacity-80",
@@ -380,6 +448,11 @@ function MobileTaskCard({
           </div>
 
           <div className="mt-2 flex min-h-5 items-center gap-1.5 text-[10px] text-muted-foreground">
+            <TaskProposalIndicators
+              count={pendingProposalCount}
+              childCount={pendingSubtaskProposalCount}
+              className="shrink-0"
+            />
             {subtasks.length > 0 && (
               <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
                 {closedSubtasks}/{subtasks.length} 子タスク
@@ -435,6 +508,7 @@ function MobileTaskCard({
           </div>
         </div>
       </div>
+      <PendingSubtaskAccess subtasks={pendingSubtasks} onOpen={onOpenSubtask} />
     </article>
   );
 }
@@ -479,7 +553,6 @@ type TaskListViewProps = {
     occurrenceContext?: RecurringOccurrenceContext | null,
   ) => void;
   browseScope?: TaskBrowseScope | null;
-  onConfirmProposal?: (proposal: TaskProposal) => void;
 };
 
 type TaskListFilterState = {
@@ -530,7 +603,6 @@ export function TaskListView({
   openTask,
   openTaskById,
   browseScope = null,
-  onConfirmProposal,
 }: TaskListViewProps) {
   // Search has two viewport-specific controls. Keep the refs separate so the
   // desktop toolbar cannot overwrite the visible mobile input (Ctrl/Cmd+F
@@ -1700,28 +1772,98 @@ export function TaskListView({
     projectMap,
   ]);
 
-  const proposalTaskIds = useMemo(
-    () => filteredTasks.map((task) => task.id),
-    [filteredTasks],
+  const proposalProjectScopeIds = useMemo(
+    () =>
+      browseProjectIds ??
+      (projectTab === "all" ? projectIds : new Set([projectTab])),
+    [browseProjectIds, projectIds, projectTab],
   );
+  const proposalScopedParentTasks = useMemo(
+    () =>
+      filteredTasks.filter(
+        (task) =>
+          proposalProjectScopeIds.has(task.project_id) &&
+          projectAccessById.has(task.project_id),
+      ),
+    [filteredTasks, projectAccessById, proposalProjectScopeIds],
+  );
+  const proposalScopedSubtasksByParentTaskId = useMemo(() => {
+    const scoped = new Map<string, Task[]>();
+    for (const task of proposalScopedParentTasks) {
+      const children = (subtaskMap.get(task.id) ?? []).filter(
+        (subtask) =>
+          proposalProjectScopeIds.has(subtask.project_id) &&
+          projectAccessById.has(subtask.project_id),
+      );
+      if (children.length > 0) scoped.set(task.id, children);
+    }
+    return scoped;
+  }, [
+    proposalScopedParentTasks,
+    projectAccessById,
+    proposalProjectScopeIds,
+    subtaskMap,
+  ]);
+  const proposalTaskIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const task of proposalScopedParentTasks) {
+      ids.push(task.id);
+      ids.push(
+        ...(proposalScopedSubtasksByParentTaskId.get(task.id) ?? []).map(
+          (subtask) => subtask.id,
+        ),
+      );
+    }
+    return ids;
+  }, [proposalScopedParentTasks, proposalScopedSubtasksByParentTaskId]);
   const proposalState = useTaskProposals({
     taskIds: proposalTaskIds,
     loading: loading || (projectsLoading && projects.length === 0),
   });
-  const handleProposalConfirm = useCallback(
-    (proposal: TaskProposal) => {
-      if (onConfirmProposal) {
-        onConfirmProposal(proposal);
-        return;
-      }
-      if (typeof window !== "undefined") {
-        window.location.assign(
-          taskProposalChatHref(proposal.session_id),
-        );
-      }
-    },
-    [onConfirmProposal],
-  );
+  const proposalCountByTaskId = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const proposal of proposalState.proposals) {
+      if (proposal.status !== "pending") continue;
+      counts.set(proposal.task_id, (counts.get(proposal.task_id) ?? 0) + 1);
+    }
+    return counts;
+  }, [proposalState.proposals]);
+  const proposalCountByParentTaskId = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const task of proposalScopedParentTasks) {
+      const count = (proposalScopedSubtasksByParentTaskId.get(task.id) ?? []).reduce(
+        (total, subtask) =>
+          total + (proposalCountByTaskId.get(subtask.id) ?? 0),
+        0,
+      );
+      if (count > 0) counts.set(task.id, count);
+    }
+    return counts;
+  }, [
+    proposalCountByTaskId,
+    proposalScopedParentTasks,
+    proposalScopedSubtasksByParentTaskId,
+  ]);
+  const pendingSubtasksByParentTaskId = useMemo(() => {
+    const pending = new Map<string, Task[]>();
+    for (const task of proposalScopedParentTasks) {
+      const children = (proposalScopedSubtasksByParentTaskId.get(task.id) ?? []).filter(
+        (subtask) => (proposalCountByTaskId.get(subtask.id) ?? 0) > 0,
+      );
+      if (children.length > 0) pending.set(task.id, children);
+    }
+    return pending;
+  }, [
+    proposalCountByTaskId,
+    proposalScopedParentTasks,
+    proposalScopedSubtasksByParentTaskId,
+  ]);
+  const showProposalLoading = proposalState.status === "loading";
+  const showProposalStatus =
+    proposalState.status === "error" ||
+    proposalState.status === "unavailable" ||
+    proposalState.status === "uncertain" ||
+    Boolean(proposalState.uncertainNotice);
 
   // キーボード移動は、展開された親の直後に表示されるサブタスクも
   // 1 行ずつ辿れるよう、デスクトップの表示順と同じフラットな配列を使う。
@@ -2035,18 +2177,29 @@ export function TaskListView({
         タップで開く / チェックで複数選択
       </p>
 
-      <TaskProposalList
-        state={proposalState}
-        getDecisionState={proposalState.getDecisionState}
-        onDecision={proposalState.decide}
-        onConfirm={handleProposalConfirm}
-        onRefresh={proposalState.refresh}
-        decisionDisabled={(proposal) => {
-          const task = tasks.find((item) => item.id === proposal.task_id);
-          return task ? isTaskReadOnly(task) : true;
-        }}
-        className="mx-3 mb-2"
-      />
+      {showProposalLoading ? (
+        <p role="status" className="mx-3 mb-2 text-xs text-muted-foreground">
+          承認待ちの提案を確認中…
+        </p>
+      ) : null}
+      {showProposalStatus ? (
+        <TaskProposalList
+          state={{
+            ...proposalState,
+            proposals: [],
+            status:
+              proposalState.status === "ready" && proposalState.uncertainNotice
+                ? "empty"
+                : proposalState.status,
+          }}
+          getDecisionState={proposalState.getDecisionState}
+          onDecision={proposalState.decide}
+          onConfirm={() => {}}
+          onRefresh={proposalState.refresh}
+          heading={null}
+          className="mx-3 mb-2"
+        />
+      ) : null}
 
       {/* タスクテーブル */}
       <ScrollArea className="min-h-0 flex-1">
@@ -2118,6 +2271,15 @@ export function TaskListView({
                     wbsMetadata={wbsMetadata}
                     selected={selectedIds.has(task.id)}
                     focused={focusedTaskId === task.id}
+                    pendingProposalCount={
+                      proposalCountByTaskId.get(task.id) ?? 0
+                    }
+                    pendingSubtaskProposalCount={
+                      proposalCountByParentTaskId.get(task.id) ?? 0
+                    }
+                    pendingSubtasks={
+                      pendingSubtasksByParentTaskId.get(task.id) ?? []
+                    }
                     showPriority={showPriority}
                     readOnly={taskReadOnly}
                     now={now}
@@ -2142,6 +2304,10 @@ export function TaskListView({
                     onTagFilter={setSearch}
                     onTimer={(event) => {
                       void handleTimer(task, event);
+                    }}
+                    onOpenSubtask={(subtask) => {
+                      focusTaskById(subtask.id);
+                      openTask(subtask);
                     }}
                   />
                 );
@@ -2285,6 +2451,13 @@ export function TaskListView({
                           (s) => getTaskDisplayStatus(s) !== "closed",
                         );
                     const isExpanded = expandedTasks.has(task.id);
+                    const pendingSubtasks =
+                      pendingSubtasksByParentTaskId.get(task.id) ?? [];
+                    const hiddenPendingSubtasks = pendingSubtasks.filter(
+                      (subtask) =>
+                        !isExpanded ||
+                        !visibleSubtasks.some((visible) => visible.id === subtask.id),
+                    );
                     const displayStatus = getTaskDisplayStatus(task);
                     const trackedTimeLabel = formatTimerClock(
                       getTrackedTimerSeconds(
@@ -2324,6 +2497,9 @@ export function TaskListView({
                           title="ドラッグで並び替え / 行の右側に落とすとサブタスク化"
                           className={cn(
                              "ao-task-row group relative h-11 cursor-pointer border-b border-border/60 transition-colors hover:bg-card/70 focus:outline-none",
+                             ((proposalCountByTaskId.get(task.id) ?? 0) > 0 ||
+                               (proposalCountByParentTaskId.get(task.id) ?? 0) > 0) &&
+                               "bg-amber-50/50 dark:bg-amber-950/20",
                              draggingIds.includes(task.id) && "opacity-40",
                              taskReadOnly && "opacity-60",
                             selectedIds.has(task.id) && "is-selected bg-primary/5",
@@ -2336,7 +2512,12 @@ export function TaskListView({
                         >
                           {/* 選択チェックボックス（Shift+クリック範囲選択対応） */}
                             <td
-                              className="h-11 py-0 pl-6"
+                              className={cn(
+                                "h-11 py-0 pl-6",
+                                ((proposalCountByTaskId.get(task.id) ?? 0) > 0 ||
+                                  (proposalCountByParentTaskId.get(task.id) ?? 0) > 0) &&
+                                  "border-l-2 border-l-amber-500",
+                              )}
                             data-no-drag="true"
                             onClick={(e) => e.stopPropagation()}
                           >
@@ -2479,6 +2660,20 @@ export function TaskListView({
                               >
                                 {task.title}
                               </span>
+                              <TaskProposalIndicators
+                                count={proposalCountByTaskId.get(task.id) ?? 0}
+                                childCount={
+                                  proposalCountByParentTaskId.get(task.id) ?? 0
+                                }
+                              />
+                              <PendingSubtaskAccess
+                                subtasks={hiddenPendingSubtasks}
+                                compact
+                                onOpen={(subtask) => {
+                                  focusTaskById(subtask.id);
+                                  openTask(subtask);
+                                }}
+                              />
                               {task.source === "remote" && (
                                 <span
                                   className="shrink-0 text-[11px] text-muted-foreground"
@@ -2892,6 +3087,9 @@ export function TaskListView({
                                onFocus={() => handleTaskRowFocus(sub.id)}
                                focusRow={() => focusTaskById(sub.id)}
                                focused={focusedTaskId === sub.id}
+                              pendingProposalCount={
+                                proposalCountByTaskId.get(sub.id) ?? 0
+                              }
                              />
                           ))}
 

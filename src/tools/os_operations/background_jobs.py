@@ -511,6 +511,15 @@ class BackgroundJobRegistry:
                 timeout_seconds = max(0.1, float(raw_timeout)) if raw_timeout is not None else None
             except (ImportError, TypeError, ValueError):
                 raise BackgroundJobError("scoped command backend selection failed") from None
+            # Launch-time narrowing by an active request-local command budget
+            # (remaining absolute task deadline); never refreshed on reads.
+            from ...llm.generation_budget import bounded_command_timeout
+            from ...llm.generation_cancellation import GenerationCancelled
+
+            try:
+                timeout_seconds = bounded_command_timeout(timeout_seconds)
+            except (TimeoutError, GenerationCancelled):
+                raise BackgroundJobError("タスクの制限時間を超過したため、バックグラウンド実行を起動しませんでした。") from None
         scoped_backend = None
         if scope is not None:
             try:
@@ -581,6 +590,16 @@ class BackgroundJobRegistry:
         popen_kwargs: Dict[str, Any] = build_process_group_kwargs()
         if backend_kind == "native_windows" and os.name == "nt":
             popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        if scope is not None:
+            # backend/cwd/env の準備中に進んだ時間を反映するため、起動直前に期限を再確認する。
+            from ...llm.generation_budget import bounded_command_timeout
+            from ...llm.generation_cancellation import GenerationCancelled
+
+            try:
+                timeout_seconds = bounded_command_timeout(timeout_seconds)
+            except (TimeoutError, GenerationCancelled):
+                raise BackgroundJobError("タスクの制限時間を超過したため、バックグラウンド実行を起動しませんでした。") from None
 
         try:
             if scoped_backend is not None:

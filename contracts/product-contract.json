@@ -235,6 +235,26 @@
         ]
       },
       {
+        "id": "tabs.settings.sync_status",
+        "path": "(tabs)/settings/sync-status",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
+        "id": "tabs.settings.sync_conflicts",
+        "path": "(tabs)/settings/sync-conflicts",
+        "kind": "settings",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.settings"
+        ]
+      },
+      {
         "id": "tabs.settings.connection",
         "path": "(tabs)/settings/connection",
         "kind": "settings",

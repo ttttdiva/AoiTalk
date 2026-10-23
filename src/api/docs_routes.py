@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import date, datetime
 from os import PathLike
-from typing import Any, AsyncContextManager, Awaitable, Callable, Literal, Optional
+from typing import Annotated, Any, AsyncContextManager, Awaitable, Callable, Literal, Optional, Union
 from uuid import UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -411,6 +411,110 @@ class ClipIngestReceiptDetailEnvelope(BaseModel):
     receipt: ClipIngestReceiptDetailResponse
 
 
+class DocsProtocolReadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    root_id: UUID
+    project_id: UUID | None = None
+    view: Literal["document", "record", "outline"] = "document"
+    cursor: str = Field(default="", max_length=512)
+    depth: int = Field(default=8, ge=0, le=32)
+    page_chars: int = Field(default=12000, ge=4096, le=32000)
+
+
+class DocsProtocolEditReadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    root_id: UUID
+    project_id: UUID | None = None
+    cursor: str = Field(default="", max_length=128)
+    depth: int = Field(default=8, ge=0, le=32)
+    page_chars: int = Field(default=12000, ge=4096, le=32000)
+
+
+class _DocsChangesetOperation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DocsUpdateOperation(_DocsChangesetOperation):
+    op: Literal["update"]
+    node_id: str
+    title: str | None = None
+    description: str | None = None
+    content: str | None = None
+
+
+class DocsCreateOperation(_DocsChangesetOperation):
+    op: Literal["create"]
+    ref: str
+    parent_id: str
+    title: str
+    description: str | None = None
+    content: str | None = None
+    block_type: Literal["paragraph", "markdown", "code"] | None = None
+
+
+class DocsSetFieldsOperation(_DocsChangesetOperation):
+    op: Literal["set_fields"]
+    node_id: str
+    values: dict[str, Any]
+
+
+class DocsAddTagOperation(_DocsChangesetOperation):
+    op: Literal["add_tag"]
+    node_id: str
+    tag_id: str
+
+
+class DocsRemoveTagOperation(_DocsChangesetOperation):
+    op: Literal["remove_tag"]
+    node_id: str
+    tag_id: str
+
+
+class DocsMoveOperation(_DocsChangesetOperation):
+    op: Literal["move"]
+    node_id: str
+    parent_id: str
+    leave_reference: bool | None = None
+
+
+class DocsArchiveOperation(_DocsChangesetOperation):
+    op: Literal["archive"]
+    node_id: str
+
+
+DocsChangesetOperation = Annotated[
+    Union[
+        DocsUpdateOperation,
+        DocsCreateOperation,
+        DocsSetFieldsOperation,
+        DocsAddTagOperation,
+        DocsRemoveTagOperation,
+        DocsMoveOperation,
+        DocsArchiveOperation,
+    ],
+    Field(discriminator="op"),
+]
+
+
+class DocsChangesetPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Literal["revise_section", "upsert_record", "reorganize_subtree"]
+    operations: list[DocsChangesetOperation] = Field(min_length=1, max_length=100)
+
+
+class DocsProtocolChangesetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    root_id: UUID
+    project_id: UUID | None = None
+    write_token: UUID
+    operation_id: UUID
+    changeset: DocsChangesetPayload
+
+
 MEETING_IMPORT_ROLES = frozenset({"minutes", "memo"})
 MEETING_IMPORT_ALLOWED_PARTS = frozenset(
     {"file", "role", "title", "meeting_date", "participants"}
@@ -617,6 +721,49 @@ def create_docs_router(
         if not user_info or "id" not in user_info:
             raise HTTPException(status_code=401, detail="Not authenticated")
         return UUID(user_info["id"])
+
+    async def _resolve_protocol_root_scope(
+        session,
+        *,
+        actor_id: UUID,
+        root_id: UUID,
+        project_id: UUID | None,
+    ) -> tuple[KnowledgeNode, set[UUID], UUID | None]:
+        """Resolve a caller root only inside the canonical Docs scope lanes."""
+
+        from ..services.docs_scope import DocsScopeMode, resolve_docs_scope
+
+        scope = await resolve_docs_scope(
+            session=session,
+            actor_user_id=actor_id,
+            project_id=project_id,
+            mode=(
+                DocsScopeMode.PROJECT_PLUS_PERSONAL
+                if project_id is not None
+                else DocsScopeMode.PERSONAL_ONLY
+            ),
+        )
+        verified_project_id = scope.project_id if project_id is not None else None
+        if project_id is not None and (
+            verified_project_id != project_id or not scope.project_ids
+        ):
+            raise HTTPException(status_code=404, detail="Docs root not found")
+        allowed_ids = set(scope.canonical_node_ids) | set(scope.related_node_ids)
+        root = await session.get(KnowledgeNode, root_id)
+        if (
+            root is None
+            or root_id not in allowed_ids
+            or root.docs_library_id not in set(scope.allowed_library_ids)
+            or getattr(root, "archived_at", None) is not None
+        ):
+            raise HTTPException(status_code=404, detail="Docs root not found")
+        return root, allowed_ids, verified_project_id
+
+    def _protocol_error(status_code: int, code: str, message: str) -> HTTPException:
+        return HTTPException(
+            status_code=status_code,
+            detail={"code": code, "message": message},
+        )
 
     def _request_scope(request: Request, user_id: UUID) -> dict[str, str | None]:
         """Extract request-scoped conversation/project identity without mutating globals.
@@ -2451,6 +2598,175 @@ def create_docs_router(
             await session.close()
 
     # ---------------- 読み取り ----------------
+
+    @router.post("/reads")
+    async def read_protocol_page(
+        payload: DocsProtocolReadRequest,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id = await _get_current_user(request)
+        session = await get_db_manager().get_session()
+        try:
+            root, allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+                session,
+                actor_id=user_id,
+                root_id=payload.root_id,
+                project_id=payload.project_id,
+            )
+            from ..services.docs_protocol_orchestration import read_docs_projection
+
+            return await read_docs_projection(
+                graph=_docs_service(session),
+                root=root,
+                actor_id=user_id,
+                allowed_node_ids=allowed_ids,
+                turn_project_id=verified_project_id,
+                view=payload.view,
+                cursor=payload.cursor,
+                depth=payload.depth,
+                page_chars=payload.page_chars,
+                wire_view=True,
+            )
+        except HTTPException:
+            raise
+        except PermissionError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Docs root not found") from exc
+        except ValueError as exc:
+            await session.rollback()
+            raise _protocol_error(409, "docs_read_conflict", str(exc)) from exc
+        finally:
+            await session.close()
+
+    @router.post("/edit-reads")
+    async def read_protocol_edit_page(
+        payload: DocsProtocolEditReadRequest,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id = await _get_current_user(request)
+        from ..services.docs_consistency import (
+            DocsConflict,
+            DocsContractUnavailable,
+            contract_available,
+        )
+
+        session = await get_db_manager().get_session()
+        try:
+            root, allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+                session,
+                actor_id=user_id,
+                root_id=payload.root_id,
+                project_id=payload.project_id,
+            )
+            if not await contract_available(session):
+                raise DocsContractUnavailable(
+                    "Docs edit protocol migration is required"
+                )
+            from ..services.docs_protocol_orchestration import (
+                http_docs_mutation_binding,
+                read_docs_edit_page,
+            )
+
+            mutation_binding = http_docs_mutation_binding(
+                actor_id=user_id,
+                verified_project_id=verified_project_id,
+            )
+            result = await read_docs_edit_page(
+                session=session,
+                graph=_docs_service(session),
+                root=root,
+                actor_id=user_id,
+                allowed_node_ids=allowed_ids,
+                turn_project_id=verified_project_id,
+                cursor=payload.cursor,
+                depth=payload.depth,
+                page_chars=payload.page_chars,
+                mutation_binding=mutation_binding,
+            )
+            await session.commit()
+            return result
+        except HTTPException:
+            await session.rollback()
+            raise
+        except DocsConflict as exc:
+            await session.rollback()
+            raise _protocol_error(409, "docs_conflict", str(exc)) from exc
+        except DocsContractUnavailable as exc:
+            await session.rollback()
+            raise _protocol_error(503, "docs_contract_unavailable", str(exc)) from exc
+        except PermissionError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Docs root not found") from exc
+        except ValueError as exc:
+            await session.rollback()
+            raise _protocol_error(400, "docs_invalid_read", str(exc)) from exc
+        finally:
+            await session.close()
+
+    @router.post("/changesets")
+    async def apply_protocol_changeset(
+        payload: DocsProtocolChangesetRequest,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id = await _get_current_user(request)
+        from ..services.docs_consistency import DocsConflict
+
+        session = await get_db_manager().get_session()
+        try:
+            root, _allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+                session,
+                actor_id=user_id,
+                root_id=payload.root_id,
+                project_id=payload.project_id,
+            )
+            from ..services.docs_protocol_orchestration import (
+                apply_docs_changeset,
+                http_docs_mutation_binding,
+            )
+
+            result = await apply_docs_changeset(
+                session=session,
+                actor_id=user_id,
+                root_id=root.id,
+                write_token=payload.write_token,
+                operation_id=payload.operation_id,
+                changeset=payload.changeset.model_dump(exclude_unset=True),
+                binding=http_docs_mutation_binding(
+                    actor_id=user_id,
+                    verified_project_id=verified_project_id,
+                ),
+                before_commit=lambda: None,
+            )
+            await session.commit()
+            result["committed"] = True
+            return result
+        except HTTPException:
+            await session.rollback()
+            raise
+        except DocsConflict as exc:
+            await session.rollback()
+            raise _protocol_error(409, "docs_conflict", str(exc)) from exc
+        except PermissionError as exc:
+            await session.rollback()
+            raise _protocol_error(403, "docs_forbidden", str(exc)) from exc
+        except ValueError as exc:
+            await session.rollback()
+            raise _protocol_error(400, "docs_invalid_changeset", str(exc)) from exc
+        except IntegrityError as exc:
+            await session.rollback()
+            raise _protocol_error(
+                409,
+                "docs_conflict",
+                "The Docs changeset could not be committed; read again before retrying",
+            ) from exc
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
     @router.get("/tree")
     async def get_tree(

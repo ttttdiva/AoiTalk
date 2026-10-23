@@ -1,0 +1,32 @@
+{
+  "status": "PASS_LOCAL_SQL_FIXTURE",
+  "synthetic_only": true,
+  "backend": "PostgreSQL 16; real Docs candidate relation / SearchSourceResolver",
+  "scope": "synthetic Personal/generated-media and Project-membership rows; excludes Space policy latency, model encoding, vector search, result/original retrieval",
+  "docs_rows": 145922,
+  "media_sources": 14593,
+  "media_allowed_sources": 7296,
+  "python_ranks_or_fetches_vectors": false,
+  "docs_candidate_sql": {
+    "observations": 30,
+    "p50_seconds": 2.95707433600046,
+    "p95_seconds": 5.053644070150176,
+    "sql_statements_min": 1,
+    "sql_statements_max": 2,
+    "allowed_node_count": 97282
+  },
+  "media_legacy_per_source_acl": {
+    "observations": 3,
+    "p50_seconds": 16.958958797000378,
+    "p95_seconds": 19.2014897545997,
+    "sql_statements_min": 36482,
+    "sql_statements_max": 36482
+  },
+  "media_bulk_candidate_acl": {
+    "observations": 30,
+    "p50_seconds": 0.4701768019995143,
+    "p95_seconds": 0.5121025127999019,
+    "sql_statements_min": 16,
+    "sql_statements_max": 16
+  }
+}

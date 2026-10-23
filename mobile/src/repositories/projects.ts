@@ -16,6 +16,11 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import {
+  assertActiveWriter,
+  type SqliteHandle,
+  type SqliteWriter,
+} from "../db/sqlite-writer";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import {
   ApiHttpError,
@@ -139,9 +144,13 @@ function buildLocalProject(
   };
 }
 
-export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
+export function applyRemoteProjectsInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  list: ApiProject[],
+): void {
+  assertActiveWriter(writer);
   if (!list.length) return;
-  const db = getDb();
   const now = new Date().toISOString();
   for (const p of list) {
     const metadata =
@@ -149,7 +158,7 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
       (p as { project_metadata?: Record<string, unknown> | null })
         .project_metadata ??
       (p.color ? { color: p.color } : null);
-    await db
+    tx
       .insert(schema.projects)
       .values({
         id: p.id,
@@ -193,8 +202,16 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
           updatedAt: (p as { updated_at?: string }).updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
   }
+}
+
+export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
+  if (!list.length) return;
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) => applyRemoteProjectsInWriter(writer, tx, list)),
+  );
 }
 
 /**
@@ -321,18 +338,32 @@ function readCurrentLocal(): Promise<ApiProject[]> {
   return enqueueAuthScopeExclusive(() => projectsRepo.listLocal());
 }
 
+export function applyProjectTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): void {
+  assertActiveWriter(writer);
+  if (!tombstones.length) return;
+  for (const item of tombstones) {
+    const deletedAt = item.deleted_at ?? new Date().toISOString();
+    tx
+      .update(schema.projects)
+      .set({ deletedAt, updatedAt: deletedAt })
+      .where(eq(schema.projects.id, item.id))
+      .run();
+  }
+}
+
 export async function applyProjectTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
   if (!tombstones.length) return;
-  const db = getDb();
-  for (const item of tombstones) {
-    const deletedAt = item.deleted_at ?? new Date().toISOString();
-    await db
-      .update(schema.projects)
-      .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.projects.id, item.id));
-  }
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyProjectTombstonesInWriter(writer, tx, tombstones),
+    ),
+  );
 }
 
 export const projectsRepo = {

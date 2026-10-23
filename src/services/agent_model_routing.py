@@ -72,6 +72,7 @@ ROUTABLE_PROVIDERS = frozenset(
         "claude-cli",
         "codex-cli",
         "grok-cli",
+        "muse-remote",
     }
 )
 
@@ -102,7 +103,14 @@ OPERATIONS_WORK_ROLES: dict[str, tuple[str, ...]] = {
     # Agent) still has an operator.  Authority remains the revision ceiling.
     # App Development can use its already-allowed implementer as the doing actor.
     # Existing operator preference and revision authority remain unchanged.
-    "operator": ("employee_operator", "general_worker", "docs_operator", "workspace_operator", "code_implementer"),
+    "operator": (
+        "employee_operator",
+        "general_worker",
+        "docs_operator",
+        "workspace_operator",
+        "code_implementer",
+        "personal_private_adapter",
+    ),
 }
 
 ROUTE_SOURCE_LABELS = {
@@ -184,8 +192,8 @@ class AgentModelRoute:
     execution_profile_id: str
     acting_subagent_id: str
     provider: str
-    model: str
-    effort: str = ""
+    model: str | None
+    effort: str | None = ""
     route_source: str = "profile_default"
     inherits_main: bool = False
     backend: str = "api"
@@ -338,6 +346,26 @@ def _route_spec_is_well_formed(spec: Mapping[str, Any]) -> bool:
             return False
     provider = _clean(spec.get("provider")).lower()
     model = _clean(spec.get("model"))
+    effort = _clean(spec.get("effort") or spec.get("reasoning_effort"))
+    backend = spec.get("backend")
+    if backend not in (None, "") and not isinstance(backend, str):
+        return False
+    declared_backend = _clean(backend).lower()
+    if declared_backend not in {"", "api", "cli", "remote"}:
+        return False
+    if provider == "muse-remote":
+        # Remote turns are explicit provider-only routes.  A model/effort is
+        # not meaningful for Muse and must never be fabricated from Main.
+        return (
+            inherit_model is False
+            and not model
+            and not effort
+            and declared_backend in {"", "remote"}
+            and str(spec.get("effort_policy") or "").strip().lower()
+            in {"", "none", "not_applicable", "default"}
+        )
+    if declared_backend == "remote":
+        return False
     # An explicit route must not silently collapse to Main when corruption
     # removes either half of its provider/model pair.  Inherit routes may omit
     # both values, as intended by the manual and legacy compatibility paths.
@@ -418,7 +446,13 @@ def resolve_agent_subagent_route(
     spec, source = _route_spec(config, pins, sid)
     if spec is not None and not _route_spec_is_well_formed(spec):
         raise AgentModelRouteError("agent_route_model_unavailable")
-    main = _main_route(config, main_route_override)
+    is_remote = (
+        isinstance(spec, Mapping)
+        and _clean(spec.get("provider")).lower() == "muse-remote"
+    )
+    # Remote routes do not inherit the local Main route and therefore do not
+    # need a model or effort resolved from it.
+    main = {} if is_remote else _main_route(config, main_route_override)
     if spec is None:
         route = dict(main)
         route["inherit_model"] = True
@@ -426,11 +460,19 @@ def resolve_agent_subagent_route(
         route = _apply_execution_route(spec, main, config=config)
     provider = _clean(route.get("provider")).lower()
     model = _clean(route.get("model"))
-    if not provider or not model:
+    if provider == "muse-remote":
+        if route.get("backend") not in (None, "", "remote"):
+            raise AgentModelRouteError("agent_route_backend_mismatch")
+        model = None
+        effort = None
+        backend = "remote"
+    elif not provider or not model:
         raise AgentModelRouteError("agent_route_model_unavailable")
     if provider not in ROUTABLE_PROVIDERS:
         raise AgentModelRouteError("agent_route_provider_unsupported")
-    effort = _clean(route.get("effort") or route.get("reasoning_effort"))
+    if provider != "muse-remote":
+        effort = _clean(route.get("effort") or route.get("reasoning_effort"))
+        backend = "cli" if provider.endswith("-cli") else "api"
     return AgentModelRoute(
         agent_id=pins.agent_id,
         agent_revision_id=pins.agent_revision_id,
@@ -443,7 +485,7 @@ def resolve_agent_subagent_route(
         effort=effort,
         route_source=source,
         inherits_main=bool(route.get("inherit_model", spec is None)),
-        backend="cli" if provider.endswith("-cli") else "api",
+        backend=backend,
     )
 
 
@@ -692,7 +734,7 @@ def safe_execution_selection(value: Any) -> dict[str, Any] | None:
         return None
     clean_backends: dict[str, str] = {}
     for role, backend in backends.items():
-        if role not in OPERATIONS_WORK_ROLES or backend not in {"api", "cli"}:
+        if role not in OPERATIONS_WORK_ROLES or backend not in {"api", "cli", "remote"}:
             return None
         clean_backends[str(role)] = str(backend)
     result["role_backends"] = clean_backends
@@ -893,7 +935,17 @@ def safe_route_projection(value: Any) -> dict[str, Any] | None:
         clean_notes = [str(note)[:80] for note in notes if isinstance(note, str) and note.strip()][:8]
         if clean_notes:
             result["notes"] = clean_notes
-    return result if result.get("provider") and result.get("model") else None
+    provider = _clean(result.get("provider")).lower()
+    backend = _clean(result.get("backend")).lower()
+    if backend == "remote" or provider == "muse-remote":
+        # A remote projection is valid only with its typed backend and with
+        # no model/effort values.  This keeps the frozen snapshot honest.
+        if provider != "muse-remote" or backend != "remote":
+            return None
+        if "model" in result or "effort" in result:
+            return None
+        return result
+    return result if provider and result.get("model") else None
 
 
 def safe_route_projections(value: Any) -> dict[str, dict[str, Any]]:
@@ -1011,8 +1063,12 @@ def _resolve_snapshot_role_route(
     if acting_subagent_id not in pins.allowed_subagent_ids:
         raise AgentModelRouteError("agent_route_subagent_unavailable")
     provider = _clean(route.get("provider")).lower()
-    model = _clean(route.get("model"))
-    if not provider or not model:
+    is_remote = provider == "muse-remote"
+    model = _clean(route.get("model")) if not is_remote else None
+    if is_remote:
+        if route.get("backend") != "remote" or "model" in route or "effort" in route:
+            raise AgentModelRouteError("agent_route_snapshot_invalid")
+    elif not provider or not model:
         raise AgentModelRouteError("agent_route_model_unavailable")
     if provider not in ROUTABLE_PROVIDERS:
         raise AgentModelRouteError("agent_route_provider_unsupported")
@@ -1026,10 +1082,10 @@ def _resolve_snapshot_role_route(
         role=role_name,
         provider=provider,
         model=model,
-        effort=_clean(route.get("effort")),
+        effort=None if is_remote else _clean(route.get("effort")),
         route_source=_clean(route.get("route_source")) or "profile_default",
         inherits_main=bool(route.get("inherits_main", False)),
-        backend=_clean(route.get("backend")) or ("cli" if provider.endswith("-cli") else "api"),
+        backend=("remote" if is_remote else (_clean(route.get("backend")) or ("cli" if provider.endswith("-cli") else "api"))),
         notes=tuple(str(item) for item in notes if isinstance(item, str)) if isinstance(notes, list) else (),
     )
 
@@ -1121,10 +1177,13 @@ def registered_route_backend(provider: Any) -> str:
     never loads provider SDKs or DB models at import time.
     """
 
+    key = _clean(provider).lower()
+    if key == "muse-remote":
+        return "remote"
+
     from .cli_development_sessions import CLI_PROVIDER_PERMISSION_MODES
     from .llm_model_catalog import PROVIDER_CAPABILITIES
 
-    key = _clean(provider).lower()
     if key and key in CLI_PROVIDER_PERMISSION_MODES:
         return "cli"
     capability = PROVIDER_CAPABILITIES.get(key) if key else None
@@ -1146,9 +1205,9 @@ def assert_registered_route_backend(provider: Any, backend: Any, *, ingress: str
     if declared != registered:
         raise AgentModelRouteError("agent_route_backend_mismatch")
     if registered != ingress:
-        raise AgentModelRouteError(
-            "cli_route_not_supported" if ingress == "api" else "agent_route_backend_mismatch"
-        )
+        if ingress == "api" and registered == "cli":
+            raise AgentModelRouteError("cli_route_not_supported")
+        raise AgentModelRouteError("agent_route_backend_mismatch")
     return registered
 
 

@@ -856,14 +856,29 @@ class GoogleCalendarService:
     async def _save_task_metadata(
         self, session: AsyncSession, *, task_id: UUID, metadata: dict[str, Any]
     ) -> dict[str, Any]:
-        result = await session.execute(select(Task).where(Task.id == task_id))
+        result = await session.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         task = result.scalar_one_or_none()
         if task is None:
             raise GoogleCalendarServiceError("Task not found", 404)
-        task.task_metadata = dict(metadata)
+        # The caller works from a snapshot taken before Google HTTP/token
+        # work. Merge only the Google-owned namespace into the locked current
+        # row so concurrent Task metadata updates are retained.
+        fresh_metadata = dict(task.task_metadata or {})
+        auto_metadata = metadata.get(self.AUTO_METADATA_KEY)
+        if isinstance(auto_metadata, dict):
+            fresh_metadata[self.AUTO_METADATA_KEY] = dict(auto_metadata)
+        else:
+            fresh_metadata.pop(self.AUTO_METADATA_KEY, None)
+        task.task_metadata = fresh_metadata
         task.updated_at = datetime.utcnow()
+        saved_metadata = dict(fresh_metadata)
         await session.commit()
-        return task.task_metadata or {}
+        return saved_metadata
 
     def _build_event_payload(
         self,

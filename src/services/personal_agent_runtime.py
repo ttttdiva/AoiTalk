@@ -1,13 +1,14 @@
-"""Dormant finance/career dispatch for the personal agents.
+"""Owner-invoked, read-only finance/career adapters for personal agents.
 
-Only the dependency-independent part lives here: profile -> domain resolution,
-trusted TurnContext/local-route re-checks, and explicit dependency slots. No
-tool is registered and nothing is autostarted. Acceptance and verification are
-authenticated human actions and are never reachable from this dispatcher.
-
-The finance store, career profile and attachment-source modules belong to other
-lanes. Until their reviewed signatures land, ``bind_domain_handler`` is the only
-entry point and unbound domains raise ``PersonalDependencyPending``.
+The server-owned signed-cookie controller binds the current private
+ConversationSession, exact selected AgentRevision/AgentExecutionBinding, a
+current-authority guard, and a session-bound local-only route before dispatch.
+This dispatcher itself remains outside the model-tool registry: personal
+profiles are still ``disabled_design_only`` with autostart false. Calls execute
+existing bounded adapters only, with no LLM request, AgentRun/WorkItem, model
+input, trace, notification, or generative response. Source/profile acceptance,
+confirmation, financial writes, and all other human-only operations are not in
+the domain allowlist.
 """
 
 from __future__ import annotations
@@ -16,13 +17,27 @@ import inspect
 from typing import Any, Awaitable, Callable
 from uuid import UUID
 
+from sqlalchemy import select
+
+from ..memory.models.workspace_files import WorkspaceFileEntry
 from .personal_career_service import PersonalCareerService, model_actor
 from .personal_finance_attachment_source import FinanceAttachmentSourceError, resolve_finance_attachment_source
 from .personal_finance_contracts import FinanceSource
-from .personal_finance_summary import FinanceSummaryTrustError, summarize_finance_snapshot
+from .personal_finance_summary import (
+    FinanceSummaryIntegrityError,
+    FinanceSummaryOverflowError,
+    FinanceSummaryTrustError,
+    summarize_finance_snapshot,
+)
 
+from .personal_async_guard import run_personal_guard
 from .personal_agent_tools import PERSONAL_AGENT_PROFILES, _binding, _check_local
-from .personal_ledger_service import LedgerPermissionError
+from .personal_ledger_service import (
+    LedgerConflictError,
+    LedgerPermissionError,
+    LedgerValidationError,
+)
+from .search_sources import SourceRef, SourceUnavailable
 from .turn_context import TurnContext, get_turn_context
 
 DOMAIN_PROFILES = {"finance": "personal-finance-reviewer", "career": "personal-career-planner"}
@@ -37,8 +52,20 @@ class PersonalDependencyPending(RuntimeError):
     """The owning lane's module has not been integrated yet."""
 
 
+class PersonalFinanceSummaryIntegrityError(LedgerConflictError):
+    """Safe conflict raised when an accepted summary has conflicting rows."""
+
+    code = "finance_summary_integrity"
+
+
+class PersonalFinanceSummaryOverflowError(LedgerValidationError):
+    """Safe validation error raised when a summary exceeds its numeric bound."""
+
+    code = "finance_summary_overflow"
+
+
 def _check_trusted(domain: str) -> TurnContext:
-    """Current turn/binding/profile/local-only policy; raises on any violation."""
+    """Current turn/profile/local-only policy; raises on any violation."""
     binding = _binding.get()
     turn = get_turn_context()
     if binding is None or binding.turn is not turn or type(turn) is not TurnContext:
@@ -50,11 +77,14 @@ def _check_trusted(domain: str) -> TurnContext:
     return turn
 
 
-def _original_guard(domain: str) -> Callable[[], None]:
-    """Guard bound to the turn/binding active now; call it right after every await."""
+def _original_guard(domain: str) -> Callable[[], Awaitable[None]]:
+    """Guard exact turn, current Agent authority, and local route after each await."""
     turn, started = _check_trusted(domain), _binding.get()
 
-    def guard() -> None:
+    async def guard() -> None:
+        result = await run_personal_guard(started.current_authority_guard)
+        if result is False:
+            raise LedgerPermissionError("current Agent authority denied")
         if _check_trusted(domain) is not turn or _binding.get() is not started:
             raise LedgerPermissionError("turn binding changed during dispatch")
 
@@ -76,6 +106,16 @@ class PersonalAgentRuntime:
             raise LedgerPermissionError("personal agent capability disabled")
         return _check_trusted(domain)
 
+    async def _authorize_current(self, domain: str) -> TurnContext:
+        binding = _binding.get()
+        turn = self._authorize(domain)
+        result = await run_personal_guard(binding.current_authority_guard)
+        if result is False:
+            raise LedgerPermissionError("current Agent authority denied")
+        if _binding.get() is not binding or self._authorize(domain) is not turn:
+            raise LedgerPermissionError("turn binding changed during authority check")
+        return turn
+
     async def dispatch(self, domain: str, operation: str, **payload: Any) -> Any:
         """Owner/session come only from the bound TurnContext, never the payload."""
         if _IDENTITY_FIELDS & payload.keys():
@@ -84,7 +124,7 @@ class PersonalAgentRuntime:
             raise LedgerPermissionError("career operation not allowed")
         if domain == "finance" and operation not in FINANCE_ALLOWED_OPERATIONS:
             raise LedgerPermissionError("finance operation not allowed")
-        turn = self._authorize(domain)
+        turn = await self._authorize_current(domain)
         handler = self._handlers.get(domain)
         if handler is None:
             raise PersonalDependencyPending(f"{domain} dependency not integrated")
@@ -93,7 +133,7 @@ class PersonalAgentRuntime:
                                operation=operation, **payload)
         # Policy may change during the await, and the turn/binding must be the very
         # ones the handler started under (a swapped valid binding is another owner/session).
-        if self._authorize(domain) is not turn or _binding.get() is not started:
+        if await self._authorize_current(domain) is not turn or _binding.get() is not started:
             raise LedgerPermissionError("turn binding changed during dispatch")
         return result
 
@@ -104,11 +144,15 @@ CAREER_CONTEXT_OPERATION = "context"
 CAREER_ALLOWED_OPERATIONS = frozenset({CAREER_CONTEXT_OPERATION})
 
 
-def career_context_handler(service: PersonalCareerService) -> Handler:
+def career_context_handler(
+    service: PersonalCareerService,
+    resolver_factory: Callable[[UUID], Any] | None = None,
+) -> Handler:
     """Real handler only when a service built on an explicit SQL factory is injected.
 
     Requires accepted_profile_ref only; default bounds only (callers cannot widen them); returns the service contract
-    unchanged. Owner comes from the bound TurnContext as a model-kind actor.
+    unchanged. Owner comes from the bound TurnContext as a model-kind actor. Every accepted version source is
+    rechecked through an owner-only resolver before and after context construction.
     """
     if not isinstance(service, PersonalCareerService):
         raise TypeError("PersonalCareerService required")
@@ -128,9 +172,72 @@ def career_context_handler(service: PersonalCareerService) -> Handler:
         # Bound to the turn/binding active at dispatch start; runs right after every DB await,
         # before the stored payload is decrypted.
         guard = _original_guard("career")
+        actor = model_actor(owner_id)
+        version = await service.get_profile_version(actor, parsed, guard=guard)
+        await run_personal_guard(guard)
+
+        async def verify_sources() -> None:
+            if not version.confirmed or not version.source_refs:
+                return
+            if resolver_factory is None:
+                raise PersonalDependencyPending("career source resolver not integrated")
+
+            selected = await service.list_selected_sources(actor, limit=64)
+            await run_personal_guard(guard)
+            selected_by_ref = {source.source_ref: source for source in selected}
+            if any(source_ref not in selected_by_ref for source_ref in version.source_refs):
+                raise LedgerPermissionError("career source selection changed")
+
+            resolver = resolver_factory(UUID(str(owner_id)))
+            if inspect.isawaitable(resolver):
+                resolver = await resolver
+                await run_personal_guard(guard)
+            try:
+                for source_ref in version.source_refs:
+                    registered = selected_by_ref[source_ref]
+                    try:
+                        resolved = await resolver.resolve(
+                            SourceRef("workspace_file", str(source_ref)), open_file=False
+                        )
+                    except SourceUnavailable:
+                        await run_personal_guard(guard)
+                        raise LedgerPermissionError("career source unavailable") from None
+                    await run_personal_guard(guard)
+                    metadata = resolved.metadata if isinstance(resolved.metadata, dict) else {}
+                    if (
+                        metadata.get("files_scope") != "user"
+                        or metadata.get("files_owner_id") != str(owner_id)
+                        or metadata.get("content_hash") != registered.source_sha256
+                        or metadata.get("mime_type") != registered.mime_type
+                    ):
+                        raise LedgerPermissionError("career source changed")
+
+                    result = await resolver.session.execute(
+                        select(WorkspaceFileEntry.size_bytes).where(
+                            WorkspaceFileEntry.id == source_ref,
+                            WorkspaceFileEntry.scope == "user",
+                            WorkspaceFileEntry.owner_id == UUID(str(owner_id)),
+                            WorkspaceFileEntry.status == "indexable",
+                            WorkspaceFileEntry.deleted_at.is_(None),
+                        )
+                    )
+                    await run_personal_guard(guard)
+                    byte_size = result.scalar_one_or_none()
+                    if byte_size is None or int(byte_size) != registered.byte_size:
+                        raise LedgerPermissionError("career source changed")
+            finally:
+                session = getattr(resolver, "session", None)
+                close = getattr(session, "close", None)
+                if callable(close):
+                    closed = close()
+                    if inspect.isawaitable(closed):
+                        await closed
+
+        await verify_sources()
         context = await service.build_context(
-            model_actor(owner_id), accepted_profile_ref=parsed, guard=guard)
-        guard()
+            actor, accepted_profile_ref=parsed, guard=guard)
+        await run_personal_guard(guard)
+        await verify_sources()
         return context.to_contract()
 
     return handler
@@ -163,7 +270,7 @@ def finance_read_handler(
     if not callable(resolver_factory):
         raise TypeError("resolver_factory required")
 
-    async def load(owner_id: Any, payload: dict, guard: Callable[[], None]) -> tuple[UUID, dict]:
+    async def load(owner_id: Any, payload: dict, guard: Callable[[], Any]) -> tuple[UUID, dict]:
         if set(payload) != {"row_ref"}:
             raise LedgerPermissionError("finance read takes only row_ref")
         try:
@@ -175,7 +282,7 @@ def finance_read_handler(
             raise LedgerPermissionError("valid row_ref required") from None
         # The repository runs guard() right after its DB await, before decrypting the payload.
         record = await repository.get_by_row_ref(owner_user_id=owner, row_ref=row_ref, guard=guard)
-        guard()
+        await run_personal_guard(guard)
         if record is None or record.get("owner_user_id") != owner or record.get("row_ref") != row_ref:
             raise LedgerPermissionError("finance entry not available")
         return owner, dict(record)
@@ -194,12 +301,21 @@ def finance_read_handler(
         try:
             snapshot = await dataset_loader.load_snapshot(
                 owner_user_id=owner, dataset_ref=dataset_ref, guard=guard)
-            guard()
+            await run_personal_guard(guard)
             return summarize_finance_snapshot(
                 snapshot, owner_user_id=owner, accepted_dataset_ref=dataset_ref,
                 month=payload["month"])
         except FinanceSummaryTrustError:
             raise LedgerPermissionError("accepted dataset not available") from None
+        except FinanceSummaryIntegrityError:
+            # Do not retain or expose row refs or source exception text at the
+            # agent/API boundary.  The stable code is sufficient for the owner
+            # UI to offer a refresh/review path.
+            raise PersonalFinanceSummaryIntegrityError() from None
+        except FinanceSummaryOverflowError:
+            # The summary contract is bounded; never round or return arithmetic
+            # details from an internal exception.
+            raise PersonalFinanceSummaryOverflowError() from None
 
     async def handler(*, owner_id, session_id, operation, **payload):
         if operation == FINANCE_SUMMARY_OPERATION:
@@ -210,7 +326,7 @@ def finance_read_handler(
             raise LedgerPermissionError("finance operation not allowed")
         guard = _original_guard("finance")
         owner, record = await load(owner_id, payload, guard)
-        guard()
+        await run_personal_guard(guard)
         row = (record.get("payload") or {}).get("row") or {}
         source = (record.get("payload") or {}).get("source")
         if operation == FINANCE_READ_ENTRY_OPERATION:
@@ -225,11 +341,11 @@ def finance_read_handler(
         if source is None:
             raise LedgerPermissionError("finance entry has no attachment")
         descriptor = FinanceSource.from_mapping(source)
-        guard()
+        await run_personal_guard(guard)
         resolver = resolver_factory(owner)
         if inspect.isawaitable(resolver):
             resolver = await resolver
-        guard()
+            await run_personal_guard(guard)
         try:
             evidence = await resolve_finance_attachment_source(
                 resolver, owner_user_id=owner, source_ref=descriptor.source_ref,
@@ -237,7 +353,7 @@ def finance_read_handler(
         except FinanceAttachmentSourceError as exc:
             raise LedgerPermissionError(f"attachment unavailable: {exc.code}") from None
         finally:
-            guard()
+            await run_personal_guard(guard)
         if evidence.mime_type != descriptor.mime_type or evidence.byte_size != descriptor.byte_size:
             raise LedgerPermissionError("attachment does not match confirmed descriptor")
         return {"source_ref": str(evidence.source_ref), "source_sha256": evidence.source_sha256,

@@ -1,19 +1,25 @@
-"""Dormant personal profiles and explicit, unregistered local-only adapters.
+"""Static personal profiles and bounded, unregistered private adapters.
 
-The production registry is src.llm.runtime_tool_registry, not the legacy global
-registry. This milestone deliberately adds nothing to either registry. A future
-controller must pin a trusted turn and its resolved outbound gateway here before
-calling adapters, and enforce the same local-only policy for the whole run.
+The production registry is ``src.llm.runtime_tool_registry``, not the legacy
+global registry. These profiles remain ``disabled_design_only`` and never
+autostart or register as model tools. The signed-cookie owner route invokes the
+adapters directly with an exact selected Agent binding, current-authority
+callback, and a session-bound local-only OutboundPrivacyGateway. The invocation
+is adapter-only: it calls no LLM, creates no AgentRun/WorkItem, and emits no
+generative response. Reads and staged-draft writes await the current authority
+and privacy guard after every database await before decode, return, or commit.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 from .personal_draft_service import digest, normalize_proposal
+from .personal_async_guard import run_personal_guard
 from .personal_ledger_service import (
     LedgerPermissionError, LedgerValidationError, MAX_STATE_ENTRIES,
     agent_actor_from_turn_context, derive_state, _SLUG_RE,
@@ -65,6 +71,7 @@ class _LocalBinding:
     gateway: Any
     provider: str
     base_url: str | None
+    current_authority_guard: Callable[[], Any]
 
 
 _binding: ContextVar[_LocalBinding | None] = ContextVar("personal_agent_local_binding", default=None)
@@ -72,9 +79,21 @@ _binding: ContextVar[_LocalBinding | None] = ContextVar("personal_agent_local_bi
 
 def _check_local(binding):
     # This is a server-owned resolved gateway, not a model label or arbitrary dict.
-    from .outbound_privacy_service import OutboundPrivacyGateway, PrivacyError, provider_classification
+    from .outbound_privacy_service import (
+        OutboundPrivacyGateway,
+        PrivacyError,
+        effective_privacy_mode,
+        provider_classification,
+    )
 
-    if not isinstance(binding.gateway, OutboundPrivacyGateway) or binding.gateway.settings.mode != "local_only":
+    if not isinstance(binding.gateway, OutboundPrivacyGateway):
+        raise LedgerPermissionError("explicit local-only gateway required")
+    current_mode = effective_privacy_mode(
+        binding.gateway.config,
+        session_context=binding.gateway.session_context,
+        project_metadata=binding.gateway.project_metadata,
+    )
+    if binding.gateway.settings.mode != "local_only" or current_mode != "local_only":
         raise LedgerPermissionError("explicit local-only gateway required")
     if binding.gateway.user_id != binding.turn.user_id or binding.gateway.session_id != binding.turn.session_id:
         raise LedgerPermissionError("gateway does not match authenticated turn")
@@ -89,7 +108,7 @@ def _check_local(binding):
 
 @contextmanager
 def bind_personal_agent_local_route(*, profile_id, gateway, provider, base_url=None,
-                                    allow_external_fallback):
+                                    allow_external_fallback, current_authority_guard):
     """Server controller hook; never expose as a tool or accept client flags.
 
     Bound to this exact immutable TurnContext. Rebinding another user/turn or
@@ -101,10 +120,12 @@ def bind_personal_agent_local_route(*, profile_id, gateway, provider, base_url=N
         raise LedgerPermissionError("trusted authenticated turn required")
     if turn.project_id or allow_external_fallback is not False:
         raise LedgerPermissionError("private scope and disabled fallback required")
+    if not callable(current_authority_guard):
+        raise LedgerPermissionError("current Agent authority guard required")
     profile = _PROFILES.get(profile_id)
     if profile is None:
         raise LedgerPermissionError("unknown personal profile")
-    binding = _LocalBinding(turn, profile, gateway, provider, base_url)
+    binding = _LocalBinding(turn, profile, gateway, provider, base_url, current_authority_guard)
     _check_local(binding)
     token = _binding.set(binding)
     try:
@@ -133,26 +154,39 @@ class PersonalAgentTools:
         _check_local(binding)  # Re-check before any DB read or decryption.
         return agent_actor_from_turn_context()
 
+    async def _authorize_current(self, name, kind):
+        binding = _binding.get()
+        turn = get_turn_context()
+        actor = self._authorize(name, kind)
+        allowed = await run_personal_guard(binding.current_authority_guard)
+        if allowed is False:
+            raise LedgerPermissionError("current Agent authority denied")
+        if _binding.get() is not binding or get_turn_context() is not turn:
+            raise LedgerPermissionError("turn binding changed during authority check")
+        if self._authorize(name, kind) != actor:
+            raise LedgerPermissionError("turn binding changed during authority check")
+        return actor
+
     def _pinned_guard(self, name, kind, actor):
         """Guard pinned to the binding/turn/actor active at call start; run right after every await."""
         started, turn = _binding.get(), get_turn_context()
 
-        def guard():
-            current = self._authorize(name, kind)
+        async def guard():
+            current = await self._authorize_current(name, kind)
             if _binding.get() is not started or get_turn_context() is not turn or current != actor:
                 raise LedgerPermissionError("turn binding changed during call")
 
         return guard
 
     async def ledger_state(self, *, ledger, subject_key=None):
-        actor = self._authorize("private.ledger.state", ledger)
+        actor = await self._authorize_current("private.ledger.state", ledger)
         if subject_key is not None and (not isinstance(subject_key, str) or not _SLUG_RE.fullmatch(subject_key)):
             raise LedgerValidationError("invalid subject key")
         # SQL filters kind and subject before decrypting, and refuses truncation.
         guard = self._pinned_guard("private.ledger.state", ledger, actor)
         entries = await self.ledger.list_entries(actor=actor, ledger=ledger, subject_key=subject_key,
                                                 limit=MAX_STATE_ENTRIES, guard=guard)
-        guard()  # Policy/owner may change during the awaited DB read.
+        await run_personal_guard(guard)  # Policy/owner may change during the awaited DB read.
         state = derive_state(entries)
         result = {
             "deadlines": [{
@@ -172,9 +206,9 @@ class PersonalAgentTools:
 
     async def propose(self, *, evidence_ref, proposal, idempotency_key):
         kind = proposal.get("kind") if isinstance(proposal, dict) else None
-        actor = self._authorize("private.draft.propose", kind)
+        actor = await self._authorize_current("private.draft.propose", kind)
         guard = self._pinned_guard("private.draft.propose", kind, actor)
         result = await self.drafts.propose(actor=actor, evidence_ref=evidence_ref,
             proposal=normalize_proposal(proposal), idempotency_key=idempotency_key, guard=guard)
-        guard()
+        await run_personal_guard(guard)
         return result

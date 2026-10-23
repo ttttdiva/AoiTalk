@@ -1010,6 +1010,7 @@ class TurnExecutionMixin:
         stream_callback: Optional[StreamCallback] = None,
         required_tool_name: Optional[str] = None,
         generation_policy: Any | None = None,
+        tool_free: bool = False,
     ) -> str:
         # Snapshot this immutable policy before any await.  Do not read the
         # shared client attribute again while the runner is active.
@@ -1047,8 +1048,15 @@ class TurnExecutionMixin:
             if generation_policy is not None
             else self._snapshot_generation_policy()
         )
-        native_tool_round_budget = self._native_tool_round_budget(
-            generation_policy=run_generation_policy,
+        # CompletionVerifier is a single model pass.  Keep its native runner
+        # scope independent of an autonomous work budget; ``tool_free`` also
+        # makes the native runner reject tools even if a resolver is present.
+        native_tool_round_budget = (
+            0
+            if tool_free
+            else self._native_tool_round_budget(
+                generation_policy=run_generation_policy,
+            )
         )
         # Cache fingerprints must describe the same effective schemas sent to
         # the provider, not the full registry held by ``agent.tools``.  The
@@ -1056,8 +1064,16 @@ class TurnExecutionMixin:
         # retain stale contextual entries when a fixed provider registry is
         # reused across turns.  Required-tool turns intentionally keep their
         # already narrow allowlist.
-        cache_tools = [] if suppress_automatic_context else list(getattr(agent, "tools", []))
-        if required_tool_name is None and not suppress_automatic_context:
+        cache_tools = (
+            []
+            if tool_free or suppress_automatic_context
+            else list(getattr(agent, "tools", []))
+        )
+        if (
+            not tool_free
+            and required_tool_name is None
+            and not suppress_automatic_context
+        ):
             try:
                 cache_tools = list(self._get_effective_tools_for_current_session())
             except Exception:  # noqa: BLE001 - preserve legacy lightweight clients
@@ -1228,9 +1244,13 @@ class TurnExecutionMixin:
                 None,
             )
             if previous_max_tool_rounds is not None:
-                self._turn_runner.max_tool_rounds = max(
-                    previous_max_tool_rounds,
-                    native_tool_round_budget,
+                self._turn_runner.max_tool_rounds = (
+                    native_tool_round_budget
+                    if tool_free
+                    else max(
+                        previous_max_tool_rounds,
+                        native_tool_round_budget,
+                    )
                 )
             # ``load_tool_pack`` mutates the client session while the native
             # runner is in its tool loop.  Resolve the effective registry on
@@ -1254,6 +1274,7 @@ class TurnExecutionMixin:
                 runner_parameters = {}
             if (
                 required_tool_name is None
+                and not tool_free
                 and (
                     "tools_provider" in runner_parameters
                     or any(
@@ -1263,6 +1284,14 @@ class TurnExecutionMixin:
                 )
             ):
                 run_kwargs["tools_provider"] = _native_tools_provider
+            if tool_free and (
+                "tool_free" in runner_parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in runner_parameters.values()
+                )
+            ):
+                run_kwargs["tool_free"] = True
             # NativeRunResult can classify an empty final response without
             # raising. Reset the attempt-local marker before running so a
             # previous turn cannot leak its failure into this one.
@@ -2262,11 +2291,25 @@ class TurnExecutionMixin:
                 dict(turn_snapshot) if turn_snapshot is not None else None
             )
             try:
+                review_run_kwargs: dict[str, Any] = {
+                    "generation_policy": run_generation_policy,
+                }
+                try:
+                    review_runner_parameters = inspect.signature(
+                        self._run_once_with_agent
+                    ).parameters
+                except (TypeError, ValueError):
+                    review_runner_parameters = {}
+                if "tool_free" in review_runner_parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in review_runner_parameters.values()
+                ):
+                    review_run_kwargs["tool_free"] = True
                 return await self._run_once_with_agent(
                     review_agent,
                     prompt,
                     None,
-                    generation_policy=run_generation_policy,
+                    **review_run_kwargs,
                 )
             finally:
                 for attribute, value in saved_state.items():

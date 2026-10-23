@@ -26,6 +26,8 @@ class GenerationBudget:
     interruptible_transport: bool = False
     parent: GenerationBudget | None = field(default=None, repr=False)
     request_lock: Any = field(default_factory=threading.Lock, repr=False)
+    # Request-local command ceiling; None keeps every legacy caller inactive.
+    command_timeout_seconds: float | None = None
 
     def checkpoint(self) -> float | None:
         inherited = self.parent.checkpoint() if self.parent is not None else None
@@ -76,6 +78,40 @@ class GenerationBudget:
 current_generation_budget: ContextVar[GenerationBudget | None] = ContextVar(
     "ephemeral_generation_budget", default=None
 )
+
+
+def command_budget_active() -> bool:
+    """True when the current budget chain carries a request-local command ceiling."""
+    node = current_generation_budget.get()
+    while node is not None and node.command_timeout_seconds is None:
+        node = node.parent
+    return node is not None
+
+
+def bounded_command_timeout(requested: float | None) -> float | None:
+    """Narrow a command/background lifetime by the active request-local command budget.
+
+    Inactive (no budget carrying ``command_timeout_seconds``): returns ``requested``
+    unchanged.  Active: checkpoints the existing budget (no new clock) and returns
+    ``min(requested, command_timeout_seconds, remaining)``.  Raises ``TimeoutError``
+    or ``GenerationCancelled`` when no positive time remains, so callers never launch.
+    """
+    budget = current_generation_budget.get()
+    node = budget
+    while node is not None and node.command_timeout_seconds is None:
+        node = node.parent
+    if node is None or budget is None:
+        return requested
+    remaining = budget.checkpoint()
+    candidates = [float(node.command_timeout_seconds)]
+    if requested is not None:
+        candidates.append(float(requested))
+    if remaining is not None:
+        candidates.append(float(remaining))
+    value = min(candidates)
+    if not math.isfinite(value) or value <= 0:
+        raise TimeoutError("ephemeral_generation_timeout")
+    return value
 
 
 def record_bounded_model_request(payload: dict[str, Any]) -> GenerationBudget | None:

@@ -61,7 +61,7 @@ persisted exeの欠損をPATH上の別exeで正常扱いしない。PATH探索�
 ```powershell
 # 以下は新しく起動する所有processだけに渡す例。実際のpathはCLI出力を使う。
 $env:LLAMA_CPP_EXECUTABLE = 'C:\path\to\runtimes\llama-cpp-b11541-vulkan\runtimes\llama_cpp\stock\current\llama-server.exe'
-$env:LLAMA_CPP_MODEL_ROOT = 'F:\AI\models\Cold_F\llm'
+$env:LLAMA_CPP_MODEL_ROOT = '<configured-model-root>'
 ```
 
 切戻しはactive consumer/generationの終了を待ち、自分が所有するruntimeだけを停止して、

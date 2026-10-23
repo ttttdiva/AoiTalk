@@ -5,11 +5,16 @@ export type LedgerEntry = components["schemas"]["PersonalLedgerEntryOut"];
 export type LedgerDeadline = components["schemas"]["PersonalLedgerDeadlineOut"];
 export type LedgerEntryCreate = components["schemas"]["LedgerEntryCreate"];
 export type LedgerEntriesPage = components["schemas"]["PersonalLedgerEntriesResponse"];
+export type ReminderActionResponse = components["schemas"]["ReminderActionResponse"];
+export type ReminderItem = components["schemas"]["ReminderItem"];
+export type ReminderListResponse = components["schemas"]["ReminderListResponse"];
+export type ReminderSelectionResponse = components["schemas"]["ReminderSelectionResponse"];
 
 /** 送信内容と冪等キーを作成時に固定した書き込み要求。再送は同じオブジェクトをそのまま使う。 */
 export type LedgerWrite = Readonly<{ path: string; body: Readonly<Record<string, unknown>> }>;
 
 const BASE = "/api/python-proxy/personal-ledger";
+const REMINDER_BASE = "/api/python-proxy/personal-reminders";
 
 /** サーバーが応答を返した失敗（結果は確定している）。 */
 export class LedgerHttpError extends Error {
@@ -28,8 +33,8 @@ export function isAmbiguousWriteFailure(error: unknown): boolean {
   return error.status >= 500 || error.status === 408;
 }
 
-async function ledgerFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+async function ownerFetch<T>(base: string, path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...init,
@@ -40,6 +45,14 @@ async function ledgerFetch<T>(path: string, init?: RequestInit): Promise<T> {
     throw new LedgerHttpError(res.status, typeof detail === "string" ? detail : `API Error: ${res.status}`);
   }
   return res.json() as Promise<T>;
+}
+
+async function ledgerFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  return ownerFetch<T>(BASE, path, init);
+}
+
+async function reminderFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  return ownerFetch<T>(REMINDER_BASE, path, init);
 }
 
 /** 操作ごとに新しい冪等キーを作る。キーは LedgerWrite の作成時に1回だけ作り、再送で変えない。 */
@@ -78,4 +91,36 @@ export const ledgerApi = {
   entries: (beforeSeq?: number | null) =>
     ledgerFetch<LedgerEntriesPage>(`/entries?limit=50${beforeSeq ? `&before_seq=${beforeSeq}` : ""}`),
   send: (write: LedgerWrite) => ledgerFetch<unknown>(write.path, { method: "POST", body: JSON.stringify(write.body) }),
+};
+
+export const reminderApi = {
+  list: () => reminderFetch<ReminderListResponse>("?limit=100"),
+  selectTime: (body: {
+    candidate_entry_id: string;
+    confirmed_digest: string;
+    remind_at: string;
+    time_zone: string;
+    idempotency_key: string;
+  }) => reminderFetch<ReminderSelectionResponse>("/selections", {
+    method: "POST", body: JSON.stringify(body),
+  }),
+  propose: (body: {
+    candidate_entry_id: string;
+    confirmed_digest: string;
+    remind_at: string;
+    time_zone: string;
+    idempotency_key: string;
+  }) => reminderFetch<ReminderActionResponse>("/propose", {
+    method: "POST", body: JSON.stringify(body),
+  }),
+  get: (draftRef: string) => reminderFetch<ReminderItem>(`/${encodeURIComponent(draftRef)}`),
+  schedule: (draftRef: string, body: { confirmed_digest: string; idempotency_key: string }) => reminderFetch<ReminderActionResponse>(
+    `/${encodeURIComponent(draftRef)}/schedule`, { method: "POST", body: JSON.stringify(body) },
+  ),
+  cancel: (draftRef: string, body: { idempotency_key: string }) => reminderFetch<ReminderActionResponse>(
+    `/${encodeURIComponent(draftRef)}/cancel`, { method: "POST", body: JSON.stringify(body) },
+  ),
+  acknowledge: (draftRef: string, body: { idempotency_key: string }) => reminderFetch<ReminderActionResponse>(
+    `/${encodeURIComponent(draftRef)}/ack`, { method: "POST", body: JSON.stringify(body) },
+  ),
 };

@@ -6106,12 +6106,13 @@ class OpenAICompatibleLocalClient:
             return api_kwargs
         budget = self._current_context_budget or self._context_budget()
         schema_tokens = estimate_prompt_tokens(_compact_json(api_kwargs.get("tools") or []))
+        input_limit = self._tool_loop_input_limit(api_kwargs, budget)
 
         def fits(candidate: Dict[str, Any]) -> bool:
             return (
                 estimate_prompt_tokens(_compact_json(candidate.get("messages") or []))
                 + schema_tokens
-                <= budget.input_tokens
+                <= input_limit
             )
 
         tool_indexes = [
@@ -6199,7 +6200,7 @@ class OpenAICompatibleLocalClient:
         # deeper at a time, so only the oldest results are rewritten.
         target_tokens = int(
             min(
-                budget.input_tokens * TOOL_LOOP_RECLAIM_TARGET,
+                input_limit * TOOL_LOOP_RECLAIM_TARGET,
                 budget.context_window_tokens * TOOL_LOOP_RECLAIM_WINDOW_SHARE,
             )
         )
@@ -6243,9 +6244,45 @@ class OpenAICompatibleLocalClient:
                     break
         logger.warning(
             "[OpenAICompatibleLocalClient] Clipped tool results to fit the local input budget (%s tokens)",
-            budget.input_tokens,
+            input_limit,
         )
         return candidate
+
+    def _tool_loop_input_limit(
+        self, api_kwargs: Dict[str, Any], budget: ContextBudget
+    ) -> int:
+        """Input tokens a tool-loop request may use.
+
+        The planning budget reserves only ``response_tokens`` (1024).  With the
+        explicit ``tool_generation_max_tokens`` opt-in the wire output is up to
+        that value, so messages + schemas must leave that much room (plus the
+        safety margin) before sending; otherwise the wire cap is cut later and
+        a long tool-code generation ends with ``finish_reason=length``.  Never
+        raises the planning limit, never applies without the opt-in, and a
+        lower explicit cap (or scoped override) keeps the planning limit.
+        """
+
+        if self._scoped_response_tokens_override() is not None:
+            return budget.input_tokens
+        getter = getattr(getattr(self, "config", None), "get", None)
+        optin = (
+            getter(
+                "openai_compatible_local.context_budget.tool_generation_max_tokens",
+                None,
+            )
+            if callable(getter)
+            else None
+        )
+        try:
+            optin = int(optin) if optin not in (None, "", False) else 0
+        except (TypeError, ValueError):
+            optin = 0
+        max_tokens = api_kwargs.get("max_tokens")
+        if optin <= 0 or not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
+            return budget.input_tokens
+        output = min(max_tokens, optin, TOOL_GENERATION_ALLOWANCE_TOKENS)
+        safety = max(384, int(budget.context_window_tokens * 0.06))
+        return min(budget.input_tokens, budget.context_window_tokens - safety - output)
 
     @staticmethod
     def _omit_oldest_tool_loop_history(

@@ -23,7 +23,14 @@ async function proxyToPython(
   params: { path: string[] },
 ) {
   const normalizedPath = params.path[0] === "api" ? params.path.slice(1) : params.path;
-  const isPersonalOwnerApi = ["personal-ledger", "personal-drafts"].includes(normalizedPath[0]);
+  const isPersonalOwnerApi = new Set([
+    "personal-ledger",
+    "personal-drafts",
+    "personal-finance",
+    "personal-career",
+    "personal-reminders",
+    "personal-agents",
+  ]).has(normalizedPath[0]);
   const measureIntent =
     request.method === "POST" &&
     normalizedPath.length === 2 &&
@@ -34,14 +41,18 @@ async function proxyToPython(
   if (!user) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   }
-  // 個人台帳の書き込みは同一オリジンの操作に限る（SameSite=Lax に加える CSRF 多層防御）。
+  // 個人データの書き込みは同一オリジン JSON 操作に限る（SameSite=Lax に加える CSRF 多層防御）。
   if (
     isPersonalOwnerApi &&
     request.method !== "GET" &&
     request.method !== "HEAD" &&
-    !isSameOriginMutation(request)
+    (
+      !isSameOriginMutation(request) ||
+      request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json" ||
+      request.headers.get("sec-fetch-site") === "cross-site"
+    )
   ) {
-    return NextResponse.json({ detail: "同一オリジンからの操作が必要です" }, { status: 403 });
+    return NextResponse.json({ detail: "同一オリジン JSON 操作が必要です" }, { status: 403 });
   }
   if (
     normalizedPath.length === 2 &&
@@ -70,7 +81,7 @@ async function proxyToPython(
   if (isMediaAssetUpload && !["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime"].includes(assetMime)) return NextResponse.json({ detail: "対応する画像・動画のbinary streamを指定してください" }, { status: 415 });
   const forwardHeaders =
     normalizedPath.length === 2 && normalizedPath[0] === "free-team" && normalizedPath[1] === "openai-confirmation" ? ["cookie"]
-      // 個人台帳は本人のWebセッションをバックエンドで再検証する（内部転送マーカーだけでは認めない）。
+      // 個人APIは本人のWebセッションをバックエンドで再検証する（内部転送マーカーだけでは認めない）。
       : isPersonalOwnerApi ? ["cookie"]
       : isMediaAssetUpload ? ["idempotency-key", "x-asset-sha256"]
       : isMediaAssetPreview || isProductDeliverable ? ["if-match"]

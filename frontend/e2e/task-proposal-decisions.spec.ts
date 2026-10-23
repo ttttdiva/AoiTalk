@@ -377,6 +377,26 @@ async function assertProposalCard(
   ]);
 }
 
+async function openTaskDetailsFromList(
+  page: Page,
+  task: ReturnType<typeof makeTask>,
+): Promise<Locator> {
+  const isNarrow = (page.viewportSize()?.width ?? 1280) < 768;
+  const listItem = page.getByTestId(
+    `${isNarrow ? "mobile-task-card" : "task-row"}-${task.id}`,
+  );
+  await expect(listItem.getByText(/承認待ち/).first()).toBeVisible();
+  await expect(listItem.getByTestId(/^task-proposal-card-/)).toHaveCount(0);
+  await expect(page.getByTestId("task-proposal-list")).toHaveCount(0);
+  await listItem.getByText(task.title, { exact: true }).first().click();
+  const detail = page
+    .locator('[role="dialog"]:visible')
+    .filter({ hasText: task.title })
+    .first();
+  await expect(detail).toBeVisible();
+  return detail;
+}
+
 test("同じ提案がToday・タスク一覧・タスク詳細に表示され、確認は既存チャットへ遷移する", async ({
   page,
 }) => {
@@ -409,20 +429,12 @@ test("同じ提案がToday・タスク一覧・タスク詳細に表示され、
   await expect(todayDialog).toBeHidden();
   await page.goto("/tasks");
   await expect(page.getByTestId(`task-row-${task.id}`)).toBeVisible();
-  await assertProposalCard(
-    visibleProposalCard(page, proposal.id),
-    proposal,
-  );
+  const listItem = page.getByTestId(`task-row-${task.id}`);
+  await expect(listItem.getByText("承認待ち", { exact: false })).toBeVisible();
+  await expect(visibleProposalCard(page, proposal.id)).toHaveCount(0);
+  await expect(page.getByTestId("task-proposal-list")).toHaveCount(0);
 
-  await page
-    .getByTestId(`task-row-${task.id}`)
-    .getByText(task.title, { exact: true })
-    .click();
-  const detailDialog = page
-    .locator('[role="dialog"]:visible')
-    .filter({ hasText: task.title })
-    .first();
-  await expect(detailDialog).toBeVisible();
+  const detailDialog = await openTaskDetailsFromList(page, task);
   await assertProposalCard(
     visibleProposalCard(detailDialog, proposal.id),
     proposal,
@@ -478,7 +490,8 @@ for (const action of ["approve", "reject"] as const) {
     await addAuthCookie(page);
 
     await page.goto("/tasks");
-    const card = visibleProposalCard(page, proposal.id);
+    const detail = await openTaskDetailsFromList(page, task);
+    const card = visibleProposalCard(detail, proposal.id);
     await assertProposalCard(card, proposal);
     fixture.resetApiPosts();
     await card

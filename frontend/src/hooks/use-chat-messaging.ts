@@ -90,8 +90,15 @@ const LLM_HANDOFF_FAILURE_MESSAGE =
  * no legacy fallback is ever dispatched on the user's behalf.
  */
 function notifyRuntimeRejection(err: unknown, executionProfileId: string | null | undefined) {
-  if (!executionProfileId || !(err instanceof ChatApiError)) return;
+  if (!(err instanceof ChatApiError)) return;
   if (err.status == null || err.status < 400 || err.status >= 500) return;
+  const requiresCliSession =
+    err.code === "cli_route_not_supported" && err.requiredIngress === "cli_session";
+  if (!executionProfileId && !requiresCliSession) return;
+  if (requiresCliSession) {
+    toast.error(`${err.message}（必要な入口: CLIセッション）`);
+    return;
+  }
   toast.error(err.message || "選択した実行環境で開始できませんでした");
 }
 

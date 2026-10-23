@@ -1,0 +1,12 @@
+{
+  "status": "PASS",
+  "synthetic_only": true,
+  "server_version": "1.16.3",
+  "vectors": "64 synthetic 1024d legacy-like points",
+  "snapshot_sha256": "194d48790131843eba14b54e637b96c1e239bb1312da903878662b9b13104406",
+  "snapshot_bytes": 540160,
+  "point_payload_vector_equality": true,
+  "production_backup_or_deletion": "not_performed",
+  "local_snapshot_supported": false,
+  "recovery_target": "new owned fixture collection; no existing collection overwritten"
+}

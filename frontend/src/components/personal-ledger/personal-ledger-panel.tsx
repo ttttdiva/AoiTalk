@@ -5,6 +5,7 @@ import { AppSelect } from "@/components/ui/app-select";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PersonalDraftPanel } from "./personal-draft-panel";
+import { PersonalReminderPanel } from "./personal-reminder-panel";
 import {
   addWrite,
   completeWrite,
@@ -232,6 +233,7 @@ export function PersonalLedgerPanel() {
         </p>
       </header>
       <PersonalDraftPanel onMaterialized={() => refresh()} />
+      <PersonalReminderPanel />
       {message && (
         <div role="status" className="rounded border p-2">
           {message}

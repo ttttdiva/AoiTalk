@@ -53,6 +53,14 @@ class AgentTaskCreateRequest(BaseModel):
         None, ge=1, le=4096,
         description="Omitted/null keeps the model's legacy output reserve. Explicit per-task opt-in: uncapped tool generation may use a bounded allowance up to this many tokens (never above 4096 or the remaining context window); explicit caller/runtime caps still win.",
     )
+    timeout_sec: StrictInt | None = Field(
+        None, ge=1, le=3600,
+        description="Omitted/null keeps the existing 3600-second admission-to-deadline limit. Explicit narrowing only: one absolute task deadline of min(3600, timeout_sec) seconds is fixed at first admission; queue/setup time consumes it and replay, restart or resume never extends it. 0 is not unlimited.",
+    )
+    command_timeout_sec: StrictInt | None = Field(
+        None, ge=1, le=900,
+        description="Omitted/null keeps the existing command limits. Explicit narrowing only: an additional ceiling on each foreground command and tracked background job lifetime, further bounded at dispatch by the remaining absolute task deadline and all existing config/harness limits. Never grants command permission.",
+    )
     agent_id: UUID
     provider: str | None = Field(None, min_length=1, max_length=200)
     model: str | None = Field(None, min_length=1, max_length=200)
@@ -209,6 +217,10 @@ class AgentTaskCancelResponse(BaseModel):
 class AgentTaskErrorResponse(BaseModel):
     detail: str | list[dict[str, Any]]
     error: str | None = None
+    required_ingress: Literal["cli_session", "remote_agent"] | None = Field(
+        None,
+        description="Explicit ingress the caller must choose for this selected route; the server never redispatches automatically",
+    )
 
 
 def _error_responses(*statuses: int) -> dict[int, dict[str, Any]]:
@@ -299,9 +311,17 @@ def create_agent_task_router(
         return value
 
     def _error(exc: AgentTaskInvocationError) -> JSONResponse:
+        content: dict[str, Any] = {"detail": exc.message, "error": exc.code}
+        if exc.http_status == 409:
+            required_ingress = {
+                "cli_route_not_supported": "cli_session",
+                "remote_route_not_supported": "remote_agent",
+            }.get(exc.code)
+            if required_ingress is not None:
+                content["required_ingress"] = required_ingress
         return JSONResponse(
             status_code=exc.http_status,
-            content={"detail": exc.message, "error": exc.code},
+            content=content,
         )
 
     @router.post(

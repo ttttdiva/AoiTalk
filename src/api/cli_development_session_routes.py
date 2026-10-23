@@ -21,7 +21,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ..services.cli_development_sessions import cli_development_policy
 
 
 CLIProvider = Literal[
@@ -29,8 +31,10 @@ CLIProvider = Literal[
     "claude-cli",
     "codex-cli",
     "grok-cli",
+    "muse-remote",
 ]
 PermissionMode = Literal["native_default", "standard", "accept_edits"]
+RoleContextMode = Literal["raw", "agent_role"]
 CLISessionStatus = Literal[
     "ready",
     "queued",
@@ -52,21 +56,79 @@ CLICapability = Literal["command_execute", "workspace_read", "workspace_write"]
 class CLIDevelopmentSessionCreateRequest(BaseModel):
     """Pinned route and workspace for one durable CLI continuation."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "oneOf": [
+                {
+                    "title": "Local CLI session",
+                    "properties": {
+                        "provider": {
+                            "enum": [
+                                "antigravity-cli",
+                                "claude-cli",
+                                "codex-cli",
+                                "grok-cli",
+                            ]
+                        }
+                    },
+                    "required": ["provider", "model", "working_directory"],
+                },
+                {
+                    "title": "Muse remote session",
+                    "properties": {"provider": {"const": "muse-remote"}},
+                    "required": ["provider"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["model"]},
+                            {"required": ["working_directory"]},
+                            {"required": ["effort"]},
+                            {"required": ["permission_mode"]},
+                            {"required": ["allowed_capabilities"]},
+                        ]
+                    },
+                },
+            ]
+        },
+    )
 
     agent_id: str = Field(..., min_length=36, max_length=36)
+    agent_revision_id: str | None = Field(default=None, min_length=36, max_length=36)
+    project_id: str | None = Field(default=None, min_length=36, max_length=36)
     provider: CLIProvider
-    model: str = Field(..., min_length=1, max_length=160)
+    # Local providers require these fields at service admission.  Muse remote
+    # has no local model or filesystem knobs, so the transport leaves them
+    # absent and lets the provider-specific service branch validate the shape.
+    model: str | None = Field(default=None, min_length=1, max_length=160)
     effort: str | None = Field(default=None, min_length=1, max_length=40)
-    working_directory: str = Field(..., min_length=1, max_length=4096)
+    working_directory: str | None = Field(default=None, min_length=1, max_length=4096)
     idempotency_key: str = Field(..., min_length=1, max_length=128)
     title: str | None = Field(default=None, max_length=255)
-    permission_mode: PermissionMode = "native_default"
+    permission_mode: PermissionMode | None = None
     # Omitted keeps the legacy full ceiling; an explicit list may only narrow it.
     allowed_capabilities: list[CLICapability] | None = Field(default=None, min_length=1, max_length=3)
     # Omitted/null keeps the AgentRevision default runtime; an explicit id
     # selects a server-validated ExecutionProfile (never a role change).
     execution_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    # Omitted remains the historical raw provider invocation.  The managed UI
+    # must opt into Agent role delivery explicitly.
+    role_context_mode: RoleContextMode | None = None
+
+    @model_validator(mode="after")
+    def validate_provider_shape(self) -> "CLIDevelopmentSessionCreateRequest":
+        local_fields = {
+            "model",
+            "working_directory",
+            "effort",
+            "permission_mode",
+            "allowed_capabilities",
+        }
+        if self.provider == "muse-remote":
+            if self.model_fields_set.intersection(local_fields):
+                raise ValueError("muse-remote forbids local execution fields")
+        elif self.model is None or self.working_directory is None:
+            raise ValueError("local providers require model and working_directory")
+        return self
 
 
 class CLIDevelopmentSessionMessageRequest(BaseModel):
@@ -143,6 +205,13 @@ class CLIDevelopmentSessionSummary(BaseModel):
     model: str | None = None
     effort: str | None = None
     working_directory: str | None = None
+    role_context_mode: RoleContextMode = "raw"
+    role_context_sha256: str | None = None
+    execution_target: str | None = None
+    local_filesystem: bool | None = None
+    sandbox: str | None = None
+    turn_status: str | None = None
+    delivery: dict[str, Any] | None = None
     status: CLISessionStatus = "ready"
     native_state: str | None = None
     run_id: str | None = None
@@ -181,6 +250,13 @@ class CLIDevelopmentSessionCollectItem(BaseModel):
     model: str | None = None
     effort: str | None = None
     working_directory: str | None = None
+    role_context_mode: RoleContextMode = "raw"
+    role_context_sha256: str | None = None
+    execution_target: str | None = None
+    local_filesystem: bool | None = None
+    sandbox: str | None = None
+    turn_status: str | None = None
+    delivery: dict[str, Any] | None = None
     status: CLISessionStatus | None = None
     native_state: str | None = None
     run_id: str | None = None
@@ -199,7 +275,7 @@ class CLIDevelopmentSessionPolicyEffective(BaseModel):
     allowed_roots: list[str] = Field(default_factory=list)
     allowed_owner_ids: list[str] = Field(default_factory=list)
     allowed_agent_ids: list[str] = Field(default_factory=list)
-    default_permission_mode: PermissionMode = "native_default"
+    default_permission_mode: PermissionMode | None = None
     allowed_permission_modes: list[PermissionMode] = Field(default_factory=list)
     approval_policy_source: str | None = None
     provider_cache_roots: dict[str, str] = Field(default_factory=dict)
@@ -220,7 +296,7 @@ class CLIDevelopmentSessionTrustedWindowsStatus(BaseModel):
 
     enabled: bool = False
     allowed_roots: list[str] = Field(default_factory=list)
-    default_permission_mode: PermissionMode = "native_default"
+    default_permission_mode: PermissionMode | None = None
 
 
 class CLIDevelopmentSessionStatusResponse(_CLIResponse):
@@ -243,6 +319,13 @@ class CLIDevelopmentSessionResponse(_CLIResponse):
     model: str | None = None
     effort: str | None = None
     working_directory: str | None = None
+    role_context_mode: RoleContextMode | None = None
+    role_context_sha256: str | None = None
+    execution_target: str | None = None
+    local_filesystem: bool | None = None
+    sandbox: str | None = None
+    turn_status: str | None = None
+    delivery: dict[str, Any] | None = None
     status: CLISessionStatus | None = None
     policy: dict[str, Any] | None = None
     native_state: str | None = None
@@ -276,6 +359,11 @@ class CLIDevelopmentSessionActionResponse(_CLIResponse):
     run_id: str | None = None
     work_item_id: str | None = None
     status: CLISessionStatus | None = None
+    execution_target: str | None = None
+    local_filesystem: bool | None = None
+    sandbox: str | None = None
+    turn_status: str | None = None
+    delivery: dict[str, Any] | None = None
     cancel_requested: bool | None = None
     accepted: bool = True
 
@@ -444,6 +532,13 @@ _COLLECT_HEADER_FIELDS = (
     "model",
     "effort",
     "working_directory",
+    "role_context_mode",
+    "role_context_sha256",
+    "execution_target",
+    "local_filesystem",
+    "sandbox",
+    "turn_status",
+    "delivery",
     "status",
     "native_state",
     "run_id",
@@ -454,6 +549,10 @@ _COLLECT_HEADER_FIELDS = (
 def _collect_header(value: Any, *, session_id: str) -> dict[str, Any]:
     projection = _session_projection(value)
     projection.setdefault("session_id", session_id)
+    # Legacy/fake service projections may omit role context or explicitly
+    # return null.  The public summary contract treats that as raw mode.
+    if projection.get("role_context_mode") in (None, ""):
+        projection["role_context_mode"] = "raw"
     return {key: projection.get(key) for key in _COLLECT_HEADER_FIELDS}
 
 
@@ -553,7 +652,9 @@ def create_cli_development_session_router(
     @router.get("/status", response_model=CLIDevelopmentSessionStatusResponse)
     async def cli_development_session_status() -> dict[str, Any]:
         candidate = _resolve_service()
-        configured = _config_bool(_config(), "cli_development_sessions.enabled", False)
+        config = _config()
+        configured = _config_bool(config, "cli_development_sessions.enabled", False)
+        default_permission_mode = cli_development_policy(config).default_permission_mode()
         payload: dict[str, Any] = {
             "success": True,
             "enabled": configured,
@@ -565,7 +666,7 @@ def create_cli_development_session_router(
                     "cli_development_sessions.trusted_windows.allowed_roots",
                     [],
                 ),
-                "default_permission_mode": "native_default",
+                "default_permission_mode": default_permission_mode,
             },
         }
         if candidate is not None:
@@ -574,6 +675,13 @@ def create_cli_development_session_router(
                 try:
                     described = await _maybe(method())
                     payload.update(_as_mapping(described))
+                    effective = _as_mapping(payload.get("effective"))
+                    trusted_windows = _as_mapping(payload.get("trusted_windows"))
+                    if "default_permission_mode" in effective:
+                        payload["trusted_windows"] = {
+                            **trusted_windows,
+                            "default_permission_mode": effective["default_permission_mode"],
+                        }
                 except Exception:
                     # Diagnostics must remain safe and bounded even when the
                     # optional runtime is not ready.
@@ -587,7 +695,9 @@ def create_cli_development_session_router(
     ) -> JSONResponse:
         try:
             payload = body.model_dump(mode="json", exclude_none=True)
-            payload["working_directory"] = _absolute_directory(body.working_directory)
+            payload["_provided_fields"] = sorted(body.model_fields_set)
+            if body.working_directory is not None:
+                payload["working_directory"] = _absolute_directory(body.working_directory)
             result = await _call("create", request, request=payload)
             response = {"success": True, "accepted": True, **_session_projection(result)}
             return JSONResponse(status_code=202, content=response)

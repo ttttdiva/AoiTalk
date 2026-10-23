@@ -5,9 +5,9 @@ from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker
 
 root = Path(__file__).resolve().parent
-profiles = json.loads((root / 'agent-definitions.json').read_text())
-contracts = json.loads((root / 'tool-contracts.json').read_text())
-fixtures = json.loads((root / 'synthetic-cases.json').read_text())
+profiles = json.loads((root / 'agent-definitions.json').read_text(encoding='utf-8'))
+contracts = json.loads((root / 'tool-contracts.json').read_text(encoding='utf-8'))
+fixtures = json.loads((root / 'synthetic-cases.json').read_text(encoding='utf-8'))
 tools = {tool['name']: tool for tool in contracts['tools']}
 checks = 0
 for tool in tools.values():

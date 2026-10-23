@@ -55,6 +55,8 @@ class CLINativeSessionScope:
     authority_digest: str | None = None
     policy_fingerprint: str | None = None
     provider_cache_root: str | None = None
+    role_context_mode: str | None = None
+    role_context_sha256: str | None = None
 
     @property
     def scope_key(self) -> str:
@@ -74,6 +76,8 @@ class CLINativeSessionScope:
             "authority_digest": self.authority_digest,
             "policy_fingerprint": self.policy_fingerprint,
             "provider_cache_root": self.provider_cache_root,
+            "role_context_mode": self.role_context_mode,
+            "role_context_sha256": self.role_context_sha256,
         }
         if any(value not in (None, "") for value in agent_key_values.values()):
             payload.update(agent_key_values)
@@ -99,6 +103,8 @@ class CLINativeSessionScope:
             "authority_digest",
             "policy_fingerprint",
             "provider_cache_root",
+            "role_context_mode",
+            "role_context_sha256",
         ):
             value = getattr(self, key, None)
             if value not in (None, ""):
@@ -240,6 +246,8 @@ class CLISessionStore:
         *,
         force_new: bool = False,
     ) -> CLISessionLease:
+        if self._invalid_role_context_scope(scope):
+            raise ValueError("Agent native continuation role context proof is invalid")
         if scope.agent_revision_id:
             required = (
                 scope.binding_snapshot_hash,
@@ -316,6 +324,14 @@ class CLISessionStore:
             native_session_id=native_session_id,
             recreated=bool(force_new and had_previous_native_session),
         )
+
+    @staticmethod
+    def _invalid_role_context_scope(scope: CLINativeSessionScope) -> bool:
+        mode = scope.role_context_mode
+        digest = scope.role_context_sha256
+        if mode in (None, "") and digest in (None, ""):
+            return False
+        return mode != "agent_role" or not isinstance(digest, str) or len(digest) != 64
 
     async def record_native_session(
         self,

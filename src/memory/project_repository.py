@@ -3,11 +3,12 @@ Repository for Project management
 """
 
 import asyncio
+import functools
 import re
 import logging
 import os
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 from sqlalchemy import select, delete, update, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,6 +74,30 @@ def is_foreign_default_inbox_project(project: Project, user_id: UUID) -> bool:
         and getattr(project, "slug", None) == user_inbox_project_slug(owner_id)
     )
 
+
+
+def _cleanup_deleted_project_files(
+    project_id: UUID,
+    *,
+    delete_workspace: bool,
+    workspace_root: str | os.PathLike[str] | None,
+) -> None:
+    """Project削除のcommit後に workspace と App instance を削除する。"""
+    from ..services.app_storage import remove_app_instance
+
+    if delete_workspace:
+        try:
+            from ..services.project_workspace_cleanup import remove_project_workspace
+
+            # ロック取得と同じ root を使わないと、別 root の workspace を
+            # 削除してしまう（= ロックが守っていない領域を触る）。
+            remove_project_workspace(project_id, workspace_root=workspace_root)
+        except Exception:
+            logger.exception("Project workspace cleanup failed after Project deletion: %s", project_id)
+    try:
+        remove_app_instance(project_id, workspace_root=workspace_root)
+    except Exception:
+        logger.exception("App instance cleanup failed after Project deletion: %s", project_id)
 
 class ProjectRepository:
     """Repository for managing projects and memberships"""
@@ -683,6 +708,7 @@ class ProjectRepository:
         delete_workspace: bool = False,
         workspace_root: str | os.PathLike[str] | None = None,
         commit: bool = True,
+        after_commit: list[Callable[[], None]] | None = None,
     ) -> bool:
         """Delete a project from the active app surface.
 
@@ -741,6 +767,7 @@ class ProjectRepository:
             .with_for_update()
         )
         active_jobs = list(active_jobs_result.scalars().all())
+        jobs_confirmed_stopped = True
         if active_jobs:
             from ..services.app_job_service import stop_running_job
 
@@ -750,7 +777,9 @@ class ProjectRepository:
                     # subprocess.run(["taskkill", ...], timeout=10) を同期実行する。
                     # event loop 上で直接呼ぶと Job 1 件あたり最大 10 秒、
                     # サーバー全体が無応答になるため必ず別スレッドへ逃がす。
-                    await asyncio.to_thread(stop_running_job, job.id)
+                    stopped = await asyncio.to_thread(stop_running_job, job.id)
+                    if not stopped:
+                        jobs_confirmed_stopped = False
                 job.status = "cancelled"
                 job.result_json = {"error": "Project was deleted"}
                 job.ended_at = now
@@ -872,25 +901,29 @@ class ProjectRepository:
         await session.execute(delete(AppGrant).where(AppGrant.project_id == project_id))
         if commit:
             await session.commit()
-        from ..services.app_storage import remove_app_instance
-
         # The DB tombstone/binding deletion is the transaction boundary.  Do
         # not destroy filesystem data before it commits: a DB rollback must
         # leave the instance available for the still-existing binding.
-        if commit and delete_workspace:
-            try:
-                from ..services.project_workspace_cleanup import remove_project_workspace
-
-                # ロック取得と同じ root を使わないと、別 root の workspace を
-                # 削除してしまう（= ロックが守っていない領域を触る）。
-                remove_project_workspace(project_id, workspace_root=workspace_root)
-            except Exception:
-                logger.exception("Project workspace cleanup failed after Project deletion: %s", project_id)
-        if commit:
-            try:
-                remove_app_instance(project_id, workspace_root=workspace_root)
-            except Exception:
-                logger.exception("App instance cleanup failed after Project deletion: %s", project_id)
+        if not jobs_confirmed_stopped:
+            logger.warning(
+                "Project削除: 実行中Jobの停止を確認できないためファイル削除を保留しました: %s",
+                project_id,
+            )
+        elif commit:
+            _cleanup_deleted_project_files(
+                project_id,
+                delete_workspace=delete_workspace,
+                workspace_root=workspace_root,
+            )
+        elif after_commit is not None:
+            after_commit.append(
+                functools.partial(
+                    _cleanup_deleted_project_files,
+                    project_id,
+                    delete_workspace=delete_workspace,
+                    workspace_root=workspace_root,
+                )
+            )
         return True
 
     @staticmethod

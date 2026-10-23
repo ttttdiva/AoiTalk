@@ -57,6 +57,7 @@ from .routes.tasks import (
     register_attachment_routes,
     register_google_calendar_routes,
     register_notification_routes,
+    register_task_operation_routes,
     register_occurrence_time_routes,
     register_space_routes,
     register_tag_reorder_routes,
@@ -484,13 +485,16 @@ def create_task_router(
             )
         except GoogleCalendarServiceError as exc:
             logger.warning(
-                "Google Calendar auto sync failed for task %s: %s",
+                "Google Calendar auto sync failed for task %s (%s)",
                 task_id,
-                exc.message,
+                type(exc).__name__,
             )
             return {"status": "warning", "message": exc.message}
         except Exception as exc:
-            logger.exception("Unexpected Google Calendar auto sync failure")
+            logger.warning(
+                "Unexpected Google Calendar auto sync failure (%s)",
+                type(exc).__name__,
+            )
             return {"status": "warning", "message": str(exc)}
 
     async def _delete_google_calendar_warning_only(
@@ -508,13 +512,16 @@ def create_task_router(
             )
         except GoogleCalendarServiceError as exc:
             logger.warning(
-                "Google Calendar auto event delete failed for task %s: %s",
+                "Google Calendar auto event delete failed for task %s (%s)",
                 task_id,
-                exc.message,
+                type(exc).__name__,
             )
             return {"status": "warning", "message": exc.message}
         except Exception as exc:
-            logger.exception("Unexpected Google Calendar auto event delete failure")
+            logger.warning(
+                "Unexpected Google Calendar auto event delete failure (%s)",
+                type(exc).__name__,
+            )
             return {"status": "warning", "message": str(exc)}
 
     async def _load_tag(session, tag_id: str) -> Tag:
@@ -563,6 +570,7 @@ def create_task_router(
 
     register_space_routes(router, ctx)
     register_task_routes(router, ctx)
+    register_task_operation_routes(router, ctx)
     register_task_proposal_routes(router, ctx)
     register_attachment_routes(router, ctx)
     register_occurrence_time_routes(router, ctx)

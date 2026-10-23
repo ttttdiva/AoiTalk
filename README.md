@@ -12,7 +12,7 @@ AoiTalk は、設定した音声合成キャラクターを AI アシスタン�
 
 ### リモートPCのブラウザとWindowsを操作する
 
-操作するWindows PCで `AoiTalk-PC-Bridge.exe` を起動し、AoiTalkの設定「PC接続」で選択します。サーバーとは別PCのログイン済みEdgeやWindowsアプリを操作できる構成です。exe・初回設定・検証範囲は [PC Bridgeガイド](docs/pc_bridge.md) を参照してください。
+操作するWindows PCで `AoiTalk-PC-Bridge.exe` を起動し、AoiTalkの設定「PC接続」で選択します。サーバーとは別PCのログイン済みEdgeやWindowsアプリを操作できる構成です。exe・初回設定・検証範囲は PC Bridgeガイド を参照してください。
 
 ### 音声合成キャラクターと会話する
 
@@ -169,17 +169,17 @@ Python パッケージ自体は macOS を考慮していますが、`setup.sh` �
 
 ## 開発・検証
 
-通常の変更は変更範囲に応じたローカルのターゲット検証を行い、`main` push 後にリモートSHAを確認します。GitHub Actions / CI の完了は待たず、成功を完了条件にしません。WebUI のユーザー挙動を変える場合は [AI WebUI QA](docs/ai_webui_qa.md) の独立実ブラウザ確認が追加で必要です。
+リポジトリ内の作業規約は `AGENTS.md` が正本です。通常の変更は変更範囲に応じたローカルのターゲット検証を行い、`main` push 後にリモートSHAを確認します。GitHub Actions / CI の完了は待たず、成功を完了条件にしません。WebUI のユーザー挙動を変える場合は AI WebUI QA の独立実ブラウザ確認が追加で必要です。
 
 ## 配布
 
 この開発リポジトリと公開版リポジトリは分離されています。公開版の同期先は `ttttdiva/AoiTalk` で、`scripts/publish_public.ps1` が公開用 tree を生成します。
 
 - Mobile 自動更新 / APK: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
-- Release 共通手順: [docs/release-checklist.md](docs/release-checklist.md)
+- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-リポジトリ直下の [LICENSE](LICENSE)（MIT）は、別段の表示がないこのリポジトリの内容に適用されます。`resources/seethrough-rig/runtime` は別パッケージで、upstream の license は未指定（package.json は `UNLICENSED`）のため、MIT を含むいかなる利用許諾も付与しません。詳細は同ディレクトリの `FIRST_PARTY_NOTICE.md` を参照してください。
+MIT
 
 - [機能名称と責務の正本](docs/feature_terminology.md)

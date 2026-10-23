@@ -404,16 +404,19 @@ def _create_triggers(table: str, name: str, function: str, events: tuple[str, ..
     out = []
     for event in events:
         if event == "INSERT":
+            out.append(f"DROP TRIGGER IF EXISTS {name}_ins ON {table};")
             out.append(
                 f"CREATE TRIGGER {name}_ins AFTER INSERT ON {table} "
                 f"FOR EACH ROW EXECUTE FUNCTION {function}();"
             )
         elif event == "UPDATE":
+            out.append(f"DROP TRIGGER IF EXISTS {name}_upd ON {table};")
             out.append(
                 f"CREATE TRIGGER {name}_upd AFTER UPDATE ON {table} "
                 f"FOR EACH ROW {changed} EXECUTE FUNCTION {function}();"
             )
         else:
+            out.append(f"DROP TRIGGER IF EXISTS {name}_del ON {table};")
             out.append(
                 f"CREATE TRIGGER {name}_del BEFORE DELETE ON {table} "
                 f"FOR EACH ROW EXECUTE FUNCTION {function}();"

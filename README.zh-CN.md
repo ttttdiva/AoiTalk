@@ -165,17 +165,17 @@ Python 包本身考虑了 macOS，但 `setup.sh` 中部分步骤以 Debian / Ubu
 
 ## 开发与验证
 
-通常应根据变更范围执行本地针对性验证，并在推送 `main` 后确认远程提交 SHA。不等待 GitHub Actions / CI 完成，也不将其成功作为完成条件。涉及 WebUI 用户行为的变更，还需要按照 [AI WebUI QA](docs/ai_webui_qa.md) 进行独立的真实浏览器验证。
+仓库内的工作规则以 `AGENTS.md` 为准。通常应根据变更范围执行本地针对性验证，并在推送 `main` 后确认远程提交 SHA。不等待 GitHub Actions / CI 完成，也不将其成功作为完成条件。涉及 WebUI 用户行为的变更，还需要按照 AI WebUI QA 进行独立的真实浏览器验证。
 
 ## 发布
 
 私有开发仓库与公开发布仓库是有意分离的。`scripts/publish_public.ps1` 会为 `ttttdiva/AoiTalk` 生成公开发布用 tree。
 
 - Mobile APK / 自动更新标准: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
-- Release checklist: [docs/release-checklist.md](docs/release-checklist.md)
+- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-根目录的 [LICENSE](LICENSE)（MIT）适用于本仓库中未另行标注的内容。`resources/seethrough-rig/runtime` 是独立的包，其 upstream license 未指定（package.json 为 `UNLICENSED`），不适用 MIT，也不授予任何形式的许可。详见该目录下的 `FIRST_PARTY_NOTICE.md`。
+MIT
 
 - [功能名称与职责](docs/feature_terminology.md)

@@ -113,7 +113,7 @@ export function StrataRuntimePanel({ status, task, busy, onAction, onCancel }: {
             <>
               <p>{settings?.setup_notice ?? "公式setupはモデル約66〜84GB、MTP約6GB、画像約1GB、Q2_0/AVX-512では追加約40GBを使用します。統合GPUは非対応です"}</p>
               <label className="block space-y-1">Source folder（空欄は管理領域へ固定source取得）<Input aria-label="Strata source folder" value={sourceRoot} onChange={(event) => { setSourceRoot(event.target.value); change(); }} /></label>
-              <label className="block space-y-1">大容量データ保存先（repository外）<Input aria-label="Strata data folder" placeholder="例: F:\AI\models\Cold_F\llm\strata" value={dataDir} onChange={(event) => { setDataDir(event.target.value); change(); }} /></label>
+              <label className="block space-y-1">大容量データ保存先（repository外）<Input aria-label="Strata data folder" placeholder="例: <configured-model-root>\strata" value={dataDir} onChange={(event) => { setDataDir(event.target.value); change(); }} /></label>
               <label className="block space-y-1">既存GGUF folder（任意・全shard、空欄は保存済み設定を保持）<Input aria-label="Strata GGUF folder" value={ggufDir} onChange={(event) => { setGgufDir(event.target.value); change(); }} /></label>
               <p className="text-muted-foreground">GGUF指定でも未準備のMTP・依存があれば公式setupが取得します。完全offlineでは準備済みsource/engine/tokenizer/MTP/visionも配置してください</p>
               <div className="grid gap-2 sm:grid-cols-3">

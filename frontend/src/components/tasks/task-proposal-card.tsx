@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import type {
   TaskProposal,
   TaskProposalDecisionAction,
@@ -15,6 +16,44 @@ import type {
 } from "@/components/tasks/hooks/use-task-proposals";
 import { TASK_PROPOSAL_UNCERTAIN_MESSAGE } from "@/components/tasks/hooks/use-task-proposals";
 import { cn } from "@/lib/utils";
+
+export function TaskProposalIndicators({
+  count = 0,
+  childCount = 0,
+  className,
+}: {
+  count?: number;
+  childCount?: number;
+  className?: string;
+}) {
+  if (count <= 0 && childCount <= 0) return null;
+
+  const badgeClassName =
+    "h-4 shrink-0 border-amber-400/70 bg-amber-50 px-1.5 text-[10px] font-medium text-amber-900 dark:border-amber-500/50 dark:bg-amber-950/40 dark:text-amber-200";
+
+  return (
+    <span className={cn("inline-flex min-w-0 items-center gap-1", className)}>
+      {count > 0 ? (
+        <Badge
+          variant="outline"
+          className={badgeClassName}
+          aria-label={`${count}件の承認待ち提案`}
+        >
+          承認待ち{count > 1 ? ` ${count}` : ""}
+        </Badge>
+      ) : null}
+      {childCount > 0 ? (
+        <Badge
+          variant="outline"
+          className={badgeClassName}
+          aria-label={`子タスクに${childCount}件の承認待ち提案`}
+        >
+          子タスク承認待ち{childCount > 1 ? ` ${childCount}` : ""}
+        </Badge>
+      ) : null}
+    </span>
+  );
+}
 
 export type TaskProposalCardProps = {
   proposal: TaskProposal;
@@ -41,6 +80,11 @@ export function TaskProposalCard({
   const [pendingAction, setPendingAction] = useState<TaskProposalDecisionAction | null>(null);
   const isDecisionDisabled =
     decisionDisabled || decisionState !== "idle" || localDecision;
+  // The one-line title is what the agent will do; the longer summary and the
+  // server-owned plan text stay folded so the card remains compact.
+  const detailText = [proposal.summary.trim(), proposal.plan_text.trim()]
+    .filter((text, index, texts) => text && texts.indexOf(text) === index)
+    .join("\n\n");
 
   const decide = async (action: TaskProposalDecisionAction) => {
     if (isDecisionDisabled) return;
@@ -56,6 +100,9 @@ export function TaskProposalCard({
       }
       if (result.message) {
         setDecisionMessage(result.message);
+        // A settled/stale card is removed by the follow-up GET, so keep the
+        // server outcome visible after the card disappears.
+        toast.info(result.message);
         return;
       }
       if (!result.accepted) return;
@@ -81,11 +128,22 @@ export function TaskProposalCard({
       data-proposal-revision={String(proposal.revision)}
     >
       <div className="min-w-0">
-        <h3 className="truncate text-sm font-semibold">{proposal.title}</h3>
-        {proposal.summary.trim() ? (
-          <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-xs text-muted-foreground">
-            {proposal.summary}
-          </p>
+        <h3
+          className="truncate text-sm font-semibold"
+          title={proposal.title}
+        >
+          {proposal.title}
+        </h3>
+        {detailText ? (
+          <details
+            className="mt-1 text-xs text-muted-foreground"
+            data-testid={`task-proposal-details-${proposal.id}`}
+          >
+            <summary className="cursor-pointer select-none">詳細</summary>
+            <p className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-words">
+              {detailText}
+            </p>
+          </details>
         ) : null}
       </div>
       {pendingAction || decisionState === "submitting" ? (
@@ -174,7 +232,8 @@ export function TaskProposalList({
       更新
     </Button>
   ) : null;
-  const headerRefreshButton = hasDecisionRecovery ? refreshButton : null;
+  const headerRefreshButton =
+    hasDecisionRecovery && !state.uncertainNotice ? refreshButton : null;
 
   return (
     <section
@@ -200,19 +259,23 @@ export function TaskProposalList({
           承認待ちの提案を読み込み中…
         </p>
       ) : state.status === "uncertain" ? (
-        <div className="flex items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
-          <p role="alert">{TASK_PROPOSAL_UNCERTAIN_MESSAGE}</p>
-          {refreshButton}
-        </div>
+        state.uncertainNotice ? null : (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+            <p role="alert">{TASK_PROPOSAL_UNCERTAIN_MESSAGE}</p>
+            {refreshButton}
+          </div>
+        )
       ) : state.status === "error" ? (
         <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
-          <p role="alert">承認待ちの提案を取得できませんでした。</p>
-          {refreshButton}
+          <p role="alert">
+            {state.error || "承認待ちの提案を取得できませんでした。"}
+          </p>
+          {state.uncertainNotice ? null : refreshButton}
         </div>
       ) : state.status === "unavailable" ? (
         <div className="flex items-center justify-between gap-2 rounded-md border border-dashed p-3 text-xs text-muted-foreground">
           <p role="status">提案機能は利用できません。</p>
-          {refreshButton}
+          {state.uncertainNotice ? null : refreshButton}
         </div>
       ) : state.status === "empty" ? (
         state.uncertainNotice ? null : (

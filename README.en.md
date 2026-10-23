@@ -167,17 +167,17 @@ Do not document fixed login passwords in the README. Bootstrap credentials are r
 
 ## Development and verification
 
-Run local targeted verification for the changed scope, then verify the remote commit SHA after pushing `main`. Do not wait for GitHub Actions / CI to finish or require its success for completion. User-visible WebUI behavior changes also require the independent browser QA flow in [AI WebUI QA](docs/ai_webui_qa.md).
+`AGENTS.md` is the repository workflow authority. Run local targeted verification for the changed scope, then verify the remote commit SHA after pushing `main`. Do not wait for GitHub Actions / CI to finish or require its success for completion. User-visible WebUI behavior changes also require the independent browser QA flow in AI WebUI QA.
 
 ## Distribution
 
 The private development repository and public distribution repository are intentionally separated. `scripts/publish_public.ps1` generates the public tree for `ttttdiva/AoiTalk`.
 
 - Mobile APK / auto-update standard: [docs/mobile-auto-update-standard.md](docs/mobile-auto-update-standard.md)
-- Release checklist: [docs/release-checklist.md](docs/release-checklist.md)
+- Enterprise handoff: `README.enterprise.md`
 
 ## License
 
-The root [LICENSE](LICENSE) (MIT) applies to this repository's contents unless marked otherwise. `resources/seethrough-rig/runtime` is a separate package whose upstream license is unspecified (`UNLICENSED` in package.json); it is not covered by the MIT license and no license grant of any kind is made for it. See `FIRST_PARTY_NOTICE.md` in that directory.
+MIT
 
 - [Feature terminology and responsibilities](docs/feature_terminology.md)

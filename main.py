@@ -538,6 +538,10 @@ async def main() -> None:
 
 if __name__ == "__main__":
     """Entry point"""
+    from src.utils.process_identity import backend_identity, set_own_console_title
+
+    set_own_console_title(backend_identity())
+    logger.info("%s", backend_identity())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

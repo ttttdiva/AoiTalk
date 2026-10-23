@@ -12,6 +12,11 @@ import type { OutboxEnqueue } from './types';
 import { getToken, getTokenAuthScope } from '../lib/auth';
 import { asc, eq, and, isNull, like, sql } from 'drizzle-orm';
 import type { OutboxSyncState } from '../stores/sync-status';
+import { assertActiveWriter, type SqliteHandle, type SqliteWriter } from '../db/sqlite-writer';
+import {
+  readSyncV3DeviceStateInWriter,
+  writeSyncV3DeviceStateInWriter,
+} from '../sync/v3/state';
 
 /**
  * Immutable pending-operation snapshot used by every resolution write.
@@ -86,7 +91,7 @@ type OutboxConflictLookup = {
  * rows untouched prevents an unknown old mutation from being attributed to a
  * newly signed-in account.
  */
-async function resolveAuthScope(
+export async function resolveAuthScope(
   requested?: string | null,
 ): Promise<string | null> {
   if (requested !== undefined) return requested;
@@ -640,6 +645,35 @@ export async function hasPendingOutbox(
   return rows.length > 0;
 }
 
+/**
+ * Synchronous form of `hasPendingOutbox` for a caller already inside a
+ * coordinator write unit. The auth scope is resolved by the caller (see
+ * `resolveAuthScope`); `null` means "no signed-in actor" and is never pending.
+ */
+export function hasPendingOutboxInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  table: string,
+  entityId: string,
+  authScope: string | null,
+): boolean {
+  assertActiveWriter(w);
+  if (authScope === null) return false;
+  const rows = tx
+    .select({ opId: schema.outbox.opId })
+    .from(schema.outbox)
+    .where(
+      and(
+        scopePredicate(authScope),
+        eq(schema.outbox.tableName, table),
+        eq(schema.outbox.entityId, entityId),
+      ),
+    )
+    .limit(1)
+    .all();
+  return rows.length > 0;
+}
+
 export async function recordOutboxServerSnapshot(
   table: string,
   entityId: string,
@@ -650,9 +684,53 @@ export async function recordOutboxServerSnapshot(
   const db = getDb();
   const authScope = await resolveCurrentAuthScope(requestedAuthScope);
   if (authScope === null) return;
+  attachOutboxServerSnapshot(
+    db,
+    authScope,
+    table,
+    entityId,
+    payload,
+    requestedDocsScopeKey,
+  );
+}
+
+/**
+ * Synchronous form of `recordOutboxServerSnapshot` for a caller already inside
+ * a coordinator write unit. The auth scope is resolved by the caller (token
+ * reads are asynchronous) and `null` means "no signed-in actor": no-op.
+ */
+export function recordOutboxServerSnapshotInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  authScope: string | null,
+  table: string,
+  entityId: string,
+  payload: unknown,
+  requestedDocsScopeKey?: string | null,
+): void {
+  assertActiveWriter(w);
+  if (authScope === null) return;
+  attachOutboxServerSnapshot(
+    tx,
+    authScope,
+    table,
+    entityId,
+    payload,
+    requestedDocsScopeKey,
+  );
+}
+
+function attachOutboxServerSnapshot(
+  db: SqliteHandle,
+  authScope: string,
+  table: string,
+  entityId: string,
+  payload: unknown,
+  requestedDocsScopeKey?: string | null,
+): void {
   const inferredScopeKey = requestedDocsScopeKey
     ?? (table.startsWith('knowledge_') ? inferDocsScopeKeyFromPayload(payload) : null);
-  const rows = await db
+  const rows = db
     .select()
     .from(schema.outbox)
     .where(and(
@@ -663,7 +741,8 @@ export async function recordOutboxServerSnapshot(
         ? [eq(schema.outbox.docsScopeKey, inferredScopeKey)]
         : []),
     ))
-    .orderBy(asc(schema.outbox.createdAt));
+    .orderBy(asc(schema.outbox.createdAt))
+    .all();
   // The helper has no opId.  Even a verified composite scope cannot identify
   // one row when multiple operations for the same entity are pending; keep
   // every candidate untouched rather than attaching the snapshot to the
@@ -689,7 +768,7 @@ export async function recordOutboxServerSnapshot(
     }
   }
   const expected = pendingSnapshot(row);
-  await db
+  db
     .update(schema.outbox)
     .set({ conflictPayload: payload as never })
     .where(outboxMutationSnapshotCondition(row.opId, expected))
@@ -1019,6 +1098,41 @@ export async function removeOutboxOpIfSnapshot(
   return Number(result.changes ?? 0) > 0;
 }
 
+/** Synchronous form of `removeOutboxOpIfSnapshot` for a caller inside a write unit. */
+export function removeOutboxOpIfSnapshotInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  opId: string,
+  snapshot: PendingOutboxSnapshot,
+  guard: {
+    authScope?: string | null;
+    docsScopeKey?: string | null;
+    requireConflict?: boolean;
+  } = {},
+): boolean {
+  assertActiveWriter(w);
+  if (snapshot.opId !== opId) return false;
+  const conditions = [outboxMutationSnapshotCondition(opId, snapshot)];
+  if (guard.authScope !== undefined) {
+    conditions.push(scopePredicate(guard.authScope));
+  }
+  if (guard.docsScopeKey !== undefined) {
+    conditions.push(
+      guard.docsScopeKey === null
+        ? isNull(schema.outbox.docsScopeKey)
+        : eq(schema.outbox.docsScopeKey, guard.docsScopeKey),
+    );
+  }
+  if (guard.requireConflict) {
+    conditions.push(like(schema.outbox.lastError, 'conflict:%'));
+  }
+  const result = tx
+    .delete(schema.outbox)
+    .where(and(...conditions))
+    .run();
+  return Number(result.changes ?? 0) > 0;
+}
+
 /**
  * Build the one full-lifecycle predicate used by every resolution write.
  *
@@ -1061,6 +1175,147 @@ export function outboxMutationSnapshotCondition(
       : eq(schema.outbox.docsScopeKey, expected.docsScopeKey),
   );
   return and(...conditions);
+}
+
+// ---------- Sync v3 send identity ----------
+
+type OutboxRow = typeof schema.outbox.$inferSelect;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort()
+      .filter((key) => record[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/** 2 x 53-bit string hash (cyrb53, two seeds). Only change detection, not security. */
+function digestString(text: string): string {
+  const hash = (seed: number) => {
+    let h1 = 0xdeadbeef ^ seed;
+    let h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, '0');
+  };
+  return `${hash(1)}${hash(2)}:${text.length}`;
+}
+
+/** Digest of what the server MACs per op (minus op_seq/scope_key, fixed by identity). */
+export function outboxV3Digest(row: Pick<OutboxRow, 'tableName' | 'action' | 'entityId' | 'payload' | 'baseUpdatedAt'>): string {
+  let patch: unknown;
+  try {
+    patch = JSON.parse(row.payload || '{}');
+  } catch {
+    patch = row.payload;
+  }
+  return digestString(canonicalJson({
+    table: row.tableName,
+    action: row.action,
+    entity_id: row.entityId,
+    patch,
+    base: { updated_at: row.baseUpdatedAt ?? null },
+  }));
+}
+
+export type OutboxV3Allocation = {
+  deviceId: string;
+  retirementFloor: number;
+  rows: OutboxRow[];
+};
+
+/**
+ * Give each send row a stable v3 op identity inside the caller's write unit.
+ *
+ * An unchanged row keeps its op_id/op_seq and nothing is written (an
+ * idempotent resend under the same device). A changed row (coalesced edit)
+ * gets a new op_id and the next op_seq. The device identity in sync_state
+ * `v3-device:<authScope>` survives auth cache clears; if it is nevertheless
+ * missing, ops already sent under the lost device cannot be resent with a
+ * matching receipt MAC nor safely re-identified (the lost response may have
+ * been applied), so they are quarantined and a new device starts at seq 0.
+ */
+export function allocateV3OpIdentitiesInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  authScope: string,
+  rows: OutboxRow[],
+): OutboxV3Allocation {
+  assertActiveWriter(w);
+  const lostReason = 'sync_v3_device_identity_lost';
+  let device = readSyncV3DeviceStateInWriter(w, tx, authScope);
+  const created = !device;
+  let sendRows = rows;
+  if (!device) {
+    const orphaned = tx.select().from(schema.outbox)
+      .where(and(
+        eq(schema.outbox.authScope, authScope),
+        sql`${schema.outbox.v3OpId} IS NOT NULL`,
+        isNull(schema.outbox.blockedReason),
+      ))
+      .all();
+    const excluded = new Set<string>();
+    for (const row of orphaned) {
+      // Whether or not the CAS wins, the row is not sent now; the next run
+      // re-reads it and decides again.
+      excluded.add(row.opId);
+      quarantineOutboxOpIfSnapshotInWriter(w, tx, row.opId, pendingSnapshot(row), lostReason);
+    }
+    sendRows = rows.filter((row) => !excluded.has(row.opId));
+    device = { device_id: randomId(), next_op_seq: 0 };
+  }
+  let nextSeq = device.next_op_seq;
+  const out: OutboxRow[] = [];
+  for (const row of sendRows) {
+    const digest = outboxV3Digest(row);
+    if (row.v3OpId && row.v3SentDigest === digest && row.v3OpSeq != null) {
+      out.push(row);
+      continue;
+    }
+    const identity = { v3OpId: randomId(), v3OpSeq: nextSeq, v3SentDigest: digest };
+    nextSeq += 1;
+    tx.update(schema.outbox).set(identity).where(eq(schema.outbox.opId, row.opId)).run();
+    out.push({ ...row, ...identity });
+  }
+  if (created || nextSeq !== device.next_op_seq) {
+    writeSyncV3DeviceStateInWriter(w, tx, authScope, { device_id: device.device_id, next_op_seq: nextSeq });
+  }
+  const remaining = tx.select({ seq: schema.outbox.v3OpSeq, blocked: schema.outbox.blockedReason })
+    .from(schema.outbox)
+    .where(and(eq(schema.outbox.authScope, authScope), sql`${schema.outbox.v3OpId} IS NOT NULL`))
+    .all()
+    .filter((row) => row.blocked !== lostReason)
+    .map((row) => Number(row.seq))
+    .filter((seq) => Number.isFinite(seq));
+  return {
+    deviceId: device.device_id,
+    retirementFloor: remaining.length ? Math.min(...remaining) : nextSeq,
+    rows: out,
+  };
+}
+
+/** Terminally block one exact outbox snapshot (a permanently rejected v3 op). */
+export function quarantineOutboxOpIfSnapshotInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  opId: string,
+  snapshot: OutboxMutationSnapshot,
+  reason: string,
+): boolean {
+  assertActiveWriter(w);
+  const result = tx.update(schema.outbox)
+    .set({ retryCount: 5, blockedReason: reason })
+    .where(outboxMutationSnapshotCondition(opId, snapshot))
+    .run();
+  return Number(result?.changes ?? 0) > 0;
 }
 
 export async function markOutboxError(

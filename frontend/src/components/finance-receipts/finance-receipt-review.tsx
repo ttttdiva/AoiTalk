@@ -1,684 +1,518 @@
 "use client";
 
-// 領収書候補のレビューUI（LANE4 / synthetic only）。
-//
-// このコンポーネントはバックエンド未接続の分離UIである:
-// - ネットワーク呼び出しは持たず、注入された ReceiptReviewAdapter だけを使う。
-// - owner / session は信頼済み呼び出し元が prop で渡す。候補DTOに owner を混ぜない。
-// - 確定は本人の明示的な操作（資料の明示選択 → 内容確認 → 確定）でのみ行い、自動確定しない。
-// - needs_review / 根拠欠落 / 重複の可能性（明示確認なし）は確定させない。
-// - 応答不明時は同じ要求・同じ冪等キーを保持し、新しい操作を作らない。
-// - owner / 資料 / 候補が変わった後に届いた遅延応答は、表示中の状態へ反映しない。
-
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { useCurrentUserId } from "@/components/providers/swr-global-provider";
 import {
-  createIdempotencyKey,
-  displayMinorUnitsRaw,
-  isDefinitiveConfirmationFailure,
-  maskAccountAlias,
-  maskByteSize,
-  maskDigest,
-  maskReference,
-  parseReceiptAcceptance,
-  parseReceiptCandidate,
-  parseSourceList,
-  parseSourcePreview,
-  receiptConfirmationBlockers,
-  type EvidenceReference,
-  type FinanceRowKind,
-  type MinorUnitFormatter,
+  isAmbiguousFinanceWrite,
+  personalFinanceApi,
   type ReceiptCandidate,
-  type ReceiptConfirmationRequest,
+  type ReceiptCandidateConfirmation,
+  type ReceiptCandidateProposal,
   type ReceiptSource,
-  type ReceiptSourcePreview,
-} from "./finance-receipt-dto";
+  type ReceiptSourcePreviewOut,
+  type ReceiptConfirmationPreviewOut,
+} from "@/components/personal-finance/personal-finance-api";
 import { FinanceReceiptSource } from "./finance-receipt-source";
+import { displayMinorUnitsRaw, maskDigest, maskReference } from "./finance-receipt-dto";
 
-/**
- * 注入アダプター。実APIの実装は統合ownerが用意する（このレーンでは未接続）。
- * 戻り値は unknown として受け取り、UI側で必ず検証する。
- */
-export type ReceiptReviewAdapter = Readonly<{
-  listSources: () => Promise<unknown>;
-  loadCandidate: (sourceRef: string) => Promise<unknown>;
-  loadSourcePreview: (source: ReceiptSource) => Promise<unknown>;
-  submitConfirmation: (request: ReceiptConfirmationRequest) => Promise<unknown>;
-  newIdempotencyKey?: () => string;
+type CandidateState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "empty" }
+  | { kind: "unavailable"; message: string }
+  | { kind: "ready"; candidate: ReceiptCandidate; preview: ReceiptSourcePreviewOut | null; previewError: string | null };
+
+type ReceiptRowInput = Readonly<{
+  occurred_on: string;
+  kind: "income" | "expense";
+  amount_minor: number;
+  currency: string;
+  account_alias: string;
+  category: string | null;
 }>;
 
-export type FinanceReceiptReviewProps = Readonly<{
-  /** 信頼済み呼び出し元が渡す不透明なスコープ識別子。確定要求には含めない。 */
+type PendingProposal = Readonly<{
   ownerKey: string;
-  adapter: ReceiptReviewAdapter;
-  /**
-   * 金額表示の注入点。既定は最小単位の整数表示のみ（通貨指数の解釈はしない）。
-   * personal_money.format_minor_units の到着後に統合ownerが差し替える。
-   */
-  formatAmount?: MinorUnitFormatter;
+  source: ReceiptSource;
+  body: ReceiptCandidateProposal;
 }>;
 
-type ReviewState =
-  | Readonly<{ kind: "idle" }>
-  | Readonly<{ kind: "loading"; sourceRef: string }>
-  | Readonly<{ kind: "empty"; sourceRef: string }>
-  | Readonly<{ kind: "unavailable"; sourceRef: string; message: string }>
-  | Readonly<{
-      kind: "ready";
-      sourceRef: string;
-      candidate: ReceiptCandidate;
-      preview: ReceiptSourcePreview | null;
-      previewError: string | null;
-    }>;
-
-type PendingOperation = Readonly<{
-  request: ReceiptConfirmationRequest;
+type PendingConfirmation = Readonly<{
+  ownerKey: string;
   candidateRef: string;
-  revision: number;
-  digest: string;
   sourceRef: string;
-  ownerKey: string;
+  rowKey: string;
+  body: ReceiptCandidateConfirmation;
 }>;
 
-type AcceptedScope = Readonly<{
-  ownerKey: string;
-  sourceRef: string;
-  candidateRef: string;
-  revision: number;
-  digest: string;
-  entryRefs: readonly string[];
-}>;
+const MAX_AMOUNT_MINOR = 9_007_199_254_740_991;
 
-const ROW_KIND_LABEL: Readonly<Record<FinanceRowKind, string>> = {
-  income: "収入",
-  expense: "支出",
-  balance: "残高",
-};
-
-const STATUS_LABEL: Readonly<Record<ReceiptCandidate["status"], string>> = {
-  pending: "未確定の候補",
-  accepted: "確定済みの候補",
-  rejected: "却下済みの候補",
-};
-
-function errorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message.length > 0) return error.message;
-  return fallback;
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : "操作を完了できませんでした";
 }
 
-export function FinanceReceiptReview({
-  ownerKey,
-  adapter,
-  formatAmount = displayMinorUnitsRaw,
-}: FinanceReceiptReviewProps) {
-  const titleId = useId();
-  const radioName = useId();
-  const confirmId = useId();
-  const duplicateId = useId();
+function fieldValue(candidate: ReceiptCandidate, name: string): unknown {
+  const field = candidate.fields[name];
+  return field && typeof field === "object" ? (field as Record<string, unknown>).value : undefined;
+}
 
-  const [sources, setSources] = useState<readonly ReceiptSource[] | null>(null);
-  const [sourcesMessage, setSourcesMessage] = useState<string | null>(null);
-  const [selectedRef, setSelectedRef] = useState<string | null>(null);
-  const [review, setReview] = useState<ReviewState>({ kind: "idle" });
+function initialRow(candidate: ReceiptCandidate): ReceiptRowInput {
+  const amount = fieldValue(candidate, "amount_minor");
+  return {
+    occurred_on: typeof fieldValue(candidate, "occurred_on") === "string" ? String(fieldValue(candidate, "occurred_on")) : "",
+    kind: "expense",
+    amount_minor: typeof amount === "number" && Number.isSafeInteger(amount) ? amount : 0,
+    currency: typeof fieldValue(candidate, "currency") === "string" ? String(fieldValue(candidate, "currency")) : "JPY",
+    account_alias: "",
+    category: null,
+  };
+}
+
+function rowKey(row: ReceiptRowInput): string {
+  return JSON.stringify(row);
+}
+
+function isValidRow(row: ReceiptRowInput): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(row.occurred_on)
+    && (row.kind === "income" || row.kind === "expense")
+    && Number.isSafeInteger(row.amount_minor) && row.amount_minor > 0 && row.amount_minor <= MAX_AMOUNT_MINOR
+    && /^[A-Z]{3}$/.test(row.currency)
+    && row.account_alias.trim().length > 0 && row.account_alias.trim().length <= 64
+    && (row.category === null || row.category.length <= 80);
+}
+
+export function FinanceReceiptReview() {
+  const ownerId = useCurrentUserId();
+  const ownerKey = ownerId?.trim() || "";
+  const [sources, setSources] = useState<ReceiptSource[] | null>(null);
+  const [selectedRef, setSelectedRef] = useState("");
+  const [review, setReview] = useState<CandidateState>({ kind: "idle" });
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [pendingProposal, setPendingProposal] = useState<PendingProposal | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
+  const [row, setRow] = useState<ReceiptRowInput | null>(null);
+  const [confirmationPreview, setConfirmationPreview] = useState<ReceiptConfirmationPreviewOut | null>(null);
+  const [previewRowKey, setPreviewRowKey] = useState("");
   const [confirmed, setConfirmed] = useState(false);
   const [duplicateConfirmed, setDuplicateConfirmed] = useState(false);
-  const [pending, setPending] = useState<PendingOperation | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [accepted, setAccepted] = useState<AcceptedScope | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-
-  const epochRef = useRef(0);
-  const scopeRef = useRef<{ ownerKey: string; sourceRef: string | null }>({
-    ownerKey,
-    sourceRef: null,
-  });
-  const pendingRef = useRef<PendingOperation | null>(null);
+  const epoch = useRef(0);
+  const inFlight = useRef(false);
   const ownerRef = useRef(ownerKey);
-  const adapterRef = useRef(adapter);
+  const pendingProposalRef = useRef<PendingProposal | null>(null);
+  const pendingConfirmationRef = useRef<PendingConfirmation | null>(null);
+  const radioName = useId();
+  const checkboxId = useId();
+  const duplicateCheckboxId = useId();
 
-  // アダプターは呼び出し元が安定した同一インスタンスを渡す前提。
-  // ここで参照を最新化しておき、遅延応答側でも最新の実装を使う。
-  useEffect(() => {
-    adapterRef.current = adapter;
-  }, [adapter]);
-
-  // owner スコープ変更: 選択・確認・確定結果を破棄する。
-  // 保留中の操作は「照合すべき不変の記録」なので意図的に保持する。
-  useEffect(() => {
-    if (ownerRef.current === ownerKey) return;
-    ownerRef.current = ownerKey;
-    epochRef.current += 1;
-    scopeRef.current = { ownerKey, sourceRef: null };
-    setSelectedRef(null);
-    setReview({ kind: "idle" });
-    setConfirmed(false);
-    setDuplicateConfirmed(false);
-    setAccepted(null);
-    setNotice(null);
+  useLayoutEffect(() => {
+    if (ownerRef.current !== ownerKey) {
+      ownerRef.current = ownerKey;
+      epoch.current += 1;
+      setSources(null);
+      setSelectedRef("");
+      setReview({ kind: "idle" });
+      setRow(null);
+      setConfirmationPreview(null);
+      setPreviewRowKey("");
+      setConfirmed(false);
+      setDuplicateConfirmed(false);
+      setNotice("");
+    }
   }, [ownerKey]);
 
   useEffect(() => {
-    let cancelled = false;
-    const epoch = epochRef.current;
-    // 一覧は ownerKey 変更ごとに外部アダプターから再取得するため、取得前に初期化する。
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    const requestEpoch = ++epoch.current;
+    const controller = new AbortController();
+    if (!ownerKey) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- an unauthenticated owner has no source list to retain.
+      setSources([]);
+      setNotice("ログイン状態を確認してください");
+      return () => controller.abort();
+    }
     setSources(null);
-    setSourcesMessage(null);
-    void adapterRef
-      .current
-      .listSources()
-      .then((raw: unknown) => {
-        if (cancelled || epoch !== epochRef.current) return;
-        const parsed = parseSourceList(raw);
-        if (!parsed.ok) {
-          setSourcesMessage(parsed.reason);
-          return;
-        }
-        setSources(parsed.value);
-        if (parsed.value.length === 0) {
-          setSourcesMessage("確認できる資料がありません");
-        }
-      })
-      .catch((error: unknown) => {
-        if (cancelled || epoch !== epochRef.current) return;
-        setSourcesMessage(errorMessage(error, "資料一覧を取得できませんでした"));
-      });
-    return () => {
-      cancelled = true;
-    };
+    setNotice("");
+    void personalFinanceApi.receiptSources(controller.signal).then((items) => {
+      if (requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      setSources(items);
+      if (items.length === 0) setNotice("本人用の画像資料がありません");
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted || requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      setSources([]);
+      setNotice(errorMessage(error));
+    });
+    return () => controller.abort();
   }, [ownerKey]);
 
-  async function loadCandidateFor(source: ReceiptSource, epoch: number) {
-    let raw: unknown;
+  async function loadCandidate(source: ReceiptSource, requestEpoch: number) {
     try {
-      raw = await adapterRef.current.loadCandidate(source.source_ref);
-    } catch (error: unknown) {
-      if (epoch !== epochRef.current) return;
-      setReview({
-        kind: "unavailable",
-        sourceRef: source.source_ref,
-        message: errorMessage(error, "候補を取得できませんでした"),
-      });
-      return;
+      const candidates = await personalFinanceApi.receiptCandidates(source.source_ref);
+      if (requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      const candidate = candidates[0];
+      if (!candidate) {
+        setReview({ kind: "empty" });
+        setRow(null);
+        return;
+      }
+      if (candidate.source.source_ref !== source.source_ref || candidate.source.source_sha256 !== source.source_sha256) {
+        setReview({ kind: "unavailable", message: "候補の資料が選択した資料と一致しません" });
+        return;
+      }
+      const fresh = await personalFinanceApi.receiptCandidate(candidate.candidate_ref);
+      if (requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      let preview: ReceiptSourcePreviewOut | null = null;
+      let previewError: string | null = null;
+      try {
+        preview = await personalFinanceApi.receiptPreview(candidate.candidate_ref);
+      } catch (error) {
+        previewError = errorMessage(error);
+      }
+      if (requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      if (fresh.source.source_ref !== source.source_ref || fresh.source.source_sha256 !== source.source_sha256) {
+        setReview({ kind: "unavailable", message: "候補の資料が選択した資料と一致しません" });
+        return;
+      }
+      setReview({ kind: "ready", candidate: fresh, preview, previewError });
+      setRow(initialRow(fresh));
+      setConfirmationPreview(null);
+      setPreviewRowKey("");
+      setConfirmed(false);
+      setDuplicateConfirmed(false);
+    } catch (error) {
+      if (requestEpoch !== epoch.current || ownerRef.current !== ownerKey) return;
+      setReview({ kind: "unavailable", message: errorMessage(error) });
     }
-    // 資料・owner が変わった後の遅延応答は表示中の状態へ反映しない。
-    if (epoch !== epochRef.current) return;
-    if (raw === null || raw === undefined) {
-      setReview({ kind: "empty", sourceRef: source.source_ref });
-      return;
-    }
-    const parsedCandidate = parseReceiptCandidate(raw);
-    if (!parsedCandidate.ok) {
-      setReview({
-        kind: "unavailable",
-        sourceRef: source.source_ref,
-        message: parsedCandidate.reason,
-      });
-      return;
-    }
-    const candidate = parsedCandidate.value;
-    if (
-      candidate.source.source_ref !== source.source_ref ||
-      candidate.source.source_sha256 !== source.source_sha256
-    ) {
-      setReview({
-        kind: "unavailable",
-        sourceRef: source.source_ref,
-        message: "候補の資料が選択した資料と一致しません",
-      });
-      return;
-    }
-
-    let preview: ReceiptSourcePreview | null = null;
-    let previewError: string | null = null;
-    try {
-      const rawPreview = await adapterRef.current.loadSourcePreview(candidate.source);
-      if (epoch !== epochRef.current) return;
-      const parsedPreview = parseSourcePreview(rawPreview, candidate.source);
-      if (parsedPreview.ok) preview = parsedPreview.value;
-      else previewError = parsedPreview.reason;
-    } catch (error: unknown) {
-      if (epoch !== epochRef.current) return;
-      previewError = errorMessage(error, "資料の根拠を取得できませんでした");
-    }
-    if (epoch !== epochRef.current) return;
-    setReview({
-      kind: "ready",
-      sourceRef: source.source_ref,
-      candidate,
-      preview,
-      previewError,
-    });
   }
 
   function selectSource(source: ReceiptSource) {
-    // 保留中の確定がある間は競合する編集を受け付けない。
-    if (pendingRef.current !== null) return;
-    epochRef.current += 1;
-    const epoch = epochRef.current;
-    scopeRef.current = { ownerKey: ownerRef.current, sourceRef: source.source_ref };
+    if (pendingProposalRef.current || pendingConfirmationRef.current) return;
+    const requestEpoch = ++epoch.current;
     setSelectedRef(source.source_ref);
+    setNotice("");
+    setReview({ kind: "loading" });
+    setRow(null);
+    setConfirmationPreview(null);
+    setPreviewRowKey("");
     setConfirmed(false);
     setDuplicateConfirmed(false);
-    setAccepted(null);
-    setNotice(null);
-    setReview({ kind: "loading", sourceRef: source.source_ref });
-    void loadCandidateFor(source, epoch);
+    void loadCandidate(source, requestEpoch);
   }
 
-  async function runConfirmation(operation: PendingOperation) {
+  async function runProposal(operation: PendingProposal) {
+    if (busy || inFlight.current || ownerRef.current !== operation.ownerKey) return;
+    inFlight.current = true;
     setBusy(true);
-    let raw: unknown;
     try {
-      raw = await adapterRef.current.submitConfirmation(operation.request);
-    } catch (error: unknown) {
-      if (pendingRef.current !== operation) return;
-      setBusy(false);
-      if (isDefinitiveConfirmationFailure(error)) {
-        pendingRef.current = null;
-        setPending(null);
-        setConfirmed(false);
-        setNotice(
-          "確定は受理されませんでした。候補を再取得して確認し直してください。",
-        );
-      } else {
-        // 結果不明: 要求はそのまま保持し、同じ冪等キーで照合に回す。
-        setNotice(
-          "確定結果を確認できませんでした。同じ内容・同じ冪等キーで照合します。",
-        );
+      const result = await personalFinanceApi.proposeReceipt(operation.body);
+      if (ownerRef.current !== operation.ownerKey || pendingProposalRef.current !== operation) return;
+      pendingProposalRef.current = null;
+      setPendingProposal(null);
+      if (result.status !== "candidate_needs_review" || !result.candidate_ref) {
+        setNotice(result.status === "processor_unavailable"
+          ? "ローカルOCR処理が未配備のため、候補は作成されていません。"
+          : result.status === "no_candidate"
+            ? "資料から候補を作れませんでした。本人入力で記録できます。"
+            : `候補を作成できませんでした（${result.status}）。`);
+        return;
       }
-      return;
+      const requestEpoch = ++epoch.current;
+      setReview({ kind: "loading" });
+      await loadCandidate(operation.source, requestEpoch);
+    } catch (error) {
+      if (ownerRef.current !== operation.ownerKey || pendingProposalRef.current !== operation) return;
+      if (isAmbiguousFinanceWrite(error)) {
+        setNotice("候補作成の結果が不明です。元の資料と同じ冪等キーで照合してください。");
+      } else {
+        pendingProposalRef.current = null;
+        setPendingProposal(null);
+        setNotice(errorMessage(error));
+      }
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
     }
-    if (pendingRef.current !== operation) return;
-    setBusy(false);
-
-    const parsed = parseReceiptAcceptance(raw, operation.request);
-    if (!parsed.ok) {
-      // 応答を検証できない = 結果不明。操作は保持したまま照合に回す。
-      setNotice(
-        `確定結果を照合できませんでした（${parsed.reason}）。同じ内容・同じ冪等キーで照合します。`,
-      );
-      return;
-    }
-
-    const sameScope =
-      scopeRef.current.ownerKey === operation.ownerKey &&
-      scopeRef.current.sourceRef === operation.sourceRef;
-    pendingRef.current = null;
-    setPending(null);
-    setConfirmed(false);
-    setDuplicateConfirmed(false);
-    if (!sameScope) {
-      setNotice(
-        "保留していた確定結果を照合しました。表示中の資料には反映していません。",
-      );
-      return;
-    }
-    setAccepted({
-      ownerKey: operation.ownerKey,
-      sourceRef: operation.sourceRef,
-      candidateRef: parsed.value.candidate_ref,
-      revision: parsed.value.revision,
-      digest: parsed.value.confirmed_digest,
-      entryRefs: parsed.value.entry_refs,
-    });
-    setNotice(null);
   }
 
-  const evidence: readonly EvidenceReference[] | null =
-    review.kind === "ready" ? review.preview?.evidence ?? null : null;
-  const blockers = useMemo<readonly string[]>(
-    () =>
-      review.kind === "ready"
-        ? receiptConfirmationBlockers(review.candidate, evidence, {
-            duplicateConfirmed,
-          })
-        : [],
-    [review, evidence, duplicateConfirmed],
-  );
+  function proposeCandidate() {
+    if (!ownerKey || !selectedRef || busy || pendingProposalRef.current) return;
+    const source = sources?.find((item) => item.source_ref === selectedRef);
+    if (!source) return;
+    const operation: PendingProposal = Object.freeze({
+      ownerKey,
+      source,
+      body: Object.freeze({
+        source_ref: source.source_ref,
+        source_sha256: source.source_sha256,
+        idempotency_key: crypto.randomUUID(),
+      }),
+    });
+    pendingProposalRef.current = operation;
+    setPendingProposal(operation);
+    void runProposal(operation);
+  }
 
-  const locked = pending !== null || busy;
-  const activeCandidate = review.kind === "ready" ? review.candidate : null;
-  const canConfirm =
-    activeCandidate !== null &&
-    activeCandidate.status === "pending" &&
-    !locked &&
-    confirmed &&
-    blockers.length === 0;
+  async function retryProposal() {
+    const operation = pendingProposalRef.current;
+    if (!operation || operation.ownerKey !== ownerKey || busy) return;
+    await runProposal(operation);
+  }
+
+  function changeRow(patch: Partial<ReceiptRowInput>) {
+    setRow((previous) => previous ? { ...previous, ...patch } : previous);
+    setConfirmationPreview(null);
+    setPreviewRowKey("");
+    setConfirmed(false);
+    setDuplicateConfirmed(false);
+  }
+
+  async function prepareConfirmation() {
+    if (review.kind !== "ready" || !row || !isValidRow(row) || busy || pendingConfirmationRef.current) return;
+    setBusy(true);
+    const rowIdentity = rowKey(row);
+    try {
+      const result = await personalFinanceApi.previewReceiptConfirmation(review.candidate.candidate_ref, {
+        revision: review.candidate.revision,
+        candidate_digest: review.candidate.confirmed_digest,
+        row,
+      });
+      if (ownerRef.current !== ownerKey || selectedRef !== review.candidate.source.source_ref) return;
+      setConfirmationPreview(result);
+      setPreviewRowKey(rowIdentity);
+      setConfirmed(false);
+      setDuplicateConfirmed(false);
+      setNotice("");
+    } catch (error) {
+      if (ownerRef.current === ownerKey) setNotice(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runConfirmation(operation: PendingConfirmation) {
+    if (busy || inFlight.current || ownerRef.current !== operation.ownerKey) return;
+    inFlight.current = true;
+    setBusy(true);
+    try {
+      const result = await personalFinanceApi.confirmReceipt(operation.candidateRef, operation.body);
+      if (ownerRef.current !== operation.ownerKey || pendingConfirmationRef.current !== operation) return;
+      if (result.candidate_ref !== operation.candidateRef || result.status !== "accepted") {
+        throw new Error("確定結果を照合できませんでした");
+      }
+      pendingConfirmationRef.current = null;
+      setPendingConfirmation(null);
+      setConfirmed(false);
+      setDuplicateConfirmed(false);
+      setNotice(result.replayed ? "同じ操作の確定済み結果を照合しました。" : "本人確認を受け付けて finance entry に記録しました。");
+      const source = sources?.find((item) => item.source_ref === operation.sourceRef);
+      if (source) {
+        const requestEpoch = ++epoch.current;
+        await loadCandidate(source, requestEpoch);
+      }
+    } catch (error) {
+      if (ownerRef.current !== operation.ownerKey || pendingConfirmationRef.current !== operation) return;
+      if (isAmbiguousFinanceWrite(error)) {
+        setNotice("確定結果が不明です。同じ内容・同じ冪等キーで照合してください。");
+      } else {
+        pendingConfirmationRef.current = null;
+        setPendingConfirmation(null);
+        setConfirmed(false);
+        setNotice(errorMessage(error));
+      }
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  }
 
   function confirmCandidate() {
-    if (review.kind !== "ready") return;
-    if (pendingRef.current !== null) return;
-    if (blockers.length > 0) {
-      setNotice(blockers[0]);
-      return;
-    }
-    if (!confirmed) {
-      setNotice("内容を確認してから確定してください。");
-      return;
-    }
-    const candidate = review.candidate;
-    const base = {
-      candidate_ref: candidate.candidate_ref,
-      revision: candidate.revision,
-      confirmed_digest: candidate.confirmed_digest,
-      idempotency_key: (adapterRef.current.newIdempotencyKey ?? createIdempotencyKey)(),
-      owner_confirmed: true as const,
-    };
-    const request: ReceiptConfirmationRequest = Object.freeze(
-      candidate.possible_duplicate && duplicateConfirmed
-        ? { ...base, duplicate_confirmed: true as const }
-        : base,
-    );
-    // 一度作った要求は凍結して保持し、再送でも同じ内容・同じ冪等キーを使う。
-    const operation: PendingOperation = Object.freeze({
-      request,
-      candidateRef: candidate.candidate_ref,
-      revision: candidate.revision,
-      digest: candidate.confirmed_digest,
-      sourceRef: review.sourceRef,
-      ownerKey: scopeRef.current.ownerKey,
+    if (review.kind !== "ready" || !row || !confirmationPreview || busy || pendingConfirmationRef.current) return;
+    if (previewRowKey !== rowKey(row) || !confirmed) return;
+    if (confirmationPreview.possible_duplicate && !duplicateConfirmed) return;
+    const body: ReceiptCandidateConfirmation = Object.freeze({
+      revision: review.candidate.revision,
+      candidate_digest: review.candidate.confirmed_digest,
+      row,
+      confirmed_digest: confirmationPreview.confirmed_digest,
+      duplicate_confirmed: duplicateConfirmed,
+      owner_confirmed: true,
+      idempotency_key: crypto.randomUUID(),
     });
-    pendingRef.current = operation;
-    setPending(operation);
-    setNotice(null);
+    const operation: PendingConfirmation = Object.freeze({
+      ownerKey,
+      candidateRef: review.candidate.candidate_ref,
+      sourceRef: review.candidate.source.source_ref,
+      rowKey: rowKey(row),
+      body,
+    });
+    pendingConfirmationRef.current = operation;
+    setPendingConfirmation(operation);
+    setNotice("");
     void runConfirmation(operation);
   }
 
-  function retryPending() {
-    const operation = pendingRef.current;
-    if (operation === null || busy) return;
-    void runConfirmation(operation);
+  async function retryConfirmation() {
+    const operation = pendingConfirmationRef.current;
+    if (!operation || operation.ownerKey !== ownerKey || busy) return;
+    await runConfirmation(operation);
   }
 
-  // 候補の再取得（候補が変わった場合の遅延応答は epoch で棄却される）。
-  function reloadCandidate() {
-    if (pendingRef.current !== null) return;
-    const source = (sources ?? []).find(
-      (item) => item.source_ref === selectedRef,
-    );
-    if (!source) return;
-    selectSource(source);
-  }
+  const locked = busy || pendingProposal !== null || pendingConfirmation !== null;
+  const selectedSource = sources?.find((item) => item.source_ref === selectedRef) ?? null;
+  const usablePreview = !!row && !!confirmationPreview && previewRowKey === rowKey(row);
 
   return (
-    <section
-      aria-labelledby={titleId}
-      data-testid="finance-receipt-review"
-      className="space-y-4 rounded-lg border border-slate-200 p-4"
-    >
-      <header className="space-y-1">
-        <h2 id={titleId} className="text-base font-semibold">
-          領収書候補の確認
-        </h2>
-        <p className="text-xs text-slate-500">
-          合成データ専用の画面です。バックエンドは未接続で、注入されたアダプター経由でのみ動作します。
-        </p>
+    <section data-testid="finance-receipt-review" className="space-y-4 rounded-lg border p-4">
+      <header>
+        <h2 className="text-base font-semibold">領収書候補の確認</h2>
+        <p className="text-xs text-muted-foreground">候補の作成と finance entry の記帳は分かれています。記帳前に内容を確認してください。</p>
       </header>
 
-      <fieldset className="space-y-2" disabled={locked}>
-        <legend className="text-sm font-medium">
-          資料を選択（自動選択はしません）
-        </legend>
-        {sources === null ? (
-          <p className="text-xs text-slate-500" data-testid="sources-loading">
-            資料一覧を読み込み中…
-          </p>
-        ) : null}
-        {sourcesMessage === null ? null : (
-          <p role="alert" className="text-xs text-rose-700">
-            {sourcesMessage}
-          </p>
-        )}
+      {!ownerKey && <p role="alert">ログイン状態を確認してください。</p>}
+      <fieldset className="space-y-2" disabled={locked || !ownerKey}>
+        <legend className="text-sm font-medium">本人用の資料を選択</legend>
+        {sources === null ? <p data-testid="sources-loading">資料一覧を読み込み中…</p> : null}
+        {sources && sources.length === 0 ? <p>確認できる画像資料がありません。</p> : null}
         <ul className="space-y-1">
-          {(sources ?? []).map((source, index) => {
-            const optionId = `${radioName}-${index}`;
-            return (
-              <li key={source.source_ref}>
-                <label htmlFor={optionId} className="flex items-center gap-2 text-sm">
-                  <input
-                    id={optionId}
-                    type="radio"
-                    name={radioName}
-                    value={source.source_ref}
-                    checked={selectedRef === source.source_ref}
-                    onChange={() => selectSource(source)}
-                  />
-                  <span data-testid={`source-option-${index}`}>
-                    資料{index + 1}・{maskReference(source.source_ref)}・
-                    {source.mime_type}・{maskByteSize(source.byte_size)}
-                  </span>
-                </label>
-              </li>
-            );
-          })}
+          {(sources ?? []).map((source, index) => (
+            <li key={source.source_ref}>
+              <label className="flex min-h-10 items-center gap-2">
+                <input
+                  type="radio" name={radioName} value={source.source_ref}
+                  checked={selectedRef === source.source_ref}
+                  onChange={() => selectSource(source)}
+                />
+                <span data-testid={`source-option-${index}`}>資料{index + 1}・{maskReference(source.source_ref)}・{source.mime_type}</span>
+              </label>
+            </li>
+          ))}
         </ul>
+        {selectedRef && (
+          <Button type="button" variant="outline" disabled={locked} onClick={() => {
+            epoch.current += 1;
+            setSelectedRef("");
+            setReview({ kind: "idle" });
+            setRow(null);
+            setConfirmationPreview(null);
+            setPreviewRowKey("");
+            setConfirmed(false);
+            setDuplicateConfirmed(false);
+            setNotice("");
+          }}>資料選択を取り消す</Button>
+        )}
       </fieldset>
 
-      {review.kind === "loading" ? (
-        <p className="text-xs text-slate-500" data-testid="candidate-loading">
-          候補を読み込み中…
-        </p>
-      ) : null}
-      {review.kind === "empty" ? (
-        <p className="text-sm" data-testid="candidate-empty">
-          この資料に対応する候補はありません。
-        </p>
-      ) : null}
-      {review.kind === "unavailable" ? (
-        <p role="alert" className="text-sm text-rose-700" data-testid="candidate-error">
-          {review.message}
-        </p>
-      ) : null}
-
-      {review.kind === "ready" ? (
-        <div className="space-y-3">
-          <FinanceReceiptSource
-            source={review.candidate.source}
-            preview={review.preview}
-            previewError={review.previewError}
-          />
-
-          <article
-            aria-label="選択した候補"
-            data-testid="receipt-candidate"
-            className="space-y-3 rounded-md border border-slate-200 p-3"
-          >
-            <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs">
-              <h3 className="text-sm font-medium">候補の内容</h3>
-              <span data-testid="candidate-status">
-                {STATUS_LABEL[review.candidate.status]}
-              </span>
-              <span>revision {review.candidate.revision}</span>
-              <span data-testid="candidate-digest">
-                照合値 {maskDigest(review.candidate.confirmed_digest)}
-              </span>
-            </header>
-
-            {review.candidate.possible_duplicate ? (
-              <p
-                data-testid="duplicate-warning"
-                className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900"
-              >
-                重複の可能性がある候補です。明示的に確認しない限り確定できません。
-              </p>
-            ) : null}
-
-            {review.candidate.needs_review.length > 0 ? (
-              <div data-testid="needs-review" className="text-xs text-amber-900">
-                <p className="font-medium">確認が必要な項目</p>
-                <ul className="list-disc space-y-1 pl-5">
-                  {review.candidate.needs_review.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            <table className="w-full text-xs" data-testid="receipt-rows">
-              <caption className="sr-only">候補の明細</caption>
-              <thead>
-                <tr className="text-left text-slate-500">
-                  <th scope="col">日付</th>
-                  <th scope="col">区分</th>
-                  <th scope="col">金額</th>
-                  <th scope="col">口座</th>
-                  <th scope="col">分類</th>
-                </tr>
-              </thead>
-              <tbody>
-                {review.candidate.rows.map((row, index) => (
-                  <tr key={row.row_ref}>
-                    <td>{row.occurred_on}</td>
-                    <td>{ROW_KIND_LABEL[row.kind]}</td>
-                    <td data-testid={`row-amount-${index}`}>
-                      {formatAmount(row.amount_minor, row.currency)}
-                    </td>
-                    <td data-testid={`row-account-${index}`}>
-                      {maskAccountAlias(row.account_alias)}
-                    </td>
-                    <td>{row.category ?? "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            <div className="space-y-2">
-              <div className="flex items-start gap-2 text-sm">
-                <Checkbox
-                  id={confirmId}
-                  aria-label="候補の内容を確認しました"
-                  aria-disabled={locked || blockers.length > 0}
-                  checked={confirmed}
-                  disabled={locked || blockers.length > 0}
-                  onCheckedChange={(value) => setConfirmed(value === true)}
-                />
-                <span>
-                  選択した資料と候補（revision {review.candidate.revision} / 照合値{" "}
-                  {maskDigest(review.candidate.confirmed_digest)}）を確認しました
-                </span>
-              </div>
-
-              {review.candidate.possible_duplicate ? (
-                <div className="flex items-start gap-2 text-sm">
-                  <Checkbox
-                    id={duplicateId}
-                    aria-label="重複の可能性を確認しました"
-                    aria-disabled={locked}
-                    checked={duplicateConfirmed}
-                    disabled={locked}
-                    onCheckedChange={(value) =>
-                      setDuplicateConfirmed(value === true)
-                    }
-                  />
-                  <span>重複の可能性を確認しました（明示的に続行します）</span>
-                </div>
-              ) : null}
-            </div>
-
-            {blockers.length > 0 ? (
-              <ul
-                role="alert"
-                data-testid="confirm-blockers"
-                className="list-disc space-y-1 pl-5 text-xs text-amber-800"
-              >
-                {blockers.map((reason) => (
-                  <li key={reason}>{reason}</li>
-                ))}
-              </ul>
-            ) : null}
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                className="min-h-11"
-                data-testid="confirm-candidate"
-                disabled={!canConfirm}
-                onClick={confirmCandidate}
-              >
-                この候補を確定
-              </Button>
-              <Button
-                type="button"
-                className="min-h-11"
-                disabled={locked}
-                onClick={reloadCandidate}
-              >
-                候補を再取得
-              </Button>
-              <span className="text-xs text-slate-500">
-                本人の明示的な確認なしに自動確定はしません。
-              </span>
-            </div>
-          </article>
-        </div>
-      ) : null}
-
-      {pending === null ? null : (
-        <section
-          aria-label="保留中の確認"
-          data-testid="pending-confirmation"
-          className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm"
-        >
-          <p>
-            確定結果を確認できていません。新しい操作は作成せず、同じ内容・同じ冪等キーで照合します。
-          </p>
-          <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-            <dt className="text-slate-500">候補</dt>
-            <dd>
-              {maskReference(pending.candidateRef)}（revision {pending.revision}）
-            </dd>
-            <dt className="text-slate-500">照合値</dt>
-            <dd>{maskDigest(pending.digest)}</dd>
-            <dt className="text-slate-500">冪等キー</dt>
-            <dd data-testid="pending-idempotency-key">
-              {maskReference(pending.request.idempotency_key)}
-            </dd>
-            <dt className="text-slate-500">スコープ</dt>
-            <dd>
-              {pending.ownerKey === ownerKey
-                ? "表示中のスコープ"
-                : "別スコープ（表示には反映しません）"}
-            </dd>
-          </dl>
-          <Button
-            type="button"
-            className="mt-2 min-h-11"
-            disabled={busy}
-            onClick={retryPending}
-          >
-            同じ操作で照合
+      {notice && <p role="status" aria-live="polite">{notice}</p>}
+      {review.kind === "loading" && <p data-testid="candidate-loading">候補を取得中…</p>}
+      {review.kind === "empty" && selectedSource && (
+        <section className="space-y-2 rounded border p-3">
+          <p data-testid="candidate-empty">この資料の候補はありません。</p>
+          <Button type="button" disabled={locked} onClick={proposeCandidate}>この資料から候補を作る</Button>
+        </section>
+      )}
+      {review.kind === "unavailable" && <p role="alert" data-testid="candidate-error">{review.message}</p>}
+      {pendingProposal && (
+        <section aria-label="候補作成結果の照合" className="rounded border border-amber-300 p-3">
+          <p>{pendingProposal.ownerKey === ownerKey ? "候補作成の結果が不明です。" : "別のログインスコープで保留中の候補作成があります。元のアカウントに戻ると同じ操作で照合できます。"}</p>
+          <Button type="button" disabled={busy || pendingProposal.ownerKey !== ownerKey} onClick={() => void retryProposal()}>
+            同じ資料・同じキーで照合
           </Button>
         </section>
       )}
 
-      {accepted !== null &&
-      accepted.ownerKey === ownerKey &&
-      accepted.sourceRef === selectedRef ? (
-        <section
-          aria-label="確定結果"
-          data-testid="receipt-accepted"
-          className="rounded-md border border-emerald-300 bg-emerald-50 p-3 text-sm"
-        >
-          <p>
-            確定しました。台帳項目 {accepted.entryRefs.length} 件を受理しました。
-          </p>
-          <ul
-            className="mt-1 space-y-1 text-xs"
-            data-testid="receipt-entry-refs"
-          >
-            {accepted.entryRefs.map((reference) => (
-              <li key={reference}>{maskReference(reference)}</li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
+      {review.kind === "ready" && (
+        <div className="space-y-3">
+          <FinanceReceiptSource source={review.candidate.source} preview={review.preview} previewError={review.previewError} />
+          <article aria-label="選択した候補" className="space-y-3 rounded border p-3">
+            <header className="flex flex-wrap items-center gap-2">
+              <h3 className="font-semibold">候補の内容</h3>
+              <span data-testid="candidate-status">{review.candidate.status === "accepted" ? "finance entry 記帳済み" : "本人確認待ち"}</span>
+              <span>revision {review.candidate.revision}</span>
+              <span data-testid="candidate-digest">照合値 {maskDigest(review.candidate.confirmed_digest)}</span>
+            </header>
+            {review.candidate.needs_review.length > 0 && (
+              <div data-testid="needs-review" className="rounded bg-amber-50 p-2 text-sm">
+                <p className="font-medium">確認事項</p>
+                <ul className="list-disc pl-5">{review.candidate.needs_review.map((item) => <li key={item}>{item}</li>)}</ul>
+                <p>曖昧な候補はこの操作から記帳できません。個人財務の本人入力を使ってください。</p>
+              </div>
+            )}
+            {review.candidate.status === "accepted" && review.candidate.accepted_row ? (
+              <p data-testid="receipt-accepted">
+                {review.candidate.accepted_row.occurred_on}・{review.candidate.accepted_row.kind === "income" ? "収入" : "支出"}・
+                {displayMinorUnitsRaw(review.candidate.accepted_row.amount_minor, review.candidate.accepted_row.currency)}・
+                {review.candidate.accepted_row.account_alias}
+              </p>
+            ) : review.candidate.status === "pending" && row ? (
+              <div className="space-y-3">
+                <fieldset className="grid gap-3 sm:grid-cols-2" disabled={locked}>
+                  <label className="grid gap-1">日付
+                    <input aria-label="日付" type="date" value={row.occurred_on} onChange={(event) => changeRow({ occurred_on: event.target.value })} />
+                  </label>
+                  <label className="grid gap-1">区分
+                    {/* eslint-disable-next-line no-restricted-syntax -- preserve the compact native expense/income selector contract. */}
+                    <select aria-label="区分" value={row.kind} onChange={(event) => changeRow({ kind: event.target.value as "income" | "expense" })}>
+                      <option value="expense">支出</option><option value="income">収入</option>
+                    </select>
+                  </label>
+                  <label className="grid gap-1">金額（最小単位の整数）
+                    <input aria-label="金額（最小単位の整数）" inputMode="numeric" value={String(row.amount_minor || "")} onChange={(event) => changeRow({ amount_minor: /^\d+$/.test(event.target.value) ? Number(event.target.value) : 0 })} />
+                  </label>
+                  <label className="grid gap-1">通貨
+                    <input aria-label="通貨" maxLength={3} value={row.currency} onChange={(event) => changeRow({ currency: event.target.value.toUpperCase() })} />
+                  </label>
+                  <label className="grid gap-1">口座の別名
+                    <input aria-label="口座の別名" maxLength={64} value={row.account_alias} onChange={(event) => changeRow({ account_alias: event.target.value })} />
+                  </label>
+                  <label className="grid gap-1">分類
+                    <input aria-label="分類" maxLength={80} value={row.category ?? ""} onChange={(event) => changeRow({ category: event.target.value || null })} />
+                  </label>
+                </fieldset>
+                <Button type="button" variant="outline" disabled={locked || !isValidRow(row) || review.candidate.needs_review.length > 0} onClick={() => void prepareConfirmation()}>
+                  候補・重複・資料状態を再確認
+                </Button>
+                {usablePreview && confirmationPreview && (
+                  <section className="space-y-2 rounded border p-3" data-testid="confirmation-preview">
+                    <p>本人確認する記帳内容</p>
+                    <p>{confirmationPreview.row.occurred_on}・{confirmationPreview.row.kind === "income" ? "収入" : "支出"}・{displayMinorUnitsRaw(confirmationPreview.row.amount_minor, confirmationPreview.row.currency)}・{confirmationPreview.row.account_alias}・{confirmationPreview.row.category ?? "分類なし"}</p>
+                    <p>確認digest: {maskDigest(confirmationPreview.confirmed_digest)}</p>
+                    {confirmationPreview.possible_duplicate && (
+                      <div className="space-y-2 rounded bg-amber-50 p-2" data-testid="duplicate-warning">
+                        <p>既存の明細と重複する可能性があります。続行する場合は明示してください。</p>
+                        {confirmationPreview.duplicate_scan_incomplete && <p>検索上限に達したため、重複を確認しきれていません。</p>}
+                        <label htmlFor={duplicateCheckboxId} className="flex items-center gap-2">
+                          {/* eslint-disable-next-line no-restricted-syntax -- preserve the native duplicate acknowledgement control and label contract. */}
+                          <input id={duplicateCheckboxId} type="checkbox" checked={duplicateConfirmed} onChange={(event) => setDuplicateConfirmed(event.target.checked)} />
+                          重複の可能性を確認して続行する
+                        </label>
+                      </div>
+                    )}
+                    <label htmlFor={checkboxId} className="flex items-center gap-2">
+                      {/* eslint-disable-next-line no-restricted-syntax -- preserve the native owner confirmation control and label contract. */}
+                      <input id={checkboxId} type="checkbox" checked={confirmed} disabled={locked} onChange={(event) => setConfirmed(event.target.checked)} />
+                      資料と表示中の全項目を確認しました
+                    </label>
+                    <Button type="button" data-testid="confirm-candidate" disabled={locked || !confirmed || (confirmationPreview.possible_duplicate && !duplicateConfirmed)} onClick={confirmCandidate}>
+                      finance entry に記帳する
+                    </Button>
+                  </section>
+                )}
+              </div>
+            ) : null}
+          </article>
+        </div>
+      )}
 
-      {notice === null ? null : (
-        <p role="status" data-testid="receipt-notice" className="text-xs text-slate-700">
-          {notice}
-        </p>
+      {pendingConfirmation && (
+        <section aria-label="記帳結果の照合" data-testid="pending-confirmation" className="rounded border border-amber-300 p-3">
+          <p>{pendingConfirmation.ownerKey === ownerKey ? "記帳結果が不明です。新しいキーを作らず同じ操作を再送してください。" : "別のログインスコープで記帳結果の照合が保留中です。元のアカウントに戻ると再照合できます。"}</p>
+          {pendingConfirmation.ownerKey === ownerKey && (
+            <p>候補 {maskReference(pendingConfirmation.candidateRef)}・キー {maskReference(pendingConfirmation.body.idempotency_key)}</p>
+          )}
+          <Button type="button" disabled={busy || pendingConfirmation.ownerKey !== ownerKey} onClick={() => void retryConfirmation()}>
+            同じ内容・同じ冪等キーで照合
+          </Button>
+        </section>
       )}
     </section>
   );

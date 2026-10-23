@@ -13,7 +13,6 @@
 | CI参考情報（通常作業での待機不要） | `wait_ci.ps1` は既存の任意ツール。CI完了は待たず、成功を完了条件にしない。検証項目の定義は `.github/workflows/ci.yml` |
 | 手動フル検証 | `run_canonical_verification.ps1`。明示的な手動実行用で、通常作業のターゲット検証と区別する |
 | Enterprise配布 | ルートの `Enterprise.bat` → `build_enterprise_handoff.ps1`。`origin/main` の固定snapshotを使用する。既定のWindows handoff生成はDocker/BuildKit不要で、対象Linux buildは必須。正本は `README.enterprise.md` |
-| Mobile APK | Windowsのローカルbuild-onlyは `cmd /d /c scripts\build_apk.bat`、公開はQA済みartifactに対する明示 `cmd /d /c scripts\build_apk.bat -PublishOnly`。補助CLIとBash入口の詳細は [リリースチェック](../docs/release-checklist.md) を参照する |
 | ChatGPT Web Director | `chatgpt_web_director.py` / `chatgpt_web_director.ps1`。[利用手順](../docs/chatgpt_web_director.md) |
 | Project Management CLI | `agent_project_management_tool.py`。既存Agentのツール定義を呼び出す |
 

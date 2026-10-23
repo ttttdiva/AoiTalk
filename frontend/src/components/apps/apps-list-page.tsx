@@ -136,6 +136,16 @@ export function AppsListPage() {
             <BlurFade duration={0.25} delay={0.12} blur="3px" offset={6}>
               <p className="mt-2 max-w-lg text-sm leading-5 text-muted-foreground">左の一覧からAppを選ぶと、用途、使い方、関連Project、実行履歴、リリースを確認できます。</p>
             </BlurFade>
+            {!originProjectId ? (
+              <section aria-labelledby="personal-workspaces-title" className="mt-8 w-full max-w-lg space-y-3">
+                <h2 id="personal-workspaces-title" className="text-sm font-semibold">本人専用</h2>
+                <nav aria-label="本人専用の作業画面" className="flex flex-wrap gap-2">
+                  <Link href="/personal-ledger" className={buttonVariants({ variant: "outline", size: "sm" })}>個人台帳・リマインダー</Link>
+                  <Link href="/personal-finance" className={buttonVariants({ variant: "outline", size: "sm" })}>家計・レシート</Link>
+                  <Link href="/personal-career" className={buttonVariants({ variant: "outline", size: "sm" })}>キャリア</Link>
+                </nav>
+              </section>
+            ) : null}
             <BlurFade duration={0.25} delay={0.16} blur="3px" offset={6}>
               <Button size="sm" className="mt-5" onClick={() => router.push(originProjectId ? `/apps?project_id=${encodeURIComponent(originProjectId)}&create=1` : "/apps?create=1")}><Plus className="size-3.5" /> 新しいApp</Button>
             </BlurFade>

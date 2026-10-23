@@ -45,6 +45,33 @@ AGENT_TEAM_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     # authorizes execution independently of a Team or model tool selection.
     "external_action_propose": {"id": "external_action_propose", "family": "employee", "access": "write", "native": False},
     "telephony_control": {"id": "telephony_control", "family": "employee", "access": "write", "native": False},
+    # Remote Muse delegation is an explicit Agent capability.  It is kept out
+    # of every built-in Subagent roster so existing revisions do not gain it
+    # merely because the catalog knows the capability.
+    "remote_agent_delegate": {
+        "id": "remote_agent_delegate", "family": "remote", "access": "write", "native": False,
+    },
+    # Explicit owner-invoked personal adapters. These are intentionally
+    # separate from generic AoiTalk/Project capabilities and have no provider
+    # or external-action authority.
+    "personal_deadline_read": {
+        "id": "personal_deadline_read", "family": "personal", "access": "read", "native": False,
+    },
+    "personal_deadline_draft": {
+        "id": "personal_deadline_draft", "family": "personal", "access": "read", "native": False,
+    },
+    "personal_inventory_read": {
+        "id": "personal_inventory_read", "family": "personal", "access": "read", "native": False,
+    },
+    "personal_inventory_draft": {
+        "id": "personal_inventory_draft", "family": "personal", "access": "read", "native": False,
+    },
+    "personal_finance_read": {
+        "id": "personal_finance_read", "family": "personal", "access": "read", "native": False,
+    },
+    "personal_career_context": {
+        "id": "personal_career_context", "family": "personal", "access": "read", "native": False,
+    },
 }
 AGENT_TEAM_SHARED_READ_CAPABILITIES = frozenset({"web_read"})
 
@@ -92,6 +119,27 @@ def _subagent(
 
 # Code-level catalog only; it is never serialized as App Config topology.
 AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
+    "personal_private_adapter": _subagent(
+        "personal_private_adapter",
+        "個人専用Adapter",
+        "本人が明示選択した個人データの読取・未受理下書きだけを担当する。",
+        "本人が開始した個人専用adapter invocationだけを扱う。"
+        "金融の受理・書込、career確認、期限確認/完了、共有scope、外部操作を行わない。"
+        "モデルや外部連携は呼び出さない。",
+        [
+            "personal_deadline_read",
+            "personal_deadline_draft",
+            "personal_inventory_read",
+            "personal_inventory_draft",
+            "personal_finance_read",
+            "personal_career_context",
+        ],
+        scalable=False,
+        default_instances=1,
+        max_instances=1,
+        workspace="none",
+        native_tools=False,
+    ),
     "employee_operator": _subagent("employee_operator", "Agent業務", "管理者が設定した自動化と電話受付を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。", ["external_action_propose", "telephony_control"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
     "general_worker": _subagent("general_worker", "汎用作業", "特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。", "特定分野に固定せず、比較、整理、要約、補助調査、小規模なファイル作業を行う。CLI Agentを選択した場合はnative toolsを利用できる。", ["workspace_read", "workspace_write", "repo_map", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
     "general_researcher": _subagent("general_researcher", "汎用調査", "Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。", "Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。", ["workspace_read", "repo_map", "web_read", "aoi_tools"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
@@ -109,6 +157,15 @@ AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 AGENT_TEAM_DEFAULT_TEAMS: dict[str, dict[str, Any]] = {
+    "personal_private": {
+        "team_id": "personal_private",
+        "name": "Personal Private",
+        "description": "本人が明示選択する個人専用adapter実行。自動起動しない。",
+        "enabled": True,
+        "sort_order": 50,
+        "activation": {"mode": "manual", "contexts": []},
+        "subagent_ids": ["personal_private_adapter"],
+    },
     "employee": {"team_id": "employee", "name": "Employee", "description": "Agentが明示的に選択する業務実行用のExecution Team。", "enabled": True, "sort_order": 40, "activation": {"mode": "manual", "contexts": []}, "subagent_ids": ["employee_operator"]},
     "general": {"team_id": "general", "name": "General", "description": "AoiTalkの通常利用を担う常用Team。", "enabled": True, "sort_order": 10, "activation": {"mode": "always", "contexts": []}, "subagent_ids": ["general_worker", "general_researcher", "docs_operator", "project_operator", "workspace_operator"]},
     "app_development": {"team_id": "app_development", "name": "App Development", "description": "アプリ開発の探索、設計、実装、レビューと承認済み外部操作。", "enabled": True, "sort_order": 20, "activation": {"mode": "contextual", "contexts": ["app_development"]}, "subagent_ids": ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer", "employee_operator"]},
@@ -315,6 +372,7 @@ _AGENT_TEAM_ROUTE_PROVIDERS = frozenset(
         "claude-cli",
         "codex-cli",
         "grok-cli",
+        "muse-remote",
     }
 )
 
@@ -425,6 +483,17 @@ def _execution_route(raw: Any) -> dict[str, Any]:
         inherit_model = not (bool(provider) and bool(model))
     else:
         inherit_model = bool(inherit)
+    # Muse is a typed remote target.  It deliberately has no local model or
+    # effort controls; keep its explicit provider-only route instead of
+    # collapsing it into Main inheritance as ordinary local routes do.
+    if provider == "muse-remote" and inherit_model is False:
+        return {
+            "inherit_model": False,
+            "provider": provider,
+            "model": None,
+            "effort_policy": "not_applicable",
+            "effort": None,
+        }
     if inherit_model:
         provider = ""
         model = ""
@@ -1088,6 +1157,15 @@ def _apply_execution_route(
     config: Any = None,
 ) -> dict[str, Any]:
     route = _execution_route(route) if route else empty_execution_route()
+    if route.get("provider") == "muse-remote" and route.get("inherit_model") is False:
+        return {
+            "inherit_model": False,
+            "provider": "muse-remote",
+            "model": None,
+            "effort_policy": "not_applicable",
+            "effort": None,
+            "backend": "remote",
+        }
     profile = {
         "profile_id": "",
         "name": "",
@@ -1183,9 +1261,9 @@ def resolve_agent_team_v3_route(config: Any, subagent_id: str, *, main_route: di
     subagent = next((item for item in agent_team_v3_subagents(config) if item.get("subagent_id") == str(subagent_id)), None)
     if not subagent:
         return None
-    route_main = dict(main_route or resolve_execution_main_route(config))
     exec_route = resolve_team_execution_route(config, str(subagent_id))
     if exec_route is None:
+        route_main = dict(main_route or resolve_execution_main_route(config))
         route = dict(route_main)
         provider = str(route.get("provider") or "").strip().lower()
         model = str(route.get("model") or "").strip()
@@ -1202,13 +1280,24 @@ def resolve_agent_team_v3_route(config: Any, subagent_id: str, *, main_route: di
         route.pop("profile_id", None)
         route.pop("profile_name", None)
     else:
+        provider = str(exec_route.get("provider") or "").strip().lower()
+        # A remote route does not read or inherit the local Main model.  This
+        # also keeps route resolution usable for a minimal config that only
+        # declares a remote Team profile.
+        route_main = {} if provider == "muse-remote" else dict(main_route or resolve_execution_main_route(config))
         route = _apply_execution_route(exec_route, route_main, config=config)
         _team_id, profile_id = _session_uses_team_execution_profile()
         route["execution_profile_id"] = profile_id or None
         route.pop("llm_profile_id", None)
         provider = str(route.get("provider") or "").strip().lower()
-        model = str(route.get("model") or "").strip()
-    if not provider or not model:
+        if provider == "muse-remote":
+            model = None
+            route["model"] = None
+            route["effort"] = None
+            route["backend"] = "remote"
+        else:
+            model = str(route.get("model") or "").strip()
+    if not provider or (not model and provider != "muse-remote"):
         return None
     if provider not in _AGENT_TEAM_ROUTE_PROVIDERS:
         return None

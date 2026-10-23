@@ -14,7 +14,10 @@ import {
   uploadFileTransfer,
   type FileTransferSaveMeta,
 } from "@/lib/file-transfer-client";
-import { MAX_COMPAT_UPLOAD_FILE_BYTES } from "@/lib/file-transfer-protocol";
+import {
+  MAX_COMPAT_UPLOAD_FILE_BYTES,
+  type FileTransferMeta,
+} from "@/lib/file-transfer-protocol";
 import { withBasePath, withoutBasePath } from "@/lib/base-path";
 
 import {
@@ -853,25 +856,99 @@ function triggerNativeFormDownload(paths: string[], action: string): void {
   }
 }
 
+const TRANSFER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidArchiveIncludePaths(value: string | null): boolean {
+  if (value === null) return true;
+  try {
+    const paths: unknown = JSON.parse(value);
+    if (!Array.isArray(paths)) return false;
+    const seen = new Set<string>();
+    for (const path of paths) {
+      if (
+        typeof path !== "string" ||
+        !path ||
+        path.length > 4096 ||
+        path !== path.trim() ||
+        path.includes("\\") ||
+        path.includes("\u0000") ||
+        path.startsWith("/") ||
+        /^[a-z]:/i.test(path)
+      ) return false;
+      const parts = path.split("/");
+      if (parts.some((part) => !part || part === "." || part === "..")) return false;
+      const key = path.toLocaleLowerCase("en-US");
+      if (seen.has(key)) return false;
+      seen.add(key);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidAppArchiveUrl(value: string, rawPath: string): boolean {
+  if (
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    value.includes("#") ||
+    rawPath.includes("%")
+  ) return false;
+  const pathname = withoutBasePath(rawPath);
+  const match = pathname.match(/^\/api\/python-proxy\/apps\/([0-9a-f-]{36})\/files\/archive$/i);
+  if (!match || !TRANSFER_UUID_PATTERN.test(match[1])) return false;
+  const allowed = new Set([
+    "project_id",
+    "include_paths",
+    "latest_commit_only",
+    "exclude_git",
+    "exclude_dependencies",
+    "exclude_runtime",
+    "exclude_credentials",
+  ]);
+  const seen = new Set<string>();
+  const queryIndex = value.indexOf("?");
+  const rawQuery = queryIndex >= 0 ? value.slice(queryIndex + 1) : "";
+  if (queryIndex >= 0 && !rawQuery) return false;
+  const searchParams = new URLSearchParams(rawQuery);
+  if (rawQuery) {
+    for (const pair of rawQuery.split("&")) {
+      const rawKey = pair.split("=", 1)[0];
+      if (!rawKey || rawKey.includes("%") || !allowed.has(rawKey)) return false;
+    }
+  }
+  for (const [key] of searchParams) {
+    if (!allowed.has(key) || seen.has(key)) return false;
+    seen.add(key);
+  }
+  const projectId = searchParams.get("project_id");
+  if (projectId !== null && !TRANSFER_UUID_PATTERN.test(projectId)) return false;
+  if (!isValidArchiveIncludePaths(searchParams.get("include_paths"))) return false;
+  for (const name of [
+    "latest_commit_only",
+    "exclude_git",
+    "exclude_dependencies",
+    "exclude_runtime",
+    "exclude_credentials",
+  ]) {
+    const parameter = searchParams.get(name);
+    if (parameter !== null && parameter !== "true" && parameter !== "false") return false;
+  }
+  return true;
+}
+
 function isCompatibilityDownloadUrl(value: string): boolean {
   try {
-    let pathname: string;
-    if (value.startsWith("/") && !value.startsWith("//")) {
-      const hashIndex = value.indexOf("#");
-      const withoutHash = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
-      const queryIndex = withoutHash.indexOf("?");
-      pathname = queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
-    } else {
-      const parsed = new URL(value, window.location.origin);
-      if (parsed.origin !== window.location.origin) return false;
-      pathname = parsed.pathname;
-    }
-    pathname = withoutBasePath(pathname);
+    if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\") || value.includes("#")) return false;
+    const rawPath = value.split(/[?#]/, 1)[0];
+    if (rawPath.includes("%")) return false;
+    const pathname = withoutBasePath(rawPath);
     return (
       pathname === "/api/python-proxy/explorer/download" ||
       /^\/api\/python-proxy\/remote-servers\/[^/]+\/workspace\/download$/u.test(
         pathname,
-      )
+      ) || isValidAppArchiveUrl(value, rawPath)
     );
   } catch {
     return false;
@@ -916,34 +993,64 @@ function releaseCompatibilityDownload(controller: AbortController): void {
   }
 }
 
+function createCompatibilityDownloadAbortError(): DOMException {
+  return new DOMException("The download was aborted", "AbortError");
+}
+
+async function cleanupCompatibilityDownloadResult(
+  result: Awaited<ReturnType<typeof downloadFileTransfer>> | undefined,
+): Promise<void> {
+  try {
+    await result?.cleanup?.();
+  } catch {
+    // Abort must remain the caller-visible result even if storage cleanup races.
+  }
+}
+
 async function compatibilityDownload(
   url: string,
   paths?: string[],
   fallbackFilename?: string,
+  responseContract?: Extract<FileTransferMeta, { operation: "download" }>["responseContract"],
+  signal?: AbortSignal,
+  allowNativeFallback = true,
 ): Promise<boolean> {
+  if (signal?.aborted) throw createCompatibilityDownloadAbortError();
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (signal?.aborted) controller.abort();
   retainCompatibilityDownload(controller);
+  let result: Awaited<ReturnType<typeof downloadFileTransfer>> | undefined;
   try {
     try {
-      const result = await downloadFileTransfer(
+      result = await downloadFileTransfer(
         {
           operation: "download",
           url: canonicalCompatibilityDownloadUrl(url),
           ...(paths ? { paths } : {}),
           ...(fallbackFilename ? { fallbackFilename } : {}),
+          ...(responseContract ? { responseContract } : {}),
         },
         { signal: controller.signal },
       );
       if (controller.signal.aborted) {
-        throw new DOMException("The download was aborted", "AbortError");
+        await cleanupCompatibilityDownloadResult(result);
+        result = undefined;
+        throw createCompatibilityDownloadAbortError();
       }
       triggerFileTransferDownload(result);
+      result = undefined;
       return true;
     } catch (error) {
-      if (error instanceof FileTransferNativeRequiredError) return false;
+      await cleanupCompatibilityDownloadResult(result);
+      result = undefined;
+      if (controller.signal.aborted) throw createCompatibilityDownloadAbortError();
+      if (error instanceof FileTransferNativeRequiredError && allowNativeFallback) return false;
       throw error;
     }
   } finally {
+    signal?.removeEventListener("abort", abortFromCaller);
     releaseCompatibilityDownload(controller);
   }
 }
@@ -960,8 +1067,43 @@ export async function explorerDownloadResource(
 ): Promise<void> {
   const fallback =
     fallbackFilename?.trim() || fallbackDownloadFilename(url, "download");
+  const hasResponseContract = Boolean(
+    options.expectedContentType || options.requireAttachment || options.rejectRedirects,
+  );
+  const isAppArchiveContract =
+    options.expectedContentType?.toLowerCase() === "application/zip" &&
+    options.requireAttachment === true &&
+    options.rejectRedirects === true;
+  if (isAppArchiveContract) {
+    const rawPath = url.startsWith("/") ? url.split(/[?#]/, 1)[0] : "";
+    if (!isValidAppArchiveUrl(url, rawPath)) {
+      throw new Error("App archive download URL is not allowed");
+    }
+  }
+  if (
+    readFileTransferCompatibilityPreference() &&
+    isAppArchiveContract &&
+    isCompatibilityDownloadUrl(url)
+  ) {
+    const rawPath = url.split(/[?#]/, 1)[0];
+    if (isValidAppArchiveUrl(url, rawPath)) {
+      await compatibilityDownload(
+        url,
+        undefined,
+        fallback,
+        {
+          expectedContentType: "application/zip",
+          requireAttachment: true,
+          rejectRedirects: true,
+        },
+        options.signal,
+        false,
+      );
+      return;
+    }
+  }
   const requiresPreflightContract = Boolean(
-    options.expectedContentType || options.requireAttachment || options.rejectRedirects || options.signal,
+    hasResponseContract || options.signal,
   );
   if (
     !requiresPreflightContract &&

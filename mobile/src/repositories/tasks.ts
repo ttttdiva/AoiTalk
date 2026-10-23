@@ -18,6 +18,11 @@
 import { eq, isNull, isNotNull, and, desc } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import {
+  assertActiveWriter,
+  type SqliteHandle,
+  type SqliteWriter,
+} from "../db/sqlite-writer";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import {
   isApiConnectionError,
@@ -64,8 +69,8 @@ type TaskTombstoneLedgerContext = {
 // arrive before the corresponding row (for example after an account switch
 // or a partial cache repair).  Keep a small durable ledger in the existing
 // sync_state cursor column so a later stale active payload cannot recreate it.
-// The in-memory mirror is only a fallback for old test/rolling DB doubles.
-const taskTombstoneLedgerMemory = new Map<string, Map<string, string>>();
+// The ledger lives only in sync_state; write failures propagate so the caller's
+// transaction rolls back together with the ledger.
 
 function parseTimestamp(value: unknown): number | null {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -93,7 +98,8 @@ export function compareTaskTimestamps(
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-async function taskTombstoneLedgerKey(): Promise<string> {
+/** Async preparation (token read) for the task InWriter functions. */
+export async function prepareTaskTombstoneLedgerKey(): Promise<string> {
   let scope = "anonymous";
   try {
     const token = await getToken();
@@ -122,89 +128,69 @@ function mergeTaskLedgerTimestamp(
   return true;
 }
 
-async function loadTaskTombstoneLedger(): Promise<TaskTombstoneLedgerContext> {
-  const storageKey = await taskTombstoneLedgerKey();
-  const entries = new Map(taskTombstoneLedgerMemory.get(storageKey) ?? []);
-  const syncState = (schema as unknown as {
-    syncState?: { tableName?: unknown; cursor?: unknown };
-  }).syncState;
-  if (!syncState?.tableName || !syncState.cursor) {
-    return { storageKey, entries };
-  }
-  try {
-    const db = getDb();
-    const stateTable = syncState as {
-      tableName: any;
-      cursor: any;
-    };
-    const rows = (await (db as any)
-      .select({ cursor: stateTable.cursor })
-      .from(stateTable)
-      .where(eq(stateTable.tableName, storageKey))) as Array<{
-      cursor?: unknown;
-    }>;
-    const raw = rows[0]?.cursor;
-    if (typeof raw === "string" && raw.trim()) {
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [id, timestamp] of Object.entries(
-          parsed as Record<string, unknown>,
-        )) {
-          if (typeof timestamp === "string") {
-            mergeTaskLedgerTimestamp(entries, id, timestamp);
-          }
+function loadTaskTombstoneLedgerInWriter(
+  tx: SqliteHandle,
+  storageKey: string,
+): TaskTombstoneLedgerContext {
+  // sync_state is the only ledger store. SELECT errors propagate; only a
+  // corrupt cursor JSON is treated as an empty ledger.
+  const entries = new Map<string, string>();
+  const rows = tx
+    .select({ cursor: schema.syncState.cursor })
+    .from(schema.syncState)
+    .where(eq(schema.syncState.tableName, storageKey))
+    .all();
+  const raw = rows[0]?.cursor;
+  if (typeof raw === "string" && raw.trim()) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [id, timestamp] of Object.entries(
+        parsed as Record<string, unknown>,
+      )) {
+        if (typeof timestamp === "string") {
+          mergeTaskLedgerTimestamp(entries, id, timestamp);
         }
       }
     }
-  } catch {
-    // A legacy/partial test database may not expose sync_state yet.  The
-    // in-memory mirror still protects the current process.
   }
-  taskTombstoneLedgerMemory.set(storageKey, entries);
   return { storageKey, entries };
 }
 
-async function persistTaskTombstoneLedger(
+function persistTaskTombstoneLedgerInWriter(
+  tx: SqliteHandle,
   context: TaskTombstoneLedgerContext,
-): Promise<void> {
-  taskTombstoneLedgerMemory.set(context.storageKey, context.entries);
-  const syncState = (schema as unknown as {
-    syncState?: { tableName?: unknown; cursor?: unknown };
-  }).syncState;
-  if (!syncState?.tableName || !syncState.cursor) return;
-  try {
-    const db = getDb();
-    const stateTable = syncState as {
-      tableName: any;
-      cursor: any;
-    };
-    await (db as any)
-      .insert(stateTable)
-      .values({
-        tableName: context.storageKey,
-        lastPulledAt: null,
-        lastPushedAt: null,
-        cursor: JSON.stringify(Object.fromEntries(context.entries)),
-      } as never)
-      .onConflictDoUpdate({
-        target: stateTable.tableName,
-        set: { cursor: JSON.stringify(Object.fromEntries(context.entries)) },
-      });
-  } catch {
-    // Keep the in-memory mirror when an older database cannot write the
-    // optional ledger row.  The next schema bootstrap can persist it.
-  }
+): void {
+  // Failures propagate so the surrounding transaction rolls back with it.
+  const cursor = JSON.stringify(Object.fromEntries(context.entries));
+  tx.insert(schema.syncState)
+    .values({
+      tableName: context.storageKey,
+      lastPulledAt: null,
+      lastPushedAt: null,
+      cursor,
+    })
+    .onConflictDoUpdate({
+      target: schema.syncState.tableName,
+      set: { cursor },
+    })
+    .run();
 }
 
-async function readLocalTaskRow(
-  db: ReturnType<typeof getDb>,
+function readLocalTaskRowInWriter(
+  tx: SqliteHandle,
   taskId: string,
-): Promise<DbTask | null> {
+): DbTask | null {
   try {
-    const rows = await db
+    const rows = tx
       .select()
       .from(schema.tasks)
-      .where(eq(schema.tasks.id, taskId));
+      .where(eq(schema.tasks.id, taskId))
+      .all();
     return (rows[0] as DbTask | undefined) ?? null;
   } catch {
     // Keep compatibility with very small repository test doubles that only
@@ -533,9 +519,18 @@ export function toApiShape(
   } as unknown as ApiTask;
 }
 
-export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
-  if (!list.length) return;
-  const db = getDb();
+/**
+ * Upsert remote tasks inside an active write unit. Returns true when the
+ * caller should reschedule local task notifications after the commit.
+ */
+export function applyRemoteTasksInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  list: ApiTask[],
+  ledgerKey: string,
+): boolean {
+  assertActiveWriter(writer);
+  if (!list.length) return false;
   const now = nowServerNaiveIso();
   // Some push acknowledgements and rolling API versions include deleted_at in
   // the change payload itself.  Handle those as tombstones first; otherwise a
@@ -550,14 +545,16 @@ export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
       activeTasks.push(task);
     }
   }
-  if (tombstones.length) await applyTaskTombstones(tombstones);
-  if (!activeTasks.length) return;
+  const tombstoneReschedule = tombstones.length
+    ? applyTaskTombstonesInWriter(writer, tx, tombstones, ledgerKey)
+    : false;
+  if (!activeTasks.length) return tombstoneReschedule;
 
-  const ledger = await loadTaskTombstoneLedger();
+  const ledger = loadTaskTombstoneLedgerInWriter(tx, ledgerKey);
   let ledgerChanged = false;
   for (const t of activeTasks) {
     const anyT = t as unknown as Record<string, unknown>;
-    const existing = await readLocalTaskRow(db, t.id);
+    const existing = readLocalTaskRowInWriter(tx, t.id);
     const hasIncomingVersion =
       typeof anyT.updated_at === "string" && anyT.updated_at.trim().length > 0;
     const incomingUpdatedAt: string =
@@ -652,16 +649,28 @@ export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
     if (autoCloseColumn() && typeof autoClose === "boolean") {
       conflictSet.autoCloseOnDue = autoClose;
     }
-    await db
+    tx
       .insert(schema.tasks)
       .values(insertValues as never)
       .onConflictDoUpdate({
         target: schema.tasks.id,
         set: conflictSet as never,
-      });
+      })
+      .run();
   }
-  if (ledgerChanged) await persistTaskTombstoneLedger(ledger);
-  void rescheduleLocalTaskNotificationsFromCache();
+  if (ledgerChanged) persistTaskTombstoneLedgerInWriter(tx, ledger);
+  return true;
+}
+
+export async function applyRemoteTasks(list: ApiTask[]): Promise<void> {
+  if (!list.length) return;
+  const ledgerKey = await prepareTaskTombstoneLedgerKey();
+  const reschedule = await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyRemoteTasksInWriter(writer, tx, list, ledgerKey),
+    ),
+  );
+  if (reschedule) void rescheduleLocalTaskNotificationsFromCache();
 }
 
 /**
@@ -755,11 +764,21 @@ async function applyCanonicalTaskList(
   scope: TaskListScope,
   snapshot: TaskListSnapshot,
 ): Promise<void> {
-  await runForegroundSqliteWrite(async () => {
+  await runForegroundSqliteWrite(async (writer) => {
     if (authScopeForToken(await getToken()) !== snapshot.authScope) {
       throw new TaskListScopeChangedError();
     }
-    await applyRemoteTasks(list);
+    const ledgerKey = await prepareTaskTombstoneLedgerKey();
+    // Already inside the write unit: use the InWriter form, never the
+    // queue-entering export (it would wait on this very task).
+    if (
+      list.length &&
+      getDb().transaction((tx) =>
+        applyRemoteTasksInWriter(writer, tx, list, ledgerKey),
+      )
+    ) {
+      void rescheduleLocalTaskNotificationsFromCache();
+    }
     const pending = await pendingTaskIds(snapshot.authScope);
     const rows = await readCanonicalTaskRows(scope);
     // An old list is not evidence that a task created/edited/sent while the
@@ -776,16 +795,30 @@ async function applyCanonicalTaskList(
     });
     if (!staleIds.length) return;
     const deletedAt = nowServerNaiveIso();
-    await applyTaskTombstones(staleIds.map((id) => ({ id, deleted_at: deletedAt })));
+    const staleTombstones = staleIds.map((id) => ({ id, deleted_at: deletedAt }));
+    if (
+      getDb().transaction((tx) =>
+        applyTaskTombstonesInWriter(writer, tx, staleTombstones, ledgerKey),
+      )
+    ) {
+      void rescheduleLocalTaskNotificationsFromCache();
+    }
   });
 }
 
-export async function applyTaskTombstones(
+/**
+ * Tombstone tasks inside an active write unit. Returns true when the caller
+ * should reschedule local task notifications after the commit.
+ */
+export function applyTaskTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
-): Promise<void> {
-  if (!tombstones.length) return;
-  const db = getDb();
-  const ledger = await loadTaskTombstoneLedger();
+  ledgerKey: string,
+): boolean {
+  assertActiveWriter(writer);
+  if (!tombstones.length) return false;
+  const ledger = loadTaskTombstoneLedgerInWriter(tx, ledgerKey);
   let changed = false;
   for (const item of tombstones) {
     if (!item.id) continue;
@@ -793,7 +826,7 @@ export async function applyTaskTombstones(
       typeof item.deleted_at === "string" && item.deleted_at.trim()
         ? item.deleted_at
         : nowServerNaiveIso();
-    const existing = await readLocalTaskRow(db, item.id);
+    const existing = readLocalTaskRowInWriter(tx, item.id);
     const previousVersion = existing?.deletedAt ?? existing?.updatedAt ?? null;
     const ledgerVersion = ledger.entries.get(item.id) ?? null;
     const latestKnown =
@@ -812,54 +845,81 @@ export async function applyTaskTombstones(
       continue;
     }
     if (existing) {
-      await db
+      tx
         .update(schema.tasks)
         .set({ deletedAt, updatedAt: deletedAt })
-        .where(eq(schema.tasks.id, item.id));
+        .where(eq(schema.tasks.id, item.id))
+        .run();
     }
     changed = mergeTaskLedgerTimestamp(ledger.entries, item.id, deletedAt) || changed;
   }
-  if (changed) await persistTaskTombstoneLedger(ledger);
-  if (changed || tombstones.some((item) => item.id)) {
-    void rescheduleLocalTaskNotificationsFromCache();
-  }
+  if (changed) persistTaskTombstoneLedgerInWriter(tx, ledger);
+  return changed || tombstones.some((item) => item.id);
+}
+
+export async function applyTaskTombstones(
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): Promise<void> {
+  if (!tombstones.length) return;
+  const ledgerKey = await prepareTaskTombstoneLedgerKey();
+  const reschedule = await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyTaskTombstonesInWriter(writer, tx, tombstones, ledgerKey),
+    ),
+  );
+  if (reschedule) void rescheduleLocalTaskNotificationsFromCache();
 }
 
 /**
  * Clear tombstones only as part of an explicit server-authorized restore.
  * Active pull payloads intentionally cannot call this path.
  */
-export async function clearTaskTombstoneLedger(
+function clearTaskTombstoneLedgerInWriter(
+  tx: SqliteHandle,
+  ledgerKey: string,
   taskIds: Iterable<string>,
-): Promise<void> {
-  const ledger = await loadTaskTombstoneLedger();
+): void {
+  const ledger = loadTaskTombstoneLedgerInWriter(tx, ledgerKey);
   let changed = false;
   for (const taskId of taskIds) {
     if (ledger.entries.delete(taskId)) changed = true;
   }
-  if (changed) await persistTaskTombstoneLedger(ledger);
+  if (changed) persistTaskTombstoneLedgerInWriter(tx, ledger);
 }
 
 /** Return whether a task is locally tombstoned, including a missing-row ledger entry. */
-export async function isTaskTombstoned(taskId: string): Promise<boolean> {
-  const db = getDb();
-  const existing = await readLocalTaskRow(db, taskId);
+export function isTaskTombstonedInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  taskId: string,
+  ledgerKey: string,
+): boolean {
+  assertActiveWriter(writer);
+  const existing = readLocalTaskRowInWriter(tx, taskId);
   if (existing?.deletedAt != null) return true;
-  const ledger = await loadTaskTombstoneLedger();
-  return ledger.entries.has(taskId);
+  return loadTaskTombstoneLedgerInWriter(tx, ledgerKey).entries.has(taskId);
 }
 
-/** Apply the canonical result of `/api/tasks/{id}/restore`. */
-export async function applyTaskRestore(
-  restored: Partial<ApiTask> & {
-    id: string;
-    task_id?: string;
-    task_ids?: string[];
-    restored_at?: string | null;
-    updated_at?: string | null;
-  },
-): Promise<void> {
-  if (!restored.id) return;
+type TaskRestoreInput = Partial<ApiTask> & {
+  id: string;
+  task_id?: string;
+  task_ids?: string[];
+  restored_at?: string | null;
+  updated_at?: string | null;
+};
+
+/**
+ * Apply the canonical result of `/api/tasks/{id}/restore` inside an active
+ * write unit. Returns true when notifications should be rescheduled.
+ */
+export function applyTaskRestoreInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  restored: TaskRestoreInput,
+  ledgerKey: string,
+): boolean {
+  assertActiveWriter(writer);
+  if (!restored.id) return false;
   const ids = new Set<string>([
     restored.id,
     ...(typeof restored.task_id === "string" ? [restored.task_id] : []),
@@ -867,20 +927,20 @@ export async function applyTaskRestore(
       ? restored.task_ids.filter((id): id is string => typeof id === "string")
       : []),
   ]);
-  await clearTaskTombstoneLedger(ids);
+  clearTaskTombstoneLedgerInWriter(tx, ledgerKey, ids);
 
-  const db = getDb();
   const restoredAt =
     (typeof restored.updated_at === "string" && restored.updated_at) ||
     (typeof restored.restored_at === "string" && restored.restored_at) ||
     nowServerNaiveIso();
   for (const taskId of ids) {
-    const existing = await readLocalTaskRow(db, taskId);
+    const existing = readLocalTaskRowInWriter(tx, taskId);
     if (!existing) continue;
-    await db
+    tx
       .update(schema.tasks)
       .set({ deletedAt: null, updatedAt: restoredAt })
-      .where(eq(schema.tasks.id, taskId));
+      .where(eq(schema.tasks.id, taskId))
+      .run();
   }
 
   // The restore endpoint returns a compact batch acknowledgement.  If a
@@ -891,16 +951,32 @@ export async function applyTaskRestore(
     typeof candidate.title === "string" &&
     typeof candidate.project_id === "string"
   ) {
-    await applyRemoteTasks([
-      {
-        ...(candidate as unknown as ApiTask),
-        deleted_at: null,
-        updated_at:
-          (candidate.updated_at as string | null | undefined) ?? restoredAt,
-      },
-    ]);
+    applyRemoteTasksInWriter(
+      writer,
+      tx,
+      [
+        {
+          ...(candidate as unknown as ApiTask),
+          deleted_at: null,
+          updated_at:
+            (candidate.updated_at as string | null | undefined) ?? restoredAt,
+        },
+      ],
+      ledgerKey,
+    );
   }
-  void rescheduleLocalTaskNotificationsFromCache();
+  return true;
+}
+
+export async function applyTaskRestore(restored: TaskRestoreInput): Promise<void> {
+  if (!restored.id) return;
+  const ledgerKey = await prepareTaskTombstoneLedgerKey();
+  const reschedule = await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyTaskRestoreInWriter(writer, tx, restored, ledgerKey),
+    ),
+  );
+  if (reschedule) void rescheduleLocalTaskNotificationsFromCache();
 }
 
 function buildLocalTask(
@@ -1566,9 +1642,7 @@ export const tasksRepo = {
         const created = await taskApi.createTask(
           canonicalTaskMutationPayload(createData),
         );
-        await runForegroundSqliteWrite(() =>
-          applyRemoteTasks([created]),
-        );
+        await applyRemoteTasks([created]);
         return created;
       } catch (error) {
         if (!shouldQueueTaskMutation(error)) throw error;
@@ -1590,8 +1664,12 @@ export const tasksRepo = {
       task_metadata: localMetadata,
     });
     let wakeScope: string | null = null;
-    await runForegroundSqliteWrite(async () => {
-      await applyRemoteTasks([local]);
+    const createLedgerKey = await prepareTaskTombstoneLedgerKey();
+    await runForegroundSqliteWrite(async (writer) => {
+      getDb().transaction((tx) =>
+        applyRemoteTasksInWriter(writer, tx, [local], createLedgerKey),
+      );
+      void rescheduleLocalTaskNotificationsFromCache();
       if (hasToken) {
         const opId = await enqueueOutbox({
           table: "tasks",
@@ -1621,7 +1699,8 @@ export const tasksRepo = {
           taskId,
           canonicalTaskMutationPayload(data),
         );
-        const updatedWithAggregates = await runForegroundSqliteWrite(async () => {
+        const updateLedgerKey = await prepareTaskTombstoneLedgerKey();
+        const updatedWithAggregates = await runForegroundSqliteWrite(async (writer) => {
           const previousSnapshot = readTaskSnapshot(taskId)?.task;
           const mergedUpdated = mergeTaskUpdateAggregates(
             updated,
@@ -1632,7 +1711,10 @@ export const tasksRepo = {
           // comments/subtasks or the assignee aggregate.  Keep those detail
           // fields from the last full GET while honoring an explicit [] from
           // a current response as an authoritative clear.
-          await applyRemoteTasks([mergedUpdated]);
+          getDb().transaction((tx) =>
+            applyRemoteTasksInWriter(writer, tx, [mergedUpdated], updateLedgerKey),
+          );
+          void rescheduleLocalTaskNotificationsFromCache();
           writeTaskSnapshot(mergedUpdated);
           return mergedUpdated;
         });
@@ -1652,12 +1734,15 @@ export const tasksRepo = {
     }
 
     let wakeScope: string | null = null;
+    const queuedLedgerKey = await prepareTaskTombstoneLedgerKey();
     const merged = await runForegroundSqliteWrite(async () => {
       const db = getDb();
       const before = (
         await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
       )[0];
-      const tombstoneLedger = await loadTaskTombstoneLedger();
+      const tombstoneLedger = db.transaction((tx) =>
+        loadTaskTombstoneLedgerInWriter(tx, queuedLedgerKey),
+      );
       if (before?.deletedAt != null || tombstoneLedger.entries.has(taskId)) {
         throw new Error("削除済みタスクは更新できません。復元操作が必要です");
       }

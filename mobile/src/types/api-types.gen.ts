@@ -910,6 +910,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/{agent_id}/execution-profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Agent Runtime Execution Profiles */
+        get: operations["get_agent_runtime_execution_profiles_api_agents__agent_id__execution_profiles_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/{agent_id}/organization-profile": {
         parameters: {
             query?: never;
@@ -3947,6 +3964,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/docs/changesets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply Protocol Changeset */
+        post: operations["apply_protocol_changeset_api_docs_changesets_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/docs/clip-ingest-receipts/{receipt_id}": {
         parameters: {
             query?: never;
@@ -4070,6 +4104,23 @@ export interface paths {
         put?: never;
         /** Undo */
         post: operations["undo_daily_capture"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/docs/edit-reads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Read Protocol Edit Page */
+        post: operations["read_protocol_edit_page_api_docs_edit_reads_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4407,6 +4458,23 @@ export interface paths {
         post?: never;
         /** Remove Supertag */
         delete: operations["remove_supertag_api_docs_nodes__node_id__supertags__supertag_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/docs/reads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Read Protocol Page */
+        post: operations["read_protocol_page_api_docs_reads_post"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5905,6 +5973,57 @@ export interface paths {
         put?: never;
         /** Propose Replacement */
         post: operations["propose_replacement_api_knowledge_documents__document_id__propose_replacement_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/plugin/documents/{document_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Plugin Document */
+        get: operations["read_plugin_document_api_knowledge_plugin_documents__document_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/plugin/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search Plugin Sources */
+        post: operations["search_plugin_sources_api_knowledge_plugin_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/plugin/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Plugin Sources */
+        get: operations["list_plugin_sources_api_knowledge_plugin_sources_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -10317,6 +10436,161 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/personal-agents/invoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Invoke */
+        post: operations["invoke_api_personal_agents_invoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-agents/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Profiles */
+        get: operations["list_profiles_api_personal_agents_profiles_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accepted Context */
+        post: operations["accepted_context_api_personal_career_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/profile-versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Profile Versions */
+        get: operations["list_profile_versions_api_personal_career_profile_versions_get"];
+        put?: never;
+        /** Create Profile Version */
+        post: operations["create_profile_version_api_personal_career_profile_versions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/profile-versions/{version_ref}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Profile Version */
+        get: operations["get_profile_version_api_personal_career_profile_versions__version_ref__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/profile-versions/{version_ref}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm Profile Version */
+        post: operations["confirm_profile_version_api_personal_career_profile_versions__version_ref__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Sources */
+        get: operations["list_sources_api_personal_career_sources_get"];
+        put?: never;
+        /** Register Source */
+        post: operations["register_source_api_personal_career_sources_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/sources/available": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Available Sources */
+        get: operations["list_available_sources_api_personal_career_sources_available_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-career/sources/{source_ref}/selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set Source Selection */
+        post: operations["set_source_selection_api_personal_career_sources__source_ref__selection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/personal-drafts": {
         parameters: {
             query?: never;
@@ -10403,6 +10677,195 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/personal-finance/datasets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Datasets */
+        get: operations["list_datasets_api_personal_finance_datasets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/datasets/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept Dataset */
+        post: operations["accept_dataset_api_personal_finance_datasets_accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/datasets/{dataset_ref}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Dataset Summary */
+        get: operations["dataset_summary_api_personal_finance_datasets__dataset_ref__summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/entries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Entries */
+        get: operations["list_entries_api_personal_finance_entries_get"];
+        put?: never;
+        /** Add Entry */
+        post: operations["add_entry_api_personal_finance_entries_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/entries/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview Entry */
+        post: operations["preview_entry_api_personal_finance_entries_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Receipt Candidates */
+        get: operations["receipt_candidates_api_personal_finance_receipts_candidates_get"];
+        put?: never;
+        /** Propose Receipt Candidate */
+        post: operations["propose_receipt_candidate_api_personal_finance_receipts_candidates_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/candidates/{candidate_ref}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Receipt Candidate */
+        get: operations["get_receipt_candidate_api_personal_finance_receipts_candidates__candidate_ref__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/candidates/{candidate_ref}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm Receipt Candidate */
+        post: operations["confirm_receipt_candidate_api_personal_finance_receipts_candidates__candidate_ref__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/candidates/{candidate_ref}/confirmation-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview Receipt Confirmation */
+        post: operations["preview_receipt_confirmation_api_personal_finance_receipts_candidates__candidate_ref__confirmation_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/candidates/{candidate_ref}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Receipt Candidate Preview */
+        get: operations["receipt_candidate_preview_api_personal_finance_receipts_candidates__candidate_ref__preview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-finance/receipts/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Receipt Sources */
+        get: operations["receipt_sources_api_personal_finance_receipts_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/personal-ledger/entries": {
         parameters: {
             query?: never;
@@ -10466,6 +10929,125 @@ export interface paths {
         get: operations["read_state_api_personal_ledger_state_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Reminders */
+        get: operations["list_reminders_api_personal_reminders_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/propose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Propose */
+        post: operations["propose_api_personal_reminders_propose_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/selections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Select Time */
+        post: operations["select_time_api_personal_reminders_selections_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/{draft_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Reminder */
+        get: operations["get_reminder_api_personal_reminders__draft_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/{draft_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge */
+        post: operations["acknowledge_api_personal_reminders__draft_id__ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/{draft_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel */
+        post: operations["cancel_api_personal_reminders__draft_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-reminders/{draft_id}/schedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Schedule */
+        post: operations["schedule_api_personal_reminders__draft_id__schedule_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -13064,6 +13646,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sync/v3/bootstrap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sync V3 Bootstrap */
+        get: operations["sync_v3_bootstrap"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/v3/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sync V3 Capabilities */
+        get: operations["sync_v3_capabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/v3/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sync V3 Changes */
+        get: operations["sync_v3_changes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/v3/ops": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Sync V3 Push Ops */
+        post: operations["sync_v3_push_ops"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/v3/scopes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sync V3 Scopes */
+        get: operations["sync_v3_scopes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tags/{tag_id}": {
         parameters: {
             query?: never;
@@ -13162,6 +13829,24 @@ export interface paths {
         put?: never;
         /** Create Task */
         post: operations["create_task_api_tasks_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/operations/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Task Operation */
+        get: operations["get_task_operation_api_tasks_operations__operation_id__get"];
+        /** Submit Task Operation */
+        put: operations["submit_task_operation_api_tasks_operations__operation_id__put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -15441,6 +16126,89 @@ export interface components {
              */
             success: boolean;
         };
+        /** AgentRuntimeExecutionProfile */
+        AgentRuntimeExecutionProfile: {
+            /** Acting Subagent Id */
+            acting_subagent_id: string;
+            /**
+             * Availability Category
+             * @enum {string}
+             */
+            availability_category: "available" | "context_required" | "policy_denied" | "provider_unavailable" | "ingress_unavailable";
+            /** Availability Reason */
+            availability_reason?: string | null;
+            /**
+             * Available
+             * @description Whether this explicit ingress is eligible for the supplied caller context; live provider delivery is separate
+             */
+            available: boolean;
+            /** Effort */
+            effort?: string | null;
+            /**
+             * Ingress
+             * @enum {string}
+             */
+            ingress: "api" | "cli_session" | "remote_agent";
+            /** Is Default */
+            is_default: boolean;
+            /** Model */
+            model?: string | null;
+            /** Name */
+            name: string;
+            /** Profile Id */
+            profile_id: string;
+            /** Provider */
+            provider: string;
+            /**
+             * Provider Readiness
+             * @enum {string}
+             */
+            provider_readiness: "unknown" | "ready" | "unavailable" | "not_applicable";
+            /** Provider Readiness Reason */
+            provider_readiness_reason?: string | null;
+        };
+        /** AgentRuntimeProfileCatalogResponse */
+        AgentRuntimeProfileCatalogResponse: {
+            /**
+             * Acting Role
+             * @constant
+             */
+            acting_role: "operator";
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Agent Revision Id
+             * Format: uuid
+             */
+            agent_revision_id: string;
+            /** Agent Team Id */
+            agent_team_id: string;
+            /** Binding Id */
+            binding_id?: string | null;
+            /**
+             * Context Source
+             * @enum {string}
+             */
+            context_source: "agent_revision" | "session_binding";
+            /** Default Execution Profile Id */
+            default_execution_profile_id: string;
+            /** Diagnostics */
+            diagnostics: components["schemas"]["AgentRuntimeProfileDiagnostic"][];
+            /** Profiles */
+            profiles: components["schemas"]["AgentRuntimeExecutionProfile"][];
+            /** Session Id */
+            session_id?: string | null;
+        };
+        /** AgentRuntimeProfileDiagnostic */
+        AgentRuntimeProfileDiagnostic: {
+            /** Profile Id */
+            profile_id: string;
+            /** Reason */
+            reason: string;
+        };
         /** AgentStateRequest */
         AgentStateRequest: {
             /** Expected State */
@@ -15476,6 +16244,11 @@ export interface components {
              * @description Omitted/null denies. Allow a normal non-force branch push; requires mutate and commands
              */
             allow_git_push?: boolean | null;
+            /**
+             * Command Timeout Sec
+             * @description Omitted/null keeps the existing command limits. Explicit narrowing only: an additional ceiling on each foreground command and tracked background job lifetime, further bounded at dispatch by the remaining absolute task deadline and all existing config/harness limits. Never grants command permission.
+             */
+            command_timeout_sec?: number | null;
             /** Completion Criteria */
             completion_criteria?: string[];
             /** Constraints */
@@ -15513,6 +16286,11 @@ export interface components {
              */
             requires_command_verification?: boolean | null;
             /**
+             * Timeout Sec
+             * @description Omitted/null keeps the existing 3600-second admission-to-deadline limit. Explicit narrowing only: one absolute task deadline of min(3600, timeout_sec) seconds is fixed at first admission; queue/setup time consumes it and replay, restart or resume never extends it. 0 is not unlimited.
+             */
+            timeout_sec?: number | null;
+            /**
              * Tool Generation Max Tokens
              * @description Omitted/null keeps the model's legacy output reserve. Explicit per-task opt-in: uncapped tool generation may use a bounded allowance up to this many tokens (never above 4096 or the remaining context window); explicit caller/runtime caps still win.
              */
@@ -15534,6 +16312,11 @@ export interface components {
             }[];
             /** Error */
             error?: string | null;
+            /**
+             * Required Ingress
+             * @description Explicit ingress the caller must choose for this selected route; the server never redispatches automatically
+             */
+            required_ingress?: ("cli_session" | "remote_agent") | null;
         };
         /** AgentTaskEventProjection */
         AgentTaskEventProjection: {
@@ -17131,8 +17914,18 @@ export interface components {
             accepted: boolean;
             /** Cancel Requested */
             cancel_requested?: boolean | null;
+            /** Delivery */
+            delivery?: {
+                [key: string]: unknown;
+            } | null;
+            /** Execution Target */
+            execution_target?: string | null;
+            /** Local Filesystem */
+            local_filesystem?: boolean | null;
             /** Run Id */
             run_id?: string | null;
+            /** Sandbox */
+            sandbox?: string | null;
             session?: components["schemas"]["CLIDevelopmentSessionSummary"] | null;
             /** Session Id */
             session_id?: string | null;
@@ -17143,6 +17936,8 @@ export interface components {
              * @default true
              */
             success: boolean;
+            /** Turn Status */
+            turn_status?: string | null;
             /** Work Item Id */
             work_item_id?: string | null;
         } & {
@@ -17166,16 +17961,24 @@ export interface components {
             agent_revision_id?: string | null;
             /** Binding Id */
             binding_id?: string | null;
+            /** Delivery */
+            delivery?: {
+                [key: string]: unknown;
+            } | null;
             /** Effort */
             effort?: string | null;
             error?: components["schemas"]["CLIDevelopmentSessionCollectError"] | null;
             /** Events */
             events?: components["schemas"]["CLIDevelopmentSessionEvent"][];
+            /** Execution Target */
+            execution_target?: string | null;
             /**
              * Has More
              * @default false
              */
             has_more: boolean;
+            /** Local Filesystem */
+            local_filesystem?: boolean | null;
             /** Model */
             model?: string | null;
             /** Native State */
@@ -17186,12 +17989,24 @@ export interface components {
             owner_id?: string | null;
             /** Provider */
             provider?: string | null;
+            /**
+             * Role Context Mode
+             * @default raw
+             * @enum {string}
+             */
+            role_context_mode: "raw" | "agent_role";
+            /** Role Context Sha256 */
+            role_context_sha256?: string | null;
             /** Run Id */
             run_id?: string | null;
+            /** Sandbox */
+            sandbox?: string | null;
             /** Session Id */
             session_id: string;
             /** Status */
             status?: ("ready" | "queued" | "running" | "completed" | "failed" | "waiting_input" | "waiting_approval" | "cancelling" | "disconnected" | "interrupted" | "cancelled") | null;
+            /** Turn Status */
+            turn_status?: string | null;
             /** Work Item Id */
             work_item_id?: string | null;
             /** Working Directory */
@@ -17234,6 +18049,8 @@ export interface components {
         CLIDevelopmentSessionCreateRequest: {
             /** Agent Id */
             agent_id: string;
+            /** Agent Revision Id */
+            agent_revision_id?: string | null;
             /** Allowed Capabilities */
             allowed_capabilities?: ("command_execute" | "workspace_read" | "workspace_write")[] | null;
             /** Effort */
@@ -17243,23 +18060,29 @@ export interface components {
             /** Idempotency Key */
             idempotency_key: string;
             /** Model */
-            model: string;
-            /**
-             * Permission Mode
-             * @default native_default
-             * @enum {string}
-             */
-            permission_mode: "native_default" | "standard" | "accept_edits";
+            model?: string | null;
+            /** Permission Mode */
+            permission_mode?: ("native_default" | "standard" | "accept_edits") | null;
+            /** Project Id */
+            project_id?: string | null;
             /**
              * Provider
              * @enum {string}
              */
-            provider: "antigravity-cli" | "claude-cli" | "codex-cli" | "grok-cli";
+            provider: "antigravity-cli" | "claude-cli" | "codex-cli" | "grok-cli" | "muse-remote";
+            /** Role Context Mode */
+            role_context_mode?: ("raw" | "agent_role") | null;
             /** Title */
             title?: string | null;
             /** Working Directory */
-            working_directory: string;
-        };
+            working_directory?: string | null;
+        } & ({
+            /** @enum {unknown} */
+            provider: "antigravity-cli" | "claude-cli" | "codex-cli" | "grok-cli";
+        } | {
+            /** @constant */
+            provider: "muse-remote";
+        });
         /** CLIDevelopmentSessionEvent */
         CLIDevelopmentSessionEvent: {
             /** Created At */
@@ -17397,12 +18220,8 @@ export interface components {
             allowed_roots?: string[];
             /** Approval Policy Source */
             approval_policy_source?: string | null;
-            /**
-             * Default Permission Mode
-             * @default native_default
-             * @enum {string}
-             */
-            default_permission_mode: "native_default" | "standard" | "accept_edits";
+            /** Default Permission Mode */
+            default_permission_mode?: ("native_default" | "standard" | "accept_edits") | null;
             /**
              * Enabled
              * @default false
@@ -17432,8 +18251,16 @@ export interface components {
             binding_id?: string | null;
             /** Created */
             created?: boolean | null;
+            /** Delivery */
+            delivery?: {
+                [key: string]: unknown;
+            } | null;
             /** Effort */
             effort?: string | null;
+            /** Execution Target */
+            execution_target?: string | null;
+            /** Local Filesystem */
+            local_filesystem?: boolean | null;
             /** Model */
             model?: string | null;
             /** Native State */
@@ -17446,12 +18273,18 @@ export interface components {
             } | null;
             /** Provider */
             provider?: string | null;
+            /** Role Context Mode */
+            role_context_mode?: ("raw" | "agent_role") | null;
+            /** Role Context Sha256 */
+            role_context_sha256?: string | null;
             /** Run */
             run?: {
                 [key: string]: unknown;
             } | null;
             /** Run Id */
             run_id?: string | null;
+            /** Sandbox */
+            sandbox?: string | null;
             session?: components["schemas"]["CLIDevelopmentSessionSummary"] | null;
             /** Session Id */
             session_id?: string | null;
@@ -17462,6 +18295,8 @@ export interface components {
              * @default true
              */
             success: boolean;
+            /** Turn Status */
+            turn_status?: string | null;
             /** Work */
             work?: {
                 [key: string]: unknown;
@@ -17508,8 +18343,16 @@ export interface components {
             binding_id?: string | null;
             /** Created */
             created?: boolean | null;
+            /** Delivery */
+            delivery?: {
+                [key: string]: unknown;
+            } | null;
             /** Effort */
             effort?: string | null;
+            /** Execution Target */
+            execution_target?: string | null;
+            /** Local Filesystem */
+            local_filesystem?: boolean | null;
             /** Model */
             model?: string | null;
             /** Native State */
@@ -17522,12 +18365,22 @@ export interface components {
             } | null;
             /** Provider */
             provider?: string | null;
+            /**
+             * Role Context Mode
+             * @default raw
+             * @enum {string}
+             */
+            role_context_mode: "raw" | "agent_role";
+            /** Role Context Sha256 */
+            role_context_sha256?: string | null;
             /** Run */
             run?: {
                 [key: string]: unknown;
             } | null;
             /** Run Id */
             run_id?: string | null;
+            /** Sandbox */
+            sandbox?: string | null;
             /** Session Id */
             session_id: string;
             /**
@@ -17536,6 +18389,8 @@ export interface components {
              * @enum {string}
              */
             status: "ready" | "queued" | "running" | "completed" | "failed" | "waiting_input" | "waiting_approval" | "cancelling" | "disconnected" | "interrupted" | "cancelled";
+            /** Turn Status */
+            turn_status?: string | null;
             /** Work */
             work?: {
                 [key: string]: unknown;
@@ -17551,12 +18406,8 @@ export interface components {
         CLIDevelopmentSessionTrustedWindowsStatus: {
             /** Allowed Roots */
             allowed_roots?: string[];
-            /**
-             * Default Permission Mode
-             * @default native_default
-             * @enum {string}
-             */
-            default_permission_mode: "native_default" | "standard" | "accept_edits";
+            /** Default Permission Mode */
+            default_permission_mode?: ("native_default" | "standard" | "accept_edits") | null;
             /**
              * Enabled
              * @default false
@@ -17583,6 +18434,164 @@ export interface components {
         CandidateUpdate: {
             /** Status */
             status: string;
+        };
+        /** CareerAvailableSourceOut */
+        CareerAvailableSourceOut: {
+            /** Byte Size */
+            byte_size: number;
+            /** Mime Type */
+            mime_type: string;
+            /** Registered */
+            registered: boolean;
+            /** Selected */
+            selected: boolean;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+        };
+        /** CareerAvailableSourcePage */
+        CareerAvailableSourcePage: {
+            /** Sources */
+            sources: components["schemas"]["CareerAvailableSourceOut"][];
+        };
+        /** CareerContextOut */
+        CareerContextOut: {
+            /** Needs Review */
+            needs_review: string[];
+            profile: components["schemas"]["CareerProfileFieldsOut"];
+            /** Source Refs */
+            source_refs: string[];
+        };
+        /** CareerContextRequest */
+        CareerContextRequest: {
+            /**
+             * Accepted Profile Ref
+             * Format: uuid
+             */
+            accepted_profile_ref: string;
+        };
+        /** CareerProfileConfirmation */
+        CareerProfileConfirmation: {
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /**
+             * Owner Confirmed
+             * @constant
+             */
+            owner_confirmed: true;
+        };
+        /** CareerProfileConfirmationOut */
+        CareerProfileConfirmationOut: {
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Version */
+            version: number;
+            /**
+             * Version Ref
+             * Format: uuid
+             */
+            version_ref: string;
+        };
+        /** CareerProfileCreate */
+        CareerProfileCreate: {
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Profile */
+            profile: {
+                [key: string]: string[];
+            };
+            /** Source Refs */
+            source_refs: string[];
+        };
+        /** CareerProfileFieldsOut */
+        CareerProfileFieldsOut: {
+            /** Constraints */
+            constraints: string[];
+            /** Preferences */
+            preferences: string[];
+            /** Skills */
+            skills: string[];
+        };
+        /** CareerProfileVersionOut */
+        CareerProfileVersionOut: {
+            /**
+             * Actor Kind
+             * @enum {string}
+             */
+            actor_kind: "user_action" | "model";
+            /** Confirmed */
+            confirmed: boolean;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            profile: components["schemas"]["CareerProfileFieldsOut"];
+            /** Recorded At */
+            recorded_at: string | null;
+            /** Source Refs */
+            source_refs: string[];
+            /** Unconfirmed Claim Count */
+            unconfirmed_claim_count: number;
+            /** Version */
+            version: number;
+            /**
+             * Version Ref
+             * Format: uuid
+             */
+            version_ref: string;
+        };
+        /** CareerProfileVersionPage */
+        CareerProfileVersionPage: {
+            /** Versions */
+            versions: components["schemas"]["CareerProfileVersionOut"][];
+        };
+        /** CareerSourceOut */
+        CareerSourceOut: {
+            /** Byte Size */
+            byte_size: number;
+            /** Mime Type */
+            mime_type: string;
+            /** Selected */
+            selected?: boolean | null;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+        };
+        /** CareerSourcePage */
+        CareerSourcePage: {
+            /** Sources */
+            sources: components["schemas"]["CareerSourceOut"][];
+        };
+        /** CareerSourceRegister */
+        CareerSourceRegister: {
+            /** Byte Size */
+            byte_size: number;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Mime Type */
+            mime_type: string;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+        };
+        /** CareerSourceSelection */
+        CareerSourceSelection: {
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Selected */
+            selected: boolean;
         };
         /**
          * ChangePasswordPayload
@@ -20864,6 +21873,28 @@ export interface components {
             /** Tax Included */
             tax_included: boolean;
         };
+        /** DocsAddTagOperation */
+        DocsAddTagOperation: {
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "add_tag";
+            /** Tag Id */
+            tag_id: string;
+        };
+        /** DocsArchiveOperation */
+        DocsArchiveOperation: {
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "archive";
+        };
         /**
          * DocsCandidateApproveRequest
          * @description Optimistic approval request.
@@ -20943,6 +21974,16 @@ export interface components {
             reason?: string | null;
             /** Version */
             version: number;
+        };
+        /** DocsChangesetPayload */
+        DocsChangesetPayload: {
+            /**
+             * Intent
+             * @enum {string}
+             */
+            intent: "revise_section" | "upsert_record" | "reorganize_subtree";
+            /** Operations */
+            operations: (components["schemas"]["DocsUpdateOperation"] | components["schemas"]["DocsCreateOperation"] | components["schemas"]["DocsSetFieldsOperation"] | components["schemas"]["DocsAddTagOperation"] | components["schemas"]["DocsRemoveTagOperation"] | components["schemas"]["DocsMoveOperation"] | components["schemas"]["DocsArchiveOperation"])[];
         };
         /** DocsClipIngestJobListResponse */
         DocsClipIngestJobListResponse: {
@@ -21026,6 +22067,26 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** DocsCreateOperation */
+        DocsCreateOperation: {
+            /** Block Type */
+            block_type?: ("paragraph" | "markdown" | "code") | null;
+            /** Content */
+            content?: string | null;
+            /** Description */
+            description?: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "create";
+            /** Parent Id */
+            parent_id: string;
+            /** Ref */
+            ref: string;
+            /** Title */
+            title: string;
+        };
         /** DocsIngestBody */
         DocsIngestBody: {
             /**
@@ -21047,6 +22108,139 @@ export interface components {
             target_node_id?: string | null;
             /** Upload Ids */
             upload_ids?: string[];
+        };
+        /** DocsMoveOperation */
+        DocsMoveOperation: {
+            /** Leave Reference */
+            leave_reference?: boolean | null;
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "move";
+            /** Parent Id */
+            parent_id: string;
+        };
+        /** DocsProtocolChangesetRequest */
+        DocsProtocolChangesetRequest: {
+            changeset: components["schemas"]["DocsChangesetPayload"];
+            /**
+             * Operation Id
+             * Format: uuid
+             */
+            operation_id: string;
+            /** Project Id */
+            project_id?: string | null;
+            /**
+             * Root Id
+             * Format: uuid
+             */
+            root_id: string;
+            /**
+             * Write Token
+             * Format: uuid
+             */
+            write_token: string;
+        };
+        /** DocsProtocolEditReadRequest */
+        DocsProtocolEditReadRequest: {
+            /**
+             * Cursor
+             * @default
+             */
+            cursor: string;
+            /**
+             * Depth
+             * @default 8
+             */
+            depth: number;
+            /**
+             * Page Chars
+             * @default 12000
+             */
+            page_chars: number;
+            /** Project Id */
+            project_id?: string | null;
+            /**
+             * Root Id
+             * Format: uuid
+             */
+            root_id: string;
+        };
+        /** DocsProtocolReadRequest */
+        DocsProtocolReadRequest: {
+            /**
+             * Cursor
+             * @default
+             */
+            cursor: string;
+            /**
+             * Depth
+             * @default 8
+             */
+            depth: number;
+            /**
+             * Page Chars
+             * @default 12000
+             */
+            page_chars: number;
+            /** Project Id */
+            project_id?: string | null;
+            /**
+             * Root Id
+             * Format: uuid
+             */
+            root_id: string;
+            /**
+             * View
+             * @default document
+             * @enum {string}
+             */
+            view: "document" | "record" | "outline";
+        };
+        /** DocsRemoveTagOperation */
+        DocsRemoveTagOperation: {
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "remove_tag";
+            /** Tag Id */
+            tag_id: string;
+        };
+        /** DocsSetFieldsOperation */
+        DocsSetFieldsOperation: {
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "set_fields";
+            /** Values */
+            values: {
+                [key: string]: unknown;
+            };
+        };
+        /** DocsUpdateOperation */
+        DocsUpdateOperation: {
+            /** Content */
+            content?: string | null;
+            /** Description */
+            description?: string | null;
+            /** Node Id */
+            node_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            op: "update";
+            /** Title */
+            title?: string | null;
         };
         /** DraftCreateRequest */
         DraftCreateRequest: {
@@ -22235,6 +23429,139 @@ export interface components {
              */
             scope: "user" | "project";
         };
+        /** FinanceDatasetAccept */
+        FinanceDatasetAccept: {
+            /** Idempotency Key */
+            idempotency_key: string;
+            /**
+             * Owner Confirmed
+             * @constant
+             */
+            owner_confirmed: true;
+            /** Row Refs */
+            row_refs: string[];
+        };
+        /** FinanceDatasetOut */
+        FinanceDatasetOut: {
+            /** Complete */
+            complete: boolean;
+            /**
+             * Dataset Ref
+             * Format: uuid
+             */
+            dataset_ref: string;
+            /** Member Count */
+            member_count: number;
+            /** Members Digest */
+            members_digest: string;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed: boolean;
+        };
+        /** FinanceDatasetPage */
+        FinanceDatasetPage: {
+            /** Datasets */
+            datasets: components["schemas"]["FinanceDatasetOut"][];
+        };
+        /** FinanceEntryCreate */
+        FinanceEntryCreate: {
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /**
+             * Owner Confirmed
+             * @constant
+             */
+            owner_confirmed: true;
+            /** Row */
+            row: {
+                [key: string]: unknown;
+            };
+            /** Source */
+            source?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** FinanceEntryOut */
+        FinanceEntryOut: {
+            /** Account Alias */
+            account_alias: string;
+            /** Amount Minor */
+            amount_minor: number;
+            /** Category */
+            category: string | null;
+            /**
+             * Confirmed By Kind
+             * @constant
+             */
+            confirmed_by_kind: "user_action";
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Currency */
+            currency: string;
+            /** Kind */
+            kind: string;
+            /** Occurred On */
+            occurred_on: string;
+            /**
+             * Row Ref
+             * Format: uuid
+             */
+            row_ref: string;
+            /** Source */
+            source: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** FinanceEntryPage */
+        FinanceEntryPage: {
+            /** Entries */
+            entries: components["schemas"]["FinanceEntryOut"][];
+        };
+        /** FinanceEntryPreviewRequest */
+        FinanceEntryPreviewRequest: {
+            /** Row */
+            row: {
+                [key: string]: unknown;
+            };
+            /** Source */
+            source?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** FinanceEntryPreviewResponse */
+        FinanceEntryPreviewResponse: {
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Row */
+            row: {
+                [key: string]: unknown;
+            };
+            /** Source */
+            source: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /** FinanceEntryWriteResponse */
+        FinanceEntryWriteResponse: {
+            entry: components["schemas"]["FinanceEntryOut"];
+            /** Replayed */
+            replayed: boolean;
+        };
+        /** FinanceSummaryResponse */
+        FinanceSummaryResponse: {
+            /** Duplicate Candidates */
+            duplicate_candidates: string[];
+            /** Needs Review */
+            needs_review: string[];
+            /** Snapshot Digest */
+            snapshot_digest: string;
+            /** Totals */
+            totals: components["schemas"]["PersonalFinanceSummaryTotalOut"][];
+        };
         /** FolderThumbnailPayload */
         FolderThumbnailPayload: {
             /** Folder Path */
@@ -23235,6 +24562,29 @@ export interface components {
             reason?: string | null;
             /** Version */
             version?: number | null;
+        };
+        /** KnowledgePluginSearchPayload */
+        KnowledgePluginSearchPayload: {
+            /** Extension */
+            extension?: string | null;
+            /**
+             * Limit
+             * @default 10
+             */
+            limit: number;
+            /** Path Prefix */
+            path_prefix?: string | null;
+            /** Project Id */
+            project_id?: string | null;
+            /**
+             * Query
+             * @default
+             */
+            query: string;
+            /** Source Id */
+            source_id?: string | null;
+            /** Tags */
+            tags?: string[];
         };
         /** KnowledgeSearchPayload */
         KnowledgeSearchPayload: {
@@ -27056,6 +28406,90 @@ export interface components {
              */
             state: "draft" | "active" | "paused" | "archived";
         };
+        /** PersonalAgentInvokeRequest */
+        PersonalAgentInvokeRequest: {
+            /** Arguments */
+            arguments?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "deadline.state" | "deadline.propose" | "inventory.state" | "inventory.propose" | "finance.read_entry" | "finance.summary" | "career.context";
+            /**
+             * Profile Id
+             * @enum {string}
+             */
+            profile_id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+            /**
+             * Session Id
+             * Format: uuid
+             */
+            session_id: string;
+        };
+        /** PersonalAgentInvokeResponse */
+        PersonalAgentInvokeResponse: {
+            /** Agent Id */
+            agent_id: string;
+            /** Agent Revision Id */
+            agent_revision_id: string;
+            /** Binding Id */
+            binding_id: string;
+            /**
+             * Execution Kind
+             * @constant
+             */
+            execution_kind: "adapter_only";
+            /**
+             * Generative Response
+             * @constant
+             */
+            generative_response: false;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "deadline.state" | "deadline.propose" | "inventory.state" | "inventory.propose" | "finance.read_entry" | "finance.summary" | "career.context";
+            /**
+             * Profile Id
+             * @enum {string}
+             */
+            profile_id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+            /** Result */
+            result: unknown;
+        };
+        /** PersonalAgentProfileOut */
+        PersonalAgentProfileOut: {
+            /**
+             * Autostart
+             * @constant
+             */
+            autostart: false;
+            /**
+             * Execution Kind
+             * @constant
+             */
+            execution_kind: "adapter_only";
+            /**
+             * Id
+             * @enum {string}
+             */
+            id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+            /** Kinds */
+            kinds: string[];
+            /** Operations */
+            operations: ("deadline.state" | "deadline.propose" | "inventory.state" | "inventory.propose" | "finance.read_entry" | "finance.summary" | "career.context")[];
+            /** Priority */
+            priority: number;
+            /** Registration State */
+            registration_state: string;
+        };
+        /** PersonalAgentProfilesOut */
+        PersonalAgentProfilesOut: {
+            /** Items */
+            items: components["schemas"]["PersonalAgentProfileOut"][];
+        };
         /** PersonalDraftAcceptanceResponse */
         PersonalDraftAcceptanceResponse: {
             /**
@@ -27161,6 +28595,17 @@ export interface components {
             status: string;
             /** Target Id */
             target_id?: string | null;
+        };
+        /** PersonalFinanceSummaryTotalOut */
+        PersonalFinanceSummaryTotalOut: {
+            /** Currency */
+            currency: string;
+            /** Expense Minor */
+            expense_minor: number;
+            /** Income Minor */
+            income_minor: number;
+            /** Record Count */
+            record_count: number;
         };
         /** PersonalLedgerAppendResponse */
         PersonalLedgerAppendResponse: {
@@ -28323,6 +29768,218 @@ export interface components {
             /** Expected Sha256 */
             expected_sha256?: string | null;
         };
+        /** ReceiptAcceptedRowOut */
+        ReceiptAcceptedRowOut: {
+            /** Account Alias */
+            account_alias: string;
+            /** Amount Minor */
+            amount_minor: number;
+            /** Category */
+            category: string | null;
+            /** Currency */
+            currency: string;
+            /** Kind */
+            kind: string;
+            /** Occurred On */
+            occurred_on: string;
+            /**
+             * Row Ref
+             * Format: uuid
+             */
+            row_ref: string;
+        };
+        /** ReceiptCandidateAcceptanceOut */
+        ReceiptCandidateAcceptanceOut: {
+            /**
+             * Candidate Ref
+             * Format: uuid
+             */
+            candidate_ref: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Entry Refs */
+            entry_refs: string[];
+            /** Replayed */
+            replayed: boolean;
+            /** Revision */
+            revision: number;
+            /**
+             * Status
+             * @constant
+             */
+            status: "accepted";
+        };
+        /** ReceiptCandidateConfirmation */
+        ReceiptCandidateConfirmation: {
+            /** Candidate Digest */
+            candidate_digest: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /**
+             * Duplicate Confirmed
+             * @default false
+             */
+            duplicate_confirmed: boolean;
+            /**
+             * Idempotency Key
+             * Format: uuid
+             */
+            idempotency_key: string;
+            /**
+             * Owner Confirmed
+             * @constant
+             */
+            owner_confirmed: true;
+            /** Revision */
+            revision: number;
+            /** Row */
+            row: {
+                [key: string]: unknown;
+            };
+        };
+        /** ReceiptCandidateOut */
+        ReceiptCandidateOut: {
+            accepted_row: components["schemas"]["ReceiptAcceptedRowOut"] | null;
+            /**
+             * Candidate Ref
+             * Format: uuid
+             */
+            candidate_ref: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Fields */
+            fields: {
+                [key: string]: unknown;
+            };
+            /** Needs Review */
+            needs_review: string[];
+            /** Parser Version */
+            parser_version: string;
+            /** Possible Duplicate */
+            possible_duplicate: boolean;
+            /** Revision */
+            revision: number;
+            source: components["schemas"]["ReceiptSourceOut"];
+            /** Source Text */
+            source_text: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "accepted";
+        };
+        /** ReceiptCandidateProposal */
+        ReceiptCandidateProposal: {
+            /**
+             * Idempotency Key
+             * Format: uuid
+             */
+            idempotency_key: string;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+        };
+        /** ReceiptCandidateProposalOut */
+        ReceiptCandidateProposalOut: {
+            /** Candidate Ref */
+            candidate_ref?: string | null;
+            /**
+             * Effective Ledger Change
+             * @constant
+             */
+            effective_ledger_change: false;
+            /** Fields */
+            fields?: {
+                [key: string]: unknown;
+            } | null;
+            /** Needs Review */
+            needs_review?: boolean | null;
+            /** Replayed */
+            replayed?: boolean | null;
+            /** Review Reasons */
+            review_reasons?: string[] | null;
+            /** Source Ref */
+            source_ref?: string | null;
+            /** Source Sha256 */
+            source_sha256?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "candidate_needs_review" | "processor_unavailable" | "processor_failed" | "no_text" | "no_candidate";
+        };
+        /** ReceiptConfirmationPreview */
+        ReceiptConfirmationPreview: {
+            /** Candidate Digest */
+            candidate_digest: string;
+            /** Revision */
+            revision: number;
+            /** Row */
+            row: {
+                [key: string]: unknown;
+            };
+        };
+        /** ReceiptConfirmationPreviewOut */
+        ReceiptConfirmationPreviewOut: {
+            /**
+             * Candidate Ref
+             * Format: uuid
+             */
+            candidate_ref: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Duplicate Entry Refs */
+            duplicate_entry_refs: string[];
+            /** Duplicate Scan Incomplete */
+            duplicate_scan_incomplete: boolean;
+            /** Possible Duplicate */
+            possible_duplicate: boolean;
+            /** Revision */
+            revision: number;
+            row: components["schemas"]["ReceiptAcceptedRowOut"];
+            source: components["schemas"]["ReceiptSourceOut"];
+        };
+        /** ReceiptEvidenceOut */
+        ReceiptEvidenceOut: {
+            /** Page */
+            page: number | null;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+            /** Span End */
+            span_end: number;
+            /** Span Start */
+            span_start: number;
+        };
+        /** ReceiptSourceOut */
+        ReceiptSourceOut: {
+            /** Byte Size */
+            byte_size: number;
+            /** Mime Type */
+            mime_type: string;
+            /**
+             * Source Ref
+             * Format: uuid
+             */
+            source_ref: string;
+            /** Source Sha256 */
+            source_sha256: string;
+        };
+        /** ReceiptSourcePreviewOut */
+        ReceiptSourcePreviewOut: {
+            /** Evidence */
+            evidence: components["schemas"]["ReceiptEvidenceOut"][];
+            /** Text */
+            text: string;
+        };
         /** ReconcileRequest */
         ReconcileRequest: {
             /** Confirmation Level */
@@ -28364,6 +30021,143 @@ export interface components {
         RejectSkillProposalRequest: {
             /** Reason */
             reason?: string | null;
+        };
+        /** ReminderActionRequest */
+        ReminderActionRequest: {
+            /** Idempotency Key */
+            idempotency_key: string;
+        };
+        /** ReminderActionResponse */
+        ReminderActionResponse: {
+            /**
+             * Delivery
+             * @constant
+             */
+            delivery: "owner_private_in_app";
+            /** Delivery Available */
+            delivery_available: boolean;
+            /**
+             * Draft Ref
+             * Format: uuid
+             */
+            draft_ref: string;
+            /** Scheduled */
+            scheduled: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "awaiting_user_review" | "scheduled" | "cancelled" | "delivered" | "acknowledged";
+            /** Was Scheduled */
+            was_scheduled: boolean;
+        };
+        /** ReminderItem */
+        ReminderItem: {
+            /** Acknowledged At */
+            acknowledged_at?: string | null;
+            /**
+             * Candidate Entry Id
+             * Format: uuid
+             */
+            candidate_entry_id: string;
+            /** Confirmation Digest */
+            confirmation_digest: string | null;
+            /**
+             * Delivery
+             * @constant
+             */
+            delivery: "owner_private_in_app";
+            /** Delivery Available */
+            delivery_available: boolean;
+            /** Delivery Ref */
+            delivery_ref?: string | null;
+            /**
+             * Draft Ref
+             * Format: uuid
+             */
+            draft_ref: string;
+            /** Due Date */
+            due_date?: string | null;
+            /** Label */
+            label?: string | null;
+            /** Remind At */
+            remind_at: string | null;
+            /** Scheduled */
+            scheduled: boolean;
+            /** Scheduled For */
+            scheduled_for?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "awaiting_user_review" | "scheduled" | "cancelled" | "delivered" | "invalidated" | "acknowledged";
+            /** Subject Key */
+            subject_key?: string | null;
+            /** Time Zone */
+            time_zone: string | null;
+            /** Title */
+            title?: string | null;
+            /** Was Scheduled */
+            was_scheduled: boolean;
+        };
+        /** ReminderListResponse */
+        ReminderListResponse: {
+            /** Delivery Available */
+            delivery_available: boolean;
+            /** Items */
+            items: components["schemas"]["ReminderItem"][];
+        };
+        /**
+         * ReminderProposeRequest
+         * @description 本人Web proposal; Agent tool proposals still use the service adapter.
+         */
+        ReminderProposeRequest: {
+            /**
+             * Candidate Entry Id
+             * Format: uuid
+             */
+            candidate_entry_id: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Remind At */
+            remind_at: string;
+            /** Time Zone */
+            time_zone: string;
+        };
+        /** ReminderScheduleRequest */
+        ReminderScheduleRequest: {
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+        };
+        /** ReminderSelectionRequest */
+        ReminderSelectionRequest: {
+            /**
+             * Candidate Entry Id
+             * Format: uuid
+             */
+            candidate_entry_id: string;
+            /** Confirmed Digest */
+            confirmed_digest: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Remind At */
+            remind_at: string;
+            /** Time Zone */
+            time_zone: string;
+        };
+        /** ReminderSelectionResponse */
+        ReminderSelectionResponse: {
+            /** Delivery Available */
+            delivery_available: boolean;
+            /**
+             * Selection Ref
+             * Format: uuid
+             */
+            selection_ref: string;
         };
         /** RemoteCommentPayload */
         RemoteCommentPayload: {
@@ -33299,6 +35093,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_agent_runtime_execution_profiles_api_agents__agent_id__execution_profiles_get: {
+        parameters: {
+            query?: {
+                agent_revision_id?: string | null;
+                session_id?: string | null;
+                project_id?: string | null;
+                working_directory?: string | null;
+            };
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentRuntimeProfileCatalogResponse"];
                 };
             };
             /** @description Validation Error */
@@ -39549,6 +41379,39 @@ export interface operations {
             };
         };
     };
+    apply_protocol_changeset_api_docs_changesets_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocsProtocolChangesetRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_clip_ingest_receipt: {
         parameters: {
             query?: never;
@@ -39792,6 +41655,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DailyCaptureResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_protocol_edit_page_api_docs_edit_reads_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocsProtocolEditReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
@@ -40426,6 +42322,39 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_protocol_page_api_docs_reads_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocsProtocolReadRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -43364,6 +45293,95 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_plugin_document_api_knowledge_plugin_documents__document_id__get: {
+        parameters: {
+            query?: {
+                view?: string;
+                max_chars?: number;
+                offset?: number;
+                fingerprint?: string | null;
+            };
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_plugin_sources_api_knowledge_plugin_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KnowledgePluginSearchPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_plugin_sources_api_knowledge_plugin_sources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };
@@ -53303,6 +55321,352 @@ export interface operations {
             };
         };
     };
+    invoke_api_personal_agents_invoke_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalAgentInvokeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentInvokeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_profiles_api_personal_agents_profiles_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentProfilesOut"];
+                };
+            };
+        };
+    };
+    accepted_context_api_personal_career_context_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CareerContextRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerContextOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_profile_versions_api_personal_career_profile_versions_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerProfileVersionPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_profile_version_api_personal_career_profile_versions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CareerProfileCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerProfileVersionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_profile_version_api_personal_career_profile_versions__version_ref__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                version_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerProfileVersionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_profile_version_api_personal_career_profile_versions__version_ref__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                version_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CareerProfileConfirmation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerProfileConfirmationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_sources_api_personal_career_sources_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerSourcePage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_source_api_personal_career_sources_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CareerSourceRegister"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerSourceOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_available_sources_api_personal_career_sources_available_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerAvailableSourcePage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_source_selection_api_personal_career_sources__source_ref__selection_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CareerSourceSelection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CareerSourceOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_drafts_api_personal_drafts_get: {
         parameters: {
             query?: {
@@ -53504,6 +55868,417 @@ export interface operations {
             };
         };
     };
+    list_datasets_api_personal_finance_datasets_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceDatasetPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    accept_dataset_api_personal_finance_datasets_accept_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FinanceDatasetAccept"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceDatasetOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dataset_summary_api_personal_finance_datasets__dataset_ref__summary_get: {
+        parameters: {
+            query: {
+                month: string;
+            };
+            header?: never;
+            path: {
+                dataset_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceSummaryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_entries_api_personal_finance_entries_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceEntryPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_entry_api_personal_finance_entries_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FinanceEntryCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceEntryWriteResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_entry_api_personal_finance_entries_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FinanceEntryPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinanceEntryPreviewResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    receipt_candidates_api_personal_finance_receipts_candidates_get: {
+        parameters: {
+            query?: {
+                source_ref?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptCandidateOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    propose_receipt_candidate_api_personal_finance_receipts_candidates_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReceiptCandidateProposal"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptCandidateProposalOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_receipt_candidate_api_personal_finance_receipts_candidates__candidate_ref__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                candidate_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptCandidateOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_receipt_candidate_api_personal_finance_receipts_candidates__candidate_ref__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                candidate_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReceiptCandidateConfirmation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptCandidateAcceptanceOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_receipt_confirmation_api_personal_finance_receipts_candidates__candidate_ref__confirmation_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                candidate_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReceiptConfirmationPreview"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptConfirmationPreviewOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    receipt_candidate_preview_api_personal_finance_receipts_candidates__candidate_ref__preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                candidate_ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptSourcePreviewOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    receipt_sources_api_personal_finance_receipts_sources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReceiptSourceOut"][];
+                };
+            };
+        };
+    };
     list_entries_api_personal_ledger_entries_get: {
         parameters: {
             query?: {
@@ -53657,6 +56432,239 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PersonalLedgerStateResponse"];
+                };
+            };
+        };
+    };
+    list_reminders_api_personal_reminders_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    propose_api_personal_reminders_propose_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReminderProposeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    select_time_api_personal_reminders_selections_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReminderSelectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderSelectionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_reminder_api_personal_reminders__draft_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_api_personal_reminders__draft_id__ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReminderActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_api_personal_reminders__draft_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReminderActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    schedule_api_personal_reminders__draft_id__schedule_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReminderScheduleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReminderActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -59449,6 +62457,132 @@ export interface operations {
             };
         };
     };
+    sync_v3_bootstrap: {
+        parameters: {
+            query: {
+                scope_key: string;
+                table: string;
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sync_v3_capabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    sync_v3_changes: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sync_v3_push_ops: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    sync_v3_scopes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
     delete_tag_api_tags__tag_id__delete: {
         parameters: {
             query?: never;
@@ -59656,6 +62790,213 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["CreateTaskPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_task_operation_api_tasks_operations__operation_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_task_operation_api_tasks_operations__operation_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Action
+                     * @constant
+                     */
+                    action: "create";
+                    /** _StrictCreateTaskPayload */
+                    payload: {
+                        /**
+                         * All Day
+                         * @default false
+                         */
+                        all_day?: boolean;
+                        /** Assignee Ids */
+                        assignee_ids?: string[];
+                        /**
+                         * Auto Close On Due
+                         * @default false
+                         */
+                        auto_close_on_due?: boolean;
+                        /** Description */
+                        description?: string | null;
+                        /** End At */
+                        end_at?: string | null;
+                        /** Estimated Hours */
+                        estimated_hours?: number | null;
+                        /** Knowledge Node Id */
+                        knowledge_node_id?: string | null;
+                        /** Notifications Enabled */
+                        notifications_enabled?: boolean | null;
+                        /** Parent Task Id */
+                        parent_task_id?: string | null;
+                        /** Priority */
+                        priority?: string | null;
+                        /** Project Id */
+                        project_id?: string | null;
+                        /** Recurrence Rrule */
+                        recurrence_rrule?: string | null;
+                        /**
+                         * Recurrence Timezone
+                         * @default Asia/Tokyo
+                         */
+                        recurrence_timezone?: string;
+                        /** Reminder Offsets */
+                        reminder_offsets?: number[] | null;
+                        /**
+                         * Source
+                         * @default local
+                         */
+                        source?: string;
+                        /** Start At */
+                        start_at?: string | null;
+                        /**
+                         * Status
+                         * @default todo
+                         */
+                        status?: string;
+                        /** Tag Ids */
+                        tag_ids?: string[];
+                        /** Task Metadata */
+                        task_metadata?: {
+                            [key: string]: unknown;
+                        } | null;
+                        /** Title */
+                        title: string;
+                    };
+                } | {
+                    /**
+                     * Action
+                     * @constant
+                     */
+                    action: "update";
+                    /** _StrictUpdateTaskPayload */
+                    changes: {
+                        /** All Day */
+                        all_day?: boolean | null;
+                        /** Assignee Ids */
+                        assignee_ids?: string[] | null;
+                        /** Auto Close On Due */
+                        auto_close_on_due?: boolean | null;
+                        /** Close Incomplete Subtasks */
+                        close_incomplete_subtasks?: boolean | null;
+                        /** Description */
+                        description?: string | null;
+                        /** End At */
+                        end_at?: string | null;
+                        /** Estimated Hours */
+                        estimated_hours?: number | null;
+                        /** Knowledge Node Id */
+                        knowledge_node_id?: string | null;
+                        /** Notifications Enabled */
+                        notifications_enabled?: boolean | null;
+                        /** Parent Task Id */
+                        parent_task_id?: string | null;
+                        /** Priority */
+                        priority?: string | null;
+                        /** Project Id */
+                        project_id?: string | null;
+                        /** Recurrence Rrule */
+                        recurrence_rrule?: string | null;
+                        /** Recurrence Timezone */
+                        recurrence_timezone?: string | null;
+                        /** Reminder Offsets */
+                        reminder_offsets?: number[] | null;
+                        /** Start At */
+                        start_at?: string | null;
+                        /** Status */
+                        status?: string | null;
+                        /** Tag Ids */
+                        tag_ids?: string[] | null;
+                        /** Task Metadata */
+                        task_metadata?: {
+                            [key: string]: unknown;
+                        } | null;
+                        /** Title */
+                        title?: string | null;
+                    };
+                    /** Expected Updated At */
+                    expected_updated_at: string;
+                    /** Task Id */
+                    task_id: string;
+                } | {
+                    /**
+                     * Action
+                     * @constant
+                     */
+                    action: "delete";
+                    /** Expected Updated At */
+                    expected_updated_at: string;
+                    /** Task Id */
+                    task_id: string;
+                } | {
+                    /**
+                     * Action
+                     * @constant
+                     */
+                    action: "restore";
+                    /** Deletion Batch Id */
+                    deletion_batch_id: string;
+                    /** Task Id */
+                    task_id: string;
+                };
             };
         };
         responses: {

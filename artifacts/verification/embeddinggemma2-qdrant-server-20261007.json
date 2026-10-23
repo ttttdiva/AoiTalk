@@ -1,0 +1,73 @@
+{
+  "status": "PASS_LOCAL_SERVER_FIXTURE",
+  "synthetic_only": true,
+  "backend": "Qdrant server HTTP; HNSW enabled",
+  "server_version": "1.16.3",
+  "client_version": "1.16.2",
+  "vector_dimension": 768,
+  "seed": 20261007,
+  "scope": "synthetic unit vectors/payloads; no model encoding, SQL ACL, original bytes, or semantic-quality claim",
+  "queries_return_bounded_top_k": true,
+  "python_ranks_or_fetches_all_vectors": false,
+  "upsert_seconds": 73.10836186100005,
+  "vectors_per_second": 1995.9686728782071,
+  "hnsw_build_seconds": 89.64473043699945,
+  "points": 145922,
+  "indexed_vectors": 291844,
+  "indexed_vectors_includes_named_dense_and_sparse": true,
+  "hnsw_config": {
+    "m": 16,
+    "ef_construct": 100,
+    "full_scan_threshold": 10000,
+    "max_indexing_threads": 0,
+    "on_disk": false,
+    "payload_m": null,
+    "inline_storage": null
+  },
+  "source_count": 14593,
+  "allowed_source_count": 7296,
+  "latency": {
+    "dense_unfiltered": {
+      "observations": 30,
+      "p50_seconds": 0.005029337999985728,
+      "p95_seconds": 0.008584155400194504
+    },
+    "dense_actor_filter": {
+      "observations": 30,
+      "p50_seconds": 0.004423458000019309,
+      "p95_seconds": 0.0058633121996535895
+    },
+    "dense_source_ids_filter": {
+      "observations": 30,
+      "p50_seconds": 0.01326887750019523,
+      "p95_seconds": 0.016298277200030496
+    },
+    "sparse_unfiltered": {
+      "observations": 30,
+      "p50_seconds": 0.001551797499814711,
+      "p95_seconds": 0.0023409805501614736
+    },
+    "sparse_actor_filter": {
+      "observations": 30,
+      "p50_seconds": 0.0016353539999727218,
+      "p95_seconds": 0.0024753482503456323
+    },
+    "sparse_source_ids_filter": {
+      "observations": 30,
+      "p50_seconds": 0.006336930000088614,
+      "p95_seconds": 0.008018573300432763
+    },
+    "hybrid_source_ids_filter": {
+      "observations": 30,
+      "p50_seconds": 0.022134735500003444,
+      "p95_seconds": 0.028582878599718232
+    }
+  },
+  "client_rss_bytes": 185933824,
+  "server_memory_metrics_bytes": {
+    "memory_active_bytes": 64643072,
+    "memory_allocated_bytes": 56118440,
+    "memory_resident_bytes": 182116352
+  },
+  "fixture_server_storage_bytes": 601796608
+}

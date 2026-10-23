@@ -40,15 +40,29 @@ from ..memory.models import (
     ConversationSession,
 )
 from .agent_authority import AgentAuthorityResolver
+from .agent_role_context import AgentRoleContext, build_agent_role_context
 from .conversation_agent_service import (
     AgentExecutionBindingSnapshot,
     ConversationAgentService,
     ConversationAgentValidationError,
 )
+from .muse_remote_execution import (
+    MUSE_ADAPTER_KEY as MUSE_REMOTE_ADAPTER_KEY,
+    MUSE_EXECUTION_TARGET,
+    MUSE_PROVIDER,
+    REMOTE_AGENT_DELEGATE,
+)
+from .muse_remote_session_store import (
+    MUSE_REMOTE_CONTEXT_KEY,
+    MuseRemotePrivacyGateway,
+    MuseRemoteSessionStore,
+    MuseRemoteTargetResolver,
+)
 
 
 CLI_SESSION_SOURCE_TYPE = "cli_session_turn"
 CLI_SESSION_ADAPTER_KEY = "cli_session_turn"
+REMOTE_SESSION_SOURCE_TYPE = MUSE_REMOTE_ADAPTER_KEY
 CLI_DEVELOPMENT_DOMAIN = "cli_development"
 CLI_DEVELOPMENT_CONTEXT_KEY = "cli_development"
 CLI_DEVELOPMENT_SCHEMA_VERSION = 1
@@ -76,12 +90,15 @@ CLI_DEVELOPMENT_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "disconnected", "interrupted"}
 )
 CLI_DEVELOPMENT_PERMISSION_MODES = frozenset({"native_default", "standard", "accept_edits"})
+CLI_ROLE_CONTEXT_MODES = frozenset({"raw", "agent_role"})
+CLI_ROLE_CONTEXT_MAX_BYTES = 128 * 1024
 CLI_PROVIDER_PERMISSION_MODES = {
     "antigravity-cli": frozenset({"native_default", "standard", "accept_edits"}),
     "claude-cli": frozenset({"native_default", "standard", "accept_edits"}),
     "codex-cli": frozenset({"native_default", "standard"}),
     "grok-cli": frozenset({"native_default", "standard"}),
 }
+REMOTE_SESSION_CAPABILITIES = (REMOTE_AGENT_DELEGATE,)
 
 
 class CLIDevelopmentSessionError(RuntimeError):
@@ -220,6 +237,72 @@ def pinned_cli_capabilities(context: Mapping[str, Any]) -> tuple[str, ...]:
         raise CLIDevelopmentSessionUnavailable("pinned session capabilities are invalid", code="session_capabilities_invalid") from exc
 
 
+def pinned_cli_role_context(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return metadata for an explicitly managed Agent role context.
+
+    Raw and legacy sessions have no role-context fields.  The role text is
+    deliberately rebuilt from the immutable binding at dispatch time and is
+    never persisted in session, manifest, Work, Run, or event projections.
+    """
+
+    mode = context.get("role_context_mode")
+    if mode in (None, ""):
+        return None
+    if mode != "agent_role":
+        raise CLIDevelopmentSessionUnavailable(
+            "pinned role context mode is invalid", code="role_context_invalid"
+        )
+    try:
+        schema_version = int(context.get("role_context_schema_version"))
+    except (TypeError, ValueError):
+        schema_version = 0
+    pins = {
+        "mode": "agent_role",
+        "context_schema_version": schema_version,
+        "agent_id": str(context.get("role_context_agent_id") or ""),
+        "agent_revision_id": str(context.get("role_context_agent_revision_id") or ""),
+        "role_context_sha256": str(context.get("role_context_sha256") or ""),
+    }
+    if (
+        schema_version != 1
+        or not pins["agent_id"]
+        or not pins["agent_revision_id"]
+        or len(pins["role_context_sha256"]) != 64
+    ):
+        raise CLIDevelopmentSessionUnavailable(
+            "pinned role context is incomplete", code="role_context_invalid"
+        )
+    return pins
+
+
+def _build_pinned_role_context(
+    binding: Any, context: Mapping[str, Any] | None = None
+) -> AgentRoleContext:
+    """Build role text and, when supplied, verify every persisted pin."""
+
+    try:
+        role_context = build_agent_role_context(binding)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise CLIDevelopmentSessionConflict(
+            "Agent role context is unavailable", code="agent_role_context_unavailable"
+        ) from exc
+    if context is not None:
+        pins = pinned_cli_role_context(context)
+        expected = {
+            "mode": role_context.mode,
+            "context_schema_version": role_context.context_schema_version,
+            "agent_id": role_context.agent_id,
+            "agent_revision_id": role_context.agent_revision_id,
+            "role_context_sha256": role_context.role_context_sha256,
+        }
+        if pins != expected:
+            raise CLIDevelopmentSessionConflict(
+                "Agent role context differs from the fixed session context",
+                code="agent_role_context_mismatch",
+            )
+    return role_context
+
+
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -317,6 +400,30 @@ class CLIDevelopmentPolicy:
     source: str = "default"
     platform: str = "windows"
 
+    def default_permission_mode(self, provider: str | None = None) -> str | None:
+        """Pick a non-elevating default supported by policy and providers.
+
+        ``accept_edits`` remains available only as an explicit request.  The
+        status projection has no provider selection, so it uses the modes
+        supported by every registered CLI provider.
+        """
+
+        if provider is None:
+            supported = set(CLI_DEVELOPMENT_PERMISSION_MODES)
+            for provider_modes in CLI_PROVIDER_PERMISSION_MODES.values():
+                supported.intersection_update(provider_modes)
+        else:
+            supported = set(
+                CLI_PROVIDER_PERMISSION_MODES.get(
+                    str(provider).strip().lower(), frozenset()
+                )
+            )
+        allowed = set(self.allowed_permission_modes).intersection(supported)
+        return next(
+            (mode for mode in ("native_default", "standard") if mode in allowed),
+            None,
+        )
+
     def to_diagnostic(self, *, cwd: str | None = None, owner_id: str | None = None) -> dict[str, Any]:
         effective = {
             "enabled": bool(self.enabled),
@@ -324,7 +431,7 @@ class CLIDevelopmentPolicy:
             "allowed_roots": list(self.allowed_roots),
             "allowed_owner_ids": list(self.allowed_owner_ids),
             "allowed_agent_ids": list(self.allowed_agent_ids),
-            "default_permission_mode": "native_default",
+            "default_permission_mode": self.default_permission_mode(),
             "allowed_permission_modes": list(self.allowed_permission_modes),
             "provider_cache_roots": dict(self.provider_cache_roots),
         }
@@ -369,8 +476,16 @@ def cli_development_policy(config: Any | None = None) -> CLIDevelopmentPolicy:
         if not isinstance(raw_allowed_modes, (list, tuple, set, frozenset)):
             allowed_modes = ()
         else:
-            raw_mode_names = tuple(dict.fromkeys(str(item).strip().lower() for item in raw_allowed_modes if str(item).strip()))
-            allowed_modes = raw_mode_names if all(item in CLI_DEVELOPMENT_PERMISSION_MODES for item in raw_mode_names) else ()
+            normalized_modes = tuple(
+                str(item).strip().lower() if isinstance(item, str) else ""
+                for item in raw_allowed_modes
+            )
+            allowed_modes = (
+                tuple(dict.fromkeys(normalized_modes))
+                if normalized_modes
+                and all(item in CLI_DEVELOPMENT_PERMISSION_MODES for item in normalized_modes)
+                else ()
+            )
     platform_name = str(raw.get("platform") or "windows").strip().lower()
     return CLIDevelopmentPolicy(
         enabled=configured_enabled if section else False,
@@ -455,7 +570,13 @@ def _executable_routes(binding: Any) -> list[Mapping[str, Any]]:
     for route in roles.values():
         if not isinstance(route, Mapping) or route.get("error"):
             continue
-        if not str(route.get("provider") or "").strip() or not str(route.get("model") or "").strip():
+        provider = str(route.get("provider") or "").strip().lower()
+        if provider == MUSE_PROVIDER:
+            if str(route.get("backend") or "").strip().lower() != "remote":
+                continue
+            if route.get("model") not in (None, "") or route.get("effort") not in (None, ""):
+                continue
+        elif not provider or not str(route.get("model") or "").strip():
             continue
         routes.append(route)
     return routes
@@ -467,31 +588,34 @@ def _binding_value(binding: Any, name: str, default: Any = None) -> Any:
     return getattr(binding, name, default)
 
 
-def _assert_route(binding: Any, *, provider: str, model: str, effort: str) -> dict[str, Any]:
+def _assert_route(binding: Any, *, provider: str, model: str | None, effort: str | None) -> dict[str, Any]:
     routes = _executable_routes(binding)
     if not routes:
         raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable")
-    want = (provider.strip().lower(), model.strip(), effort.strip())
+    want = (provider.strip().lower(), str(model or "").strip(), str(effort or "").strip())
     matches: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     declared_backends: dict[tuple[str, str, str, str], str] = {}
     for route in routes:
+        route_provider = str(route.get("provider") or "").strip().lower()
         actual = (
-            str(route.get("provider") or "").strip().lower(),
+            route_provider,
             str(route.get("model") or "").strip(),
-            str(route.get("effort") or "").strip(),
+            str(route.get("effort") or route.get("reasoning_effort") or "").strip(),
         )
         if actual != want:
             continue
         backend = str(route.get("backend") or "").strip().lower()
-        kind = "cli" if not backend or backend in _CLI_BACKEND_ALIASES else backend
+        kind = "remote" if route_provider == MUSE_PROVIDER else "cli" if not backend or backend in _CLI_BACKEND_ALIASES else backend
+        if route_provider == MUSE_PROVIDER and backend != "remote":
+            continue
         declared_backends.setdefault((*actual, kind), backend)
         matches.setdefault(
             (*actual, kind),
             {
                 "provider": actual[0],
-                "model": actual[1],
-                "effort": actual[2],
-                "backend": backend or "cli",
+                "model": None if route_provider == MUSE_PROVIDER else actual[1],
+                "effort": None if route_provider == MUSE_PROVIDER else actual[2],
+                "backend": "remote" if route_provider == MUSE_PROVIDER else backend or "cli",
                 "route_source": str(route.get("route_source") or "")[:80],
             },
         )
@@ -503,6 +627,8 @@ def _assert_route(binding: Any, *, provider: str, model: str, effort: str) -> di
     if len(matches) > 1:
         raise CLIDevelopmentSessionConflict("Agent route is ambiguous", code="agent_route_ambiguous")
     (key, result), = matches.items()
+    if key[3] == "remote":
+        return result
     if key[3] != "cli":
         raise CLIDevelopmentSessionConflict("Agent route is not a CLI route", code="agent_route_backend_mismatch")
     if _binding_selected_profile(binding) is not None:
@@ -573,40 +699,92 @@ def _decision_allowed(decision: Any) -> bool:
 class CreateCLIDevelopmentSessionRequest:
     owner_id: str
     agent_id: str
+    agent_revision_id: str | None
     provider: str
-    model: str
+    model: str | None
     effort: str
-    working_directory: str
+    working_directory: str | None
     idempotency_key: str
     actor_role: str | None = None
     title: str = ""
     project_id: str | None = None
-    permission_mode: str = "native_default"
+    permission_mode: str | None = None
     allowed_capabilities: tuple[str, ...] = CLI_DEVELOPMENT_CAPABILITIES
     execution_profile_id: str | None = None
+    role_context_mode: str = "raw"
+    execution_target: str | None = None
+    provided_fields: frozenset[str] = frozenset()
 
     @classmethod
     def from_value(cls, value: Any = None, **kwargs: Any) -> "CreateCLIDevelopmentSessionRequest":
         source = dict(value) if isinstance(value, Mapping) else {}
         source.update(kwargs)
-        caps = normalize_cli_capabilities(source.get("allowed_capabilities"))
+        provided_raw = source.get("_provided_fields")
+        provided = (
+            frozenset(str(item) for item in provided_raw)
+            if isinstance(provided_raw, (list, tuple, set, frozenset))
+            else frozenset(str(key) for key in source)
+        )
+        provider = _identifier(source.get("provider"), field_name="provider", limit=80).lower()
+        remote = provider == MUSE_PROVIDER
+        if remote and provided.intersection(
+            {"model", "working_directory", "permission_mode", "allowed_capabilities", "effort"}
+        ):
+            raise CLIDevelopmentSessionInvalid(
+                "muse-remote does not accept local execution fields",
+                code="remote_request_field_forbidden",
+            )
+        execution_target = source.get("execution_target")
+        if remote and execution_target not in (None, MUSE_EXECUTION_TARGET):
+            raise CLIDevelopmentSessionInvalid(
+                "execution_target does not match the server remote target",
+                code="remote_execution_target_mismatch",
+            )
+        caps = REMOTE_SESSION_CAPABILITIES if remote else normalize_cli_capabilities(source.get("allowed_capabilities"))
         execution_profile_id = source.get("execution_profile_id")
         if execution_profile_id is not None and (not isinstance(execution_profile_id, str) or not execution_profile_id):
             raise CLIDevelopmentSessionInvalid("execution_profile_id is invalid", code="agent_execution_profile_invalid")
+        raw_role_context_mode = source.get("role_context_mode")
+        role_context_mode = (
+            "raw"
+            if raw_role_context_mode is None
+            else str(raw_role_context_mode).strip().lower()
+        )
+        if role_context_mode not in CLI_ROLE_CONTEXT_MODES:
+            raise CLIDevelopmentSessionInvalid(
+                "role_context_mode must be raw or agent_role",
+                code="role_context_mode_invalid",
+            )
+        requested_revision = source.get("agent_revision_id")
+        agent_revision_id = (
+            None if requested_revision is None else _safe_uuid(requested_revision)
+        )
+        if requested_revision is not None and agent_revision_id is None:
+            raise CLIDevelopmentSessionInvalid(
+                "agent_revision_id is invalid", code="agent_revision_id_invalid"
+            )
         return cls(
             owner_id=_identifier(source.get("owner_id", source.get("user_id")), field_name="owner_id"),
             agent_id=_identifier(source.get("agent_id"), field_name="agent_id"),
-            provider=_identifier(source.get("provider"), field_name="provider", limit=80).lower(),
-            model=_identifier(source.get("model"), field_name="model", limit=160),
+            agent_revision_id=agent_revision_id,
+            provider=provider,
+            model=(None if remote else _identifier(source.get("model"), field_name="model", limit=160)),
             effort=str(source.get("effort") or "").strip(),
-            working_directory=_text(source.get("working_directory"), field_name="working_directory", limit=1024),
+            working_directory=(None if remote else _text(source.get("working_directory"), field_name="working_directory", limit=1024)),
             idempotency_key=_text(source.get("idempotency_key"), field_name="idempotency_key", limit=512),
             actor_role=str(source.get("actor_role") or source.get("role") or "") or None,
             title=str(source.get("title") or "")[:200],
             project_id=str(source.get("project_id")) if source.get("project_id") not in (None, "") else None,
-            permission_mode=str(source.get("permission_mode") or "native_default").strip().lower(),
+            permission_mode=(
+                None
+                if source.get("permission_mode") is None
+                else str(source["permission_mode"]).strip().lower()
+            ),
             allowed_capabilities=caps,
             execution_profile_id=execution_profile_id,
+            role_context_mode=role_context_mode,
+            execution_target=MUSE_EXECUTION_TARGET if remote else execution_target,
+            provided_fields=provided,
         )
 
 
@@ -639,6 +817,63 @@ class EventPage:
         return {"events": list(self.events), "next_cursor": self.next_cursor, "has_more": self.has_more}
 
 
+class MuseRemoteTurnWorkSource:
+    """Source contract for already-admitted remote Muse turns."""
+
+    source_type = REMOTE_SESSION_SOURCE_TYPE
+
+    def __init__(self, service: "CLIDevelopmentSessionService") -> None:
+        self.service = service
+
+    async def discover(self, session: Any, *, now: Any = None) -> Sequence[Any]:
+        del session, now
+        # API admission creates the Work row directly. Discovery must never
+        # replay a user turn or synthesize another remote side thread.
+        return ()
+
+    async def refresh(self, session: Any, claim: Any) -> bool:
+        db = session
+        owns = db is None
+        if db is None:
+            db = await self.service._session()
+        try:
+            work = await db.get(AgentWorkItem, uuid.UUID(str(getattr(claim, "work_item_id", ""))))
+            if work is None or str(work.source_type or "") != REMOTE_SESSION_SOURCE_TYPE or str(work.execution_adapter or "") != MUSE_REMOTE_ADAPTER_KEY:
+                return False
+            run = await db.get(AgentRun, work.active_agent_run_id) if work.active_agent_run_id else None
+            conversation = await db.get(ConversationSession, work.conversation_session_id)
+            metadata = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+            owner = str(metadata.get("owner_id") or "")
+            claim_metadata = getattr(claim, "metadata", {})
+            if not isinstance(claim_metadata, Mapping):
+                claim_metadata = {}
+            claim_owner = str(claim_metadata.get("owner_id") or "")
+            if (
+                conversation is None
+                or not owner
+                or not claim_owner
+                or owner != claim_owner
+                or str(conversation.user_id) != owner
+                or str(work.assigned_agent_id) != str(getattr(claim, "assigned_agent_id", None) or "")
+            ):
+                return False
+            if run is None:
+                return False
+            return (
+                str(work.agent_revision_id) == str(getattr(claim, "agent_revision_id", None) or "")
+                and str(run.session_id) == str(work.conversation_session_id)
+                and str(run.agent_id) == str(work.assigned_agent_id)
+                and str(run.agent_revision_id) == str(work.agent_revision_id)
+                and str(run.run_type or "") in {REMOTE_SESSION_SOURCE_TYPE, "autonomous_work"}
+                and owner == str((getattr(claim, "metadata", {}) or {}).get("owner_id") or "")
+            )
+        except (TypeError, ValueError, AttributeError):
+            return False
+        finally:
+            if owns:
+                await self.service._close(db)
+
+
 class CLIDevelopmentSessionService:
     """Admission and projection facade for the CLI development lane."""
 
@@ -660,6 +895,8 @@ class CLIDevelopmentSessionService:
         self.agent_service = agent_service or ConversationAgentService(db_manager, config=config)
         self.authority_resolver = authority_resolver or AgentAuthorityResolver(db_manager, config=config)
         self._clock = clock or _utcnow
+        self.remote_adapter: Any | None = None
+        self.remote_binding_store: Any | None = None
 
     async def _session(self) -> Any:
         manager = self._db_manager
@@ -692,6 +929,82 @@ class CLIDevelopmentSessionService:
         policy = cli_development_policy(self.config)
         return policy.to_diagnostic(cwd=working_directory, owner_id=owner_id)
 
+    def _remote_target_config(self) -> Mapping[str, Any]:
+        config = self.config
+        if isinstance(config, Mapping):
+            section = config.get("remote_targets", {})
+            return section.get("muse", {}) if isinstance(section, Mapping) and isinstance(section.get("muse", {}), Mapping) else {}
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            try:
+                section = getter("remote_targets", {})
+            except Exception:
+                section = {}
+            return section.get("muse", {}) if isinstance(section, Mapping) and isinstance(section.get("muse", {}), Mapping) else {}
+        return {}
+
+    def _get_remote_adapter(self) -> Any:
+        """Return the server-owned Muse adapter used by the shared Work lane."""
+
+        if self.remote_adapter is not None:
+            return self.remote_adapter
+        from .muse_remote_execution import MuseRemoteExecutionAdapter
+
+        self.remote_binding_store = self.remote_binding_store or MuseRemoteSessionStore(
+            self._db_manager
+        )
+        target = self._remote_target_config()
+        self.remote_adapter = MuseRemoteExecutionAdapter(
+            credential_resolver=MuseRemoteTargetResolver(self.config),
+            binding_store=self.remote_binding_store,
+            privacy_gateway=MuseRemotePrivacyGateway(self.config),
+            wait_seconds=target.get("wait_seconds", 0.0),
+            reconcile_timeout_seconds=target.get("reconcile_timeout_seconds", 0.0),
+            poll_interval_seconds=target.get("poll_interval_seconds", 0.0),
+        )
+        return self.remote_adapter
+
+    @staticmethod
+    def _remote_allowlisted(value: str, raw: Any) -> bool:
+        if isinstance(raw, str):
+            values = [raw]
+        elif isinstance(raw, (list, tuple, set, frozenset)):
+            values = list(raw)
+        else:
+            values = []
+        return bool(values) and value in {str(item).strip() for item in values if str(item).strip()}
+
+    def _assert_remote_admission(self, *, owner_id: str, agent_id: str) -> Mapping[str, Any]:
+        target = self._remote_target_config()
+        if not bool(target.get("enabled") is True or str(target.get("enabled") or "").strip().lower() in {"1", "true", "yes", "on"}):
+            raise CLIDevelopmentSessionUnavailable("Muse remote target is disabled", code="remote_target_disabled")
+        try:
+            from ..features import Features
+
+            if Features.is_enterprise() or not Features.is_enabled("remote_server_view"):
+                raise CLIDevelopmentSessionForbidden("Muse remote target is unavailable for this feature profile", code="remote_target_feature_denied")
+        except CLIDevelopmentSessionError:
+            raise
+        except Exception as exc:
+            raise CLIDevelopmentSessionUnavailable("Muse remote feature gate is unavailable", code="remote_target_feature_unavailable") from exc
+        if not self._remote_allowlisted(owner_id, target.get("allowed_owner_ids")):
+            raise CLIDevelopmentSessionForbidden("owner is not allowed for the Muse remote target", code="remote_target_owner_denied")
+        if not self._remote_allowlisted(agent_id, target.get("allowed_agent_ids")):
+            raise CLIDevelopmentSessionForbidden("Agent is not allowed for the Muse remote target", code="remote_target_agent_denied")
+        credential_ref = ""
+        for key in ("owner_credential_refs", "credentials_by_owner", "credential_refs"):
+            refs = target.get(key)
+            if isinstance(refs, Mapping) and refs.get(owner_id) not in (None, ""):
+                credential_ref = str(refs.get(owner_id)).strip()
+                break
+        if not credential_ref and target.get("credential_ref") not in (None, ""):
+            credential_ref = str(target.get("credential_ref")).strip()
+        if not credential_ref:
+            raise CLIDevelopmentSessionUnavailable("Muse owner credential reference is unavailable", code="remote_credential_ref_missing")
+        if not bool(target.get("egress_enabled") is True or str(target.get("egress_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}):
+            raise CLIDevelopmentSessionUnavailable("Muse remote egress is disabled", code="remote_egress_disabled")
+        return target
+
     def _policy_for_request(self, *, owner_id: str, agent_id: str, working_directory: str) -> tuple[CLIDevelopmentPolicy, str]:
         policy = cli_development_policy(self.config)
         if os.name != "nt" or policy.platform != "windows":
@@ -709,7 +1022,7 @@ class CLIDevelopmentSessionService:
 
     @staticmethod
     def _validate_permission_mode(policy: CLIDevelopmentPolicy, requested: str) -> str:
-        mode = str(requested or "native_default").strip().lower()
+        mode = str(requested or "").strip().lower()
         if mode not in CLI_DEVELOPMENT_PERMISSION_MODES:
             raise CLIDevelopmentSessionInvalid("unsupported permission mode", code="permission_mode_invalid")
         if mode not in policy.allowed_permission_modes:
@@ -724,6 +1037,25 @@ class CLIDevelopmentSessionService:
                 "provider does not support the requested permission mode",
                 code="permission_mode_unsupported",
             )
+
+    @classmethod
+    def _resolve_permission_mode(
+        cls,
+        policy: CLIDevelopmentPolicy,
+        provider: str,
+        requested: str | None,
+    ) -> str:
+        if requested is None:
+            mode = policy.default_permission_mode(provider)
+            if mode is None:
+                raise CLIDevelopmentSessionUnavailable(
+                    "no safe default permission mode is available for this provider",
+                    code="permission_mode_default_unavailable",
+                )
+        else:
+            mode = cls._validate_permission_mode(policy, requested)
+        cls._validate_provider_permission_mode(provider, mode)
+        return mode
 
     @staticmethod
     def _provider_cache_root(policy: CLIDevelopmentPolicy, provider: str) -> str:
@@ -775,7 +1107,12 @@ class CLIDevelopmentSessionService:
         return uuid.uuid5(uuid.NAMESPACE_URL, f"aoitalk:cli-development-session:v1:{owner_id}:{idempotency_key}")
 
     @staticmethod
-    def _wire_create_fingerprint(request: CreateCLIDevelopmentSessionRequest) -> str:
+    def _wire_create_fingerprint(
+        request: CreateCLIDevelopmentSessionRequest,
+        *,
+        permission_mode_override: str | None = None,
+        role_context_sha256: str | None = None,
+    ) -> str:
         """Fingerprint only caller supplied create fields.
 
         Deployment-derived roots/policies are deliberately excluded so a
@@ -791,15 +1128,54 @@ class CLIDevelopmentSessionService:
             "effort": request.effort,
             "working_directory": request.working_directory,
             "project_id": request.project_id,
-            "permission_mode": request.permission_mode,
+            "permission_mode": (
+                request.permission_mode
+                if permission_mode_override is None
+                else permission_mode_override
+            ),
             "title": request.title,
             "allowed_capabilities": list(request.allowed_capabilities),
         }
+        if request.provider == MUSE_PROVIDER:
+            material["execution_target"] = request.execution_target or MUSE_EXECUTION_TARGET
         if request.execution_profile_id is not None:
             # Only an explicit runtime selection joins the identity; omitted
             # keeps every historical fingerprint byte-identical.
             material["execution_profile_id"] = request.execution_profile_id
+        if request.agent_revision_id is not None:
+            # Exact-revision callers opt into a new identity component;
+            # omission keeps every historical create fingerprint unchanged.
+            material["agent_revision_id"] = request.agent_revision_id
+        if request.role_context_mode == "agent_role":
+            material["role_context_mode"] = "agent_role"
+            if role_context_sha256:
+                material["role_context_sha256"] = role_context_sha256
         return _json_hash(material)
+
+    @classmethod
+    def _wire_create_fingerprint_matches(
+        cls,
+        request: CreateCLIDevelopmentSessionRequest,
+        context: Mapping[str, Any],
+        wire_fingerprint: str,
+    ) -> bool:
+        stored = context.get("wire_request_fingerprint")
+        if stored == wire_fingerprint:
+            return True
+        if request.role_context_mode == "agent_role":
+            pinned_digest = str(context.get("role_context_sha256") or "")
+            if pinned_digest and stored == cls._wire_create_fingerprint(
+                request, role_context_sha256=pinned_digest
+            ):
+                return True
+        # Before omitted mode was represented distinctly, an omitted value
+        # was fingerprinted as native_default. Accept that receipt only when
+        # the persisted mode confirms the same historical interpretation.
+        if request.permission_mode is None and context.get("permission_mode") == "native_default":
+            return stored == cls._wire_create_fingerprint(
+                request, permission_mode_override="native_default"
+            )
+        return False
 
     @staticmethod
     def _context_tuple(
@@ -807,14 +1183,15 @@ class CLIDevelopmentSessionService:
         owner_id: str,
         agent_id: str,
         provider: str,
-        model: str,
+        model: str | None,
         effort: str,
-        working_directory: str,
+        working_directory: str | None,
         idempotency_key: str,
         project_id: str | None,
-        permission_mode: str = "native_default",
+        permission_mode: str | None,
         title: str = "",
         allowed_capabilities: Sequence[str] = CLI_DEVELOPMENT_CAPABILITIES,
+        execution_target: str | None = None,
     ) -> dict[str, Any]:
         context = {
             "schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION,
@@ -834,7 +1211,9 @@ class CLIDevelopmentSessionService:
             "native_state": "unknown",
             "event_sequence": 0,
         }
-        context["deployment_fingerprint"] = _json_hash({
+        if execution_target:
+            context["execution_target"] = execution_target
+        deployment_material = {
             "owner_id": owner_id,
             "agent_id": agent_id,
             "provider": provider,
@@ -845,7 +1224,10 @@ class CLIDevelopmentSessionService:
             "permission_mode": permission_mode,
             "title": title,
             "allowed_capabilities": list(allowed_capabilities),
-        })
+        }
+        if execution_target:
+            deployment_material["execution_target"] = execution_target
+        context["deployment_fingerprint"] = _json_hash(deployment_material)
         return context
 
     @staticmethod
@@ -855,6 +1237,10 @@ class CLIDevelopmentSessionService:
             return {}
         raw = context.get(CLI_DEVELOPMENT_CONTEXT_KEY)
         return dict(raw) if isinstance(raw, Mapping) else {}
+
+    @staticmethod
+    def _is_remote_context(context: Mapping[str, Any]) -> bool:
+        return str(context.get("provider") or "").strip().lower() == MUSE_PROVIDER
 
     @classmethod
     def _allocate_event_sequences(cls, row: Any, count: int) -> list[int]:
@@ -903,13 +1289,39 @@ class CLIDevelopmentSessionService:
         return "ready"
 
     async def _load_latest(self, session: Any, session_id: uuid.UUID) -> tuple[Any | None, Any | None]:
-        run = (await session.execute(select(AgentRun).where(AgentRun.session_id == session_id, AgentRun.run_type == CLI_SESSION_SOURCE_TYPE).order_by(desc(AgentRun.created_at), desc(AgentRun.id)).limit(1))).scalars().first()
+        run = (await session.execute(select(AgentRun).where(AgentRun.session_id == session_id, AgentRun.run_type.in_((CLI_SESSION_SOURCE_TYPE, REMOTE_SESSION_SOURCE_TYPE))).order_by(desc(AgentRun.created_at), desc(AgentRun.id)).limit(1))).scalars().first()
         work = None
         if run is not None and getattr(run, "work_item_id", None) is not None:
-            work = (await session.execute(select(AgentWorkItem).where(AgentWorkItem.id == run.work_item_id, AgentWorkItem.source_type == CLI_SESSION_SOURCE_TYPE, AgentWorkItem.execution_adapter == CLI_SESSION_ADAPTER_KEY))).scalars().first()
+            work = (await session.execute(select(AgentWorkItem).where(AgentWorkItem.id == run.work_item_id, AgentWorkItem.source_type.in_((CLI_SESSION_SOURCE_TYPE, REMOTE_SESSION_SOURCE_TYPE)), AgentWorkItem.execution_adapter.in_((CLI_SESSION_ADAPTER_KEY, MUSE_REMOTE_ADAPTER_KEY))))).scalars().first()
         if work is None:
-            work = (await session.execute(select(AgentWorkItem).where(AgentWorkItem.conversation_session_id == session_id, AgentWorkItem.source_type == CLI_SESSION_SOURCE_TYPE, AgentWorkItem.execution_adapter == CLI_SESSION_ADAPTER_KEY).order_by(desc(AgentWorkItem.created_at), desc(AgentWorkItem.id)).limit(1))).scalars().first()
+            work = (await session.execute(select(AgentWorkItem).where(AgentWorkItem.conversation_session_id == session_id, AgentWorkItem.source_type.in_((CLI_SESSION_SOURCE_TYPE, REMOTE_SESSION_SOURCE_TYPE)), AgentWorkItem.execution_adapter.in_((CLI_SESSION_ADAPTER_KEY, MUSE_REMOTE_ADAPTER_KEY))).order_by(desc(AgentWorkItem.created_at), desc(AgentWorkItem.id)).limit(1))).scalars().first()
         return run, work
+
+    @staticmethod
+    def _remote_result_fields(run: Any | None, work: Any | None) -> dict[str, Any]:
+        run_result = (
+            getattr(run, "result", None)
+            if isinstance(getattr(run, "result", None), Mapping)
+            else {}
+        )
+        work_result = (
+            getattr(work, "result_summary_json", None)
+            if isinstance(getattr(work, "result_summary_json", None), Mapping)
+            else {}
+        )
+        turn_status = run_result.get("turn_status") or work_result.get("turn_status")
+        delivery = run_result.get("delivery") or work_result.get("delivery")
+        return {
+            "execution_target": MUSE_EXECUTION_TARGET,
+            "local_filesystem": False,
+            "sandbox": "remote_uncontrolled",
+            "turn_status": (
+                str(turn_status)[:32]
+                if isinstance(turn_status, str) and turn_status
+                else None
+            ),
+            "delivery": dict(delivery) if isinstance(delivery, Mapping) else None,
+        }
 
     async def _binding_for_row(self, session: Any, row: Any) -> Any:
         context = self._context(row)
@@ -932,6 +1344,227 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
         return AgentExecutionBindingSnapshot.from_row(binding)
 
+    @staticmethod
+    def _managed_role_mapping(binding: Any, context: Mapping[str, Any]) -> dict[str, Any] | None:
+        if str(context.get("role_context_mode") or "raw") != "agent_role":
+            return None
+        role = _build_pinned_role_context(binding, context)
+        return {
+            "mode": role.mode,
+            "context_schema_version": role.context_schema_version,
+            "agent_id": role.agent_id,
+            # Muse's provider-only contract names this immutable pin
+            # ``agent_revision_id``.  Keep the role text in memory only; the
+            # returned mapping is used to build an ephemeral claim below.
+            "agent_revision_id": role.agent_revision_id,
+            "role_context_sha256": role.role_context_sha256,
+            "text": role.text,
+        }
+
+    async def _create_remote_session(self, req: CreateCLIDevelopmentSessionRequest, *, session_id: uuid.UUID, wire_fingerprint: str) -> dict[str, Any]:
+        """Admit one typed Muse route without entering local CLI policy."""
+
+        self._assert_remote_admission(owner_id=req.owner_id, agent_id=req.agent_id)
+        try:
+            agent, revision = await self.agent_service.validate_agent_selection(
+                agent_id=req.agent_id,
+                actor_user_id=req.owner_id,
+                actor_role=req.actor_role,
+                project_id=req.project_id,
+            )
+        except CLIDevelopmentSessionError:
+            raise
+        except Exception as exc:
+            raise CLIDevelopmentSessionForbidden("Agent selection is not authorized", code="agent_selection_denied") from exc
+        agent_id = str(getattr(agent, "id", None) or req.agent_id)
+        revision_id = str(getattr(revision, "id", None) or "")
+        if req.agent_revision_id is not None and revision_id != req.agent_revision_id:
+            raise CLIDevelopmentSessionConflict(
+                "Requested AgentRevision is stale", code="agent_revision_stale"
+            )
+        if req.agent_revision_id is not None and not callable(
+            getattr(self.agent_service, "pin_turn_binding", None)
+        ):
+            raise CLIDevelopmentSessionUnavailable(
+                "Exact AgentRevision admission is unavailable",
+                code="agent_revision_pin_unavailable",
+            )
+        try:
+            expected_snapshot = AgentExecutionBindingSnapshot.from_revision(
+                session_id=session_id,
+                agent=agent,
+                revision=revision,
+                config=self.config,
+                created_by=req.owner_id,
+                execution_profile_id=req.execution_profile_id,
+            )
+            route = _assert_route(expected_snapshot, provider=MUSE_PROVIDER, model=None, effort=None)
+            role_context = (
+                _build_pinned_role_context(expected_snapshot)
+                if req.role_context_mode == "agent_role"
+                else None
+            )
+        except CLIDevelopmentSessionError:
+            raise
+        except ConversationAgentValidationError as exc:
+            raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
+        except Exception as exc:
+            raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
+        authority = await self._resolve_authority(
+            agent_id=agent_id,
+            revision_id=revision_id,
+            project_id=req.project_id,
+            capabilities=REMOTE_SESSION_CAPABILITIES,
+        )
+        context_tuple = self._context_tuple(
+            owner_id=req.owner_id,
+            agent_id=agent_id,
+            provider=MUSE_PROVIDER,
+            model=None,
+            effort="",
+            working_directory=None,
+            idempotency_key=req.idempotency_key,
+            project_id=req.project_id,
+            permission_mode=None,
+            title=req.title,
+            allowed_capabilities=REMOTE_SESSION_CAPABILITIES,
+            execution_target=MUSE_EXECUTION_TARGET,
+        )
+        # Muse has no local native session handle.  The shared context tuple
+        # keeps the legacy local default; remove it only for this remote lane.
+        context_tuple.pop("native_state", None)
+        context_tuple.update(
+            {
+                "wire_request_fingerprint": wire_fingerprint,
+                "remote_target_key": str(session_id),
+                "remote_binding_state": "unbound",
+                "route": route,
+                "authority": authority,
+                "policy": {
+                    "execution_target": MUSE_EXECUTION_TARGET,
+                    "local_filesystem": False,
+                    "sandbox": "remote_uncontrolled",
+                },
+            }
+        )
+        deployment_material = {
+            "owner_id": req.owner_id,
+            "agent_id": agent_id,
+            "provider": MUSE_PROVIDER,
+            "execution_target": MUSE_EXECUTION_TARGET,
+            "project_id": req.project_id,
+            "title": req.title,
+            "allowed_capabilities": list(REMOTE_SESSION_CAPABILITIES),
+            "route": route,
+        }
+        if req.execution_profile_id is not None:
+            context_tuple["execution_profile_id"] = req.execution_profile_id
+            deployment_material["execution_profile_id"] = req.execution_profile_id
+        if role_context is not None:
+            context_tuple.update(
+                {
+                    "role_context_mode": role_context.mode,
+                    "role_context_schema_version": role_context.context_schema_version,
+                    "role_context_agent_id": role_context.agent_id,
+                    "role_context_agent_revision_id": role_context.agent_revision_id,
+                    "role_context_sha256": role_context.role_context_sha256,
+                }
+            )
+            deployment_material["role_context"] = {
+                "mode": role_context.mode,
+                "context_schema_version": role_context.context_schema_version,
+                "agent_id": role_context.agent_id,
+                "agent_revision_id": role_context.agent_revision_id,
+                "role_context_sha256": role_context.role_context_sha256,
+            }
+        context_tuple["deployment_fingerprint"] = _json_hash(deployment_material)
+        context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
+        policy = cli_development_policy(self.config)
+        db = await self._session()
+        try:
+            existing = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
+            if existing is not None:
+                current = self._context(existing)
+                if str(getattr(existing, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
+                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
+                return await self._session_projection(db, existing, policy=policy, owner_id=req.owner_id, created=False)
+            row = ConversationSession(
+                id=session_id,
+                user_id=req.owner_id,
+                character_name="cli_development",
+                title=req.title,
+                context=context,
+                message_count=0,
+                is_active=True,
+                project_id=uuid.UUID(req.project_id) if req.project_id else None,
+                agent_id=None,
+                session_start=self._clock(),
+                last_activity=self._clock(),
+                development_status="waiting_for_user",
+            )
+            db.add(row)
+            db.add(ConversationParticipant(session_id=session_id, participant_type="user", participant_id=req.owner_id, role="owner", status="joined", auto_respond=False, participant_metadata={}))
+            await db.flush()
+            await db.commit()
+        except IntegrityError as exc:
+            await self._rollback_async(db)
+            if not _is_unique_integrity_error(exc):
+                raise CLIDevelopmentSessionStorageError("remote session admission could not be persisted", code="session_admission_storage_error") from None
+            winner_db = await self._session()
+            try:
+                winner = await winner_db.get(ConversationSession, session_id)
+                if winner is None:
+                    raise CLIDevelopmentSessionConflict("remote session admission could not be reconciled", code="session_admission_unavailable")
+                current = self._context(winner)
+                if str(getattr(winner, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
+                    raise CLIDevelopmentSessionConflict("session idempotency key conflict", code="session_idempotency_conflict")
+                return await self._session_projection(winner_db, winner, policy=policy, owner_id=req.owner_id, created=False)
+            finally:
+                await self._close(winner_db)
+        finally:
+            await self._close(db)
+        try:
+            result = await self.agent_service.bind_session_agent(
+                session_id=str(session_id),
+                agent_id=agent_id,
+                actor_user_id=req.owner_id,
+                actor_role=req.actor_role,
+                expected_agent_id=None,
+                **_execution_profile_kwargs(req.execution_profile_id),
+            )
+        except Exception as exc:
+            raise CLIDevelopmentSessionForbidden("Agent binding could not be persisted", code="agent_binding_denied") from exc
+        binding = getattr(result, "binding", None)
+        if binding is None:
+            raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
+        if req.agent_revision_id is not None and str(_binding_value(binding, "agent_revision_id", "")) != revision_id:
+            raise CLIDevelopmentSessionConflict(
+                "Exact AgentRevision binding is unavailable",
+                code="agent_revision_binding_required",
+            )
+        bound_route = _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+        _assert_binding_selection(binding, req.execution_profile_id)
+        if role_context is not None:
+            _build_pinned_role_context(binding, context_tuple)
+        binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
+        binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
+        if not binding_id or not binding_hash:
+            raise CLIDevelopmentSessionConflict("immutable Agent binding proof is incomplete", code="agent_binding_proof_missing")
+        db = await self._session()
+        try:
+            row = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
+            if row is None:
+                raise CLIDevelopmentSessionNotFound()
+            current = self._context(row)
+            current.update({"binding_id": binding_id, "binding_snapshot_hash": binding_hash, "agent_revision_id": revision_id, "route": bound_route, "status": "ready", "admission_state": "ready"})
+            next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
+            next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = current
+            row.context = next_context
+            await db.commit()
+            return await self._session_projection(db, row, policy=policy, owner_id=req.owner_id, created=True)
+        finally:
+            await self._close(db)
+
     async def create_session(self, request: Any = None, **kwargs: Any) -> dict[str, Any]:
         req = CreateCLIDevelopmentSessionRequest.from_value(request, **kwargs)
         wire_fingerprint = self._wire_create_fingerprint(req)
@@ -947,15 +1580,22 @@ class CLIDevelopmentSessionService:
                 current = self._context(existing)
                 if getattr(existing, "deleted_at", None) is not None:
                     raise CLIDevelopmentSessionConflict("session idempotency key is tombstoned", code="session_idempotency_conflict")
-                if str(getattr(existing, "user_id", "")) != req.owner_id or current.get("wire_request_fingerprint") != wire_fingerprint:
+                if str(getattr(existing, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
                     raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
                 if str(current.get("admission_state") or "") == "ready":
                     return await self._session_projection(early_db, existing, policy=cli_development_policy(self.config), owner_id=req.owner_id, created=False)
         finally:
             await self._close(early_db)
+        if req.provider == MUSE_PROVIDER:
+            return await self._create_remote_session(
+                req,
+                session_id=session_id,
+                wire_fingerprint=wire_fingerprint,
+            )
         policy, cwd = self._policy_for_request(owner_id=req.owner_id, agent_id=req.agent_id, working_directory=req.working_directory)
-        permission_mode = self._validate_permission_mode(policy, req.permission_mode)
-        self._validate_provider_permission_mode(req.provider, permission_mode)
+        permission_mode = self._resolve_permission_mode(
+            policy, req.provider, req.permission_mode
+        )
 
         # Validate the requested Agent and route before mutating a session.
         try:
@@ -971,8 +1611,20 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionForbidden("Agent selection is not authorized", code="agent_selection_denied") from exc
         revision_id = str(getattr(revision, "id", None) or "")
         agent_id = str(getattr(agent, "id", None) or req.agent_id)
+        if req.agent_revision_id is not None and revision_id != req.agent_revision_id:
+            raise CLIDevelopmentSessionConflict(
+                "Requested AgentRevision is stale", code="agent_revision_stale"
+            )
+        if req.agent_revision_id is not None and not callable(
+            getattr(self.agent_service, "pin_turn_binding", None)
+        ):
+            raise CLIDevelopmentSessionUnavailable(
+                "Exact AgentRevision admission is unavailable",
+                code="agent_revision_pin_unavailable",
+            )
         # Build the expected immutable snapshot once. bind_session_agent will
         # create the persisted row and is checked again after the lock.
+        role_context: AgentRoleContext | None = None
         try:
             expected_snapshot = AgentExecutionBindingSnapshot.from_revision(
                 session_id=session_id,
@@ -983,6 +1635,11 @@ class CLIDevelopmentSessionService:
                 execution_profile_id=req.execution_profile_id,
             )
             route = _assert_route(expected_snapshot, provider=req.provider, model=req.model, effort=req.effort)
+            if req.role_context_mode == "agent_role":
+                role_context = _build_pinned_role_context(expected_snapshot)
+                wire_fingerprint = self._wire_create_fingerprint(
+                    req, role_context_sha256=role_context.role_context_sha256
+                )
         except CLIDevelopmentSessionError:
             raise
         except ConversationAgentValidationError as exc:
@@ -1014,6 +1671,26 @@ class CLIDevelopmentSessionService:
         if req.execution_profile_id is not None:
             context_tuple["execution_profile_id"] = req.execution_profile_id
             deployment_material["execution_profile_id"] = req.execution_profile_id
+        if req.agent_revision_id is not None:
+            context_tuple["agent_revision_id"] = revision_id
+            deployment_material["agent_revision_id"] = revision_id
+        if role_context is not None:
+            context_tuple.update(
+                {
+                    "role_context_mode": role_context.mode,
+                    "role_context_schema_version": role_context.context_schema_version,
+                    "role_context_agent_id": role_context.agent_id,
+                    "role_context_agent_revision_id": role_context.agent_revision_id,
+                    "role_context_sha256": role_context.role_context_sha256,
+                }
+            )
+            deployment_material["role_context"] = {
+                "mode": role_context.mode,
+                "context_schema_version": role_context.context_schema_version,
+                "agent_id": role_context.agent_id,
+                "agent_revision_id": role_context.agent_revision_id,
+                "role_context_sha256": role_context.role_context_sha256,
+            }
         context_tuple["deployment_fingerprint"] = _json_hash(deployment_material)
         context_tuple["route"] = route
         context_tuple["policy"] = policy.to_diagnostic(cwd=cwd, owner_id=req.owner_id)
@@ -1025,17 +1702,27 @@ class CLIDevelopmentSessionService:
             existing = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
             if existing is not None:
                 current = self._context(existing)
-                if str(getattr(existing, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or current.get("wire_request_fingerprint") != wire_fingerprint:
+                if str(getattr(existing, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
                     raise CLIDevelopmentSessionConflict("session idempotency key belongs to another request", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
+                if req.agent_revision_id is not None and str(current.get("agent_revision_id") or "") != revision_id:
+                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different AgentRevision", code="session_idempotency_conflict")
                 binding = None
                 try:
                     binding = await self._binding_for_row(db, existing)
                 except Exception:
                     if str(current.get("admission_state") or "") != "creating":
                         raise CLIDevelopmentSessionConflict("immutable Agent binding is unavailable", code="agent_binding_required")
+                    if req.agent_revision_id is not None:
+                        # Exact-revision admission is atomic below. A committed
+                        # creating row has no safe canonical exact binding to
+                        # recover and must never fall back to latest.
+                        raise CLIDevelopmentSessionConflict(
+                            "Exact AgentRevision binding is unavailable",
+                            code="agent_revision_binding_required",
+                        )
                     # A process may have committed the deterministic session
                     # row immediately before crashing in the separate
                     # canonical bind transaction. Release this lock before
@@ -1062,6 +1749,8 @@ class CLIDevelopmentSessionService:
                         raise CLIDevelopmentSessionConflict("immutable Agent binding is unavailable", code="agent_binding_required")
                 _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
                 _assert_binding_selection(binding, current.get("execution_profile_id"))
+                if role_context is not None:
+                    _build_pinned_role_context(binding, current)
                 binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
                 binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
                 if not binding_id or not binding_hash:
@@ -1085,7 +1774,7 @@ class CLIDevelopmentSessionService:
                 # Bind through ConversationAgentService after the row exists;
                 # setting this before its CAS path would make
                 # ``expected_agent_id=None`` look stale.
-                agent_id=None,
+                agent_id=(uuid.UUID(agent_id) if req.agent_revision_id is not None else None),
                 session_start=self._clock(),
                 last_activity=self._clock(),
                 development_status="waiting_for_user",
@@ -1093,7 +1782,58 @@ class CLIDevelopmentSessionService:
             db.add(row)
             db.add(ConversationParticipant(session_id=session_id, participant_type="user", participant_id=req.owner_id, role="owner", status="joined", auto_respond=False, participant_metadata={}))
             await db.flush()
+            if req.agent_revision_id is not None:
+                exact_binding = await self.agent_service.pin_turn_binding(
+                    db_session=db,
+                    session_id=str(session_id),
+                    agent_id=agent_id,
+                    agent_revision_id=req.agent_revision_id,
+                    actor_user_id=req.owner_id,
+                    actor_role=req.actor_role,
+                    config=self.config,
+                    execution_profile_id=req.execution_profile_id,
+                )
+                exact_route = _assert_route(
+                    exact_binding,
+                    provider=req.provider,
+                    model=req.model,
+                    effort=req.effort,
+                )
+                _assert_binding_selection(exact_binding, req.execution_profile_id)
+                if role_context is not None:
+                    _build_pinned_role_context(exact_binding, context_tuple)
+                binding_id = str(
+                    _binding_value(exact_binding, "binding_id")
+                    or _binding_value(exact_binding, "id")
+                    or ""
+                )
+                binding_hash = str(_binding_value(exact_binding, "snapshot_hash") or "")
+                if (
+                    str(_binding_value(exact_binding, "agent_revision_id") or "")
+                    != req.agent_revision_id
+                    or not binding_id
+                    or not binding_hash
+                ):
+                    raise CLIDevelopmentSessionConflict(
+                        "Exact AgentRevision binding proof is incomplete",
+                        code="agent_revision_binding_required",
+                    )
+                context_tuple.update(
+                    {
+                        "binding_id": binding_id,
+                        "binding_snapshot_hash": binding_hash,
+                        "agent_revision_id": req.agent_revision_id,
+                        "route": exact_route,
+                        "status": "ready",
+                        "admission_state": "ready",
+                    }
+                )
+                row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
             await db.commit()
+            if req.agent_revision_id is not None:
+                return await self._session_projection(
+                    db, row, policy=policy, owner_id=req.owner_id, created=True
+                )
         except IntegrityError as exc:
             await self._rollback_async(db)
             if not _is_unique_integrity_error(exc):
@@ -1106,11 +1846,13 @@ class CLIDevelopmentSessionService:
                 if winner is None:
                     raise exc
                 current = self._context(winner)
-                if str(getattr(winner, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or current.get("wire_request_fingerprint") != wire_fingerprint:
+                if str(getattr(winner, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
                     raise CLIDevelopmentSessionConflict("session idempotency key conflict", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
+                if req.agent_revision_id is not None and str(current.get("agent_revision_id") or "") != revision_id:
+                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different AgentRevision", code="session_idempotency_conflict")
                 return await self._session_projection(winner_db, winner, policy=policy, owner_id=req.owner_id, created=False)
             finally:
                 await self._close(winner_db)
@@ -1131,6 +1873,8 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
         bound_route = _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
         _assert_binding_selection(binding, req.execution_profile_id)
+        if role_context is not None:
+            _build_pinned_role_context(binding, context_tuple)
         binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
         binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
         if not binding_id or not binding_hash:
@@ -1153,6 +1897,20 @@ class CLIDevelopmentSessionService:
     async def _session_projection(self, db: Any, row: Any, *, policy: CLIDevelopmentPolicy, owner_id: str, created: bool) -> dict[str, Any]:
         run, work = await self._load_latest(db, row.id)
         context = self._context(row)
+        remote = self._is_remote_context(context)
+        remote_fields = self._remote_result_fields(run, work) if remote else {}
+        delivery = remote_fields.get("delivery")
+        policy_projection = (
+            {
+                "execution_target": MUSE_EXECUTION_TARGET,
+                "local_filesystem": False,
+                "sandbox": "remote_uncontrolled",
+            }
+            if remote
+            else policy.to_diagnostic(
+                cwd=context.get("working_directory"), owner_id=owner_id
+            )
+        )
         return {
             "session_id": str(row.id),
             "owner_id": owner_id,
@@ -1164,10 +1922,25 @@ class CLIDevelopmentSessionService:
             "model": context.get("model"),
             "effort": context.get("effort", ""),
             "working_directory": context.get("working_directory"),
+            "role_context_mode": context.get("role_context_mode") or "raw",
+            "role_context_sha256": context.get("role_context_sha256"),
+            "execution_target": remote_fields.get("execution_target") or context.get("execution_target") or "local_cli",
+            "local_filesystem": remote_fields.get("local_filesystem", True),
+            "sandbox": remote_fields.get("sandbox") or "trusted_windows",
+            "role_delivery": dict(delivery) if isinstance(delivery, Mapping) else None,
+            "cancel_semantics": "local_stop_only_remote_unconfirmed" if remote else "local_provider_stop_requested",
+            **(
+                {
+                    "turn_status": remote_fields.get("turn_status"),
+                    "delivery": remote_fields.get("delivery"),
+                }
+                if remote
+                else {}
+            ),
             "status": self._status_from_rows(context, run, work),
             "created": created,
-            "policy": policy.to_diagnostic(cwd=context.get("working_directory"), owner_id=owner_id),
-            "native_state": context.get("native_state", "unknown"),
+            "policy": policy_projection,
+            "native_state": None if remote else context.get("native_state", "unknown"),
             "run": run.to_dict() if run is not None else None,
             "work": work.to_safe_dict() if work is not None else None,
         }
@@ -1188,6 +1961,178 @@ class CLIDevelopmentSessionService:
             return await self._session_projection(db, row, policy=policy, owner_id=owner, created=False)
         finally:
             await self._close(db)
+
+    async def _send_remote_locked(
+        self,
+        db: Any,
+        row: Any,
+        context: Mapping[str, Any],
+        request: SendCLIDevelopmentSessionRequest,
+        *,
+        sid: str,
+        send_key: str,
+        key_digest: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Create a remote Work item while the session row is locked."""
+
+        self._assert_remote_admission(
+            owner_id=request.owner_id,
+            agent_id=str(context.get("agent_id") or row.agent_id or ""),
+        )
+        run, work = await self._load_latest(db, row.id)
+        current_status = self._status_from_rows(context, run, work)
+        if current_status in {"disconnected", "interrupted", "cancelling", "failed"}:
+            raise CLIDevelopmentSessionUnavailable("remote session cannot accept a new send in its current state", code=f"session_{current_status}")
+        binding = await self._binding_for_row(db, row)
+        route = _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+        role_mapping = self._managed_role_mapping(binding, context)
+        pinned_caps = REMOTE_SESSION_CAPABILITIES
+        await self._resolve_authority(
+            agent_id=str(context.get("agent_id") or row.agent_id or ""),
+            revision_id=str(context.get("agent_revision_id") or ""),
+            project_id=context.get("project_id"),
+            capabilities=pinned_caps,
+        )
+        existing_message = (await db.execute(select(ConversationMessage).where(ConversationMessage.session_id == row.id, ConversationMessage.client_message_id == send_key).with_for_update())).scalars().first()
+        if existing_message is not None:
+            if existing_message.content != request.content:
+                raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
+            trigger_message_id = existing_message.id
+        else:
+            trigger_message_id = uuid.uuid4()
+            db.add(ConversationMessage(id=trigger_message_id, session_id=row.id, role="user", content=request.content, client_message_id=send_key, sender_type="user", sender_id=request.owner_id, message_metadata={"client_message_id": send_key, "cli_development": True, "execution_target": MUSE_EXECUTION_TARGET}, created_at=self._clock(), updated_at=self._clock(), is_active_branch=True, branch_index=0))
+            await db.flush()
+            row.message_count = int(row.message_count or 0) + 1
+            row.last_activity = self._clock()
+            row.development_status = "working"
+        run_id = uuid.uuid4()
+        role_pins = {
+            key: role_mapping[key]
+            for key in (
+                "mode",
+                "context_schema_version",
+                "agent_id",
+                "agent_revision_id",
+                "role_context_sha256",
+            )
+        } if role_mapping is not None else None
+        manifest = {
+            "schema_version": 2,
+            "agent_id": str(context.get("agent_id") or row.agent_id),
+            "agent_revision_id": str(context.get("agent_revision_id") or ""),
+            "work_item_id": None,
+            "source": REMOTE_SESSION_SOURCE_TYPE,
+            "capabilities": list(pinned_caps),
+            "route_snapshot": {"operator": dict(route)},
+            "execution_target": MUSE_EXECUTION_TARGET,
+            "local_filesystem": False,
+            "sandbox": "remote_uncontrolled",
+        }
+        manifest.update(_binding_selection_manifest_fields(binding, context.get("execution_profile_id")))
+        if role_pins is not None:
+            manifest["role_context"] = dict(role_pins)
+        manifest_hash = _json_hash(manifest)
+        remote_run_metadata = {
+            "schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION,
+            "send_key_digest": key_digest,
+            "execution_target": MUSE_EXECUTION_TARGET,
+            "local_filesystem": False,
+            "sandbox": "remote_uncontrolled",
+            "binding_id": context.get("binding_id"),
+            "binding_snapshot_hash": context.get("binding_snapshot_hash"),
+            "remote_target_key": sid,
+        }
+        if role_pins is not None:
+            remote_run_metadata["role_context"] = dict(role_pins)
+        run = AgentRun(
+            id=run_id,
+            root_run_id=run_id,
+            session_id=row.id,
+            trigger_message_id=trigger_message_id,
+            agent_id=uuid.UUID(str(context.get("agent_id") or row.agent_id)),
+            agent_revision_id=uuid.UUID(str(context.get("agent_revision_id"))),
+            user_id=request.owner_id,
+            client_message_id=send_key,
+            client_message_key=key_digest,
+            request_fingerprint=request_fingerprint,
+            run_type=REMOTE_SESSION_SOURCE_TYPE,
+            status="queued",
+            provider=MUSE_PROVIDER,
+            model=None,
+            generation_profile="assisted_work",
+            work_item_attempt=1,
+            objective="",
+            title="",
+            result={},
+            validation={},
+            run_metadata={"cli_development": remote_run_metadata},
+            resolved_execution_manifest=manifest,
+            execution_manifest_hash=manifest_hash,
+            created_at=self._clock(),
+            updated_at=self._clock(),
+            last_event_at=self._clock(),
+        )
+        db.add(run)
+        await db.flush()
+        work_metadata: dict[str, Any] = {
+            "owner_id": request.owner_id,
+            "execution_target": MUSE_EXECUTION_TARGET,
+            "remote_target_key": sid,
+            "input_text": request.content,
+            "binding_id": context.get("binding_id"),
+            "binding_snapshot_hash": context.get("binding_snapshot_hash"),
+        }
+        if role_mapping is not None:
+            # Keep role text out of durable Work/Run projections.  The common
+            # remote adapter reconstructs it from the immutable Agent binding
+            # in its in-memory claim immediately before provider execution.
+            work_metadata["managed_role_context"] = {
+                key: role_mapping[key]
+                for key in (
+                    "mode",
+                    "context_schema_version",
+                    "agent_id",
+                    "agent_revision_id",
+                    "role_context_sha256",
+                )
+            }
+        work = AgentWorkItem(
+            source_type=REMOTE_SESSION_SOURCE_TYPE,
+            source_id=str(run_id),
+            source_revision=str(context.get("agent_revision_id") or ""),
+            intent_key=MUSE_REMOTE_ADAPTER_KEY,
+            domain=CLI_DEVELOPMENT_DOMAIN,
+            conversation_session_id=row.id,
+            assigned_agent_id=run.agent_id,
+            agent_revision_id=run.agent_revision_id,
+            required_capabilities_json=list(pinned_caps),
+            execution_adapter=MUSE_REMOTE_ADAPTER_KEY,
+            max_attempts=1,
+            state="pending",
+            attempt_count=0,
+            concurrency_key=f"conversation:{row.id}",
+            metadata_json=work_metadata,
+            created_at=self._clock(),
+            updated_at=self._clock(),
+        )
+        db.add(work)
+        await db.flush()
+        run.work_item_id = work.id
+        work.active_agent_run_id = run.id
+        next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
+        remote_context = dict(context)
+        remote_context.update({"status": "queued", "last_run_id": str(run_id), "remote_binding_state": "pending"})
+        next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = remote_context
+        row.context = next_context
+        manifest["work_item_id"] = str(work.id)
+        run.resolved_execution_manifest = manifest
+        run.execution_manifest_hash = _json_hash(manifest)
+        queued_sequence = self._allocate_event_sequences(row, 1)[0]
+        db.add(AgentRunEvent(run_id=run_id, sequence=1, event_type="run.queued", status="queued", message="Muse remote turn queued", payload={"source": REMOTE_SESSION_SOURCE_TYPE, "execution_target": MUSE_EXECUTION_TARGET, "cli_session_sequence": queued_sequence}, created_at=self._clock()))
+        db.add(AgentWorkEvent(work_item_id=work.id, sequence=1, event_type="work.queued", from_state=None, to_state="pending", status="pending", actor_kind="service", actor_service_key="aoitalk.system", agent_run_id=run_id, payload_json={"source": REMOTE_SESSION_SOURCE_TYPE, "execution_target": MUSE_EXECUTION_TARGET}, created_at=self._clock()))
+        await db.commit()
+        return {"accepted": True, "created": True, "session_id": sid, "run_id": str(run_id), "work_item_id": str(work.id), "status": "queued", "execution_target": MUSE_EXECUTION_TARGET, "local_filesystem": False, "sandbox": "remote_uncontrolled", "run": run.to_dict(), "work": work.to_safe_dict()}
 
     async def send(self, session_id: Any, request: Any = None, **kwargs: Any) -> dict[str, Any]:
         sid = _safe_uuid(session_id)
@@ -1215,6 +2160,17 @@ class CLIDevelopmentSessionService:
                 if existing.request_fingerprint != request_fingerprint:
                     raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
                 return {"accepted": True, "created": False, "session_id": sid, "run": existing.to_dict(), "run_id": str(existing.id), "status": self._status_from_rows(context, existing, await db.get(AgentWorkItem, existing.work_item_id) if existing.work_item_id else None)}
+            if self._is_remote_context(context):
+                return await self._send_remote_locked(
+                    db,
+                    row,
+                    context,
+                    req,
+                    sid=sid,
+                    send_key=send_key,
+                    key_digest=key_digest,
+                    request_fingerprint=request_fingerprint,
+                )
             current_status = self._status_from_rows(context, *(await self._load_latest(db, row.id)))
             if current_status in {"disconnected", "interrupted", "cancelling", "failed"}:
                 raise CLIDevelopmentSessionUnavailable("session cannot accept a new send in its current state", code=f"session_{current_status}")
@@ -1247,6 +2203,9 @@ class CLIDevelopmentSessionService:
                 raise CLIDevelopmentSessionUnavailable("provider state root changed", code="provider_state_root_changed")
             binding = await self._binding_for_row(db, row)
             route = _assert_route(binding, provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), effort=str(context.get("effort") or ""))
+            role_context_pins = pinned_cli_role_context(context)
+            if role_context_pins is not None:
+                _build_pinned_role_context(binding, context)
             pinned_caps = pinned_cli_capabilities(context)
             await self._resolve_authority(agent_id=str(context.get("agent_id") or row.agent_id), revision_id=str(context.get("agent_revision_id") or ""), project_id=context.get("project_id"), capabilities=pinned_caps)
             existing_message = (await db.execute(select(ConversationMessage).where(ConversationMessage.session_id == row.id, ConversationMessage.client_message_id == send_key).with_for_update())).scalars().first()
@@ -1268,12 +2227,20 @@ class CLIDevelopmentSessionService:
             run_id = uuid.uuid4()
             manifest = {"schema_version": 2, "agent_id": str(context.get("agent_id") or row.agent_id), "agent_revision_id": str(context.get("agent_revision_id") or ""), "work_item_id": None, "source": CLI_SESSION_SOURCE_TYPE, "capabilities": list(pinned_caps), "route_snapshot": {"operator": dict(route)}}
             manifest.update(_binding_selection_manifest_fields(binding, context.get("execution_profile_id")))
+            if role_context_pins is not None:
+                manifest["role_context"] = dict(role_context_pins)
             manifest_hash = _json_hash(manifest)
-            run = AgentRun(id=run_id, root_run_id=run_id, session_id=row.id, trigger_message_id=trigger_message_id, agent_id=uuid.UUID(str(context.get("agent_id") or row.agent_id)), agent_revision_id=uuid.UUID(str(context.get("agent_revision_id"))), user_id=req.owner_id, client_message_id=send_key, client_message_key=key_digest, request_fingerprint=request_fingerprint, run_type=CLI_SESSION_SOURCE_TYPE, status="queued", provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), generation_profile="assisted_work", work_item_attempt=1, objective="", title="", result={}, validation={}, run_metadata={"cli_development": {"schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION, "send_key_digest": key_digest, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "approval_policy_source": "provider_native_default_unknown" if str(context.get("permission_mode") or "native_default") == "native_default" else "explicit_deployment_policy", "execution_lane": policy.execution_lane, "working_directory_fingerprint": _sha256(cwd), "provider_cache_root_fingerprint": _sha256(str(context.get("provider_cache_root") or "")), "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}}, resolved_execution_manifest=manifest, execution_manifest_hash=manifest_hash, created_at=self._clock(), updated_at=self._clock(), last_event_at=self._clock())
+            cli_run_metadata = {"schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION, "send_key_digest": key_digest, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "approval_policy_source": "provider_native_default_unknown" if str(context.get("permission_mode") or "native_default") == "native_default" else "explicit_deployment_policy", "execution_lane": policy.execution_lane, "working_directory_fingerprint": _sha256(cwd), "provider_cache_root_fingerprint": _sha256(str(context.get("provider_cache_root") or "")), "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}
+            if role_context_pins is not None:
+                cli_run_metadata["role_context"] = dict(role_context_pins)
+            run = AgentRun(id=run_id, root_run_id=run_id, session_id=row.id, trigger_message_id=trigger_message_id, agent_id=uuid.UUID(str(context.get("agent_id") or row.agent_id)), agent_revision_id=uuid.UUID(str(context.get("agent_revision_id"))), user_id=req.owner_id, client_message_id=send_key, client_message_key=key_digest, request_fingerprint=request_fingerprint, run_type=CLI_SESSION_SOURCE_TYPE, status="queued", provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), generation_profile="assisted_work", work_item_attempt=1, objective="", title="", result={}, validation={}, run_metadata={"cli_development": cli_run_metadata}, resolved_execution_manifest=manifest, execution_manifest_hash=manifest_hash, created_at=self._clock(), updated_at=self._clock(), last_event_at=self._clock())
             db.add(run)
             await db.flush()
             resource_key = f"conversation:{row.id}"
-            work =AgentWorkItem(source_type=CLI_SESSION_SOURCE_TYPE, source_id=str(run_id), source_revision=str(context.get("agent_revision_id") or ""), intent_key=CLI_SESSION_ADAPTER_KEY, domain=CLI_DEVELOPMENT_DOMAIN, conversation_session_id=row.id, assigned_agent_id=run.agent_id, agent_revision_id=run.agent_revision_id, required_capabilities_json=list(pinned_caps), execution_adapter=CLI_SESSION_ADAPTER_KEY, max_attempts=1, state="pending", attempt_count=0, concurrency_key=resource_key, metadata_json={"owner_id": req.owner_id, "send_key_digest": key_digest, "provider": run.provider, "model": run.model, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "execution_lane": policy.execution_lane, "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}, created_at=self._clock(), updated_at=self._clock())
+            work_metadata = {"owner_id": req.owner_id, "send_key_digest": key_digest, "provider": run.provider, "model": run.model, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "execution_lane": policy.execution_lane, "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}
+            if role_context_pins is not None:
+                work_metadata["role_context"] = dict(role_context_pins)
+            work =AgentWorkItem(source_type=CLI_SESSION_SOURCE_TYPE, source_id=str(run_id), source_revision=str(context.get("agent_revision_id") or ""), intent_key=CLI_SESSION_ADAPTER_KEY, domain=CLI_DEVELOPMENT_DOMAIN, conversation_session_id=row.id, assigned_agent_id=run.agent_id, agent_revision_id=run.agent_revision_id, required_capabilities_json=list(pinned_caps), execution_adapter=CLI_SESSION_ADAPTER_KEY, max_attempts=1, state="pending", attempt_count=0, concurrency_key=resource_key, metadata_json=work_metadata, created_at=self._clock(), updated_at=self._clock())
             db.add(work)
             await db.flush()
             run.work_item_id = work.id
@@ -1336,7 +2303,7 @@ class CLIDevelopmentSessionService:
                 .join(AgentRun, AgentRun.id == AgentRunEvent.run_id)
                 .where(
                     AgentRun.session_id == row.id,
-                    AgentRun.run_type == CLI_SESSION_SOURCE_TYPE,
+                    AgentRun.run_type.in_((CLI_SESSION_SOURCE_TYPE, REMOTE_SESSION_SOURCE_TYPE)),
                     sequence_expr > cursor_sequence,
                 )
                 .order_by(sequence_expr, AgentRunEvent.id)
@@ -1422,6 +2389,72 @@ class CLIDevelopmentSessionService:
                 raise CLIDevelopmentSessionForbidden("session owner mismatch", code="session_owner_mismatch")
             context = self._context(row)
             run, work = await self._load_latest(db, row.id)
+            if self._is_remote_context(context):
+                # Muse has no local native session handle or trusted Windows
+                # filesystem.  Reconnect only rechecks the immutable Agent
+                # binding, current authority and the durable remote binding
+                # state; it never exposes a thread ID or credentials.
+                status = self._status_from_rows(context, run, work)
+                authority_valid = False
+                remote_state = "unbound"
+                remote_safe = False
+                remote_context = (
+                    row.context.get(MUSE_REMOTE_CONTEXT_KEY)
+                    if isinstance(row.context, Mapping)
+                    else None
+                )
+                remote_binding = (
+                    remote_context.get("binding")
+                    if isinstance(remote_context, Mapping)
+                    and isinstance(remote_context.get("binding"), Mapping)
+                    else remote_context
+                )
+                if isinstance(remote_binding, Mapping):
+                    remote_state = str(remote_binding.get("state") or "unbound")[:32]
+                    remote_safe = bool(
+                        remote_binding.get("safe_to_send")
+                        and not remote_binding.get("current_turn_nonce")
+                        and remote_state not in {"unsafe", "thread_create_pending"}
+                    )
+                try:
+                    self._assert_remote_admission(
+                        owner_id=owner,
+                        agent_id=str(context.get("agent_id") or row.agent_id or ""),
+                    )
+                    binding = await self._binding_for_row(db, row)
+                    _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+                    await self._resolve_authority(
+                        agent_id=str(context.get("agent_id") or row.agent_id or ""),
+                        revision_id=str(context.get("agent_revision_id") or ""),
+                        project_id=context.get("project_id"),
+                        capabilities=REMOTE_SESSION_CAPABILITIES,
+                    )
+                    authority_valid = True
+                except Exception:
+                    authority_valid = False
+                admission_ready = (
+                    str(context.get("admission_state") or "") == "ready"
+                    and bool(context.get("binding_id"))
+                    and bool(context.get("binding_snapshot_hash"))
+                )
+                safe_to_send = bool(
+                    authority_valid
+                    and admission_ready
+                    and status in {"ready", "completed"}
+                    and (status == "ready" or remote_safe)
+                )
+                return {
+                    "session_id": sid,
+                    "status": status,
+                    "native_handle": "remote_bound" if remote_state == "bound" else "remote_unbound",
+                    "native_session_id": None,
+                    "remote_binding_state": remote_state,
+                    "safe_to_send": safe_to_send,
+                    "run_id": str(run.id) if run else None,
+                    "work_item_id": str(work.id) if work else None,
+                    "reconciled": True,
+                    **self._remote_result_fields(run, work),
+                }
             native = "absent"
             native_id = None
             native_lease_free = False
@@ -1513,7 +2546,10 @@ class CLIDevelopmentSessionService:
         db = await self._session()
         try:
             run = (await db.execute(select(AgentRun).where(AgentRun.id == uuid.UUID(str(run_id))).with_for_update())).scalars().first()
-            if run is None or str(run.run_type or "") != CLI_SESSION_SOURCE_TYPE:
+            if run is None or str(run.run_type or "") not in {
+                CLI_SESSION_SOURCE_TYPE,
+                REMOTE_SESSION_SOURCE_TYPE,
+            }:
                 return
             session_row = (await db.execute(select(ConversationSession).where(ConversationSession.id == run.session_id).with_for_update())).scalars().first()
             if session_row is None:
@@ -1526,7 +2562,16 @@ class CLIDevelopmentSessionService:
             db.add(AgentRunEvent(run_id=run.id, sequence=next_run_sequence, event_type=str(event_type)[:80], status=str(status)[:32] if status else None, message=None, payload=event_payload, created_at=self._clock()))
             if work_item_id:
                 work = (await db.execute(select(AgentWorkItem).where(AgentWorkItem.id == uuid.UUID(str(work_item_id))).with_for_update())).scalars().first()
-                if work is not None and str(work.source_type or "") == CLI_SESSION_SOURCE_TYPE and str(work.execution_adapter or "") == CLI_SESSION_ADAPTER_KEY:
+                if work is not None and (
+                    (
+                        str(work.source_type or "") == CLI_SESSION_SOURCE_TYPE
+                        and str(work.execution_adapter or "") == CLI_SESSION_ADAPTER_KEY
+                    )
+                    or (
+                        str(work.source_type or "") == REMOTE_SESSION_SOURCE_TYPE
+                        and str(work.execution_adapter or "") == MUSE_REMOTE_ADAPTER_KEY
+                    )
+                ):
                     work_events = (await db.execute(select(AgentWorkEvent).where(AgentWorkEvent.work_item_id == work.id).order_by(desc(AgentWorkEvent.sequence)).limit(1))).scalars().first()
                     next_work_sequence = int(getattr(work_events, "sequence", 0) or 0) + 1
                     allowed_work_statuses = {"pending", "claimed", "running", "awaiting_approval", "blocked", "retry_wait", "uncertain", "succeeded", "failed", "cancelled", "dead_letter", "transient", "permanent"}
@@ -1547,6 +2592,8 @@ class CLIDevelopmentSessionService:
         work_item_id: str,
         classification: str,
         output: str | None = None,
+        assistant_text: str | None = None,
+        assistant_message_id: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         native_state: str | None = None,
@@ -1572,6 +2619,39 @@ class CLIDevelopmentSessionService:
             work = (await db.execute(select(AgentWorkItem).where(AgentWorkItem.id == wid, AgentWorkItem.conversation_session_id == sid).with_for_update())).scalars().first()
             if row is None or run is None or work is None:
                 raise CLIDevelopmentSessionNotFound()
+            context = self._context(row)
+            remote = self._is_remote_context(context)
+            expected_source = REMOTE_SESSION_SOURCE_TYPE if remote else CLI_SESSION_SOURCE_TYPE
+            expected_adapter = MUSE_REMOTE_ADAPTER_KEY if remote else CLI_SESSION_ADAPTER_KEY
+            run_source_type = getattr(run, "run_type", None)
+            work_source_type = getattr(work, "source_type", None)
+            work_adapter = getattr(work, "execution_adapter", None)
+            if (
+                (
+                    remote
+                    and (
+                        str(run_source_type or "") != expected_source
+                        or str(work_source_type or "") != expected_source
+                        or str(work_adapter or "") != expected_adapter
+                    )
+                )
+                or (
+                    not remote
+                    and (
+                        run_source_type not in (None, "", expected_source)
+                        or work_source_type not in (None, "", expected_source)
+                        or work_adapter not in (None, "", expected_adapter)
+                    )
+                )
+            ):
+                await db.rollback()
+                return {
+                    "discarded": True,
+                    "status": "interrupted",
+                    "run_id": str(rid),
+                    "work_item_id": str(wid),
+                    "reason": "binding_mismatch",
+                }
             # A cancelled/settled Work owns the terminal fence.  Provider
             # threads may finish after an async cancellation, but their late
             # plaintext must never become a new assistant message.
@@ -1596,7 +2676,6 @@ class CLIDevelopmentSessionService:
                 ):
                     await db.rollback()
                     return {"discarded": True, "status": "interrupted", "run_id": str(rid), "work_item_id": str(wid), "reason": "lease_fence_lost"}
-            context = self._context(row)
             normalized = str(classification or "failed").strip().lower()
             if normalized in {"success", "ok", "succeeded"}:
                 normalized = "succeeded"
@@ -1612,22 +2691,88 @@ class CLIDevelopmentSessionService:
                 normalized = "failed"
             output_content = ""
             output_message_id = None
+            provider_message_id = None
             if normalized == "succeeded":
+                if remote:
+                    # Only the provider adapter's confirmed-correlation
+                    # fields are accepted.  Never infer a reply from an
+                    # arbitrary outcome field or an uncertain history read.
+                    provider_message_id = str(assistant_message_id or "").strip()
+                    output_content = str(assistant_text or "")
+                    if (
+                        not provider_message_id
+                        or len(provider_message_id) > 512
+                        or any(ord(char) < 0x20 for char in provider_message_id)
+                        or not output_content
+                    ):
+                        await db.rollback()
+                        return {
+                            "discarded": True,
+                            "status": "interrupted",
+                            "run_id": str(rid),
+                            "work_item_id": str(wid),
+                            "reason": "remote_reply_unconfirmed",
+                        }
                 # The durable assistant message is the only transcript copy;
                 # Run/Work metadata carries its identity and no raw output.
-                assistant_key = f"cli-assistant:{rid}"
+                assistant_key = (
+                    f"muse-assistant:{rid}"
+                    if remote
+                    else f"cli-assistant:{rid}"
+                )
                 message = (await db.execute(select(ConversationMessage).where(ConversationMessage.session_id == sid, ConversationMessage.client_message_id == assistant_key).limit(1))).scalars().first()
+                if message is not None and remote:
+                    existing_provider_id = str(
+                        (message.message_metadata or {}).get("provider_message_id") or ""
+                    )
+                    if (
+                        existing_provider_id != provider_message_id
+                        or str(message.content or "") != output_content
+                    ):
+                        await db.rollback()
+                        return {
+                            "discarded": True,
+                            "status": "interrupted",
+                            "run_id": str(rid),
+                            "work_item_id": str(wid),
+                            "reason": "remote_reply_conflict",
+                        }
                 if message is None:
-                    message = ConversationMessage(id=uuid.uuid4(), session_id=sid, role="assistant", content=str(output or ""), client_message_id=assistant_key, sender_type="agent", sender_id=str(run.agent_id), message_metadata={"cli_development": True, "run_id": str(rid)}, created_at=self._clock(), updated_at=self._clock(), is_active_branch=True, branch_index=0)
+                    message_metadata = {
+                        "cli_development": True,
+                        "run_id": str(rid),
+                    }
+                    if remote:
+                        # Provider identity is useful for replay correlation;
+                        # credentials and managed role text never enter this
+                        # metadata.
+                        message_metadata.update(
+                            {
+                                "execution_target": MUSE_EXECUTION_TARGET,
+                                "provider_message_id": provider_message_id,
+                            }
+                        )
+                    message = ConversationMessage(id=uuid.uuid4(), session_id=sid, role="assistant", content=(output_content if remote else str(output or "")), client_message_id=assistant_key, sender_type="agent", sender_id=str(run.agent_id), message_metadata=message_metadata, created_at=self._clock(), updated_at=self._clock(), is_active_branch=True, branch_index=0)
                     db.add(message)
                     row.message_count = int(row.message_count or 0) + 1
                 # New messages are still pending when autoflush is disabled.
                 # Use this exact message for both persistence and output ranges.
                 output_content = str(message.content or "")
                 output_message_id = str(message.id)
-                run.result = {"assistant_message_id": output_message_id}
+                run.result = {
+                    "assistant_message_id": output_message_id,
+                    **(
+                        {"provider_assistant_message_id": provider_message_id}
+                        if remote and provider_message_id
+                        else {}
+                    ),
+                }
                 run.validation = {"provider_output_persisted": True}
-                work.result_summary = "CLI session turn completed"
+                work.result_summary = (
+                    "Muse remote turn completed"
+                    if remote
+                    else "CLI session turn completed"
+                )
                 target_status = "completed"
             elif normalized == "awaiting_approval":
                 target_status = "waiting_approval"
@@ -1676,7 +2821,17 @@ class CLIDevelopmentSessionService:
                 for chunk_index in range(chunk_count):
                     start = chunk_index * chunk_size
                     end = min(len(output_content), start + chunk_size)
-                    db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type="cli.output", status="completed", message=None, payload={"assistant_message_id": output_message_id, "chunk_index": chunk_index, "chunk_count": chunk_count, "start": start, "end": end, "cli_session_sequence": feed_sequences[output_sequence_index]}, created_at=self._clock()))
+                    chunk_payload = {
+                        "assistant_message_id": output_message_id,
+                        "chunk_index": chunk_index,
+                        "chunk_count": chunk_count,
+                        "start": start,
+                        "end": end,
+                        "cli_session_sequence": feed_sequences[output_sequence_index],
+                    }
+                    if remote and provider_message_id:
+                        chunk_payload["provider_assistant_message_id"] = provider_message_id
+                    db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type="cli.output", status="completed", message=None, payload=chunk_payload, created_at=self._clock()))
                     next_sequence += 1
                     output_sequence_index += 1
             tail_payload = {
@@ -1684,11 +2839,26 @@ class CLIDevelopmentSessionService:
                 "error_code": str(error_code or "")[:96],
                 "cli_session_sequence": feed_sequences[-1],
             }
+            if remote and provider_message_id:
+                tail_payload["provider_assistant_message_id"] = provider_message_id
             if error_message:
                 tail_payload["error_message"] = str(error_message)[:1024]
             db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type=f"cli.{target_status}", status=target_status, message=str(error_message)[:1024] if error_message else None, payload=tail_payload, created_at=self._clock()))
             await db.commit()
-            receipt_dict: dict[str, Any] = {"status": target_status, "run_id": str(rid), "work_item_id": str(wid), "assistant_message_id": (run.result or {}).get("assistant_message_id") if isinstance(run.result, Mapping) else None}
+            receipt_dict: dict[str, Any] = {
+                "status": target_status,
+                "run_id": str(rid),
+                "work_item_id": str(wid),
+                "assistant_message_id": (
+                    (run.result or {}).get("assistant_message_id")
+                    if isinstance(run.result, Mapping)
+                    else None
+                ),
+            }
+            if remote and isinstance(run.result, Mapping):
+                receipt_dict["provider_assistant_message_id"] = run.result.get(
+                    "provider_assistant_message_id"
+                )
             if error_message:
                 receipt_dict["error_message"] = str(error_message)[:1024]
             return receipt_dict
@@ -1715,7 +2885,10 @@ class CLIDevelopmentSessionService:
             work = await db.get(AgentWorkItem, run.work_item_id) if run.work_item_id else None
             if work is None:
                 raise CLIDevelopmentSessionConflict("CLI Work binding is missing", code="work_binding_missing")
-            if str(run.run_type or "") != CLI_SESSION_SOURCE_TYPE or str(work.source_type or "") != CLI_SESSION_SOURCE_TYPE or str(work.execution_adapter or "") != CLI_SESSION_ADAPTER_KEY:
+            remote = self._is_remote_context(self._context(row))
+            expected_source = REMOTE_SESSION_SOURCE_TYPE if remote else CLI_SESSION_SOURCE_TYPE
+            expected_adapter = MUSE_REMOTE_ADAPTER_KEY if remote else CLI_SESSION_ADAPTER_KEY
+            if str(run.run_type or "") != expected_source or str(work.source_type or "") != expected_source or str(work.execution_adapter or "") != expected_adapter:
                 raise CLIDevelopmentSessionConflict("CLI Work binding is missing", code="work_binding_missing")
             current_status = self._status_from_rows(self._context(row), run, work)
             if current_status in CLI_DEVELOPMENT_TERMINAL_STATUSES or str(work.state or "") in {"succeeded", "failed", "cancelled", "dead_letter", "uncertain"}:
@@ -1732,15 +2905,53 @@ class CLIDevelopmentSessionService:
             except Exception:
                 pass
             accepted = bool(result)
-            if accepted and str(run.status or "") == "queued":
+            if accepted and remote:
+                # The shared coordinator owns the durable Work cancellation;
+                # the provider adapter only receives a local stop signal and
+                # must never claim that the remote side was cancelled.
+                try:
+                    remote_adapter = self._get_remote_adapter()
+                    cancel_remote = getattr(remote_adapter, "cancel", None)
+                    if callable(cancel_remote):
+                        value = cancel_remote(str(work.id))
+                        if inspect.isawaitable(value):
+                            await value
+                except Exception:
+                    pass
+            if accepted and (remote or str(run.status or "") == "queued"):
                 try:
                     from .agent_run_service import AgentRunService
 
                     await AgentRunService(self._db_manager, config=self.config).cancel_run(rid, message=reason)
                 except Exception:
                     pass
+            if accepted and remote:
+                try:
+                    await self.record_runtime_event(
+                        run_id=rid,
+                        work_item_id=str(work.id),
+                        event_type="cli.cancelled",
+                        status="cancelled",
+                        payload={"reason": str(reason or "cancelled")[:96]},
+                    )
+                except Exception:
+                    pass
             fresh = await self.get_session(sid, owner_id=owner)
-            return {"accepted": accepted, "session_id": sid, "run_id": rid, "work_item_id": str(work.id), "cancel_requested": accepted, "status": fresh.get("status"), "session": fresh, "result": result}
+            remote_fields = (
+                {
+                    key: fresh.get(key)
+                    for key in (
+                        "execution_target",
+                        "local_filesystem",
+                        "sandbox",
+                        "turn_status",
+                        "delivery",
+                    )
+                }
+                if remote
+                else {}
+            )
+            return {"accepted": accepted, "session_id": sid, "run_id": rid, "work_item_id": str(work.id), "cancel_requested": accepted, "status": fresh.get("status"), "session": fresh, "result": result, **remote_fields}
         finally:
             if db is not None:
                 await self._close(db)
@@ -1755,8 +2966,25 @@ class CLIDevelopmentSessionService:
             wid = uuid.UUID(str(work_item_id))
             row = (await db.execute(select(ConversationSession).where(ConversationSession.id == sid).with_for_update())).scalars().first()
             run = (await db.execute(select(AgentRun).where(AgentRun.id == rid, AgentRun.session_id == sid).with_for_update())).scalars().first()
-            work = (await db.execute(select(AgentWorkItem).where(AgentWorkItem.id == wid, AgentWorkItem.conversation_session_id == sid, AgentWorkItem.source_type == CLI_SESSION_SOURCE_TYPE, AgentWorkItem.execution_adapter == CLI_SESSION_ADAPTER_KEY).with_for_update())).scalars().first()
-            if row is None or run is None or work is None or str(work.state or "") != "cancelled":
+            work = (await db.execute(select(AgentWorkItem).where(AgentWorkItem.id == wid, AgentWorkItem.conversation_session_id == sid).with_for_update())).scalars().first()
+            expected_source = (
+                REMOTE_SESSION_SOURCE_TYPE
+                if row is not None and self._is_remote_context(self._context(row))
+                else CLI_SESSION_SOURCE_TYPE
+            )
+            expected_adapter = (
+                MUSE_REMOTE_ADAPTER_KEY
+                if expected_source == REMOTE_SESSION_SOURCE_TYPE
+                else CLI_SESSION_ADAPTER_KEY
+            )
+            if (
+                row is None
+                or run is None
+                or work is None
+                or str(work.source_type or "") != expected_source
+                or str(work.execution_adapter or "") != expected_adapter
+                or str(work.state or "") != "cancelled"
+            ):
                 await db.rollback()
                 return False
             if str(run.status or "") in {"cancelled", "failed", "succeeded"}:
@@ -1767,8 +2995,13 @@ class CLIDevelopmentSessionService:
             run.ended_at = self._clock()
             run.updated_at = self._clock()
             context = self._context(row)
+            remote = self._is_remote_context(context)
             context["status"] = "cancelled"
-            context["native_state"] = str(native_state or "cancelled")[:32]
+            if remote:
+                # A remote Muse thread has no local native-session handle.
+                context.pop("native_state", None)
+            else:
+                context["native_state"] = str(native_state or "cancelled")[:32]
             next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
             next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = context
             row.context = next_context
@@ -1776,7 +3009,21 @@ class CLIDevelopmentSessionService:
             tail = (await db.execute(select(AgentRunEvent).where(AgentRunEvent.run_id == run.id).order_by(desc(AgentRunEvent.sequence)).limit(1))).scalars().first()
             run_sequence = int(getattr(tail, "sequence", 0) or 0) + 1
             session_sequence = self._allocate_event_sequences(row, 1)[0]
-            db.add(AgentRunEvent(run_id=run.id, sequence=run_sequence, event_type="cli.cancelled", status="cancelled", message=None, payload={"reason": str(reason or "cancelled")[:96], "cli_session_sequence": session_sequence}, created_at=self._clock()))
+            event_payload = {
+                "reason": str(reason or "cancelled")[:96],
+                "cli_session_sequence": session_sequence,
+            }
+            if remote:
+                event_payload.update(
+                    {
+                        "execution_target": MUSE_EXECUTION_TARGET,
+                        "local_filesystem": False,
+                        "sandbox": "remote_uncontrolled",
+                        "turn_status": "local_stopped",
+                        "remote_cancel_status": "remote_unconfirmed",
+                    }
+                )
+            db.add(AgentRunEvent(run_id=run.id, sequence=run_sequence, event_type="cli.cancelled", status="cancelled", message=None, payload=event_payload, created_at=self._clock()))
             await db.commit()
             return True
         except Exception:
@@ -1818,11 +3065,25 @@ class CLIDevelopmentSessionService:
     def bind_coordinator(self, coordinator: Any, *, backend_factory: Any | None = None, session_store: Any | None = None) -> Any:
         """Register this service's adapter on the caller-owned coordinator."""
 
-        from .cli_session_work_adapter import register_cli_session_work
+        from .cli_session_work_adapter import (
+            register_cli_session_work,
+            register_muse_remote_session_work,
+        )
 
         self.coordinator = coordinator
         self.session_store = session_store or self.session_store
-        return register_cli_session_work(coordinator, self, backend_factory=backend_factory, session_store=self.session_store)
+        adapter = register_cli_session_work(
+            coordinator,
+            self,
+            backend_factory=backend_factory,
+            session_store=self.session_store,
+        )
+        register_muse_remote_session_work(
+            coordinator,
+            self,
+            remote_adapter=self._get_remote_adapter(),
+        )
+        return adapter
 
 __all__ = [
     "CLI_SESSION_SOURCE_TYPE",
@@ -1835,6 +3096,7 @@ __all__ = [
     "CreateCLIDevelopmentSessionRequest",
     "SendCLIDevelopmentSessionRequest",
     "EventPage",
+    "MuseRemoteTurnWorkSource",
     "CLIDevelopmentSessionError",
     "CLIDevelopmentSessionNotFound",
     "CLIDevelopmentSessionForbidden",
@@ -1844,4 +3106,6 @@ __all__ = [
     "cli_development_policy",
     "canonical_windows_cwd",
     "CLIDevelopmentSessionService",
+    "REMOTE_SESSION_SOURCE_TYPE",
+    "REMOTE_SESSION_CAPABILITIES",
 ]

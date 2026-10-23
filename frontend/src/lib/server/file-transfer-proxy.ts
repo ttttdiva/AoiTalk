@@ -67,7 +67,7 @@ class TransferRequestTimeoutError extends TransferRequestError {
 
 type TransferTarget = {
   canonicalUrl: URL;
-  kind: "upload" | "save" | "explorer-download" | "remote-download";
+  kind: "upload" | "save" | "explorer-download" | "remote-download" | "app-archive-download";
   pathParts: string[];
   method: "GET" | "POST" | "PUT";
 };
@@ -137,7 +137,7 @@ function parseTransferMeta(value: unknown): FileTransferMeta {
     };
   }
   if (operation === "download") {
-    if (!hasOnlyKeys(value, ["operation", "url", "paths", "fallbackFilename"])) {
+    if (!hasOnlyKeys(value, ["operation", "url", "paths", "fallbackFilename", "responseContract"])) {
       throw new TransferRequestError(400, "Invalid download metadata");
     }
     let paths: string[] | undefined;
@@ -147,6 +147,23 @@ function parseTransferMeta(value: unknown): FileTransferMeta {
       }
       paths = value.paths.map((path) => boundedString(path, "download path"));
     }
+    let responseContract: Extract<FileTransferMeta, { operation: "download" }>["responseContract"];
+    if (value.responseContract !== undefined) {
+      if (
+        !isRecord(value.responseContract) ||
+        !hasOnlyKeys(value.responseContract, ["expectedContentType", "requireAttachment", "rejectRedirects"]) ||
+        value.responseContract.expectedContentType !== "application/zip" ||
+        value.responseContract.requireAttachment !== true ||
+        value.responseContract.rejectRedirects !== true
+      ) {
+        throw new TransferRequestError(400, "Invalid download response contract");
+      }
+      responseContract = {
+        expectedContentType: "application/zip",
+        requireAttachment: true,
+        rejectRedirects: true,
+      };
+    }
     return {
       operation,
       url,
@@ -155,6 +172,7 @@ function parseTransferMeta(value: unknown): FileTransferMeta {
         value.fallbackFilename === undefined
           ? undefined
           : boundedStringValue(value.fallbackFilename, "fallbackFilename", 512),
+      responseContract,
     };
   }
   throw new TransferRequestError(400, "Invalid transfer operation");
@@ -362,6 +380,84 @@ function canonicalTargetUrl(origin: string, pathname: string, source: URL): URL 
   return target;
 }
 
+function validateArchiveIncludePaths(raw: string | undefined): void {
+  if (raw === undefined) return;
+  let paths: unknown;
+  try {
+    paths = JSON.parse(raw);
+  } catch {
+    throw new TransferRequestError(400, "Invalid include_paths query parameter");
+  }
+  if (!Array.isArray(paths)) {
+    throw new TransferRequestError(400, "Invalid include_paths query parameter");
+  }
+  const seen = new Set<string>();
+  for (const path of paths) {
+    if (
+      typeof path !== "string" ||
+      !path ||
+      path.length > MAX_TRANSFER_STRING_BYTES ||
+      path !== path.trim() ||
+      path.includes("\\") ||
+      path.includes("\u0000") ||
+      path.startsWith("/") ||
+      /^[a-z]:/i.test(path)
+    ) {
+      throw new TransferRequestError(400, "Invalid include_paths query parameter");
+    }
+    const parts = path.split("/");
+    if (parts.some((part) => !part || part === "." || part === "..")) {
+      throw new TransferRequestError(400, "Invalid include_paths query parameter");
+    }
+    const key = path.toLocaleLowerCase("en-US");
+    if (seen.has(key)) {
+      throw new TransferRequestError(400, "Duplicate include_paths entry");
+    }
+    seen.add(key);
+  }
+}
+
+function validateArchiveQueryShape(metaUrl: string, parsed: URL): void {
+  const allowed = new Set([
+    "project_id",
+    "include_paths",
+    "latest_commit_only",
+    "exclude_git",
+    "exclude_dependencies",
+    "exclude_runtime",
+    "exclude_credentials",
+  ]);
+  const question = metaUrl.indexOf("?");
+  if (question >= 0) {
+    const rawQuery = metaUrl.slice(question + 1);
+    if (!rawQuery) throw new TransferRequestError(400, "Invalid archive query");
+    for (const pair of rawQuery.split("&")) {
+      const rawKey = pair.split("=", 1)[0];
+      if (!rawKey || !allowed.has(rawKey)) {
+        throw new TransferRequestError(403, "Transfer target query is not allowed");
+      }
+    }
+  }
+  rejectUnknownQuery(parsed, Array.from(allowed));
+  const projectId = singleQueryValue(parsed, "project_id", false);
+  if (projectId !== undefined && !UUID_PATTERN.test(projectId)) {
+    throw new TransferRequestError(400, "Invalid project_id");
+  }
+  validateArchiveIncludePaths(singleQueryValue(parsed, "include_paths", false));
+  for (const name of [
+    "latest_commit_only",
+    "exclude_git",
+    "exclude_dependencies",
+    "exclude_runtime",
+    "exclude_credentials",
+  ]) {
+    const value = singleQueryValue(parsed, name, false);
+    if (value !== undefined && value !== "true" && value !== "false") {
+      throw new TransferRequestError(400, `Invalid ${name} query parameter`);
+    }
+  }
+}
+
 function parseTransferTarget(
   meta: FileTransferMeta,
   request: NextRequest,
@@ -379,17 +475,23 @@ function parseTransferTarget(
     parsed.origin !== request.nextUrl.origin ||
     parsed.username ||
     parsed.password ||
-    parsed.hash
+    parsed.hash ||
+    meta.url.includes("#")
   ) {
     throw new TransferRequestError(403, "Transfer target origin is not allowed");
   }
 
-  let pathname: string;
-  try {
-    pathname = decodeURIComponent(parsed.pathname);
-  } catch {
+  const queryIndex = meta.url.indexOf("?");
+  const rawPathname = queryIndex >= 0 ? meta.url.slice(0, queryIndex) : meta.url;
+  // Every allowlisted path is ASCII and fixed-shape. Reject encoded separators,
+  // dot segments, backslashes, and URL-parser normalization before matching it.
+  if (rawPathname.includes("%") || rawPathname.includes("\\") || rawPathname !== parsed.pathname) {
     throw new TransferRequestError(403, "Transfer target path is not allowed");
   }
+  if (rawPathname.startsWith("/api/python-proxy/api/apps/")) {
+    throw new TransferRequestError(403, "App archive target is not allowed");
+  }
+  let pathname = parsed.pathname;
   // A few callers build the same route through a helper that already carries
   // the `/api` prefix. Normalize that one harmless duplicate only; all other
   // paths remain subject to the exact allowlist below.
@@ -404,6 +506,11 @@ function parseTransferTarget(
   const explorerUpload = pathname === `${prefix}explorer/upload`;
   const explorerSave = pathname === `${prefix}explorer/save`;
   const explorerDownload = pathname === `${prefix}explorer/download`;
+  const appArchiveMatch = pathname.match(
+    new RegExp(`^${prefix}apps/([0-9a-f-]{36})/files/archive$`, "i"),
+  );
+  const appArchiveDownload =
+    appArchiveMatch !== null && UUID_PATTERN.test(appArchiveMatch[1]);
   const projectUploadMatch = pathname.match(
     new RegExp(`^${prefix}projects/([0-9a-f-]{36})/files/upload$`, "i"),
   );
@@ -443,6 +550,9 @@ function parseTransferTarget(
   }
 
   if (meta.operation === "download" && explorerDownload) {
+    if (meta.responseContract !== undefined) {
+      throw new TransferRequestError(400, "Response contract is not allowed for this target");
+    }
     const method = meta.paths === undefined ? "GET" : "POST";
     if (method === "GET") {
       rejectUnknownQuery(parsed, ["path"]);
@@ -460,6 +570,9 @@ function parseTransferTarget(
   }
 
   if (meta.operation === "download" && remoteDownloadMatch) {
+    if (meta.responseContract !== undefined) {
+      throw new TransferRequestError(400, "Response contract is not allowed for this target");
+    }
     const profileId = remoteDownloadMatch[1];
     if (!SAFE_PROFILE_ID_PATTERN.test(profileId)) {
       throw new TransferRequestError(403, "Remote profile is not allowed");
@@ -478,6 +591,22 @@ function parseTransferTarget(
       kind: "remote-download",
       pathParts: pathname.slice(prefix.length).split("/"),
       method: meta.paths === undefined ? "GET" : "POST",
+    };
+  }
+
+  if (meta.operation === "download" && appArchiveMatch) {
+    if (!appArchiveDownload) {
+      throw new TransferRequestError(403, "App archive target is not allowed");
+    }
+    if (meta.paths !== undefined || !meta.responseContract) {
+      throw new TransferRequestError(400, "Invalid App archive transfer contract");
+    }
+    validateArchiveQueryShape(meta.url, parsed);
+    return {
+      canonicalUrl: canonicalTargetUrl(request.nextUrl.origin, pathname, parsed),
+      kind: "app-archive-download",
+      pathParts: pathname.slice(prefix.length).split("/"),
+      method: "GET",
     };
   }
 
@@ -622,6 +751,15 @@ async function executeTransferTarget(
   if (target.kind === "explorer-download") {
     return proxyExplorerDownload(synthetic, authorityUser);
   }
+  if (target.kind === "app-archive-download") {
+    return proxyRequestToPythonApi(synthetic, {
+      path: target.pathParts,
+      user: authorityUser,
+      forwardHeaders: transferForwardHeaders(),
+      downstreamResponseLifetime: true,
+      rejectRedirects: true,
+    });
+  }
   return proxyRequestToPythonApi(synthetic, {
     path: target.pathParts,
     user: authorityUser,
@@ -670,8 +808,12 @@ function ndjsonLine(value: unknown): Uint8Array {
 function streamDownloadResponse(
   response: NextResponse,
   fallbackFilename: string | undefined,
+  attachment: boolean,
 ): NextResponse {
-  const metadata = downloadMetadata(response, fallbackFilename);
+  const baseMetadata = downloadMetadata(response, fallbackFilename);
+  const metadata: FileTransferDownloadMetadata = attachment
+    ? { ...baseMetadata, attachment: true }
+    : baseMetadata;
   const reader = response.body?.getReader();
   let metadataSent = false;
   let sourceDone = reader === undefined;
@@ -710,6 +852,7 @@ function streamDownloadResponse(
           const chunk = sourceChunk.subarray(sourceOffset, end);
           sourceOffset = end;
           total += chunk.byteLength;
+          if (!Number.isSafeInteger(total)) throw new Error("download is too large");
           controller.enqueue(
             ndjsonLine({ type: "chunk", data: encodeTransferBase64(chunk) }),
           );
@@ -739,6 +882,7 @@ function streamDownloadResponse(
             const chunk = sourceChunk.subarray(0, end);
             sourceOffset = end;
             total += chunk.byteLength;
+            if (!Number.isSafeInteger(total)) throw new Error("download is too large");
             controller.enqueue(
               ndjsonLine({ type: "chunk", data: encodeTransferBase64(chunk) }),
             );
@@ -782,6 +926,46 @@ function streamDownloadResponse(
       "content-type": "application/x-ndjson",
     },
   });
+}
+
+async function cancelDownloadBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The contract error remains the relevant result if cancellation races.
+  }
+}
+
+async function enforceAppArchiveResponseContract(
+  response: NextResponse,
+): Promise<void> {
+  if (response.status >= 300 && response.status < 400) {
+    await cancelDownloadBody(response);
+    throw new TransferRequestError(
+      502,
+      "ダウンロード先が転送されました。ログイン状態を確認して再試行してください",
+    );
+  }
+  if (!response.ok) return;
+  const contentType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== "application/zip") {
+    await cancelDownloadBody(response);
+    throw new TransferRequestError(
+      502,
+      "ZIPを取得できませんでした。ログイン状態を確認して再試行してください",
+    );
+  }
+  if (!/^\s*attachment(?:\s*;|\s*$)/i.test(response.headers.get("content-disposition") || "")) {
+    await cancelDownloadBody(response);
+    throw new TransferRequestError(
+      502,
+      "ダウンロード応答を確認できませんでした。ログイン状態を確認して再試行してください",
+    );
+  }
 }
 
 async function readBoundedResponseBody(
@@ -902,11 +1086,21 @@ export async function proxyFileTransfer(
       }
 
       const upstream = await executeTransferTarget(request, target, meta, data, user);
+      if (target.kind === "app-archive-download") {
+        await enforceAppArchiveResponseContract(upstream);
+        if (!upstream.ok) return preserveUpstreamError(upstream);
+        return streamDownloadResponse(
+          upstream,
+          meta.operation === "download" ? meta.fallbackFilename : undefined,
+          true,
+        );
+      }
       if (target.kind === "explorer-download" || target.kind === "remote-download") {
         if (!upstream.ok) return preserveUpstreamError(upstream);
         return streamDownloadResponse(
           upstream,
           meta.operation === "download" ? meta.fallbackFilename : undefined,
+          false,
         );
       }
       return upstream;

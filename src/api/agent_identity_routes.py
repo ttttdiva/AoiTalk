@@ -115,6 +115,48 @@ class AgentThumbnailResponse(BaseModel):
     artifact_id: UUID | None
 
 
+class AgentRuntimeProfileDiagnostic(BaseModel):
+    profile_id: str
+    reason: str
+
+
+class AgentRuntimeExecutionProfile(BaseModel):
+    profile_id: str
+    name: str
+    is_default: bool
+    acting_subagent_id: str
+    provider: str
+    model: str | None = None
+    effort: str | None = None
+    ingress: Literal["api", "cli_session", "remote_agent"]
+    available: bool = Field(
+        description="Whether this explicit ingress is eligible for the supplied caller context; live provider delivery is separate"
+    )
+    availability_category: Literal[
+        "available",
+        "context_required",
+        "policy_denied",
+        "provider_unavailable",
+        "ingress_unavailable",
+    ]
+    availability_reason: str | None = None
+    provider_readiness: Literal["unknown", "ready", "unavailable", "not_applicable"]
+    provider_readiness_reason: str | None = None
+
+
+class AgentRuntimeProfileCatalogResponse(BaseModel):
+    agent_id: UUID
+    agent_revision_id: UUID
+    agent_team_id: str
+    acting_role: Literal["operator"]
+    default_execution_profile_id: str
+    context_source: Literal["agent_revision", "session_binding"]
+    session_id: UUID | None = None
+    binding_id: UUID | None = None
+    profiles: list[AgentRuntimeExecutionProfile]
+    diagnostics: list[AgentRuntimeProfileDiagnostic]
+
+
 class CreateRevisionRequest(_CommandModel):
     display_name: str = Field(min_length=1, max_length=160)
     mission: str = Field(default="", max_length=10_000)
@@ -337,6 +379,18 @@ def create_agent_identity_router(
             raise HTTPException(status_code=401, detail="Not authenticated")
         return actor_id
 
+    async def human_actor(request: Request) -> tuple[Any, str]:
+        user = await current_user(request)
+        actor_kind = _user_field(user, "actor_type") or _user_field(user, "principal_kind")
+        if bool(_user_field(user, "is_agent", False)):
+            raise HTTPException(status_code=403, detail="ordinary human authorization required")
+        if actor_kind and str(actor_kind).strip().casefold() != "human":
+            raise HTTPException(status_code=403, detail="ordinary human authorization required")
+        actor_id = _user_field(user, "id") or _user_field(user, "user_id")
+        if actor_id in (None, ""):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return actor_id, str(_user_field(user, "role", "user") or "user")
+
     def company_enabled() -> None:
         try:
             flag = getattr(Features, "virtual_company", None)
@@ -416,6 +470,35 @@ def create_agent_identity_router(
             raise HTTPException(status_code=404, detail="employee runtime is disabled")
         actor_id = await admin_actor(request)
         return await _invoke(identity.employee_catalog, actor_user_id=actor_id)
+
+    @router.get(
+        "/agents/{agent_id}/execution-profiles",
+        response_model=AgentRuntimeProfileCatalogResponse,
+    )
+    async def get_agent_runtime_execution_profiles(
+        agent_id: UUID,
+        request: Request,
+        agent_revision_id: UUID | None = Query(default=None),
+        session_id: UUID | None = Query(default=None),
+        project_id: UUID | None = Query(default=None),
+        working_directory: str | None = Query(default=None, max_length=1024),
+        _: Any = Depends(require_auth_dependency),
+    ) -> AgentRuntimeProfileCatalogResponse:
+        company_enabled()
+        if not Features.autonomous_agent_runtime():
+            raise HTTPException(status_code=404, detail="employee runtime is disabled")
+        actor_id, actor_role = await human_actor(request)
+        result = await _invoke(
+            identity.runtime_execution_profile_catalog,
+            agent_id=agent_id,
+            actor_user_id=actor_id,
+            actor_role=actor_role,
+            agent_revision_id=agent_revision_id,
+            session_id=session_id,
+            project_id=project_id,
+            working_directory=working_directory,
+        )
+        return AgentRuntimeProfileCatalogResponse.model_validate(result)
 
     @router.get("/agents/{agent_id}")
     async def get_agent(agent_id: str, request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:

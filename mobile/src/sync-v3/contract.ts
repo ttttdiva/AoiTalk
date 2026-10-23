@@ -61,6 +61,7 @@ export type ConflictRecord = {
   kind: ConflictKind; local: Record<string, unknown>; base: Record<string, unknown> | null;
   server: Record<string, unknown> | null; fields: string[]; source_op_id: string | null;
   title_hint: string | null; created_at: number; state: 'open' | 'reapplied' | 'dismissed';
+  can_reapply?: boolean;
 };
 export interface ConflictStore {
   listOpen(authScope: string): Promise<ConflictRecord[]>;
@@ -86,12 +87,26 @@ export type SyncV3Status = {
   queue: { queued: number; backoff: number; sent: number };
   openConflicts: number; legacy: LegacyMigrationStatus;
   disabledReason: string | null; overall: SyncV3Overall;
+  cursor?: string | null;
+  scopeSetRevision?: string | null;
+  scopes?: Array<{ scopeKey: string; kind: string | null; bootstrap: boolean }>;
+  lastSuccessAt?: number | null;
+  entityCounts?: Record<string, number>;
+  sweepError?: string | null;
+  recentRequests?: SyncV3RequestDiagnostic[];
+  writeUnits?: { count: number; p95Ms: number | null; maxMs: number | null; samples: number };
+};
+export type SyncV3RequestOutcome = 'not_sent' | 'no_response' | 'http_error' | 'write_failed' | 'ok';
+export type SyncV3RequestDiagnostic = {
+  requestId: string; lane: 'push' | 'changes' | 'bootstrap' | 'scopes' | 'capabilities';
+  outcome: SyncV3RequestOutcome; status: number | null; occurredAt: number; durationMs: number; errorCode: string | null;
 };
 export type SyncTrigger = 'interval' | 'foreground' | 'mutation' | 'manual' | 'auth';
 export interface SyncV3EngineControl {
   start(authScope: string): void;
   stop(): Promise<void>;
   requestSync(reason: SyncTrigger): void;
+  safeStop(): Promise<void>;
   requestRebootstrap(scopeKey: string): Promise<void>;
   /** 画面に表示した captureSha256 と一致した場合だけ、旧outboxの移行を実行する。 */
   confirmLegacyMigration(captureSha256: string): Promise<void>;

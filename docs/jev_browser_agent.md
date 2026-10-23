@@ -1,6 +1,6 @@
 # PC BridgeのBrowser AgentとJev判断
 
-一般Browser Agentは [ポータブルPC Bridge](pc_bridge.md) で選択したPCの既存Edgeを操作する。サーバーPC固定のローカルPythonホスト方式は廃止した。
+一般Browser Agentは ポータブルPC Bridge で選択したPCの既存Edgeを操作する。サーバーPC固定のローカルPythonホスト方式は廃止した。
 
 `browser_agent(goal, start_url?, tab_id?, device_id?, completion_text?, completion_url?)` は、接続中PCをユーザー設定から解決し、Bridge同梱のextension不要な `agent_browser` helperで明示選択した既存Edge targetへDOM観測と操作を送る。`start_url` は選択target上のnavigationであり、別tabを暗黙に作らない。Cookieや保存パスワードをコピーせず、普段のログイン済みセッションを使う。選択PCまたはtargetが利用できなければ停止し、別ブラウザやサーバーPCへfallbackしない。
 
@@ -22,7 +22,7 @@ OFF時は新規tool登録・schema・promptから専用操作を除き、保持�
 
 `resume_run_id` は同じ専用tab／contextを保持したサーバー側service再作成からの再開に対応する。Bridgeのprocess再起動でcontextが変わった場合は、保存タスクを保持したまま停止する。新しいcontextでの作業復元、実Studio、実Jevの速度比較、今回の正式frozen配布は未検証である。隔離された合成画面の実DOM検証を、本番のログイン済みブラウザの成功として報告しない。
 
-インストール、通信、操作先選択、exeのビルド、検証結果・未検証範囲は [PC Bridgeガイド](pc_bridge.md) を正本とする。
+インストール、通信、操作先選択、exeのビルド、検証結果・未検証範囲は PC Bridgeガイド を正本とする。
 
 ## 2026-09-23: 対象選択と実行結果の強化
 

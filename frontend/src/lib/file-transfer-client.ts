@@ -30,6 +30,7 @@ export type FileTransferDownloadResult = {
   blob: Blob;
   filename: string;
   mimeType: string;
+  cleanup?: () => Promise<void>;
 };
 
 /** Signals that the validated resource is outside the in-memory compatibility
@@ -95,6 +96,30 @@ function responseErrorMessage(status: number, text: string): string {
   return normalized.length > 500 ? `${normalized.slice(0, 499)}…` : normalized;
 }
 
+function createDownloadAbortError(): DOMException {
+  return new DOMException("The download was aborted", "AbortError");
+}
+
+function throwIfDownloadAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw createDownloadAbortError();
+}
+
+function isRedirectResponse(response: Response): boolean {
+  return (
+    response.redirected ||
+    response.type === "opaqueredirect" ||
+    (response.status >= 300 && response.status < 400)
+  );
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The response validation error remains the relevant result.
+  }
+}
+
 /**
  * Post one compatibility envelope.  The endpoint is the only URL that is
  * base-path-adjusted; URLs inside metadata remain the canonical server paths
@@ -115,6 +140,10 @@ export async function postFileTransfer(
   };
   if (data !== undefined) body.data = encodeTransferBase64(data);
 
+  const rejectRedirects =
+    meta.operation === "download" &&
+    meta.responseContract?.rejectRedirects === true;
+
   return fetch(withBasePath(FILE_TRANSFER_ENDPOINT), {
     method: "POST",
     credentials: "include",
@@ -122,6 +151,7 @@ export async function postFileTransfer(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal: options.signal,
+    ...(rejectRedirects ? { redirect: "manual" as const } : {}),
   });
 }
 
@@ -155,6 +185,7 @@ function assertDownloadMetadata(value: unknown): ClientDownloadMetadata {
   }
   const metadata = value as Partial<ClientDownloadMetadata>;
   if (
+    Object.keys(value).some((key) => !["filename", "mimeType", "size", "attachment"].includes(key)) ||
     typeof metadata.filename !== "string" ||
     !metadata.filename.trim() ||
     typeof metadata.mimeType !== "string"
@@ -169,10 +200,14 @@ function assertDownloadMetadata(value: unknown): ClientDownloadMetadata {
   ) {
     throw new Error("invalid download metadata");
   }
+  if (metadata.attachment !== undefined && metadata.attachment !== true) {
+    throw new Error("invalid download metadata");
+  }
   return {
     filename: metadata.filename,
     mimeType: metadata.mimeType,
     ...(metadata.size !== undefined ? { size: metadata.size } : {}),
+    ...(metadata.attachment === true ? { attachment: true as const } : {}),
   };
 }
 
@@ -187,15 +222,102 @@ function assertDownloadEndSize(value: unknown, total: number): void {
   }
 }
 
-function parseDownloadLine(
+type DiskBackedDownloadSink = {
+  write(bytes: Uint8Array): Promise<void>;
+  close(): Promise<File>;
+  cleanup(): Promise<void>;
+};
+
+type DownloadParseState = {
+  metadata?: ClientDownloadMetadata;
+  parts: ArrayBuffer[];
+  total: number;
+  ended: boolean;
+  sink?: DiskBackedDownloadSink;
+  cleanup?: () => Promise<void>;
+};
+
+async function createDiskBackedDownloadSink(): Promise<DiskBackedDownloadSink> {
+  if (typeof navigator === "undefined" || !navigator.storage) {
+    throw new Error("このブラウザでは大容量ファイルの互換ダウンロードを利用できません");
+  }
+  const storage = navigator.storage as StorageManager & {
+    getDirectory?: () => Promise<FileSystemDirectoryHandle>;
+  };
+  if (typeof storage.getDirectory !== "function") {
+    throw new Error("このブラウザでは大容量ファイルの互換ダウンロードを利用できません");
+  }
+  const root = await storage.getDirectory();
+  const directory = await root.getDirectoryHandle("aoitalk-file-transfer", { create: true });
+  const id =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const name = `download-${id}.tmp`;
+  const handle = await directory.getFileHandle(name, { create: true });
+  let writable: FileSystemWritableFileStream;
+  try {
+    writable = await handle.createWritable();
+  } catch (error) {
+    await directory.removeEntry(name).catch(() => undefined);
+    throw error;
+  }
+  let closed = false;
+  let removed = false;
+  const cleanup = async () => {
+    if (removed) return;
+    removed = true;
+    if (!closed) {
+      try {
+        await writable.abort();
+      } catch {
+        // Removing the entry below is the final cleanup attempt.
+      }
+    }
+    try {
+      await directory.removeEntry(name);
+    } catch {
+      // A committed file may already have been evicted with the origin quota.
+    }
+  };
+  return {
+    async write(bytes) {
+      const exact = bytes.slice().buffer as ArrayBuffer;
+      await writable.write(exact);
+    },
+    async close() {
+      await writable.close();
+      closed = true;
+      return handle.getFile();
+    },
+    cleanup,
+  };
+}
+
+async function ensureDiskBackedSink(state: DownloadParseState): Promise<void> {
+  if (state.sink) return;
+  const sink = await createDiskBackedDownloadSink();
+  state.sink = sink;
+  state.cleanup = sink.cleanup;
+  try {
+    for (const part of state.parts) {
+      await sink.write(new Uint8Array(part));
+    }
+    state.parts = [];
+  } catch (error) {
+    await sink.cleanup();
+    state.sink = undefined;
+    state.cleanup = undefined;
+    throw error;
+  }
+}
+
+async function parseDownloadLine(
   line: string,
-  state: {
-    metadata?: ClientDownloadMetadata;
-    parts: BlobPart[];
-    total: number;
-    ended: boolean;
-  },
-): void {
+  state: DownloadParseState,
+  allowDiskBackedLargeFile: boolean,
+  responseContract: Extract<FileTransferMeta, { operation: "download" }>["responseContract"],
+): Promise<void> {
   if (!line.trim()) return;
   let value: unknown;
   try {
@@ -213,6 +335,21 @@ function parseDownloadLine(
     size?: unknown;
     message?: unknown;
   };
+  const allowedKeysByType: Record<string, readonly string[]> = {
+    meta: ["type", "value"],
+    chunk: ["type", "data"],
+    end: ["type", "size"],
+    error: ["type", "message"],
+  };
+  const allowedKeys = typeof entry.type === "string"
+    ? allowedKeysByType[entry.type]
+    : undefined;
+  if (
+    !allowedKeys ||
+    Object.keys(value).some((key) => !allowedKeys.includes(key))
+  ) {
+    throw new Error("invalid download response");
+  }
   if (state.ended) throw new Error("download response has trailing data");
 
   if (entry.type === "meta") {
@@ -225,10 +362,19 @@ function parseDownloadLine(
       ),
     );
     if (
+      responseContract &&
+      (state.metadata.mimeType.split(";", 1)[0].trim().toLowerCase() !==
+        responseContract.expectedContentType ||
+        state.metadata.attachment !== true)
+    ) {
+      throw new Error("download response does not meet the required contract");
+    }
+    if (
       state.metadata.size !== undefined &&
       state.metadata.size > MAX_COMPAT_DOWNLOAD_FILE_BYTES
     ) {
-      throw new FileTransferNativeRequiredError();
+      if (!allowDiskBackedLargeFile) throw new FileTransferNativeRequiredError();
+      await ensureDiskBackedSink(state);
     }
     return;
   }
@@ -240,12 +386,23 @@ function parseDownloadLine(
     if (bytes.byteLength > MAX_COMPAT_DOWNLOAD_CHUNK_BYTES) {
       throw new Error("download chunk exceeds limit");
     }
-    if (state.total + bytes.byteLength > MAX_COMPAT_DOWNLOAD_FILE_BYTES) {
-      throw new FileTransferNativeRequiredError();
+    if (
+      state.metadata.size !== undefined &&
+      state.total + bytes.byteLength > state.metadata.size
+    ) {
+      throw new Error("download size mismatch");
     }
-    const blobBytes = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(blobBytes).set(bytes);
-    state.parts.push(blobBytes);
+    if (state.total + bytes.byteLength > MAX_COMPAT_DOWNLOAD_FILE_BYTES) {
+      if (!allowDiskBackedLargeFile) throw new FileTransferNativeRequiredError();
+      await ensureDiskBackedSink(state);
+    }
+    if (state.sink) {
+      await state.sink.write(bytes);
+    } else {
+      const blobBytes = new ArrayBuffer(bytes.byteLength);
+      new Uint8Array(blobBytes).set(bytes);
+      state.parts.push(blobBytes);
+    }
     state.total += bytes.byteLength;
     if (!Number.isSafeInteger(state.total)) throw new Error("download is too large");
     return;
@@ -254,6 +411,9 @@ function parseDownloadLine(
   if (entry.type === "end") {
     if (!state.metadata) throw new Error("download metadata is missing");
     assertDownloadEndSize(entry.size, state.total);
+    if (state.metadata.size !== undefined && state.metadata.size !== state.total) {
+      throw new Error("download size mismatch");
+    }
     state.ended = true;
     return;
   }
@@ -280,24 +440,44 @@ export async function downloadFileTransfer(
   meta: Extract<FileTransferMeta, { operation: "download" }>,
   options: FileTransferRequestOptions = {},
 ): Promise<FileTransferDownloadResult> {
+  throwIfDownloadAborted(options.signal);
   const response = await postFileTransfer(meta, undefined, options);
+  if (options.signal?.aborted) {
+    await cancelResponseBody(response);
+    throw createDownloadAbortError();
+  }
+  if (meta.responseContract?.rejectRedirects && isRedirectResponse(response)) {
+    await cancelResponseBody(response);
+    throw new Error("ダウンロード先が転送されました。ログイン状態を確認して再試行してください");
+  }
   if (!response.ok) throw await responseError(response);
+  if (
+    response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() !==
+    "application/x-ndjson"
+  ) {
+    await cancelResponseBody(response);
+    throw new Error("invalid download response type");
+  }
   if (!response.body) throw new Error("download response has no body");
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const state: {
     metadata?: ClientDownloadMetadata;
-    parts: BlobPart[];
+    parts: ArrayBuffer[];
     total: number;
     ended: boolean;
+    sink?: DiskBackedDownloadSink;
+    cleanup?: () => Promise<void>;
   } = { parts: [], total: 0, ended: false };
   let pending = "";
 
   try {
+    throwIfDownloadAborted(options.signal);
     while (true) {
       const result = await reader.read();
       if (result.done) break;
+      throwIfDownloadAborted(options.signal);
       pending += decoder.decode(result.value, { stream: true });
       let newline = pending.indexOf("\n");
       while (newline >= 0) {
@@ -306,21 +486,43 @@ export async function downloadFileTransfer(
           throw new Error("download response line exceeds limit");
         }
         pending = pending.slice(newline + 1);
-        parseDownloadLine(line, state);
+        await parseDownloadLine(line, state, meta.responseContract !== undefined, meta.responseContract);
+        throwIfDownloadAborted(options.signal);
         newline = pending.indexOf("\n");
       }
       if (pending.length > MAX_DOWNLOAD_LINE_CHARS) {
         throw new Error("download response line exceeds limit");
       }
     }
+    throwIfDownloadAborted(options.signal);
     pending += decoder.decode();
     if (pending.length > MAX_DOWNLOAD_LINE_CHARS) {
       throw new Error("download response line exceeds limit");
     }
-    if (pending) parseDownloadLine(pending.replace(/\r$/u, ""), state);
+    if (pending) {
+      await parseDownloadLine(
+        pending.replace(/\r$/u, ""),
+        state,
+        meta.responseContract !== undefined,
+        meta.responseContract,
+      );
+    }
+    throwIfDownloadAborted(options.signal);
     if (!state.metadata) throw new Error("download metadata is missing");
     if (!state.ended) throw new Error("download stream ended unexpectedly");
 
+    if (state.sink) {
+      const file = await state.sink.close();
+      throwIfDownloadAborted(options.signal);
+      return {
+        blob: file,
+        filename: state.metadata.filename,
+        mimeType: state.metadata.mimeType,
+        cleanup: state.cleanup,
+      };
+    }
+
+    throwIfDownloadAborted(options.signal);
     return {
       blob: new Blob(state.parts, { type: state.metadata.mimeType }),
       filename: state.metadata.filename,
@@ -332,6 +534,7 @@ export async function downloadFileTransfer(
     } catch {
       // The original parse/network error is more useful to the caller.
     }
+    await state.cleanup?.();
     throw error;
   } finally {
     reader.releaseLock();
@@ -341,6 +544,7 @@ export async function downloadFileTransfer(
 type BlobDownloadContext = {
   objectUrl: string;
   timer?: number;
+  cleanup?: () => Promise<void>;
 };
 
 const activeBlobDownloads = new Set<BlobDownloadContext>();
@@ -350,6 +554,7 @@ function cleanupBlobDownload(context: BlobDownloadContext): void {
   if (context.timer !== undefined) window.clearTimeout(context.timer);
   activeBlobDownloads.delete(context);
   URL.revokeObjectURL(context.objectUrl);
+  void context.cleanup?.();
   if (blobDownloadPagehideRegistered && activeBlobDownloads.size === 0) {
     blobDownloadPagehideRegistered = false;
     window.removeEventListener("pagehide", cleanupBlobDownloadsOnPageHide);
@@ -372,16 +577,23 @@ export function triggerFileTransferDownload(
   result: FileTransferDownloadResult,
 ): void {
   if (typeof URL.createObjectURL !== "function") {
+    void result.cleanup?.();
     throw new Error("browser download is unavailable");
   }
-  const objectUrl = URL.createObjectURL(result.blob);
+  let objectUrl: string;
+  try {
+    objectUrl = URL.createObjectURL(result.blob);
+  } catch (error) {
+    void result.cleanup?.();
+    throw error;
+  }
   const anchor = document.createElement("a");
   anchor.href = objectUrl;
   anchor.download = result.filename;
   anchor.hidden = true;
   anchor.setAttribute("aria-hidden", "true");
   document.body.append(anchor);
-  const context: BlobDownloadContext = { objectUrl };
+  const context: BlobDownloadContext = { objectUrl, cleanup: result.cleanup };
   retainBlobDownload(context);
   try {
     anchor.click();

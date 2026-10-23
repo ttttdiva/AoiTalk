@@ -35,6 +35,7 @@ import {
 } from "../lib/local-notifications";
 import { AoiDotsProvider } from "../features/aoidots/AoiDotsOverlay";
 import { ReadOnlyDiagnosticsBadge } from "../components/read-only-diagnostics-badge";
+import { SyncV3Lifecycle } from "../sync-v3/SyncV3Lifecycle";
 
 const theme = {
   ...MD3DarkTheme,
@@ -303,15 +304,18 @@ export default function RootLayout() {
               <AuthProvider>
                 <StatusBar style="light" />
                 {schemaState === "ready" ? (
-                  <ProjectProvider>
-                    <AoiDotsProvider>
-                      <AppSidebar>
-                        <Slot />
-                        <ReadOnlyDiagnosticsBadge />
-                      </AppSidebar>
-                      <TaskCompletionUndoStack />
-                    </AoiDotsProvider>
-                  </ProjectProvider>
+                  <>
+                    <SyncV3Lifecycle />
+                    <ProjectProvider>
+                      <AoiDotsProvider>
+                        <AppSidebar>
+                          <Slot />
+                          <ReadOnlyDiagnosticsBadge />
+                        </AppSidebar>
+                        <TaskCompletionUndoStack />
+                      </AoiDotsProvider>
+                    </ProjectProvider>
+                  </>
                 ) : (
                   <SchemaBootstrapScreen
                     status={schemaState}

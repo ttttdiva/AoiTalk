@@ -33,7 +33,10 @@ import { NumberTicker } from "@/components/magicui/number-ticker";
 import { taskApi } from "@/lib/task-api";
 import { TaskProposalList } from "@/components/tasks/task-proposal-card";
 import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
-import type { TaskProposal } from "@/lib/task-proposals-api";
+import {
+  taskProposalChatPath,
+  type TaskProposal,
+} from "@/lib/task-proposals-api";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
 import { TASK_STATUS_DOT_COLORS, TASK_STATUS_LABELS } from "@/lib/task-status";
 import { useOptionalProject } from "@/contexts/project-context";
@@ -107,7 +110,10 @@ function SummaryMetric({
   tone?: string;
 }) {
   return (
-    <div className="rounded-md border bg-muted/20 px-3 py-2">
+    <div
+      className="rounded-md border bg-muted/20 px-3 py-2"
+      data-today-metric={label}
+    >
       <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground">
         <span className={tone}>{icon}</span>
         <span>{label}</span>
@@ -118,6 +124,9 @@ function SummaryMetric({
         ) : (
           <NumberTicker
             value={value}
+            // Start from the fetched value: a count that just arrived must not
+            // flash a fabricated 0 while the ticker animates.
+            startValue={value}
             decimalPlaces={0}
             className="tabular-nums text-inherit tracking-normal"
           />
@@ -334,7 +343,7 @@ export function HomeTodayOverlay() {
   const confirmProposal = useCallback(
     (proposal: TaskProposal) => {
       setOpen(false);
-      router.push(`/chat?s=${encodeURIComponent(proposal.session_id)}`);
+      router.push(taskProposalChatPath(proposal));
     },
     [router],
   );
@@ -418,7 +427,7 @@ export function HomeTodayOverlay() {
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="flex items-center gap-2 text-sm font-semibold">
                     <Bot className="size-4 text-primary" />
-                    エージェント確認
+                    承認待ちの提案
                   </h2>
                   <Badge variant="outline">
                     {pendingProposalMetric === null

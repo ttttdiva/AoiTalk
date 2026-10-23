@@ -12,23 +12,27 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import selectinload
 
 from ..features import Features
 from ..memory.database import get_database_manager
 from ..memory.models import (
     Agent,
+    AgentExecutionBinding,
     AgentOrganizationProfile,
     AgentProjectGrant,
     AgentRevision,
     AgentSpaceAssignment,
     AgentTaskAssignment,
+    ConversationSession,
     Organization,
     Persona,
     PersonaOperatorAssignment,
@@ -908,6 +912,374 @@ class AgentIdentityService:
                           "subagents": members, "execution_profiles": profiles})
         return {"teams": teams, "capabilities": list(AGENT_TEAM_CAPABILITY_CATALOG.values()),
                 "can_manage": True, "runtime_profile": Features.profile_name()}
+
+    @staticmethod
+    def _runtime_profile_candidates(revision: Any, configured: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+        """Return stable same-Team/system profile identifiers for one Revision."""
+
+        default_id = str(getattr(revision, "execution_profile_id", "") or "").strip()
+        names = {
+            "manual": "標準モデル",
+            "free-team": "Free Team",
+        }
+        enabled_ids: list[str] = []
+        for item in configured:
+            profile_id = str(item.get("profile_id") or "").strip()
+            if not profile_id or item.get("enabled", True) is not True:
+                continue
+            names[profile_id] = str(item.get("name") or profile_id)
+            enabled_ids.append(profile_id)
+        ordered = list(dict.fromkeys([default_id, "manual", "free-team", *enabled_ids]))
+        return [
+            {"profile_id": profile_id, "name": names.get(profile_id, profile_id)}
+            for profile_id in ordered
+            if profile_id
+        ]
+
+    def _runtime_cli_availability(
+        self,
+        *,
+        owner_id: str,
+        agent_id: str,
+        provider: str,
+        working_directory: str | None,
+    ) -> dict[str, Any]:
+        """Project CLI admission without creating a session or probing a provider."""
+
+        from .cli_development_sessions import (
+            CLIDevelopmentSessionError,
+            CLIDevelopmentSessionService,
+            cli_development_policy,
+        )
+
+        service = CLIDevelopmentSessionService(self._db_manager, config=self.config)
+        policy = cli_development_policy(self.config)
+        policy_denial = None
+        if os.name != "nt" or policy.platform != "windows":
+            policy_denial = "trusted_windows_unavailable"
+        elif not policy.enabled or policy.execution_lane != "trusted_windows":
+            policy_denial = "trusted_windows_disabled"
+        elif not policy.allowed_owner_ids:
+            policy_denial = "trusted_windows_owner_policy_missing"
+        elif owner_id not in policy.allowed_owner_ids:
+            policy_denial = "trusted_windows_owner_denied"
+        elif policy.allowed_agent_ids and agent_id not in policy.allowed_agent_ids:
+            policy_denial = "trusted_windows_agent_denied"
+
+        readiness = "unknown"
+        readiness_reason = None
+        try:
+            service._resolve_permission_mode(policy, provider, None)
+            service._provider_cache_root(policy, provider)
+        except CLIDevelopmentSessionError as exc:
+            readiness = "unavailable"
+            readiness_reason = exc.code
+
+        if policy_denial is not None:
+            return {
+                "available": False,
+                "availability_category": "policy_denied",
+                "availability_reason": policy_denial,
+                "provider_readiness": readiness,
+                "provider_readiness_reason": readiness_reason,
+            }
+
+        cwd = str(working_directory or "").strip()
+        if not cwd:
+            return {
+                "available": False,
+                "availability_category": "context_required",
+                "availability_reason": "trusted_windows_context_required",
+                "provider_readiness": readiness,
+                "provider_readiness_reason": readiness_reason,
+            }
+        try:
+            service._policy_for_request(
+                owner_id=owner_id,
+                agent_id=agent_id,
+                working_directory=cwd,
+            )
+        except CLIDevelopmentSessionError as exc:
+            return {
+                "available": False,
+                "availability_category": "policy_denied",
+                "availability_reason": exc.code,
+                "provider_readiness": readiness,
+                "provider_readiness_reason": readiness_reason,
+            }
+        if readiness == "unavailable":
+            return {
+                "available": False,
+                "availability_category": "provider_unavailable",
+                "availability_reason": None,
+                "provider_readiness": readiness,
+                "provider_readiness_reason": readiness_reason,
+            }
+        return {
+            "available": True,
+            "availability_category": "available",
+            "availability_reason": None,
+            "provider_readiness": readiness,
+            "provider_readiness_reason": readiness_reason,
+        }
+
+    @staticmethod
+    def _raise_conversation_catalog_error(exc: Exception) -> None:
+        from .conversation_agent_service import (
+            ConversationAgentAuthorizationError,
+            ConversationAgentConflictError,
+            ConversationAgentNotFoundError,
+        )
+
+        if isinstance(exc, ConversationAgentAuthorizationError):
+            raise AgentIdentityAuthorizationError("Agent runtime catalog access denied") from None
+        if isinstance(exc, ConversationAgentNotFoundError):
+            raise AgentIdentityNotFoundError("Agent runtime catalog context not found") from None
+        if isinstance(exc, ConversationAgentConflictError):
+            raise AgentIdentityConflictError("Agent runtime catalog context changed") from None
+        raise AgentIdentityValidationError("Agent runtime catalog context is invalid") from None
+
+    async def _runtime_catalog_revision(
+        self,
+        *,
+        agent_id: UUID,
+        agent_revision_id: Any,
+        session_id: Any,
+        actor_user_id: Any,
+        actor_role: Any,
+        project_id: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Resolve either the selected latest Revision or a session's canonical binding."""
+
+        from .conversation_agent_service import (
+            AgentExecutionBindingSnapshot,
+            ConversationAgentError,
+            ConversationAgentService,
+        )
+
+        if (agent_revision_id is None) == (session_id is None):
+            raise AgentIdentityValidationError(
+                "exactly one of agent_revision_id or session_id is required"
+            )
+        conversations = ConversationAgentService(self._db_manager, config=self.config)
+        if session_id is None:
+            try:
+                agent, revision = await conversations.validate_agent_selection(
+                    agent_id=agent_id,
+                    actor_user_id=actor_user_id,
+                    actor_role=actor_role,
+                    project_id=project_id,
+                )
+            except ConversationAgentError as exc:
+                self._raise_conversation_catalog_error(exc)
+            requested_revision = _uuid(agent_revision_id, "agent_revision_id")
+            if str(getattr(agent, "id", "")) != str(agent_id):
+                raise AgentIdentityConflictError("Agent selection changed")
+            if str(getattr(revision, "id", "")) != str(requested_revision):
+                raise AgentIdentityConflictError("Agent revision changed; reload before selecting a runtime")
+            return revision, {
+                "context_source": "agent_revision",
+                "session_id": None,
+                "binding_id": None,
+            }
+
+        if project_id is not None:
+            raise AgentIdentityValidationError(
+                "project_id must be omitted when session_id is used"
+            )
+        sid = _uuid(session_id, "session_id")
+        actor = _uuid(actor_user_id, "actor_user_id")
+        session = await self._session()
+        try:
+            row = (
+                await session.execute(
+                    select(ConversationSession)
+                    .options(selectinload(ConversationSession.participants))
+                    .where(ConversationSession.id == sid)
+                )
+            ).scalar_one_or_none()
+            if row is None or row.deleted_at is not None:
+                raise AgentIdentityNotFoundError("Conversation not found")
+            if str(row.agent_id or "") != str(agent_id):
+                raise AgentIdentityConflictError("Conversation Agent changed")
+            if not conversations._session_can_read(row, actor, actor_role):
+                raise AgentIdentityAuthorizationError("Conversation read denied")
+            if row.project_id is not None and not await conversations._human_project_permission(
+                session,
+                project_id=row.project_id,
+                actor_id=actor,
+                actor_role=actor_role,
+                permission="read",
+            ):
+                raise AgentIdentityAuthorizationError("Project read permission is required")
+            try:
+                # A readable historical conversation is not itself a current
+                # Agent grant.  Recheck the same Agent/Project selection ACL
+                # used by turn admission, while retaining the older bound
+                # Revision below as the catalog's identity context.
+                await conversations._agent_for_selection(
+                    session,
+                    agent_id=agent_id,
+                    actor_id=actor,
+                    actor_role=actor_role,
+                    project_id=row.project_id,
+                )
+            except ConversationAgentError as exc:
+                self._raise_conversation_catalog_error(exc)
+            binding_cutoff = row.agent_binding_updated_at
+            if binding_cutoff is None:
+                raise AgentIdentityConflictError("Conversation has no canonical Agent binding")
+            binding = (
+                await session.execute(
+                    select(AgentExecutionBinding)
+                    .where(
+                        AgentExecutionBinding.session_id == sid,
+                        AgentExecutionBinding.agent_id == agent_id,
+                        AgentExecutionBinding.created_at <= binding_cutoff,
+                    )
+                    .order_by(
+                        desc(AgentExecutionBinding.created_at),
+                        desc(AgentExecutionBinding.id),
+                    )
+                    .limit(1)
+                )
+            ).scalars().first()
+            if binding is None:
+                raise AgentIdentityConflictError("Conversation has no canonical Agent binding")
+            try:
+                snapshot = AgentExecutionBindingSnapshot.from_row(binding)
+            except ConversationAgentError as exc:
+                self._raise_conversation_catalog_error(exc)
+            revision = await session.get(AgentRevision, binding.agent_revision_id)
+            if (
+                revision is None
+                or str(revision.agent_id) != str(agent_id)
+                or str(revision.id) != str(snapshot.agent_revision_id)
+                or str(revision.content_hash or "") != str(snapshot.revision_content_hash or "")
+            ):
+                raise AgentIdentityConflictError("Conversation Agent binding is stale")
+            return revision, {
+                "context_source": "session_binding",
+                "session_id": str(sid),
+                "binding_id": str(binding.id),
+            }
+        finally:
+            await session.close()
+
+    async def runtime_execution_profile_catalog(
+        self,
+        *,
+        agent_id: Any,
+        actor_user_id: Any,
+        actor_role: Any,
+        agent_revision_id: Any = None,
+        session_id: Any = None,
+        project_id: Any = None,
+        working_directory: Any = None,
+    ) -> dict[str, Any]:
+        """Context-bound runtime choices for the same immutable Agent role."""
+
+        from .agent_model_routing import (
+            AgentModelRouteError,
+            AgentRoutingPins,
+            assert_registered_route_backend,
+            registered_route_backend,
+            resolve_agent_execution_selection,
+            resolve_agent_role_route,
+        )
+
+        aid = _uuid(agent_id, "agent_id")
+        revision, context = await self._runtime_catalog_revision(
+            agent_id=aid,
+            agent_revision_id=agent_revision_id,
+            session_id=session_id,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            project_id=project_id,
+        )
+        base_pins = AgentRoutingPins.from_revision(revision)
+        profiles: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, str]] = []
+        configured = list_team_execution_profiles(self.config, base_pins.agent_team_id)
+        for candidate in self._runtime_profile_candidates(revision, configured):
+            profile_id = candidate["profile_id"]
+            try:
+                selected = resolve_agent_execution_selection(
+                    self.config,
+                    base_pins,
+                    None if profile_id == base_pins.execution_profile_id else profile_id,
+                )
+                pins = base_pins.with_execution_selection(selected)
+                route = resolve_agent_role_route(self.config, pins, "operator")
+                registered = registered_route_backend(route.provider)
+                assert_registered_route_backend(
+                    route.provider,
+                    route.backend,
+                    ingress=registered,
+                )
+                ingress = {
+                    "api": "api",
+                    "cli": "cli_session",
+                    "remote": "remote_agent",
+                    "remote_agent": "remote_agent",
+                }.get(registered)
+                if ingress is None:
+                    raise AgentModelRouteError("agent_route_provider_unsupported")
+            except AgentModelRouteError as exc:
+                diagnostics.append({"profile_id": profile_id, "reason": exc.code})
+                continue
+
+            availability: dict[str, Any]
+            if ingress == "cli_session":
+                availability = self._runtime_cli_availability(
+                    owner_id=str(actor_user_id),
+                    agent_id=str(aid),
+                    provider=str(route.provider or ""),
+                    working_directory=(
+                        str(working_directory).strip()
+                        if working_directory not in (None, "")
+                        else None
+                    ),
+                )
+            elif ingress == "remote_agent":
+                availability = {
+                    "available": False,
+                    "availability_category": "ingress_unavailable",
+                    "availability_reason": "remote_agent_unavailable",
+                    "provider_readiness": "not_applicable",
+                    "provider_readiness_reason": None,
+                }
+            else:
+                availability = {
+                    "available": True,
+                    "availability_category": "available",
+                    "availability_reason": None,
+                    # Adapter registration is known; credentials and live
+                    # provider delivery are deliberately not probed here.
+                    "provider_readiness": "unknown",
+                    "provider_readiness_reason": None,
+                }
+            profiles.append({
+                "profile_id": profile_id,
+                "name": candidate["name"],
+                "is_default": profile_id == base_pins.execution_profile_id,
+                "acting_subagent_id": route.acting_subagent_id,
+                "provider": route.provider,
+                "model": route.model,
+                "effort": route.effort or None,
+                "ingress": ingress,
+                **availability,
+            })
+        return {
+            "agent_id": str(aid),
+            "agent_revision_id": str(revision.id),
+            "agent_team_id": str(revision.agent_team_id),
+            "acting_role": "operator",
+            "default_execution_profile_id": str(revision.execution_profile_id),
+            **context,
+            "profiles": profiles,
+            "diagnostics": diagnostics,
+        }
 
     def _validate_team_refs(
         self,

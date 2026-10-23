@@ -34,6 +34,7 @@ _KNOWN_EXECUTION_PROFILE_PROVIDERS = frozenset(
         "claude-cli",
         "antigravity-cli",
         "grok-cli",
+        "muse-remote",
         "kimi",
         "deepseek",
         "deepinfra",
@@ -477,6 +478,19 @@ def validate_execution_route(
     submitted_provider = str(route.get("provider") or "").strip()
     submitted_model = str(route.get("model") or "").strip()
     submitted_inherit = route.get("inherit_model")
+    if submitted_provider.lower() == "muse-remote":
+        # Muse is a typed remote target.  It has no model or effort controls;
+        # accepting a provider-only explicit route must not weaken validation
+        # for ordinary local provider/model routes.
+        remote_effort = str(route.get("effort") or route.get("reasoning_effort") or "").strip()
+        remote_policy = str(route.get("effort_policy") or "").strip().lower()
+        if submitted_inherit is not False:
+            warnings.append(f"{label} requires inherit_model=false for muse-remote")
+        if submitted_model or remote_effort:
+            warnings.append(f"{label} does not accept model or effort for muse-remote")
+        if remote_policy not in {"", "none", "not_applicable", "default"}:
+            warnings.append(f"{label} does not accept effort_policy={remote_policy} for muse-remote")
+        return warnings
     submitted_is_explicit_model = submitted_inherit is False or (
         submitted_inherit is None and bool(submitted_provider and submitted_model)
     )
@@ -697,6 +711,15 @@ def validate_execution_profile(
         inherit_model = route.get("inherit_model") is not False and not (
             route.get("inherit_model") is None and provider and model
         )
+        if provider == "muse-remote":
+            policy = str(route.get("effort_policy") or "").strip().lower()
+            if route.get("inherit_model") is not False:
+                warnings.append(f"{label} requires inherit_model=false for muse-remote")
+            if model or effort:
+                warnings.append(f"{label} does not accept model or effort for muse-remote")
+            if policy not in {"", "none", "not_applicable", "default"}:
+                warnings.append(f"{label} does not accept effort_policy={policy} for muse-remote")
+            return
         if not provider and not model and not effort:
             return
         if require_provider and (not provider or not model):

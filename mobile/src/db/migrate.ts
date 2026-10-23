@@ -647,6 +647,66 @@ const DDL: string[] = [
      last_pushed_at TEXT,
      cursor TEXT
    );`,
+  // Sync v3: which server scope/generation delivers each local entity.
+  `CREATE TABLE IF NOT EXISTS sync_v3_membership (
+     auth_scope TEXT NOT NULL,
+     table_name TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     scope_key TEXT NOT NULL,
+     generation INTEGER NOT NULL,
+     PRIMARY KEY (auth_scope, table_name, entity_id, scope_key)
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_v3_membership_scope
+     ON sync_v3_membership(auth_scope, scope_key, generation);`,
+  `CREATE TABLE IF NOT EXISTS sync_v3_legacy_capture (
+     id TEXT PRIMARY KEY,
+     generation INTEGER NOT NULL DEFAULT 1,
+     capture_sha256 TEXT NOT NULL,
+     snapshot_json TEXT NOT NULL,
+     capture_count INTEGER NOT NULL DEFAULT 0,
+     op_count INTEGER NOT NULL DEFAULT 0,
+     dirty_count INTEGER NOT NULL DEFAULT 0,
+     owner_unknown_count INTEGER NOT NULL DEFAULT 0,
+     state TEXT NOT NULL DEFAULT 'awaiting_confirm',
+     source_cleared INTEGER NOT NULL DEFAULT 0,
+     confirmed_sha256 TEXT,
+     updated_at INTEGER NOT NULL,
+     error_code TEXT
+   );`,
+  `CREATE TABLE IF NOT EXISTS sync_v3_conflicts (
+     id TEXT PRIMARY KEY,
+     auth_scope TEXT NOT NULL,
+     table_name TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     scope_key TEXT,
+     kind TEXT NOT NULL,
+     local_json TEXT NOT NULL,
+     base_json TEXT,
+     server_json TEXT,
+     fields_json TEXT NOT NULL DEFAULT '[]',
+     source_op_id TEXT,
+     source_snapshot_json TEXT NOT NULL,
+     title_hint TEXT,
+     created_at INTEGER NOT NULL,
+     state TEXT NOT NULL DEFAULT 'open',
+     reapplied_op_id TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_v3_conflicts_scope_state
+     ON sync_v3_conflicts(auth_scope, state, created_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_v3_conflicts_entity
+     ON sync_v3_conflicts(auth_scope, table_name, entity_id, state);`,
+  `CREATE TABLE IF NOT EXISTS sync_v3_request_logs (
+     request_id TEXT PRIMARY KEY,
+     auth_scope TEXT NOT NULL,
+     lane TEXT NOT NULL,
+     outcome TEXT NOT NULL,
+     status INTEGER,
+     occurred_at INTEGER NOT NULL,
+     duration_ms INTEGER NOT NULL,
+     error_code TEXT
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_v3_request_logs_scope_time
+     ON sync_v3_request_logs(auth_scope, occurred_at);`,
   // Docs pull pages land here before a validated snapshot is promoted to the
   // live knowledge_* tables.  All keys include the auth scope so an account
   // transition can never resume another account's partial download.
@@ -948,7 +1008,9 @@ const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
   ["outbox", "auth_scope", "ALTER TABLE outbox ADD COLUMN auth_scope TEXT;"],
   ["outbox", "docs_scope_key", "ALTER TABLE outbox ADD COLUMN docs_scope_key TEXT;"],
   ["outbox", "blocked_reason", "ALTER TABLE outbox ADD COLUMN blocked_reason TEXT;"],
-  ["outbox_resolution_records", "operation_origin", "ALTER TABLE outbox_resolution_records ADD COLUMN operation_origin TEXT NOT NULL DEFAULT 'unrecorded';"],
+  ["outbox", "v3_op_id", "ALTER TABLE outbox ADD COLUMN v3_op_id TEXT;"],
+  ["outbox", "v3_op_seq", "ALTER TABLE outbox ADD COLUMN v3_op_seq INTEGER;"],
+  ["outbox", "v3_sent_digest", "ALTER TABLE outbox ADD COLUMN v3_sent_digest TEXT;"],  ["outbox_resolution_records", "operation_origin", "ALTER TABLE outbox_resolution_records ADD COLUMN operation_origin TEXT NOT NULL DEFAULT 'unrecorded';"],
   ["outbox_resolution_records", "target_namespace_json", "ALTER TABLE outbox_resolution_records ADD COLUMN target_namespace_json TEXT;"],
   ["docs_sync_runs", "scope_key", "ALTER TABLE docs_sync_runs ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'personal';"],
   ["docs_sync_runs", "project_id", "ALTER TABLE docs_sync_runs ADD COLUMN project_id TEXT;"],
@@ -975,6 +1037,10 @@ const INDEX_MIGRATIONS = [
   "CREATE INDEX IF NOT EXISTS idx_outbox_docs_cursor ON outbox(docs_scope_key, op_id, auth_scope);",
   // Protected-row conflict projection must not rescan an entire Docs scope.
   "CREATE INDEX IF NOT EXISTS idx_outbox_docs_entity ON outbox(auth_scope, docs_scope_key, table_name, entity_id);",
+  "CREATE INDEX IF NOT EXISTS idx_sync_v3_membership_scope ON sync_v3_membership(auth_scope, scope_key, generation);",
+  "CREATE INDEX IF NOT EXISTS idx_sync_v3_conflicts_scope_state ON sync_v3_conflicts(auth_scope, state, created_at);",
+  "CREATE INDEX IF NOT EXISTS idx_sync_v3_conflicts_entity ON sync_v3_conflicts(auth_scope, table_name, entity_id, state);",
+  "CREATE INDEX IF NOT EXISTS idx_sync_v3_request_logs_scope_time ON sync_v3_request_logs(auth_scope, occurred_at);",
   "CREATE INDEX IF NOT EXISTS idx_cs_pinned_activity ON conversation_sessions(is_pinned, updated_at);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_runs_auth_scope ON docs_sync_runs(auth_scope, scope_key, scope_id, project_id, state);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_staging_auth_scope ON docs_sync_staging(auth_scope, scope_key, scope_id, project_id);",

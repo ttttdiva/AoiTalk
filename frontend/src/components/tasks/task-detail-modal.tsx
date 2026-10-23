@@ -75,7 +75,10 @@ import { useTaskDocsNode } from "@/components/tasks/hooks/use-task-docs-node";
 import { useTaskDraftForm } from "@/components/tasks/hooks/use-task-draft-form";
 import { useTaskTimer } from "@/components/tasks/hooks/use-task-timer";
 import { useTaskProposals } from "@/components/tasks/hooks/use-task-proposals";
-import type { TaskProposal } from "@/lib/task-proposals-api";
+import {
+  taskProposalChatPath,
+  type TaskProposal,
+} from "@/lib/task-proposals-api";
 import { isImageFile } from "@/lib/editor-image-files";
 import {
   deriveTaskTriageView,
@@ -289,7 +292,7 @@ export function TaskDetailModal({
   });
   const handleProposalConfirm = useCallback(
     (proposal: TaskProposal) => {
-      router.push(`/chat?s=${encodeURIComponent(proposal.session_id)}`);
+      router.push(taskProposalChatPath(proposal));
     },
     [router],
   );

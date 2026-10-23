@@ -71,12 +71,14 @@ async def build_docs_read_projection(
     page_chars: int = 12000,
     include_manifest: bool = False,
     record_only: bool = False,
+    outline_only: bool = False,
 ) -> dict:
     """Read canonical content as ID-anchored segments with explicit omissions.
 
-    The view covers containment, own descriptions, typed content, tags and
-    Fields. It does not traverse placements, backlinks, edges or attachments.
-    Limits describe the projection separately from pagination of its segments.
+    The document view covers containment, own descriptions, typed content,
+    tags and Fields. The outline view emits only ID-anchored title segments.
+    Neither traverses placements, backlinks, edges or attachments. Limits
+    describe the projection separately from pagination of its segments.
     """
     if type(depth) is not int or not 0 <= depth <= MAX_DEPTH:
         raise ValueError(f"depth must be between 0 and {MAX_DEPTH}")
@@ -235,7 +237,10 @@ async def build_docs_read_projection(
                node_type=node.node_type, updated_at=node.updated_at.isoformat() if node.updated_at else None,
                created_at=node.created_at.isoformat() if node.created_at else None,
                day_date=node.day_date.isoformat() if node.day_date else None,
-               **({"managed_domain": policy.managed_domain, "mutation_tools": sorted(policy.allowed_tools)} if policy else {}))
+               **({"managed_domain": policy.managed_domain, "mutation_tools": sorted(policy.allowed_tools)}
+                  if policy and not outline_only else {}))
+        if outline_only:
+            continue
         if node.description:
             append(node.id, "description", node.description)
         if body.get("format") == "doc_block" and body.get("block_type") in {"markdown", "code"}:
@@ -318,6 +323,7 @@ async def build_docs_read_projection(
         "schema": SCHEMA, "actor": str(user_id), "root": str(root.id), "depth": depth,
         "turn_project": str(turn_project_id),
         "record_only": record_only,
+        "outline_only": outline_only,
         "scope": sorted(map(str, allowed_node_ids)) if allowed_node_ids is not None else None,
         "segments": segments, "reasons": sorted(reasons),
     }
@@ -331,7 +337,12 @@ async def build_docs_read_projection(
         used += cost
         end += 1
     return {
-        "schema": SCHEMA, "view": "document", "root_id": str(root.id),
+        "schema": SCHEMA,
+        # The direct tool has historically named record projections "document".
+        # The HTTP orchestration wrapper gives its own record view a distinct
+        # wire name without changing that existing tool contract.
+        "view": "outline" if outline_only else "document",
+        "root_id": str(root.id),
         "read_fingerprint": fingerprint, "fingerprint_is_write_revision": False,
         "consistency": "live_read",
         "coverage_complete": not reasons, "coverage_reasons": sorted(reasons),

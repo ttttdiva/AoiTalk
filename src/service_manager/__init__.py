@@ -3108,6 +3108,8 @@ def _ensure_strata_server(
                         startup_log_offset = startup_log_path.stat().st_size
                     except OSError:
                         startup_log_offset = 0
+                    from src.utils.process_identity import strata_title_template
+
                     proc = _start_logged_openai_compatible_process(
                         args, cwd=cwd,
                         log_path=startup_log_path,
@@ -3120,6 +3122,7 @@ def _ensure_strata_server(
                         # other runtimes retain their existing console policy.
                         mirror_to_parent_console=False,
                         create_new_console_on_windows=False,
+                        console_title=strata_title_template(model),
                     )
                     try:
                         startup_log_offset = min(

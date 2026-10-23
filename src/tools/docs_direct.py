@@ -1391,51 +1391,46 @@ def build_docs_direct_tools() -> list:
                         scope_ids=_scope_node_ids(docs_scope) if docs_scope is not None else None,
                         turn_project_id=_docs_query_turn_project_id()), ensure_ascii=False, separators=(",", ":"))
                 if view in {"document", "record", "edit"}:
-                    from ..services.docs_read_projection import build_docs_read_projection
+                    from ..services.docs_protocol_orchestration import (
+                        read_docs_edit_page,
+                        read_docs_projection,
+                    )
 
                     if view == "edit":
                         from ..services.docs_consistency import DocsContractUnavailable, contract_available
                         if not await contract_available(session):
                             raise DocsContractUnavailable("Docs Agent consistency migration is required")
-                        from ..services.docs_edit_read_session import (
-                            DocsEditReadSessionService,
-                            edit_read_scope_binding,
-                        )
                         turn_project_id = _docs_query_turn_project_id()
                         allowed_node_ids = (
                             _scope_node_ids(docs_scope) if docs_scope is not None else None
                         )
                         mutation_binding = _docs_edit_binding(user_id, project_obj)
-                        session_binding = edit_read_scope_binding(
-                            actor_id=user_id,
-                            root_id=root.id,
-                            library_id=root.docs_library_id,
-                            depth=depth,
-                            page_chars=page_chars,
-                            turn_project_id=turn_project_id,
-                            allowed_node_ids=allowed_node_ids,
-                            context_binding=mutation_binding,
-                        )
-                        payload = await DocsEditReadSessionService(session).read_page(
+                        payload = await read_docs_edit_page(
+                            session=session,
                             graph=service,
                             root=root,
                             actor_id=user_id,
                             allowed_node_ids=allowed_node_ids,
                             turn_project_id=turn_project_id,
+                            cursor=cursor,
                             depth=depth,
                             page_chars=page_chars,
-                            cursor=cursor,
-                            scope_binding=session_binding,
                             mutation_binding=mutation_binding,
                         )
                         await session.commit()
                     else:
-                        payload = await build_docs_read_projection(
-                            service, root, user_id,
-                            allowed_node_ids=_scope_node_ids(docs_scope) if docs_scope is not None else None,
-                            turn_project_id=_docs_query_turn_project_id(), depth=depth,
-                            cursor=cursor, page_chars=page_chars, include_manifest=False,
-                            record_only=view == "record",
+                        payload = await read_docs_projection(
+                            graph=service,
+                            root=root,
+                            actor_id=user_id,
+                            allowed_node_ids=(
+                                _scope_node_ids(docs_scope) if docs_scope is not None else None
+                            ),
+                            turn_project_id=_docs_query_turn_project_id(),
+                            view=view,
+                            cursor=cursor,
+                            depth=depth,
+                            page_chars=page_chars,
                         )
                     result = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                     if view == "edit":
@@ -2448,7 +2443,10 @@ def build_docs_direct_tools() -> list:
                     graph, docs_library_id=None, ref=str(root_id),
                     project_id=selected.id if selected else None, user_id=actor, required="write",
                 )
-                result = await DocsMutationService(session).apply(
+                from ..services.docs_protocol_orchestration import apply_docs_changeset
+
+                result = await apply_docs_changeset(
+                    session=session,
                     actor_id=actor, root_id=root.id, write_token=lease_id,
                     operation_id=request_id, changeset=payload, binding=_docs_edit_binding(actor, selected),
                     before_commit=_assert_generation_mutation_allowed,

@@ -194,6 +194,13 @@ class AgentAuthorityResolver:
         # identity revisions even on installations with older saved topology.
         # An explicit configured override (including disabled) still wins.
         subagents.setdefault("employee_operator", AGENT_TEAM_SUBAGENT_CATALOG["employee_operator"])
+        # Personal private adapters are likewise a code-owned opt-in built-in.
+        # Only the dedicated manual Team includes this Subagent by default;
+        # an explicit configured entry (including disabled/narrowed caps) wins.
+        subagents.setdefault(
+            "personal_private_adapter",
+            AGENT_TEAM_SUBAGENT_CATALOG["personal_private_adapter"],
+        )
         result: set[str] = set()
         allowed_subagents = {
             str(item).strip()

@@ -72,7 +72,7 @@ function DraftReview({ draft, locked, onDecision }: {
           <summary className="cursor-pointer">根拠の記録情報</summary>
           <dl className="space-y-1 pt-2 [overflow-wrap:anywhere]">
             <dt>抽出方法</dt><dd>{String(draft.evidence.extractor_version ?? "不明")}</dd>
-            <dt>資料の指紋</dt><dd>{String(draft.evidence.source_sha256 ?? "不明")}</dd>
+            <dt>資料の指紋</dt><dd className="break-all font-mono">{String(draft.evidence.source_sha256 ?? "不明")}</dd>
             <dt>値の文字範囲</dt><dd><pre className="whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(draft.evidence.field_spans ?? {}, null, 2)}</pre></dd>
           </dl>
         </details>
@@ -261,6 +261,7 @@ export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => 
 
   useEffect(() => {
     mounted.current = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load the owner-scoped draft list on mount.
     void reload();
     return () => { mounted.current = false; };
   }, [reload]);

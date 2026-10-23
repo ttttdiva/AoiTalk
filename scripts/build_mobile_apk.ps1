@@ -1136,32 +1136,105 @@ function Invoke-NativeSnapshotBuild([string]$SourceRoot, [psobject]$Workspace, [
     $autolinking = Join-Path $buildRoot "node_modules\@react-native\gradle-plugin\react-native-gradle-plugin\src\main\kotlin\com\facebook\react\tasks\GenerateAutolinkingNewArchitecturesFileTask.kt"
     Replace-TextFile $autolinking { param($content) $content.Replace('${libraryName}_autolinked_build', '${libraryName.take(12)}_autolinked_build') }
 
+    $nodeModules = Join-Path $buildRoot "node_modules"
+    $cmakeSourceStage = '${CMAKE_CURRENT_SOURCE_DIR}/.aoitalk-cmake-stage'
     $keyboard = Join-Path $buildRoot "node_modules\react-native-keyboard-controller\android\src\main\jni\CMakeLists.txt"
+    $keyboardStageDir = Join-Path (Split-Path -Parent $keyboard) ".aoitalk-cmake-stage"
+    if (-not (Is-Under $keyboardStageDir $nodeModules) -or (Test-Path -LiteralPath $keyboardStageDir)) { Stop-Launcher "Keyboard-controller relative CMake stage is outside the owned package root or already exists" }
     Replace-TextFile $keyboard {
         param($content)
         $needle = 'file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.cpp ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.cpp)'
         if (-not $content.Contains($needle)) { Stop-Launcher "Keyboard-controller CMake marker was not found" }
-        $stageUnix = $stage.Replace('\', '/')
+        $custom = $cmakeSourceStage + '/custom'
+        $codegen = $cmakeSourceStage + '/codegen'
         $nl = [Environment]::NewLine
         $q = [char]34
-        $block = $needle + $nl + $nl + 'file(GLOB LIB_CUSTOM_HEADERS CONFIGURE_DEPENDS ${LIB_COMMON_COMPONENTS_DIR}/*.h)' + $nl + 'file(GLOB LIB_CODEGEN_HEADERS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.h ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.h)' + $nl + ('file(MAKE_DIRECTORY ' + $q + $stageUnix + '/custom' + $q + ' ' + $q + $stageUnix + '/codegen' + $q + ')') + $nl + ('file(COPY ${LIB_CUSTOM_SRCS} ${LIB_CUSTOM_HEADERS} DESTINATION ' + $q + $stageUnix + '/custom' + $q + ')') + $nl + ('file(COPY ${LIB_CODEGEN_SRCS} ${LIB_CODEGEN_HEADERS} DESTINATION ' + $q + $stageUnix + '/codegen' + $q + ')') + $nl + ('file(GLOB LIB_CUSTOM_SRCS CONFIGURE_DEPENDS ' + $q + $stageUnix + '/custom/*.cpp' + $q + ')') + $nl + ('file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ' + $q + $stageUnix + '/codegen/*.cpp' + $q + ')')
+        $block = $needle + $nl + $nl + 'file(GLOB LIB_CUSTOM_HEADERS CONFIGURE_DEPENDS ${LIB_COMMON_COMPONENTS_DIR}/*.h)' + $nl + 'file(GLOB LIB_CODEGEN_HEADERS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.h ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.h)' + $nl + ('file(MAKE_DIRECTORY ' + $q + $custom + $q + ' ' + $q + $codegen + $q + ')') + $nl + ('file(COPY ${LIB_CUSTOM_SRCS} ${LIB_CUSTOM_HEADERS} DESTINATION ' + $q + $custom + $q + ')') + $nl + ('file(COPY ${LIB_CODEGEN_SRCS} ${LIB_CODEGEN_HEADERS} DESTINATION ' + $q + $codegen + $q + ')') + $nl + ('file(GLOB LIB_CUSTOM_SRCS CONFIGURE_DEPENDS ' + $q + $custom + '/*.cpp' + $q + ')') + $nl + ('file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ' + $q + $codegen + '/*.cpp' + $q + ')')
         return $content.Replace($needle, $block)
     }
 
-    $nodeModules = Join-Path $buildRoot "node_modules"
+    $workletsGradle = Join-Path $nodeModules "react-native-worklets\android\build.gradle"
+    $workletsCmakeStage = Join-Path $stage "worklets-cmake"
+    $workletsModuleBuild = Join-Path $nodeModules "react-native-worklets\android\build"
+    if (-not (Is-Under $workletsCmakeStage $stage) -or (Is-Under $workletsCmakeStage $workletsModuleBuild)) { Stop-Launcher "Worklets CMake staging directory is outside the owned short staging root" }
+    $workletsCmakeStage = (Full-Path $workletsCmakeStage).Replace('\', '/')
+    Replace-TextFile $workletsGradle {
+        param($content)
+        if ([regex]::Matches($content, '(?m)^android\s*\{').Count -ne 1 -or [regex]::Matches($content, '(?i)\bbuildStagingDirectory\b').Count -ne 0) { Stop-Launcher "Worklets Gradle Android marker was not found or a staging override already exists" }
+        $newline = if ($content.Contains(([string][char]13) + ([string][char]10))) { ([string][char]13) + ([string][char]10) } else { [string][char]10 }
+        if (-not $content.EndsWith($newline)) { $content += $newline }
+        $stagePathGradle = "'" + $workletsCmakeStage.Replace("'", "\'") + "'"
+        $block = @(
+            'android {'
+            '    externalNativeBuild {'
+            '        cmake {'
+            ('            buildStagingDirectory ' + $stagePathGradle)
+            '        }'
+            '    }'
+            '}'
+        ) -join $newline
+        return $content + $block + $newline
+    }
+
+    $reanimatedGradle = Join-Path $nodeModules "react-native-reanimated\android\build.gradle"
+    $reanimatedCmakeStage = Join-Path $stage "reanimated-cmake"
+    $reanimatedModuleBuild = Join-Path $nodeModules "react-native-reanimated\android\build"
+    if (-not (Is-Under $reanimatedCmakeStage $stage) -or (Is-Under $reanimatedCmakeStage $reanimatedModuleBuild)) { Stop-Launcher "Reanimated CMake staging directory is outside the owned short staging root" }
+    $reanimatedCmakeStage = (Full-Path $reanimatedCmakeStage).Replace('\', '/')
+    Replace-TextFile $reanimatedGradle {
+        param($content)
+        if ([regex]::Matches($content, '(?m)^android\s*\{').Count -ne 1 -or [regex]::Matches($content, '(?i)\bbuildStagingDirectory\b').Count -ne 0) { Stop-Launcher "Reanimated Gradle Android marker was not found or a staging override already exists" }
+        $newline = if ($content.Contains(([string][char]13) + ([string][char]10))) { ([string][char]13) + ([string][char]10) } else { [string][char]10 }
+        if (-not $content.EndsWith($newline)) { $content += $newline }
+        $stagePathGradle = "'" + $reanimatedCmakeStage.Replace("'", "\'") + "'"
+        $block = @(
+            'android {'
+            '    externalNativeBuild {'
+            '        cmake {'
+            ('            buildStagingDirectory ' + $stagePathGradle)
+            '        }'
+            '    }'
+            '}'
+        ) -join $newline
+        return $content + $block + $newline
+    }
+
+    $expoModulesCoreGradle = Join-Path $nodeModules "expo-modules-core\android\build.gradle"
+    $expoModulesCoreCmakeStage = Join-Path $stage "expo-modules-core-cmake"
+    $expoModulesCoreModuleBuild = Join-Path $nodeModules "expo-modules-core\android\build"
+    if (-not (Is-Under $expoModulesCoreCmakeStage $stage) -or (Is-Under $expoModulesCoreCmakeStage $expoModulesCoreModuleBuild)) { Stop-Launcher "Expo-modules-core CMake staging directory is outside the owned short staging root" }
+    $expoModulesCoreCmakeStage = (Full-Path $expoModulesCoreCmakeStage).Replace('\', '/')
+    Replace-TextFile $expoModulesCoreGradle {
+        param($content)
+        if ([regex]::Matches($content, '(?m)^android\s*\{').Count -ne 1 -or [regex]::Matches($content, '(?i)\bbuildStagingDirectory\b').Count -ne 0) { Stop-Launcher "Expo-modules-core Gradle Android marker was not found or a staging override already exists" }
+        $newline = if ($content.Contains(([string][char]13) + ([string][char]10))) { ([string][char]13) + ([string][char]10) } else { [string][char]10 }
+        if (-not $content.EndsWith($newline)) { $content += $newline }
+        $stagePathGradle = "'" + $expoModulesCoreCmakeStage.Replace("'", "\'") + "'"
+        $block = @(
+            'android {'
+            '    externalNativeBuild {'
+            '        cmake {'
+            ('            buildStagingDirectory ' + $stagePathGradle)
+            '        }'
+            '    }'
+            '}'
+        ) -join $newline
+        return $content + $block + $newline
+    }
     foreach ($target in @(
         @((Join-Path $nodeModules "react-native-safe-area-context\android\src\main\jni\CMakeLists.txt"), "safeareacontext"),
         @((Join-Path $nodeModules "react-native-screens\android\src\main\jni\CMakeLists.txt"), "rnscreens")
     )) {
         $path = [string]$target[0]
         $label = [string]$target[1]
+        $moduleStageDir = Join-Path (Split-Path -Parent $path) ".aoitalk-cmake-stage"
+        if (-not (Is-Under $moduleStageDir $nodeModules) -or (Test-Path -LiteralPath $moduleStageDir)) { Stop-Launcher "${label} relative CMake stage is outside the owned package root or already exists" }
         Replace-TextFile $path {
             param($content)
             $needle = if ($label -eq "rnscreens") { 'file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.cpp)' } else { 'file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.cpp ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.cpp)' }
             if (-not $content.Contains($needle)) { Stop-Launcher "Codegen CMake marker was not found: $path" }
-            $stageUnix = $stage.Replace('\', '/')
-            $custom = $stageUnix + '/' + $label + '-custom'
-            $codegen = $stageUnix + '/' + $label + '-codegen'
+            $custom = $cmakeSourceStage + '/' + $label + '-custom'
+            $codegen = $cmakeSourceStage + '/' + $label + '-codegen'
             $nl = [Environment]::NewLine
             $q = [char]34
             $block = $needle + $nl + $nl + 'file(GLOB LIB_CUSTOM_HEADERS CONFIGURE_DEPENDS *.h ${LIB_COMMON_DIR}/react/renderer/components/${LIB_LITERAL}/*.h ${LIB_COMMON_DIR}/react/renderer/components/${LIB_LITERAL}/utils/*.h)' + $nl + 'file(GLOB LIB_CODEGEN_HEADERS CONFIGURE_DEPENDS ${LIB_ANDROID_GENERATED_JNI_DIR}/*.h ${LIB_ANDROID_GENERATED_COMPONENTS_DIR}/*.h)' + $nl + ('file(MAKE_DIRECTORY ' + $q + $custom + $q + ' ' + $q + $codegen + $q + ')') + $nl + ('file(COPY ${LIB_CUSTOM_SRCS} ${LIB_CUSTOM_HEADERS} DESTINATION ' + $q + $custom + $q + ')') + $nl + ('file(GLOB LIB_CUSTOM_SRCS CONFIGURE_DEPENDS ' + $q + $custom + '/*.cpp' + $q + ')') + $nl + ('include_directories(' + $q + $custom + $q + ')') + $nl + ('file(COPY ${LIB_CODEGEN_SRCS} ${LIB_CODEGEN_HEADERS} DESTINATION ' + $q + $codegen + $q + ')') + $nl + ('file(GLOB LIB_CODEGEN_SRCS CONFIGURE_DEPENDS ' + $q + $codegen + '/*.cpp' + $q + ')')
@@ -1182,10 +1255,28 @@ function Invoke-NativeSnapshotBuild([string]$SourceRoot, [psobject]$Workspace, [
         return $content
     }
     $appGradle = Join-Path $androidDir "app\build.gradle"
+    $appCmakeStage = Join-Path $stage "app-cmake"
+    $appModuleBuild = Join-Path $androidDir "app\build"
+    if (-not (Is-Under $appCmakeStage $stage) -or (Is-Under $appCmakeStage $appModuleBuild)) { Stop-Launcher "App CMake staging directory is outside the owned short staging root" }
+    $appCmakeStage = (Full-Path $appCmakeStage).Replace('\', '/')
     Replace-TextFile $appGradle {
         param($content)
-        $content += [Environment]::NewLine + ('android.defaultConfig.externalNativeBuild.cmake.arguments.add(' + [char]34 + '-DCMAKE_OBJECT_PATH_MAX=128' + [char]34 + ')') + [Environment]::NewLine
-        return [regex]::Replace($content, '(?m)^\s*cliFile = new File\(\["node", "--print", "require\.resolve\(''@expo/cli'', \{ paths: \[require\.resolve\(''expo/package\.json''\) \]\}\)"\]\.execute\(null, rootDir\)\.text\.trim\(\)\)$', '    cliFile = new File(rootDir, "../node_modules/expo/node_modules/@expo/cli/build/bin/cli")')
+        if ([regex]::Matches($content, '(?m)^android\s*\{').Count -ne 1 -or [regex]::Matches($content, '(?i)\bbuildStagingDirectory\b').Count -ne 0) { Stop-Launcher "App Gradle Android marker was not found or a staging override already exists" }
+        $newline = if ($content.Contains(([string][char]13) + ([string][char]10))) { ([string][char]13) + ([string][char]10) } else { [string][char]10 }
+        if (-not $content.EndsWith($newline)) { $content += $newline }
+        $content = [regex]::Replace($content, '(?m)^\s*cliFile = new File\(\["node", "--print", "require\.resolve\(''@expo/cli'', \{ paths: \[require\.resolve\(''expo/package\.json''\) \]\}\)"\]\.execute\(null, rootDir\)\.text\.trim\(\)\)$', '    cliFile = new File(rootDir, "../node_modules/expo/node_modules/@expo/cli/build/bin/cli")')
+        $content += $newline + ('android.defaultConfig.externalNativeBuild.cmake.arguments.add(' + [char]34 + '-DCMAKE_OBJECT_PATH_MAX=128' + [char]34 + ')') + $newline
+        $stagePathGradle = "'" + $appCmakeStage.Replace("'", "\'") + "'"
+        $block = @(
+            'android {'
+            '    externalNativeBuild {'
+            '        cmake {'
+            ('            buildStagingDirectory ' + $stagePathGradle)
+            '        }'
+            '    }'
+            '}'
+        ) -join $newline
+        return $content + $block + $newline
     }
     $wrapper = Join-Path $androidDir "gradle\wrapper\gradle-wrapper.properties"
     Replace-TextFile $wrapper {

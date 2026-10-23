@@ -15,6 +15,7 @@ import json
 import re
 import threading
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -22,13 +23,25 @@ from typing import Any, Callable, Mapping, Sequence
 from .agent_work_runtime import ExecutionOutcome, WorkCandidate, WorkClaim
 from .cli_development_sessions import (
     CLI_DEVELOPMENT_CAPABILITIES,
+    CLI_ROLE_CONTEXT_MAX_BYTES,
     CLIDevelopmentSessionInvalid,
+    _build_pinned_role_context,
     normalize_cli_capabilities,
     pinned_cli_capabilities,
+    pinned_cli_role_context,
     CLI_SESSION_ADAPTER_KEY,
     CLI_SESSION_SOURCE_TYPE,
     CLIDevelopmentSessionService,
+    REMOTE_SESSION_SOURCE_TYPE,
+    REMOTE_SESSION_CAPABILITIES,
+    _assert_route,
     _sha256,
+)
+from .muse_remote_execution import (
+    MUSE_ADAPTER_KEY as MUSE_REMOTE_ADAPTER_KEY,
+    MUSE_EXECUTION_TARGET,
+    MUSE_PROVIDER,
+    REMOTE_AGENT_DELEGATE,
 )
 
 from ..llm.cli_backends.base import CLIInvocationOptions
@@ -230,6 +243,9 @@ class CLISessionWorkAdapter:
             "binding_id": context.get("binding_id"),
             "binding_snapshot_hash": context.get("binding_snapshot_hash"),
         }
+        role_context = pinned_cli_role_context(context)
+        if role_context is not None:
+            proof["role_context"] = dict(role_context)
         return CLINativeSessionScope(
             chat_session_id=session_id,
             branch_key="cli_development",
@@ -245,7 +261,43 @@ class CLISessionWorkAdapter:
             authority_digest=_sha256(json.dumps(context.get("authority") or {}, sort_keys=True, default=str)),
             policy_fingerprint=_sha256(json.dumps(context.get("policy") or {}, sort_keys=True, default=str)),
             provider_cache_root=str(context.get("provider_cache_root") or "") or None,
+            role_context_mode=(
+                str(role_context["mode"]) if role_context is not None else None
+            ),
+            role_context_sha256=(
+                str(role_context["role_context_sha256"])
+                if role_context is not None
+                else None
+            ),
         )
+
+    @staticmethod
+    def _validate_role_context_transport(backend: Any, role_context_text: str) -> None:
+        """Reject an unsupported or oversized role channel before dispatch."""
+
+        if len(role_context_text.encode("utf-8")) > CLI_ROLE_CONTEXT_MAX_BYTES:
+            raise CLISessionWorkError(
+                "cli_role_context_too_large",
+                "Agent role context exceeds the managed CLI transport limit",
+            )
+        execute = getattr(backend, "execute_prompt", None)
+        if not callable(execute):
+            raise CLISessionWorkError("cli_backend_invalid", "CLI backend has no execute_prompt")
+        try:
+            parameters = inspect.signature(execute).parameters
+        except (TypeError, ValueError) as exc:
+            raise CLISessionWorkError(
+                "cli_role_context_channel_unsupported",
+                "CLI backend role-context channel cannot be verified",
+            ) from exc
+        if "system_context" not in parameters and not any(
+            item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values()
+        ):
+            raise CLISessionWorkError(
+                "cli_role_context_channel_unsupported",
+                "CLI backend has no managed role-context channel",
+            )
 
     async def _invoke_backend(
         self,
@@ -256,10 +308,14 @@ class CLISessionWorkAdapter:
         options: CLIInvocationOptions,
         event_callback: Callable[[str, Mapping[str, Any]], Any],
         cancel_handle: Any,
+        system_context: str | None = None,
+        on_transport_send: Callable[[], None] | None = None,
     ) -> tuple[bool, str]:
         execute = getattr(backend, "execute_prompt", None)
         if not callable(execute):
             raise CLISessionWorkError("cli_backend_invalid", "CLI backend has no execute_prompt")
+        if system_context is not None:
+            self._validate_role_context_transport(backend, system_context)
         invocation = options
         if options.allowed_capabilities is not None:
             # A narrowed ceiling must reach the provider; never let signature
@@ -278,7 +334,7 @@ class CLISessionWorkAdapter:
             "cwd": Path(options.cwd) if options.cwd is not None else None,
             "timeout": None,
             "extra_args": [],
-            "system_context": None,
+            "system_context": system_context,
             "event_callback": event_callback,
             "native_session_id": options.native_session_id,
             "native_session_action": options.native_session_action,
@@ -295,7 +351,10 @@ class CLISessionWorkAdapter:
 
         def operation() -> tuple[bool, str]:
             # The only process boundary is the backend implementation.  The
-            # raw prompt is passed as-is and no system context is synthesized.
+            # raw prompt is passed as-is. Managed Agent mode supplies the
+            # separately validated server role context through system_context.
+            if on_transport_send is not None:
+                on_transport_send()
             return execute(prompt, **kwargs)
 
         from ..llm.generation_cancellation import (
@@ -410,6 +469,26 @@ class CLISessionWorkAdapter:
             route_projection = _assert_route(binding, provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), effort=str(context.get("effort") or ""))
             pinned = pinned_cli_capabilities(context)
             manifest = getattr(run_row, "resolved_execution_manifest", None)
+            role_context_pins = pinned_cli_role_context(context)
+            manifest_role_context = (
+                manifest.get("role_context") if isinstance(manifest, Mapping) else None
+            )
+            if role_context_pins is None:
+                if manifest_role_context not in (None, {}):
+                    return ExecutionOutcome(
+                        classification="blocked",
+                        error_code="cli_session_role_context_mismatch",
+                        error_message="raw session manifest contains managed role context",
+                    )
+                role_context = None
+            else:
+                if not isinstance(manifest_role_context, Mapping) or dict(manifest_role_context) != role_context_pins:
+                    return ExecutionOutcome(
+                        classification="blocked",
+                        error_code="cli_session_role_context_mismatch",
+                        error_message="execution role context differs from the fixed session context",
+                    )
+                role_context = _build_pinned_role_context(binding, context)
             records = (
                 self._claim_value(claim, "required_capabilities"),
                 getattr(work, "required_capabilities_json", None),
@@ -456,6 +535,23 @@ class CLISessionWorkAdapter:
                 if key in option_parameters
             })
             backend = await self._backend(provider=provider, model=model, effort=effort, options=options)
+            if role_context is not None:
+                self._validate_role_context_transport(backend, role_context.text)
+                role_delivery = {
+                    "mode": role_context.mode,
+                    "schema_version": role_context.context_schema_version,
+                    "agent_id": role_context.agent_id,
+                    "agent_revision_id": role_context.agent_revision_id,
+                    "role_sha256": role_context.role_context_sha256,
+                    "native_session_action": lease.action,
+                }
+                await self.service.record_runtime_event(
+                    run_id=run_id_text,
+                    work_item_id=work_id,
+                    event_type="cli.role_context.delivery",
+                    status="prepared",
+                    payload={**role_delivery, "delivery_state": "prepared"},
+                )
             with self._active_lock:
                 self._active[work_id] = (backend, run_id_text)
             loop = asyncio.get_running_loop()
@@ -495,7 +591,36 @@ class CLISessionWorkAdapter:
             # Prompt comes from the encrypted ConversationMessage.  It must be
             # read verbatim, including leading/trailing whitespace.
             prompt = str(getattr(trigger, "content", ""))
-            success, output = await self._invoke_backend(backend, prompt, run_id=run_id_text, options=options, event_callback=event_callback, cancel_handle=run_row)
+            transport_send_callback: Callable[[], None] | None = None
+            if role_context is not None:
+                def _record_role_sent() -> None:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.service.record_runtime_event(
+                            run_id=run_id_text,
+                            work_item_id=work_id,
+                            event_type="cli.role_context.delivery",
+                            status="sent",
+                            payload={**role_delivery, "delivery_state": "sent"},
+                        ),
+                        loop,
+                    )
+                    try:
+                        future.result(timeout=30)
+                    except BaseException:
+                        future.cancel()
+                        raise
+
+                transport_send_callback = _record_role_sent
+            success, output = await self._invoke_backend(
+                backend,
+                prompt,
+                run_id=run_id_text,
+                options=options,
+                event_callback=event_callback,
+                cancel_handle=run_row,
+                system_context=role_context.text if role_context is not None else None,
+                on_transport_send=transport_send_callback,
+            )
             native_id = None
             consume = getattr(backend, "consume_last_native_session_id", None)
             if callable(consume):
@@ -523,24 +648,32 @@ class CLISessionWorkAdapter:
                 for key, value in invocation_config.items()
                 if str(key) in applied_keys and value not in (None, "")
             }
+            requested_invocation = {
+                "provider": provider,
+                "model": model,
+                "effort": effort,
+                "permission_mode": str(context.get("permission_mode") or "native_default"),
+                "provider_state_root": str(context.get("provider_cache_root") or ""),
+                "execution_lane": "trusted_windows",
+                "native_session_action": lease.action,
+                "raw_prompt": True,
+                "retry_count": 1,
+                "source": "invocation_options",
+            }
+            if role_context is not None:
+                requested_invocation["agent_role"] = {
+                    "mode": role_context.mode,
+                    "schema_version": role_context.context_schema_version,
+                    "role_sha256": role_context.role_context_sha256,
+                    "delivery_state": "sent",
+                }
             await self.service.record_runtime_event(
                 run_id=run_id_text,
                 work_item_id=work_id,
                 event_type="cli.invocation",
                 status=str(diagnostics.get("status") or diagnostics.get("state") or "unknown")[:32],
                 payload={
-                    "requested": {
-                        "provider": provider,
-                        "model": model,
-                        "effort": effort,
-                        "permission_mode": str(context.get("permission_mode") or "native_default"),
-                        "provider_state_root": str(context.get("provider_cache_root") or ""),
-                        "execution_lane": "trusted_windows",
-                        "native_session_action": lease.action,
-                        "raw_prompt": True,
-                        "retry_count": 1,
-                        "source": "invocation_options",
-                    },
+                    "requested": requested_invocation,
                     "observed": observed_config,
                     "applied": applied_config,
                     "diagnostics": {str(key): value for key, value in diagnostics.items() if key in {"status", "state", "error_code", "wait_state", "wait_kind", "permission_event_count", "native_permission_denied_event_count", "permission_denial_count", "permission_denial_summary", "input_event_count", "effective_model", "cwd", "permission_mode", "stderr_present"}},
@@ -613,7 +746,7 @@ class CLISessionWorkAdapter:
                     await self.service.record_execution_result(session_id=str(getattr(lease.scope, "chat_session_id", "")), run_id=run_id_text, work_item_id=work_id, classification="uncertain", error_code=str(code), error_message="CLI execution state is uncertain", lease_owner=lease_owner, lease_token=lease_token, attempt=claim_attempt)
                 except Exception:
                     pass
-            return ExecutionOutcome(classification="blocked" if str(code).startswith(("trusted_windows", "agent_", "cli_session_binding", "cli_session_capability", "cli_capability")) else "uncertain", error_code=str(code), error_message="CLI session execution could not be completed")
+            return ExecutionOutcome(classification="blocked" if str(code).startswith(("trusted_windows", "agent_", "cli_session_binding", "cli_session_capability", "cli_capability", "cli_role_context")) else "uncertain", error_code=str(code), error_message="CLI session execution could not be completed")
         finally:
             native_handle_for_continuation = None
             release_ok = False
@@ -688,6 +821,236 @@ class CLISessionWorkAdapter:
             self._active.pop(work_id, None)
 
 
+class MuseRemoteTurnWorkAdapter:
+    """Execute one admitted Muse turn through the shared Work lease."""
+
+    adapter_key = MUSE_REMOTE_ADAPTER_KEY
+
+    def __init__(self, service: CLIDevelopmentSessionService, *, remote_adapter: Any | None = None):
+        self.service = service
+        self.remote_adapter = remote_adapter or service._get_remote_adapter()
+
+    @staticmethod
+    def _claim_value(claim: Any, name: str, default: Any = None) -> Any:
+        if isinstance(claim, Mapping):
+            return claim.get(name, default)
+        return getattr(claim, name, default)
+
+    def required_capabilities(self, claim: WorkClaim) -> tuple[str, ...]:
+        del claim
+        return (REMOTE_AGENT_DELEGATE,)
+
+    async def execute(
+        self,
+        claim: WorkClaim,
+        *,
+        coordinator: Any,
+        run_id: str | None = None,
+        run: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> ExecutionOutcome:
+        del coordinator
+        from ..memory.models import AgentRun, AgentWorkItem, ConversationSession
+
+        work_id = str(self._claim_value(claim, "work_item_id") or "")
+        if (
+            str(self._claim_value(claim, "source_type") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(self._claim_value(claim, "execution_adapter") or "") != MUSE_REMOTE_ADAPTER_KEY
+            or not work_id
+        ):
+            return ExecutionOutcome(classification="blocked", error_code="remote_session_binding_invalid")
+
+        db = await self.service._session()
+        try:
+            work = await db.get(AgentWorkItem, uuid.UUID(work_id))
+            if (
+                work is None
+                or str(work.source_type or "") != REMOTE_SESSION_SOURCE_TYPE
+                or str(work.execution_adapter or "") != MUSE_REMOTE_ADAPTER_KEY
+            ):
+                return ExecutionOutcome(classification="blocked", error_code="remote_session_binding_invalid")
+            conversation = await db.get(ConversationSession, work.conversation_session_id)
+            if conversation is None or getattr(conversation, "deleted_at", None) is not None:
+                return ExecutionOutcome(classification="blocked", error_code="remote_session_missing")
+
+            metadata = dict(claim.metadata) if isinstance(claim.metadata, Mapping) else {}
+            work_metadata = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+            context = self.service._context(conversation)
+            owner_id = str(metadata.get("owner_id") or "")
+            agent_id = str(self._claim_value(claim, "assigned_agent_id") or "")
+            revision_id = str(self._claim_value(claim, "agent_revision_id") or "")
+            remote_target_key = str(metadata.get("remote_target_key") or "")
+            if (
+                not self.service._is_remote_context(context)
+                or str(conversation.user_id) != owner_id
+                or str(work_metadata.get("owner_id") or "") != owner_id
+                or str(work.conversation_session_id) != str(conversation.id)
+                or str(work.assigned_agent_id) != agent_id
+                or str(work.agent_revision_id) != revision_id
+                or str(context.get("agent_id") or conversation.agent_id or "") != agent_id
+                or str(context.get("agent_revision_id") or "") != revision_id
+                or remote_target_key != str(conversation.id)
+                or str(metadata.get("execution_target") or "") != MUSE_EXECUTION_TARGET
+                or set(self._claim_value(claim, "required_capabilities", ()) or ())
+                != {REMOTE_AGENT_DELEGATE}
+            ):
+                return ExecutionOutcome(classification="blocked", error_code="remote_session_identity_mismatch")
+
+            selected_run_id = str(
+                (run or {}).get("id") or run_id or work.active_agent_run_id or ""
+            )
+            active_run = await db.get(AgentRun, uuid.UUID(selected_run_id)) if selected_run_id else None
+            if (
+                active_run is None
+                or str(work.active_agent_run_id or "") != str(active_run.id)
+                or str(active_run.work_item_id or "") != str(work.id)
+                or str(active_run.session_id) != str(conversation.id)
+                or str(active_run.run_type or "") != REMOTE_SESSION_SOURCE_TYPE
+                or str(active_run.agent_id) != agent_id
+                or str(active_run.agent_revision_id) != revision_id
+            ):
+                return ExecutionOutcome(classification="blocked", error_code="remote_session_run_mismatch")
+
+            self.service._assert_remote_admission(owner_id=owner_id, agent_id=agent_id)
+            await self.service._resolve_authority(
+                agent_id=agent_id,
+                revision_id=revision_id,
+                project_id=context.get("project_id"),
+                capabilities=REMOTE_SESSION_CAPABILITIES,
+            )
+            binding = await self.service._binding_for_row(db, conversation)
+            _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+            managed_role = self.service._managed_role_mapping(binding, context)
+            pinned_role = work_metadata.get("managed_role_context")
+            if managed_role is None:
+                if pinned_role not in (None, {}):
+                    return ExecutionOutcome(classification="blocked", error_code="remote_role_context_mismatch")
+            else:
+                expected_pins = {
+                    key: managed_role[key]
+                    for key in (
+                        "mode",
+                        "context_schema_version",
+                        "agent_id",
+                        "agent_revision_id",
+                        "role_context_sha256",
+                    )
+                }
+                if not isinstance(pinned_role, Mapping) or dict(pinned_role) != expected_pins:
+                    return ExecutionOutcome(classification="blocked", error_code="remote_role_context_mismatch")
+
+            metadata.update(
+                {
+                    "agent_id": agent_id,
+                    "agent_revision_id": revision_id,
+                    "provider": MUSE_PROVIDER,
+                }
+            )
+            if managed_role is not None:
+                # Role text is rebuilt from the immutable binding and exists
+                # only in this in-memory claim passed to the provider adapter.
+                metadata["managed_role_context"] = managed_role
+            execution_claim = replace(claim, metadata=metadata)
+            current_authority = {
+                "owner_id": owner_id,
+                "agent_id": agent_id,
+                "revision_id": revision_id,
+                "remote_target_key": remote_target_key,
+                "required_capabilities": list(REMOTE_SESSION_CAPABILITIES),
+                "allowed_adapters": [MUSE_REMOTE_ADAPTER_KEY],
+                "allowed_targets": [MUSE_EXECUTION_TARGET],
+            }
+        except Exception as exc:
+            safe_code = str(getattr(exc, "code", None) or "remote_session_admission_failed")[:96]
+            return ExecutionOutcome(classification="blocked", error_code=safe_code)
+        finally:
+            await self.service._close(db)
+
+        outcome = await self.remote_adapter.execute(
+            execution_claim,
+            authority=current_authority,
+        )
+        result = outcome.result if isinstance(outcome.result, Mapping) else {}
+        try:
+            receipt = await self.service.record_execution_result(
+                session_id=str(conversation.id),
+                run_id=str(active_run.id),
+                work_item_id=work_id,
+                classification=outcome.classification,
+                assistant_text=(
+                    str(result.get("assistant_text") or "")
+                    if outcome.classification == "succeeded"
+                    else None
+                ),
+                assistant_message_id=(
+                    str(result.get("assistant_message_id") or "")
+                    if outcome.classification == "succeeded"
+                    else None
+                ),
+                error_code=outcome.error_code,
+                error_message=outcome.error_message,
+                lease_owner=str(self._claim_value(claim, "lease_owner") or ""),
+                lease_token=str(self._claim_value(claim, "lease_token") or ""),
+                attempt=int(self._claim_value(claim, "attempt", 0) or 0),
+            )
+        except Exception:
+            safe_result = dict(result)
+            safe_result["turn_status"] = "uncertain"
+            safe_result["safe_to_send"] = False
+            return ExecutionOutcome(
+                classification="uncertain",
+                success=False,
+                error_code="remote_result_persist_failed",
+                result=safe_result,
+                metadata=dict(outcome.metadata or {}),
+            )
+        if receipt.get("discarded"):
+            safe_result = dict(result)
+            safe_result["turn_status"] = "uncertain"
+            safe_result["safe_to_send"] = False
+            return ExecutionOutcome(
+                classification="uncertain",
+                success=False,
+                error_code="remote_result_discarded",
+                result=safe_result,
+                metadata=dict(outcome.metadata or {}),
+            )
+        return outcome
+
+    async def abort(self, claim: WorkClaim) -> Mapping[str, Any]:
+        work_id = str(self._claim_value(claim, "work_item_id") or "")
+        return await self.remote_adapter.cancel(work_id)
+
+    cancel = abort
+
+    async def recover_stale(
+        self,
+        session: Any,
+        row: Any,
+        *,
+        coordinator: Any,
+        now: Any,
+    ) -> bool:
+        """Park an expired remote attempt for history-only reconciliation."""
+
+        del now
+        if (
+            str(getattr(row, "source_type", "") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(getattr(row, "execution_adapter", "") or "") != MUSE_REMOTE_ADAPTER_KEY
+            or str(getattr(row, "state", "") or "") not in {"claimed", "running"}
+        ):
+            return False
+        await coordinator._transition_locked(
+            session,
+            row,
+            "uncertain",
+            token=None,
+            error_code="muse_remote_interrupted_by_restart",
+            error_message="Muse remote execution outcome requires history reconciliation",
+        )
+        return True
+
+
 def register_cli_session_work(coordinator: Any, service: CLIDevelopmentSessionService, *, backend_factory: Any | None = None, session_store: Any | None = None) -> CLISessionWorkAdapter:
     """Register the source and adapter on an existing shared coordinator."""
 
@@ -700,10 +1063,31 @@ def register_cli_session_work(coordinator: Any, service: CLIDevelopmentSessionSe
     return adapter
 
 
+def register_muse_remote_session_work(
+    coordinator: Any,
+    service: CLIDevelopmentSessionService,
+    *,
+    remote_adapter: Any | None = None,
+) -> MuseRemoteTurnWorkAdapter:
+    """Register admitted Muse turns on the shared durable Work lane."""
+
+    if coordinator is None:
+        raise ValueError("shared AgentWorkCoordinator is required")
+    from .cli_development_sessions import MuseRemoteTurnWorkSource
+
+    adapter = MuseRemoteTurnWorkAdapter(service, remote_adapter=remote_adapter)
+    source = MuseRemoteTurnWorkSource(service)
+    coordinator.register_source(source, source_type=REMOTE_SESSION_SOURCE_TYPE)
+    coordinator.register_adapter(adapter, adapter_key=MUSE_REMOTE_ADAPTER_KEY)
+    return adapter
+
+
 __all__ = [
     "CLIInvocationOptions",
     "CLISessionTurnWorkSource",
     "CLISessionWorkAdapter",
+    "MuseRemoteTurnWorkAdapter",
     "register_cli_session_work",
+    "register_muse_remote_session_work",
     "CLISessionWorkError",
 ]

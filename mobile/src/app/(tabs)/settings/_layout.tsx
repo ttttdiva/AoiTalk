@@ -49,6 +49,24 @@ export default function SettingsLayout() {
           ),
         }}
       />
+      <Stack.Screen
+        name="sync-status"
+        options={{
+          title: "同期の状態",
+          header: ({ navigation }) => (
+            <SettingsNativeHeader title="同期の状態" navigation={navigation} />
+          ),
+        }}
+      />
+      <Stack.Screen
+        name="sync-conflicts"
+        options={{
+          title: "同期の競合",
+          header: ({ navigation }) => (
+            <SettingsNativeHeader title="同期の競合" navigation={navigation} />
+          ),
+        }}
+      />
       <Stack.Screen name="connection" options={{ title: 'Server / Network', headerShown: false }} />
       <Stack.Screen name="remote-servers" options={{ title: '外部サーバー接続', headerShown: false }} />
       <Stack.Screen name="notifications" options={{ title: 'Task notifications / Calendar', headerShown: false }} />

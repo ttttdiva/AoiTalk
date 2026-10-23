@@ -876,6 +876,8 @@ class OpenAIToolCallRecord:
     arguments_digest: str = ""
     # Safe provenance (code, target digest) of a server-contract argument rejection.
     argument_rejection: dict[str, str] | None = None
+    # Safe fixed code for a framework policy refusal before execution.
+    policy_denial: dict[str, str] | None = None
 
     @property
     def call_id(self) -> str:
@@ -1565,6 +1567,11 @@ def _openai_tool_call_record_from_unified(tool_result: Any) -> OpenAIToolCallRec
         argument_rejection=(
             dict(getattr(tool_result, "argument_rejection"))
             if getattr(tool_result, "argument_rejection", None)
+            else None
+        ),
+        policy_denial=(
+            dict(getattr(tool_result, "policy_denial"))
+            if getattr(tool_result, "policy_denial", None)
             else None
         ),
     )

@@ -31,6 +31,7 @@ from .personal_finance_contracts import (
     compute_confirmed_digest,
 )
 from .personal_finance_service import _parse_idempotency_key
+from .personal_async_guard import run_personal_guard
 from .personal_finance_summary import (
     MAX_ROWS,
     STATE_OWNER_CONFIRMED,
@@ -108,6 +109,7 @@ class PersonalFinanceDatasetService:
         row_refs: Sequence[Any],
         owner_confirmed: bool,
         idempotency_key: str,
+        guard: Any | None = None,
     ) -> FinanceDatasetView:
         if not isinstance(actor, FinanceActor):
             raise FinanceActorNotAllowed("actor must be an issued FinanceActor")
@@ -131,17 +133,19 @@ class PersonalFinanceDatasetService:
                     entry_model.row_ref.in_(refs),
                 )
             )
+            await run_personal_guard(guard)
             found = {row.row_ref: (row.id, row.content_digest) for row in result}
             if set(found) != set(refs):
                 raise FinanceContractError("every row_ref must be an owner-confirmed entry of this owner")
-            total = (
-                await session.execute(
-                    select(func.count()).select_from(entry_model).where(entry_model.owner_user_id == owner)
-                )
-            ).scalar_one()
+            total_result = await session.execute(
+                select(func.count()).select_from(entry_model).where(entry_model.owner_user_id == owner)
+            )
+            await run_personal_guard(guard)
+            total = total_result.scalar_one()
             digest = members_digest(owner, [(ref, found[ref][1]) for ref in refs])
 
             existing = await self._get_by_key(session, dataset_model, owner, key)
+            await run_personal_guard(guard)
             if existing is not None:
                 return self._replay_or_conflict(existing, digest)
 
@@ -155,6 +159,7 @@ class PersonalFinanceDatasetService:
             session.add(dataset)
             try:
                 await session.flush()
+                await run_personal_guard(guard)
                 for ref in sorted(refs, key=str):
                     session.add(
                         member_model(
@@ -174,6 +179,7 @@ class PersonalFinanceDatasetService:
                     idempotency_key=key,
                 )
                 await session.commit()
+                await run_personal_guard(guard)
             except IntegrityError as exc:
                 await session.rollback()
                 if "uq_personal_finance_datasets_owner_idempotency_key" not in str(getattr(exc, "orig", exc)):
@@ -184,9 +190,43 @@ class PersonalFinanceDatasetService:
         # Lost the race: replay or conflict against the winner.
         async with self._session_factory() as session:
             existing = await self._get_by_key(session, dataset_model, owner, key)
+            await run_personal_guard(guard)
         if existing is None:  # pragma: no cover - defensive
             raise raced
         return self._replay_or_conflict(existing, digest)
+
+    async def list_datasets(
+        self,
+        *,
+        owner_user_id: UUID,
+        limit: int = 50,
+        guard: Any | None = None,
+    ) -> tuple[FinanceDatasetView, ...]:
+        """Return a bounded owner-only list of accepted snapshot headers."""
+
+        if not isinstance(owner_user_id, UUID) or type(limit) is not int or not 1 <= limit <= 100:
+            raise FinanceContractError("invalid finance dataset list request")
+        _, dataset_model, _ = self._models()
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(dataset_model)
+                .where(dataset_model.owner_user_id == owner_user_id)
+                .order_by(dataset_model.created_at.desc(), dataset_model.id.desc())
+                .limit(limit)
+            )
+            await run_personal_guard(guard)
+            rows = result.scalars().all()
+            return tuple(
+                FinanceDatasetView(
+                    owner_user_id=row.owner_user_id,
+                    dataset_ref=row.id,
+                    member_count=row.member_count,
+                    complete=row.complete,
+                    members_digest=row.members_digest,
+                    idempotency_key=row.idempotency_key,
+                )
+                for row in rows
+            )
 
     @staticmethod
     async def _get_by_key(session: Any, dataset_model: Any, owner: UUID, key: str) -> Any:
@@ -217,13 +257,13 @@ class PersonalFinanceDatasetService:
         *,
         owner_user_id: UUID,
         dataset_ref: UUID,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> FinanceSummarySnapshot:
         """Owner SQL filter, ``guard`` after each await, decrypt, then re-verify digests."""
         if not isinstance(owner_user_id, UUID) or not isinstance(dataset_ref, UUID):
             raise FinanceSummaryTrustError("owner and dataset must be UUIDs")
         entry_model, dataset_model, member_model = self._models()
-        check = guard if guard is not None else (lambda: None)
+        check = guard
 
         async with self._session_factory() as session:
             header_result = await session.execute(
@@ -232,7 +272,7 @@ class PersonalFinanceDatasetService:
                     dataset_model.id == dataset_ref,
                 )
             )
-            check()
+            await run_personal_guard(check)
             header = header_result.scalar_one_or_none()
             if header is None:
                 raise FinanceSummaryTrustError("accepted dataset not available for this owner")
@@ -250,7 +290,7 @@ class PersonalFinanceDatasetService:
                 .order_by(member_model.row_ref)
                 .limit(MAX_ROWS + 1)
             )
-            check()
+            await run_personal_guard(check)
             pairs = list(member_result.all())
             # Payload decryption happens only below, after the guard re-check.
             if len(pairs) != header.member_count or len(pairs) > MAX_ROWS:

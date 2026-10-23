@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import ast
 import re
 import shlex
 import uuid
@@ -492,10 +493,6 @@ _DESTRUCTIVE_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bdd\s+[^|]*\bof=", re.IGNORECASE),
     # 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製、
     # /dev/null・$null・NUL への破棄はファイルを壊さないので対象外。
-    re.compile(
-        r"(?<!>)>(?!>)(?!&)\s*(?!(?:/dev/null|\$null|nul\b))\S",
-        re.IGNORECASE,
-    ),
     re.compile(r"\bOut-File\b(?![^|]*-Append)", re.IGNORECASE),
     re.compile(r"\bSet-Content\b", re.IGNORECASE),
     # 破壊的な git 操作
@@ -516,6 +513,58 @@ _DESTRUCTIVE_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+# 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製、
+# /dev/null・$null・NUL への破棄はファイルを壊さないので対象外。
+_OVERWRITE_REDIRECT_PATTERN = re.compile(
+    r"(?<!>)>(?!>)(?!&)\s*(?!(?:/dev/null|\$null|nul\b))\S",
+    re.IGNORECASE,
+)
+
+# `python -c "<code>"` / `python -c '<code>'` のコード引数。
+_PYTHON_C_ARG_PATTERN = re.compile(
+    r"""\b(?:python3?|py)(?:\.exe)?(?:\s+-[A-Za-z]+)*\s+-c\s+("(?:\\.|[^"\\])*"|'[^']*')""",
+    re.IGNORECASE,
+)
+
+
+def _python_c_string_literals(arg: str) -> Optional[str]:
+    """``python -c`` の引用済みコード引数から文字列リテラルだけを取り出す。
+
+    コードが構文解析できる場合、``len(x) > 0`` のような比較演算子は shell の
+    リダイレクトではないので捨て、``os.system('echo x > f')`` のように
+    shell へ渡り得る文字列定数だけを残す。解析できなければ ``None``。
+    """
+    body = arg[1:-1]
+    if arg[0] == '"':
+        body = body.replace('\\"', '"')
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return None
+    literals = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                literals.append(node.value)
+            elif isinstance(node.value, bytes):
+                # b'...'.decode() 経由で shell へ渡り得るので保守的に保持する
+                literals.append(node.value.decode("latin-1"))
+    return " ".join(literals)
+
+
+def _mask_python_code_args(text: str) -> str:
+    """リダイレクト判定用に ``python -c`` のコード本文を文字列定数へ縮める。"""
+
+    def _replace(match: "re.Match[str]") -> str:
+        literals = _python_c_string_literals(match.group(1))
+        if literals is None:
+            return match.group(0)
+        head = match.group(0)[: match.start(1) - match.start(0)]
+        return head + '"' + literals.replace('"', "'") + '"'
+
+    return _PYTHON_C_ARG_PATTERN.sub(_replace, text)
+
+
 def _command_looks_destructive(command: str) -> bool:
     """コマンド文字列が取り返しのつかない操作かどうかを判定する。
 
@@ -525,7 +574,9 @@ def _command_looks_destructive(command: str) -> bool:
     text = str(command or "").strip()
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _DESTRUCTIVE_COMMAND_PATTERNS)
+    if any(pattern.search(text) for pattern in _DESTRUCTIVE_COMMAND_PATTERNS):
+        return True
+    return bool(_OVERWRITE_REDIRECT_PATTERN.search(_mask_python_code_args(text)))
 
 
 def _command_program_name(command: str) -> str:

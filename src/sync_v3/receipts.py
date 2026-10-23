@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from typing import Any
 from uuid import UUID
 
@@ -13,7 +14,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..security.field_crypto import FieldCryptoError, decrypt_json_value_if_needed, encrypt_json_value, get_data_key
-from .merge import FIELD_NAME_RE
+
+FIELD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 RECEIPT_RETIREMENT_DDL = """
 ALTER TABLE sync_op_receipts ADD COLUMN IF NOT EXISTS device_id uuid NOT NULL;
@@ -29,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sync_device_floors (
 """
 
 RECORD_KEYS = frozenset(
-    {"v", "status", "code", "applied_fields", "conflict_fields", "request_mac"}
+    {"v", "status", "code", "reason_code", "applied_fields", "conflict_fields", "request_mac"}
 )
 _MAC_INFO = b"aoitalk:sync_op_receipts:request:v1"
 _ENCRYPTED_PREFIX = "enc:v1:"
@@ -60,17 +62,27 @@ def _field_list(value: Any) -> list[str]:
     return list(value)
 
 
+def _reason_code(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not (isinstance(value, str) and FIELD_NAME_RE.match(value)):
+        raise FieldCryptoError("receipt record has invalid reason_code")
+    return value
+
+
 def build_record(
     status: str,
     code: str | None,
     applied_fields: list[str],
     conflict_fields: list[str],
     mac: str,
+    reason_code: str | None = None,
 ) -> dict[str, Any]:
     return {
         "v": 1,
         "status": status,
         "code": code,
+        "reason_code": _reason_code(reason_code),
         "applied_fields": _field_list(list(applied_fields)),
         "conflict_fields": _field_list(list(conflict_fields)),
         "request_mac": mac,
@@ -96,6 +108,7 @@ def decrypt_record(user_id: UUID, op_id: UUID, stored: Any) -> dict[str, Any]:
         raise FieldCryptoError("receipt record has unexpected keys")
     _field_list(record["applied_fields"])
     _field_list(record["conflict_fields"])
+    _reason_code(record["reason_code"])
     return record
 
 

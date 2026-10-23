@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -43,8 +43,10 @@ from ._shared import (
     UpdateTaskPayload,
     _build_update_task_updates,
     _parse_browse_scope,
+    _parse_datetime,
     _parse_wall_clock_datetime,
 )
+from .read_projection import get_task_section
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +259,47 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 if browse_project_id is not None or browse_space_id is not None
                 else {}
             )
+            if request.query_params.get("projection") == "compact":
+                try:
+                    limit = int(request.query_params.get("limit", "50"))
+                    offset = int(request.query_params.get("offset", "0"))
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid limit or offset"
+                    ) from exc
+                if not 1 <= limit <= 100 or offset < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="limit must be 1-100 and offset non-negative",
+                    )
+                tasks, has_more = await service.list_tasks_compact(
+                    session,
+                    user_id=user_id,
+                    project_id=parse_uuid_or_400(
+                        request.query_params.get("project_id"), "project_id"
+                    ),
+                    space_id=parse_uuid_or_400(
+                        request.query_params.get("space_id"), "space_id"
+                    ),
+                    status=request.query_params.get("status"),
+                    assignee_id=parse_uuid_or_400(
+                        request.query_params.get("assignee_id"), "assignee_id"
+                    ),
+                    search=request.query_params.get("search"),
+                    due_before=_parse_wall_clock_datetime(
+                        request.query_params.get("due_before"), "due_before"
+                    ),
+                    updated_before=_parse_datetime(
+                        request.query_params.get("updated_before"), "updated_before"
+                    ),
+                    limit=limit,
+                    offset=offset,
+                    **browse_kwargs,
+                )
+                return JSONResponse(
+                    content=tasks,
+                    headers={"X-AoiTalk-Has-More": "true" if has_more else "false"},
+                )
             tasks = await service.list_tasks(
                 session,
                 user_id=user_id,
@@ -290,6 +333,16 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            if request.query_params.get("section") is not None:
+                return await get_task_section(
+                    session,
+                    service=service,
+                    user_id=user_id,
+                    task_id=parse_uuid_or_400(task_id, "task_id"),
+                    request=request,
+                    serialize_reference=_serialize_task_reference,
+                    serialize_relation=_serialize_task_relation,
+                )
             browse_project_id, browse_space_id = _parse_browse_scope(request)
             browse_kwargs = (
                 {

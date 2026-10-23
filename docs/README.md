@@ -23,18 +23,14 @@
 | [mage_vl.md](mage_vl.md) | Mage-VL / SGLang video route |
 | [growi-rag-setup.md](growi-rag-setup.md) | GROWI knowledge source |
 | [logging.md](logging.md) | ログ配置・rotation。`src/utils/log_layout.py`, housekeeping |
-| [workspace_storage_cleanup.md](workspace_storage_cleanup.md) | workspace orphan audit/cleanup |
 | [security_hardening.md](security_hardening.md) | field encryption / local security |
 | [pricing_catalog.md](pricing_catalog.md) | cost catalog。実単価の正本は `config/pricing_catalog.json` |
 | [openapi_typegen.md](openapi_typegen.md) | FastAPI OpenAPI → TypeScript 型生成 |
 | [schema_drift_check.md](schema_drift_check.md) | Alembic と Drizzle の schema drift 検知 |
 | [mobile-auto-update-standard.md](mobile-auto-update-standard.md) | APK / `latest.json` / mobile release |
-| [release-checklist.md](release-checklist.md) | 通常 push、mobile、public publish、Enterprise handoff の入口 |
 | [enterprise_project_permissions.md](enterprise_project_permissions.md) | Enterprise project ACL / migration operation |
 | [enterprise_secrets.md](enterprise_secrets.md) | Enterprise secret boundary |
 | [chatgpt_web_director.md](chatgpt_web_director.md) | ChatGPT Web Director の利用・CLI |
-| [local_agent_tasks.md](local_agent_tasks.md) | Home MCP Gateway からのローカルLLM多段階タスク委譲。`src/services/local_agent_tasks.py`, `src/api/local_agent_task_routes.py` |
-| [ai_webui_qa.md](ai_webui_qa.md) | WebUI 変更時の独立 AI browser QA |
 | [task_workspace_rebuild.md](task_workspace_rebuild.md) | 現行 task workspace の構成と参照先。歴史的なファイル名は維持 |
 | [media_brand_portfolio.md](media_brand_portfolio.md) | MediaOps ブランドポートフォリオ配置表と簡易設定手順。47素材・15アカウント・8下書き・9管理参照 |
 
@@ -52,7 +48,6 @@
 
 ## 3. 設計・再構築・履歴文書
 
-- [pc_bridge.md](pc_bridge.md) — ポータブルexe、接続先PCの選択、既存EdgeとWindows Computer Use
 - [jev_browser_agent.md](jev_browser_agent.md) — 既存Microsoft Edgeのログイン済みタブを操作する拡張機能。Jev/LLM切り替え、インストール、設定、実動作検証
 
 これらは重要な設計根拠ですが、**現在の runtime 仕様そのものではありません**。過去時点の DB 件数、未実装項目、ファイル行数、API の有無を現行仕様として引用しないでください。

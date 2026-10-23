@@ -340,6 +340,7 @@ class TimeTrackingMixin:
         started_at: Optional[datetime] = None,
         ended_at: Optional[datetime] = None,
         note: Optional[str] = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         result = await session.execute(
             select(TimeEntry).where(
@@ -379,7 +380,10 @@ class TimeTrackingMixin:
             raise TaskManagementError(
                 "ended_at must be after started_at", status_code=400
             )
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
         return await self._serialize_time_entry(session, entry_id)
 
     async def delete_time_entry(
@@ -388,6 +392,7 @@ class TimeTrackingMixin:
         *,
         user_id: UUID,
         entry_id: UUID,
+        commit: bool = True,
     ) -> None:
         result = await session.execute(
             select(TimeEntry).where(
@@ -406,7 +411,10 @@ class TimeTrackingMixin:
             entry.ended_at = timer_now_db()
         entry.deleted_at = now
         entry.updated_at = now
-        await session.commit()
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
 
     async def list_time_entries(
         self,

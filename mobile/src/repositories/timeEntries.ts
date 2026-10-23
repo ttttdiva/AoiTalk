@@ -1,17 +1,27 @@
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import {
+  assertActiveWriter,
+  type SqliteHandle,
+  type SqliteWriter,
+} from "../db/sqlite-writer";
 import { decodeTokenPayload, getToken } from "../lib/auth";
 import { taskApi } from "../lib/task-api";
 import { canAttemptAoiTalkServer } from "../stores/network";
 import type { TimeEntry, TimeReport, TimeReportBucket } from "../types/api";
 import { enqueueOutbox, getOutboxMutationWakeScope, randomId } from "./outbox";
 import { notifyMutationQueued } from "../sync/task-mutation-wake";
-import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
+import {
+  compareTaskTimestamps,
+  isTaskTombstonedInWriter,
+  prepareTaskTombstoneLedgerKey,
+} from "./tasks";
 import {
   compareTombstoneTimestamps,
-  loadTombstoneLedger,
-  persistTombstoneLedger,
+  loadTombstoneLedgerInWriter,
+  persistTombstoneLedgerInWriter,
+  prepareTombstoneLedgerKey,
 } from "./tombstone-ledger";
 
 type JoinedTimeEntryRow = {
@@ -180,29 +190,55 @@ async function joinTimeEntries(
     .orderBy(desc(schema.timeEntries.startedAt));
 }
 
-export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
+const TIME_ENTRY_LEDGER_PREFIX = "time-entries:tombstones";
+
+/** Async preparation (token reads) shared by the time-entry InWriter functions. */
+export type TimeEntryApplyPrep = {
+  ledgerKey: string;
+  taskLedgerKey: string;
+  token: string | null;
+  userId: string | null;
+};
+
+export async function prepareTimeEntryApply(): Promise<TimeEntryApplyPrep> {
+  const token = await getToken();
+  const userId = token ? await currentUserId() : null;
+  return {
+    ledgerKey: await prepareTombstoneLedgerKey(TIME_ENTRY_LEDGER_PREFIX),
+    taskLedgerKey: await prepareTaskTombstoneLedgerKey(),
+    token,
+    userId,
+  };
+}
+
+export function applyRemoteTimeEntriesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  list: TimeEntry[],
+  prep: TimeEntryApplyPrep,
+): void {
+  assertActiveWriter(writer);
   if (!list.length) return;
   // Sync responses can contain entries from other members of a shared
   // project.  The local time-entry cache is account-owned, so filter before
   // touching SQLite (not only at the list/refresh boundary).  An opaque or
   // undecodable token is fail-closed rather than being treated as anonymous.
-  const token = await getToken();
-  const userId = token ? await currentUserId() : null;
+  const { token, userId } = prep;
   const scoped = list.filter((entry) => {
     const entryUserId = typeof entry.user_id === "string" ? entry.user_id : "";
     return token ? Boolean(userId) && entryUserId === userId : !entryUserId;
   });
   if (!scoped.length) return;
-  const db = getDb();
   const now = new Date().toISOString();
-  const ledger = await loadTombstoneLedger("time-entries:tombstones");
+  const ledger = loadTombstoneLedgerInWriter(writer, tx, prep.ledgerKey);
   let ledgerChanged = false;
   for (const entry of scoped) {
-    if (await isTaskTombstoned(entry.task_id)) continue;
-    const existing = await db
+    if (isTaskTombstonedInWriter(writer, tx, entry.task_id, prep.taskLedgerKey)) continue;
+    const existing = tx
       .select({ deletedAt: schema.timeEntries.deletedAt, updatedAt: schema.timeEntries.updatedAt })
       .from(schema.timeEntries)
-      .where(eq(schema.timeEntries.id, entry.id));
+      .where(eq(schema.timeEntries.id, entry.id))
+      .all();
     const current = existing[0];
     const incomingUpdatedAt = entry.updated_at ?? now;
     const hasIncomingVersion =
@@ -234,7 +270,7 @@ export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
     ) {
       continue;
     }
-    await db
+    tx
       .insert(schema.timeEntries)
       .values({
         id: entry.id,
@@ -264,17 +300,31 @@ export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
           updatedAt: entry.updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
   }
-  if (ledgerChanged) await persistTombstoneLedger(ledger);
+  if (ledgerChanged) persistTombstoneLedgerInWriter(writer, tx, ledger);
 }
 
-export async function applyTimeEntryTombstones(
+export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
+  if (!list.length) return;
+  const prep = await prepareTimeEntryApply();
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyRemoteTimeEntriesInWriter(writer, tx, list, prep),
+    ),
+  );
+}
+
+export function applyTimeEntryTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
-): Promise<void> {
+  ledgerKey: string,
+): void {
+  assertActiveWriter(writer);
   if (!tombstones.length) return;
-  const db = getDb();
-  const ledger = await loadTombstoneLedger("time-entries:tombstones");
+  const ledger = loadTombstoneLedgerInWriter(writer, tx, ledgerKey);
   let ledgerChanged = false;
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
@@ -284,12 +334,25 @@ export async function applyTimeEntryTombstones(
     }
     ledger.entries.set(item.id, deletedAt);
     ledgerChanged = true;
-    await db
+    tx
       .update(schema.timeEntries)
       .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.timeEntries.id, item.id));
+      .where(eq(schema.timeEntries.id, item.id))
+      .run();
   }
-  if (ledgerChanged) await persistTombstoneLedger(ledger);
+  if (ledgerChanged) persistTombstoneLedgerInWriter(writer, tx, ledger);
+}
+
+export async function applyTimeEntryTombstones(
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): Promise<void> {
+  if (!tombstones.length) return;
+  const ledgerKey = await prepareTombstoneLedgerKey(TIME_ENTRY_LEDGER_PREFIX);
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyTimeEntryTombstonesInWriter(writer, tx, tombstones, ledgerKey),
+    ),
+  );
 }
 
 export function buildTimeReportFromEntries(

@@ -31,6 +31,20 @@ export const MAX_TASK_PROPOSAL_TASK_IDS = 50;
 export const TASK_PROPOSALS_LIST_PATH = "/api/python-proxy/task-proposals";
 export const TASK_PROPOSALS_REFRESH_EVENT = "aoitalk:task-proposals-refresh";
 
+/**
+ * 「確認」の遷移先。提案が属する既存の会話を開き、どの提案かを
+ * `proposal` で識別する。実行・決定は一切送らない。
+ */
+export function taskProposalChatPath(
+  proposal: Pick<TaskProposal, "id" | "session_id">,
+): string {
+  const query = new URLSearchParams({
+    s: proposal.session_id,
+    proposal: proposal.id,
+  });
+  return `/chat?${query.toString()}`;
+}
+
 export class TaskProposalsApiError extends Error {
   constructor(
     message: string,

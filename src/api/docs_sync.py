@@ -41,6 +41,7 @@ from ..services.docs_graph_service import (
     DocsGraphService,
     is_explicit_blank_paragraph,
 )
+from ..services.docs_workspace import DOCS_LIBRARY_NAME
 from ..services.docs_acl import (
     batch_sync_node_access,
     docs_readable_node_predicate,
@@ -2085,6 +2086,109 @@ def _split_entity_id(entity_id: str) -> tuple[Optional[UUID], Optional[UUID]]:
     return parse_uuid(parts[0]), parse_uuid(parts[1]) if len(parts) == 2 else None
 
 
+async def resolve_docs_conflict_library(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    entity_id: str,
+    payload: dict[str, Any],
+    read_only: bool = False,
+) -> DocsLibrary | None:
+    """Resolve the library used by the legacy Docs conflict projection.
+
+    v2 conflict projection is payload-driven: project_id wins, then node_id,
+    then the first composite-key component, and finally the actor's Personal
+    library. Keep that precedence shared with v3. Its response read uses the
+    SELECT-only path so resolving a conflict cannot initialize a library.
+    """
+    service = DocsGraphService(session)
+
+    async def personal_library() -> DocsLibrary | None:
+        if not read_only:
+            return await service.ensure_library(user_id)
+        result = await session.execute(
+            select(DocsLibrary)
+            .where(DocsLibrary.owner_user_id == user_id)
+            .order_by(
+                (DocsLibrary.name == DOCS_LIBRARY_NAME).desc(),
+                DocsLibrary.created_at,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    conflict_project = payload.get("project_id")
+    if conflict_project:
+        try:
+            project_id = UUID(str(conflict_project))
+            if read_only:
+                # ensure_project_information_library requires write permission
+                # and may seed/repair rows. Mirror its authorization using a
+                # SELECT-only permission check before reading the canonical
+                # project library.
+                allowed = await ProjectRepository.has_permission(
+                    session,
+                    project_id=project_id,
+                    user_id=user_id,
+                    permission="write",
+                )
+                if not allowed:
+                    return await personal_library()
+                library = await service.get_project_information_library(project_id, user_id)
+                return library if library is not None else await personal_library()
+            return await service.ensure_project_information_library(project_id, user_id)
+        except Exception:
+            return await personal_library()
+
+    conflict_ref = payload.get("node_id") or str(entity_id).split(":", 1)[0]
+    try:
+        conflict_node = await session.get(KnowledgeNode, UUID(str(conflict_ref)))
+    except (TypeError, ValueError):
+        conflict_node = None
+    if conflict_node is not None:
+        return await session.get(DocsLibrary, conflict_node.docs_library_id)
+    return await personal_library()
+
+
+async def docs_composite_response_readable(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    table: str,
+    entity_id: str,
+    docs_library_id: UUID,
+) -> bool:
+    """Check the existing Docs ACL for a composite response and its target.
+
+    A hidden composite must not turn the parent's mutation clock into a
+    tombstone version. The parent, tag/field definition, and any linked target
+    node must all be readable in the selected library.
+    """
+    if table not in {"knowledge_node_supertags", "knowledge_field_values"}:
+        return False
+    node_id, target_id = _split_entity_id(entity_id)
+    if node_id is None or target_id is None:
+        return False
+    node = await session.get(KnowledgeNode, node_id)
+    if (
+        node is None
+        or node.docs_library_id != docs_library_id
+        or not await can_read_node(session, node, user_id, include_archived=True)
+    ):
+        return False
+    if table == "knowledge_node_supertags":
+        tag = await session.get(KnowledgeSupertag, target_id)
+        return tag is not None and tag.docs_library_id == docs_library_id
+
+    field = await session.get(KnowledgeField, target_id)
+    if field is None or field.docs_library_id != docs_library_id:
+        return False
+    row = await session.get(KnowledgeFieldValue, {"node_id": node_id, "field_id": target_id})
+    return row is None or row.target_node_id is None or await can_read_node(
+        session, row.target_node_id, user_id, include_archived=True
+    )
+
+
 async def load_current_docs_entity(
     session: AsyncSession,
     *,
@@ -2475,13 +2579,20 @@ async def _update_app_readme_from_docs(
     node: KnowledgeNode,
     user_id: UUID,
     payload: dict[str, Any],
+    readme_lock_held: bool,
 ) -> dict[str, Any]:
-    """Write the canonical README when an app_readme Docs node is edited."""
+    """Write the canonical README when an app_readme Docs node is edited.
+
+    呼出元（``apply_docs_operation``）が ``app_operation_lock`` を保持している
+    ことが前提。この関数自身は lock を取得しない。
+    """
     from ..memory.models import App
     from ..services.app_git_service import AppGitError, AppGitService
-    from ..services.app_operation_lock import app_operation_lock
     from ..services.app_service import AppAccessError, AppService
     from ..services.app_storage import get_workspaces_root, resolve_app_file, sha256_file
+
+    if not readme_lock_held:
+        raise RuntimeError("app_readme update requires caller-held app_operation_lock")
 
     # ロック path を決める root と、実際に触る README の root がずれると
     # 排他が静かに壊れる（別ロックで同じファイルを触る最悪形）。この操作で
@@ -2508,45 +2619,52 @@ async def _update_app_readme_from_docs(
         )
     except AppAccessError as exc:
         raise DocsOperationError(str(exc), status_code=403) from exc
-    async with app_operation_lock(app.id, workspace_root=workspace_root):
-        readme_path = resolve_app_file(app.id, "README.md", workspace_root=workspace_root)
-        current_hash = sha256_file(readme_path) if readme_path.exists() else None
-        props = node.display_props if isinstance(node.display_props, dict) else {}
-        expected_hash = props.get("app_readme_sha256")
-        if not expected_hash:
-            previous = node.body_json if isinstance(node.body_json, dict) else {}
-            previous_markdown = previous.get("markdown")
-            if isinstance(previous_markdown, str):
-                expected_hash = hashlib.sha256(previous_markdown.encode("utf-8")).hexdigest()
-        if expected_hash and current_hash != expected_hash:
-            raise DocsOperationError(
-                "README.mdがDocsの編集開始後に変更されています。先に競合を解決してください",
-                status_code=409,
-                reason_code="docs_business_conflict",
-            )
-        # README.md が正本、Docs Node は同期ビュー。
-        # checkpoint / Node同期のどちらかが失敗したら、書き込み前の README を
-        # 復元してから例外を投げる。ファイルだけ新しく Git と Docs が旧い、
-        # という中途半端な状態を残さないための補償処理。
-        previous_bytes = readme_path.read_bytes() if readme_path.exists() else None
-        readme_path.parent.mkdir(parents=True, exist_ok=True)
-        readme_path.write_text(markdown, encoding="utf-8", newline="\n")
-        try:
-            try:
-                AppGitService(workspace_root=workspace_root).checkpoint(
-                    app.id, "DocsからApp READMEを更新", actor=str(user_id)
-                )
-            except AppGitError as exc:
-                raise DocsOperationError(
-                    f"App READMEのGit checkpointに失敗しました: {exc}", status_code=503
-                ) from exc
-            await AppService(workspace_root=workspace_root).sync_readme_to_node(
-                service.session, app, user_id
-            )
-        except BaseException:
-            _restore_app_readme(readme_path, previous_bytes)
-            raise
+    readme_path = resolve_app_file(app.id, "README.md", workspace_root=workspace_root)
+    # 冪等判定: README.md が既に要求内容と同一なら（DB commit 失敗後の再送など）、
+    # 書込みと checkpoint を行わず Node だけを README に揃える。
+    requested_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    if readme_path.exists() and sha256_file(readme_path) == requested_hash:
+        await AppService(workspace_root=workspace_root).sync_readme_to_node(
+            service.session, app, user_id
+        )
         return serialize_docs_node(node)
+    current_hash = sha256_file(readme_path) if readme_path.exists() else None
+    props = node.display_props if isinstance(node.display_props, dict) else {}
+    expected_hash = props.get("app_readme_sha256")
+    if not expected_hash:
+        previous = node.body_json if isinstance(node.body_json, dict) else {}
+        previous_markdown = previous.get("markdown")
+        if isinstance(previous_markdown, str):
+            expected_hash = hashlib.sha256(previous_markdown.encode("utf-8")).hexdigest()
+    if expected_hash and current_hash != expected_hash:
+        raise DocsOperationError(
+            "README.mdがDocsの編集開始後に変更されています。先に競合を解決してください",
+            status_code=409,
+            reason_code="docs_business_conflict",
+        )
+    # README.md が正本、Docs Node は同期ビュー。
+    # Node同期 / checkpoint のどちらかが失敗したら、書き込み前の README を
+    # 復元してから例外を投げる。ファイルだけ新しく Git と Docs が旧い、
+    # という中途半端な状態を残さないための補償処理。
+    previous_bytes = readme_path.read_bytes() if readme_path.exists() else None
+    readme_path.parent.mkdir(parents=True, exist_ok=True)
+    readme_path.write_text(markdown, encoding="utf-8", newline="\n")
+    try:
+        await AppService(workspace_root=workspace_root).sync_readme_to_node(
+            service.session, app, user_id
+        )
+        try:
+            AppGitService(workspace_root=workspace_root).checkpoint(
+                app.id, "DocsからApp READMEを更新", actor=str(user_id)
+            )
+        except AppGitError as exc:
+            raise DocsOperationError(
+                f"App READMEのGit checkpointに失敗しました: {exc}", status_code=503
+            ) from exc
+    except BaseException:
+        _restore_app_readme(readme_path, previous_bytes)
+        raise
+    return serialize_docs_node(node)
 
 
 def _restore_app_readme(readme_path: Path, previous_bytes: bytes | None) -> None:
@@ -2573,10 +2691,15 @@ async def apply_docs_operation(
     payload: dict[str, Any],
     base_updated_at: Optional[str] = None,
     require_base_version: bool = False,
+    commit: bool = True,
+    held_app_lock: UUID | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Docs 書き込みの単一入口。派生更新は DocsGraphService に委譲し、commit まで行う。
 
     戻り値はシリアライズ済み entity。REST/push で共有する（ロジック二重化ゼロ）。
+    ``commit=False`` では commit せず flush だけを行う。App README 更新では
+    ``app_operation_lock`` を commit（または flush）完了まで保持する。
     """
     payload = payload or {}
     if docs_library_id is None:
@@ -2584,6 +2707,77 @@ async def apply_docs_operation(
     if docs_library_id is None:
         raise ValueError("docs_library_id is required")
 
+    readme_app_id: UUID | None = None
+    if (
+        table == "knowledge_nodes"
+        and action in ("update", "delete")
+        and "body_json" in payload
+    ):
+        readme_node_id = parse_uuid(entity_id)
+        if readme_node_id is not None:
+            readme_row = (
+                await session.execute(
+                    select(KnowledgeNode.node_type, KnowledgeNode.app_id).where(
+                        KnowledgeNode.id == readme_node_id
+                    )
+                )
+            ).first()
+            if (
+                readme_row is not None
+                and readme_row.node_type == "app_readme"
+                and readme_row.app_id is not None
+            ):
+                readme_app_id = readme_row.app_id
+
+    operation_kwargs = dict(
+        user_id=user_id,
+        docs_library_id=docs_library_id,
+        table=table,
+        action=action,
+        entity_id=entity_id,
+        payload=payload,
+        base_updated_at=base_updated_at,
+        require_base_version=require_base_version,
+        commit=commit,
+        outcome=outcome,
+    )
+    if readme_app_id is None:
+        return await _apply_docs_operation_locked(
+            session, service, readme_lock_held=False, **operation_kwargs
+        )
+    if held_app_lock == readme_app_id:
+        return await _apply_docs_operation_locked(
+            session, service, readme_lock_held=True, **operation_kwargs
+        )
+    if not commit:
+        raise RuntimeError("app_readme update requires caller-held app_operation_lock")
+    from ..services.app_operation_lock import app_operation_lock
+    from ..services.app_storage import get_workspaces_root
+
+    effective_root = get_workspaces_root(getattr(service, "workspace_root", None))
+    async with app_operation_lock(readme_app_id, workspace_root=effective_root):
+        return await _apply_docs_operation_locked(
+            session, service, readme_lock_held=True, **operation_kwargs
+        )
+
+
+async def _apply_docs_operation_locked(
+    session: AsyncSession,
+    service: DocsGraphService,
+    *,
+    user_id: UUID,
+    docs_library_id: UUID,
+    table: str,
+    action: str,
+    entity_id: str,
+    payload: dict[str, Any],
+    base_updated_at: Optional[str],
+    require_base_version: bool,
+    commit: bool,
+    readme_lock_held: bool,
+    outcome: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """``apply_docs_operation`` の本体（ACL 確認・鮮度確認・適用・serialize・commit）。"""
     # Authorization is checked immediately before dispatch, in the same
     # transaction as the mutation. Individual graph methods repeat the check
     # after locking/refreshing the target row to close revoke-vs-write races.
@@ -2612,6 +2806,8 @@ async def apply_docs_operation(
         result = await _apply_node_operation(
             service, docs_library_id=docs_library_id, user_id=user_id,
             action=action, entity_id=entity_id, payload=payload,
+            readme_lock_held=readme_lock_held,
+            outcome=outcome,
         )
     elif table == "knowledge_node_supertags":
         result = await _apply_node_supertag_operation(
@@ -2631,6 +2827,39 @@ async def apply_docs_operation(
     else:
         raise DocsOperationError(f"Unsupported docs table: {table}", status_code=400)
 
+    if not readme_lock_held:
+        return await _finish_docs_operation(
+            session,
+            result,
+            table=table,
+            entity_id=entity_id,
+            user_id=user_id,
+            commit=commit,
+        )
+    # README.md / Git には既に編集が入っている。以降の失敗をドメインの拒否
+    # （DocsOperationError）として記録しないよう RuntimeError に変換する。
+    try:
+        return await _finish_docs_operation(
+            session,
+            result,
+            table=table,
+            entity_id=entity_id,
+            user_id=user_id,
+            commit=commit,
+        )
+    except DocsOperationError as exc:
+        raise RuntimeError("docs post-readme step failed") from exc
+
+
+async def _finish_docs_operation(
+    session: AsyncSession,
+    result: dict[str, Any],
+    *,
+    table: str,
+    entity_id: str,
+    user_id: UUID,
+    commit: bool,
+) -> dict[str, Any]:
     # Push responses use the same ACL metadata as pull responses.  Without
     # this enrichment a successful offline mutation would overwrite the
     # mobile row's source/access/read_only fields with the legacy serializer's
@@ -2654,7 +2883,10 @@ async def apply_docs_operation(
                     user_id=user_id,
                 )
 
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return result
 
 
@@ -2760,6 +2992,8 @@ async def _apply_node_operation(
     action: str,
     entity_id: str,
     payload: dict[str, Any],
+    readme_lock_held: bool = False,
+    outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Provenance is optional, but when supplied it is persisted on the
     # resulting KnowledgeRevision.  Validate once at the mutation boundary so
@@ -2919,7 +3153,29 @@ async def _apply_node_operation(
                 action="update",
                 entity_id=entity_id,
                 payload=payload,
+                readme_lock_held=readme_lock_held,
+                outcome=outcome,
             )
+            if readme_lock_held:
+                # README.md / Git / Node は既に更新済み。archive 部分の拒否は
+                # savepoint だけを戻し、README 更新の DB 効果は残す。
+                try:
+                    async with service.session.begin_nested():
+                        node = await _get_node(service, docs_library_id, entity_id)
+                        await service.archive_subtree(root=node, user_id=user_id)
+                except (DocsOperationError, PermissionError, ValueError) as exc:
+                    if isinstance(exc, DocsOperationError):
+                        status = exc.status_code
+                    elif isinstance(exc, PermissionError):
+                        status = 403
+                    else:
+                        status = 409
+                    if outcome is None:
+                        raise RuntimeError("docs archive failed after readme update") from exc
+                    outcome["archive_rejected_status"] = status
+                    node = await _get_node(service, docs_library_id, entity_id)
+                    return serialize_docs_node(node)
+                return serialize_docs_node(node)
             node = await _get_node(service, docs_library_id, entity_id)
         # node だけ archive すると、outline から消えたのに検索へ残る孤児ができる。
         await service.archive_subtree(root=node, user_id=user_id)
@@ -3152,6 +3408,7 @@ async def _apply_node_operation(
                 node=node,
                 user_id=user_id,
                 payload=payload,
+                readme_lock_held=readme_lock_held,
             )
         final_parent = None
         if "parent_id" in payload:

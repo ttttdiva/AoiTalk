@@ -126,4 +126,4 @@ exit code や JSON field は CLI 実装を正本とします。
 .\venv\Scripts\python.exe tests\manual\chatgpt_web_smoke.py
 ```
 
-WebUI behavior を変更する実装作業では、この smoke だけで独立 AI browser QA を代替しません。[ai_webui_qa.md](ai_webui_qa.md) と `AGENTS.md` の gate に従います。
+WebUI behavior を変更する実装作業では、この smoke だけで独立 AI browser QA を代替しません。ai_webui_qa.md と `AGENTS.md` の gate に従います。

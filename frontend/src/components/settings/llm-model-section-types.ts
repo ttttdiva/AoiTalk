@@ -1344,7 +1344,10 @@ export interface AgentTeamActivation {
   contexts: string[];
 }
 
-export type ExecutionRouteEffortPolicy = "same" | "lower" | "explicit" | "default";
+export type ExecutionRouteEffortPolicy = "same" | "lower" | "explicit" | "default" | "not_applicable";
+
+/** Provider-only route whose execution target is managed outside the local runtimes. */
+export const REMOTE_EXECUTION_PROVIDER = "muse-remote" as const;
 
 /**
  * Safe presentation metadata for a resolved Execution Route.
@@ -1353,11 +1356,11 @@ export type ExecutionRouteEffortPolicy = "same" | "lower" | "explicit" | "defaul
  * provider fallback keeps older catalog responses useful without teaching
  * each surface its own provider heuristic.
  */
-export type ExecutionRouteBackend = "local" | "api" | "cli" | "free_team" | "unknown";
+export type ExecutionRouteBackend = "local" | "api" | "cli" | "remote" | "free_team" | "unknown";
 
 export type ExecutionRoutePresentation = {
   backend: ExecutionRouteBackend;
-  label: "Local" | "API" | "CLI" | "Free Team" | "Unknown";
+  label: "Local" | "API" | "CLI" | "Remote" | "Free Team" | "Unknown";
   provider: string;
   model: string;
   effort: string;
@@ -1367,9 +1370,9 @@ export type ExecutionRoutePresentation = {
 export interface ExecutionRoute {
   inherit_model: boolean;
   provider: string;
-  model: string;
+  model: string | null;
   effort_policy: ExecutionRouteEffortPolicy;
-  effort: string;
+  effort: string | null;
   /** Read-only metadata accepted from effective-route projections. */
   backend?: string;
   route_source?: string;
@@ -1539,6 +1542,16 @@ export function canonicalExecutionRoute(value: Partial<ExecutionRoute> | null | 
   const raw = value ?? {};
   const inheritModel = raw.inherit_model !== false;
   if (!inheritModel) {
+    const provider = String(raw.provider || "").trim();
+    if (provider.toLowerCase() === REMOTE_EXECUTION_PROVIDER) {
+      return {
+        inherit_model: false,
+        provider: REMOTE_EXECUTION_PROVIDER,
+        model: null,
+        effort_policy: "not_applicable",
+        effort: null,
+      };
+    }
     // An explicit provider/model route can deliberately defer to that model's
     // own default.  Keep this separate from a raw catalog effort; otherwise a
     // read/modify/write cycle would silently turn model default into an
@@ -1552,7 +1565,7 @@ export function canonicalExecutionRoute(value: Partial<ExecutionRoute> | null | 
         : "default";
     return {
       inherit_model: false,
-      provider: String(raw.provider || "").trim(),
+      provider,
       model: String(raw.model || "").trim(),
       effort_policy: effortPolicy,
       effort: effortPolicy === "explicit" ? effort : "",
@@ -1563,7 +1576,8 @@ export function canonicalExecutionRoute(value: Partial<ExecutionRoute> | null | 
     raw.effort_policy === "same" ||
     raw.effort_policy === "lower" ||
     raw.effort_policy === "explicit" ||
-    raw.effort_policy === "default";
+    raw.effort_policy === "default" ||
+    raw.effort_policy === "not_applicable";
   const effortPolicy: ExecutionRouteEffortPolicy = knownPolicy && raw.effort_policy ? raw.effort_policy : "same";
   return {
     inherit_model: true,
@@ -1602,6 +1616,7 @@ export function executionRouteBackend(value: {
   const model = String(value?.model ?? "").trim().toLowerCase();
   const explicit = String(value?.backend ?? "").trim().toLowerCase();
   if (provider === "routing-profile" && model === "free-team") return "free_team";
+  if (provider === REMOTE_EXECUTION_PROVIDER || explicit === "remote") return "remote";
   // Local providers may be exposed through an OpenAI-compatible API.  The
   // catalog's transport field then says `api`, but the operator-facing
   // classification must still identify the actual local runtime.
@@ -1625,7 +1640,9 @@ export function executionRouteBackendLabel(value: {
     ? "Local"
     : backend === "cli"
       ? "CLI"
-      : backend === "free_team"
+      : backend === "remote"
+        ? "Remote"
+        : backend === "free_team"
         ? "Free Team"
         : backend === "api"
           ? "API"

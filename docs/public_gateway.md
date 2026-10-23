@@ -6,7 +6,7 @@ AoiTalk owns its application servers only:
 - Next.js on `AOITALK_NEXT_PORT` (default `3002`)
 - application authentication, WebSocket endpoints, files, and browser UI
 
-The personal/shared public edge is maintained in `D:\Dev\85_CaddyGateway` and the private repository `ttttdiva/85_CaddyGateway`. That repository owns:
+The personal/shared public edge is maintained in `<external-caddy-gateway-root>` and the private repository `ttttdiva/85_CaddyGateway`. That repository owns:
 
 - the long-running shared Caddy process and port `6002`
 - Cloudflare Tunnel lifecycle integration

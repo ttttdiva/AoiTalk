@@ -24,6 +24,9 @@ def main(argv=None):
     if uses_windows_venv() and not args.direct_python:
         launch_coordinator()
         return
+    from src.utils.process_identity import broker_identity
+
+    logging.info("%s (no console of its own; Strata/llama windows are titled separately)", broker_identity())
     isolate_runtime_environment(os.environ)
     ownership = install_process_ownership()
     if ownership is None:

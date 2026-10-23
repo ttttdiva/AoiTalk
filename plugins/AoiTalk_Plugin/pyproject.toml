@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75,<81", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aoitalk-plugin"
+version = "0.1.0"
+description = "Standalone MCP v2 server for the AoiTalk plugin"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "anyio>=4.7,<5",
+  "mcp>=2.2,<3",
+  "httpx>=0.28,<1",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1,<2",
+  "typing-extensions>=4.12,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<9", "pytest-asyncio>=1,<2"]
+
+[project.scripts]
+aoitalk-plugin = "aoitalk_plugin.stdio:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aoitalk_plugin", "aoitalk_plugin.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --tb=short"

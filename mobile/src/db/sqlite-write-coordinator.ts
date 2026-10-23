@@ -1,7 +1,14 @@
+import {
+  closeSqliteWriter,
+  openSqliteWriter,
+  type SqliteWriter,
+} from "./sqlite-writer";
+
 type SqliteWritePriority = "foreground" | "background";
 
 type PendingSqliteWrite<T> = {
-  task: () => Promise<T> | T;
+  task: (writer: SqliteWriter) => Promise<T> | T;
+  source: "app" | "sync-v3";
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
 };
@@ -10,6 +17,27 @@ const foregroundQueue: Array<PendingSqliteWrite<unknown>> = [];
 const backgroundQueue: Array<PendingSqliteWrite<unknown>> = [];
 
 let active = false;
+const syncV3WriteSamples: number[] = [];
+let syncV3WriteCount = 0;
+
+export type SyncV3WriteUnitStats = { count: number; p95Ms: number | null; maxMs: number | null; samples: number };
+
+export function getSyncV3WriteUnitStats(): SyncV3WriteUnitStats {
+  const sorted = [...syncV3WriteSamples].sort((a, b) => a - b);
+  return {
+    count: syncV3WriteCount,
+    p95Ms: sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] : null,
+    maxMs: sorted.length ? sorted[sorted.length - 1] : null,
+    samples: sorted.length,
+  };
+}
+
+function recordFinishedWrite(source: "app" | "sync-v3", startedAt: number): void {
+  if (source !== "sync-v3") return;
+  syncV3WriteCount += 1;
+  syncV3WriteSamples.push(Math.max(0, Date.now() - startedAt));
+  if (syncV3WriteSamples.length > 20) syncV3WriteSamples.shift();
+}
 
 /**
  * True while interactive SQLite work is queued behind the currently active
@@ -33,14 +61,21 @@ function drainSqliteWriteQueue(): void {
   if (!pending) return;
 
   active = true;
+  const writer = openSqliteWriter();
+  const startedAt = Date.now();
 
   void Promise.resolve()
-    .then(() => pending.task())
+    .then(() => pending.task(writer))
     .then(
       (value) => {
+        // Invalidate before the caller can observe completion.
+        closeSqliteWriter(writer);
+        recordFinishedWrite(pending.source, startedAt);
         pending.resolve(value);
       },
       (error) => {
+        closeSqliteWriter(writer);
+        recordFinishedWrite(pending.source, startedAt);
         pending.reject(error);
       },
     )
@@ -52,11 +87,13 @@ function drainSqliteWriteQueue(): void {
 
 function enqueueSqliteWrite<T>(
   priority: SqliteWritePriority,
-  task: () => Promise<T> | T,
+  task: (writer: SqliteWriter) => Promise<T> | T,
+  source: "app" | "sync-v3" = "app",
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const pending: PendingSqliteWrite<T> = {
       task,
+      source,
       resolve,
       reject,
     };
@@ -78,9 +115,10 @@ function enqueueSqliteWrite<T>(
  * awaiting another coordinator callback from inside it.
  */
 export function runForegroundSqliteWrite<T>(
-  task: () => Promise<T> | T,
+  task: (writer: SqliteWriter) => Promise<T> | T,
+  source: "app" | "sync-v3" = "app",
 ): Promise<T> {
-  return enqueueSqliteWrite("foreground", task);
+  return enqueueSqliteWrite("foreground", task, source);
 }
 
 /**
@@ -96,9 +134,10 @@ export function runForegroundSqliteWrite<T>(
  * foreground-pending signal used by yielding Docs promotion.
  */
 export function runBackgroundSqliteAccess<T>(
-  task: () => Promise<T> | T,
+  task: (writer: SqliteWriter) => Promise<T> | T,
+  source: "app" | "sync-v3" = "app",
 ): Promise<T> {
-  return enqueueSqliteWrite("background", task);
+  return enqueueSqliteWrite("background", task, source);
 }
 
 /**
@@ -109,7 +148,8 @@ export function runBackgroundSqliteAccess<T>(
  * exclusive transaction use `runBackgroundSqliteAccess`.
  */
 export function runBackgroundSqliteWrite<T>(
-  task: () => Promise<T> | T,
+  task: (writer: SqliteWriter) => Promise<T> | T,
+  source: "app" | "sync-v3" = "app",
 ): Promise<T> {
-  return runBackgroundSqliteAccess(task);
+  return runBackgroundSqliteAccess(task, source);
 }

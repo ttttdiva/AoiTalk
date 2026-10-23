@@ -1294,6 +1294,7 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        tool_free: bool = False,
         cloud_advisor_origin: Any | None = None,
         cloud_advisor_assessment: Any | None = None,
     ) -> NativeRunResult:
@@ -1303,7 +1304,9 @@ class AgentTurnRunner:
         caller that owns the session (the normal ``AgentLLMClient`` path)
         can provide a resolver so the next model request receives the newly
         loaded function schemas.  Direct callers retain the historical static
-        ``agent.tools`` behavior when no resolver is supplied.
+        ``agent.tools`` behavior when no resolver is supplied.  ``tool_free``
+        is an explicit verifier boundary that suppresses both sources and
+        permits only the initial model request.
         """
         # Help is a trusted, Guide-only controller turn.  Enforce the
         # stateless boundary here as a final guard for direct native callers
@@ -1389,6 +1392,7 @@ class AgentTurnRunner:
                     user_input,
                     stream_callback=stream_callback,
                     tools_provider=tools_provider,
+                    tool_free=tool_free,
                 )
         finally:
             _NATIVE_TIMING_ID.reset(timing_id_token)
@@ -1410,6 +1414,7 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        tool_free: bool = False,
     ) -> NativeRunResult:
         # local_only changes the execution deployment, not just the payload.
         # Resolve the configured privacy sidecar explicitly and fail closed
@@ -1427,6 +1432,7 @@ class AgentTurnRunner:
                 user_input,
                 stream_callback=stream_callback,
                 tools_provider=tools_provider,
+                tool_free=tool_free,
             )
         # 公式 OpenAI 経路は Responses API を使う。openrouter など base_url を差し替えた
         # OpenAI 互換プロバイダは従来の chat.completions を維持する。
@@ -1436,12 +1442,14 @@ class AgentTurnRunner:
                 user_input,
                 stream_callback=stream_callback,
                 tools_provider=tools_provider,
+                tool_free=tool_free,
             )
         return await self._run_core_chat(
             agent,
             user_input,
             stream_callback=stream_callback,
             tools_provider=tools_provider,
+            tool_free=tool_free,
         )
 
     async def _run_core_chat(
@@ -1451,6 +1459,7 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        tool_free: bool = False,
     ) -> NativeRunResult:
         await _emit(stream_callback, "stream_start", {"message": "応答を生成しています"})
         suppress_automatic_context = _help_turn_is_isolated()
@@ -1470,7 +1479,11 @@ class AgentTurnRunner:
         tool_records: list[ToolExecutionRecord] = []
         usage_records: list[dict[str, int]] = []
         context_snapshots: list[dict[str, Any]] = []
-        active_tools = _resolve_runtime_tools(agent, tools_provider)
+        active_tools = _resolve_runtime_tools(
+            agent,
+            tools_provider,
+            tool_free=tool_free,
+        )
         tools_payload = _tool_specs(active_tools)
         requested_tool_choice = _normalize_tool_choice(
             agent.model_settings.tool_choice,
@@ -1489,19 +1502,26 @@ class AgentTurnRunner:
         terminal_status_message = ""
         context_shaper = self._within_turn_context_shaper("native.chat")
 
-        for round_index in range(self.max_tool_rounds + 1):
+        max_tool_rounds = 0 if tool_free else self.max_tool_rounds
+        for round_index in range(max_tool_rounds + 1):
             # A tool call can load a deferred pack.  Resolve the effective
             # registry and schemas again before the next provider request so
             # the newly loaded tools are callable as native functions.
             if round_index:
-                active_tools = _resolve_runtime_tools(agent, tools_provider)
+                active_tools = _resolve_runtime_tools(
+                    agent,
+                    tools_provider,
+                    tool_free=tool_free,
+                )
                 tools_payload = _tool_specs(active_tools)
                 if authoritative_task_complete:
                     active_tools = []
                     tools_payload = []
                     current_tool_choice = None
             approved_directive = (
-                None if suppress_automatic_context else get_approved_action_directive()
+                None
+                if tool_free or suppress_automatic_context
+                else get_approved_action_directive()
             )
             while approved_directive is not None:
                 existing_receipt = await get_approved_action_receipt(
@@ -1805,6 +1825,33 @@ class AgentTurnRunner:
                 message,
                 registry=tool_registry,
             )
+
+            if tool_free and tool_calls:
+                content = str(self.privacy_gateway.restore_aliases(content))
+                failure = classify_generation_error(
+                    ModelOutputIncompleteError(
+                        "tool_call_in_tool_free_run",
+                        transport="chat.completions",
+                    )
+                )
+                terminal = protocol_error_terminal(
+                    provider_terminal,
+                    reason="review_tool_calls",
+                )
+                await _emit(
+                    stream_callback,
+                    "stream_end",
+                    {"content": content, "provider_terminal": terminal},
+                )
+                return NativeRunResult(
+                    final_output=content,
+                    messages=[*messages, assistant_payload],
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    provider_terminal=terminal,
+                )
 
             if approved_directive is not None:
                 if not tool_calls:
@@ -2275,6 +2322,7 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        tool_free: bool = False,
     ) -> NativeRunResult:
         settings = self.privacy_gateway.settings
         provider = settings.local_provider
@@ -2340,6 +2388,7 @@ class AgentTurnRunner:
             user_input,
             stream_callback=stream_callback,
             tools_provider=tools_provider,
+            tool_free=tool_free,
         )
 
     async def _run_core_responses(
@@ -2349,6 +2398,7 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        tool_free: bool = False,
     ) -> NativeRunResult:
         """公式 OpenAI Responses API でエージェントターンを実行する。
 
@@ -2394,7 +2444,11 @@ class AgentTurnRunner:
         tool_records: list[ToolExecutionRecord] = []
         usage_records: list[dict[str, int]] = []
         context_snapshots: list[dict[str, Any]] = []
-        active_tools = _resolve_runtime_tools(agent, tools_provider)
+        active_tools = _resolve_runtime_tools(
+            agent,
+            tools_provider,
+            tool_free=tool_free,
+        )
         tools_payload = _responses_tool_specs(active_tools)
         requested_tool_choice = _normalize_tool_choice(
             agent.model_settings.tool_choice,
@@ -2623,19 +2677,26 @@ class AgentTurnRunner:
                     model=agent.model,
                 )
 
-        for round_index in range(self.max_tool_rounds + 1):
+        max_tool_rounds = 0 if tool_free else self.max_tool_rounds
+        for round_index in range(max_tool_rounds + 1):
             # See the chat-completions path above.  Keep the provider payload
             # and execution registry in lockstep with the session's current
             # deferred-pack state on every round.
             if round_index:
-                active_tools = _resolve_runtime_tools(agent, tools_provider)
+                active_tools = _resolve_runtime_tools(
+                    agent,
+                    tools_provider,
+                    tool_free=tool_free,
+                )
                 tools_payload = _responses_tool_specs(active_tools)
                 if authoritative_task_complete:
                     active_tools = []
                     tools_payload = []
                     current_tool_choice = None
             approved_directive = (
-                None if suppress_automatic_context else get_approved_action_directive()
+                None
+                if tool_free or suppress_automatic_context
+                else get_approved_action_directive()
             )
             while approved_directive is not None:
                 existing_receipt = await get_approved_action_receipt(
@@ -2946,6 +3007,32 @@ class AgentTurnRunner:
                     context_snapshots=list(context_snapshots),
                     generation_failure=failure,
                     provider_terminal=provider_terminal,
+                )
+            if tool_free and function_calls:
+                content = str(self.privacy_gateway.restore_aliases(content))
+                failure = classify_generation_error(
+                    ModelOutputIncompleteError(
+                        "tool_call_in_tool_free_run",
+                        transport="responses",
+                    )
+                )
+                terminal = protocol_error_terminal(
+                    provider_terminal,
+                    reason="review_tool_calls",
+                )
+                await _emit(
+                    stream_callback,
+                    "stream_end",
+                    {"content": content, "provider_terminal": terminal},
+                )
+                return NativeRunResult(
+                    final_output=content,
+                    messages=[*chat_messages, {"role": "assistant", "content": content}],
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    provider_terminal=terminal,
                 )
             if approved_directive is not None:
                 if not function_calls:
@@ -3924,6 +4011,8 @@ def _tool_specs(tools: Iterable[ToolDefinition]) -> list[dict[str, Any]]:
 def _resolve_runtime_tools(
     agent: AgentDefinition,
     tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None,
+    *,
+    tool_free: bool = False,
 ) -> list[ToolDefinition]:
     """Resolve the native tools for one model round.
 
@@ -3931,6 +4020,10 @@ def _resolve_runtime_tools(
     failure must not make the model turn disappear, and the static agent tool
     list remains the safe fallback for legacy/direct callers.
     """
+    # Completion verification is an explicit tool-free pass.  This intent
+    # takes precedence over both static definitions and per-round resolvers.
+    if tool_free:
+        return []
     # ``AgentTurnRunner`` is also a public low-level entrypoint.  Do not rely
     # solely on TerminalMode/tool-exposure filtering: a direct Help caller can
     # supply a static AgentDefinition containing arbitrary mutation tools.

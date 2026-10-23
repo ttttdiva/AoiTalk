@@ -8,6 +8,9 @@ import type { ChatCommandCapability } from "@/lib/chat-commands";
 export type { ChatCommandCapability } from "@/lib/chat-commands";
 import type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
 export type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
+import type {
+  AgentExecutionProfileCatalog,
+} from "@/lib/agent-runtime-selection";
 import type { components } from "@/lib/api-types.gen";
 import {
   normalizeCharacterOptions,
@@ -20,6 +23,9 @@ import {
 // 経由（= FastAPI 直）のリクエストボディはここから型を引く。
 // （`/api/conversations/...` 等の Next.js BFF 経由は OpenAPI 対象外なので触らない）
 type Schemas = components["schemas"];
+type RequiredAgentIngress = NonNullable<
+  Schemas["AgentTaskErrorResponse"]["required_ingress"]
+>;
 export type MemorySelectionResponse = Schemas["MemorySelectionResponse"];
 export type MemorySelectionItem = Schemas["MemorySelectionItem"];
 export type MemoryToolReference = Schemas["MemoryToolReference"];
@@ -738,6 +744,38 @@ export type AgentRunFetchOptions = {
   includeTimeline?: boolean;
 };
 
+export type AgentExecutionProfileCatalogRequest =
+  | {
+      sessionId: string;
+      agentRevisionId?: never;
+      projectId?: never;
+      workingDirectory?: string | null;
+      signal?: AbortSignal;
+    }
+  | {
+      sessionId?: never;
+      agentRevisionId: string;
+      projectId?: string | null;
+      workingDirectory?: string | null;
+      signal?: AbortSignal;
+    };
+
+export type CliSessionRoleContextMode = "raw" | "agent_role";
+
+export type CliSessionCreateRequest = Schemas["CLIDevelopmentSessionCreateRequest"] & {
+  /** Exact catalog revision assertion; older callers may omit it. */
+  agent_revision_id?: string;
+  /** Preserve the exact Project authority used by revision-path catalog admission. */
+  project_id?: string;
+  /** The managed local CLI launcher always supplies these validated route fields. */
+  model: string;
+  working_directory: string;
+  /** Omit for legacy/raw CLI behavior. */
+  role_context_mode?: CliSessionRoleContextMode;
+};
+
+export type CliSessionResponse = Schemas["CLIDevelopmentSessionResponse"];
+
 // ─── ベースリクエスト関数 ───
 
 type ChatRequestInit = RequestInit & {
@@ -752,6 +790,7 @@ export type StructuredApiError = {
   message: string;
   retryable: boolean;
   request_id?: string | null;
+  required_ingress?: RequiredAgentIngress;
 };
 
 export class ChatApiError extends Error {
@@ -760,6 +799,8 @@ export class ChatApiError extends Error {
   readonly retryable: boolean;
   readonly requestId: string | null;
   readonly request_id: string | null;
+  readonly requiredIngress: RequiredAgentIngress | null;
+  readonly required_ingress: RequiredAgentIngress | null;
   readonly error: StructuredApiError;
 
   constructor(
@@ -776,11 +817,14 @@ export class ChatApiError extends Error {
       (status != null && RETRYABLE_STATUSES.has(status));
     this.requestId = details?.request_id ?? null;
     this.request_id = this.requestId;
+    this.requiredIngress = details?.required_ingress ?? null;
+    this.required_ingress = this.requiredIngress;
     this.error = {
       code: this.code,
       message,
       retryable: this.retryable,
       request_id: this.requestId,
+      ...(this.requiredIngress ? { required_ingress: this.requiredIngress } : {}),
     };
   }
 }
@@ -809,10 +853,15 @@ function parseStructuredApiError(
     payload = null;
   }
 
-  const candidate =
+  const payloadRecord =
     payload && typeof payload === "object"
-      ? (payload as { error?: unknown }).error
+      ? (payload as Record<string, unknown>)
       : null;
+  const candidate = payloadRecord?.error;
+  const requiredIngress = (value: unknown): RequiredAgentIngress | undefined =>
+    value === "cli_session" || value === "remote_agent"
+      ? value
+      : undefined;
   if (candidate && typeof candidate === "object") {
     const value = candidate as Record<string, unknown>;
     const code =
@@ -835,24 +884,31 @@ function parseStructuredApiError(
           ? value.retryable
           : RETRYABLE_STATUSES.has(status),
       request_id: requestId,
+      required_ingress:
+        requiredIngress(value.required_ingress) ??
+        requiredIngress(payloadRecord?.required_ingress),
     };
   }
 
   // Older proxy routes returned {detail: ...}. Keep the message for
   // compatibility, but cap it and avoid exposing a raw HTML/stack response.
-  const detail =
-    payload && typeof payload === "object"
-      ? (payload as { detail?: unknown }).detail
-      : null;
+  const detail = payloadRecord?.detail;
+  const topLevelCode =
+    typeof payloadRecord?.error === "string" && payloadRecord.error.trim()
+      ? payloadRecord.error.trim()
+      : typeof payloadRecord?.code === "string" && payloadRecord.code.trim()
+        ? payloadRecord.code.trim()
+        : "chat_api_error";
   const message =
     typeof detail === "string" && detail.trim() && detail.length <= 512
       ? detail.trim()
       : fallbackApiErrorMessage(status, statusText);
   return {
-    code: "chat_api_error",
+    code: topLevelCode,
     message,
     retryable: RETRYABLE_STATUSES.has(status),
     request_id: responseRequestId,
+    required_ingress: requiredIngress(payloadRecord?.required_ingress),
   };
 }
 
@@ -967,9 +1023,59 @@ export function getLlmModelCatalog() {
   });
 }
 
+function executionProfileCatalogQuery(
+  options: AgentExecutionProfileCatalogRequest,
+): string {
+  const sessionId = options.sessionId?.trim() || "";
+  const revisionId = options.agentRevisionId?.trim() || "";
+  if (Boolean(sessionId) === Boolean(revisionId)) {
+    throw new Error("Execution Profile catalog requires exactly one binding context");
+  }
+  if (sessionId && options.projectId) {
+    throw new Error("project_id is valid only with an Agent revision catalog context");
+  }
+  const query = new URLSearchParams();
+  if (sessionId) query.set("session_id", sessionId);
+  else query.set("agent_revision_id", revisionId);
+  const workingDirectory = options.workingDirectory?.trim();
+  if (workingDirectory) query.set("working_directory", workingDirectory);
+  const projectId = options.projectId?.trim();
+  if (projectId) query.set("project_id", projectId);
+  return query.toString();
+}
+
 // ─── API関数 ───
 
 export const chatApi = {
+  getAgentExecutionProfileCatalog: (
+    agentId: string,
+    options: AgentExecutionProfileCatalogRequest,
+  ) =>
+    request<AgentExecutionProfileCatalog>(
+      `/api/python-proxy/agents/${encodeURIComponent(agentId)}/execution-profiles?${executionProfileCatalogQuery(options)}`,
+      { cache: "no-store", timeoutMs: 10_000, signal: options.signal },
+    ),
+
+  createCliSession: (data: CliSessionCreateRequest) =>
+    request<CliSessionResponse>("/api/python-proxy/cli-sessions", {
+      method: "POST",
+      body: JSON.stringify(data),
+      timeoutMs: 15_000,
+    }),
+
+  sendCliSessionMessage: (
+    sessionId: string,
+    data: { message: string; idempotency_key: string },
+  ) =>
+    request<CliSessionResponse>(
+      `/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}/messages`,
+      {
+        method: "POST",
+        body: JSON.stringify(data),
+        timeoutMs: 15_000,
+      },
+    ),
+
   /** ヘッダーで現在選択されているキャラクターを取得 */
   getCurrentCharacterName: async () => {
     const data = await request<{

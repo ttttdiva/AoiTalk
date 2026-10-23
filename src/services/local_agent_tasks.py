@@ -1087,6 +1087,133 @@ def check_command(
     return None
 
 
+def _git_blocking_policy_code(
+    text: str, *, spec: LocalAgentTaskSpec, workspace: Path
+) -> str | None:
+    """Classify Git policy blocks independently of the displayed first reason."""
+
+    matches = list(_GIT_INVOCATION_RE.finditer(text))
+    if not matches:
+        return None
+    write_matches = [match for match in matches if match.group(2).lower() in {"add", "commit", "push"}]
+    if write_matches:
+        if _GIT_ENV_OVERRIDE_RE.search(text):
+            return "command_git_env_override"
+        if _git_write_command_details(text) is None:
+            return "command_git_write_shape"
+    for match in matches:
+        sub = match.group(2).lower()
+        rest = (match.group(3) or "").strip()
+        global_options = (match.group(1) or "").strip()
+        if sub in _GIT_READ:
+            continue
+        if sub == "branch" and (not rest or re.fullmatch(r"(?:(?:-a|-r|-v|-vv|--list|--show-current|--all|--no-color)\s*)+", rest)):
+            continue
+        if sub == "remote" and (not rest or rest in {"-v", "show origin"}):
+            continue
+        if sub == "stash" and _GIT_STASH_READ_RE.fullmatch(rest):
+            continue
+        if sub == "worktree" and _GIT_WORKTREE_LIST_RE.fullmatch(rest):
+            continue
+        if sub == "tag" and (not rest or rest.startswith(("-l", "--list"))):
+            continue
+        if sub == "config" and re.match(r"(?:--get|--list|-l)\b", rest):
+            continue
+        if sub in {"add", "commit"} and spec.mode == "mutate" and spec.allow_commands and spec.allow_git_commit:
+            if global_options or not _git_workspace_is_repository_root(workspace):
+                return "command_git_workspace_scope"
+            if sub == "add" and _git_add_paths_are_scoped(rest, workspace) is None:
+                return "command_git_add_scope"
+            if sub == "commit" and not _git_commit_message_is_scoped(rest):
+                return "command_git_commit_scope"
+            continue
+        if sub == "push" and spec.mode == "mutate" and spec.allow_commands and spec.allow_git_push:
+            if global_options or not _git_push_is_scoped(rest, workspace):
+                return "command_git_push_scope"
+            continue
+        if sub == "apply" and spec.mode == "mutate" and "--reverse" not in rest and "-R" not in rest.split():
+            continue
+        return "command_git_operation"
+    return None
+
+
+def _blocking_command_policy_code(
+    text: str, *, spec: LocalAgentTaskSpec, workspace: Path
+) -> str | None:
+    """Find a blocking policy independently of ``check_command``'s first reason.
+
+    This is classification only. ``check_command`` remains the sole allow/deny
+    decision and keeps its existing first-match reason and deny behavior.
+    """
+
+    if _SECRET_PATH_TOKEN_RE.search(text):
+        return "command_secret_reference"
+    if _ENV_DUMP_RE.search(text):
+        return "command_env_dump"
+    git_code = _git_blocking_policy_code(text, spec=spec, workspace=workspace)
+    if git_code:
+        return git_code
+    if _ADB_RE.search(text):
+        if not spec.allow_adb:
+            return "command_adb_not_enabled"
+        if _ADB_DENY_RE.search(text):
+            return "command_adb_destructive"
+    writes = _WRITE_VERB_RE.search(text) is not None
+    paths = [match.group(1).rstrip(".,)") for match in _ABS_WIN_PATH_RE.finditer(text)]
+    if os.name != "nt":
+        try:
+            write_executable, posix_paths = _posix_command_write_paths(text)
+        except ValueError:
+            if writes:
+                return "command_policy_classification_unknown"
+        else:
+            writes = writes or write_executable
+            paths.extend(posix_paths)
+    if writes:
+        for candidate in paths:
+            try:
+                resolved = Path(os.path.realpath(os.path.abspath(candidate)))
+            except (OSError, ValueError):
+                return "command_workspace_scope"
+            if not _path_within(resolved, workspace):
+                return "command_workspace_scope"
+    if spec.mode == "read_only" and writes:
+        return "command_read_only_write"
+    return None
+
+
+def check_command_denial(
+    command: str,
+    *,
+    spec: LocalAgentTaskSpec,
+    workspace: Path,
+) -> tuple[str | None, str | None]:
+    """Return the unchanged denial reason and a fixed, fail-closed policy code."""
+
+    text = str(command or "")
+    reason = check_command(text, spec=spec, workspace=workspace)
+    if reason is None:
+        return None, None
+    blocking_code = _blocking_command_policy_code(text, spec=spec, workspace=workspace)
+    if blocking_code:
+        return reason, blocking_code
+    if reason == "empty command":
+        return reason, "command_empty"
+    code = (
+        "command_too_long" if reason == "command is too long"
+        else "command_destructive_pattern" if reason.startswith("destructive command blocked")
+        else None
+    )
+    if code:
+        # Text containing shell expansion or quoting (e.g. ``git"" push``)
+        # cannot be fully classified by these literal policy scanners, so it
+        # remains blocking. Only plain text is an answerable refusal.
+        if any(token in text for token in ("`", "$", "\\", "%", "^", "!", "(", ")", "\n", "\r", "'", '"')):
+            return reason, "command_policy_classification_unknown"
+        return reason, code
+    return reason, "command_policy_classification_unknown"
+
+
 # ---------------------------------------------------------------------------
 # LLM backend
 # ---------------------------------------------------------------------------

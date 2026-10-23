@@ -1,9 +1,8 @@
-"""Bounded, read-only source lookup for personal finance attachments (R1).
+"""Bounded, read-only source lookup for personal finance image attachments.
 
-The only supported attachment type in this revision is a user-scoped
-``workspace_file`` containing a PNG original.  This module intentionally does
-not extract text, inspect metadata beyond the required checks, or perform any
-network/model operation.
+Only user-scoped ``workspace_file`` images with bounded PNG, JPEG or WebP
+headers are accepted. This module does not decode, sanitize, extract text, or
+perform any network/model operation.
 """
 
 from __future__ import annotations
@@ -15,20 +14,34 @@ import os
 from pathlib import Path
 import re
 import stat
+from typing import Any
 from uuid import UUID
 
+from .personal_finance_image_types import (
+    SUPPORTED_MIME_TYPES,
+    FinanceImageTypeError,
+    inspect_finance_image,
+)
 from .search_sources import (
     ResolvedSource,
     SearchSourceResolver,
     SourceRef,
     SourceUnavailable,
 )
+from .personal_async_guard import run_personal_guard
 
 
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
-MIME_TYPE_PNG = "image/png"
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _SHA256_LOWER_HEX = re.compile(r"[0-9a-f]{64}\Z")
+_IMAGE_ERROR_CODES = frozenset(
+    {
+        "unsupported_type",
+        "mime_mismatch",
+        "malformed_header",
+        "source_too_large",
+        "pixel_limit",
+    }
+)
 
 
 class FinanceAttachmentSourceError(RuntimeError):
@@ -123,9 +136,9 @@ async def resolve_finance_attachment_source(
     owner_user_id: UUID,
     source_ref: UUID,
     expected_sha256: str,
-    guard: Callable[[], None] | None = None,
+    guard: Callable[[], Any] | None = None,
 ) -> FinanceAttachmentEvidence:
-    """Resolve one user-owned PNG footer file with bounded verification.
+    """Resolve one user-owned image file with bounded verification.
 
     ``source_ref`` is intentionally opaque: only a UUID is accepted.  The
     resolver is called exactly once for a valid request, and its returned path
@@ -153,7 +166,7 @@ async def resolve_finance_attachment_source(
     if guard is not None:
         # Trusted hook: re-check turn/binding/policy right after the await, before any
         # metadata, path or byte access.
-        guard()
+        await run_personal_guard(guard)
 
     if not isinstance(resolved, ResolvedSource):
         _raise("source_unavailable")
@@ -164,7 +177,11 @@ async def resolve_finance_attachment_source(
         owner_user_id=owner_user_id,
         expected_sha256=expected_sha256,
     )
-    if metadata.get("mime_type") != MIME_TYPE_PNG:
+    claimed_mime = metadata.get("mime_type")
+    if (
+        not isinstance(claimed_mime, str)
+        or claimed_mime.strip().lower() not in SUPPORTED_MIME_TYPES
+    ):
         _raise("unsupported_type")
 
     if resolved.path is None:
@@ -176,17 +193,28 @@ async def resolve_finance_attachment_source(
         raise
     except (OSError, TypeError, ValueError):
         raise FinanceAttachmentSourceError("source_unavailable") from None
+    await run_personal_guard(guard)
 
-    if not content.startswith(_PNG_SIGNATURE):
-        _raise("unsupported_type")
     indexed_hash = metadata.get("content_hash")
     if digest != expected_sha256 or digest != indexed_hash:
         _raise("source_hash_mismatch")
 
+    try:
+        image_type = inspect_finance_image(
+            content,
+            claimed_mime,
+            max_bytes=MAX_ATTACHMENT_BYTES,
+        )
+    except FinanceImageTypeError as exc:
+        code = exc.code if exc.code in _IMAGE_ERROR_CODES else "source_unavailable"
+        raise FinanceAttachmentSourceError(code) from None
+
+    await run_personal_guard(guard)
+
     return FinanceAttachmentEvidence(
         source_ref=source_ref,
         source_sha256=digest,
-        mime_type=MIME_TYPE_PNG,
+        mime_type=image_type.mime_type,
         byte_size=len(content),
         content=content,
     )

@@ -48,6 +48,8 @@ import {
 } from "@/components/chat/app-context-picker";
 import { GenerationProfileSelector } from "@/components/chat/generation-profile-selector";
 import { Button } from "@/components/ui/button";
+import { HelpPopover } from "@/components/ui/help-popover";
+import { AgentCliSessionLauncher } from "@/components/chat/agent-cli-session-launcher";
 import {
   Popover,
   PopoverContent,
@@ -158,12 +160,20 @@ import {
 import { characterOptionLabel } from "@/lib/character-options";
 import {
   agentRuntimeScope,
+  canUseConversationIngress,
+  executionAvailabilityLabel,
+  executionIngressLabel,
   normalizeRuntimeProfileId,
-  runtimeProfileOptionsForTeam,
+  providerReadinessLabel,
+  resolvedRuntimeProfile,
+  runtimeProfileById,
   selectedRuntimeProfileId,
   type AgentRuntimeSelection,
 } from "@/lib/agent-runtime-selection";
-import { useAgentRoleRuntime } from "@/hooks/use-agent-role-runtime";
+import {
+  useAgentRoleRuntime,
+  type AgentRoleRuntime,
+} from "@/hooks/use-agent-role-runtime";
 import {
   useOptionalRuntimeContext,
   type RuntimeContextValue,
@@ -689,6 +699,10 @@ function ModelControl({
   onComposerFocusRequest,
   onLlmModeRefresh,
   agentId,
+  projectId,
+  roleRuntime,
+  roleRuntimeLoading = false,
+  roleRuntimeError = null,
   runtimeProfileId = null,
   onRuntimeProfileChange,
 }: {
@@ -709,6 +723,10 @@ function ModelControl({
   onComposerFocusRequest?: () => void;
   onLlmModeRefresh?: () => Promise<void>;
   agentId?: string | null;
+  projectId?: string | null;
+  roleRuntime?: AgentRoleRuntime | null;
+  roleRuntimeLoading?: boolean;
+  roleRuntimeError?: string | null;
   runtimeProfileId?: string | null;
   onRuntimeProfileChange?: (profileId: string | null) => void;
 }) {
@@ -739,22 +757,16 @@ function ModelControl({
     ...routeFields
   } = routeState;
   const [modeRefreshing] = useState(false);
-  const { runtime: roleRuntime, error: roleRuntimeError } = useAgentRoleRuntime(
-    agentBound && open ? normalizedAgentId : null,
-  );
-  const runtimeProfileOptions = useMemo(
-    () => runtimeProfileOptionsForTeam(roleRuntime?.teamId, routeFields.agentTeamOptions),
-    [roleRuntime?.teamId, routeFields.agentTeamOptions],
-  );
+  const runtimeProfileOptions = roleRuntime?.catalog.profiles ?? [];
   const roleDefaultProfile = roleRuntime?.defaultProfileId ?? null;
-  const roleDefaultLabel = !roleRuntime
+  const roleDefault = runtimeProfileById(roleRuntime?.catalog, roleDefaultProfile);
+  const selectedProfile = resolvedRuntimeProfile(roleRuntime?.catalog, runtimeProfileId);
+  const roleDefaultLabel = roleRuntimeLoading
     ? "取得中"
-    : roleDefaultProfile
-    ? (routeFields.agentTeamOptions
-        .find((team) => team.team_id === roleRuntime?.teamId)
-        ?.execution_profiles?.find((profile) => profile.profile_id === roleDefaultProfile)
-        ?.name || roleDefaultProfile)
-    : "なし";
+    : roleDefault?.name || roleDefaultProfile || "なし";
+  const selectedProfileLabel = runtimeProfileId
+    ? selectedProfile?.name || runtimeProfileId
+    : `Agent既定（${roleDefaultLabel}）`;
 
   const available = filterAvailableProviders(
     runtime.llmEngines,
@@ -1659,12 +1671,30 @@ function ModelControl({
               data-testid="agent-bound-settings-summary"
               className="space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2 text-xs"
             >
-              <p className="font-medium">このChatはAgentに紐づいています</p>
-              <p className="text-muted-foreground">
-                職務・モデル・Execution TeamはAgent管理が正本です。下の実行環境は、この会話の次の依頼だけに使うruntimeで、Agent自体は変更しません。
+              <p className="inline-flex items-center gap-1 font-medium">
+                Agentの役割と今回の実行先
+                <HelpPopover label="Agentの役割と今回の実行先">
+                  AgentとRevisionが職務を固定します。Execution Profileは今回使う登録済み実行先です。選択してもAgent、Revision、Character、ACLは変更されません。
+                </HelpPopover>
               </p>
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
+                <dt className="text-muted-foreground">Agent</dt>
+                <dd className="truncate" title={roleRuntime?.agentId || normalizedAgentId || undefined}>
+                  {roleRuntime?.agentName || normalizedAgentId || "取得中"}
+                </dd>
+                <dt className="text-muted-foreground">Revision</dt>
+                <dd className="truncate" title={roleRuntime?.revisionId}>
+                  {roleRuntime
+                    ? `${roleRuntime.revisionVersion ? `v${roleRuntime.revisionVersion} · ` : ""}${roleRuntime.revisionId}`
+                    : "取得中"}
+                </dd>
+                <dt className="text-muted-foreground">Agent既定</dt>
+                <dd>{roleDefaultLabel}</dd>
+                <dt className="text-muted-foreground">今回の選択</dt>
+                <dd>{selectedProfileLabel}</dd>
+              </dl>
               <label className="grid gap-1 text-xs text-muted-foreground">
-                <span>実行環境（Execution Profile）</span>
+                <span>会話/APIのExecution Profile</span>
                 <AppSelect
                   aria-label="実行環境 Execution Profile"
                   data-testid="agent-runtime-profile-select"
@@ -1674,23 +1704,36 @@ function ModelControl({
                     // explicit role-default option may reset the choice.
                     const next = event.target.value;
                     if (next === ROLE_DEFAULT_RUNTIME_VALUE) onRuntimeProfileChange?.(null);
-                    else if (normalizeRuntimeProfileId(next)) {
-                      onRuntimeProfileChange?.(normalizeRuntimeProfileId(next));
+                    else {
+                      const normalized = normalizeRuntimeProfileId(next);
+                      const candidate = runtimeProfileById(roleRuntime?.catalog, normalized);
+                      if (normalized && canUseConversationIngress(candidate)) {
+                        onRuntimeProfileChange?.(normalized);
+                      }
                     }
                   }}
-                  disabled={
-                    routeSettingsLoading || (!roleRuntime && !runtimeProfileId)
-                  }
+                  disabled={roleRuntimeLoading || !roleRuntime}
                   className={cn(runtimeSelectClassName, "w-full")}
                   container={selectPortalHostRef}
                 >
-                  <option value={ROLE_DEFAULT_RUNTIME_VALUE}>{`Agent既定（${roleDefaultLabel}）`}</option>
+                  <option
+                    value={ROLE_DEFAULT_RUNTIME_VALUE}
+                    disabled={Boolean(roleDefault && !canUseConversationIngress(roleDefault))}
+                  >
+                    {`Agent既定（${roleDefaultLabel}）`}
+                  </option>
                   {runtimeProfileId &&
                   !runtimeProfileOptions.some((profile) => profile.profile_id === runtimeProfileId) ? (
-                    <option value={runtimeProfileId}>{runtimeProfileId}</option>
+                    <option value={runtimeProfileId} disabled>{`${runtimeProfileId}（catalogにありません）`}</option>
                   ) : null}
-                  {runtimeProfileOptions.map((profile) => (
-                    <option key={profile.profile_id} value={profile.profile_id}>
+                  {runtimeProfileOptions
+                    .filter((profile) => profile.ingress === "api")
+                    .map((profile) => (
+                    <option
+                      key={profile.profile_id}
+                      value={profile.profile_id}
+                      disabled={!canUseConversationIngress(profile)}
+                    >
                       {profile.name || profile.profile_id}
                     </option>
                   ))}
@@ -1698,10 +1741,53 @@ function ModelControl({
               </label>
               {roleRuntimeError ? (
                 <p role="alert" className="text-[10px] text-destructive">
-                  {runtimeProfileId
-                    ? `実行環境の候補を取得できませんでした。選択中の「${runtimeProfileId}」で送信されます(サーバーが検証します)。`
-                    : "実行環境の候補を取得できませんでした。Agent既定で実行されます。"}
+                  {roleRuntimeError}。実行先を確認できないため送信しません。
                 </p>
+              ) : null}
+              {roleRuntime ? (
+                <div className="space-y-1" data-testid="agent-execution-profile-catalog">
+                  {runtimeProfileOptions.map((profile) => (
+                    <div key={profile.profile_id} className="rounded border bg-card/70 p-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate font-medium">
+                            {profile.name} {profile.is_default ? "· 既定" : ""}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {executionIngressLabel(profile.ingress)} · {profile.provider}
+                            {profile.model ? ` / ${profile.model}` : ""}
+                            {profile.effort ? ` / ${profile.effort}` : ""}
+                          </p>
+                          <p className="text-[10px]">
+                            {executionAvailabilityLabel(profile)}
+                            {profile.availability_reason ? ` · ${profile.availability_reason}` : ""}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {providerReadinessLabel(profile.provider_readiness)}
+                            {profile.provider_readiness_reason
+                              ? ` · ${profile.provider_readiness_reason}`
+                              : ""}
+                          </p>
+                        </div>
+                        {profile.ingress === "cli_session" ? (
+                          <AgentCliSessionLauncher
+                            agentId={roleRuntime.agentId}
+                            agentRevisionId={roleRuntime.revisionId}
+                            profile={profile}
+                            {...(sessionId?.trim()
+                              ? { sessionId: sessionId.trim() }
+                              : { projectId: projectId?.trim() || null })}
+                          />
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                  {roleRuntime.catalog.diagnostics.map((diagnostic) => (
+                    <p key={`${diagnostic.profile_id}:${diagnostic.reason}`} role="status" className="text-[10px] text-muted-foreground">
+                      {diagnostic.profile_id}: {diagnostic.reason}
+                    </p>
+                  ))}
+                </div>
               ) : null}
               {normalizedAgentId ? (
                 <Link
@@ -2289,6 +2375,7 @@ export function ChatComposer({
   // Runtime (ExecutionProfile) chosen for an Agent-bound Chat. The selection is
   // scoped to user/session/agent, so another Chat or account never inherits it.
   const runtimeScope = agentRuntimeScope(draftUserId, sessionId, agentId?.trim() || null);
+  const roleRuntimeState = useAgentRoleRuntime(agentId, { sessionId, projectId });
   const [runtimeSelection, setRuntimeSelection] = useState<AgentRuntimeSelection | null>(null);
   const runtimeProfileId = agentId?.trim()
     ? selectedRuntimeProfileId(runtimeSelection, runtimeScope)
@@ -2300,15 +2387,54 @@ export function ChatComposer({
   // first submit; later retries replay the outbox value instead.
   const onSend = useCallback<ChatComposerProps["onSend"]>(
     (...args) => {
-      const profileId = runtimeProfileId;
-      if (!profileId || (args[7] && "executionProfileId" in args[7])) {
+      const agentBound = Boolean(agentId?.trim());
+      const hasCapturedProfile = Boolean(
+        args[7] && Object.prototype.hasOwnProperty.call(args[7], "executionProfileId"),
+      );
+      const profileId = hasCapturedProfile
+        ? normalizeRuntimeProfileId(args[7]?.executionProfileId)
+        : runtimeProfileId;
+      if (agentBound) {
+        if (roleRuntimeState.loading) {
+          toast.error("Agentの実行先を確認中です。確認後にもう一度送信してください。");
+          return false;
+        }
+        if (roleRuntimeState.error || !roleRuntimeState.runtime) {
+          toast.error("Agentの実行先を確認できないため送信しませんでした。");
+          return false;
+        }
+        const selected = profileId
+          ? runtimeProfileById(roleRuntimeState.runtime.catalog, profileId)
+          : resolvedRuntimeProfile(roleRuntimeState.runtime.catalog, null);
+        if (!selected) {
+          toast.error("選択したExecution Profileをcatalogで確認できないため送信しませんでした。");
+          return false;
+        }
+        if (selected.ingress !== "api") {
+          toast.error(
+            selected.ingress === "cli_session"
+              ? "このExecution ProfileはCLIセッション入口から開始してください。会話送信は実行していません。"
+              : "このExecution ProfileのRemote Agent入口は利用できません。会話送信は実行していません。",
+          );
+          return false;
+        }
+        if (!canUseConversationIngress(selected)) {
+          toast.error(
+            `${executionAvailabilityLabel(selected)}${
+              selected.availability_reason ? ` (${selected.availability_reason})` : ""
+            }。会話送信は実行していません。`,
+          );
+          return false;
+        }
+      }
+      if (!profileId || hasCapturedProfile) {
         return onSendProp(...args);
       }
       const sendArgs = [...args] as Parameters<ChatComposerProps["onSend"]>;
       sendArgs[7] = { ...args[7], executionProfileId: profileId };
       return onSendProp(...sendArgs);
     },
-    [onSendProp, runtimeProfileId],
+    [agentId, onSendProp, roleRuntimeState, runtimeProfileId],
   );
   const composerDraftKey =
     draftKey ?? sessionId ?? NEW_CHAT_COMPOSER_DRAFT_KEY;
@@ -4689,6 +4815,10 @@ export function ChatComposer({
               onComposerFocusRequest={() => textareaRef.current?.focus()}
               onLlmModeRefresh={refreshLlmMode}
               agentId={agentId}
+              projectId={projectId}
+              roleRuntime={roleRuntimeState.runtime}
+              roleRuntimeLoading={roleRuntimeState.loading}
+              roleRuntimeError={roleRuntimeState.errorMessage}
               runtimeProfileId={runtimeProfileId}
               onRuntimeProfileChange={handleRuntimeProfileChange}
             />

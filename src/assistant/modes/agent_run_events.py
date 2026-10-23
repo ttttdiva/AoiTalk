@@ -825,6 +825,9 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         metadata = {}
     else:
         metadata = dict(metadata)
+    # A similarly named caller metadata field is not provenance. The typed
+    # framework field below is the only source allowed into the receipt.
+    metadata.pop("policy_denial", None)
     # Execution provenance is framework-owned and must survive the
     # compatibility record projection. Keep it in bounded metadata so the
     # durable AgentRun row can distinguish an actual provider execution from
@@ -858,6 +861,11 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         rejection_code = str(rejection.get("code") or "").strip()
         if re.fullmatch(r"tool_argument_[a-z]{3,16}", rejection_code):
             metadata.setdefault("error_code", rejection_code)
+    denial = value("policy_denial", default=None)
+    if isinstance(denial, Mapping):
+        denial_code = str(denial.get("code") or "").strip()
+        if re.fullmatch(r"[a-z][a-z0-9_]{2,63}", denial_code):
+            metadata.setdefault("policy_denial", {"code": denial_code})
     if error:
         metadata.setdefault("error", error)
     if blocked_reason:

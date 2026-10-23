@@ -375,36 +375,185 @@ _DENIAL_EXECUTABLE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]{0,63}")
 _DENIAL_URL_RE = re.compile(r"https?://([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?:/[^@\s]*)?")
 
 
-def _summarize_denial_target(tool_input: Any) -> str:
+_DENIAL_MAX_EXECUTABLES = 4
+_DENIAL_ENV_ASSIGN_RE = re.compile(r"(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*=", re.IGNORECASE)
+_DENIAL_INLINE_FLAGS = frozenset({"-c", "-command", "-e"})
+_DENIAL_EXE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1")
+_DENIAL_UNKNOWN = "[command]"
+
+
+def _split_denial_command(command: str) -> Optional[Tuple[List[List[str]], Dict[str, bool]]]:
+    """quote/escape-awareにtop-levelの && || ; | だけで区間分割し、単語へ分ける。
+
+    引用内・escape・backtickは不透明。解釈に確信が持てない(不完全quote、escape、backtick)
+    場合はNoneを返し、呼び出し側は[command]へ倒す。
+    """
+    shape = {key: False for key in ("chain", "pipe", "redirect", "subshell", "inline_code", "env_assignment")}
+    segments: List[List[str]] = [[]]
+    word: List[str] = []
+    quote = ""
+    certain = True
+
+    def end_word() -> None:
+        if word:
+            segments[-1].append("".join(word))
+            word.clear()
+
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        nxt = command[i + 1] if i + 1 < n else ""
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "`" or (ch == "$" and nxt == "("):
+                shape["subshell"] = True
+                certain = False
+            elif ch == "\\" and quote == '"' and nxt in ('"', "\\"):
+                word.append(ch)
+                i += 1
+                ch = nxt
+            word.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            word.append(ch)
+        elif ch == "`":
+            shape["subshell"] = True
+            certain = False
+            word.append(ch)
+        elif ch == "\\" and nxt in ("'", '"', ";", "|", "&", "`"):
+            certain = False
+            word.append(ch)
+        elif ch == "$" and nxt == "(":
+            shape["subshell"] = True
+            certain = False
+            word.append(ch)
+        elif ch in "()":
+            shape["subshell"] = True
+            certain = False
+            word.append(ch)
+        elif ch == "^" or (ch == "#" and not word):
+            # cmdのcaret escapeやshell commentは解釈に確信が持てないためopaque。
+            certain = False
+            word.append(ch)
+        elif ch.isspace():
+            end_word()
+        elif ch in ";|&" and (ch != "&" or nxt == "&"):
+            end_word()
+            if ch == "&" or ch == ";":
+                shape["chain"] = True
+                i += 1 if ch == ";" else 2
+            elif nxt == "|":
+                shape["chain"] = True
+                i += 2
+            else:
+                shape["pipe"] = True
+                i += 1
+            segments.append([])
+            continue
+        else:
+            if ch in "<>":
+                shape["redirect"] = True
+            word.append(ch)
+        i += 1
+    end_word()
+    if quote or not certain:
+        return None
+    for words in segments:
+        # `$env:X= value` / `X= value` は代入値が次のtokenに分離され得るためopaque。
+        if any(t.lower().startswith("$env:") or t.endswith("=") for t in words):
+            return None
+    for words in segments:
+        for token in words:
+            if token.lower() in _DENIAL_INLINE_FLAGS:
+                shape["inline_code"] = True
+    return [words for words in segments if words], shape
+
+
+def _segment_executable(words: List[str], shape: Dict[str, bool]) -> str:
+    """区間先頭のlauncher/代入を読み飛ばし、素の実行ファイル名と確定できる場合だけ返す。"""
+    for token in words:
+        if token in ("&", "."):
+            continue
+        if _DENIAL_ENV_ASSIGN_RE.match(token):
+            shape["env_assignment"] = True
+            continue
+        if "://" in token or any(char in token for char in ("'", '"', "@", "?", "=")):
+            return _DENIAL_UNKNOWN
+        name = re.split(r"[\\/]", token)[-1]
+        lowered = name.lower()
+        for suffix in _DENIAL_EXE_SUFFIXES:
+            if lowered.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        if not _DENIAL_EXECUTABLE_RE.fullmatch(name):
+            return _DENIAL_UNKNOWN
+        return _DENIAL_SECRET_RE.sub("[redacted]", name)
+    return _DENIAL_UNKNOWN
+
+
+def _summarize_denial_command(command: str) -> Dict[str, Any]:
+    shape = {key: False for key in ("chain", "pipe", "redirect", "subshell", "inline_code", "env_assignment")}
+    parsed = _split_denial_command(command)
+    if parsed is None:
+        # 不完全quote/escape/subshellは全体をopaqueにし、shapeは見えた範囲の真偽値だけ返す。
+        shape["subshell"] = "`" in command or "(" in command
+        shape["env_assignment"] = bool(_DENIAL_ENV_ASSIGN_RE.match(command.lstrip()))
+        return {"executables": [_DENIAL_UNKNOWN], "shape": shape}
+    segments, shape = parsed
+    executables: List[str] = []
+    for words in segments:
+        exe = _segment_executable(words, shape)
+        if exe not in executables:
+            executables.append(exe)
+    return {"executables": (executables or [_DENIAL_UNKNOWN])[:_DENIAL_MAX_EXECUTABLES], "shape": shape}
+
+
+def _denial_path_scope(value: str, observed_cwd: str) -> str:
+    """観測cwdに対するinside_cwd/outside_cwd。cwd未観測は unknown。"""
+    if not observed_cwd:
+        return "unknown"
+    try:
+        base = os.path.normcase(os.path.normpath(observed_cwd))
+        raw = value.strip()
+        full = raw if os.path.isabs(raw) else os.path.join(observed_cwd, raw)
+        full = os.path.normcase(os.path.normpath(full))
+        return "inside_cwd" if os.path.commonpath([base, full]) == base else "outside_cwd"
+    except ValueError:
+        return "outside_cwd"
+
+
+def _summarize_denial_target(tool_input: Any, observed_cwd: str = "") -> Dict[str, Any]:
     """拒否対象の短い要約。tool_input全量は保持せず、秘密を含み得る部分は落とす。"""
     if not isinstance(tool_input, dict):
-        return ""
+        return {"target": ""}
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
             parts = [part for part in re.split(r"[\\/]+", value.strip()) if part]
-            target = "/".join(parts[-2:])
-            break
-    else:
-        command = tool_input.get("command")
-        url = tool_input.get("url")
-        if isinstance(command, str) and command.strip():
-            # 先頭tokenが素の実行ファイル名と確定できる場合だけ残す。
-            # VAR=value代入・演算子・引用・パス・URLなど解析不能なものは固定placeholder。
-            first = command.strip().split()[0]
-            target = first if _DENIAL_EXECUTABLE_RE.fullmatch(first) else "[command]"
-        elif isinstance(url, str) and url.strip():
-            match = _DENIAL_URL_RE.fullmatch(url.strip().split("?")[0].split("#")[0])
-            target = match.group(0).split("/")[0] + "//" + match.group(1) if match else "[url]"
-        else:
-            return ""
-    return _DENIAL_SECRET_RE.sub("[redacted]", target)[:120]
+            target = _DENIAL_SECRET_RE.sub("[redacted]", "/".join(parts[-2:]))[:120]
+            return {"target": target, "scope": _denial_path_scope(value, observed_cwd)}
+    command = tool_input.get("command")
+    url = tool_input.get("url")
+    if isinstance(command, str) and command.strip():
+        info = _summarize_denial_command(command)
+        # 従来のtargetは先頭区間の実行ファイル名(確定できない場合は[command])。
+        first = command.strip().split()[0]
+        target = first if _DENIAL_EXECUTABLE_RE.fullmatch(first) and info["executables"][0] == first else _DENIAL_UNKNOWN
+        return {"target": _DENIAL_SECRET_RE.sub("[redacted]", target)[:120], "command": info}
+    if isinstance(url, str) and url.strip():
+        match = _DENIAL_URL_RE.fullmatch(url.strip().split("?")[0].split("#")[0])
+        target = match.group(0).split("/")[0] + "//" + match.group(1) if match else "[url]"
+        return {"target": _DENIAL_SECRET_RE.sub("[redacted]", target)[:120]}
+    return {"target": ""}
 
 
-def _summarize_permission_denials(denials: Any) -> Dict[str, Any]:
+def _summarize_permission_denials(denials: Any, observed_cwd: str = "") -> Dict[str, Any]:
     """permission_denialsを件数 + tool_name/tool_use_id/対象要約へ縮約する。"""
     items_in = denials if isinstance(denials, list) else [denials]
-    items: List[Dict[str, str]] = []
+    items: List[Dict[str, Any]] = []
     for denial in items_in[:_DENIAL_MAX_ITEMS]:
         if not isinstance(denial, dict):
             items.append({"tool_name": "", "tool_use_id": "", "target": ""})
@@ -413,7 +562,7 @@ def _summarize_permission_denials(denials: Any) -> Dict[str, Any]:
             {
                 "tool_name": str(denial.get("tool_name") or denial.get("tool") or "")[:80],
                 "tool_use_id": str(denial.get("tool_use_id") or "")[:80],
-                "target": _summarize_denial_target(denial.get("tool_input")),
+                **_summarize_denial_target(denial.get("tool_input"), observed_cwd),
             }
         )
     return {"count": len(items_in), "items": items}
@@ -657,7 +806,7 @@ class ClaudeCLIBackend(CLIBackendBase):
                 code = "claude_permission_denied" if denials else "claude_result_error"
                 self._set_cli_diagnostic(status="failed", state="failed", error_code=code)
                 if denials:
-                    summary = _summarize_permission_denials(denials)
+                    summary = _summarize_permission_denials(denials, str(self._last_invocation_config.get("observed_cwd") or ""))
                     self._last_cli_diagnostics["permission_denial_count"] = summary["count"]
                     self._last_cli_diagnostics["permission_denial_summary"] = summary["items"]
                     detail = f"denied_count={summary['count']} denied={json.dumps(summary['items'], ensure_ascii=False)}"

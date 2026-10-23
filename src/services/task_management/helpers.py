@@ -97,13 +97,19 @@ def _assert_generation_mutation_allowed() -> None:
 class HelperMixin:
     """共有ヘルパー: 権限・プロジェクト解決・タスクツリー等。"""
 
-    async def _broadcast(self, event_type: str, data: dict[str, Any]) -> None:
+    async def _broadcast(self, event_type: str, data: dict[str, Any]) -> bool:
         if not self._broadcaster:
-            return
+            return False
         try:
             await self._broadcaster({"type": event_type, "data": data})
-        except Exception:
-            logger.exception("Task event broadcast failed: %s", event_type)
+        except Exception as exc:
+            logger.warning(
+                "Task event broadcast failed for %s (%s)",
+                event_type,
+                type(exc).__name__,
+            )
+            return False
+        return True
 
     async def _get_accessible_project_ids(
         self, session: AsyncSession, user_id: UUID
@@ -366,6 +372,7 @@ class HelperMixin:
         task_id: UUID,
         *,
         populate_existing: bool = False,
+        include_deleted: bool = False,
     ) -> Task:
         statement = (
             select(Task)
@@ -380,8 +387,10 @@ class HelperMixin:
                 selectinload(Task.time_entries).selectinload(TimeEntry.occurrence),
                 selectinload(Task.task_tags).selectinload(TaskTag.tag),
             )
-            .where(Task.id == task_id, Task.deleted_at.is_(None))
+            .where(Task.id == task_id)
         )
+        if not include_deleted:
+            statement = statement.where(Task.deleted_at.is_(None))
         if populate_existing:
             # Relationship-only updates replace rows through bulk DELETEs and
             # pending INSERTs.  The update response explicitly opts into a

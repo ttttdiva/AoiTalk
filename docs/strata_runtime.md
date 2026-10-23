@@ -2,7 +2,7 @@
 
 Strataは既存の `openai_compatible_local` transportのruntime profileとして利用する。
 チャット・streaming・tool calling・reasoningは既存clientを共用し、別LLM provider/clientを増やさない。
-Agent委譲（正準 prefix `/api/agent-tasks`）でStrataを推論に使う場合のpin済みclientも `OpenAICompatibleLocalClient` であり、native `AgentTurnRunner` ではない。委譲実行のturn loopは [local_agent_tasks.md](local_agent_tasks.md) が、共有brokerのlease契約は [shared_local_runtime.md](shared_local_runtime.md) が扱い、このprofile契約が会話・tool状態の共有や複数会話 parking の有効化を行うことはない。
+Agent委譲（正準 prefix `/api/agent-tasks`）でStrataを推論に使う場合のpin済みclientも `OpenAICompatibleLocalClient` であり、native `AgentTurnRunner` ではない。委譲実行のturn loopは local_agent_tasks.md が、共有brokerのlease契約は shared_local_runtime.md が扱い、このprofile契約が会話・tool状態の共有や複数会話 parking の有効化を行うことはない。
 
 ## 対応環境と固定source
 
@@ -199,7 +199,7 @@ native起動からready観測は約131秒、arena読込は39.97GiB/0.44GiB/s、3
 
 稼働中のStrata engine（port 8083、`strata-iq3_xxs.json`）の引数は、packとGGUF shardをいずれも `C:\path\to\models\Hot\llm\strata-iq3_xxs`（`packs\iq3_xxs`、`models\IQ3_XXS`）から読んでいることを確認した。
 `E:\AI\models\Cold_E\llm\strata` は存在せず、上記2026-10-09のE現用は現在の状態ではない。E側の重複は削除（ごみ箱へ移動）済みと親作業で確認している。
-`F:\AI\models\Cold_F\llm\strata` には `models` / `mtp` / `packs` が残っているが、稼働中processはこれを参照していない。保存先の整理・移動は [ローカルLLMストレージ運用規約](local_llm_storage_policy.md) に従い、この文書では行わない。
+`<configured-model-root>\strata` には `models` / `mtp` / `packs` が残っているが、稼働中processはこれを参照していない。保存先の整理・移動は [ローカルLLMストレージ運用規約](local_llm_storage_policy.md) に従い、この文書では行わない。
 
 Personalの画面で起動・停止できる。AoiTalkが起動して追跡しているStrata processだけ停止する。
 応答生成中は停止を拒否し、外部processがportを使用中なら勝手に終了させない。

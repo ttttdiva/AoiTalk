@@ -2007,6 +2007,27 @@ def execute_command(
                 operation="command",
             )
 
+    # Dispatch-time narrowing by an active request-local command budget
+    # (API task explicit limits); expiry prevents the process from starting.
+    from ...llm.generation_budget import bounded_command_timeout, command_budget_active
+    from ...llm.generation_cancellation import GenerationCancelled
+
+    try:
+        if command_budget_active():
+            # 明示timeoutでもconfigの下位上限は超えない（新control有効時のみ）。
+            try:
+                timeout = min(float(timeout), float(command_config.get("timeout_seconds", 120)))
+            except (TypeError, ValueError):
+                pass
+        timeout = bounded_command_timeout(timeout)
+    except (TimeoutError, GenerationCancelled):
+        return {
+            "success": False,
+            "error": "タスクの制限時間を超過したため、コマンドを起動しませんでした。",
+            "timed_out": True,
+            **_command_execution_boundary(),
+        }
+
     executor = get_command_executor()
     result = executor.execute(
         command,

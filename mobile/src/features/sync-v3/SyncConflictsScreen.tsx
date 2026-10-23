@@ -89,10 +89,10 @@ export function SyncConflictsScreen({
   };
 
   const confirmDismiss = (id: string) => {
-    Alert.alert("この項目を破棄", "この端末の変更は反映されません。破棄しますか？", [
+    Alert.alert("この項目を閉じる", "一覧から閉じます。未送信データは端末に保持され、以後の自動同期対象から外れます。", [
       { text: "キャンセル", style: "cancel" },
       {
-        text: "破棄",
+        text: "一覧から閉じる",
         style: "destructive",
         onPress: () => {
           void (async () => {
@@ -116,6 +116,9 @@ export function SyncConflictsScreen({
             {item.title_hint ?? item.entity_id}（{item.table}）
           </Text>
           <Text variant="labelMedium">{kindLabel(item.kind)}</Text>
+          {item.kind === "migrated_unresolved" && item.source_op_id === null && item.can_reapply === false ? (
+            <Text variant="bodySmall">この項目は現在の同期契約では安全に再適用できません。内容は端末に保持されています。</Text>
+          ) : null}
           {item.fields.map((field) => (
             <View key={field} style={styles.field}>
               <Text variant="labelMedium">{field}</Text>
@@ -124,7 +127,7 @@ export function SyncConflictsScreen({
             </View>
           ))}
           <View style={styles.actions}>
-            {REAPPLY_KINDS.includes(item.kind) ? (
+            {(item.can_reapply ?? REAPPLY_KINDS.includes(item.kind)) ? (
               <Button mode="contained" onPress={() => void reapply(item.id)}>
                 この端末の値で上書き
               </Button>
@@ -144,7 +147,7 @@ export function SyncConflictsScreen({
             >
               内容をコピー
             </Button>
-            <Button onPress={() => confirmDismiss(item.id)}>破棄</Button>
+            <Button onPress={() => confirmDismiss(item.id)}>一覧から閉じる</Button>
           </View>
         </View>
       ))}

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -62,6 +62,20 @@ class KnowledgeSearchPayload(BaseModel):
     top_k: int = 10
 
 
+class KnowledgePluginSearchPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(default="", max_length=2000)
+    source_id: UUID | None = None
+    project_id: UUID | None = None
+    tags: list[Annotated[str, Field(max_length=200)]] = Field(
+        default_factory=list, max_length=64
+    )
+    extension: str | None = Field(default=None, max_length=32)
+    path_prefix: str | None = Field(default=None, max_length=1000)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
 class OrganizeKnowledgePayload(BaseModel):
     dry_run: bool = True
     limit: int = 200
@@ -94,6 +108,99 @@ def create_knowledge_router(
 
     def _is_admin(user_info: dict[str, Any]) -> bool:
         return user_info.get("role") == "admin"
+
+    @router.get("/plugin/sources")
+    async def list_plugin_sources(
+        request: Request,
+        _: None = Depends(require_auth_dependency),
+    ):
+        user_info = await _get_user_or_401(request)
+        session = await get_db_manager().get_session()
+        try:
+            from ..services.knowledge_plugin_access import list_plugin_sources as list_sources
+
+            return {
+                "sources": await list_sources(
+                    session=session,
+                    actor_user_id=_actor_id(user_info),
+                )
+            }
+        finally:
+            await session.close()
+
+    @router.post("/plugin/search")
+    async def search_plugin_sources(
+        payload: KnowledgePluginSearchPayload,
+        request: Request,
+        _: None = Depends(require_auth_dependency),
+    ):
+        user_info = await _get_user_or_401(request)
+        session = await get_db_manager().get_session()
+        try:
+            from ..services.knowledge_plugin_access import search_plugin_knowledge
+
+            results = await search_plugin_knowledge(
+                session=session,
+                actor_user_id=_actor_id(user_info),
+                query=payload.query,
+                source_id=payload.source_id,
+                project_id=payload.project_id,
+                tags=payload.tags,
+                extension=payload.extension,
+                path_prefix=payload.path_prefix,
+                limit=payload.limit,
+            )
+            return {"results": results}
+        finally:
+            await session.close()
+
+    @router.get("/plugin/documents/{document_id}")
+    async def read_plugin_document(
+        document_id: UUID,
+        request: Request,
+        view: str = Query(default="body", pattern="^(body|outline)$"),
+        max_chars: int = Query(default=16_000, ge=1, le=32_000),
+        offset: int = Query(default=0, ge=0),
+        fingerprint: str | None = Query(
+            default=None,
+            min_length=64,
+            max_length=64,
+            pattern="^[0-9a-f]{64}$",
+        ),
+        _: None = Depends(require_auth_dependency),
+    ):
+        user_info = await _get_user_or_401(request)
+        session = await get_db_manager().get_session()
+        try:
+            from ..services.knowledge_plugin_access import (
+                KnowledgePluginContentChanged,
+                KnowledgePluginNotFound,
+                read_plugin_document as read_document,
+            )
+
+            return await read_document(
+                session=session,
+                actor_user_id=_actor_id(user_info),
+                document_id=document_id,
+                view=view,
+                max_chars=max_chars,
+                offset=offset,
+                fingerprint=fingerprint,
+            )
+        except KnowledgePluginContentChanged as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "content_changed", "message": str(exc)},
+            ) from exc
+        except KnowledgePluginNotFound as exc:
+            raise HTTPException(status_code=404, detail="Knowledge document not found") from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_read", "message": str(exc)},
+            ) from exc
+        finally:
+            await session.close()
 
     @router.get("/sources")
     async def list_sources(

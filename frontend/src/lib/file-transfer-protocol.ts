@@ -26,6 +26,11 @@ export type FileTransferMeta =
       url: string;
       paths?: string[];
       fallbackFilename?: string;
+      responseContract?: {
+        expectedContentType: "application/zip";
+        requireAttachment: true;
+        rejectRedirects: true;
+      };
     }
   | {
       operation: "save";
@@ -44,6 +49,7 @@ export type FileTransferDownloadMetadata = {
   filename: string;
   mimeType: string;
   size?: number;
+  attachment?: true;
 };
 
 export type FileTransferDownloadLine =

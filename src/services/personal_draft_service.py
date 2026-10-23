@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text, tuple_
 
 from ..memory.models.personal_draft import PersonalDraftEvent as Event
+from .personal_async_guard import run_personal_guard
 from .personal_ledger_service import (
     LedgerActor, LedgerConflictError, LedgerNotFoundError, LedgerPermissionError,
     LedgerValidationError, PersonalLedgerService, agent_actor, normalize_payload,
@@ -153,8 +154,7 @@ class PersonalDraftService:
 
     async def _evidence(self, session, owner, ref, guard=None):
         row = await self._owned(session, owner, ref, "evidence")
-        if guard is not None:
-            guard()  # right after the DB await, before the payload is read/decrypted
+        await run_personal_guard(guard)  # right after the DB await, before the payload is read/decrypted
         evidence = row.payload["evidence"]
         if evidence != _manual_evidence(evidence["proposal"], evidence["source_text"]):
             raise LedgerConflictError("source integrity mismatch")
@@ -168,17 +168,13 @@ class PersonalDraftService:
         request = {"evidence_ref": str(evidence_ref), "proposal": proposal, "actor_kind": actor.kind}
         session = await self.ledger._open()
         try:
-            if guard is not None:
-                guard()  # after _open, before the first DB read
+            await run_personal_guard(guard)  # after _open, before the first DB read
             async with session.begin():
-                if guard is not None:
-                    guard()  # after transaction enter
+                await run_personal_guard(guard)  # after transaction enter
                 await self._lock(session, actor.user_id)
-                if guard is not None:
-                    guard()  # after the advisory lock, before the next DB read
+                await run_personal_guard(guard)  # after the advisory lock, before the next DB read
                 existing = await self._by_key(session, actor.user_id, key)
-                if guard is not None:
-                    guard()
+                await run_personal_guard(guard)
                 if existing:
                     return self._replay(existing, request)["result"]
                 evidence = await self._evidence(session, actor.user_id, evidence_ref, guard)
@@ -187,8 +183,7 @@ class PersonalDraftService:
                 duplicate = (await session.execute(select(Event.id).where(
                     Event.owner_user_id == actor.user_id, Event.evidence_ref == evidence_ref,
                 ))).first()
-                if guard is not None:
-                    guard()  # raising here rolls the transaction back before any write
+                await run_personal_guard(guard)  # raising here rolls the transaction back before any write
                 if duplicate:
                     raise LedgerConflictError("evidence already has a draft")
                 draft_id = uuid4()
@@ -204,8 +199,7 @@ class PersonalDraftService:
                                "proposal": proposal, "evidence_digest": digest(evidence)}
                 session.add(row)
                 await session.flush()
-                if guard is not None:
-                    guard()  # raising here rolls back the flushed audit row before COMMIT
+                await run_personal_guard(guard)  # raising here rolls back the flushed audit row before COMMIT
                 return result
         finally:
             await session.close()

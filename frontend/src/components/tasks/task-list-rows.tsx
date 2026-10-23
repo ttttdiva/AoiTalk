@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { TaskRowDatePicker } from "@/components/tasks/task-row-date-picker";
+import { TaskProposalIndicators } from "@/components/tasks/task-proposal-card";
 import {
   TaskStatusMenuItems,
   type TaskStatusOption,
@@ -73,6 +74,7 @@ export function SubtaskRow({
   onFocus,
   focusRow,
   focused = false,
+  pendingProposalCount = 0,
 }: {
   sub: Task;
   parentTask: Task;
@@ -111,6 +113,7 @@ export function SubtaskRow({
   onFocus?: () => void;
   focusRow?: () => void;
   focused?: boolean;
+  pendingProposalCount?: number;
 }) {
   const status = getTaskDisplayStatus(sub);
   const trackedTimeLabel = formatTimerClock(
@@ -209,12 +212,19 @@ export function SubtaskRow({
       }}
       className={cn(
         "group relative h-11 cursor-pointer border-b border-border/40 bg-muted/10 transition-colors hover:bg-card/60",
+        pendingProposalCount > 0 &&
+          "bg-amber-50/50 dark:bg-amber-950/20",
         draggingIds.includes(sub.id) && "opacity-40",
         focused &&
           "is-focused bg-primary/10 outline outline-1 -outline-offset-1 outline-primary/60",
       )}
     >
-      <td className="h-11 py-0 pl-6">
+      <td
+        className={cn(
+          "h-11 py-0 pl-6",
+          pendingProposalCount > 0 && "border-l-2 border-l-amber-500",
+        )}
+      >
         {dropTargetId === sub.id && !draggingIds.includes(sub.id) && (
           <div
             className={cn(
@@ -292,6 +302,7 @@ export function SubtaskRow({
           >
             {sub.title}
           </span>
+          <TaskProposalIndicators count={pendingProposalCount} />
           {sub.has_recurrence && (
             <span
               className="text-[10px] text-muted-foreground"

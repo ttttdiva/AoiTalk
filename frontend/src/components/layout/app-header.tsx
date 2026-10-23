@@ -240,6 +240,8 @@ function getWorkspaceTitle(pathname: string | null): string {
   if (pathname.startsWith("/reports")) return "レポート";
   if (pathname.startsWith("/operations")) return "Operations";
   if (pathname.startsWith("/personal-ledger")) return "個人台帳";
+  if (pathname.startsWith("/personal-finance")) return "家計・レシート";
+  if (pathname.startsWith("/personal-career")) return "キャリア";
   if (pathname.startsWith("/projects")) return "プロジェクト";
   if (pathname.startsWith("/apps")) return "Apps";
   if (pathname.startsWith("/settings")) return "設定";

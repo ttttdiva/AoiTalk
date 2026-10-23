@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title AoiTalk
+title AoiTalk launcher (run.bat) - starting
 cd /d "%~dp0"
 if not defined AOITALK_PROFILE set "AOITALK_PROFILE=personal"
 if not defined AIVTUBER_ENV set "AIVTUBER_ENV=personal"
@@ -13,6 +13,7 @@ if not defined AOITALK_CADDY_NEXT_PORT set "AOITALK_CADDY_NEXT_PORT=%AOITALK_NEX
 if not defined AOITALK_SKIP_CADDY set "AOITALK_SKIP_CADDY=true"
 if not defined AOITALK_PUBLIC_BASE_PATH set "AOITALK_PUBLIC_BASE_PATH=/at"
 if not defined NEXT_PUBLIC_BASE_PATH set "NEXT_PUBLIC_BASE_PATH=%AOITALK_PUBLIC_BASE_PATH%"
+set "AOITALK_LAUNCH_SOURCE=run.bat"
 set "AOITALK_PYTHON=%~dp0venv\Scripts\python.exe"
 if not exist "%AOITALK_PYTHON%" (
     echo Python virtual environment not found: %AOITALK_PYTHON%

@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 from uuid import UUID, uuid4
 
 import httpx
@@ -577,8 +577,10 @@ class TaskCrudMixin:
         self,
         session: AsyncSession,
         task_id: UUID,
+        *,
+        include_deleted: bool = False,
     ) -> Task:
-        result = await session.execute(
+        statement = (
             select(Task)
             .options(
                 selectinload(Task.project),
@@ -591,9 +593,12 @@ class TaskCrudMixin:
                 selectinload(Task.time_entries).selectinload(TimeEntry.user),
                 selectinload(Task.task_tags).selectinload(TaskTag.tag),
             )
-            .where(Task.id == task_id, Task.deleted_at.is_(None))
             .with_for_update()
         )
+        statement = statement.where(Task.id == task_id)
+        if not include_deleted:
+            statement = statement.where(Task.deleted_at.is_(None))
+        result = await session.execute(statement)
         task = result.scalar_one_or_none()
         if task is None:
             raise TaskManagementError("Task not found", status_code=404)
@@ -871,6 +876,185 @@ class TaskCrudMixin:
 
         result = await session.execute(stmt)
         return [task.to_dict() for task in result.scalars().unique().all()]
+
+    async def list_tasks_compact(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        project_id: Optional[UUID] = None,
+        space_id: Optional[UUID] = None,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
+        status: Optional[str] = None,
+        assignee_id: Optional[UUID] = None,
+        search: Optional[str] = None,
+        due_before: Optional[datetime] = None,
+        updated_before: Optional[datetime] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return a bounded Task summary projection and one-row lookahead."""
+        project_ids = await self.resolve_read_project_ids(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            space_id=space_id,
+            browse_project_id=browse_project_id,
+            browse_space_id=browse_space_id,
+        )
+        if not project_ids:
+            return [], False
+
+        stmt = (
+            select(Task, Project.name, func.substr(Task.description, 1, 241))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.project_id,
+                    Task.title,
+                    Task.status,
+                    Task.priority,
+                    Task.start_at,
+                    Task.end_at,
+                    Task.updated_at,
+                    Task.parent_task_id,
+                )
+            )
+            .join(Project, Project.id == Task.project_id)
+            .where(
+                Task.project_id.in_(project_ids),
+                Task.archived_at.is_(None),
+                Task.deleted_at.is_(None),
+            )
+            .order_by(
+                Task.sort_order.asc().nulls_last(),
+                Task.project_id.asc(),
+                Task.parent_task_id.asc().nulls_first(),
+                Task.created_at.asc(),
+                Task.id.asc(),
+            )
+        )
+        if status:
+            stmt = stmt.where(Task.status == normalize_task_status(status))
+        if search:
+            like_term = f"%{search.strip()}%"
+            stmt = stmt.where(
+                or_(Task.title.ilike(like_term), Task.description.ilike(like_term))
+            )
+        if assignee_id:
+            stmt = stmt.where(
+                Task.id.in_(
+                    select(TaskAssignee.task_id).where(
+                        TaskAssignee.user_id == assignee_id
+                    )
+                )
+            )
+        if due_before is not None:
+            stmt = stmt.where(Task.end_at.is_not(None), Task.end_at < due_before)
+        if updated_before is not None:
+            stmt = stmt.where(Task.updated_at < updated_before)
+        result = await session.execute(stmt.limit(limit + 1).offset(offset))
+        rows = list(result.unique().all())
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        tasks = [row[0] for row in page]
+        project_names = {task.id: project_name for task, project_name, _ in page}
+        descriptions = {task.id: snippet for task, _, snippet in page}
+        task_ids = [task.id for task in tasks]
+
+        assignees_by_task: dict[UUID, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        tags_by_task: dict[UUID, list[dict[str, Any]]] = {
+            task_id: [] for task_id in task_ids
+        }
+        if task_ids:
+            assignee_ranked = (
+                select(
+                    TaskAssignee.task_id.label("task_id"),
+                    TaskAssignee.user_id.label("user_id"),
+                    User.display_name.label("display_name"),
+                    User.username.label("username"),
+                    func.row_number()
+                    .over(
+                        partition_by=TaskAssignee.task_id,
+                        order_by=(
+                            TaskAssignee.is_primary.desc(),
+                            TaskAssignee.assigned_at.asc(),
+                            TaskAssignee.user_id.asc(),
+                        ),
+                    )
+                    .label("row_number"),
+                )
+                .join(User, User.id == TaskAssignee.user_id)
+                .where(TaskAssignee.task_id.in_(task_ids))
+            ).subquery()
+            assignee_rows = await session.execute(
+                select(assignee_ranked).where(assignee_ranked.c.row_number <= 10)
+            )
+            for row in assignee_rows.mappings().all():
+                assignees_by_task[row["task_id"]].append(
+                    {
+                        "id": str(row["user_id"]),
+                        "display_name": row["display_name"],
+                        "username": row["username"],
+                    }
+                )
+
+            tag_ranked = (
+                select(
+                    TaskTag.task_id.label("task_id"),
+                    Tag.id.label("tag_id"),
+                    Tag.name.label("name"),
+                    Tag.color.label("color"),
+                    func.row_number()
+                    .over(
+                        partition_by=TaskTag.task_id,
+                        order_by=(Tag.name.asc(), Tag.id.asc()),
+                    )
+                    .label("row_number"),
+                )
+                .join(Tag, Tag.id == TaskTag.tag_id)
+                .where(TaskTag.task_id.in_(task_ids))
+            ).subquery()
+            tag_rows = await session.execute(
+                select(tag_ranked).where(tag_ranked.c.row_number <= 10)
+            )
+            for row in tag_rows.mappings().all():
+                tags_by_task[row["task_id"]].append(
+                    {
+                        "id": str(row["tag_id"]),
+                        "name": row["name"],
+                        "color": row["color"],
+                    }
+                )
+        summaries = []
+        for task in tasks:
+            summaries.append(
+                {
+                    "id": str(task.id),
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "project_id": str(task.project_id),
+                    "project_name": project_names.get(task.id),
+                    "parent_task_id": (
+                        str(task.parent_task_id) if task.parent_task_id else None
+                    ),
+                    "start_at": task.start_at.isoformat() if task.start_at else None,
+                    "end_at": task.end_at.isoformat() if task.end_at else None,
+                    "updated_at": (
+                        task.updated_at.isoformat() if task.updated_at else None
+                    ),
+                    "assignees": assignees_by_task.get(task.id, []),
+                    "tags": tags_by_task.get(task.id, []),
+                    "description_excerpt": self._task_candidate_snippet(
+                        descriptions.get(task.id), max_len=240
+                    ),
+                }
+            )
+        return summaries, has_more
 
     @staticmethod
     def _task_candidate_snippet(description: str | None, *, max_len: int = 120) -> str:
@@ -1173,6 +1357,7 @@ class TaskCrudMixin:
         *,
         user_id: UUID,
         task_id: UUID,
+        expected_updated_at: Optional[datetime] = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         """Soft-delete a task tree and return its canonical tombstone.
@@ -1196,16 +1381,25 @@ class TaskCrudMixin:
         await self.require_project_permission(
             session, project_id=task.project_id, user_id=user_id, permission="write"
         )
+        fresh_result = await session.execute(
+            select(Task.updated_at, Task.deleted_at, Task.deletion_batch_id).where(
+                Task.id == task_id
+            )
+        )
+        fresh_updated_at, fresh_deleted_at, fresh_batch_id = fresh_result.one()
 
-        if getattr(task, "deleted_at", None) is not None:
+        # A fresh tombstone is the canonical idempotent delete result.  It
+        # wins over a stale caller version, and is read as a scalar tuple so
+        # an older identity-map Task cannot hide a concurrent delete.
+        if fresh_deleted_at is not None:
             payload = {
                 "id": str(task.id),
                 "task_id": str(task.id),
                 "task_ids": [str(task.id)],
-                "deleted_at": task.deleted_at.isoformat(),
+                "deleted_at": fresh_deleted_at.isoformat(),
                 "deletion_batch_id": (
-                    str(getattr(task, "deletion_batch_id", None))
-                    if getattr(task, "deletion_batch_id", None)
+                    str(fresh_batch_id)
+                    if fresh_batch_id
                     else None
                 ),
                 "idempotent": True,
@@ -1213,6 +1407,15 @@ class TaskCrudMixin:
             if commit:
                 await self._broadcast("task_deleted", payload)
             return payload
+        if (
+            expected_updated_at is not None
+            and fresh_updated_at != expected_updated_at
+        ):
+            raise TaskManagementError(
+                "Task was updated by another request",
+                status_code=409,
+                detail={"code": "task_cas_stale"},
+            )
 
         task_ids = await self._collect_task_tree_ids(
             session,
@@ -1308,6 +1511,8 @@ class TaskCrudMixin:
         task_id: UUID,
         deletion_batch_id: Optional[UUID] = None,
         now: Optional[datetime] = None,
+        commit: bool = True,
+        after_commit: list[Callable[[], Any]] | None = None,
     ) -> dict[str, Any]:
         """Restore one exact, unexpired task-deletion batch.
 
@@ -1466,8 +1671,11 @@ class TaskCrudMixin:
             project_id=root.project_id,
             event_at=restored_at,
         )
-        _assert_generation_mutation_allowed()
-        await session.commit()
+        if commit:
+            _assert_generation_mutation_allowed()
+            await session.commit()
+        else:
+            await session.flush()
         payload = {
             "id": str(root.id),
             "task_id": str(root.id),
@@ -1477,7 +1685,12 @@ class TaskCrudMixin:
             "restored": True,
             "idempotent": False,
         }
-        await self._broadcast("task_restored", payload)
+        if after_commit is not None:
+            after_commit.append(
+                lambda payload=payload: self._broadcast("task_restored", payload)
+            )
+        else:
+            await self._broadcast("task_restored", payload)
         return payload
 
     async def purge_deleted_task_ids(
@@ -1962,6 +2175,7 @@ class TaskCrudMixin:
         task_id: UUID,
         updates: dict[str, Any],
         close_incomplete_subtasks: bool = False,
+        expected_updated_at: Optional[datetime] = None,
         commit: bool = True,
     ) -> dict[str, Any]:
         requested_status = updates.get("status")
@@ -1973,7 +2187,9 @@ class TaskCrudMixin:
         # callers (REST, sync, and the agent tool) all use
         # ``prepare_task_project_move`` which acquires the sorted project lock
         # namespace first, avoiding a move/dependency/schedule deadlock.
-        task = await self._load_task(session, task_id)
+        task = await self._load_task(
+            session, task_id, include_deleted=expected_updated_at is not None
+        )
         # A few legacy callers provide a lightweight task double only through
         # ``_load_task_for_update`` for close requests. Keep that compatibility
         # path while real ORM tasks always carry ``project_id`` and therefore
@@ -2005,7 +2221,22 @@ class TaskCrudMixin:
             # order.  Taking the row lock unconditionally also serializes the
             # Docs-node binding path without orphaning a concurrently-created
             # node.
-            locked_task = await self._load_task_for_update(session, task_id)
+            locked_task = await self._load_task_for_update(
+                session,
+                task_id,
+                include_deleted=expected_updated_at is not None,
+            )
+            if expected_updated_at is not None:
+                fresh_result = await session.execute(
+                    select(Task.updated_at, Task.deleted_at).where(Task.id == task_id)
+                )
+                fresh_updated_at, fresh_deleted_at = fresh_result.one()
+                if fresh_deleted_at is not None or fresh_updated_at != expected_updated_at:
+                    raise TaskManagementError(
+                        "Task was updated by another request",
+                        status_code=409,
+                        detail={"code": "task_cas_stale"},
+                    )
             if locked_task.project_id != task.project_id:
                 raise TaskManagementError(
                     "TaskのProjectが同時変更されたため更新できません",

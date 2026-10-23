@@ -18,6 +18,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Mapping
 from uuid import UUID
 
+from .agent_role_context import build_agent_role_context
 from .agent_model_routing import (
     AgentModelRoute,
     AgentModelRouteError,
@@ -612,19 +613,9 @@ def _clean(value: Any) -> str:
 
 
 def _system_prompt(binding: "AgentExecutionBindingSnapshot") -> str:
-    parts = [
-        "あなたはAoiTalk Operations Agentです。Character/Personaとして振る舞わず、"
-        "このAgentRevisionに記載された職務だけを実行してください。",
-    ]
-    for label, value in (
-        ("Mission", binding.mission),
-        ("Responsibility", binding.responsibility_summary),
-        ("Operational instructions", binding.operational_instructions),
-    ):
-        text = _clean(value)
-        if text:
-            parts.append(f"{label}:\n{text[:30_000]}")
-    return "\n\n".join(parts)
+    """Compatibility wrapper around the shared immutable role builder."""
+
+    return build_agent_role_context(binding).text
 
 
 async def _session_db(db_manager: Any | None = None) -> Any:

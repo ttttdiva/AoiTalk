@@ -1,9 +1,9 @@
 import { eq } from "drizzle-orm";
-import { getDb, schema } from "../db/client";
+import { schema } from "../db/client";
+import { assertActiveWriter, type SqliteHandle, type SqliteWriter } from "../db/sqlite-writer";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 
 export type TombstoneLedger = { storageKey: string; entries: Map<string, string> };
-const memoryLedgers = new Map<string, Map<string, string>>();
 
 function parseTimestamp(value: string | null | undefined): number | null {
   if (!value) return null;
@@ -34,45 +34,60 @@ async function authScope(): Promise<string> {
   }
 }
 
-export async function loadTombstoneLedger(prefix: string): Promise<TombstoneLedger> {
-  const storageKey = `${prefix}:${await authScope()}`;
-  const entries = new Map(memoryLedgers.get(storageKey) ?? []);
-  try {
-    const rows = await getDb()
-      .select({ cursor: schema.syncState.cursor })
-      .from(schema.syncState)
-      .where(eq(schema.syncState.tableName, storageKey));
-    const raw = rows[0]?.cursor;
-    if (typeof raw === "string") {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      for (const [id, value] of Object.entries(parsed ?? {})) {
-        if (typeof value === "string") entries.set(id, value);
-      }
+/** Async preparation (token read) for the InWriter ledger functions. */
+export async function prepareTombstoneLedgerKey(prefix: string): Promise<string> {
+  return `${prefix}:${await authScope()}`;
+}
+
+/**
+ * Synchronous ledger load for a write unit. The ledger lives only in
+ * sync_state; write failures propagate and roll back the caller's transaction
+ * together with the ledger. A corrupt cursor JSON is treated as empty.
+ */
+export function loadTombstoneLedgerInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  storageKey: string,
+): TombstoneLedger {
+  assertActiveWriter(writer);
+  const entries = new Map<string, string>();
+  const rows = tx
+    .select({ cursor: schema.syncState.cursor })
+    .from(schema.syncState)
+    .where(eq(schema.syncState.tableName, storageKey))
+    .all();
+  const raw = rows[0]?.cursor;
+  if (typeof raw === "string") {
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      parsed = null;
     }
-  } catch {
-    // Legacy test/DB doubles may not have sync_state; the current process
-    // still guards rows through their local deleted_at column.
+    for (const [id, value] of Object.entries(parsed ?? {})) {
+      if (typeof value === "string") entries.set(id, value);
+    }
   }
-  memoryLedgers.set(storageKey, entries);
   return { storageKey, entries };
 }
 
-export async function persistTombstoneLedger(ledger: TombstoneLedger): Promise<void> {
-  memoryLedgers.set(ledger.storageKey, new Map(ledger.entries));
-  try {
-    await getDb()
-      .insert(schema.syncState)
-      .values({
-        tableName: ledger.storageKey,
-        lastPulledAt: null,
-        lastPushedAt: null,
-        cursor: JSON.stringify(Object.fromEntries(ledger.entries)),
-      })
-      .onConflictDoUpdate({
-        target: schema.syncState.tableName,
-        set: { cursor: JSON.stringify(Object.fromEntries(ledger.entries)) },
-      });
-  } catch {
-    // Keep the row-level tombstone when a legacy DB cannot persist the ledger.
-  }
+export function persistTombstoneLedgerInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  ledger: TombstoneLedger,
+): void {
+  assertActiveWriter(writer);
+  const cursor = JSON.stringify(Object.fromEntries(ledger.entries));
+  tx.insert(schema.syncState)
+    .values({
+      tableName: ledger.storageKey,
+      lastPulledAt: null,
+      lastPushedAt: null,
+      cursor,
+    })
+    .onConflictDoUpdate({
+      target: schema.syncState.tableName,
+      set: { cursor },
+    })
+    .run();
 }

@@ -865,6 +865,8 @@ class UnifiedToolResult:
     # Safe, framework-authored provenance of a server-contract argument
     # rejection (code and target digest only; never argument values).
     argument_rejection: Mapping[str, str] | None = None
+    # Fixed framework policy code for a refusal that happened before execution.
+    policy_denial: Mapping[str, str] | None = None
 
     @property
     def model_output(self) -> str:
@@ -1907,6 +1909,7 @@ class RegistryToolRouter:
             error=payload["error"],
             elapsed_ms=elapsed_ms,
             executed=False,
+            policy_denial={"code": exc.code},
         )
 
     def _argument_validation_result(

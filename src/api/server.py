@@ -1871,6 +1871,39 @@ class WebChatServer(
         from .routes.personal_draft_routes import register_personal_draft_routes
 
         register_personal_draft_routes(self.app, self)
+        from .routes.personal_finance_routes import register_personal_finance_routes
+
+        register_personal_finance_routes(self.app, self)
+        from .routes.personal_career_routes import register_personal_career_routes
+
+        register_personal_career_routes(self.app, self)
+        from .routes.personal_agent_routes import register_personal_agent_routes
+
+        register_personal_agent_routes(self.app, self)
+        from ..services.personal_reminder_service import PersonalReminderService
+        from ..services.personal_reminder_worker import PersonalReminderWorker
+        from .routes.personal_reminder_routes import register_personal_reminder_routes
+
+        reminder_service = PersonalReminderService(
+            lambda: self._db_manager.get_session()
+        )
+        reminder_worker = PersonalReminderWorker(
+            reminder_service,
+            config=self.config,
+        )
+        self._personal_reminder_service = reminder_service
+        self._personal_reminder_worker = reminder_worker
+        # This worker only delivers schedules explicitly approved by the owner.
+        # It is disabled unless an operator deliberately enables the narrow
+        # personal_reminders.worker_enabled setting after staging migration 0105.
+        self._register_lifecycle_pair(reminder_worker.start, reminder_worker.stop)
+        register_personal_reminder_routes(
+            self.app,
+            self,
+            service=reminder_service,
+            schema_ready=reminder_service.schema_available,
+            worker_ready=lambda: reminder_worker.ready,
+        )
         register_capabilities_routes(self.app, self)
         if not Features.is_enterprise():
             register_remote_server_routes(self.app, self)
@@ -2474,6 +2507,30 @@ class WebChatServer(
         )
         self.app.include_router(router)
         logger.info("Mobile sync routes registered")
+
+        from ..sync_v3.change_feed import PgChangeFeed
+        from ..sync_v3.settings import sync_v3_enabled
+        from .sync_v3_ops_routes import create_sync_v3_ops_router
+        from .sync_v3_routes import create_sync_v3_router
+
+        self.app.include_router(
+            create_sync_v3_router(
+                PgChangeFeed(),
+                get_db_manager=lambda: self._db_manager,
+                get_user_from_request=self._get_user_info_from_request,
+                require_auth_dependency=require_auth,
+            )
+        )
+        self.app.include_router(
+            create_sync_v3_ops_router(
+                sync_v3_enabled,
+                get_db_manager=lambda: self._db_manager,
+                get_user_from_request=self._get_user_info_from_request,
+                require_auth_dependency=require_auth,
+                workspace_root=self._resolve_workspace_root(),
+            )
+        )
+        logger.info("Mobile sync v3 routes registered")
 
     def _register_docs_routes(self):
         """Register Docs REST API routes"""

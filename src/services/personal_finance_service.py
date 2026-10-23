@@ -32,6 +32,7 @@ from .personal_finance_contracts import (
     MAX_IDEMPOTENCY_KEY_LENGTH,
     compute_confirmed_digest,
 )
+from .personal_async_guard import run_personal_guard
 
 
 def _parse_idempotency_key(value: object) -> str:
@@ -55,6 +56,7 @@ class PersonalFinanceRepository(Protocol):
         *,
         owner_user_id: UUID,
         idempotency_key: str,
+        guard: Callable[[], Any] | None = None,
     ) -> Mapping[str, Any] | None: ...
 
     async def get_by_row_ref(
@@ -62,8 +64,16 @@ class PersonalFinanceRepository(Protocol):
         *,
         owner_user_id: UUID,
         row_ref: UUID,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> Mapping[str, Any] | None: ...
+
+    async def list_by_owner(
+        self,
+        *,
+        owner_user_id: UUID,
+        limit: int,
+        guard: Callable[[], Any] | None = None,
+    ) -> list[Mapping[str, Any]]: ...
 
     async def insert(
         self,
@@ -74,6 +84,7 @@ class PersonalFinanceRepository(Protocol):
         content_digest: str,
         confirmed_by_kind: str,
         payload: Mapping[str, Any],
+        guard: Callable[[], Any] | None = None,
     ) -> Mapping[str, Any]: ...
 
 
@@ -104,6 +115,54 @@ class PersonalFinanceService:
     def __init__(self, repository: PersonalFinanceRepository) -> None:
         self._repository = repository
 
+    async def list_confirmed_entries(
+        self,
+        actor: FinanceActor,
+        *,
+        limit: int = 100,
+        guard: Callable[[], None] | None = None,
+    ) -> tuple[FinanceEntryView, ...]:
+        """Return a bounded, owner-filtered view of confirmed entries.
+
+        The repository applies the owner predicate in SQL before decrypting
+        payloads and invokes ``guard`` immediately after the query.  This read
+        adapter exposes only the same canonical private row/source projection
+        as the append service; it does not widen dataset or project scope.
+        """
+
+        if not isinstance(actor, FinanceActor) or actor.kind != ACTOR_USER_ACTION:
+            raise FinanceActorNotAllowed("owner action required to read finance entries")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise FinanceContractError("limit must be within 1..1000")
+        records = await self._repository.list_by_owner(
+            owner_user_id=actor.owner_user_id,
+            limit=limit,
+            guard=guard,
+        )
+        await run_personal_guard(guard)
+        return tuple(_view_from_record(record, replayed=False) for record in records)
+
+    async def get_confirmed_entry(
+        self,
+        actor: FinanceActor,
+        *,
+        row_ref: UUID,
+        guard: Callable[[], None] | None = None,
+    ) -> FinanceEntryView | None:
+        """Return one confirmed row only within the authenticated owner scope."""
+
+        if not isinstance(actor, FinanceActor) or actor.kind != ACTOR_USER_ACTION:
+            raise FinanceActorNotAllowed("owner action required to read finance entries")
+        if not isinstance(row_ref, UUID):
+            raise FinanceContractError("row_ref must be a UUID")
+        record = await self._repository.get_by_row_ref(
+            owner_user_id=actor.owner_user_id,
+            row_ref=row_ref,
+            guard=guard,
+        )
+        await run_personal_guard(guard)
+        return None if record is None else _view_from_record(record, replayed=False)
+
     async def append_confirmed_entry(
         self,
         actor: FinanceActor,
@@ -113,6 +172,7 @@ class PersonalFinanceService:
         confirmed_digest: str,
         owner_confirmed: bool,
         idempotency_key: str,
+        guard: Callable[[], Any] | None = None,
     ) -> FinanceEntryView:
         if not isinstance(actor, FinanceActor):
             raise FinanceActorNotAllowed("actor must be an issued FinanceActor")
@@ -145,14 +205,18 @@ class PersonalFinanceService:
         existing = await self._repository.get_by_idempotency_key(
             owner_user_id=actor.owner_user_id,
             idempotency_key=key,
+            guard=guard,
         )
+        await run_personal_guard(guard)
         if existing is not None:
             return self._replay_or_conflict(existing, content_digest=expected_digest)
 
         duplicate = await self._repository.get_by_row_ref(
             owner_user_id=actor.owner_user_id,
             row_ref=entry_row.row_ref,
+            guard=guard,
         )
+        await run_personal_guard(guard)
         if duplicate is not None:
             raise FinanceDuplicateRowRef(
                 "row_ref is already stored for this owner by another operation"
@@ -166,12 +230,16 @@ class PersonalFinanceService:
                 content_digest=expected_digest,
                 confirmed_by_kind=actor.kind,
                 payload=payload,
+                guard=guard,
             )
+            await run_personal_guard(guard)
         except FinanceIdempotencyRace:
             raced = await self._repository.get_by_idempotency_key(
                 owner_user_id=actor.owner_user_id,
                 idempotency_key=key,
+                guard=guard,
             )
+            await run_personal_guard(guard)
             if raced is None:  # pragma: no cover - defensive
                 raise
             return self._replay_or_conflict(raced, content_digest=expected_digest)
@@ -233,6 +301,7 @@ class SqlPersonalFinanceRepository:
         *,
         owner_user_id: UUID,
         idempotency_key: str,
+        guard: Callable[[], Any] | None = None,
     ) -> dict[str, Any] | None:
         model = self._model()
         async with self._session_factory() as session:
@@ -242,6 +311,7 @@ class SqlPersonalFinanceRepository:
                     model.idempotency_key == idempotency_key,
                 )
             )
+            await run_personal_guard(guard)
             entry = result.scalar_one_or_none()
             return None if entry is None else _record_from_entry(entry)
 
@@ -250,7 +320,7 @@ class SqlPersonalFinanceRepository:
         *,
         owner_user_id: UUID,
         row_ref: UUID,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> dict[str, Any] | None:
         """``guard`` (trusted read hook) runs right after the DB await, before payload decryption."""
         model = self._model()
@@ -261,10 +331,33 @@ class SqlPersonalFinanceRepository:
                     model.row_ref == row_ref,
                 )
             )
-            if guard is not None:
-                guard()
+            await run_personal_guard(guard)
             entry = result.scalar_one_or_none()
             return None if entry is None else _record_from_entry(entry)
+
+    async def list_by_owner(
+        self,
+        *,
+        owner_user_id: UUID,
+        limit: int,
+        guard: Callable[[], Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """SQL owner filter first; re-check trusted scope before decrypting."""
+
+        model = self._model()
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(model)
+                .where(
+                    model.owner_user_id == owner_user_id,
+                    model.confirmed_by_kind == ACTOR_USER_ACTION,
+                )
+                .order_by(model.created_at.desc(), model.id.desc())
+                .limit(limit)
+            )
+            await run_personal_guard(guard)
+            entries = result.scalars().all()
+            return [_record_from_entry(entry) for entry in entries]
 
     async def insert(
         self,
@@ -275,6 +368,7 @@ class SqlPersonalFinanceRepository:
         content_digest: str,
         confirmed_by_kind: str,
         payload: Mapping[str, Any],
+        guard: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         model = self._model()
         entry = model(
@@ -297,6 +391,8 @@ class SqlPersonalFinanceRepository:
         async with self._session_factory() as session:
             session.add(entry)
             try:
+                await session.flush()
+                await run_personal_guard(guard)
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()

@@ -23,6 +23,7 @@ from types import UnionType
 import asyncio
 import contextvars
 import inspect
+import re
 
 
 def coerce_boolean_argument(tool_name: str, argument: str, value: Any) -> Any:
@@ -166,8 +167,10 @@ class ToolPolicyDeniedError(Exception):
     to the model.  The router records the call with ``executed=False``.
     """
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, code: str = "tool_policy_denied") -> None:
         self.reason = str(reason or "denied by task execution policy").strip()
+        candidate = str(code or "").strip()
+        self.code = candidate if re.fullmatch(r"[a-z][a-z0-9_]{2,63}", candidate) else "tool_policy_denied"
         super().__init__(self.reason)
 
 

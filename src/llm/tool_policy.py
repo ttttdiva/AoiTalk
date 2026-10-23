@@ -1294,6 +1294,18 @@ _TASK_UNENUMERATED_PREFIX_RE = re.compile(
     r"^.*?(?:" + _TASK_UNENUMERATED_TARGET_RE.pattern + r")(?P<path>[A-Za-z0-9_.~].*)$",
     re.IGNORECASE,
 )
+# Constraints on the quality of a fix or on assuming success.  They do not
+# forbid editing files, so they are removed before the whole-task scan; any
+# other prohibition left in the same sentence is still enforced.
+_TASK_SHORTCUT_CONSTRAINT_RE = re.compile(
+    r"(?:時間切れ|タイムアウト|timeout|skip|forceExit)[^。\n、，,]{0,80}?"
+    r"追加だけの(?:解決|対応|修正)(?:は|を)?(?:禁止|しない|不可)"
+    r"|新(?:規)?メソッド(?:だけ|のみ)追加して[^。\n、，,]{0,20}?(?:仮定|想定)しない"
+    # ``Gitの…一括add禁止`` forbids specific Git operations only.  Japanese
+    # particles are Unicode word characters, so the boundary is ASCII-only.
+    r"|(?<![A-Za-z0-9_])git(?![A-Za-z0-9_])の[^。\n、，,]*?(?:禁止|しない|不可)",
+    re.IGNORECASE,
+)
 _TASK_SENTENCE_SPLIT_RE = re.compile(r"[\n。;；]+|(?<=[!?])\s+|(?<=\.)\s+")
 _TASK_CLAUSE_SPLIT_RE = re.compile(
     r"[、，,]+|\s+(?:but|while|whereas|however|and)\s+|ただし|しかし",
@@ -1337,11 +1349,22 @@ _TASK_SCOPE_TARGET_RE = re.compile(
     r"\d+\s*(?:個の)?(?:ファイル|files?)"
     r"|TTL|認証|資格情報|秘密|シークレット|\.env|DB|データベース|コマンド|設定|スキーマ|マイグレーション"
     r"|\b(?:auth\w*|credentials?|secrets?|tokens?|database|db|commands?|config\w*|schema|migrations?|"
-    r"git|tests?|lockfiles?|dependenc\w+)\b"
+    r"tests?|lockfiles?|dependenc\w+)\b"
+    # ``Gitの新branch…``: Japanese particles are Unicode word characters, so
+    # only the Git object uses an ASCII-only boundary.
+    r"|(?<![A-Za-z0-9_])git(?![A-Za-z0-9_])"
     # A qualified code object ("do not change calendar code") names a part of
     # the repository; bare "code"/"all code" stays an unscoped declaration.
     r"|\b(?!(?:the|any|all|this|that|these|those|my|your|our|its|source|of|existing|change|modify|edit|update|write|touch|create|delete|alter|add|remove)\b)"
     r"[A-Za-z][\w-]*\s+(?:source\s+)?(?:code|codebase|modules?)\b",
+    re.IGNORECASE,
+)
+# "<対象>の保持は変更しない": the sentence preserves a named state/binding, which
+# is an instruction to the model and not a declaration that the task is read-only.
+_TASK_PRESERVED_STATE_RE = re.compile(
+    r"(?:(?:かつ|および|ならびに|また|さらに)\s*)?(?:[A-Za-z0-9_.-]+\s*)?"
+    r"(?:保持|維持|保全|binding|バインド|紐付け?|紐づけ?)(?:は|を)?\s*(?:も)?"
+    r"(?:変更|編集|修正|書き換え)(?:しない|禁止|不可)",
     re.IGNORECASE,
 )
 _TASK_READ_ONLY_TARGET_RE = re.compile(
@@ -1515,7 +1538,18 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
         sentence = sentence.strip()
         if not sentence:
             continue
-        scan = _TASK_INSPECTION_QUALIFIER_RE.sub(" ", sentence)
+        scan = _TASK_SHORTCUT_CONSTRAINT_RE.sub(
+            " ", _TASK_INSPECTION_QUALIFIER_RE.sub(" ", sentence)
+        )
+        # Remove only the minimal preserving span; the rest of the sentence is
+        # still classified, so a real whole-task ban next to it stays whole.
+        # Clauses are re-joined with spaces so Japanese connectives (ただし等)
+        # cannot glue to an adjacent ASCII ban and defeat its word boundary.
+        scan = " ".join(
+            _TASK_PRESERVED_STATE_RE.sub(" ", clause)
+            for clause in _TASK_CLAUSE_SPLIT_RE.split(scan)
+            if clause
+        )
         forbidden = any(
             pattern.search(scan) is not None
             for pattern in _MUTATION_FORBIDDEN_PATTERNS
@@ -1530,7 +1564,7 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
             elif _task_path_tokens(sentence):
                 # The named files are protected by the clause scan below.
                 pass
-            elif _TASK_SCOPE_TARGET_RE.search(sentence):
+            elif _TASK_SCOPE_TARGET_RE.search(scan):
                 # A restriction that names no file ("設定ファイルは変更しない
                 # こと", "TTL/認証/DB禁止") stays an instruction to the model in
                 # the prompt.  It neither widens nor narrows the file scope.

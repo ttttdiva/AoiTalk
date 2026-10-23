@@ -7,6 +7,7 @@
 from .attachments_routes import register_attachment_routes
 from .google_calendar_routes import register_google_calendar_routes
 from .notifications_routes import register_notification_routes
+from .operations_routes import register_task_operation_routes
 from .occurrences_time_routes import register_occurrence_time_routes
 from .spaces_routes import register_space_routes
 from .tags_reorder_routes import register_tag_reorder_routes
@@ -17,6 +18,7 @@ __all__ = [
     "register_attachment_routes",
     "register_google_calendar_routes",
     "register_notification_routes",
+    "register_task_operation_routes",
     "register_occurrence_time_routes",
     "register_space_routes",
     "register_tag_reorder_routes",

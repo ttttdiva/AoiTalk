@@ -126,7 +126,7 @@ function updateRecord<T>(record: Record<string, T>, id: string, patch: Partial<T
 }
 
 function explicitRouteValidationError(
-  route: { inherit_model: boolean; provider: string; model: string; effort_policy: string; effort: string },
+  route: { inherit_model: boolean; provider: string; model: string | null; effort_policy: string; effort: string | null },
   catalog: LlmModelCatalogResponse,
   label: string,
 ): string {
@@ -138,6 +138,12 @@ function explicitRouteValidationError(
   }
   const provider = String(route.provider || "").trim().toLowerCase();
   const model = String(route.model || "").trim();
+  if (provider === "muse-remote") {
+    if (route.model !== null || route.effort !== null || route.effort_policy !== "not_applicable") {
+      return `${label} の Muse remote route は model / effort を指定できません。`;
+    }
+    return "";
+  }
   if (!provider || !model) return `${label} は provider と model の両方が必要です。`;
   // Free Team is a routing profile rather than an effort-capable model.
   if (provider === "routing-profile" && model === "free-team") return "";

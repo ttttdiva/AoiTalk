@@ -46,6 +46,9 @@ _CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_ITEMS = 20
 _MAX_ITEM_CHARS = 1000
 _TASK_TIMEOUT_SECONDS = 3600
+_TASK_COMMAND_TIMEOUT_SECONDS = 900
+# Optional per-task narrowing controls (strict int, never bool); omitted keeps legacy.
+_TASK_TIME_LIMIT_RANGES = {"timeout_sec": _TASK_TIMEOUT_SECONDS, "command_timeout_sec": _TASK_COMMAND_TIMEOUT_SECONDS}
 
 
 class AgentTaskInvocationError(RuntimeError):
@@ -387,7 +390,46 @@ def _normalise_request(payload: Mapping[str, Any], config: Any) -> dict[str, Any
             raise AgentTaskInvocationError("invalid_input", "tool_generation_max_tokens must be an integer between 1 and 4096", 422)
         # Explicit per-task opt-in; only a present value joins the identity.
         normalized["tool_generation_max_tokens"] = tool_generation
+    for key, upper in _TASK_TIME_LIMIT_RANGES.items():
+        value = payload.get(key)
+        if value is None:
+            continue
+        if not _valid_time_limit(value, upper):
+            raise AgentTaskInvocationError("invalid_input", f"{key} must be an integer between 1 and {upper}", 422)
+        # Narrowing-only control; only an explicit value joins the identity.
+        normalized[key] = value
     return normalized
+
+
+def _valid_time_limit(value: Any, upper: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= upper
+
+
+def _has_explicit_time_limit(request: Mapping[str, Any]) -> bool:
+    return any(request.get(key) is not None for key in _TASK_TIME_LIMIT_RANGES)
+
+
+def _effective_task_timeout(request: Mapping[str, Any]) -> int:
+    requested = request.get("timeout_sec")
+    return min(_TASK_TIMEOUT_SECONDS, requested) if requested is not None else _TASK_TIMEOUT_SECONDS
+
+
+def _task_command_ceiling(request: Mapping[str, Any]) -> int:
+    requested = request.get("command_timeout_sec")
+    return min(_TASK_COMMAND_TIMEOUT_SECONDS, requested) if requested is not None else _TASK_COMMAND_TIMEOUT_SECONDS
+
+
+def _narrowed_command_seconds(request: Mapping[str, Any], remaining: float | None) -> float:
+    """Per-command ceiling: existing 900 s, explicit cap, and the remaining absolute deadline."""
+
+    if not _has_explicit_time_limit(request):
+        return float(_TASK_COMMAND_TIMEOUT_SECONDS)
+    value = float(_task_command_ceiling(request))
+    if remaining is not None:
+        if remaining <= 0:
+            raise AgentTaskInvocationError("timeout", "The task deadline elapsed", 409)
+        value = min(value, float(remaining))
+    return value
 
 
 def _request_fingerprint(request: Mapping[str, Any]) -> str:
@@ -834,6 +876,11 @@ _CORRECTABLE_EVIDENCE_CODES = frozenset({
     "task_no_successful_tool_receipt",
     "task_filesystem_mutation_receipt_required",
     "task_required_output_missing",
+})
+_SUPERSEDABLE_POLICY_CODES = frozenset({
+    "command_destructive_pattern",
+    "command_empty",
+    "command_too_long",
 })
 _OUTPUT_WRITE_TOOLS = frozenset({"create_file", "append_to_file", "edit_file", "insert_to_file"})
 _REPARSE_POINT_ATTRIBUTE = 0x400
@@ -1555,6 +1602,27 @@ def _command_workspace_mutation(receipt: Any, request: Mapping[str, Any] | None 
     return _COMMAND_WORKSPACE_UNKNOWN
 
 
+def _supersedable_refusal(receipt: Any, request: Mapping[str, Any]) -> bool:
+    """A v2 command refusal eligible for a later, explicit verification."""
+
+    if request.get("completion_ledger") != 2:
+        return False
+    if _command_tool_name(receipt) != "execute_command":
+        return False
+    if getattr(receipt, "success", None) is not False:
+        return False
+    metadata = _receipt_mapping(receipt, "result_metadata")
+    if metadata.get("executed") is not False or metadata.get("synthetic") is not False:
+        return False
+    policy_denial = metadata.get("policy_denial")
+    if not isinstance(policy_denial, Mapping):
+        return False
+    code = str(policy_denial.get("code") or "")
+    if not _SAFE_FAILURE_CODE_RE.fullmatch(code) or code not in _SUPERSEDABLE_POLICY_CODES:
+        return False
+    return _command_workspace_mutation(receipt, request) == _COMMAND_WORKSPACE_UNCHANGED
+
+
 def _receipt_scope_consistent(metadata: Mapping[str, Any], request: Mapping[str, Any] | None) -> bool:
     """Whether an ``unchanged`` receipt's observation scope is trustworthy.
 
@@ -1624,6 +1692,8 @@ def _completion_evidence_satisfied(request: Mapping[str, Any], receipts: Sequenc
         return False, "task_no_successful_tool_receipt"
     if ledger.unresolved:
         return False, "task_unresolved_tool_failure"
+    if ledger.refused and not request.get("requires_command_verification"):
+        return False, "task_policy_refusal_unanswered"
     if request.get("mode") == "mutate" and not any(
         bool(getattr(receipt, "success", False))
         and str(getattr(receipt, "tool_name", "")).rsplit(".", 1)[-1].casefold()
@@ -1648,6 +1718,11 @@ def _completion_evidence_satisfied(request: Mapping[str, Any], receipts: Sequenc
                 and _command_workspace_mutation(receipt, request) != _COMMAND_WORKSPACE_UNCHANGED
             )
         ), default=-1)
+        last_supersedable_refusal = max((
+            index for index, receipt in enumerate(receipts)
+            if _supersedable_refusal(receipt, request)
+        ), default=-1)
+        last_mutation = max(last_mutation, last_supersedable_refusal)
         # Verification must come after that point and itself be a command (or a
         # completed background read) proven not to have changed the workspace.
         for index in range(last_mutation + 1, len(receipts)):
@@ -1753,8 +1828,11 @@ def _failure_reason_code(receipt: Any) -> str:
 
     metadata = _receipt_mapping(receipt, "result_metadata")
     payload = _receipt_result_payload(receipt)
+    policy_denial = metadata.get("policy_denial")
+    denial_code = str(policy_denial.get("code") or "").strip() if isinstance(policy_denial, Mapping) else ""
     error = str(metadata.get("error") or "").strip()
     candidates = (
+        denial_code,
         error,
         str(metadata.get("error_code") or "").strip(),
         str(payload.get("error_code") or "").strip(),
@@ -1808,6 +1886,8 @@ class _ToolFailureLedger:
     recovered: tuple[dict[str, Any], ...]
     unresolved: tuple[dict[str, Any], ...]
     diagnostic: tuple[dict[str, Any], ...] = ()
+    refused: tuple[dict[str, Any], ...] = ()
+    completion_ledger: int = 1
 
 
 def _normalise_receipt_path(value: Any) -> str:
@@ -2067,7 +2147,18 @@ def _tool_failure_ledger(
                 kept = [item for item in candidates if item not in rejected]
                 if kept:
                     pending[rejection_key] = kept
-            for earlier_index, earlier in [*pending.pop(key, []), *rejected]:
+            earlier_same_action = pending.pop(key, [])
+            refused = [
+                item for item in earlier_same_action
+                if _supersedable_refusal(item[1], request or {})
+            ]
+            if refused:
+                # A later successful receipt is independent evidence. It does
+                # not rewrite the denied receipt into a recovered/succeeded
+                # action, so preserve it for the refused ledger.
+                pending[key] = refused
+            recoverable_same_action = [item for item in earlier_same_action if item not in refused]
+            for earlier_index, earlier in [*recoverable_same_action, *rejected]:
                 recovered.append((earlier_index, earlier, key[0]))
                 pending_existing_creates = [
                     item for item in pending_existing_creates if item[0] != earlier_index
@@ -2125,6 +2216,8 @@ def _tool_failure_ledger(
         ),
         key=lambda item: item[0],
     )
+    refused = [item for item in unresolved if _supersedable_refusal(item[1], request or {})]
+    unresolved = [item for item in unresolved if item not in refused]
     # A launched foreground command that exited nonzero is a settled
     # diagnostic observation (failing tests, ``grep`` exit 1, a negative test).
     # It stays visible but cannot by itself make completion impossible;
@@ -2141,11 +2234,13 @@ def _tool_failure_ledger(
         ),
         unresolved=tuple(_tool_failure_entry(receipt, name) for _, receipt, name in unresolved),
         diagnostic=tuple(_tool_failure_entry(receipt, name) for _, receipt, name in diagnostic),
+        refused=tuple(_tool_failure_entry(receipt, name) for _, receipt, name in refused),
+        completion_ledger=2 if (request or {}).get("completion_ledger") == 2 else 1,
     )
 
 
 def _tool_failure_summary(ledger: _ToolFailureLedger) -> dict[str, Any]:
-    return {
+    summary = {
         "recovered_count": len(ledger.recovered),
         "recovered": [dict(item) for item in ledger.recovered[:_FAILURE_LIST_LIMIT]],
         "unresolved_count": len(ledger.unresolved),
@@ -2153,6 +2248,12 @@ def _tool_failure_summary(ledger: _ToolFailureLedger) -> dict[str, Any]:
         "diagnostic_count": len(ledger.diagnostic),
         "diagnostic": [dict(item) for item in ledger.diagnostic[:_FAILURE_LIST_LIMIT]],
     }
+    if ledger.completion_ledger == 2:
+        summary.update({
+            "refused_count": len(ledger.refused),
+            "refused": [dict(item) for item in ledger.refused[:_FAILURE_LIST_LIMIT]],
+        })
+    return summary
 
 
 def _failure_detail(
@@ -2211,6 +2312,12 @@ def _assert_api_route(route: Any, expected: Mapping[str, str], *, explicit: bool
     values = _route_projection(route)
     provider = values["provider"].casefold()
     backend = str(getattr(route, "backend", "") or "").casefold()
+    if backend == "remote" or provider == "muse-remote":
+        raise AgentTaskInvocationError(
+            "remote_route_not_supported",
+            "Remote Agent routes are owned by the remote Agent ingress",
+            409,
+        )
     if explicit:
         # An explicit ExecutionProfile must land on a registered API adapter;
         # the provider-name suffix alone is never trusted.
@@ -2309,7 +2416,7 @@ def _install_task_command_policy(client: Any, request: Mapping[str, Any]) -> Non
         _git_index_paths,
         _git_worktree_paths,
         _git_write_command_details,
-        check_command,
+        check_command_denial,
     )
 
     original = definition.function
@@ -2329,13 +2436,13 @@ def _install_task_command_policy(client: Any, request: Mapping[str, Any]) -> Non
 
     def guarded_execute_command(*args: Any, **kwargs: Any) -> Any:
         command = str(kwargs.get("command") or (args[0] if args else ""))
-        denial = check_command(
+        denial, denial_code = check_command_denial(
             command,
             spec=policy_spec,
             workspace=workspace,
         )
         if denial:
-            raise ToolPolicyDeniedError(denial)
+            raise ToolPolicyDeniedError(denial, code=denial_code or "command_policy_classification_unknown")
         git_write = _git_write_command_details(command)
         add_paths: set[str] | None = None
         if git_write is not None:
@@ -2346,14 +2453,23 @@ def _install_task_command_policy(client: Any, request: Mapping[str, Any]) -> Non
                 if not cwd.is_absolute():
                     cwd = workspace / cwd
                 if os.path.normcase(os.path.realpath(cwd)) != os.path.normcase(os.path.realpath(workspace)):
-                    raise ToolPolicyDeniedError("Git writes must run at the assigned repository root")
+                    raise ToolPolicyDeniedError(
+                        "Git writes must run at the assigned repository root",
+                        code="command_git_workspace_root",
+                    )
             if operation in {"add", "commit"}:
                 if baseline_staged is None or baseline_dirty is None or baseline_staged:
-                    raise ToolPolicyDeniedError("Git commit is blocked while pre-existing staged changes are present")
+                    raise ToolPolicyDeniedError(
+                        "Git commit is blocked while pre-existing staged changes are present",
+                        code="command_git_staged_state",
+                    )
                 if operation == "add":
                     add_paths = _git_add_paths_are_scoped(rest, workspace)
                     if add_paths is None or add_paths.intersection(baseline_dirty):
-                        raise ToolPolicyDeniedError("Git add may include only clean task-scoped files")
+                        raise ToolPolicyDeniedError(
+                            "Git add may include only clean task-scoped files",
+                            code="command_git_add_scope",
+                        )
                 else:
                     staged_now = _git_index_paths(workspace)
                     if (
@@ -2362,7 +2478,10 @@ def _install_task_command_policy(client: Any, request: Mapping[str, Any]) -> Non
                         or staged_now.intersection(baseline_dirty)
                         or not staged_now.issubset(task_added_paths)
                     ):
-                        raise ToolPolicyDeniedError("Git commit may include only files explicitly staged during this task")
+                        raise ToolPolicyDeniedError(
+                            "Git commit may include only files explicitly staged during this task",
+                            code="command_git_commit_scope",
+                        )
 
         result = original(*args, **kwargs)
         if git_write is not None and git_write[0] == "add" and add_paths is not None:
@@ -3159,6 +3278,7 @@ class AgentTaskInvocationService:
                 "allow_commands": bool(metadata.get("allow_commands")),
                 "required_outputs": [str(item) for item in metadata.get("required_outputs") or ()],
                 "required_output_baseline": await self._load_output_baseline(run_id) or {},
+                **({"completion_ledger": metadata["completion_ledger"]} if "completion_ledger" in metadata else {}),
             }
         finally:
             await session.close()
@@ -3428,7 +3548,7 @@ class AgentTaskInvocationService:
                 )
             _require_model_registry_entry(self.config, resolved_route["provider"], resolved_route["model"])
 
-            deadline = datetime.utcnow() + timedelta(seconds=_TASK_TIMEOUT_SECONDS)
+            deadline = datetime.utcnow() + timedelta(seconds=_effective_task_timeout(request))
             admission_nonce = uuid.uuid4().hex
             admission_revision = _admission_revision(task_id)
             candidate = WorkCandidate(
@@ -3448,6 +3568,9 @@ class AgentTaskInvocationService:
                 concurrency_key=_task_concurrency_key(task_id),
                 metadata={
                     "task_id": task_id,
+                    # Framework admission version; it is not part of the
+                    # normalized request or its idempotency fingerprint.
+                    "completion_ledger": 2,
                     "owner_user_id": owner_id,
                     "request_fingerprint": fingerprint,
                     "admission_revision": admission_revision,
@@ -3457,6 +3580,7 @@ class AgentTaskInvocationService:
                     "allow_git_commit": bool(request.get("allow_git_commit", False)),
                     "allow_git_push": bool(request.get("allow_git_push", False)),
                     **({"tool_generation_max_tokens": request["tool_generation_max_tokens"]} if request.get("tool_generation_max_tokens") else {}),
+                    **{key: request[key] for key in _TASK_TIME_LIMIT_RANGES if request.get(key) is not None},
                     "requires_command_verification": _requires_command_verification(request),
                     **({"required_outputs": list(request["required_outputs"])} if request.get("required_outputs") else {}),
                     **({"edit_scope": edit_scope_payload} if edit_scope_payload is not None else {}),
@@ -3494,6 +3618,10 @@ class AgentTaskInvocationService:
                 if stored.get("tool_generation_max_tokens") != request.get("tool_generation_max_tokens"):
                     # An admitted execution control must survive durable storage intact.
                     raise AgentTaskInvocationError("invalid_input", "tool_generation_max_tokens could not be stored intact", 422)
+                for key in _TASK_TIME_LIMIT_RANGES:
+                    stored_limit = stored.get(key)
+                    if stored_limit != request.get(key) or isinstance(stored_limit, bool):
+                        raise AgentTaskInvocationError("invalid_input", f"{key} could not be stored intact", 422)
                 await work_session.commit()
             except BaseException:
                 await work_session.rollback()
@@ -3688,8 +3816,9 @@ class AgentTaskInvocationService:
             ):
                 raise AgentTaskInvocationError("lease_lost", "The task execution fence changed", 409)
             remaining: float | None = None
-            if work.deadline is not None:
-                remaining = (work.deadline - datetime.utcnow()).total_seconds()
+            deadline = work.deadline
+            if deadline is not None:
+                remaining = (deadline - datetime.utcnow()).total_seconds()
                 if remaining <= 0:
                     raise AgentTaskInvocationError("timeout", "The task deadline elapsed", 409)
             if metadata.get("cancellation_requested"):
@@ -3706,6 +3835,11 @@ class AgentTaskInvocationService:
         )
         if str(admitted) != str(Path(request["workspace"])):
             raise AgentTaskInvocationError("workspace_not_allowed", "workspace is no longer approved", 403)
+        if deadline is not None and any(key in request for key in _TASK_TIME_LIMIT_RANGES):
+            # 明示制限時は await 準備で進んだ時間を反映し、同じ永続 deadline から残量を再計算する。
+            remaining = (deadline - datetime.utcnow()).total_seconds()
+            if remaining <= 0:
+                raise AgentTaskInvocationError("timeout", "The task deadline elapsed", 409)
         return remaining
 
     async def _task_request_for_run(self, claim: Any, run_id: str, run: Mapping[str, Any]) -> dict[str, Any]:
@@ -3724,6 +3858,14 @@ class AgentTaskInvocationService:
         # route with no effort selection therefore round-trips without that
         # key; restore its canonical empty value before exact route comparison.
         stored_route.setdefault("effort", "")
+        time_limits: dict[str, int] = {}
+        for key, upper in _TASK_TIME_LIMIT_RANGES.items():
+            if key not in stored:
+                continue  # legacy row: no explicit control
+            value = stored[key]
+            if not _valid_time_limit(value, upper):
+                raise AgentTaskInvocationError("execution_binding_mismatch", f"The stored {key} is invalid", 409)
+            time_limits[key] = value
         request = {
             "task_id": claim.source_id,
             "admission_revision": str(stored.get("admission_revision") or ""),
@@ -3735,8 +3877,10 @@ class AgentTaskInvocationService:
             "allow_git_commit": bool(stored.get("allow_git_commit")),
             "allow_git_push": bool(stored.get("allow_git_push")),
             **({"tool_generation_max_tokens": int(stored["tool_generation_max_tokens"])} if stored.get("tool_generation_max_tokens") else {}),
+            **time_limits,
             "requires_command_verification": bool(stored.get("requires_command_verification")),
             "required_outputs": [str(item) for item in stored.get("required_outputs") or ()],
+            **({"completion_ledger": stored["completion_ledger"]} if "completion_ledger" in stored else {}),
             # Captured once at first execution (a Run event), never at admission.
             "required_output_baseline": {},
             "required_capabilities": tuple(stored.get("required_capabilities") or ()),
@@ -4016,16 +4160,17 @@ class AgentTaskInvocationService:
         # user token. WSL2/bubblewrap remains the explicit default elsewhere;
         # neither model input nor task payload can select this backend.
         backend_kind = "native_windows" if os.name == "nt" else "wsl_bwrap"
-        await self._checkpoint(claim, run_id, request, run)
+        remaining = await self._checkpoint(claim, run_id, request, run)
+        command_seconds = _narrowed_command_seconds(request, remaining)
         scope = build_agent_work_harness_scope(
             workspace_path=request["workspace"],
             harness_workspace_root=workspace_root,
             resource_limits=ResourceLimits(
-                timeout_seconds=900,
+                timeout_seconds=command_seconds,
                 max_processes=32,
                 max_output_bytes=256 * 1024,
                 max_disk_bytes=256 * 1024 * 1024,
-                max_background_seconds=900,
+                max_background_seconds=command_seconds,
             ),
             agent_id=str(claim.assigned_agent_id),
             organization_id=str(decision.organization_id),
@@ -4096,6 +4241,7 @@ class AgentTaskInvocationService:
         budget_timed_out = False
         provider_terminal: dict[str, Any] | None = None
         event_provider_terminal: dict[str, Any] | None = None
+        framework_stop: dict[str, Any] | None = None
         try:
             request = await self._task_request_for_run(claim, run_id, run)
             if (
@@ -4312,6 +4458,11 @@ class AgentTaskInvocationService:
                                     deadline_remaining,
                                     interruptible_transport=True,
                                     parent=current_generation_budget.get(),
+                                    command_timeout_seconds=(
+                                        float(_task_command_ceiling(request))
+                                        if _has_explicit_time_limit(request)
+                                        else None
+                                    ),
                                 )
                                 budget_token = current_generation_budget.set(budget)
                                 if request["mode"] == "mutate":
@@ -4319,6 +4470,39 @@ class AgentTaskInvocationService:
 
                                     read_stagnation_policy = ReadStagnationPolicy()
                                     read_stagnation_token = _read_stagnation.set(read_stagnation_policy)
+
+                                def current_framework_stop() -> dict[str, Any] | None:
+                                    from ..llm.agentic_completion import (
+                                        generation_failure_is_terminal,
+                                        generation_failure_kind,
+                                        get_current_compatible_generation_failure,
+                                    )
+                                    from ..llm.generation_error import GenerationErrorKind
+
+                                    accepted_kinds = {
+                                        GenerationErrorKind.TOOL_FAILURE_CIRCUIT_OPEN,
+                                        GenerationErrorKind.READ_STAGNATION,
+                                    }
+                                    candidates = (
+                                        getattr(client, "_last_generation_failure", None),
+                                        get_current_compatible_generation_failure(),
+                                    )
+                                    for failure in candidates:
+                                        kind = generation_failure_kind(failure)
+                                        if kind not in accepted_kinds or not generation_failure_is_terminal(failure):
+                                            continue
+                                        evidence = {"kind": kind}
+                                        detail = getattr(failure, "technical_detail", None)
+                                        if isinstance(detail, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.: =-]{0,511}", detail):
+                                            evidence["technical_detail"] = detail
+                                        return evidence
+                                    if read_stagnation_policy is not None and read_stagnation_policy.stopped:
+                                        evidence = {"kind": GenerationErrorKind.READ_STAGNATION}
+                                        signature = str(read_stagnation_policy.stop_signature or "")
+                                        if signature:
+                                            evidence["stop_signature"] = signature[:256]
+                                        return evidence
+                                    return None
 
                                 # Bounded before/after workspace observations for command
                                 # receipts of this attempt, keyed by tool_call_id.  This is
@@ -4331,18 +4515,26 @@ class AgentTaskInvocationService:
                                 background_windows: dict[str, Mapping[str, Any]] = {}
 
                                 async def record_runtime_event(event_type: str, payload: Any) -> None:
-                                    nonlocal event_provider_terminal
+                                    nonlocal event_provider_terminal, framework_stop
                                     from .agent_run_service import (
                                         AgentRunService,
                                         sanitize_tool_audit_payload,
                                     )
 
                                     raw = dict(payload) if isinstance(payload, Mapping) else {"_redacted": "invalid_event"}
+                                    if event_type == "stream_end":
+                                        framework_stop = current_framework_stop() or framework_stop
+                                        if framework_stop is not None:
+                                            raw["framework_stop"] = framework_stop
                                     if "provider_terminal" in raw:
                                         terminal = sanitize_terminal_evidence(raw["provider_terminal"])
                                         raw.pop("provider_terminal")
                                         if terminal is not None:
-                                            if event_type == "stream_end" and terminal["state"] == "continuation":
+                                            if (
+                                                event_type == "stream_end"
+                                                and terminal["state"] == "continuation"
+                                                and framework_stop is None
+                                            ):
                                                 terminal = protocol_error_terminal(
                                                     terminal, "unconsumed_continuation"
                                                 )
@@ -4530,10 +4722,10 @@ class AgentTaskInvocationService:
                                 # Appended to this attempt's first input only: corrective
                                 # turns continue the live history, which already holds it.
                                 async def generate_within_budget(text: str) -> Any:
-                                    nonlocal budget_timed_out, provider_terminal, event_provider_terminal
+                                    nonlocal budget_timed_out, provider_terminal, event_provider_terminal, framework_stop
                                     # Each explicit turn owns its evidence. A previous request's
                                     # clean stop cannot settle an interrupted corrective turn.
-                                    provider_terminal = event_provider_terminal = None
+                                    provider_terminal = event_provider_terminal = framework_stop = None
                                     if hasattr(client, "_last_provider_terminal_evidence"):
                                         client._last_provider_terminal_evidence = None
                                     if hasattr(client, "_last_provider_failure"):
@@ -4546,6 +4738,7 @@ class AgentTaskInvocationService:
                                                 text, stream_callback=record_runtime_event
                                             ),
                                         )
+                                        framework_stop = current_framework_stop() or framework_stop
                                         client_terminal = sanitize_terminal_evidence(
                                             getattr(client, "_last_provider_terminal_evidence", None)
                                         )
@@ -4556,7 +4749,11 @@ class AgentTaskInvocationService:
                                             item for item in candidates
                                             if item is not None and item["state"] in FAILED_TERMINAL_STATES
                                         ), client_terminal or event_provider_terminal)
-                                        if provider_terminal is not None and provider_terminal["state"] == "continuation":
+                                        if (
+                                            provider_terminal is not None
+                                            and provider_terminal["state"] == "continuation"
+                                            and framework_stop is None
+                                        ):
                                             # This call returned to task settlement without
                                             # consuming the provider's continuation request.
                                             provider_terminal = protocol_error_terminal(
@@ -4584,6 +4781,7 @@ class AgentTaskInvocationService:
                                 gaps_before: list[str] = []
                                 while (
                                     not task_policy_denial
+                                    and framework_stop is None
                                     and (provider_terminal or {}).get("state") not in FAILED_TERMINAL_STATES
                                     and request.get("required_outputs")
                                     and not (read_stagnation_policy and read_stagnation_policy.stopped)
@@ -4692,7 +4890,20 @@ class AgentTaskInvocationService:
                     error_message="A task tool call was denied by the tool policy",
                     result={"final_response": safe_result, "completion_evidence": "tool_policy_denied"},
                 )
-            if provider_terminal is not None and provider_terminal["state"] in FAILED_TERMINAL_STATES:
+            unconsumed_continuation = bool(
+                provider_terminal is not None
+                and provider_terminal["state"] == "protocol_error"
+                and provider_terminal.get("protocol_error") == "unconsumed_continuation"
+            )
+            framework_stop_kind = str((framework_stop or {}).get("kind") or "")
+            if (
+                provider_terminal is not None
+                and provider_terminal["state"] in FAILED_TERMINAL_STATES
+                and not (
+                    unconsumed_continuation
+                    and framework_stop_kind in {"tool_failure_circuit_open", "read_stagnation"}
+                )
+            ):
                 # Tool receipts prove individual effects, not completion of the
                 # provider's final answer. Preserve those effects without an
                 # automatic retry after an uncertain provider/transport outcome.
@@ -4724,7 +4935,25 @@ class AgentTaskInvocationService:
                     },
                     **failure_extra,
                 )
-            if read_stagnation_policy is not None and read_stagnation_policy.stopped:
+            if framework_stop_kind == "tool_failure_circuit_open":
+                from ..llm.generation_error import user_message_for_generation_kind
+
+                return ExecutionOutcome(
+                    classification="permanent",
+                    error_code=framework_stop_kind,
+                    error_message=user_message_for_generation_kind(framework_stop_kind)
+                    or "The task stopped after repeated tool failures",
+                    result={
+                        "final_response": safe_result,
+                        "completion_evidence": framework_stop_kind,
+                        "framework_stop": framework_stop,
+                        **({"provider_terminal": provider_terminal} if provider_terminal is not None else {}),
+                        **({"corrective_turns": corrective_turns} if corrective_turns else {}),
+                    },
+                )
+            if framework_stop_kind == "read_stagnation" or (
+                read_stagnation_policy is not None and read_stagnation_policy.stopped
+            ):
                 return ExecutionOutcome(
                     classification="permanent",
                     error_code="read_stagnation",
@@ -4732,7 +4961,13 @@ class AgentTaskInvocationService:
                     result={
                         "final_response": safe_result,
                         "completion_evidence": "read_stagnation",
-                        "stop_signature": read_stagnation_policy.stop_signature,
+                        **(
+                            {"stop_signature": read_stagnation_policy.stop_signature}
+                            if read_stagnation_policy is not None and read_stagnation_policy.stopped
+                            else {}
+                        ),
+                        **({"framework_stop": framework_stop} if framework_stop is not None else {}),
+                        **({"provider_terminal": provider_terminal} if provider_terminal is not None else {}),
                     },
                 )
             evidence_ok, evidence_code, tool_failures = await self._completion_evidence(run_id, request)

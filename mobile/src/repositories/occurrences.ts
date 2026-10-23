@@ -1,12 +1,23 @@
 import { and, desc, eq, gte, isNull, lte } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import {
+  assertActiveWriter,
+  type SqliteHandle,
+  type SqliteWriter,
+} from "../db/sqlite-writer";
 import { rescheduleLocalTaskNotificationsFromCache } from "../lib/local-notifications";
 import { taskApi } from "../lib/task-api";
-import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
+import {
+  compareTaskTimestamps,
+  isTaskTombstonedInWriter,
+  prepareTaskTombstoneLedgerKey,
+} from "./tasks";
 import {
   compareTombstoneTimestamps,
-  loadTombstoneLedger,
-  persistTombstoneLedger,
+  loadTombstoneLedgerInWriter,
+  persistTombstoneLedgerInWriter,
+  prepareTombstoneLedgerKey,
 } from "./tombstone-ledger";
 import type { TaskOccurrence } from "../types/api";
 
@@ -54,27 +65,47 @@ function toApiShape(
   };
 }
 
-export async function applyRemoteOccurrences(
+const OCCURRENCE_LEDGER_PREFIX = "task-occurrences:tombstones";
+
+/** Async preparation (token reads) shared by the occurrence InWriter functions. */
+export type OccurrenceApplyPrep = {
+  ledgerKey: string;
+  taskLedgerKey: string;
+};
+
+export async function prepareOccurrenceApply(): Promise<OccurrenceApplyPrep> {
+  return {
+    ledgerKey: await prepareTombstoneLedgerKey(OCCURRENCE_LEDGER_PREFIX),
+    taskLedgerKey: await prepareTaskTombstoneLedgerKey(),
+  };
+}
+
+/** Returns true when local task notifications should be rescheduled after commit. */
+export function applyRemoteOccurrencesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
   list: TaskOccurrence[],
-): Promise<void> {
-  if (!list.length) return;
-  const db = getDb();
+  prep: OccurrenceApplyPrep,
+): boolean {
+  assertActiveWriter(writer);
+  if (!list.length) return false;
   const now = new Date().toISOString();
-  const ledger = await loadTombstoneLedger("task-occurrences:tombstones");
+  const ledger = loadTombstoneLedgerInWriter(writer, tx, prep.ledgerKey);
   let ledgerChanged = false;
   for (const occurrence of list) {
     // A task tree tombstone is authoritative for its materialized rows. Do
     // not let a stale occurrence payload recreate a child while the task is
     // deleted locally (including when only the missing-row ledger exists).
-    if (await isTaskTombstoned(occurrence.task_id)) continue;
-    const existing = await db
+    if (isTaskTombstonedInWriter(writer, tx, occurrence.task_id, prep.taskLedgerKey)) continue;
+    const existing = tx
       .select({
         deletedAt: schema.taskOccurrences.deletedAt,
         updatedAt: schema.taskOccurrences.updatedAt,
         originalStartAt: schema.taskOccurrences.originalStartAt,
       })
       .from(schema.taskOccurrences)
-      .where(eq(schema.taskOccurrences.id, occurrence.id));
+      .where(eq(schema.taskOccurrences.id, occurrence.id))
+      .all();
     const current = existing[0];
     // Keep the cached canonical identity when talking to an older server that
     // omits the additive field.  An explicit null remains authoritative.
@@ -115,7 +146,7 @@ export async function applyRemoteOccurrences(
     ) {
       continue;
     }
-    await db
+    tx
       .insert(schema.taskOccurrences)
       .values({
         id: occurrence.id,
@@ -147,18 +178,36 @@ export async function applyRemoteOccurrences(
           updatedAt: occurrence.updated_at ?? now,
           deletedAt: null,
         },
-      });
+      })
+      .run();
   }
-  if (ledgerChanged) await persistTombstoneLedger(ledger);
-  void rescheduleLocalTaskNotificationsFromCache();
+  if (ledgerChanged) persistTombstoneLedgerInWriter(writer, tx, ledger);
+  return true;
 }
 
-export async function applyOccurrenceTombstones(
-  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+export async function applyRemoteOccurrences(
+  list: TaskOccurrence[],
 ): Promise<void> {
-  if (!tombstones.length) return;
-  const db = getDb();
-  const ledger = await loadTombstoneLedger("task-occurrences:tombstones");
+  if (!list.length) return;
+  const prep = await prepareOccurrenceApply();
+  const reschedule = await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyRemoteOccurrencesInWriter(writer, tx, list, prep),
+    ),
+  );
+  if (reschedule) void rescheduleLocalTaskNotificationsFromCache();
+}
+
+/** Returns true when local task notifications should be rescheduled after commit. */
+export function applyOccurrenceTombstonesInWriter(
+  writer: SqliteWriter,
+  tx: SqliteHandle,
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+  ledgerKey: string,
+): boolean {
+  assertActiveWriter(writer);
+  if (!tombstones.length) return false;
+  const ledger = loadTombstoneLedgerInWriter(writer, tx, ledgerKey);
   let ledgerChanged = false;
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
@@ -168,12 +217,26 @@ export async function applyOccurrenceTombstones(
     }
     ledger.entries.set(item.id, deletedAt);
     ledgerChanged = true;
-    await db
+    tx
       .update(schema.taskOccurrences)
       .set({ deletedAt, updatedAt: deletedAt })
-      .where(eq(schema.taskOccurrences.id, item.id));
+      .where(eq(schema.taskOccurrences.id, item.id))
+      .run();
   }
-  if (ledgerChanged) await persistTombstoneLedger(ledger);
+  if (ledgerChanged) persistTombstoneLedgerInWriter(writer, tx, ledger);
+  return true;
+}
+
+export async function applyOccurrenceTombstones(
+  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+): Promise<void> {
+  if (!tombstones.length) return;
+  const ledgerKey = await prepareTombstoneLedgerKey(OCCURRENCE_LEDGER_PREFIX);
+  await runForegroundSqliteWrite((writer) =>
+    getDb().transaction((tx) =>
+      applyOccurrenceTombstonesInWriter(writer, tx, tombstones, ledgerKey),
+    ),
+  );
   void rescheduleLocalTaskNotificationsFromCache();
 }
 

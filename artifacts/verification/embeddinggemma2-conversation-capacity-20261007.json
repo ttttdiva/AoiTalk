@@ -1,0 +1,47 @@
+{
+  "status": "PASS",
+  "synthetic_only": true,
+  "backend": "PostgreSQL 16 + QdrantClient local in-memory",
+  "includes": "real candidate SQL + one local vector query + fresh bulk SQL original read",
+  "excludes": "native query encoding, disk-persisted local Qdrant overhead, production corpus quality",
+  "python_fetches_or_ranks_vectors": false,
+  "cases": [
+    {
+      "allowed_messages": 100,
+      "observations": 30,
+      "p50_seconds": 0.0066949744996236404,
+      "p95_seconds": 0.008065693599291988,
+      "sql_statements_min": 4,
+      "sql_statements_max": 4,
+      "vector_queries_min": 1,
+      "vector_queries_max": 1,
+      "result_count": 5,
+      "original_candidates_max": 20
+    },
+    {
+      "allowed_messages": 500,
+      "observations": 30,
+      "p50_seconds": 0.01430645749951509,
+      "p95_seconds": 0.01839798959890686,
+      "sql_statements_min": 4,
+      "sql_statements_max": 4,
+      "vector_queries_min": 1,
+      "vector_queries_max": 1,
+      "result_count": 5,
+      "original_candidates_max": 20
+    },
+    {
+      "allowed_messages": 145922,
+      "observations": 30,
+      "p50_seconds": 3.006306526500339,
+      "p95_seconds": 3.561719269049081,
+      "sql_statements_min": 4,
+      "sql_statements_max": 4,
+      "vector_queries_min": 1,
+      "vector_queries_max": 1,
+      "result_count": 5,
+      "original_candidates_max": 20
+    }
+  ],
+  "total_fixture_and_query_seconds": 153.21472745900064
+}

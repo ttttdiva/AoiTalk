@@ -7,8 +7,9 @@
   context に混ぜない。
 - 家計（finance）とはテーブル・FK・DTOを共有しない。推測、スクレイピング、
   ログイン、応募、連絡は行わない。
-- ここは実行時APIそのものではなく、後続 integration owner が呼ぶ明示メソッド群。
-  server/registry/model初期化には触れない。
+- ここは保存service。本人のsource/profile操作はowner HTTP routesから行い、実行時は個人Agent
+  controllerが確認済みprofileを指定したread-only context adapterだけを呼ぶ。serverの
+  model-tool registryやmodel初期化には接続しない。
 
 limit と失敗時の方針:
 - 壊れた保存payloadや digest 不一致は fail-closed（その版を権威として採用しない）。
@@ -28,6 +29,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 
+from .personal_async_guard import run_personal_guard
 from src.memory.models.personal_career import (
     MAX_CLAIM_CHARS,
     MAX_PROFILE_ITEMS,
@@ -848,7 +850,7 @@ class SqlCareerRepository:
 
 
 class PersonalCareerService:
-    """明示メソッドだけを公開するサービス。runtime/server へは未配線。"""
+    """Owner-scoped career history and explicit accepted-profile context service."""
 
     def __init__(self, repository: CareerRepository) -> None:
         self._repository = repository
@@ -1157,21 +1159,19 @@ class PersonalCareerService:
         actor: CareerActor,
         version_ref: Any,
         *,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> CareerProfileVersionView:
         """``guard`` (trusted read hook) runs right after each DB await, before payload decryption."""
 
         ref = as_uuid(version_ref)
         version = await self._repository.get_version(actor.user_id, ref)
-        if guard is not None:
-            guard()
+        await run_personal_guard(guard)
         if version is None or version.owner_user_id != actor.user_id:
             raise CareerNotFoundError("version_not_found")
         confirmation = await self._repository.get_confirmation(
             actor.user_id, version.id
         )
-        if guard is not None:
-            guard()
+        await run_personal_guard(guard)
         return self._version_view(version, confirmation)
 
     async def list_profile_versions(
@@ -1213,7 +1213,7 @@ class PersonalCareerService:
         bounds: CareerContextBounds | None = None,
         *,
         accepted_profile_ref: Any | None = None,
-        guard: Callable[[], None] | None = None,
+        guard: Callable[[], Any] | None = None,
     ) -> CareerContext:
         """確認済み版と選択sourceだけを返す読み取り専用adapter。
 
@@ -1243,8 +1243,7 @@ class PersonalCareerService:
             rows = await self._repository.list_versions_with_confirmation(
                 actor.user_id, CONTEXT_SCAN_VERSIONS
             )
-            if guard is not None:
-                guard()
+            await run_personal_guard(guard)
 
         for version, confirmation in rows:
             if version.owner_user_id != actor.user_id:
@@ -1270,8 +1269,7 @@ class PersonalCareerService:
         selected_sources = await self._repository.list_selected_sources(
             actor.user_id, CONTEXT_HARD_MAX_SOURCES
         )
-        if guard is not None:
-            guard()
+        await run_personal_guard(guard)
         selected_refs = {row.source_ref for row in selected_sources}
         confirmed_refs = tuple(
             ref for ref in chosen.source_refs if ref in selected_refs

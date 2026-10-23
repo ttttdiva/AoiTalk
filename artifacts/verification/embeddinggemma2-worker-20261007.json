@@ -1,0 +1,36 @@
+{
+  "identity": "5fdc0b596b0b9ec70259b4d28282acaa6ef601c8640845f1d0251d07a982ba97",
+  "status": "PASS_LOCAL_FIXTURE",
+  "synthetic_only": true,
+  "cold_load_seconds": 26.166019800002687,
+  "bounded_batch_documents": 33,
+  "crash_recovery_seconds": 12.921653299999889,
+  "cancellation_drained_seconds": 0.1316600000136532,
+  "timeout_error": "TimeoutError: embedding_worker_request_timeout",
+  "timeout_recovery": true,
+  "worker_metrics": {
+    "rss_bytes": 2030907392,
+    "peak_rss_bytes": 2693840896,
+    "cuda_peak_bytes": 1512631808,
+    "versions": {
+      "sentence-transformers": "6.1.0",
+      "transformers": "5.19.0",
+      "torch": "2.10.0+cu128",
+      "torchvision": "0.25.0+cu128",
+      "torchaudio": "2.10.0+cu128",
+      "av": "18.1.0",
+      "huggingface-hub": "1.33.0"
+    }
+  },
+  "capacity": {
+    "points": 145922,
+    "upsert_seconds": 890.8374742000015,
+    "vectors_per_second": 163.80316749813684,
+    "query_observations": 30,
+    "dense_plus_sparse_filtered_p50_seconds": 3.1144241000001784,
+    "dense_plus_sparse_filtered_p95_seconds": 3.3920936450143926,
+    "host_rss_bytes": 1488875520,
+    "index_disk_bytes": 1209778759,
+    "scope": "repeated native vector with synthetic payloads; capacity only, not semantic quality or live SQL ACL latency"
+  }
+}

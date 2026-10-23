@@ -735,6 +735,22 @@ def canonical_resource_for_tool(
     selected = workspace_key or shared_key
     if selected is None and project_id is not None and not (_is_filesystem_mutation(tool_definition) and run_scope is not None):
         selected = f"project:{project_id}"
+    # Personal Docs changesets carry a server-issued write token bound to the
+    # authenticated actor and document root; Docs itself enforces that token,
+    # its receipt, and database locks. When no Project scope exists, serialize
+    # them in the actor's namespace instead of trusting the raw Docs target as
+    # a generic resource key.
+    if (
+        selected is None
+        and _tool_name(tool_definition) == "docs_mutate"
+        and getattr(context, "agent_execution_binding", None) is None
+    ):
+        owner_id = _uuid(getattr(context, "user_id", None))
+        if owner_id is not None:
+            return CanonicalMutationResource(
+                _resource_key_for_user_namespace(owner_id),
+                "user",
+            )
     if selected is None:
         # Preserve unscoped legacy direct calls.  A real turn with an Agent
         # binding must have an issued workspace/lease proof before mutation.

@@ -58,7 +58,7 @@ setup.bat
 7. `scripts/init_db_schema.py` で DB schema を初期化 / migration
 8. `npm run build:production` で production Next.js build を生成
 
-NVIDIA Windows の PyTorch 正常系は CUDA 12.8 (`cu128`) です。CUDA 対応 PyTorch を導入しても、Whisper の既定 device は CPU、`fp16` は false のままです。EmbeddingGemma 2 は専用venvの常駐workerを使用し、`device: auto` はCUDA/BF16またはCPU/FP32を選びます。別モデルへのfallbackはありません。専用workerは公式cu128またはCPU wheelを導入します。Rerankerのdevice設定は独立しています。llama.cpp/llama-server の GPU offload は PyTorch と独立しています。詳細は [検索基盤と移行手順](embeddinggemma2_search.md) を参照してください。
+NVIDIA Windows の PyTorch 正常系は CUDA 12.8 (`cu128`) です。CUDA 対応 PyTorch を導入しても、Whisper の既定 device は CPU、`fp16` は false のままです。EmbeddingGemma 2 は専用venvの常駐workerを使用し、`device: auto` はCUDA/BF16またはCPU/FP32を選びます。別モデルへのfallbackはありません。専用workerは公式cu128またはCPU wheelを導入します。Rerankerのdevice設定は独立しています。llama.cpp/llama-server の GPU offload は PyTorch と独立しています。詳細は 検索基盤と移行手順 を参照してください。
 
 Irodori の依存理由と個別 smoke は [irodori_tts.md](irodori_tts.md) を参照してください。
 

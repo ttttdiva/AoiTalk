@@ -2,7 +2,7 @@
   "expo": {
     "name": "AoiTalk",
     "slug": "aoitalk",
-    "version": "0.1.289",
+    "version": "0.1.290",
     "orientation": "default",
     "scheme": "aoitalk",
     "icon": "./assets/icon.png",
@@ -33,7 +33,7 @@
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.RECORD_AUDIO"
       ],
-      "versionCode": 289,
+      "versionCode": 290,
       "package": "com.aoitalk.mobile",
       "intentFilters": [
         {

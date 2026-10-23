@@ -1,6 +1,8 @@
 import { and, eq, like } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { runBackgroundSqliteWrite, runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
+import type { SqliteHandle, SqliteWriter } from "../db/sqlite-writer";
+import { rescheduleLocalTaskNotificationsFromCache } from "../lib/local-notifications";
 import {
   docsSqliteAsyncAvailable,
   encodeDocsBoolean,
@@ -11,49 +13,69 @@ import {
 } from "../db/docs-sync-async";
 import {
   hasPendingOutbox,
+  hasPendingOutboxInWriter,
+  resolveAuthScope,
   getOutboxState,
   listPendingOutbox,
   markOutboxConflict,
   markOutboxError,
   rebaseOutboxOp,
-  recordOutboxServerSnapshot,
   removeOutboxOpIfSnapshot,
+  removeOutboxOpIfSnapshotInWriter,
+  recordOutboxServerSnapshotInWriter,
   randomId,
+  quarantineOutboxOpIfSnapshotInWriter,
   validateOutboxConflictServerScope,
 } from "../repositories/outbox";
+import { getSyncV3Mode, type SyncV3Mode } from "./v3/api";
+import { requestV3DocsRebootstrap, runV3Pull } from "./v3/pull";
+import { pushOutboxViaV3 } from "./v3/push";
+import { SyncV3DisabledError } from "./v3/types";
+import { captureLegacy } from "../sync-v3/legacy-migration";
+import { markSyncV3RequestWriteFailed } from "../sync-v3/request-observer";
+import { checkSyncV3CacheSafety, isSyncV3ManuallyStopped } from "./v3/safety";
 import { rebaseDocsWriteFollowups, rebaseLegacyBlankDocsUpdate, isDocsResultOlderThanRecordedConflict, matchesDocsCreateContent, compareDocsVersions } from "../repositories/docs-create-ack";
 import { isTaskCasStaleReason, matchesTaskUpdateReceipt } from "./task-update-receipt";
 import {
   applyRemoteTasks,
+  applyRemoteTasksInWriter,
   applyTaskRestore,
   applyTaskTombstones,
+  applyTaskTombstonesInWriter,
+  prepareTaskTombstoneLedgerKey,
 } from "../repositories/tasks";
 import {
-  applyProjectTombstones,
+  applyProjectTombstonesInWriter,
   applyRemoteProjects,
+  applyRemoteProjectsInWriter,
 } from "../repositories/projects";
 import {
-  applyOccurrenceTombstones,
-  applyRemoteOccurrences,
+  applyOccurrenceTombstonesInWriter,
+  applyRemoteOccurrencesInWriter,
+  prepareOccurrenceApply,
 } from "../repositories/occurrences";
 import {
-  applyConversationMessageTombstones,
-  applyConversationSessionTombstones,
-  applyRemoteConversationMessages,
+  applyConversationMessageTombstonesInWriter,
+  applyConversationSessionTombstonesInWriter,
+  applyRemoteConversationMessagesInWriter,
   applyRemoteConversationSessions,
-  reconcileConversationSessionsWithServer,
+  applyRemoteConversationSessionsInWriter,
+  prepareRemoteConversationSessions,
+  reconcileConversationSessionsWithServerInWriter,
 } from "../repositories/conversations";
 import {
   applyRemoteTimeEntries,
-  applyTimeEntryTombstones,
+  applyRemoteTimeEntriesInWriter,
+  applyTimeEntryTombstonesInWriter,
+  prepareTimeEntryApply,
 } from "../repositories/timeEntries";
 import {
-  applyRecordFieldTombstones,
-  applyRecordRowTombstones,
-  applyRecordTableTombstones,
-  applyRemoteRecordFields,
-  applyRemoteRecordRows,
-  applyRemoteRecordTables,
+  applyRecordFieldTombstonesInWriter,
+  applyRecordRowTombstonesInWriter,
+  applyRecordTableTombstonesInWriter,
+  applyRemoteRecordFieldsInWriter,
+  applyRemoteRecordRowsInWriter,
+  applyRemoteRecordTablesInWriter,
 } from "../repositories/records";
 import {
   applyDocsNodeTombstones,
@@ -62,12 +84,16 @@ import {
   applyRemoteDocsFields,
   applyRemoteDocsNodeSupertags,
   applyRemoteDocsNodes,
+  applyRemoteDocsNodesInWriter,
+  applyRemoteDocsSupertagsInWriter,
+  applyRemoteDocsNodeSupertagsInWriter,
+  applyRemoteDocsFieldValuesInWriter,
+  deleteLocalDocsNodeSupertagInWriter,
+  deleteLocalDocsFieldValueInWriter,
   applyRemoteDocsPlacements,
   applyRemoteDocsSupertagFields,
   applyRemoteDocsSupertags,
   rollbackDocsArchiveOptimistic,
-  deleteLocalDocsFieldValue,
-  deleteLocalDocsNodeSupertag,
   reconcileDocsFieldsWithServer,
   reconcileDocsNodesWithServer,
   reconcileDocsSupertagsWithServer,
@@ -315,6 +341,7 @@ type SyncExecutionContext = {
     frozen: boolean;
   };
   diagnostic?: SyncDiagnosticReceipt;
+  v3PushRequestIds: Set<string>;
 };
 type DocsSyncRunRow = typeof schema.docsSyncRuns.$inferSelect;
 type DocsSyncAuthoritative = Record<
@@ -790,6 +817,7 @@ function createSyncExecutionContext(
     controller: new AbortController(),
     flightSequence,
     diagnostic,
+    v3PushRequestIds: new Set<string>(),
   };
   activeSyncContexts.add(context);
   return context;
@@ -1711,81 +1739,153 @@ async function applyPullResponse(
   assertSyncExecutionActive(context);
   // A Docs-only page has no general writes to enqueue.
   if (TABLES.some((table) => generalTableNeedsApply(response.tables[table]))) {
-  await runBackgroundSqliteWrite(async () => {
+  // Everything that needs a token read is prepared before the write unit.
+  // The unit itself is synchronous: one transaction per table, using the
+  // InWriter functions of the same repositories the async wrappers delegate to.
   const projects = response.tables.projects;
-  if (projects && generalTableNeedsApply(projects)) {
-    await applyRemoteProjects(projects.changes as unknown as Project[]);
-    await applyProjectTombstones(projects.tombstones);
-  }
+  const projectsApply = !!projects && generalTableNeedsApply(projects);
 
   const tasks = response.tables.tasks;
-  if (tasks && generalTableNeedsApply(tasks)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteTasks(tasks.changes as unknown as Task[]);
-    await applyTaskTombstones(tasks.tombstones);
-  }
+  const tasksApply = !!tasks && generalTableNeedsApply(tasks);
+  const taskLedgerKey = tasksApply
+    && (tasks.changes.length || tasks.tombstones.length)
+    ? await prepareTaskTombstoneLedgerKey()
+    : null;
 
   const occurrences = response.tables.task_occurrences;
-  if (occurrences && generalTableNeedsApply(occurrences)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteOccurrences(
-      occurrences.changes as unknown as TaskOccurrence[],
-    );
-    await applyOccurrenceTombstones(occurrences.tombstones);
-  }
+  const occurrencesApply = !!occurrences && generalTableNeedsApply(occurrences);
+  const occurrencePrep = occurrencesApply
+    && (occurrences.changes.length || occurrences.tombstones.length)
+    ? await prepareOccurrenceApply()
+    : null;
 
   const timeEntries = response.tables.time_entries;
-  if (timeEntries && generalTableNeedsApply(timeEntries)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteTimeEntries(timeEntries.changes as unknown as TimeEntry[]);
-    await applyTimeEntryTombstones(timeEntries.tombstones);
-  }
+  const timeEntriesApply = !!timeEntries && generalTableNeedsApply(timeEntries);
+  const timeEntryPrep = timeEntriesApply
+    && (timeEntries.changes.length || timeEntries.tombstones.length)
+    ? await prepareTimeEntryApply()
+    : null;
 
   const sessions = response.tables.conversation_sessions;
-  if (sessions && generalTableNeedsApply(sessions)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteConversationSessions(
-      sessions.changes as unknown as ConversationSession[],
-    );
-    await applyConversationSessionTombstones(sessions.tombstones);
-    await reconcileConversationSessionsWithServer(sessions.authoritative_ids);
-  }
+  const sessionsApply = !!sessions && generalTableNeedsApply(sessions);
+  const sessionChanges = sessionsApply
+    ? sessions.changes as unknown as ConversationSession[]
+    : [];
+  const pendingPinSessionIds = sessionChanges.length
+    ? await prepareRemoteConversationSessions(sessionChanges)
+    : new Set<string>();
+  const pendingPinOutboxScope = sessionChanges.length
+    ? await resolveAuthScope()
+    : null;
 
   const messages = response.tables.conversation_messages;
-  if (messages && generalTableNeedsApply(messages)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteConversationMessages(
-      messages.changes as unknown as ConversationMessage[],
-    );
-    await applyConversationMessageTombstones(messages.tombstones);
-  }
-
+  const messagesApply = !!messages && generalTableNeedsApply(messages);
   const recordTables = response.tables.record_tables;
-  if (recordTables && generalTableNeedsApply(recordTables)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteRecordTables(
-      recordTables.changes as unknown as RecordTable[],
-    );
-    await applyRecordTableTombstones(recordTables.tombstones);
-  }
-
+  const recordTablesApply = !!recordTables && generalTableNeedsApply(recordTables);
   const recordFields = response.tables.record_fields;
-  if (recordFields && generalTableNeedsApply(recordFields)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteRecordFields(
-      recordFields.changes as unknown as RecordField[],
-    );
-    await applyRecordFieldTombstones(recordFields.tombstones);
-  }
-
+  const recordFieldsApply = !!recordFields && generalTableNeedsApply(recordFields);
   const recordRows = response.tables.record_rows;
-  if (recordRows && generalTableNeedsApply(recordRows)) {
-    assertSyncExecutionActive(context);
-    await applyRemoteRecordRows(recordRows.changes as unknown as RecordRow[]);
-    await applyRecordRowTombstones(recordRows.tombstones);
-  }
+  const recordRowsApply = !!recordRows && generalTableNeedsApply(recordRows);
 
+  const rescheduleTasks = await runBackgroundSqliteWrite((writer) => {
+    // The unit may have waited behind foreground work, and the preparation
+    // awaits above ran before it was queued: re-check before the first SQL.
+    assertSyncExecutionActive(context);
+    let reschedule = false;
+    if (projectsApply) {
+      getDb().transaction((tx) => {
+        applyRemoteProjectsInWriter(writer, tx, projects.changes as unknown as Project[]);
+        applyProjectTombstonesInWriter(writer, tx, projects.tombstones);
+      });
+    }
+
+    if (tasksApply) {
+      assertSyncExecutionActive(context);
+      if (taskLedgerKey !== null) {
+        reschedule = getDb().transaction((tx) => {
+          const applied = applyRemoteTasksInWriter(
+            writer, tx, tasks.changes as unknown as Task[], taskLedgerKey);
+          const tombstoned = applyTaskTombstonesInWriter(
+            writer, tx, tasks.tombstones, taskLedgerKey);
+          return applied || tombstoned;
+        }) || reschedule;
+      }
+    }
+
+    if (occurrencesApply) {
+      assertSyncExecutionActive(context);
+      if (occurrencePrep) {
+        reschedule = getDb().transaction((tx) => {
+          const applied = applyRemoteOccurrencesInWriter(
+            writer, tx, occurrences.changes as unknown as TaskOccurrence[], occurrencePrep);
+          const tombstoned = applyOccurrenceTombstonesInWriter(
+            writer, tx, occurrences.tombstones, occurrencePrep.ledgerKey);
+          return applied || tombstoned;
+        }) || reschedule;
+      }
+    }
+
+    if (timeEntriesApply) {
+      assertSyncExecutionActive(context);
+      if (timeEntryPrep) {
+        getDb().transaction((tx) => {
+          applyRemoteTimeEntriesInWriter(
+            writer, tx, timeEntries.changes as unknown as TimeEntry[], timeEntryPrep);
+          applyTimeEntryTombstonesInWriter(
+            writer, tx, timeEntries.tombstones, timeEntryPrep.ledgerKey);
+        });
+      }
+    }
+
+    if (sessionsApply) {
+      assertSyncExecutionActive(context);
+      getDb().transaction((tx) => {
+        applyRemoteConversationSessionsInWriter(
+          writer, tx, sessionChanges, pendingPinSessionIds, pendingPinOutboxScope);
+        applyConversationSessionTombstonesInWriter(writer, tx, sessions.tombstones);
+        reconcileConversationSessionsWithServerInWriter(
+          writer, tx, sessions.authoritative_ids);
+      });
+    }
+
+    if (messagesApply) {
+      assertSyncExecutionActive(context);
+      getDb().transaction((tx) => {
+        applyRemoteConversationMessagesInWriter(
+          writer, tx, messages.changes as unknown as ConversationMessage[]);
+        applyConversationMessageTombstonesInWriter(writer, tx, messages.tombstones);
+      });
+    }
+
+    if (recordTablesApply) {
+      assertSyncExecutionActive(context);
+      getDb().transaction((tx) => {
+        applyRemoteRecordTablesInWriter(
+          writer, tx, recordTables.changes as unknown as RecordTable[]);
+        applyRecordTableTombstonesInWriter(writer, tx, recordTables.tombstones);
+      });
+    }
+
+    if (recordFieldsApply) {
+      assertSyncExecutionActive(context);
+      getDb().transaction((tx) => {
+        applyRemoteRecordFieldsInWriter(
+          writer, tx, recordFields.changes as unknown as RecordField[]);
+        applyRecordFieldTombstonesInWriter(writer, tx, recordFields.tombstones);
+      });
+    }
+
+    if (recordRowsApply) {
+      assertSyncExecutionActive(context);
+      getDb().transaction((tx) => {
+        applyRemoteRecordRowsInWriter(
+          writer, tx, recordRows.changes as unknown as RecordRow[]);
+        applyRecordRowTombstonesInWriter(writer, tx, recordRows.tombstones);
+      });
+    }
+    return reschedule;
   });
+  if (rescheduleTasks) void rescheduleLocalTaskNotificationsFromCache();
   }
 
   // ---------- Docs ----------
@@ -3184,6 +3284,35 @@ export async function forceDocsResync(
         throw new Error("サーバー接続が失われたため、Docs再構築を中止しました");
       }
       assertSyncExecutionActive(context);
+      const legacy = await captureLegacy();
+      if (legacy.state !== "migrated" && legacy.state !== "not_needed") {
+        throw new Error("旧版データの移行確認後にDocs再構築を実行してください");
+      }
+      const v3Safety = await checkSyncV3CacheSafety(authScope);
+      // An unavailable capabilities probe keeps the existing v2 rebuild, which
+      // reports its own transport/HTTP failures exactly as before.
+      const mode = v3Safety.safe
+        ? await getSyncV3Mode(context.controller.signal, authScope).catch((): SyncV3Mode => "v2")
+        : "v2";
+      assertSyncExecutionActive(context);
+      if (mode === "v3") {
+        // Re-bootstrap every Docs scope at the next generation; live rows stay
+        // until each scope's new snapshot completes.
+        const v3Context = {
+          signal: context.controller.signal,
+          assertActive: () => assertSyncExecutionActive(context),
+          onPage: (page: number) => reportProgress({ phase: "downloading", completed: 0, total: null, page }),
+        };
+        try {
+          await requestV3DocsRebootstrap(authScope, v3Context);
+          await runV3Pull(authScope, v3Context);
+          reportProgress({ phase: "finalizing", completed: 0, total: null, page: 0 });
+          assertSyncExecutionActive(context);
+          return;
+        } catch (error) {
+          if (!(error instanceof SyncV3DisabledError)) throw error;
+        }
+      }
       await applyDocsPull(authScope, context, {
         forceDocs: true,
         onProgress: reportProgress,
@@ -3203,130 +3332,130 @@ export async function forceDocsResync(
 }
 
 /**
+ * knowledge_nodes の push 応答（サーバ権威）を、呼出元の write unit 内で反映する。
+ * pending 判定・snapshot 記録・ACL 計算・強制適用を同じ transaction で行う。
+ */
+function projectDocsPushNodeInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  entity: Record<string, unknown>,
+  authScope: string | null,
+  preservePending: boolean,
+): void {
+  if (authScope && getTokenAuthScope(getCachedToken()) !== authScope) return;
+  const id = String(entity.id);
+  if (hasPendingOutboxInWriter(w, tx, "knowledge_nodes", id, authScope)) {
+    if (!preservePending) recordOutboxServerSnapshotInWriter(w, tx, authScope, "knowledge_nodes", id, entity);
+    return;
+  }
+  let node = entity as unknown as DocsNode;
+  // Conflict receipts intentionally omit ACL fields. Preserve the
+  // same actor/composite projection; absence must not revoke a locally
+  // verified parent or silently invent write permission.
+  const [cached] = tx.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, id)).all();
+  // A cleared live cache still has actor/composite memberships; do
+  // not bypass their revocation when a delayed ACK recreates a row.
+  const sameScope = !cached || (cached.workspaceId === entity.workspace_id
+    && (cached.projectId ?? null) === (entity.project_id ?? null));
+  const memberships = authScope && sameScope && schema.docsScopeMembership
+    ? tx.select().from(schema.docsScopeMembership).where(and(
+      eq(schema.docsScopeMembership.authScope, authScope),
+      eq(schema.docsScopeMembership.scopeKey, `${String(entity.workspace_id)}|project:${entity.project_id ?? ""}`),
+      eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+      eq(schema.docsScopeMembership.entityKey, id),
+    )).all() : [];
+  const membership = memberships[0];
+  const writable = membership?.state === "active" && membership.readOnly === false
+    && ["owner", "write"].includes(membership.access ?? "")
+    && cached?.readOnly !== true && cached?.access !== "read";
+  const has = (key: string) => Object.prototype.hasOwnProperty.call(entity, key);
+  const knownReadOnly = sameScope && (cached?.readOnly === true || cached?.access === "read"
+    || (membership != null && membership.state !== "active") || membership?.readOnly === true || membership?.access === "read");
+  // A delayed write receipt cannot grant permissions revoked locally
+  // while HTTP was in flight. A fresh pull owns permission upgrades.
+  const access = knownReadOnly ? "read" : has("access") ? node.access : writable ? membership.access as DocsNode["access"] : "read";
+  node = { ...node,
+    source: has("source") ? node.source : sameScope ? cached?.source as DocsNode["source"] : undefined,
+    access,
+    read_only: !["owner", "write"].includes(access ?? "")
+      || (has("read_only") ? entity.read_only !== false : !writable),
+  };
+  applyRemoteDocsNodesInWriter(w, tx, [node], null, { force: true });
+}
+
+/**
+ * knowledge_supertags / node_supertags / field_values の push 応答を、呼出元の
+ * write unit 内で反映する。pending 判定・snapshot 記録・強制適用を同じ transaction で行う。
+ */
+function projectDocsPushNonNodeInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  table: string,
+  entity: Record<string, unknown>,
+  authScope: string | null,
+  preservePending: boolean,
+): void {
+  void preservePending; // 非 node は従来どおり pending 時に常に snapshot を記録する。
+  if (authScope && getTokenAuthScope(getCachedToken()) !== authScope) return;
+  const deleted = entity.deleted === true;
+  const key = table === "knowledge_supertags"
+    ? String(entity.id)
+    : table === "knowledge_node_supertags"
+      ? `${String(entity.node_id)}:${String(entity.supertag_id)}`
+      : table === "knowledge_field_values"
+        ? `${String(entity.node_id)}:${String(entity.field_id)}`
+        : null;
+  if (key === null) return;
+  if (hasPendingOutboxInWriter(w, tx, table, key, authScope)) {
+    recordOutboxServerSnapshotInWriter(w, tx, authScope, table, key, entity);
+    return;
+  }
+  if (table === "knowledge_supertags") {
+    applyRemoteDocsSupertagsInWriter(w, tx, [entity as unknown as DocsSupertag], null, { force: true });
+  } else if (table === "knowledge_node_supertags") {
+    if (deleted) {
+      deleteLocalDocsNodeSupertagInWriter(w, tx, String(entity.node_id), String(entity.supertag_id));
+    } else {
+      applyRemoteDocsNodeSupertagsInWriter(w, tx, [entity as unknown as DocsNodeSupertag], undefined, null, { force: true });
+    }
+  } else if (deleted) {
+    deleteLocalDocsFieldValueInWriter(w, tx, String(entity.node_id), String(entity.field_id));
+  } else {
+    applyRemoteDocsFieldValuesInWriter(w, tx, [entity as unknown as DocsFieldValue], undefined, null, { force: true });
+  }
+}
+
+/**
  * Docs push 応答の entity（サーバ権威）を対応する applyRemote* で反映する。
  * 409 conflict の応答も、競合解決が適用済みと判断した場合に反映する。
  */
-async function applyDocsPushEntity(
+export async function applyDocsPushEntity(
   table: string | undefined,
   entity: Record<string, unknown> | undefined,
   authScope?: string,
   preservePending = false,
-  insideForeground = false,
 ): Promise<void> {
   if (!table || !entity) return;
-  // クリア/タグ削除時、サーバは { ..., "deleted": true } を返す。無条件 upsert すると
-  // 削除済み行を再 INSERT してしまうため、deleted の場合はローカル行を物理削除する。
-  const deleted = entity.deleted === true;
   switch (table) {
-    case "knowledge_nodes":
+    case "knowledge_nodes": {
       // A foreground edit owns its live-row write and outbox merge together.
       // Keep the pending check and forced receipt projection in that same
       // coordinator, rather than clearing a newer edit after a stale read.
-      const projectNode = async () => {
-        if (authScope && getTokenAuthScope(getCachedToken()) !== authScope) return;
-        if (await hasPendingOutbox(table, String(entity.id), authScope)) {
-          if (!preservePending) await recordOutboxServerSnapshot(table, String(entity.id), entity, authScope);
-          return;
-        }
-        let node = entity as unknown as DocsNode;
-        // Conflict receipts intentionally omit ACL fields. Preserve the
-        // same actor/composite projection; absence must not revoke a locally
-        // verified parent or silently invent write permission.
-        {
-          const db = getDb();
-          const [cached] = await db.select().from(schema.knowledgeNodes).where(eq(schema.knowledgeNodes.id, String(entity.id)));
-          // A cleared live cache still has actor/composite memberships; do
-          // not bypass their revocation when a delayed ACK recreates a row.
-          const sameScope = !cached || (cached.workspaceId === entity.workspace_id
-            && (cached.projectId ?? null) === (entity.project_id ?? null));
-          const memberships = authScope && sameScope && schema.docsScopeMembership
-            ? await db.select().from(schema.docsScopeMembership).where(and(
-              eq(schema.docsScopeMembership.authScope, authScope),
-              eq(schema.docsScopeMembership.scopeKey, `${String(entity.workspace_id)}|project:${entity.project_id ?? ""}`),
-              eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
-              eq(schema.docsScopeMembership.entityKey, String(entity.id)),
-            )) : [];
-          const membership = memberships[0];
-          const writable = membership?.state === "active" && membership.readOnly === false
-            && ["owner", "write"].includes(membership.access ?? "")
-            && cached?.readOnly !== true && cached?.access !== "read";
-          const has = (key: string) => Object.prototype.hasOwnProperty.call(entity, key);
-          const knownReadOnly = sameScope && (cached?.readOnly === true || cached?.access === "read"
-            || (membership != null && membership.state !== "active") || membership?.readOnly === true || membership?.access === "read");
-          // A delayed write receipt cannot grant permissions revoked locally
-          // while HTTP was in flight. A fresh pull owns permission upgrades.
-          const access = knownReadOnly ? "read" : has("access") ? node.access : writable ? membership.access as DocsNode["access"] : "read";
-          node = { ...node,
-            source: has("source") ? node.source : sameScope ? cached?.source as DocsNode["source"] : undefined,
-            access,
-            read_only: !["owner", "write"].includes(access ?? "")
-              || (has("read_only") ? entity.read_only !== false : !writable),
-          };
-        }
-        await applyRemoteDocsNodes([node], { force: true });
-      };
-      if (insideForeground) await projectNode();
-      else await runForegroundSqliteWrite(projectNode);
+      const resolvedScope = await resolveAuthScope(authScope);
+      await runForegroundSqliteWrite((w) =>
+        getDb().transaction((tx) =>
+          projectDocsPushNodeInWriter(w, tx, entity, resolvedScope, preservePending)));
       break;
+    }
     case "knowledge_supertags":
-      if (await hasPendingOutbox(table, String(entity.id), authScope)) {
-        await recordOutboxServerSnapshot(table, String(entity.id), entity, authScope);
-        return;
-      }
-      await applyRemoteDocsSupertags([entity as unknown as DocsSupertag], { force: true });
-      break;
     case "knowledge_node_supertags":
-      if (await hasPendingOutbox(
-        table,
-        `${String(entity.node_id)}:${String(entity.supertag_id)}`,
-        authScope,
-      )) {
-        await recordOutboxServerSnapshot(
-          table,
-          `${String(entity.node_id)}:${String(entity.supertag_id)}`,
-          entity,
-          authScope,
-        );
-        return;
-      }
-      if (deleted) {
-        await deleteLocalDocsNodeSupertag(
-          String(entity.node_id),
-          String(entity.supertag_id),
-        );
-      } else {
-        await applyRemoteDocsNodeSupertags([
-          entity as unknown as DocsNodeSupertag,
-        ], undefined, { force: true });
-      }
+    case "knowledge_field_values": {
+      const resolvedScope = await resolveAuthScope(authScope);
+      await runForegroundSqliteWrite((w) =>
+        getDb().transaction((tx) =>
+          projectDocsPushNonNodeInWriter(w, tx, table, entity, resolvedScope, preservePending)));
       break;
-    case "knowledge_field_values":
-      if (await hasPendingOutbox(
-        table,
-        `${String(entity.node_id)}:${String(entity.field_id)}`,
-        authScope,
-      )) {
-        await recordOutboxServerSnapshot(
-          table,
-          `${String(entity.node_id)}:${String(entity.field_id)}`,
-          entity,
-          authScope,
-        );
-        return;
-      }
-      if (deleted) {
-        await deleteLocalDocsFieldValue(
-          String(entity.node_id),
-          String(entity.field_id),
-        );
-      } else {
-        await applyRemoteDocsFieldValues(
-          [entity as unknown as DocsFieldValue],
-          undefined,
-          { force: true },
-        );
-      }
-      break;
+    }
     default:
       break;
   }
@@ -3423,15 +3552,15 @@ async function removeAcknowledgedOutboxSnapshot(
   opId: string,
   snapshot: PendingOutboxSnapshot,
   guard?: Parameters<typeof removeOutboxOpIfSnapshot>[2],
-  project?: () => Promise<void>,
+  project?: (w: SqliteWriter, tx: SqliteHandle) => void,
   expected?: PendingOutbox,
   assertActive: () => void = () => {},
 ): Promise<boolean> {
-  return runForegroundSqliteWrite(async () => {
+  return runForegroundSqliteWrite((w) => getDb().transaction((tx) => {
     assertActive();
     if (expected?.tableName === "knowledge_nodes") {
       if (getTokenAuthScope(getCachedToken()) !== expected.authScope) return false;
-      const current = getDb().select().from(schema.outbox).where(eq(schema.outbox.opId, opId)).get();
+      const current = tx.select().from(schema.outbox).where(eq(schema.outbox.opId, opId)).get();
       // A newer recorded conflict/block is part of the receipt snapshot too.
       // Do not erase it after waiting behind another foreground mutation.
       if (!current || current.blockedReason !== expected.blockedReason
@@ -3446,12 +3575,12 @@ async function removeAcknowledgedOutboxSnapshot(
     // durable snapshot over any reduced operation projection supplied by an
     // older call site.
     const fullSnapshot: PendingOutboxSnapshot = expected ?? snapshot;
-    const removed = await removeOutboxOpIfSnapshot(opId, fullSnapshot, guard);
+    const removed = removeOutboxOpIfSnapshotInWriter(w, tx, opId, fullSnapshot, guard);
     // CAS removal and baseline projection are one unit. Otherwise an edit
     // queued between them can inherit NULL even though create was confirmed.
-    if (removed && project) await project();
+    if (removed && project) project(w, tx);
     return removed;
-  });
+  }));
 }
 
 async function getCurrentOutbox(
@@ -3909,10 +4038,11 @@ async function rollbackRejectedDocsDelete(
 async function pushOutbox(
   authScope: string,
   context: SyncExecutionContext,
+  mode: SyncV3Mode = "v2",
 ): Promise<void> {
   assertSyncExecutionActive(context);
   const allPending = await listPendingOutbox(undefined, authScope);
-  const pending = allPending.filter((op) => op.action !== "reorder");
+  let pending = allPending.filter((op) => op.action !== "reorder");
   const reorderPending = allPending.filter((op) => op.action === "reorder");
   assertSyncExecutionActive(context);
   if (!pending.length && !reorderPending.length) return;
@@ -3921,7 +4051,7 @@ async function pushOutbox(
     return;
   }
 
-  const operations: SyncPushOperation[] = pending.map((op) => ({
+  let operations: SyncPushOperation[] = pending.map((op) => ({
     op_id: op.opId,
     table: op.tableName,
     action: op.action as SyncPushOperation["action"],
@@ -3930,7 +4060,24 @@ async function pushOutbox(
     base_updated_at: op.baseUpdatedAt ?? null,
   }));
 
-  const response = await pushSync(operations, context.controller.signal);
+  // v3 only changes the transport and the result conversion. The rows re-read
+  // in the identity-allocation transaction are the snapshot for every receipt.
+  let v3Quarantine = new Map<string, string>();
+  let response: { results: SyncPushResult[] };
+  if (mode === "v3") {
+    const v3 = await pushOutboxViaV3(
+      authScope,
+      context.controller.signal,
+      () => assertSyncExecutionActive(context),
+      (requestId) => context.v3PushRequestIds.add(requestId),
+    );
+    pending = v3.pending;
+    operations = v3.operations;
+    response = { results: v3.results };
+    v3Quarantine = v3.quarantine;
+  } else {
+    response = await pushSync(operations, context.controller.signal);
+  }
   assertSyncExecutionActive(context);
   const docsCreateRebased = await rebaseDocsWriteFollowups(
     authScope, pending, response.results, () => assertSyncExecutionActive(context),
@@ -4045,7 +4192,7 @@ async function pushOutbox(
       if (operation) {
         const removed = await removeAcknowledgedOutboxSnapshot(result.op_id,
         pendingOperation, { authScope, docsScopeKey: pendingOperation.docsScopeKey },
-        operation.table === "knowledge_nodes" ? () => applyDocsPushEntity(operation.table, result.entity, authScope, true, true) : undefined, pendingOperation, () => assertSyncExecutionActive(context));
+        operation.table === "knowledge_nodes" ? (w, tx) => { if (result.entity) projectDocsPushNodeInWriter(w, tx, result.entity, authScope, true); } : undefined, pendingOperation, () => assertSyncExecutionActive(context));
         if (!removed) {
           if (isTaskPrerequisite(pendingOperation)) {
             regularResultStatuses.set(result.op_id, "error");
@@ -4078,7 +4225,10 @@ async function pushOutbox(
 
     if (result.status === "conflict") {
       if (pendingOperation && operation?.table === "tasks" && operation.action === "update") {
-        const acknowledged = await runForegroundSqliteWrite(async () => {
+        // The ledger key needs a token read, so it is prepared before the unit.
+        const taskLedgerKey = await prepareTaskTombstoneLedgerKey();
+        let rescheduleTaskNotifications = false;
+        const acknowledged = await runForegroundSqliteWrite(async (writer) => {
           assertSyncExecutionActive(context);
           const current = await getCurrentOutbox(result.op_id);
           assertSyncExecutionActive(context);
@@ -4108,9 +4258,26 @@ async function pushOutbox(
             pendingOperation,
             { authScope },
           );
-          if (removed) await applyTaskPushEntity(operation, result.entity, result.server_updated_at);
+          if (removed) {
+            // Same non-restore decision as applyTaskPushEntity, applied in this unit.
+            const entityId = typeof result.entity?.id === "string" && result.entity.id
+              ? result.entity.id : operation.entity_id;
+            const deletedAt = typeof result.entity?.deleted_at === "string" && result.entity.deleted_at
+              ? result.entity.deleted_at : null;
+            if (entityId) {
+              if (deletedAt != null) {
+                rescheduleTaskNotifications = getDb().transaction((tx) =>
+                  applyTaskTombstonesInWriter(writer, tx, [{ id: entityId, deleted_at: deletedAt }], taskLedgerKey));
+              } else if (result.entity) {
+                const entity = result.entity as unknown as Task;
+                rescheduleTaskNotifications = getDb().transaction((tx) =>
+                  applyRemoteTasksInWriter(writer, tx, [entity], taskLedgerKey));
+              }
+            }
+          }
           return removed;
         });
+        if (rescheduleTaskNotifications) void rescheduleLocalTaskNotificationsFromCache();
         if (acknowledged) regularResultStatuses.set(result.op_id, "ok");
         continue;
       }
@@ -4146,7 +4313,7 @@ async function pushOutbox(
         if (resolution === "applied") {
           const removed = await removeAcknowledgedOutboxSnapshot(result.op_id,
           pendingOperation, { authScope, docsScopeKey: pendingOperation.docsScopeKey },
-          operation.table === "knowledge_nodes" ? () => applyDocsPushEntity(operation.table, result.entity, authScope, true, true) : undefined, pendingOperation, () => assertSyncExecutionActive(context));
+          operation.table === "knowledge_nodes" ? (w, tx) => { if (result.entity) projectDocsPushNodeInWriter(w, tx, result.entity, authScope, true); } : undefined, pendingOperation, () => assertSyncExecutionActive(context));
           if (!removed) continue;
           if (isTaskPrerequisite(pendingOperation)) {
             regularResultStatuses.set(result.op_id, "ok");
@@ -4190,6 +4357,27 @@ async function pushOutbox(
       if (!pendingOperation) continue;
       await markOutboxError(result.op_id, syncResultFailureReason(result), pendingOperation);
     }
+  }
+  // A permanently rejected v3 op_id is rejected again on every resend: block
+  // exactly the snapshot markOutboxError produced (last_error kept as written).
+  for (const result of response.results) {
+    const code = v3Quarantine.get(result.op_id);
+    const sent = pendingById.get(result.op_id);
+    if (!code || !sent || result.status !== "error") continue;
+    assertSyncExecutionActive(context);
+    const expected = {
+      ...sent,
+      retryCount: sent.retryCount + 1,
+      lastError: syncResultFailureReason(result),
+    };
+    await runForegroundSqliteWrite((w) => {
+      // The unit may have waited behind other writes: re-check the run first.
+      assertSyncExecutionActive(context);
+      if (getTokenAuthScope(getCachedToken()) !== authScope) return false;
+      return getDb().transaction((tx) =>
+        quarantineOutboxOpIfSnapshotInWriter(w, tx, result.op_id, expected, `sync_v3_rejected_${code}`));
+    });
+    assertSyncExecutionActive(context);
   }
   await flushReorderOutbox(
     reorderPending,
@@ -4363,8 +4551,69 @@ async function performSync(
   syncExecutionCount += 1;
   if (context.diagnostic) markSyncDiagnosticStarted(context.diagnostic);
   let hadFailure = false;
+  // The protocol is decided per run and never persisted. 404/enabled=false/503
+  // select v2 (identical to the pre-v3 flight); a transport failure is handled
+  // like a failed outbox step.
+  let mode: SyncV3Mode = "v2";
+  if (isSyncV3ManuallyStopped()) return "interrupted";
+  let legacyGate;
+  try {
+    assertSyncExecutionActive(context);
+    legacyGate = await captureLegacy();
+    assertSyncExecutionActive(context);
+  } catch (error) {
+    if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) {
+      return "interrupted";
+    }
+    console.warn("[sync] legacy capture failed", error instanceof Error ? error.name : "UnknownError");
+    return "partial";
+  }
+  if (legacyGate.state !== "migrated" && legacyGate.state !== "not_needed") {
+    return "partial";
+  }
+  const v3Safety = await checkSyncV3CacheSafety(authScope).catch(() => ({
+    safe: false, unclassifiedRecords: 1, reason: "full_eviction_safety_unavailable",
+  }));
+  if (v3Safety.safe) {
+    try {
+      assertSyncExecutionActive(context);
+      mode = await getSyncV3Mode(context.controller.signal, authScope);
+      assertSyncExecutionActive(context);
+    } catch (error) {
+      if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) {
+        return "interrupted";
+      }
+      if (isApiConnectionError(error) || isApiTimeoutError(error)) {
+        console.warn("[sync] outbox push failed", error instanceof Error ? error.name : "UnknownError");
+        return "partial";
+      }
+      mode = "v2";
+    }
+  }
+  let v3PullDisabled = false;
+  const v2PullActive = () => mode === "v2" || v3PullDisabled;
   const steps: Array<[SyncStage, string, () => Promise<unknown>, boolean?]> = [
-    ["outbox", "outbox push", () => pushOutbox(authScope, context)],
+    ["outbox", "outbox push", () => pushOutbox(authScope, context, mode)],
+    ...(mode === "v3"
+      ? [["general", "v3 pull", async () => {
+          try {
+            const result = await runV3Pull(authScope, {
+              signal: context.controller.signal,
+              assertActive: () => assertSyncExecutionActive(context),
+              onPage: (page) => reportGeneralSyncProgress(authScope, context, page, 0),
+            });
+            assertSyncExecutionActive(context);
+            const generalChanged = [...result.appliedTables].some((table) =>
+              (TABLES as string[]).includes(table));
+            if (generalChanged && getTokenAuthScope(getCachedToken()) === authScope) {
+              updateSyncStatus(() => useSyncStatusStore.getState().generalApplied(authScope));
+            }
+          } catch (error) {
+            if (!(error instanceof SyncV3DisabledError)) throw error;
+            v3PullDisabled = true;
+          }
+        }] as [SyncStage, string, () => Promise<unknown>, boolean?]]
+      : []),
     // 一般tableの全件replayが長引くと、アプリがbackgroundへ移る前にDocsへ
     // 到達できない。Docsを先に一つのflightへ含め、HTTP200だけで完了扱いに
     // せず、staging/promotionまで進めてから一般tableを収束させる。
@@ -4372,10 +4621,13 @@ async function performSync(
     // partialとしてgeneralへ進む。低レイヤーDB/SecureStore awaitがsignalを
     // 無視しても、進行中transactionは原子的に完了し、次のstaging/write
     // 境界のguardでchild処理を止める。この自然終了待ちは残る実行上の限界である。
-    ["docs", "Docs pull", () => applyDocsPullWithinFlightBudget(authScope, context), true],
+    ["docs", "Docs pull", async () => {
+      if (v2PullActive()) await applyDocsPullWithinFlightBudget(authScope, context);
+    }, true],
     // Docsだけのtransport失敗でも後続の通常tableを試す。Docsの失敗は
     // partialとして記録し、outboxやgeneralの結果を成功へ畳み込まない。
     ["general", "general pull", async () => {
+      if (!v2PullActive()) return;
       const changed = await applyGeneralPull(authScope, context);
       assertSyncExecutionActive(context);
       if (changed && getTokenAuthScope(getCachedToken()) === authScope) {
@@ -4417,6 +4669,10 @@ async function performSync(
         "[sync] " + label + " failed",
         error instanceof Error ? error.name : "UnknownError",
       );
+      if (label === "outbox push" && mode === "v3") {
+        await Promise.all([...context.v3PushRequestIds].map((requestId) =>
+          markSyncV3RequestWriteFailed(requestId).catch(() => undefined)));
+      }
       // transport断では後続のAPIも同じ理由で失敗するため、このrunだけ打ち切る。
       // HTTP応答・認証・ローカルDB・個別機能の失敗では他領域の同期を継続する。
       if (isApiConnectionError(error) && !continueAfterConnectionFailure) {
