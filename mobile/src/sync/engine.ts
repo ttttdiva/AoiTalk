@@ -342,6 +342,7 @@ type SyncExecutionContext = {
   };
   diagnostic?: SyncDiagnosticReceipt;
   v3PushRequestIds: Set<string>;
+  v3PullActive?: boolean;
 };
 type DocsSyncRunRow = typeof schema.docsSyncRuns.$inferSelect;
 type DocsSyncAuthoritative = Record<
@@ -4042,7 +4043,10 @@ async function pushOutbox(
 ): Promise<void> {
   assertSyncExecutionActive(context);
   const allPending = await listPendingOutbox(undefined, authScope);
-  let pending = allPending.filter((op) => op.action !== "reorder");
+  // A sealed v3 request with no receipt must recover through the same v3
+  // identity, even if a later capabilities probe selects v2.
+  let pending = allPending.filter((op) => op.action !== "reorder"
+    && (mode === "v3" || op.v3SentDigest == null));
   const reorderPending = allPending.filter((op) => op.action === "reorder");
   assertSyncExecutionActive(context);
   if (!pending.length && !reorderPending.length) return;
@@ -4551,43 +4555,31 @@ async function performSync(
   syncExecutionCount += 1;
   if (context.diagnostic) markSyncDiagnosticStarted(context.diagnostic);
   let hadFailure = false;
-  // The protocol is decided per run and never persisted. 404/enabled=false/503
-  // select v2 (identical to the pre-v3 flight); a transport failure is handled
-  // like a failed outbox step.
-  let mode: SyncV3Mode = "v2";
+  // Capabilities is a read-only protocol probe. Legacy migration and cache
+  // ownership gate only actual v3 writes/pulls; disabled servers retain v2.
+  let mode: SyncV3Mode;
   if (isSyncV3ManuallyStopped()) return "interrupted";
-  let legacyGate;
   try {
     assertSyncExecutionActive(context);
-    legacyGate = await captureLegacy();
+    mode = await getSyncV3Mode(context.controller.signal, authScope);
     assertSyncExecutionActive(context);
   } catch (error) {
-    if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) {
-      return "interrupted";
-    }
-    console.warn("[sync] legacy capture failed", error instanceof Error ? error.name : "UnknownError");
-    return "partial";
+    if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) return "interrupted";
+    if (isApiConnectionError(error) || isApiTimeoutError(error)) return "partial";
+    mode = "v2";
   }
-  if (legacyGate.state !== "migrated" && legacyGate.state !== "not_needed") {
-    return "partial";
-  }
-  const v3Safety = await checkSyncV3CacheSafety(authScope).catch(() => ({
-    safe: false, unclassifiedRecords: 1, reason: "full_eviction_safety_unavailable",
-  }));
-  if (v3Safety.safe) {
+  if (mode === "v3") {
     try {
+      const legacyGate = await captureLegacy();
       assertSyncExecutionActive(context);
-      mode = await getSyncV3Mode(context.controller.signal, authScope);
+      if (legacyGate.state !== "migrated" && legacyGate.state !== "not_needed") return "partial";
+      const safety = await checkSyncV3CacheSafety(authScope);
       assertSyncExecutionActive(context);
+      if (!safety.safe) return "partial";
     } catch (error) {
-      if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) {
-        return "interrupted";
-      }
-      if (isApiConnectionError(error) || isApiTimeoutError(error)) {
-        console.warn("[sync] outbox push failed", error instanceof Error ? error.name : "UnknownError");
-        return "partial";
-      }
-      mode = "v2";
+      if (error instanceof SyncExecutionInterruptedError || isSyncExecutionInterrupted(context)) return "interrupted";
+      console.warn("[sync] migration check failed", error instanceof Error ? error.name : "UnknownError");
+      return "partial";
     }
   }
   let v3PullDisabled = false;
@@ -4597,6 +4589,8 @@ async function performSync(
     ...(mode === "v3"
       ? [["general", "v3 pull", async () => {
           try {
+            context.v3PullActive = true;
+            if (activeAuthScopeTransitions.size > 0) context.controller.abort();
             const result = await runV3Pull(authScope, {
               signal: context.controller.signal,
               assertActive: () => assertSyncExecutionActive(context),
@@ -4611,6 +4605,8 @@ async function performSync(
           } catch (error) {
             if (!(error instanceof SyncV3DisabledError)) throw error;
             v3PullDisabled = true;
+          } finally {
+            context.v3PullActive = false;
           }
         }] as [SyncStage, string, () => Promise<unknown>, boolean?]]
       : []),
@@ -4954,6 +4950,9 @@ export function runAuthScopeTransition<T>(
   notifySyncDiagnosticListeners();
   const transitionToken = ++nextAuthScopeTransitionToken;
   activeAuthScopeTransitions.add(transitionToken);
+  for (const context of activeSyncContexts) {
+    if (context.v3PullActive) context.controller.abort();
+  }
   updateSyncStatus(() => useSyncStatusStore.getState().reset());
   return runQueuedAuthScopeTransition(callback).finally(() => {
     activeAuthScopeTransitions.delete(transitionToken);

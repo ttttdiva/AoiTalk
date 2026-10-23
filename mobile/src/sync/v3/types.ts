@@ -190,6 +190,7 @@ export type SyncV3BootstrapPosition = {
 };
 
 export type SyncV3ScopeState = {
+  evictionPending?: boolean;
   fingerprint: string;
   generation: number;
   tables: SyncV3Table[];
@@ -208,6 +209,7 @@ export type SyncV3State = {
   cursor: string | null;
   scopeSetRevision: string | null;
   fullEvictPending: boolean;
+  membershipResetPending?: boolean;
   lastSuccessAt?: number | null;
   scopes: Record<string, SyncV3ScopeState>;
 };

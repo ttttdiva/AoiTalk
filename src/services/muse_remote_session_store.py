@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from ..memory.models import ConversationSession
 from .muse_remote_execution import (
+    MuseBindingError,
     MuseBinding,
     MuseCredentialResolution,
     MuseError,
@@ -104,14 +105,14 @@ def _binding_dict(binding: MuseBinding) -> dict[str, Any]:
     return {str(key): item for key, item in value.items() if item is not None}
 
 
-def _binding_from_context(value: Any) -> MuseBinding | None:
+def _binding_from_context(value: Any) -> MuseBinding:
     if not isinstance(value, Mapping):
-        return None
+        raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE)
     raw = value.get("binding") if isinstance(value.get("binding"), Mapping) else value
     try:
         return MuseBinding(**dict(raw)).normalized()
     except Exception:
-        return None
+        raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE) from None
 
 
 class MuseRemoteSessionStore:
@@ -165,8 +166,13 @@ class MuseRemoteSessionStore:
             row = await db.get(ConversationSession, self._session_id(binding_key))
             if row is None or getattr(row, "deleted_at", None) is not None:
                 return None
+            raw_context = getattr(row, "context", None)
+            if not isinstance(raw_context, Mapping):
+                raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE)
             context = self._context(row)
-            remote = context.get(MUSE_REMOTE_CONTEXT_KEY)
+            if MUSE_REMOTE_CONTEXT_KEY not in context:
+                return None
+            remote = context[MUSE_REMOTE_CONTEXT_KEY]
             return _binding_from_context(remote)
         finally:
             await self._close(db)

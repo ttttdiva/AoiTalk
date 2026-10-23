@@ -43,6 +43,7 @@ from .agent_authority import AgentAuthorityResolver
 from .agent_role_context import AgentRoleContext, build_agent_role_context
 from .conversation_agent_service import (
     AgentExecutionBindingSnapshot,
+    ConversationAgentConflictError,
     ConversationAgentService,
     ConversationAgentValidationError,
 )
@@ -948,13 +949,21 @@ class CLIDevelopmentSessionService:
 
         if self.remote_adapter is not None:
             return self.remote_adapter
-        from .muse_remote_execution import MuseRemoteExecutionAdapter
+        from .muse_remote_execution import MuseRemoteClient, MuseRemoteExecutionAdapter
+
+        repository_root = Path(__file__).resolve().parents[2]
+        muse_venv = repository_root / ".local" / "tools" / "muse-cli-0.3.2" / "venv"
+        if os.name == "nt":
+            executable = muse_venv / "Scripts" / "muse-cli.exe"
+        else:
+            executable = muse_venv / "bin" / "muse-cli"
 
         self.remote_binding_store = self.remote_binding_store or MuseRemoteSessionStore(
             self._db_manager
         )
         target = self._remote_target_config()
         self.remote_adapter = MuseRemoteExecutionAdapter(
+            client=MuseRemoteClient(executable=str(executable)),
             credential_resolver=MuseRemoteTargetResolver(self.config),
             binding_store=self.remote_binding_store,
             privacy_gateway=MuseRemotePrivacyGateway(self.config),
@@ -1112,6 +1121,7 @@ class CLIDevelopmentSessionService:
         *,
         permission_mode_override: str | None = None,
         role_context_sha256: str | None = None,
+        resolved_agent_revision_id: str | None = None,
     ) -> str:
         """Fingerprint only caller supplied create fields.
 
@@ -1144,8 +1154,15 @@ class CLIDevelopmentSessionService:
             material["execution_profile_id"] = request.execution_profile_id
         if request.agent_revision_id is not None:
             # Exact-revision callers opt into a new identity component;
-            # omission keeps every historical create fingerprint unchanged.
+            # raw/legacy callers keep their historical request shape.
             material["agent_revision_id"] = request.agent_revision_id
+        elif (
+            request.role_context_mode == "agent_role"
+            and resolved_agent_revision_id is not None
+        ):
+            # Keep caller omission distinct from an explicit wire pin while
+            # binding managed admission to the revision resolved by authority.
+            material["resolved_agent_revision_id"] = resolved_agent_revision_id
         if request.role_context_mode == "agent_role":
             material["role_context_mode"] = "agent_role"
             if role_context_sha256:
@@ -1162,12 +1179,6 @@ class CLIDevelopmentSessionService:
         stored = context.get("wire_request_fingerprint")
         if stored == wire_fingerprint:
             return True
-        if request.role_context_mode == "agent_role":
-            pinned_digest = str(context.get("role_context_sha256") or "")
-            if pinned_digest and stored == cls._wire_create_fingerprint(
-                request, role_context_sha256=pinned_digest
-            ):
-                return True
         # Before omitted mode was represented distinctly, an omitted value
         # was fingerprinted as native_default. Accept that receipt only when
         # the persisted mode confirms the same historical interpretation.
@@ -1382,11 +1393,10 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict(
                 "Requested AgentRevision is stale", code="agent_revision_stale"
             )
-        if req.agent_revision_id is not None and not callable(
-            getattr(self.agent_service, "pin_turn_binding", None)
-        ):
+        pin_turn_binding = getattr(self.agent_service, "pin_turn_binding", None)
+        if not callable(pin_turn_binding):
             raise CLIDevelopmentSessionUnavailable(
-                "Exact AgentRevision admission is unavailable",
+                "Atomic remote AgentRevision admission is unavailable",
                 code="agent_revision_pin_unavailable",
             )
         try:
@@ -1404,6 +1414,12 @@ class CLIDevelopmentSessionService:
                 if req.role_context_mode == "agent_role"
                 else None
             )
+            if role_context is not None:
+                wire_fingerprint = self._wire_create_fingerprint(
+                    req,
+                    role_context_sha256=role_context.role_context_sha256,
+                    resolved_agent_revision_id=revision_id,
+                )
         except CLIDevelopmentSessionError:
             raise
         except ConversationAgentValidationError as exc:
@@ -1430,6 +1446,7 @@ class CLIDevelopmentSessionService:
             allowed_capabilities=REMOTE_SESSION_CAPABILITIES,
             execution_target=MUSE_EXECUTION_TARGET,
         )
+        context_tuple["agent_revision_id"] = revision_id
         # Muse has no local native session handle.  The shared context tuple
         # keeps the legacy local default; remove it only for this remote lane.
         context_tuple.pop("native_state", None)
@@ -1454,6 +1471,7 @@ class CLIDevelopmentSessionService:
             "execution_target": MUSE_EXECUTION_TARGET,
             "project_id": req.project_id,
             "title": req.title,
+            "agent_revision_id": revision_id,
             "allowed_capabilities": list(REMOTE_SESSION_CAPABILITIES),
             "route": route,
         }
@@ -1480,14 +1498,78 @@ class CLIDevelopmentSessionService:
         context_tuple["deployment_fingerprint"] = _json_hash(deployment_material)
         context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
         policy = cli_development_policy(self.config)
+
+        async def validated_receipt(db: Any, row: Any) -> dict[str, Any]:
+            current = self._context(row)
+            if (
+                getattr(row, "deleted_at", None) is not None
+                or str(getattr(row, "user_id", "")) != req.owner_id
+                or not self._wire_create_fingerprint_matches(
+                    req, current, wire_fingerprint
+                )
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "session idempotency key was reused with a different request",
+                    code="session_idempotency_conflict",
+                )
+            if str(current.get("admission_state") or "") != "ready":
+                raise CLIDevelopmentSessionConflict(
+                    "remote session admission is incomplete; use a new idempotency key",
+                    code="session_admission_incomplete",
+                )
+            if (
+                str(current.get("agent_id") or "") != agent_id
+                or str(current.get("agent_revision_id") or "") != revision_id
+                or str(getattr(row, "agent_id", "") or "") != agent_id
+                or str(current.get("execution_profile_id") or "")
+                != str(req.execution_profile_id or "")
+                or str(current.get("role_context_mode") or "raw")
+                != req.role_context_mode
+                or str(current.get("role_context_sha256") or "")
+                != str(role_context.role_context_sha256 if role_context else "")
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "session idempotency key was reused with a different fixed Agent context",
+                    code="session_idempotency_conflict",
+                )
+            binding = await self._binding_for_row(db, row)
+            if str(_binding_value(binding, "agent_revision_id", "")) != revision_id:
+                raise CLIDevelopmentSessionConflict(
+                    "remote session binding revision changed",
+                    code="agent_revision_stale",
+                )
+            bound_route = _assert_route(
+                binding, provider=MUSE_PROVIDER, model=None, effort=None
+            )
+            _assert_binding_selection(binding, req.execution_profile_id)
+            if role_context is not None:
+                _build_pinned_role_context(binding, current)
+            binding_id = str(
+                _binding_value(binding, "binding_id")
+                or _binding_value(binding, "id")
+                or ""
+            )
+            binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
+            if (
+                not binding_id
+                or not binding_hash
+                or str(current.get("binding_id") or "") != binding_id
+                or str(current.get("binding_snapshot_hash") or "") != binding_hash
+                or current.get("route") != bound_route
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "remote session binding proof is incomplete",
+                    code="agent_binding_proof_missing",
+                )
+            return await self._session_projection(
+                db, row, policy=policy, owner_id=req.owner_id, created=False
+            )
+
         db = await self._session()
         try:
             existing = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
             if existing is not None:
-                current = self._context(existing)
-                if str(getattr(existing, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
-                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
-                return await self._session_projection(db, existing, policy=policy, owner_id=req.owner_id, created=False)
+                return await validated_receipt(db, existing)
             row = ConversationSession(
                 id=session_id,
                 user_id=req.owner_id,
@@ -1497,7 +1579,7 @@ class CLIDevelopmentSessionService:
                 message_count=0,
                 is_active=True,
                 project_id=uuid.UUID(req.project_id) if req.project_id else None,
-                agent_id=None,
+                agent_id=uuid.UUID(agent_id),
                 session_start=self._clock(),
                 last_activity=self._clock(),
                 development_status="waiting_for_user",
@@ -1505,7 +1587,57 @@ class CLIDevelopmentSessionService:
             db.add(row)
             db.add(ConversationParticipant(session_id=session_id, participant_type="user", participant_id=req.owner_id, role="owner", status="joined", auto_respond=False, participant_metadata={}))
             await db.flush()
+
+            # Persist the canonical Agent binding in the same transaction as
+            # the deterministic session row. A crash cannot leave a committed
+            # "creating" receipt that a duplicate request could mistake for a
+            # bound session.
+            binding = await pin_turn_binding(
+                db_session=db,
+                session_id=str(session_id),
+                agent_id=agent_id,
+                agent_revision_id=revision_id,
+                actor_user_id=req.owner_id,
+                actor_role=req.actor_role,
+                config=self.config,
+                execution_profile_id=req.execution_profile_id,
+            )
+            if str(_binding_value(binding, "agent_revision_id", "")) != revision_id:
+                raise CLIDevelopmentSessionConflict(
+                    "Exact AgentRevision binding is unavailable",
+                    code="agent_revision_binding_required",
+                )
+            bound_route = _assert_route(
+                binding, provider=MUSE_PROVIDER, model=None, effort=None
+            )
+            _assert_binding_selection(binding, req.execution_profile_id)
+            if role_context is not None:
+                _build_pinned_role_context(binding, context_tuple)
+            binding_id = str(
+                _binding_value(binding, "binding_id")
+                or _binding_value(binding, "id")
+                or ""
+            )
+            binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
+            if not binding_id or not binding_hash:
+                raise CLIDevelopmentSessionConflict(
+                    "immutable Agent binding proof is incomplete",
+                    code="agent_binding_proof_missing",
+                )
+            context_tuple.update(
+                {
+                    "binding_id": binding_id,
+                    "binding_snapshot_hash": binding_hash,
+                    "route": bound_route,
+                    "status": "ready",
+                    "admission_state": "ready",
+                }
+            )
+            row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
             await db.commit()
+            return await self._session_projection(
+                db, row, policy=policy, owner_id=req.owner_id, created=True
+            )
         except IntegrityError as exc:
             await self._rollback_async(db)
             if not _is_unique_integrity_error(exc):
@@ -1515,53 +1647,30 @@ class CLIDevelopmentSessionService:
                 winner = await winner_db.get(ConversationSession, session_id)
                 if winner is None:
                     raise CLIDevelopmentSessionConflict("remote session admission could not be reconciled", code="session_admission_unavailable")
-                current = self._context(winner)
-                if str(getattr(winner, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
-                    raise CLIDevelopmentSessionConflict("session idempotency key conflict", code="session_idempotency_conflict")
-                return await self._session_projection(winner_db, winner, policy=policy, owner_id=req.owner_id, created=False)
+                return await validated_receipt(winner_db, winner)
             finally:
                 await self._close(winner_db)
-        finally:
-            await self._close(db)
-        try:
-            result = await self.agent_service.bind_session_agent(
-                session_id=str(session_id),
-                agent_id=agent_id,
-                actor_user_id=req.owner_id,
-                actor_role=req.actor_role,
-                expected_agent_id=None,
-                **_execution_profile_kwargs(req.execution_profile_id),
-            )
-        except Exception as exc:
-            raise CLIDevelopmentSessionForbidden("Agent binding could not be persisted", code="agent_binding_denied") from exc
-        binding = getattr(result, "binding", None)
-        if binding is None:
-            raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
-        if req.agent_revision_id is not None and str(_binding_value(binding, "agent_revision_id", "")) != revision_id:
+        except CLIDevelopmentSessionError:
+            await self._rollback_async(db)
+            raise
+        except ConversationAgentConflictError as exc:
+            await self._rollback_async(db)
             raise CLIDevelopmentSessionConflict(
-                "Exact AgentRevision binding is unavailable",
-                code="agent_revision_binding_required",
-            )
-        bound_route = _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
-        _assert_binding_selection(binding, req.execution_profile_id)
-        if role_context is not None:
-            _build_pinned_role_context(binding, context_tuple)
-        binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
-        binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
-        if not binding_id or not binding_hash:
-            raise CLIDevelopmentSessionConflict("immutable Agent binding proof is incomplete", code="agent_binding_proof_missing")
-        db = await self._session()
-        try:
-            row = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
-            if row is None:
-                raise CLIDevelopmentSessionNotFound()
-            current = self._context(row)
-            current.update({"binding_id": binding_id, "binding_snapshot_hash": binding_hash, "agent_revision_id": revision_id, "route": bound_route, "status": "ready", "admission_state": "ready"})
-            next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
-            next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = current
-            row.context = next_context
-            await db.commit()
-            return await self._session_projection(db, row, policy=policy, owner_id=req.owner_id, created=True)
+                "Agent binding admission is stale",
+                code=str(getattr(exc, "code", "") or "agent_revision_stale"),
+            ) from exc
+        except ConversationAgentValidationError as exc:
+            await self._rollback_async(db)
+            code = str(getattr(exc, "code", "") or "")
+            raise CLIDevelopmentSessionConflict(
+                "Agent binding admission failed",
+                code=code or "agent_binding_required",
+            ) from exc
+        except Exception as exc:
+            await self._rollback_async(db)
+            raise CLIDevelopmentSessionForbidden(
+                "Agent binding could not be persisted", code="agent_binding_denied"
+            ) from exc
         finally:
             await self._close(db)
 
@@ -1580,10 +1689,22 @@ class CLIDevelopmentSessionService:
                 current = self._context(existing)
                 if getattr(existing, "deleted_at", None) is not None:
                     raise CLIDevelopmentSessionConflict("session idempotency key is tombstoned", code="session_idempotency_conflict")
-                if str(getattr(existing, "user_id", "")) != req.owner_id or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
+                if str(getattr(existing, "user_id", "")) != req.owner_id:
                     raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
-                if str(current.get("admission_state") or "") == "ready":
-                    return await self._session_projection(early_db, existing, policy=cli_development_policy(self.config), owner_id=req.owner_id, created=False)
+                # Managed contexts need a freshly resolved immutable Revision
+                # and digest before replay. Muse also resolves its server-owned
+                # route and binding atomically before returning a receipt.
+                if (
+                    req.role_context_mode != "agent_role"
+                    and req.provider != MUSE_PROVIDER
+                    and req.agent_revision_id is None
+                ):
+                    if not self._wire_create_fingerprint_matches(
+                        req, current, wire_fingerprint
+                    ):
+                        raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
+                    if str(current.get("admission_state") or "") == "ready":
+                        return await self._session_projection(early_db, existing, policy=cli_development_policy(self.config), owner_id=req.owner_id, created=False)
         finally:
             await self._close(early_db)
         if req.provider == MUSE_PROVIDER:
@@ -1615,7 +1736,17 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict(
                 "Requested AgentRevision is stale", code="agent_revision_stale"
             )
-        if req.agent_revision_id is not None and not callable(
+        effective_revision_id = req.agent_revision_id
+        if effective_revision_id is None and req.role_context_mode == "agent_role":
+            if not revision_id:
+                raise CLIDevelopmentSessionConflict(
+                    "Validated AgentRevision is unavailable",
+                    code="agent_revision_binding_required",
+                )
+            # The validated revision becomes this admission's immutable pin;
+            # the caller request stays untouched for wire identity.
+            effective_revision_id = revision_id
+        if effective_revision_id is not None and not callable(
             getattr(self.agent_service, "pin_turn_binding", None)
         ):
             raise CLIDevelopmentSessionUnavailable(
@@ -1638,7 +1769,9 @@ class CLIDevelopmentSessionService:
             if req.role_context_mode == "agent_role":
                 role_context = _build_pinned_role_context(expected_snapshot)
                 wire_fingerprint = self._wire_create_fingerprint(
-                    req, role_context_sha256=role_context.role_context_sha256
+                    req,
+                    role_context_sha256=role_context.role_context_sha256,
+                    resolved_agent_revision_id=effective_revision_id,
                 )
         except CLIDevelopmentSessionError:
             raise
@@ -1651,7 +1784,8 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
         if req.allowed_capabilities != CLI_DEVELOPMENT_CAPABILITIES and req.provider not in {"claude", "claude-cli", "claudecode"}:
             raise CLIDevelopmentSessionInvalid("narrowed capabilities are only enforceable for the Claude provider", code="allowed_capabilities_unsupported_provider")
-        authority = await self._resolve_authority(agent_id=agent_id, revision_id=revision_id, project_id=req.project_id, capabilities=req.allowed_capabilities)
+        authority_revision_id = effective_revision_id or revision_id
+        authority = await self._resolve_authority(agent_id=agent_id, revision_id=authority_revision_id, project_id=req.project_id, capabilities=req.allowed_capabilities)
         context_tuple = self._context_tuple(owner_id=req.owner_id, agent_id=agent_id, provider=req.provider, model=req.model, effort=req.effort, working_directory=cwd, idempotency_key=req.idempotency_key, project_id=req.project_id, permission_mode=permission_mode, title=req.title, allowed_capabilities=req.allowed_capabilities)
         context_tuple["provider_cache_root"] = self._provider_cache_root(policy, req.provider)
         context_tuple["wire_request_fingerprint"] = wire_fingerprint
@@ -1671,7 +1805,7 @@ class CLIDevelopmentSessionService:
         if req.execution_profile_id is not None:
             context_tuple["execution_profile_id"] = req.execution_profile_id
             deployment_material["execution_profile_id"] = req.execution_profile_id
-        if req.agent_revision_id is not None:
+        if effective_revision_id is not None:
             context_tuple["agent_revision_id"] = revision_id
             deployment_material["agent_revision_id"] = revision_id
         if role_context is not None:
@@ -1697,6 +1831,58 @@ class CLIDevelopmentSessionService:
         context_tuple["authority"] = authority
         context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
 
+        async def exact_receipt_binding(db: Any, row: Any, current: Mapping[str, Any]) -> Any:
+            if str(current.get("admission_state") or "") != "ready":
+                raise CLIDevelopmentSessionConflict(
+                    "Exact AgentRevision admission is incomplete",
+                    code="session_admission_incomplete",
+                )
+            if (
+                str(current.get("agent_revision_id") or "") != str(effective_revision_id)
+                or str(getattr(row, "agent_id", "") or "") != agent_id
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "session idempotency key was reused with a different exact Agent context",
+                    code="session_idempotency_conflict",
+                )
+            try:
+                exact_binding = await self._binding_for_row(db, row)
+            except Exception as exc:
+                raise CLIDevelopmentSessionConflict(
+                    "immutable exact Agent binding is unavailable",
+                    code="agent_revision_binding_required",
+                ) from exc
+            if str(_binding_value(exact_binding, "agent_revision_id", "")) != str(effective_revision_id):
+                raise CLIDevelopmentSessionConflict(
+                    "session idempotency key has a different AgentRevision binding",
+                    code="session_idempotency_conflict",
+                )
+            exact_route = _assert_route(
+                exact_binding, provider=req.provider, model=req.model, effort=req.effort
+            )
+            _assert_binding_selection(exact_binding, req.execution_profile_id)
+            if role_context is not None:
+                _build_pinned_role_context(exact_binding, current)
+            exact_binding_id = str(
+                _binding_value(exact_binding, "binding_id")
+                or _binding_value(exact_binding, "id")
+                or ""
+            )
+            exact_binding_hash = str(_binding_value(exact_binding, "snapshot_hash") or "")
+            if (
+                not exact_binding_id
+                or not exact_binding_hash
+                or str(current.get("binding_id") or "") != exact_binding_id
+                or str(current.get("binding_snapshot_hash") or "") != exact_binding_hash
+                or current.get("route") != exact_route
+                or exact_route != route
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "immutable exact Agent binding proof is incomplete or changed",
+                    code="agent_binding_proof_missing",
+                )
+            return exact_binding
+
         db = await self._session()
         try:
             existing = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
@@ -1707,15 +1893,16 @@ class CLIDevelopmentSessionService:
                 for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
-                if req.agent_revision_id is not None and str(current.get("agent_revision_id") or "") != revision_id:
-                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different AgentRevision", code="session_idempotency_conflict")
+                if effective_revision_id is not None:
+                    await exact_receipt_binding(db, existing, current)
+                    return await self._session_projection(db, existing, policy=policy, owner_id=req.owner_id, created=False)
                 binding = None
                 try:
                     binding = await self._binding_for_row(db, existing)
                 except Exception:
                     if str(current.get("admission_state") or "") != "creating":
                         raise CLIDevelopmentSessionConflict("immutable Agent binding is unavailable", code="agent_binding_required")
-                    if req.agent_revision_id is not None:
+                    if effective_revision_id is not None:
                         # Exact-revision admission is atomic below. A committed
                         # creating row has no safe canonical exact binding to
                         # recover and must never fall back to latest.
@@ -1774,7 +1961,7 @@ class CLIDevelopmentSessionService:
                 # Bind through ConversationAgentService after the row exists;
                 # setting this before its CAS path would make
                 # ``expected_agent_id=None`` look stale.
-                agent_id=(uuid.UUID(agent_id) if req.agent_revision_id is not None else None),
+                agent_id=(uuid.UUID(agent_id) if effective_revision_id is not None else None),
                 session_start=self._clock(),
                 last_activity=self._clock(),
                 development_status="waiting_for_user",
@@ -1782,12 +1969,12 @@ class CLIDevelopmentSessionService:
             db.add(row)
             db.add(ConversationParticipant(session_id=session_id, participant_type="user", participant_id=req.owner_id, role="owner", status="joined", auto_respond=False, participant_metadata={}))
             await db.flush()
-            if req.agent_revision_id is not None:
+            if effective_revision_id is not None:
                 exact_binding = await self.agent_service.pin_turn_binding(
                     db_session=db,
                     session_id=str(session_id),
                     agent_id=agent_id,
-                    agent_revision_id=req.agent_revision_id,
+                    agent_revision_id=effective_revision_id,
                     actor_user_id=req.owner_id,
                     actor_role=req.actor_role,
                     config=self.config,
@@ -1810,7 +1997,7 @@ class CLIDevelopmentSessionService:
                 binding_hash = str(_binding_value(exact_binding, "snapshot_hash") or "")
                 if (
                     str(_binding_value(exact_binding, "agent_revision_id") or "")
-                    != req.agent_revision_id
+                    != effective_revision_id
                     or not binding_id
                     or not binding_hash
                 ):
@@ -1822,7 +2009,7 @@ class CLIDevelopmentSessionService:
                     {
                         "binding_id": binding_id,
                         "binding_snapshot_hash": binding_hash,
-                        "agent_revision_id": req.agent_revision_id,
+                        "agent_revision_id": effective_revision_id,
                         "route": exact_route,
                         "status": "ready",
                         "admission_state": "ready",
@@ -1830,10 +2017,26 @@ class CLIDevelopmentSessionService:
                 )
                 row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
             await db.commit()
-            if req.agent_revision_id is not None:
+            if effective_revision_id is not None:
                 return await self._session_projection(
                     db, row, policy=policy, owner_id=req.owner_id, created=True
                 )
+        except CLIDevelopmentSessionError:
+            await self._rollback_async(db)
+            raise
+        except ConversationAgentConflictError as exc:
+            await self._rollback_async(db)
+            raise CLIDevelopmentSessionConflict(
+                "Agent binding admission is stale",
+                code=str(getattr(exc, "code", "") or "agent_revision_stale"),
+            ) from exc
+        except ConversationAgentValidationError as exc:
+            await self._rollback_async(db)
+            code = str(getattr(exc, "code", "") or "")
+            raise CLIDevelopmentSessionConflict(
+                "Agent binding admission failed",
+                code=code or "agent_binding_required",
+            ) from exc
         except IntegrityError as exc:
             await self._rollback_async(db)
             if not _is_unique_integrity_error(exc):
@@ -1851,8 +2054,8 @@ class CLIDevelopmentSessionService:
                 for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
-                if req.agent_revision_id is not None and str(current.get("agent_revision_id") or "") != revision_id:
-                    raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different AgentRevision", code="session_idempotency_conflict")
+                if effective_revision_id is not None:
+                    await exact_receipt_binding(winner_db, winner, current)
                 return await self._session_projection(winner_db, winner, policy=policy, owner_id=req.owner_id, created=False)
             finally:
                 await self._close(winner_db)

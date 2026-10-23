@@ -5,12 +5,12 @@
   "task_diagnostics_source_commit": "494617135b8f422ecb93dff9c9ac9873cae7dbd1",
   "backend_contract_source_commit": "b6571a8623d08b2323fce64b8d8a8cd318410c64",
   "management_contract_fixture_sha256": "16faf1f933a8f8539e020db72472d7a4e592559cafa5e6ce6149e9bd2fb04ea9",
-  "legacy_21_schema_snapshot_sha256": "064ff02e6e387cd23097b64fbdc29c4702240bfad7efcc4f7fe20cc73f7e4505",
+  "legacy_21_schema_snapshot_sha256": "15a015ab0e2994615a345f4324bdcb7e11a08150ab497f3f672757827d22e91e",
   "source_files": {
     "aoitalk.py": {
       "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",
       "source_sha256": "7c0d5d0f1342dd7abedbf93fef7394e0fe40c5e9be3976a03adfea3add90dbe5",
-      "migrated_sha256": "3c2e06e864bd13198713ded9bd739a1a2d0f1947eedd479da32bf22e185011eb"
+      "migrated_sha256": "b85a5a8de8ab2920c87030e01eb2304d67047642d417bfa42323f39bffb4c67e"
     },
     "aoitalk_auth.py": {
       "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",
@@ -28,9 +28,9 @@
       "migrated_sha256": "5fcb0ec9e6e726309374f408080979fb8737a52bf8b96072ce43cbeb83a1a061"
     },
     "aoitalk_cli_sessions.py": {
-      "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",
-      "source_sha256": "d44b1e76908291d5dae1f12285d3be0ff46e9b5c5a9e4330e9a66ff15e59bcf3",
-      "migrated_sha256": "d44b1e76908291d5dae1f12285d3be0ff46e9b5c5a9e4330e9a66ff15e59bcf3"
+      "source_commit": "4c1ba420301140b799ee0c30e440f250230743b5",
+      "source_sha256": "01410ee77969642dd42e8b1087958b7c2949cc026468bf97a3c400ed3d9fb827",
+      "migrated_sha256": "01410ee77969642dd42e8b1087958b7c2949cc026468bf97a3c400ed3d9fb827"
     },
     "aoitalk_manage.py": {
       "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",
@@ -53,9 +53,9 @@
       "migrated_sha256": "eed2350663fc8a07163afc3bc6ae93a559af4cfb029e622f210d842d647e2d6b"
     },
     "aoitalk_cli_session_schema.py": {
-      "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",
-      "source_sha256": "7cc6a45a9073af6734f974696a192f057a4a8660c1f4b5f08a09b95f73a7c660",
-      "migrated_sha256": "7cc6a45a9073af6734f974696a192f057a4a8660c1f4b5f08a09b95f73a7c660"
+      "source_commit": "4c1ba420301140b799ee0c30e440f250230743b5",
+      "source_sha256": "98bc733032eadb789889e60c6908009266e44f232bd3fc242360bc5415665153",
+      "migrated_sha256": "98bc733032eadb789889e60c6908009266e44f232bd3fc242360bc5415665153"
     },
     "telemetry.py": {
       "source_commit": "e130d4744623f4518cad6785fe200b09e288c317",

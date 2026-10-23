@@ -2,11 +2,13 @@
 
 import asyncio
 import logging
+import math
 import os
 from ...services.browser_agent_models import browser_settings_payload, validate_browser_settings_update
 import re
 import time
 from typing import TYPE_CHECKING, Any
+import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -69,6 +71,212 @@ if TYPE_CHECKING:
     from ..server import WebChatServer
 
 logger = logging.getLogger(__name__)
+
+_MUSE_REMOTE_TARGET_KEY = "remote_targets.muse"
+_MUSE_REMOTE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,256}$")
+_MUSE_REMOTE_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_MUSE_REMOTE_MAX_LIST_ITEMS = 64
+_MUSE_REMOTE_MAX_STATE_ROOT_CHARS = 4096
+_MUSE_REMOTE_MAX_RECONCILE_SECONDS = 600.0
+_MUSE_REMOTE_MAX_POLL_SECONDS = 60.0
+
+
+def _validate_muse_remote_target(value: Any) -> dict[str, Any]:
+    """Validate the strict, server-owned Muse remote target settings object."""
+
+    if not isinstance(value, dict):
+        raise ValueError("Invalid Muse remote target settings")
+
+    allowed_fields = {
+        "enabled",
+        "egress_enabled",
+        "authenticated",
+        "credential_ref",
+        "state_root",
+        "vm_id",
+        "node_id",
+        "auth_fingerprint",
+        "allowed_owner_ids",
+        "allowed_agent_ids",
+        "wait_seconds",
+        "reconcile_timeout_seconds",
+        "poll_interval_seconds",
+    }
+    if set(value) - allowed_fields:
+        raise ValueError("Invalid Muse remote target settings")
+
+    normalized: dict[str, Any] = {}
+    for key in ("enabled", "egress_enabled", "authenticated"):
+        if key not in value:
+            continue
+        item = value[key]
+        if not isinstance(item, bool):
+            raise ValueError("Invalid Muse remote target settings")
+        normalized[key] = item
+
+    for key in ("credential_ref", "vm_id", "node_id"):
+        if key not in value:
+            continue
+        item = value[key]
+        if not isinstance(item, str):
+            raise ValueError("Invalid Muse remote target settings")
+        item = item.strip()
+        if not _MUSE_REMOTE_IDENTIFIER_RE.fullmatch(item):
+            raise ValueError("Invalid Muse remote target settings")
+        normalized[key] = item
+
+    if "auth_fingerprint" in value:
+        fingerprint = value["auth_fingerprint"]
+        if not isinstance(fingerprint, str):
+            raise ValueError("Invalid Muse remote target settings")
+        fingerprint = fingerprint.strip()
+        if not _MUSE_REMOTE_FINGERPRINT_RE.fullmatch(fingerprint):
+            raise ValueError("Invalid Muse remote target settings")
+        normalized["auth_fingerprint"] = fingerprint.lower()
+
+    if "state_root" in value:
+        state_root = value["state_root"]
+        if not isinstance(state_root, str):
+            raise ValueError("Invalid Muse remote target settings")
+        state_root = state_root.strip()
+        if (
+            not state_root
+            or len(state_root) > _MUSE_REMOTE_MAX_STATE_ROOT_CHARS
+            or "\x00" in state_root
+        ):
+            raise ValueError("Invalid Muse remote target settings")
+        from pathlib import Path
+
+        try:
+            root = Path(state_root)
+            if not root.is_absolute() or not root.is_dir():
+                raise ValueError("Invalid Muse remote target settings")
+            home = Path.home()
+            if os.path.normcase(os.path.realpath(root)) == os.path.normcase(
+                os.path.realpath(home)
+            ):
+                raise ValueError("Invalid Muse remote target settings")
+        except (OSError, RuntimeError, TypeError):
+            raise ValueError("Invalid Muse remote target settings") from None
+        state_root = str(root)
+        normalized["state_root"] = state_root
+
+    for key in ("allowed_owner_ids", "allowed_agent_ids"):
+        if key not in value:
+            continue
+        raw_ids = value[key]
+        if not isinstance(raw_ids, list) or len(raw_ids) > _MUSE_REMOTE_MAX_LIST_ITEMS:
+            raise ValueError("Invalid Muse remote target settings")
+        ids: list[str] = []
+        seen: set[str] = set()
+        for raw_id in raw_ids:
+            if not isinstance(raw_id, str):
+                raise ValueError("Invalid Muse remote target settings")
+            try:
+                canonical_id = str(uuid.UUID(raw_id.strip()))
+            except (ValueError, AttributeError):
+                raise ValueError("Invalid Muse remote target settings") from None
+            if canonical_id not in seen:
+                seen.add(canonical_id)
+                ids.append(canonical_id)
+        normalized[key] = ids
+
+    from ...services.muse_remote_execution import MAX_WAIT_SECONDS
+
+    timing_bounds = {
+        "wait_seconds": (0.0, float(MAX_WAIT_SECONDS), False),
+        "reconcile_timeout_seconds": (0.0, _MUSE_REMOTE_MAX_RECONCILE_SECONDS, True),
+        "poll_interval_seconds": (0.0, _MUSE_REMOTE_MAX_POLL_SECONDS, True),
+    }
+    for key, (minimum, maximum, exclusive_minimum) in timing_bounds.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError("Invalid Muse remote target settings")
+        numeric = float(item)
+        if not math.isfinite(numeric):
+            raise ValueError("Invalid Muse remote target settings")
+        if (numeric <= minimum if exclusive_minimum else numeric < minimum) or numeric > maximum:
+            raise ValueError("Invalid Muse remote target settings")
+        normalized[key] = numeric
+
+    if normalized.get("enabled") is True:
+        if (
+            normalized.get("egress_enabled") is not True
+            or normalized.get("authenticated") is not True
+        ):
+            raise ValueError("Invalid Muse remote target settings")
+        if not all(
+            normalized.get(key)
+            for key in (
+                "credential_ref",
+                "state_root",
+                "vm_id",
+                "auth_fingerprint",
+            )
+        ):
+            raise ValueError("Invalid Muse remote target settings")
+        if not normalized.get("allowed_owner_ids") or not normalized.get(
+            "allowed_agent_ids"
+        ):
+            raise ValueError("Invalid Muse remote target settings")
+
+    return normalized
+
+
+def _muse_remote_target_summary(value: Any) -> dict[str, Any]:
+    """Expose only non-sensitive readiness assertions and allowlist counts."""
+
+    target = value if isinstance(value, dict) else {}
+    nonempty = bool(target)
+
+    def _present(key: str) -> bool:
+        item = target.get(key)
+        return isinstance(item, str) and bool(item.strip())
+
+    def _count(key: str) -> int:
+        item = target.get(key)
+        return len(item) if isinstance(item, list) else 0
+
+    return {
+        "configured": nonempty,
+        "enabled": target.get("enabled") is True,
+        "egress_enabled": target.get("egress_enabled") is True,
+        "authenticated_configured": target.get("authenticated") is True,
+        "credential_ref_present": _present("credential_ref"),
+        "state_root_present": _present("state_root"),
+        "vm_id_present": _present("vm_id"),
+        "node_id_present": _present("node_id"),
+        "auth_fingerprint_present": _present("auth_fingerprint"),
+        "allowed_owner_count": _count("allowed_owner_ids"),
+        "allowed_agent_count": _count("allowed_agent_ids"),
+    }
+
+
+def _muse_remote_target_profile_enabled() -> bool:
+    """Fail closed when the current feature profile cannot use Muse remote."""
+
+    try:
+        return not Features.is_enterprise() and Features.remote_server_view()
+    except Exception:
+        return False
+
+
+def _validate_execution_route_backend(route: dict[str, Any], *, label: str) -> None:
+    """Accept the explicit remote backend only on the canonical Muse route."""
+
+    if "backend" not in route:
+        return
+    if (
+        route.get("provider") != "muse-remote"
+        or route.get("inherit_model") is not False
+        or route.get("backend") != "remote"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} backend is only valid for the explicit muse-remote remote route",
+        )
 
 
 def _attach_server_timing(
@@ -295,6 +503,9 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     # ── Settings API Endpoints ──────────────────────────────────────────
     # Allowed settings that can be modified via WebUI
     ALLOWED_SETTINGS = {
+        # The Muse remote target is one server-owned document with a dedicated
+        # strict validator below; child dotted keys are intentionally absent.
+        _MUSE_REMOTE_TARGET_KEY: {"type": "object"},
         # Provider visibility is a global, UI-only preference.  The enclosing
         # application config is DB-backed and the route's existing admin gate
         # protects writes; it is deliberately not consulted by LLM execution
@@ -736,6 +947,15 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     }
                 },
             }
+            # Remote target values are never returned directly.  Even the
+            # presence summary is administrator-only and hidden by profiles
+            # where remote-server access is unavailable.
+            if is_admin and _muse_remote_target_profile_enabled():
+                settings["remote_targets"] = {
+                    "muse": _muse_remote_target_summary(
+                        server.config.get(_MUSE_REMOTE_TARGET_KEY, {})
+                    )
+                }
             return JSONResponse({"settings": settings, "schema": ALLOWED_SETTINGS})
         except Exception as e:
             logger.error(f"Failed to get settings: {e}")
@@ -885,7 +1105,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "profile_id", "name", "display_name", "enabled", "default_route", "overrides",
         }
         allowed_execution_route_fields = {
-            "inherit_model", "provider", "model", "effort_policy", "effort",
+            "inherit_model", "provider", "model", "effort_policy", "effort", "backend",
         }
         for key, team in teams_raw.items():
             if not isinstance(team, dict):
@@ -973,6 +1193,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             status_code=400,
                             detail=f"Unsupported ExecutionRoute field for {profile_key}: {sorted(str(item) for item in extra_route)[0]}",
                         )
+                    _validate_execution_route_backend(
+                        default_route,
+                        label=f"Execution Profile {profile_key}",
+                    )
                 overrides = profile.get("overrides")
                 if overrides is None:
                     continue
@@ -995,6 +1219,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             status_code=400,
                             detail=f"Unsupported ExecutionRoute field for {profile_key}.overrides[{override_key}]: {sorted(str(item) for item in extra_override)[0]}",
                         )
+                    _validate_execution_route_backend(
+                        override,
+                        label=f"Execution Profile {profile_key}.overrides[{override_key}]",
+                    )
 
         for key, subagent in subagents_raw.items():
             if not isinstance(subagent, dict):
@@ -1070,7 +1298,9 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 default_route = profile.get("default_route")
                 if isinstance(default_route, dict):
                     provider = str(default_route.get("provider") or "").strip().lower()
-                    if provider and provider not in (MODEL_ROUTING_PROVIDERS | {"routing-profile"}):
+                    if provider and provider not in (
+                        MODEL_ROUTING_PROVIDERS | {"routing-profile", "muse-remote"}
+                    ):
                         raise HTTPException(
                             status_code=400,
                             detail=f"Unsupported provider for Execution Profile {profile_key}",
@@ -1101,7 +1331,9 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     if route_errors:
                         raise HTTPException(status_code=400, detail=route_errors[0])
                     provider = str(override.get("provider") or "").strip().lower()
-                    if provider and provider not in (MODEL_ROUTING_PROVIDERS | {"routing-profile"}):
+                    if provider and provider not in (
+                        MODEL_ROUTING_PROVIDERS | {"routing-profile", "muse-remote"}
+                    ):
                         raise HTTPException(
                             status_code=400,
                             detail=f"Unsupported provider for {team_id}/{profile_key}/{override_key}",
@@ -1154,6 +1386,68 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         key = payload.key
         value = payload.value
         persist = payload.persist
+
+        if key == _MUSE_REMOTE_TARGET_KEY:
+            # The remote target is a privileged, profile-gated server setting
+            # even when cookie authentication is disabled for local operation.
+            if not await server._is_admin_user(request):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required",
+                )
+            if not _muse_remote_target_profile_enabled():
+                raise HTTPException(
+                    status_code=403,
+                    detail="This setting is disabled in the current profile",
+                )
+            try:
+                raw_request_payload = await request.json()
+            except Exception:
+                raw_request_payload = None
+            if (
+                not isinstance(raw_request_payload, dict)
+                or raw_request_payload.get("persist") is not True
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Muse remote target settings must be persisted",
+                )
+            try:
+                value = _validate_muse_remote_target(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid Muse remote target settings",
+                ) from None
+
+            try:
+                if not server.config.save_to_file(key, value):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to persist setting to DB",
+                    )
+
+                logger.info(
+                    "Setting updated: %s = %s (persist=%s)",
+                    key,
+                    format_setting_log_value(key, value),
+                    True,
+                )
+                return JSONResponse(
+                    public_setting_patch_payload(key, value, persisted=True)
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Failed to update setting: key=%s exception_type=%s",
+                    key,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to update setting",
+                ) from None
 
         if getattr(server, "auth_enabled", True) and not await server._is_admin_user(
             request

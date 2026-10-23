@@ -11,7 +11,7 @@
  * protected at scope sweep. A fresh/classified cache can complete with a
  * verified no-op sweep and persist that fact.
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "../../db/client";
 import { runBackgroundSqliteWrite } from "../../db/sqlite-write-coordinator";
 import type { SqliteHandle, SqliteWriter } from "../../db/sqlite-writer";
@@ -19,6 +19,7 @@ import { isApiHttpError } from "../../lib/api-client";
 import { rescheduleLocalTaskNotificationsFromCache } from "../../lib/local-notifications";
 import { getSyncV3Bootstrap, getSyncV3Changes, getSyncV3Scopes } from "./api";
 import {
+  SYNC_V3_SWEEP_BATCH_SIZE,
   applySyncV3BootstrapInWriter,
   applySyncV3ChangesInWriter,
   changesToSyncV3Entries,
@@ -62,7 +63,15 @@ export type SyncV3PullResult = {
 
 /** Bound on scope/cursor restarts within one run (corrupt server protection). */
 const MAX_RESTARTS = 16;
-const MAX_PAGES = 100_000;
+export const SYNC_V3_PULL_MAX_PAGES = 64;
+export const SYNC_V3_PULL_BUDGET_MS = 90_000;
+
+export class SyncV3PullBudgetError extends Error {
+  constructor() {
+    super("同期v3は次のflightで保存済み位置から再開します");
+    this.name = "SyncV3PullBudgetError";
+  }
+}
 
 type BootstrapPositionWithTarget = NonNullable<SyncV3ScopeState["bootstrap"]> & {
   /** Fingerprint this bootstrap is collecting (saved on completion). */
@@ -152,11 +161,12 @@ class SyncV3PullRunner {
     private resetMembership: boolean,
   ) {
     this.state = initial;
+    this.resetMembership ||= initial.membershipResetPending === true;
   }
 
   private nextPage(): void {
     this.page += 1;
-    if (this.page > MAX_PAGES) throw new Error("同期v3のページ数上限を超えました");
+    if (this.page > SYNC_V3_PULL_MAX_PAGES) throw new SyncV3PullBudgetError();
     try {
       this.context.onPage?.(this.page);
     } catch {
@@ -207,25 +217,51 @@ class SyncV3PullRunner {
   /** Step 2: reconcile the server scope set (one transaction). */
   private async reconcileScopes(response: SyncV3ScopesResponse, requestId?: string): Promise<void> {
     const prep = syncV3EvictionPrep(this.authScope);
-    const resetMembership = this.resetMembership;
+    if (this.resetMembership) {
+      let remaining = true;
+      while (remaining) {
+        await this.unit((_w, tx, next) => {
+          const rows = tx.select().from(schema.syncV3Membership)
+            .where(eq(schema.syncV3Membership.authScope, this.authScope))
+            .limit(SYNC_V3_SWEEP_BATCH_SIZE).all();
+          for (const row of rows) {
+            tx.delete(schema.syncV3Membership).where(and(
+              eq(schema.syncV3Membership.authScope, this.authScope),
+              eq(schema.syncV3Membership.tableName, row.tableName),
+              eq(schema.syncV3Membership.entityId, row.entityId),
+              eq(schema.syncV3Membership.scopeKey, row.scopeKey),
+            )).run();
+          }
+          remaining = rows.length === SYNC_V3_SWEEP_BATCH_SIZE;
+          next.membershipResetPending = remaining;
+        }, requestId);
+        await this.yieldBetweenUnits();
+      }
+    }
+    // Retain the scope's durable state until its last chunk is committed.
+    // On cancellation, remaining membership itself is the resumable position.
+    const serverKeys = new Set(response.scopes.map((scope) => scope.scope_key));
+    for (const scopeKey of Object.keys(this.state.scopes)) {
+      if (serverKeys.has(scopeKey)) continue;
+      let remaining: boolean;
+      do {
+        remaining = false;
+        await this.unit((w, tx, next) => {
+          next.scopes[scopeKey].evictionPending = true;
+          const result = dropSyncV3ScopeMembershipInWriter(w, tx, this.context_(prep, next), scopeKey, null);
+          remaining = result.remaining;
+          return result;
+        }, requestId);
+        await this.yieldBetweenUnits();
+      } while (remaining);
+    }
     await this.unit((w, tx, next) => {
       const tables = new Set<SyncV3Table>();
-      let reschedule = false;
-      if (resetMembership) {
-        // No durable state for this account (first run, or an auth transition
-        // cleared sync_state but not this table): any membership left over is
-        // from an older lifecycle and must not keep entities alive.
-        tx.delete(schema.syncV3Membership)
-          .where(eq(schema.syncV3Membership.authScope, this.authScope))
-          .run();
-      }
+      const reschedule = false;
       const serverKeys = new Set(response.scopes.map((scope) => scope.scope_key));
       const removed: Array<{ id: string; projectId: string | null }> = [];
       for (const [scopeKey, scope] of Object.entries(next.scopes)) {
         if (serverKeys.has(scopeKey)) continue;
-        const dropped = dropSyncV3ScopeMembershipInWriter(w, tx, this.context_(prep, next), scopeKey, null);
-        dropped.tables.forEach((table) => tables.add(table));
-        reschedule ||= dropped.reschedule;
         if (scope.kind === "docs" && scope.id) removed.push({ id: scope.id, projectId: scope.projectId ?? null });
         delete next.scopes[scopeKey];
       }
@@ -244,6 +280,10 @@ class SyncV3PullRunner {
           access: scope.access,
           readOnly: scope.read_only,
         });
+        if (saved.evictionPending) {
+          next.scopes[scope.scope_key] = scopeStateFrom(scope, saved.generation + 1, saved.fingerprint);
+          continue;
+        }
         if (pending && (pending.fingerprint ?? saved.fingerprint) === scope.fingerprint) continue;
         if (!pending && saved.fingerprint === scope.fingerprint) continue;
         next.scopes[scope.scope_key] = scopeStateFrom(scope, saved.generation + 1, saved.fingerprint);
@@ -254,6 +294,11 @@ class SyncV3PullRunner {
       return { tables, reschedule };
     }, requestId);
     this.resetMembership = false;
+  }
+
+  private async yieldBetweenUnits(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    this.context.assertActive();
   }
 
   private pendingScopeKeys(): string[] {
@@ -320,14 +365,19 @@ class SyncV3PullRunner {
             const dropped = dropSyncV3ScopeMembershipInWriter(w, tx, ctx, scopeKey, target.generation);
             dropped.tables.forEach((item) => tables.add(item));
             reschedule ||= dropped.reschedule;
-            target.fingerprint = current.fingerprint ?? target.fingerprint;
-            target.lastBootstrap = { seen, total: totalCount };
-            target.bootstrap = null;
+            if (dropped.remaining) {
+              target.bootstrap = { ...nextPosition, tableIndex: target.tables.length, seen, total: totalCount };
+            } else {
+              target.fingerprint = current.fingerprint ?? target.fingerprint;
+              target.lastBootstrap = { seen, total: totalCount };
+              target.bootstrap = null;
+            }
           } else {
             target.bootstrap = nextPosition;
           }
           return { tables, reschedule };
         }, requestId);
+        await this.yieldBetweenUnits();
       }
     }
     return true;
@@ -364,6 +414,7 @@ class SyncV3PullRunner {
         next.cursor = response.cursor;
         return applied;
       }, requestId);
+      await this.yieldBetweenUnits();
       if (response.scope_set_revision !== this.state.scopeSetRevision) return "rescope";
       if (!response.has_more) return "done";
     }
@@ -439,9 +490,48 @@ export async function runV3Pull(
   context: SyncV3RunContext,
 ): Promise<SyncV3PullResult> {
   context.assertActive();
-  const saved = await readSyncV3State(authScope);
-  context.assertActive();
-  return new SyncV3PullRunner(authScope, context, saved ?? emptySyncV3State(), saved == null).run();
+  const controller = new AbortController();
+  const expiresAt = Date.now() + SYNC_V3_PULL_BUDGET_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abortParent: (() => void) | undefined;
+  const child: SyncV3RunContext = {
+    ...context,
+    signal: controller.signal,
+    assertActive: () => {
+      context.assertActive();
+      if (controller.signal.aborted) throw Object.assign(new Error("sync_v3_pull_interrupted"), { name: "AbortError" });
+      if (Date.now() >= expiresAt) throw new SyncV3PullBudgetError();
+    },
+  };
+  const stopped = new Promise<never>((_, reject) => {
+    abortParent = () => {
+      controller.abort();
+      try { context.assertActive(); } catch (error) { reject(error); return; }
+      reject(Object.assign(new Error("sync_v3_pull_interrupted"), { name: "AbortError" }));
+    };
+    if (context.signal.aborted) abortParent();
+    else context.signal.addEventListener("abort", abortParent, { once: true });
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new SyncV3PullBudgetError());
+    }, SYNC_V3_PULL_BUDGET_MS);
+  });
+  const flight = (async () => {
+    child.assertActive();
+    const saved = await readSyncV3State(authScope);
+    child.assertActive();
+    return new SyncV3PullRunner(authScope, child, saved ?? emptySyncV3State(), saved == null).run();
+  })();
+  // A transport that ignores abort can settle later; child guards prohibit a
+  // subsequent write and its rejection is consumed after the queue is released.
+  void flight.catch(() => undefined);
+  try {
+    return await Promise.race([flight, stopped]);
+  } finally {
+    controller.abort();
+    if (timer !== undefined) clearTimeout(timer);
+    if (abortParent) context.signal.removeEventListener("abort", abortParent);
+  }
 }
 
 /**

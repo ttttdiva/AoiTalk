@@ -493,6 +493,7 @@ def _execution_route(raw: Any) -> dict[str, Any]:
             "model": None,
             "effort_policy": "not_applicable",
             "effort": None,
+            "backend": "remote",
         }
     if inherit_model:
         provider = ""

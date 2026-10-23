@@ -51,6 +51,7 @@ class SyncV3ProductEngine implements SyncV3EngineControl {
   private confirming = false;
   private listeners = new Set<(status: SyncV3Status) => void>();
   private refreshQueued = false;
+  private lastObservedRefreshAt = 0;
   private readonly removeRequestObserver = subscribeSyncV3RequestDiagnostics(() => this.queueRefresh());
   private readonly removeSyncStatus = useSyncStatusStore.subscribe(() => this.queueRefresh());
 
@@ -64,10 +65,11 @@ class SyncV3ProductEngine implements SyncV3EngineControl {
   private queueRefresh(): void {
     if (this.refreshQueued) return;
     this.refreshQueued = true;
-    queueMicrotask(() => {
+    setTimeout(() => {
       this.refreshQueued = false;
+      this.lastObservedRefreshAt = Date.now();
       void this.refresh();
-    });
+    }, Math.max(0, 1000 - (Date.now() - this.lastObservedRefreshAt)));
   }
 
   private async refresh(): Promise<void> {
@@ -141,13 +143,15 @@ class SyncV3ProductEngine implements SyncV3EngineControl {
       });
     } catch (error) {
       if (generation !== this.generation) return;
+      const legacy = await getLegacyMigrationStatus().catch(() => ({
+        state: "failed" as const, legacyCount: null, ownerUnknownCount: null,
+        captureSha256: null, captureFile: null, errorCode: "legacy_status_unavailable",
+      }));
+      if (generation !== this.generation || authScope !== this.authScope) return;
       this.publish({
         ...this.status,
         authScope,
-        legacy: await getLegacyMigrationStatus().catch(() => ({
-          state: "failed", legacyCount: null, ownerUnknownCount: null,
-          captureSha256: null, captureFile: null, errorCode: "legacy_status_unavailable",
-        })),
+        legacy,
         overall: "degraded",
         disabledReason: error instanceof Error ? error.name : "diagnostics_unavailable",
       });

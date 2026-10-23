@@ -1,3 +1,4 @@
+import { acknowledgeLegacyOpInWriter } from "../sync-v3/legacy-migration";
 /**
  * Outbox helpers (M1: enqueue-only skeleton).
  *
@@ -1130,7 +1131,9 @@ export function removeOutboxOpIfSnapshotInWriter(
     .delete(schema.outbox)
     .where(and(...conditions))
     .run();
-  return Number(result.changes ?? 0) > 0;
+  const removed = Number(result.changes ?? 0) > 0;
+  if (removed) acknowledgeLegacyOpInWriter(w, tx, snapshot as unknown as Record<string, unknown>);
+  return removed;
 }
 
 /**

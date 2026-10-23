@@ -8,6 +8,7 @@ import { isSyncV3ManuallyStopped } from "../sync/v3/safety";
 
 export const LEGACY_CAPTURE_ID = "sync-v3-legacy";
 const UNKNOWN_OWNER_SCOPE = "legacy:unknown";
+const LEGACY_V2_ACK_KEY = "sync_v3_legacy_v2_acknowledged";
 const DIRTY_TABLES = [
   "knowledge_nodes",
   "knowledge_supertags",
@@ -32,6 +33,7 @@ export type LegacySnapshot = {
   dirty: DirtyCapture[];
   conflicts: Array<Record<string, unknown>>;
   archived?: LegacySnapshot[];
+  v2Acknowledged?: Array<{ op: Record<string, unknown>; dirty: DirtyCapture[] }>;
 };
 
 type CaptureRow = typeof schema.syncV3LegacyCapture.$inferSelect;
@@ -238,7 +240,54 @@ function currentSnapshotInWriter(tx: SqliteHandle): LegacySnapshot {
   }
   dirty.sort((a, b) => a.table.localeCompare(b.table) || a.entityId.localeCompare(b.entityId));
   conflicts.sort((a, b) => stableLegacyJson(a).localeCompare(stableLegacyJson(b)));
-  return { version: 1, outbox, dirty, conflicts };
+  const journal = tx.select({ cursor: schema.syncState.cursor }).from(schema.syncState)
+    .where(eq(schema.syncState.tableName, LEGACY_V2_ACK_KEY)).get();
+  const v2Acknowledged = journal?.cursor
+    ? JSON.parse(journal.cursor) as NonNullable<LegacySnapshot["v2Acknowledged"]> : [];
+  return { version: 1, outbox, dirty, conflicts, ...(v2Acknowledged.length ? { v2Acknowledged } : {}) };
+}
+
+/** A successful, exact outbox CAS is the only proof used to retire old captures.
+ * The export is preserved; the durable journal makes a later confirmation stale.
+ */
+export function acknowledgeLegacyOpInWriter(
+  w: SqliteWriter,
+  tx: SqliteHandle,
+  op: Record<string, unknown>,
+): void {
+  assertActiveWriter(w);
+  if (getCaptureInWriter(tx)?.state !== "awaiting_confirm" || !op.authScope) return;
+  const snapshot = currentSnapshotInWriter(tx);
+  const acknowledged = snapshot.v2Acknowledged ?? [];
+  const payload = jsonObject(op.payload);
+  const dirty = snapshot.dirty.filter((item) => item.table === op.tableName && item.entityId === op.entityId
+    && item.ownerAuthScopes.length === 1 && item.ownerAuthScopes[0] === op.authScope
+    && payload && Object.entries(payload).every(([key, value]) =>
+      stableLegacyJson(item.local[key]) === stableLegacyJson(value)));
+  const next = [...acknowledged, { op, dirty }];
+  tx.insert(schema.syncState).values({ tableName: LEGACY_V2_ACK_KEY, cursor: stableLegacyJson(next) })
+    .onConflictDoUpdate({ target: schema.syncState.tableName, set: { cursor: stableLegacyJson(next) } }).run();
+}
+
+function operationContent(op: Record<string, unknown>): string {
+  return stableLegacyJson(Object.fromEntries(
+    ["opId", "authScope", "tableName", "action", "entityId", "payload", "baseUpdatedAt", "basePayload"]
+      .map((key) => [key, op[key] ?? null]),
+  ));
+}
+
+/** Archived data stays exportable; confirmed v2 receipts cannot revive it. */
+function pendingSnapshotParts(snapshot: LegacySnapshot): LegacySnapshot[] {
+  const parts = flattenSnapshotParts(snapshot);
+  const receipts = parts.flatMap((part) => part.v2Acknowledged ?? []);
+  const ops = new Set(receipts.map((item) => operationContent(item.op)));
+  const dirty = new Set(receipts.flatMap((item) => item.dirty).map(stableLegacyJson));
+  const activeDirty = new Set(snapshot.dirty.map(stableLegacyJson));
+  return parts.map((part) => ({
+    ...part,
+    outbox: part.outbox.filter((op) => !ops.has(operationContent(op))),
+    dirty: part.dirty.filter((item) => activeDirty.has(stableLegacyJson(item)) || !dirty.has(stableLegacyJson(item))),
+  }));
 }
 
 export function readCurrentDirtyCaptureInWriter(
@@ -257,7 +306,7 @@ function ownerUnknownCount(snapshot: LegacySnapshot): number {
 }
 
 function snapshotCounts(snapshot: LegacySnapshot) {
-  const parts = flattenSnapshotParts(snapshot);
+  const parts = pendingSnapshotParts(snapshot);
   const outbox = uniqueByStable(parts.flatMap((part) => part.outbox));
   const dirty = uniqueByStable(parts.flatMap((part) => part.dirty));
   const normalized: LegacySnapshot = { version: 1, outbox, dirty, conflicts: [] };
@@ -280,7 +329,8 @@ function uniqueByStable<T>(values: T[]): T[] {
 }
 
 function activeSnapshot(snapshot: LegacySnapshot): LegacySnapshot {
-  return { version: 1, outbox: snapshot.outbox, dirty: snapshot.dirty, conflicts: snapshot.conflicts };
+  return { version: 1, outbox: snapshot.outbox, dirty: snapshot.dirty, conflicts: snapshot.conflicts,
+    ...(snapshot.v2Acknowledged?.length ? { v2Acknowledged: snapshot.v2Acknowledged } : {}) };
 }
 
 function flattenSnapshotParts(snapshot: LegacySnapshot): LegacySnapshot[] {
@@ -329,6 +379,8 @@ export function captureLegacy(): Promise<LegacyMigrationStatus> {
 }
 
 async function captureLegacyOnce(): Promise<LegacyMigrationStatus> {
+  const completed = await getLegacyMigrationStatus();
+  if (completed.state === "migrated") return completed;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const observed = await runForegroundSqliteWrite((w) => {
       return getDb().transaction((tx) => {
@@ -593,7 +645,7 @@ export async function migrateLegacy(
       resultState.state = "awaiting_confirm";
       return;
     }
-    const parts = flattenSnapshotParts(snapshot);
+    const parts = pendingSnapshotParts(snapshot);
     const capturedOps = uniqueByStable(parts.flatMap((part) => part.outbox));
     const capturedDirty = uniqueByStable(parts.flatMap((part) => part.dirty));
     const operationsSnapshot: LegacySnapshot = { version: 1, outbox: capturedOps, dirty: [], conflicts: [] };

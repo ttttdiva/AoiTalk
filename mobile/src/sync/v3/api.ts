@@ -205,8 +205,8 @@ export async function postSyncV3Ops(
       });
     return response;
   } catch (error) {
-    // /ops answers 503 only for sync_disabled; treat any 503 as a v2 fallback.
-    if (isApiHttpError(error) && error.status === 503) throw new SyncV3DisabledError();
+    // A gateway 503 may follow a committed apply. Only the explicit protocol
+    // sync_disabled response proves that this request did not apply.
     return translate(error);
   }
 }

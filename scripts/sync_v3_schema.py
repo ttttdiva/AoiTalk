@@ -26,7 +26,7 @@ from sqlalchemy.engine import URL, make_url  # noqa: E402
 
 from src.memory.config import validate_postgres_schema  # noqa: E402
 from src.sync_v3.schema_readiness import (  # noqa: E402
-    SYNC_V3_MIGRATION_REVISION,
+    SYNC_V3_LATEST_REVISION,
     SYNC_V3_VERSION_TABLE,
     inspect_connection,
     migration_preflight,
@@ -116,7 +116,7 @@ def _revision_ancestry_ok(heads: tuple[str, ...]) -> bool:
     config.set_main_option("script_location", str(ROOT / "alembic_sync_v3"))
     script = ScriptDirectory.from_config(config)
     return all(
-        _revision_descends_from(script, head, SYNC_V3_MIGRATION_REVISION)
+        _revision_descends_from(script, head, SYNC_V3_LATEST_REVISION)
         for head in heads
     )
 
@@ -127,7 +127,7 @@ def _read_report(url: URL, *, schema: str | None, require_revision: bool):
     engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
     try:
         with engine.connect() as connection:
-            report = inspect_connection(connection, check_key=True, require_revision=False)
+            report = inspect_connection(connection, check_key=True, require_revision=False, include_docs_visibility=True)
             heads = tuple(
                 MigrationContext.configure(
                     connection, opts={"version_table": SYNC_V3_VERSION_TABLE}
@@ -135,7 +135,7 @@ def _read_report(url: URL, *, schema: str | None, require_revision: bool):
             )
             current = ",".join(sorted(heads)) if heads else None
             if require_revision and not _revision_ancestry_ok(heads):
-                missing = (*report.missing, f"alembic_revision_ancestry:{SYNC_V3_MIGRATION_REVISION}")
+                missing = (*report.missing, f"alembic_revision_ancestry:{SYNC_V3_LATEST_REVISION}")
                 report = replace(report, ready=False, revision_ok=False, missing=tuple(sorted(set(missing))))
             return report, current
     finally:
@@ -156,7 +156,7 @@ def _run_apply(url: URL, *, schema: str | None):
         engine.dispose()
 
     config = _alembic_config(url, schema)
-    command.upgrade(config, SYNC_V3_MIGRATION_REVISION)
+    command.upgrade(config, SYNC_V3_LATEST_REVISION)
     return _read_report(url, schema=schema, require_revision=True)
 
 
@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "operation": args.operation,
             "target": target,
-            "migration_revision": SYNC_V3_MIGRATION_REVISION,
+            "migration_revision": SYNC_V3_LATEST_REVISION,
             "current_revision": current,
             "report": report.as_dict(),
         }

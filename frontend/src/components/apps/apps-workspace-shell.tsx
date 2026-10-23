@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
-import { Archive, ArchiveRestore, Boxes, Download, Plus, Search } from "lucide-react";
+import { Archive, ArchiveRestore, Boxes, Plus, Search } from "lucide-react";
 import { buttonVariants } from "@/components/ui/button";
 import { AppSelect } from "@/components/ui/app-select";
 import { Input } from "@/components/ui/input";
@@ -110,17 +110,6 @@ export function AppsWorkspaceShell({
     [projectAppsData?.apps],
   );
   const boundAppIds = useMemo(() => new Set(projectApps.map((binding) => binding.app_id)), [projectApps]);
-  const activeProjectBinding = useMemo(
-    () => projectApps.find((binding) => binding.app_id === activeAppId),
-    [activeAppId, projectApps],
-  );
-  const activeProjectApp = activeProjectBinding?.app;
-  const canDownloadActiveApp = Boolean(
-    embedded
-      && activeProjectApp
-      && permissionAtLeast(activeProjectBinding?.permission, "runner"),
-  );
-
   const activeApps = useMemo(
     () => (data?.apps || []).filter((app) => !app.archived_at),
     [data?.apps],
@@ -490,18 +479,6 @@ export function AppsWorkspaceShell({
         </div>
       )}
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto" data-shell-region="apps-workspace-content">
-        {canDownloadActiveApp && activeProjectApp && (
-          <div className="sticky top-0 z-20 flex justify-end border-b border-border/80 bg-background/95 px-4 py-2 backdrop-blur">
-            <a
-              href={appsApi.downloadArchive(activeProjectApp.id, projectId || undefined, { git: true, dependencies: true, runtime: true, credentials: true })}
-              download
-              className={buttonVariants({ variant: "outline", size: "sm", className: "h-8 px-3" })}
-              title={`${activeProjectApp.name} を軽量・安全設定でダウンロード`}
-            >
-              <Download className="size-3.5" /> ダウンロード
-            </a>
-          </div>
-        )}
         {children}
       </div>
     </div>

@@ -4018,7 +4018,16 @@ class AgentWorkCoordinator:
                     )
                 row.heartbeat_at = now
                 row.updated_at = now
-                row.safe_error_code = "stale_lease_recovered" if state == "retry_wait" else "max_attempts_exhausted"
+                # Interactive provider state is unknown after lease loss,
+                # regardless of the attempt ceiling. Keep that fence distinct
+                # from both exhausted retries and proven restart reconciliation.
+                row.safe_error_code = (
+                    "interactive_lease_expired"
+                    if interactive_source
+                    else "stale_lease_recovered"
+                    if state == "retry_wait"
+                    else "max_attempts_exhausted"
+                )
                 if stale_run_id:
                     stale_run_ids.append(str(stale_run_id))
                 await self._append_event_in_session(session, row, event_type=f"work.{state}", actor_kind="service", actor_id=self.worker_id, agent_run_id=stale_run_id, from_state=previous_state, to_state=state, safe_error_code=row.safe_error_code, payload={"recovered_after_restart": True, "error_code": row.safe_error_code})

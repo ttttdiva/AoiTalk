@@ -3,6 +3,12 @@ param(
     [switch]$Watch,
     [switch]$ValidateOnly,
     [switch]$Stop,
+    [switch]$ControlInternal,
+    [string]$InstanceNonce = "",
+    [ValidateSet("console", "background-task")]
+    [string]$OwnerMode = "console",
+    [ValidateSet("watch-child", "watch-current")]
+    [string]$ProcessKind = "watch-current",
     [ValidateRange(5, 300)]
     [int]$PollSeconds = 30
 )
@@ -13,6 +19,7 @@ Set-StrictMode -Version Latest
 $PackageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "..\.."))
 $Entry = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "aoitalk_plugin_stdio.py"))
+$ControlLauncherEntry = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "connect_tunnel.ps1"))
 $Python = Join-Path $PackageRoot "venv\Scripts\python.exe"
 $RuntimeAlias = "aoitalk-41"
 $ProfileName = "aoitalk-plugin-41"
@@ -35,6 +42,27 @@ $AllowedConfigKeys = @(
 )
 $SavedEnvironment = @{}
 $LockStream = $null
+$script:ControlStopAttempted = $false
+
+. (Join-Path $PSScriptRoot "plugin_launch_control_lib.ps1")
+Initialize-PluginLaunchControl $RepoRoot $ControlLauncherEntry
+
+if (($Watch -and $Stop) -or (($Watch -or $Stop) -and -not $ControlInternal -and $ValidateOnly)) {
+    throw "Choose one Plugin launcher mode."
+}
+if ($Watch -and -not $ControlInternal) {
+    & (Join-Path $PSScriptRoot "plugin_launch_control.ps1") -Mode WatchCurrent -EnvFile $EnvFile
+    return
+}
+if ($Stop -and -not $ControlInternal) {
+    & (Join-Path $PSScriptRoot "plugin_launch_control.ps1") -Mode Stop -EnvFile $EnvFile
+    return
+}
+
+$script:ControlInstanceNonce = $InstanceNonce
+$script:ControlOwnerMode = $OwnerMode
+$script:ControlProcessKind = $ProcessKind
+$script:ControlProcessStartUtc = if ($InstanceNonce) { Get-ControlProcessStart $PID } else { "" }
 
 function Read-LiteralEnv([string]$Path) {
     $values = @{}
@@ -72,68 +100,7 @@ function Write-SafeLog([string]$Message) {
     Add-Content -LiteralPath $script:SupervisorLog -Value $line -Encoding UTF8
 }
 
-function Get-ClientStatus {
-    $output = @(& $script:TunnelClient runtimes status $script:RuntimeAlias --json 2>$null)
-    $code = $LASTEXITCODE
-    if ($code -ne 0) { return $null }
-    try { return (($output -join "`n") | ConvertFrom-Json -ErrorAction Stop) }
-    catch { throw "tunnel-client returned an unreadable status for alias '$script:RuntimeAlias'." }
-}
-
-function Test-ClientListHasAlias($Value) {
-    if ($null -eq $Value) { return $false }
-    if ($Value -is [System.Collections.IDictionary]) {
-        if (($Value.Contains("alias") -and $Value["alias"] -eq $script:RuntimeAlias) -or
-            ($Value.Contains("name") -and $Value["name"] -eq $script:RuntimeAlias)) { return $true }
-        foreach ($key in $Value.Keys) { if (Test-ClientListHasAlias $Value[$key]) { return $true } }
-    } elseif ($Value -is [PSCustomObject]) {
-        $aliasProperty = $Value.PSObject.Properties["alias"]
-        $nameProperty = $Value.PSObject.Properties["name"]
-        if (($aliasProperty -and $aliasProperty.Value -eq $script:RuntimeAlias) -or
-            ($nameProperty -and $nameProperty.Value -eq $script:RuntimeAlias)) { return $true }
-        foreach ($property in $Value.PSObject.Properties) {
-            if (Test-ClientListHasAlias $property.Value) { return $true }
-        }
-    } elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
-        foreach ($item in $Value) { if (Test-ClientListHasAlias $item) { return $true } }
-    }
-    return $false
-}
-
-function Read-RuntimeIdentity {
-    if (-not (Test-Path -LiteralPath $script:IdentityPath -PathType Leaf)) { return $null }
-    try { return (Get-Content -LiteralPath $script:IdentityPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop) }
-    catch { throw "AoiTalk Plugin runtime identity file is malformed; refusing to touch alias '$script:RuntimeAlias'." }
-}
-
-function Assert-OwnIdentity {
-    $identity = Read-RuntimeIdentity
-    if (-not $identity -or
-        -not [IO.Path]::GetFullPath([string]$identity.repo_root).Equals($script:RepoRoot, [StringComparison]::OrdinalIgnoreCase) -or
-        -not [IO.Path]::GetFullPath([string]$identity.entry).Equals($script:Entry, [StringComparison]::OrdinalIgnoreCase) -or
-        -not [IO.Path]::GetFullPath([string]$identity.profile_dir).Equals($script:ProfileRoot, [StringComparison]::OrdinalIgnoreCase) -or
-        [string]$identity.alias -ne $script:RuntimeAlias -or [string]$identity.profile -ne $script:ProfileName) {
-        throw "Runtime alias/profile identity does not match this 41 checkout and entry; it was left untouched."
-    }
-}
-
-function Assert-LocalAliasOwnership {
-    $identity = Read-RuntimeIdentity
-    if ($identity) { Assert-OwnIdentity }
-    $status = Get-ClientStatus
-    if ($status -and -not $identity) {
-        throw "Local tunnel-client alias '$script:RuntimeAlias' already exists without this 41 checkout's identity marker; it was left untouched."
-    }
-    if (-not $identity) {
-        $listOutput = @(& $script:TunnelClient runtimes list --json 2>$null)
-        if ($LASTEXITCODE -ne 0) { throw "Could not verify the local tunnel-client alias registry; refusing to create or replace an alias." }
-        try { $list = ($listOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop }
-        catch { throw "Could not parse the local tunnel-client alias registry; refusing to create or replace an alias." }
-        if (Test-ClientListHasAlias $list) {
-            throw "Local tunnel-client alias '$script:RuntimeAlias' belongs to another profile; it was left untouched."
-        }
-    }
-}
+. (Join-Path $PSScriptRoot "runtime_ownership.ps1")
 
 function Write-Status($Status, [string]$State) {
     $runtimePid = $null
@@ -154,78 +121,83 @@ function Write-Status($Status, [string]$State) {
     $snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StatusPath -Encoding UTF8
 }
 
-function Stop-OwnRuntime {
-    Assert-OwnIdentity
-    $status = Get-ClientStatus
-    if (-not $status) {
-        $output = @(& $script:TunnelClient runtimes list --json 2>$null)
-        if ($LASTEXITCODE -ne 0) { throw "Could not verify whether the AoiTalk Plugin runtime is running; no runtime was stopped." }
-        try { $list = ($output -join "`n") | ConvertFrom-Json -ErrorAction Stop }
-        catch { throw "Could not parse the local tunnel-client alias registry; no runtime was stopped." }
-        if (Test-ClientListHasAlias $list) {
-            throw "The owned runtime alias exists but status is unavailable; no runtime was stopped."
+function Stop-AndVerifyOwnRuntime([ValidateRange(0, 300)][int]$TimeoutSeconds = 20) {
+    $null = Stop-OwnRuntime
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $status = Get-ClientStatus
+        if ($status) {
+            Assert-StatusOwnership $status -RequireTunnelId
+            if (Test-ObjectHasProperty $status "process_running") {
+                $running = Get-ObjectValue $status "process_running"
+                if ($null -ne $running -and -not [bool]$running) { return $true }
+            }
+        } else {
+            $listCapture = Invoke-NativeCapture -Executable $script:TunnelClient -ArgumentList @(
+                "runtimes", "list", "--json"
+            )
+            if ($listCapture.ExitCode -eq 0) {
+                try {
+                    $list = ($listCapture.StdOut -join "`n") | ConvertFrom-Json -ErrorAction Stop
+                    if (-not (Assert-ListedAliasOwnership $list)) { return $true }
+                } catch { }
+            }
         }
-        return $false
-    }
-    if ($status -and $status.process_running) {
-        & $script:TunnelClient runtimes stop $script:RuntimeAlias 1>> $script:TunnelLog 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Could not stop the verified AoiTalk Plugin runtime alias '$script:RuntimeAlias'." }
-        return $true
-    }
-    return $false
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "STOP_UNCONFIRMED: the verified runtime did not report stopped before timeout."
 }
 
-function Test-PortAvailable([string]$Address, [switch]$AllowOwnedRuntime) {
-    if ($Address -notmatch '^(127\.0\.0\.1|localhost):([0-9]{1,5})$') {
-        throw "AOITALK_PLUGIN_HEALTH_LISTEN_ADDR must be a loopback IPv4 address and fixed port, for example 127.0.0.1:8783."
+function Invoke-RequestedStop {
+    $request = Get-ControlStopRequest
+    if (-not $request) { return $false }
+    $script:ControlStopAttempted = $true
+    Set-ControlStopState $request "received"
+    try {
+        $stopped = Stop-AndVerifyOwnRuntime
+        Write-Status $null "stopped"
+        Set-ControlStopState $request "stopped"
+        return $true
+    } catch {
+        Write-Status $null "stop_unconfirmed"
+        Set-ControlStopState $request "stop_unconfirmed" ($_.Exception.Message -replace '[\r\n]+', ' ')
+        throw
     }
-    $port = [int]$Matches[2]
-    if ($port -lt 1 -or $port -gt 65535) { throw "The dedicated tunnel health port is outside 1..65535." }
-    if ($AllowOwnedRuntime) {
-        try {
-            Assert-OwnIdentity
-            $status = Get-ClientStatus
-            $ui = $null
-            if ($status -and $status.process_running -and $status.healthy -and $status.ready -and
-                [Uri]::TryCreate([string]$status.ui_url, [UriKind]::Absolute, [ref]$ui) -and
-                $ui.Port -eq $port -and $ui.Host -in @("127.0.0.1", "localhost")) {
-                return
-            }
-        } catch { }
-    }
-    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse("127.0.0.1"), $port)
-    try { $listener.Start() }
-    catch { throw "Dedicated tunnel health port $Address is already in use; change AOITALK_PLUGIN_HEALTH_LISTEN_ADDR and retry." }
-    finally { $listener.Stop() }
 }
 
 function Test-ClientVersion {
-    $result = @(& $script:TunnelClient --version 2>$null)
-    if ($LASTEXITCODE -ne 0 -or (($result -join " ") -notmatch ("(?<![0-9.])" + [regex]::Escape($script:ExpectedClientVersion) + "(?:\+|\s|$)"))) {
+    $capture = Invoke-NativeCapture -Executable $script:TunnelClient -ArgumentList @("--version")
+    if ($capture.ExitCode -ne 0 -or (($capture.StdOut -join " ") -notmatch ("(?<![0-9.])" + [regex]::Escape($script:ExpectedClientVersion) + "(?:\+|\s|$)"))) {
         throw "Expected official tunnel-client version $script:ExpectedClientVersion. Run tunnel-client --version and inspect the official release page."
     }
 }
 
 function Test-AoiTalkSettings {
     $oldEnvPath = [Environment]::GetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", "Process")
+    $oldPluginConfigPath = [Environment]::GetEnvironmentVariable("AOITALK_PLUGIN_CONFIG_FILE", "Process")
     $oldPluginRoot = [Environment]::GetEnvironmentVariable("AOITALK_PLUGIN_ROOT", "Process")
     $oldRepositoryRoot = [Environment]::GetEnvironmentVariable("AOITALK_REPOSITORY_ROOT", "Process")
-    $configuredPath = Get-Setting "HOME_MCP_AOITALK_ENV_FILE"
-    if ([string]::IsNullOrWhiteSpace($configuredPath)) { $configuredPath = $EnvFile }
-    if ([IO.Path]::IsPathRooted($configuredPath)) { $apiEnvPath = [IO.Path]::GetFullPath($configuredPath) }
-    else { $apiEnvPath = [IO.Path]::GetFullPath((Join-Path $PackageRoot $configuredPath)) }
-    [Environment]::SetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", $apiEnvPath, "Process")
+    $identityPath = Get-Setting "HOME_MCP_AOITALK_ENV_FILE"
+    if (-not [string]::IsNullOrWhiteSpace($identityPath)) {
+        if ([IO.Path]::IsPathRooted($identityPath)) { $identityPath = [IO.Path]::GetFullPath($identityPath) }
+        else { $identityPath = [IO.Path]::GetFullPath((Join-Path $PackageRoot $identityPath)) }
+        [Environment]::SetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", $identityPath, "Process")
+    }
+    [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_CONFIG_FILE", $EnvFile, "Process")
     [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_ROOT", $PackageRoot, "Process")
     [Environment]::SetEnvironmentVariable("AOITALK_REPOSITORY_ROOT", $RepoRoot, "Process")
     Push-Location $PackageRoot
     try {
-        & $Python -c "from aoitalk_plugin.aoitalk import load_settings; load_settings()" 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $capture = Invoke-NativeCapture -Executable $Python -ArgumentList @(
+            "-c", "from aoitalk_plugin.aoitalk import load_settings; load_settings()"
+        )
+        if ($capture.ExitCode -ne 0) {
             throw "AoiTalk API configuration is incomplete. Set the existing bootstrap admin username/password in the plugin .env or point HOME_MCP_AOITALK_ENV_FILE at the 41 .env."
         }
     } finally {
         Pop-Location
         [Environment]::SetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", $oldEnvPath, "Process")
+        [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_CONFIG_FILE", $oldPluginConfigPath, "Process")
         [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_ROOT", $oldPluginRoot, "Process")
         [Environment]::SetEnvironmentVariable("AOITALK_REPOSITORY_ROOT", $oldRepositoryRoot, "Process")
     }
@@ -239,12 +211,13 @@ try {
     $TunnelId = if ($script:Config.ContainsKey("HOME_MCP_AOITALK_TUNNEL_ID")) {
         [string]$script:Config["HOME_MCP_AOITALK_TUNNEL_ID"]
     } else { "" }
-    if (-not $Stop -and ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -match 'replace|placeholder|example' -or
-        $TunnelId -notmatch '^tunnel_[A-Za-z0-9_-]+$')) {
+    $script:TunnelId = $TunnelId
+    if ([string]::IsNullOrWhiteSpace($TunnelId) -or $TunnelId -match 'replace|placeholder|example' -or
+        $TunnelId -notmatch '^tunnel_[A-Za-z0-9_-]+$') {
         throw "Set HOME_MCP_AOITALK_TUNNEL_ID in the 41 plugin .env after a separate AoiTalk tunnel is issued; there is no home-tunnel fallback."
     }
     $homeId = [Environment]::GetEnvironmentVariable("CONTROL_PLANE_TUNNEL_ID", "Process")
-    if (-not $Stop -and $homeId -and $TunnelId -eq $homeId) { throw "The AoiTalk plugin tunnel ID must differ from the home CONTROL_PLANE_TUNNEL_ID." }
+    if ($homeId -and $TunnelId -eq $homeId) { throw "The AoiTalk plugin tunnel ID must differ from the home CONTROL_PLANE_TUNNEL_ID." }
 
     $RuntimeKey = if ($script:Config.ContainsKey($RuntimeKeyName)) {
         [string]$script:Config[$RuntimeKeyName]
@@ -303,7 +276,7 @@ try {
 
     $envNames = @(
         $RuntimeKeyName,"CONTROL_PLANE_API_KEY","OPENAI_ADMIN_KEY","OPENAI_ADMIN_API_KEY","OPENAI_API_KEY",
-        "CONTROL_PLANE_TUNNEL_ID","HOME_MCP_AOITALK_ENV_FILE","AOITALK_PLUGIN_ROOT","AOITALK_REPOSITORY_ROOT",
+        "CONTROL_PLANE_TUNNEL_ID","HOME_MCP_AOITALK_ENV_FILE","AOITALK_PLUGIN_CONFIG_FILE","AOITALK_PLUGIN_ROOT","AOITALK_REPOSITORY_ROOT",
         "HEALTH_LISTEN_ADDR","HEALTH_URL_FILE","PID_FILE",
         "LOG_FILE","XDG_CACHE_HOME","TUNNEL_CLIENT_PROFILE_DIR"
     )
@@ -313,27 +286,33 @@ try {
     foreach ($name in @("CONTROL_PLANE_API_KEY","OPENAI_ADMIN_KEY","OPENAI_ADMIN_API_KEY","OPENAI_API_KEY","CONTROL_PLANE_TUNNEL_ID")) {
         [Environment]::SetEnvironmentVariable($name, $null, "Process")
     }
-    if (-not $Stop) { [Environment]::SetEnvironmentVariable($RuntimeKeyName, $RuntimeKey, "Process") }
+    $runtimeKeyForProcess = if ($Stop) { $null } else { $RuntimeKey }
+    [Environment]::SetEnvironmentVariable($RuntimeKeyName, $runtimeKeyForProcess, "Process")
     $envFileSetting = Get-Setting "HOME_MCP_AOITALK_ENV_FILE"
     if ($envFileSetting) {
         if ([IO.Path]::IsPathRooted($envFileSetting)) { $appEnv = [IO.Path]::GetFullPath($envFileSetting) }
         else { $appEnv = [IO.Path]::GetFullPath((Join-Path $PackageRoot $envFileSetting)) }
         [Environment]::SetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", $appEnv, "Process")
-    } else {
-        [Environment]::SetEnvironmentVariable("HOME_MCP_AOITALK_ENV_FILE", $EnvFile, "Process")
     }
+    [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_CONFIG_FILE", $EnvFile, "Process")
     [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_ROOT", $PackageRoot, "Process")
     [Environment]::SetEnvironmentVariable("AOITALK_REPOSITORY_ROOT", $RepoRoot, "Process")
     [Environment]::SetEnvironmentVariable("HEALTH_LISTEN_ADDR", $HealthAddress, "Process")
     [Environment]::SetEnvironmentVariable("HEALTH_URL_FILE", (Join-Path $LogRoot "health-url.txt"), "Process")
     [Environment]::SetEnvironmentVariable("PID_FILE", (Join-Path $LogRoot "tunnel-client.pid"), "Process")
-    [Environment]::SetEnvironmentVariable("LOG_FILE", $TunnelLog, "Process")
+    [Environment]::SetEnvironmentVariable("LOG_FILE", $null, "Process")
     [Environment]::SetEnvironmentVariable("XDG_CACHE_HOME", $CacheRoot, "Process")
     [Environment]::SetEnvironmentVariable("TUNNEL_CLIENT_PROFILE_DIR", $ProfileRoot, "Process")
 
     $script:StateLock = $null
     try { $script:StateLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
     catch { throw "Another AoiTalk Plugin watcher owns $LockPath; it was left untouched." }
+    if ($Watch -and $ControlInternal) {
+        if ($InstanceNonce -notmatch '^[0-9a-f]{32}$' -or -not $script:ControlProcessStartUtc) {
+            throw "AoiTalk Plugin watcher instance identity is incomplete."
+        }
+        Set-ControlReceiptState "watching" $true
+    }
 
     if (-not $identity) {
         Assert-LocalAliasOwnership
@@ -342,6 +321,7 @@ try {
             entry = $Entry
             alias = $RuntimeAlias
             profile = $ProfileName
+            tunnel_id = $TunnelId
             profile_dir = $ProfileRoot
             task_name = $TaskName
         }
@@ -351,10 +331,9 @@ try {
     }
 
     if ($Stop) {
-        $wasRunning = Stop-OwnRuntime
-        Write-Status $null $(if ($wasRunning) { "stopped" } else { "not_running" })
-        if ($wasRunning) { Write-Output "Stopped only verified runtime alias '$RuntimeAlias'." }
-        else { Write-Output "No running runtime was present under verified alias '$RuntimeAlias'." }
+        $null = Stop-AndVerifyOwnRuntime
+        Write-Status $null "stopped"
+        Write-Output "STOPPED: verified runtime alias '$RuntimeAlias' is not running."
         return
     }
 
@@ -363,17 +342,17 @@ try {
     # restart, so startup health does not trigger an immediate reconnect loop.
     $failures = 0
     while ($true) {
+        if ($Watch -and (Invoke-RequestedStop)) { return }
         $status = $null
         try {
             $status = Get-ClientStatus
+            if ($status) { Assert-StatusOwnership $status -RequireTunnelId }
             if (-not ($status -and $status.process_running)) {
+                if ($Watch -and (Invoke-RequestedStop)) { return }
                 Test-PortAvailable $HealthAddress
-                $pythonArg = '"' + $Python.Replace('\','/') + '" -m aoitalk_plugin.stdio'
-                & $script:TunnelClient runtimes connect --alias $RuntimeAlias --tunnel-id $TunnelId --profile $ProfileName `
-                    --profile-dir ($ProfileRoot.Replace('\','/')) --runtime-api-key ("env:" + $RuntimeKeyName) `
-                    --mcp-command $pythonArg 1>> $TunnelLog 2>&1
-                if ($LASTEXITCODE -ne 0) { throw "tunnel-client runtimes connect failed with exit code $LASTEXITCODE." }
+                Connect-OwnRuntime $TunnelId $RuntimeKeyName $Python $ProfileRoot $TunnelLog
                 $status = Get-ClientStatus
+                if ($status) { Assert-StatusOwnership $status -RequireTunnelId }
             }
 
             if ($status -and $status.process_running -and $status.healthy -and $status.ready) {
@@ -383,31 +362,50 @@ try {
                     Write-Output "AoiTalk Plugin tunnel runtime is healthy and ready (alias '$RuntimeAlias')."
                     return
                 }
-                Start-Sleep -Seconds $PollSeconds
+                if (Wait-ControlInterval $PollSeconds) { continue }
                 continue
             }
             $state = if ($status -and $status.process_running) { "starting" } else { "retrying" }
             Write-Status $status $state
-            if (-not $Watch) { throw "Tunnel runtime is not ready. Inspect logs\aoitalk_plugin\status.json and tunnel-client.log." }
+            if (-not $Watch) { throw "Tunnel runtime is not ready. Inspect logs\aoitalk_plugin\status.json and the displayed launcher error." }
             $failures++
             if ($status -and $status.process_running -and $failures -ge 3) { Stop-OwnRuntime }
             Write-SafeLog "Runtime is not ready; the dedicated alias will be checked again."
-            Start-Sleep -Seconds $PollSeconds
+            if (Wait-ControlInterval $PollSeconds) { continue }
         } catch {
+            if ($_.Exception.Message -like "AoiTalk runtime ownership mismatch:*") { throw }
             if (-not $Watch) { throw }
+            if (Get-ControlStopRequest) { throw }
             Write-SafeLog "Runtime check/connect failed; retrying after the configured interval."
             try {
                 $status = Get-ClientStatus
+                if ($status) { Assert-StatusOwnership $status -RequireTunnelId }
                 if ($status -and $status.process_running) {
                     $failures++
                     if ($failures -ge 3) { Stop-OwnRuntime }
                 }
-            } catch { }
+            } catch {
+                if ($_.Exception.Message -like "AoiTalk runtime ownership mismatch:*") { throw }
+            }
             Write-Status $status "retrying"
-            Start-Sleep -Seconds $PollSeconds
+            if (Wait-ControlInterval $PollSeconds) { continue }
         }
     }
 } finally {
+    if ($Watch -and $script:StateLock -and $InstanceNonce -and -not $script:ControlStopAttempted) {
+        $request = Get-ControlStopRequest
+        if ($request) {
+            try { Invoke-RequestedStop | Out-Null } catch { }
+        } else {
+            $script:ControlStopAttempted = $true
+            try {
+                if (Stop-AndVerifyOwnRuntime) { Write-Status $null "stopped_on_watcher_exit" }
+            } catch {
+                try { Write-Status $null "stop_unconfirmed" } catch { }
+            }
+        }
+        try { Set-ControlReceiptState "exited" $false } catch { }
+    }
     if ($script:StateLock) { $script:StateLock.Dispose() }
     foreach ($name in $SavedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $SavedEnvironment[$name], "Process")

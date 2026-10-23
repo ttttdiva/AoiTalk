@@ -31,8 +31,25 @@ function Test-OwnTask($Task) {
     try { $sameWorkingDirectory = [IO.Path]::GetFullPath([string]$action.WorkingDirectory).Equals($RepoRoot, [StringComparison]::OrdinalIgnoreCase) }
     catch { $sameWorkingDirectory = $false }
     $args = [string]$action.Arguments
-    $sameEntry = $args.IndexOf($Launcher, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-                 $args -match '(?i)(?:^|\s)-Watch(?:\s|$)'
+    $argumentValues = @([regex]::Matches($args, '"(?:[^"]|"")*"|\S+') | ForEach-Object {
+        $value = $_.Value
+        if ($value.Length -ge 2 -and $value.StartsWith('"') -and $value.EndsWith('"')) {
+            $value = $value.Substring(1, $value.Length - 2).Replace('""', '"')
+        }
+        $value
+    })
+    $fileValue = ""
+    for ($index = 0; $index -lt $argumentValues.Count; $index++) {
+        if ([string]$argumentValues[$index] -iin @("-Command", "-CommandWithArgs", "-EncodedCommand")) { break }
+        if ([string]$argumentValues[$index] -ieq "-File" -and $index + 1 -lt $argumentValues.Count) {
+            $fileValue = [string]$argumentValues[$index + 1]
+            break
+        }
+    }
+    $sameEntry = $false
+    try { $sameEntry = [IO.Path]::GetFullPath($fileValue).Equals($Launcher, [StringComparison]::OrdinalIgnoreCase) }
+    catch { $sameEntry = $false }
+    $sameEntry = $sameEntry -and ($argumentValues -icontains "-Watch")
     return $sameExecutable -and $sameWorkingDirectory -and $sameEntry
 }
 

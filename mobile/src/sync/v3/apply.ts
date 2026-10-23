@@ -636,6 +636,8 @@ export function applySyncV3BootstrapInWriter(
   return result;
 }
 
+export const SYNC_V3_SWEEP_BATCH_SIZE = 100;
+
 /**
  * Remove the membership of one scope (all generations, or only those below
  * `belowGeneration`) and evict every entity left with no membership.
@@ -646,7 +648,7 @@ export function dropSyncV3ScopeMembershipInWriter(
   context: SyncV3ApplyContext,
   scopeKey: string,
   belowGeneration: number | null,
-): SyncV3ApplyResult {
+): SyncV3ApplyResult & { remaining: boolean } {
   assertActiveWriter(w);
   const authScope = context.prep.authScope;
   const condition = and(
@@ -658,14 +660,19 @@ export function dropSyncV3ScopeMembershipInWriter(
     .select({ table: schema.syncV3Membership.tableName, entityId: schema.syncV3Membership.entityId })
     .from(schema.syncV3Membership)
     .where(condition)
+    .limit(SYNC_V3_SWEEP_BATCH_SIZE)
     .all() as Array<{ table: SyncV3Table; entityId: string }>;
-  if (!dropped.length) return { reschedule: false, tables: new Set() };
-  tx.delete(schema.syncV3Membership).where(condition).run();
+  if (!dropped.length) return { reschedule: false, tables: new Set(), remaining: false };
   for (const item of dropped) {
+    tx.delete(schema.syncV3Membership).where(and(condition,
+      eq(schema.syncV3Membership.tableName, item.table),
+      eq(schema.syncV3Membership.entityId, item.entityId),
+    )).run();
     removeDocsMembershipInWriter(w, tx, authScope, item.table, item.entityId, scopeKey);
   }
   const orphans = orphanedInWriter(tx, authScope, dropped);
-  return evictSyncV3EntitiesInWriter(w, tx, context.prep, orphans);
+  return { ...evictSyncV3EntitiesInWriter(w, tx, context.prep, orphans),
+    remaining: dropped.length === SYNC_V3_SWEEP_BATCH_SIZE };
 }
 
 function orphanedInWriter(

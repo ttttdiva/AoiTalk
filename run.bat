@@ -35,6 +35,9 @@ if exist ".env" (
 )
 set AOITALK_WEB_AUTO_OPEN=false
 echo AoiTalkを起動しています。
+call "%~dp0run_plugin.bat"
+set "AOITALK_PLUGIN_LAUNCH_EXIT=%ERRORLEVEL%"
+if not "%AOITALK_PLUGIN_LAUNCH_EXIT%"=="0" if not "%AOITALK_PLUGIN_LAUNCH_EXIT%"=="2" echo [警告] AoiTalk Pluginの起動に失敗しました（終了コード %AOITALK_PLUGIN_LAUNCH_EXIT%）。AoiTalk本体は続けて起動します。
 
 :start
 if not exist ".local" mkdir ".local" >nul 2>&1

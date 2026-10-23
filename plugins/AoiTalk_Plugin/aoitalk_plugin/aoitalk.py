@@ -136,13 +136,20 @@ def _env_file(
 
 def load_settings() -> Settings:
     # dotenv_values neither mutates os.environ nor expands ${...} in passwords.
-    # The plugin's own .env is the complete default configuration. If an
-    # operator explicitly points at AoiTalk's main .env, only the existing
-    # bootstrap identity is read from that file.
-    gateway = _env_file(GATEWAY_ROOT / ".env")
+    # AOITALK_PLUGIN_CONFIG_FILE selects the complete plugin configuration;
+    # without it, the plugin-local .env is used. HOME_MCP_AOITALK_ENV_FILE is
+    # only a source for the existing bootstrap identity below.
+    config_path_value = os.environ.get("AOITALK_PLUGIN_CONFIG_FILE", "").strip()
+    if config_path_value:
+        config_path = Path(config_path_value).expanduser()
+        if not config_path.is_absolute():
+            config_path = GATEWAY_ROOT / config_path
+        plugin_config = _env_file(config_path, required=True)
+    else:
+        plugin_config = _env_file(GATEWAY_ROOT / ".env")
 
     def option(name: str, default: str = "") -> str:
-        return os.environ.get(name, gateway.get(name, default))
+        return os.environ.get(name, plugin_config.get(name, default))
 
     path_value = option("HOME_MCP_AOITALK_ENV_FILE").strip()
     app: dict[str, str] = {}
@@ -154,11 +161,25 @@ def load_settings() -> Settings:
             path,
             allowed_keys={"AOITALK_BOOTSTRAP_ADMIN_USERNAME", "AOITALK_BOOTSTRAP_ADMIN_PASSWORD"},
         )
-    username = option("AOITALK_BOOTSTRAP_ADMIN_USERNAME", app.get("AOITALK_BOOTSTRAP_ADMIN_USERNAME", ""))
-    password = option("AOITALK_BOOTSTRAP_ADMIN_PASSWORD", app.get("AOITALK_BOOTSTRAP_ADMIN_PASSWORD", ""))
+    explicit_username = option("AOITALK_BOOTSTRAP_ADMIN_USERNAME")
+    explicit_password = option("AOITALK_BOOTSTRAP_ADMIN_PASSWORD")
+    # Blank values in the distributed example are placeholders. Let the
+    # explicit identity reference supply either field independently, while
+    # preserving every non-empty plugin/environment value as the override.
+    username = explicit_username if explicit_username else app.get(
+        "AOITALK_BOOTSTRAP_ADMIN_USERNAME", ""
+    )
+    password = explicit_password if explicit_password else app.get(
+        "AOITALK_BOOTSTRAP_ADMIN_PASSWORD", ""
+    )
     if not username.strip() or not password:
         raise ClipError("configuration_error")
-    raw_url = option("HOME_MCP_AOITALK_URL", "http://127.0.0.1:3000").strip().rstrip("/")
+    raw_url = os.environ.get("HOME_MCP_AOITALK_URL", "").strip()
+    if not raw_url:
+        raw_url = plugin_config.get("HOME_MCP_AOITALK_URL", "").strip()
+    if not raw_url:
+        raw_url = "http://127.0.0.1:3000"
+    raw_url = raw_url.rstrip("/")
     try:
         url = httpx.URL(raw_url)
         loopback = url.host == "localhost"

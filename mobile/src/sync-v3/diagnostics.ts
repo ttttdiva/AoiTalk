@@ -1,4 +1,4 @@
-import { and, eq, like } from "drizzle-orm";
+import { and, eq, like, sql, countDistinct, notExists } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { getSyncV3WriteUnitStats } from "../db/sqlite-write-coordinator";
 import { readSyncV3State } from "../sync/v3/state";
@@ -33,43 +33,41 @@ function emptyState(): SyncV3State {
 
 export async function getSyncV3Diagnostics(authScope: string): Promise<SyncV3DiagnosticsSnapshot> {
   const db = getDb();
-  const [state, outbox, durableConflicts, outboxConflicts, legacy, members, safety, recentRequests] = await Promise.all([
+  const [state, queueCounts, durableConflicts, outboxConflicts, legacy, members, safety, recentRequests] = await Promise.all([
     readSyncV3State(authScope),
-    db.select().from(schema.outbox).where(eq(schema.outbox.authScope, authScope)),
-    db.select({ id: schema.syncV3Conflicts.id, sourceOpId: schema.syncV3Conflicts.sourceOpId,
-      tableName: schema.syncV3Conflicts.tableName, entityId: schema.syncV3Conflicts.entityId })
+    db.select({
+      queued: sql<number>`coalesce(sum(case when ${schema.outbox.v3OpId} is null and ${schema.outbox.blockedReason} is null and coalesce(${schema.outbox.retryCount}, 0) < 5 then 1 else 0 end), 0)`,
+      backoff: sql<number>`coalesce(sum(case when ${schema.outbox.v3OpId} is null and (${schema.outbox.blockedReason} is not null or ${schema.outbox.retryCount} >= 5) then 1 else 0 end), 0)`,
+      sent: sql<number>`coalesce(sum(case when ${schema.outbox.v3OpId} is not null then 1 else 0 end), 0)`,
+    }).from(schema.outbox).where(eq(schema.outbox.authScope, authScope)),
+    db.select({ value: countDistinct(sql`coalesce(${schema.syncV3Conflicts.sourceOpId}, 'durable:' || ${schema.syncV3Conflicts.id})`) })
       .from(schema.syncV3Conflicts).where(and(
-      eq(schema.syncV3Conflicts.authScope, authScope), eq(schema.syncV3Conflicts.state, "open"),
-    )),
-    db.select({ opId: schema.outbox.opId, tableName: schema.outbox.tableName, entityId: schema.outbox.entityId })
-      .from(schema.outbox).where(and(
+        eq(schema.syncV3Conflicts.authScope, authScope), eq(schema.syncV3Conflicts.state, "open"),
+      )),
+    db.select({ value: sql<number>`count(*)` }).from(schema.outbox).where(and(
       eq(schema.outbox.authScope, authScope), like(schema.outbox.lastError, "conflict:%"),
+      notExists(db.select({ one: sql`1` }).from(schema.syncV3Conflicts).where(and(
+        eq(schema.syncV3Conflicts.authScope, authScope), eq(schema.syncV3Conflicts.state, "open"),
+        eq(schema.syncV3Conflicts.sourceOpId, schema.outbox.opId),
+      ))),
     )),
     getLegacyMigrationStatus(),
-    db.select({ table: schema.syncV3Membership.tableName, entityId: schema.syncV3Membership.entityId })
-      .from(schema.syncV3Membership).where(eq(schema.syncV3Membership.authScope, authScope)),
+    db.select({ table: schema.syncV3Membership.tableName, value: countDistinct(schema.syncV3Membership.entityId) })
+      .from(schema.syncV3Membership).where(eq(schema.syncV3Membership.authScope, authScope))
+      .groupBy(schema.syncV3Membership.tableName),
     checkSyncV3CacheSafety(authScope),
     recentSyncV3Requests(authScope),
   ]);
   const saved = state ?? emptyState();
-  const queue = { queued: 0, backoff: 0, sent: 0 };
-  for (const item of outbox) {
-    if (item.v3OpId) queue.sent += 1;
-    else if (item.blockedReason || item.retryCount >= 5) queue.backoff += 1;
-    else queue.queued += 1;
-  }
-  const entityCounts: Record<string, number> = {};
-  const memberEntities = new Set(members.map((item) => `${item.table}:${item.entityId}`));
-  for (const item of memberEntities) {
-    const table = item.slice(0, item.indexOf(":"));
-    entityCounts[table] = (entityCounts[table] ?? 0) + 1;
-  }
-  const conflictIdentities = new Set<string>();
-  for (const item of durableConflicts) conflictIdentities.add(item.sourceOpId ?? `durable:${item.id}`);
-  for (const item of outboxConflicts) {
-    const durable = durableConflicts.some((conflict) => conflict.sourceOpId === item.opId);
-    if (!durable) conflictIdentities.add(`outbox:${item.opId}`);
-  }
+  const queue = {
+    queued: Number(queueCounts[0]?.queued ?? 0),
+    backoff: Number(queueCounts[0]?.backoff ?? 0),
+    sent: Number(queueCounts[0]?.sent ?? 0),
+  };
+  const entityCounts: Record<string, number> = Object.fromEntries(
+    members.map((item) => [item.table, Number(item.value)]),
+  );
+  const openConflicts = Number(durableConflicts[0]?.value ?? 0) + Number(outboxConflicts[0]?.value ?? 0);
   const scopes = Object.entries(saved.scopes).sort(([a], [b]) => a.localeCompare(b)).map(([scopeKey, value]) => ({
     scopeKey,
     kind: value.kind ?? null,
@@ -96,7 +94,7 @@ export async function getSyncV3Diagnostics(authScope: string): Promise<SyncV3Dia
     lastSuccessAt: saved.lastSuccessAt ?? null,
     entityCounts,
     queue,
-    openConflicts: conflictIdentities.size,
+    openConflicts,
     legacy,
     sweepError: safety.safe ? null : safety.reason,
     unclassifiedRecords: safety.unclassifiedRecords,

@@ -762,7 +762,7 @@ export type AgentExecutionProfileCatalogRequest =
 
 export type CliSessionRoleContextMode = "raw" | "agent_role";
 
-export type CliSessionCreateRequest = Schemas["CLIDevelopmentSessionCreateRequest"] & {
+type CliSessionCreateBase = Schemas["CLIDevelopmentSessionCreateRequest"] & {
   /** Exact catalog revision assertion; older callers may omit it. */
   agent_revision_id?: string;
   /** Preserve the exact Project authority used by revision-path catalog admission. */
@@ -770,9 +770,17 @@ export type CliSessionCreateRequest = Schemas["CLIDevelopmentSessionCreateReques
   /** The managed local CLI launcher always supplies these validated route fields. */
   model: string;
   working_directory: string;
-  /** Omit for legacy/raw CLI behavior. */
-  role_context_mode?: CliSessionRoleContextMode;
 };
+export type CliSessionCreateRequest =
+  | (CliSessionCreateBase & {
+      /** The server resolves and pins an omitted revision at admission. */
+      agent_revision_id?: string;
+      role_context_mode: "agent_role";
+    })
+  | (CliSessionCreateBase & {
+      /** Omit for legacy/raw CLI behavior. */
+      role_context_mode?: "raw";
+    });
 
 export type CliSessionResponse = Schemas["CLIDevelopmentSessionResponse"];
 

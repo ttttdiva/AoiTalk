@@ -619,10 +619,23 @@ class Config:
                 )
             else:
                 self.set(key, value)
-            logger.info("Config saved: %s = %s", key, redact_secret_value(key, value))
+            log_value = (
+                "[REDACTED]"
+                if key == "remote_targets.muse"
+                or key.startswith("remote_targets.muse.")
+                else redact_secret_value(key, value)
+            )
+            logger.info("Config saved: %s = %s", key, log_value)
             return True
         except Exception as e:
-            logger.error(f"Failed to save config: {e}")
+            if key == "remote_targets.muse" or key.startswith("remote_targets.muse."):
+                logger.error(
+                    "Failed to save config: key=%s exception_type=%s",
+                    key,
+                    type(e).__name__,
+                )
+            else:
+                logger.error(f"Failed to save config: {e}")
             return False
         
         

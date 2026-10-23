@@ -45,7 +45,7 @@ def public_session_context(value: Any) -> Any:
     return {
         key: value_item
         for key, value_item in value.items()
-        if key != "cli_native_sessions"
+        if key not in {"cli_native_sessions", "muse_remote"}
     }
 
 

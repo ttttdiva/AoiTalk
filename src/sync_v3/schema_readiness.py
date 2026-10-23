@@ -22,7 +22,8 @@ from . import contract, receipts, schema_sql
 
 # The optional schema has its own Alembic tree and version table.  Keeping these
 # names here makes the CLI, migration, and runtime readiness check one contract.
-SYNC_V3_MIGRATION_REVISION = "20261023_0002"
+SYNC_V3_MIGRATION_REVISION = "20261023_0002"  # frozen identity imported by revision 0002
+SYNC_V3_LATEST_REVISION = "20261023_0003"
 SYNC_V3_VERSION_TABLE = "sync_v3_alembic_version"
 
 _FALSE_FLAGS = {"", "0", "false", "no", "off"}
@@ -122,25 +123,22 @@ def _function_signatures() -> frozenset[str]:
     return frozenset(names)
 
 
-def _trigger_targets() -> dict[str, str]:
-    targets = {
-        name: table for table, name in schema_sql._trigger_pairs()
-    }
-    targets["zz_sync_commit_order"] = "sync_change_log"
-    return targets
+def _trigger_targets() -> frozenset[tuple[str, str]]:
+    # Trigger names are table-local (task child triggers deliberately share names).
+    return frozenset((*schema_sql._trigger_pairs(), ("sync_change_log", "zz_sync_commit_order")))
 
 
-def _trigger_functions() -> dict[str, str]:
-    functions: dict[str, str] = {
-        f"sync_v3_log_{table}_{suffix}": f"sync_v3_log_{table}"
+def _trigger_functions() -> dict[tuple[str, str], str]:
+    functions: dict[tuple[str, str], str] = {
+        (table, f"sync_v3_log_{table}_{suffix}"): f"sync_v3_log_{table}"
         for table in schema_sql._ROW_TRIGGER_TABLES
         for suffix in ("ins", "upd", "del")
     }
     suffixes = {"INSERT": "ins", "UPDATE": "upd", "DELETE": "del"}
     for table, name, function, events in schema_sql._DEPENDENCY_TRIGGERS:
         for event in events:
-            functions[f"{name}_{suffixes[event]}"] = function
-    functions["zz_sync_commit_order"] = "sync_assign_commit_seq"
+            functions[(table, f"{name}_{suffixes[event]}")] = function
+    functions[("sync_change_log", "zz_sync_commit_order")] = "sync_assign_commit_seq"
     return functions
 
 
@@ -156,6 +154,8 @@ _SOURCE_TABLES = frozenset(
 @dataclass(frozen=True)
 class _TriggerRow:
     table: str
+    function: str
+    function_in_schema: bool
     definition: str
     enabled: str
     timing: str
@@ -305,7 +305,7 @@ def read_sync_v3_flag_explicit_false(connection: Connection) -> bool:
 def _relation(connection: Connection, name: str) -> str | None:
     return connection.execute(
         text(
-            "SELECT c.relkind FROM pg_class c "
+            "SELECT c.relkind::text FROM pg_class c "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = current_schema() AND c.relname = :name"
         ),
@@ -344,7 +344,7 @@ def _catalog_snapshot(
     literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
     rows = connection.execute(
         text(
-            "SELECT c.relname, c.relkind, a.attname, "
+            "SELECT c.relname, c.relkind::text, a.attname, "
             "format_type(a.atttypid, a.atttypmod), a.attnotnull "
             "FROM pg_class c "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -430,24 +430,29 @@ def _function_rows(connection: Connection) -> set[str]:
     return result
 
 
-def _trigger_rows(connection: Connection) -> dict[str, _TriggerRow]:
+def _trigger_rows(connection: Connection) -> dict[tuple[str, str], _TriggerRow]:
     rows = connection.execute(
         text(
-            "SELECT t.tgname, c.relname, t.tgenabled, t.tgtype, "
+            "SELECT t.tgname, c.relname, t.tgenabled::text, t.tgtype, "
             "(t.tgconstraint <> 0), COALESCE(con.condeferrable, false), "
-            "COALESCE(con.condeferred, false), pg_get_triggerdef(t.oid) "
+            "COALESCE(con.condeferred, false), pg_get_triggerdef(t.oid), "
+            "p.proname, (pn.nspname = current_schema()) "
             "FROM pg_trigger t "
+            "JOIN pg_proc p ON p.oid = t.tgfoid "
+            "JOIN pg_namespace pn ON pn.oid = p.pronamespace "
             "JOIN pg_class c ON c.oid = t.tgrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "LEFT JOIN pg_constraint con ON con.oid = t.tgconstraint "
             "WHERE n.nspname = current_schema() AND NOT t.tgisinternal"
         )
     ).all()
-    result: dict[str, _TriggerRow] = {}
+    result: dict[tuple[str, str], _TriggerRow] = {}
     for row in rows:
         tgtype = int(row[3])
-        result[str(row[0])] = _TriggerRow(
+        result[(str(row[1]), str(row[0]))] = _TriggerRow(
             table=str(row[1]),
+            function=str(row[8]),
+            function_in_schema=bool(row[9]),
             definition=str(row[7]),
             enabled=str(row[2]),
             timing=_trigger_timing(tgtype),
@@ -476,8 +481,11 @@ def inspect_connection(
     *,
     check_key: bool = False,
     require_revision: bool = False,
+    include_docs_visibility: bool = False,
 ) -> SchemaReadiness:
-    """Inspect a PostgreSQL connection without changing it."""
+    """Inspect without writes. Revision 0002 uses the frozen base inventory;
+    runtime and the CLI additionally require the revision 0003 inventory.
+    """
 
     missing: set[str] = set()
     wrong: set[str] = set()
@@ -532,9 +540,19 @@ def inspect_connection(
         if signature not in functions:
             missing.add(f"function:{signature}")
 
+    trigger_functions = dict(_REQUIRED_TRIGGER_FUNCTIONS)
+    if include_docs_visibility:
+        from .docs_visibility_sql import DOCS_VISIBILITY_TRIGGERS
+        for signature in ("sync_v3_emit_docs_visibility(uuid)", "sync_v3_dep_docs_visibility()", "sync_v3_dep_docs_share()"):
+            if signature not in functions:
+                missing.add(f"function:{signature}")
+        suffixes = {"INSERT": "ins", "UPDATE": "upd", "DELETE": "del"}
+        for table, name, events in DOCS_VISIBILITY_TRIGGERS:
+            for event in events:
+                trigger_functions[(table, f"{name}_{suffixes[event]}")] = name
     triggers = _trigger_rows(connection)
-    for name, table in _REQUIRED_TRIGGERS.items():
-        row = triggers.get(name)
+    for (table, name), expected_function in trigger_functions.items():
+        row = triggers.get((table, name))
         if row is None:
             missing.add(f"trigger:{table}.{name}")
             continue
@@ -546,7 +564,6 @@ def inspect_connection(
             expected_deferrable,
             expected_deferred,
         ) = _expected_trigger_shape(name)
-        expected_function = _REQUIRED_TRIGGER_FUNCTIONS[name]
         if (
             row.table != table
             or row.enabled != "O"
@@ -556,10 +573,8 @@ def inspect_connection(
             or row.is_constraint != expected_constraint
             or row.deferrable != expected_deferrable
             or row.initially_deferred != expected_deferred
-            or not re.search(
-                rf"execute function (?:[a-z_][a-z0-9_]*\.)?{re.escape(expected_function)}\s*\(",
-                row.definition.lower(),
-            )
+            or row.function != expected_function
+            or not row.function_in_schema
         ):
             wrong.add(f"trigger:{table}.{name}")
 
@@ -617,7 +632,7 @@ async def inspect_readiness(
             )
     return await session.run_sync(
         lambda connection: inspect_connection(
-            connection, check_key=False, require_revision=require_revision
+            connection, check_key=False, require_revision=require_revision, include_docs_visibility=True
         )
     ) if not check_key else await _inspect_with_key(session, require_revision=require_revision)
 
@@ -625,7 +640,7 @@ async def inspect_readiness(
 async def _inspect_with_key(session: AsyncSession, *, require_revision: bool) -> SchemaReadiness:
     report = await session.run_sync(
         lambda connection: inspect_connection(
-            connection, check_key=False, require_revision=require_revision
+            connection, check_key=False, require_revision=require_revision, include_docs_visibility=True
         )
     )
     try:
