@@ -8,6 +8,7 @@ import {
   type AgentRunEvent,
   type AgentRunTimelineItem,
 } from "@/lib/chat-api";
+import { withBasePath } from "@/lib/base-path";
 import {
   Sheet,
   SheetContent,
@@ -296,7 +297,7 @@ function RunView({
         <div className="flex flex-wrap gap-2 text-[11px]">
           {run.agent_id && (
             <a
-              href={`/operations?tab=agents&agent=${encodeURIComponent(run.agent_id)}&panel=activity`}
+              href={withBasePath(`/operations?tab=agents&agent=${encodeURIComponent(run.agent_id)}&panel=activity`)}
               className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-1 text-primary underline-offset-2 hover:underline"
             >
               <ExternalLink className="size-3" />
@@ -305,7 +306,7 @@ function RunView({
           )}
           {run.work_item_id && (
             <a
-              href={`/operations?tab=work&work_id=${encodeURIComponent(run.work_item_id)}`}
+              href={withBasePath(`/operations?tab=work&work_id=${encodeURIComponent(run.work_item_id)}`)}
               className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-1 text-primary underline-offset-2 hover:underline"
             >
               <ExternalLink className="size-3" />

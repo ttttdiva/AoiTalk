@@ -283,6 +283,7 @@ class WebChatServer(
         self._mage_vl_preload_factory: Any = None
         self._mage_vl_preload_task: asyncio.Task[Any] | None = None
         self._register_mage_vl_lifecycle()
+        self._register_gpu_admission_lifecycle()
         self._register_docs_index_lifecycle()
         self._register_media_index_lifecycle()
         self._register_files_index_lifecycle()
@@ -1074,6 +1075,47 @@ class WebChatServer(
         self._mage_vl_preload_factory = _preload_mage_vl
         self._register_lifecycle_pair(_preload_mage_vl, _shutdown_mage_vl)
 
+    def _build_gpu_lease_backend(self) -> Any:
+        """The real trial backend (psutil, nvidia-smi and shared-broker ports), or None.
+
+        Opt-in by ``AOITALK_GPU_TRIAL_PROFILE`` (see ``gpu_admission_factory``). None keeps
+        cooperative admission a pass-through watchdog: no lease can be granted, so indexing is
+        never paused, and ``_gpu_admission_unavailable_reason`` says why (never "ready").
+        Installing a backend starts the coordinator in RECOVERY until surviving trial
+        processes are reconciled.
+        """
+        from ..services.gpu_admission_factory import build_gpu_trial_runtime
+
+        runtime, reason = build_gpu_trial_runtime(self.config)
+        self._gpu_trial_runtime = runtime
+        self._gpu_admission_unavailable_reason = reason
+        return runtime.backend if runtime is not None else None
+
+    def _register_gpu_admission_lifecycle(self) -> None:
+        """Own the GPU admission watchdog; registered before any ticket holder starts."""
+        from ..services.gpu_admission import configure_gpu_admission
+        from ..services.gpu_admission_driver import GpuAdmissionDriver
+
+        backend = self._build_gpu_lease_backend()
+        coordinator = configure_gpu_admission(recovering=backend is not None)
+        driver = self._gpu_admission_driver = GpuAdmissionDriver(coordinator, backend)
+        runtime = getattr(self, "_gpu_trial_runtime", None)
+        if runtime is None:
+            self._gpu_trial_launcher = None
+            self._register_lifecycle_pair(driver.start, driver.stop)
+            return
+        launcher = self._gpu_trial_launcher = runtime.launcher(driver)
+
+        async def _stop_gpu_admission() -> None:
+            # Producers first (they only request cancels), then the watchdog, and the state store
+            # last: it must still be there to persist whatever the stopping calls recorded, and its
+            # shutdown waits for every write already queued.
+            await launcher.aclose()
+            await driver.stop()
+            await runtime.backend.aclose()
+
+        self._register_lifecycle_pair(driver.start, _stop_gpu_admission)
+
     def _register_docs_index_lifecycle(self) -> None:
         """Pair the durable Docs index worker with this server lifespan."""
         from ..services.docs_index_worker import DocsIndexWorker
@@ -1805,6 +1847,9 @@ class WebChatServer(
         from .routes.embedding_runtime_routes import register_embedding_runtime_routes
 
         register_embedding_runtime_routes(self.app, self)
+        from .routes.gpu_admission_routes import register_gpu_admission_routes
+
+        register_gpu_admission_routes(self.app, self)
         register_config_routes(self.app, self)
         from .routes.pc_bridge_routes import register_pc_bridge_routes
         register_pc_bridge_routes(self.app, self)
@@ -1938,6 +1983,7 @@ class WebChatServer(
             is_admin_user=self._is_admin_user,
             get_coordinator=lambda: self._agent_work_coordinator,
             get_user_from_request=self._get_user_info_from_request,
+            get_generation_status=self.get_conversation_generation_status,
         )
         self.app.include_router(router)
         logger.info("Common AgentWork routes registered")

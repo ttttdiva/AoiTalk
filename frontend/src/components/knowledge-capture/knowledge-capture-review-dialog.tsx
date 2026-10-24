@@ -21,6 +21,7 @@ import {
   type KnowledgeCaptureReviewExchange,
   type KnowledgeCaptureReviewResponse,
 } from "@/lib/knowledge-capture";
+import { withBasePath } from "@/lib/base-path";
 
 type Props = {
   open: boolean;
@@ -418,7 +419,7 @@ function KnowledgeCaptureReviewSession({
                 <p className="text-xs text-muted-foreground">元のTask</p>
                 {currentCandidate.seedTask && isUuid(currentCandidate.seedTask.id) ? (
                   <a
-                    href={taskHref(currentCandidate.seedTask.id)}
+                    href={withBasePath(taskHref(currentCandidate.seedTask.id))}
                     target="_blank"
                     rel="noreferrer"
                     className="break-words font-medium underline"
@@ -441,7 +442,7 @@ function KnowledgeCaptureReviewSession({
                     {context.chatSessions.map((session) => (
                       <a
                         key={session.id}
-                        href={chatHref(session.id)}
+                        href={withBasePath(chatHref(session.id))}
                         target="_blank"
                         rel="noreferrer"
                         className="block break-words underline"
@@ -459,7 +460,7 @@ function KnowledgeCaptureReviewSession({
                 {context?.publicationTarget?.action === "update" &&
                 context.publicationTarget.nodeId ? (
                   <a
-                    href={docsHref(context.publicationTarget.nodeId)}
+                    href={withBasePath(docsHref(context.publicationTarget.nodeId))}
                     target="_blank"
                     rel="noreferrer"
                     className="break-words underline"

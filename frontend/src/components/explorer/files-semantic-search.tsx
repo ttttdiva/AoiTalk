@@ -45,6 +45,7 @@ import {
   type FilesSemanticResult,
   type FilesSemanticScope,
 } from "@/lib/explorer/files-semantic-search";
+import { withBasePath } from "@/lib/base-path";
 import { cn } from "@/lib/utils";
 
 const KIND_ICONS: Record<FilesFileKind, typeof FileIcon> = {
@@ -289,7 +290,7 @@ function SemanticResultItem({
           </Button>
           {result.best.originalUrl && (
             <a
-              href={result.best.originalUrl}
+              href={withBasePath(result.best.originalUrl)}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex h-6 items-center gap-1 rounded px-2 text-xs text-muted-foreground underline-offset-2 hover:bg-muted hover:text-foreground hover:underline"
@@ -318,7 +319,7 @@ function SemanticResultItem({
                   <ScoreBadge score={position.score} />
                   {position.originalUrl && (
                     <a
-                      href={position.originalUrl}
+                      href={withBasePath(position.originalUrl)}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-[11px] text-muted-foreground underline"

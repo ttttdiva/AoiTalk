@@ -839,9 +839,14 @@ async def _semantic_docs_hits(
     user_id: UUID | None = None,
     allowed_node_ids: set[UUID] | None = None,
     tag: str = "",
+    semantic_enabled: bool | None = None,
 ) -> tuple[list[UUID], Any]:
-    """Return semantic node ids and lane telemetry, or ([], None) when unavailable."""
-    if not str(query or "").strip():
+    """Return semantic node ids and lane telemetry, or ([], None) when unavailable.
+
+    ``semantic_enabled`` is the decision sampled once by ``docs_search``; ``False``
+    never reaches the index entry.
+    """
+    if not str(query or "").strip() or semantic_enabled is False:
         return [], None
     try:
         from ..rag.docs_index import search_docs_index_with_telemetry
@@ -856,6 +861,7 @@ async def _semantic_docs_hits(
             allowed_node_ids=allowed_node_ids,
             tag=tag,
             turn_project_id=_docs_query_turn_project_id(),
+            **({} if semantic_enabled is None else {"_semantic_enabled": semantic_enabled}),
         )
         return result.node_ids, result.telemetry
     except Exception:
@@ -1109,6 +1115,9 @@ def build_docs_direct_tools() -> list:
             from ..rag.docs_index import docs_rag_enabled
 
             started = time.perf_counter()
+            # One sample per request, off the event loop (config snapshot may hit
+            # the DB). It drives both the semantic entry and the telemetry.
+            semantic_enabled = bool(await asyncio.to_thread(docs_rag_enabled))
             failure_stage["value"] = "database_manager"
             db = get_database_manager()
             failure_stage["value"] = "open_session"
@@ -1156,6 +1165,7 @@ def build_docs_direct_tools() -> list:
                     ids, lane_telemetry = await _semantic_docs_hits(
                         library_id, query, project_id if docs_scope is None else None, limit,
                         session=session, user_id=user_id, allowed_node_ids=allowed_ids, tag=tag,
+                        semantic_enabled=semantic_enabled,
                     )
                     index_telemetry = lane_telemetry or index_telemetry
                     if not ids:
@@ -1182,7 +1192,7 @@ def build_docs_direct_tools() -> list:
                     merged_count=len(merged),
                     latency_ms=(time.perf_counter() - started) * 1000.0,
                     index=index_telemetry,
-                    docs_rag_enabled=docs_rag_enabled(),
+                    docs_rag_enabled=semantic_enabled,
                 )
                 logger.debug("docs_search telemetry %s", telemetry.as_dict())
                 render_scope = {"include_parent_titles": docs_scope is None} if hasattr(

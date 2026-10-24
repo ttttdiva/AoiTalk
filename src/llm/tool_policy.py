@@ -275,6 +275,17 @@ KNOWLEDGE_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+SEMANTIC_EMBEDDING_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        # Semantic-only search surfaces: they cannot answer without the
+        # EmbeddingGemma2 master switch, so they follow it directly.
+        # Lexical memory search and the hybrid Docs/Knowledge tools stay out
+        # of this set on purpose.
+        "media_search",
+        "semantic_memory_search",
+    }
+)
+
 FILESYSTEM_READ_TOOL_NAMES: set[str] = {
     "read_file",
     "list_directory",
@@ -1311,6 +1322,7 @@ _TASK_CLAUSE_SPLIT_RE = re.compile(
     r"[、，,]+|\s+(?:but|while|whereas|however|and)\s+|ただし|しかし",
     re.IGNORECASE,
 )
+_TASK_WHOLE_CLAUSE_SPLIT_RE = re.compile(_TASK_CLAUSE_SPLIT_RE.pattern + r"|かつ", re.IGNORECASE)
 _TASK_PATH_EXT = r"\.[A-Za-z][A-Za-z0-9]{0,9}"
 # Quoted targets may contain spaces; unquoted ones may contain non-ASCII
 # (e.g. Japanese) characters but no whitespace or prose punctuation.
@@ -1322,7 +1334,54 @@ _TASK_PATH_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_./\\:-])"
     r"((?:[A-Za-z]:)?[/\\]{0,2}(?:" + _TASK_PATH_NAME + r"+[/\\])*"
     + _TASK_PATH_NAME + r"+?" + _TASK_PATH_EXT + r")"
-    r"(?![A-Za-z0-9_/\\])"
+    r"(?![A-Za-z0-9_/\\]|\.[A-Za-z0-9_])"
+)
+# Only an explicit trailing separator names a directory.  These tokens are
+# negative scope only; prose never grants directory-wide mutation authority.
+_TASK_QUOTED_DIRECTORY_RE = re.compile(
+    r"[\"'`“「『]([^\"'`”」』\n]+[/\\])(?=[\"'`”」』])"
+)
+_TASK_DIRECTORY_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_./\\:-])"
+    r"((?:[A-Za-z]:)?[/\\]{0,2}(?:" + _TASK_PATH_NAME + r"+[/\\])+)"
+    r"(?=$|[\s:：\"'`”」』()（）\[\]{},、，。;；!?]|配下(?:は|を|の|\s|$)|\.(?:$|\s))"
+)
+_TASK_QUOTED_TARGET_RE = re.compile(
+    r"(?:" + _TASK_QUOTED_PATH_RE.pattern + r"|" + _TASK_QUOTED_DIRECTORY_RE.pattern + r")[\"'`”」』]"
+)
+_TASK_FILE_LIST_ITEM = r"(?:" + _TASK_QUOTED_PATH_RE.pattern + r"[\"'`”」』]|" + _TASK_PATH_TOKEN_RE.pattern + r")"
+_TASK_FILE_LIST_SEPARATOR = r"(?:\s*[,、]\s*(?:and\s+)?|\s+and\s+)"
+# Share an edit predicate only across an actual file list, not arbitrary
+# neighbouring prose.  Likewise parentheses around target lists are grouping,
+# whereas parentheses containing a prohibition delimit an independent clause.
+_TASK_EDIT_FILE_LIST_RE = re.compile(
+    r"\s*(?:edit|modify|update|change|fix|patch|rewrite|replace|create|write)\s+(?:only\s+)?"
+    + _TASK_FILE_LIST_ITEM + r"(?:" + _TASK_FILE_LIST_SEPARATOR + _TASK_FILE_LIST_ITEM + r")+"
+    r"\s*(?:only)?[.!]?\s*",
+    re.IGNORECASE,
+)
+_TASK_PARENTHESIZED_FILE_LIST_RE = re.compile(
+    r"[(（]\s*" + _TASK_FILE_LIST_ITEM
+    + r"(?:" + _TASK_FILE_LIST_SEPARATOR + _TASK_FILE_LIST_ITEM + r")*\s*[)）]",
+    re.IGNORECASE,
+)
+# These describe a code object's behavior or a particular operation/content,
+# not the task's mutation mode.  Mask only the matched span in both scans so
+# nearby file protections and unqualified bans retain their original meaning.
+_TASK_GETTER_BEHAVIOR_RE = re.compile(r"\bread[\s_-]*only\s+getters?\b", re.IGNORECASE)
+_TASK_INTERPRETER_PRESERVATION_RE = re.compile(
+    r"\bpip\s+install\s*(?:等|など)?(?:で|によって)\s*"
+    r"(?:変更|更新|改変)(?:は|を)?(?:しない|禁止|不可)"
+    r"|\b(?:do\s+not|don['’]?t)\s+(?:modify|change|update)\s+"
+    r"(?:(?:the|this|specified|named)\s+)?(?:Python\s+)?(?:interpreter|environment)\s+"
+    r"(?:with|via|using)\s+pip\s+install\b",
+    re.IGNORECASE,
+)
+_TASK_CONFIG_VALUES_CONSTRAINT_RE = re.compile(
+    r"\b(?:do\s+not|don['’]?t)\s+(?:add|modify|change|update|write)\s+"
+    r"config(?:uration)?\s+values?\s+(?:to|in|of)\s+"
+    r"(?:" + _TASK_QUOTED_PATH_RE.pattern + r"|" + _TASK_PATH_TOKEN_RE.pattern + r")",
+    re.IGNORECASE,
 )
 # A carve-out (other/remaining/except ...) means another target is editable.
 _TASK_SCOPE_EXCLUSION_RE = re.compile(
@@ -1338,6 +1397,7 @@ _TASK_WHOLE_READ_ONLY_RE = re.compile(
     r"|\b(?:do\s+not|don['’]?t|dont|never)\s+(?:modify|change|edit|write|touch|update)\s+"
     r"(?:any|anything|all)\b"
     r"|\bno\s+(?:file\s+)?(?:changes|edits|modifications|writes)\s+(?:at\s+all|whatsoever)\b"
+    r"|(?<!\w)(?:全)?ファイル(?:の|は|を)?(?:変更|編集|修正|書き込み|作成)(?:は|を)?(?:禁止|しない|不可)"
     r"|読み取り専用(?:の|で)?(?:タスク|作業|モード|依頼|調査|対応|実行)"
     r"|(?:タスク|作業|依頼)(?:全体)?(?:は|を)?(?:読み取り専用|読み取りのみ)"
     r"|(?:一切|何も)(?:の)?(?:ファイルを?)?(?:変更|編集|修正|書き込み|作成)",
@@ -1366,6 +1426,27 @@ _TASK_PRESERVED_STATE_RE = re.compile(
     r"(?:保持|維持|保全|binding|バインド|紐付け?|紐づけ?)(?:は|を)?\s*(?:も)?"
     r"(?:変更|編集|修正|書き換え)(?:しない|禁止|不可)",
     re.IGNORECASE,
+)
+# "元journal・既存scriptは読み取りだけ": a qualified source-resource subject is
+# preserved as read-only input, so the predicate is not a whole-task
+# declaration.  Only the qualified subject list and its exact predicate are
+# masked; preceding/following clauses are still classified, so a neighbouring
+# "一切変更しない" stays a whole-task ban.  Bare "script"/"code"/"allfiles" and
+# arbitrary subjects are never scoped this way.
+_TASK_RESOURCE_PRESERVED_SPAN_RE = re.compile(
+    r"(?:元|既存)(?:の)?(?:journal|script|ジャーナル|スクリプト)(?![A-Za-z0-9_])"
+    r"(?:\s*・\s*(?:元|既存)(?:の)?"
+    r"(?:journal|script|ジャーナル|スクリプト)(?![A-Za-z0-9_]))*"
+    r"\s*は\s*(?:読み取り|読取)(?:だけ|のみ)(?:です)?",
+    re.IGNORECASE,
+)
+# A named algorithm's threshold/semantics is a local implementation constraint.
+# Match only that identifier and operation, never the surrounding list or ban.
+# ASCII identifiers keep Japanese connectives and unscoped bans out of the span.
+_TASK_ALGORITHM_CONSTRAINT_RE = re.compile(
+    r"(?<![A-Za-z0-9_./\\-])[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:閾値(?:は|を)\s*追加|の意味(?:は|を)?\s*変更)"
+    r"(?:は)?(?:しない|禁止|不可)"
 )
 _TASK_READ_ONLY_TARGET_RE = re.compile(
     r"読取|読み取り|参照|閲覧|確認のみ|確認だけ|変更禁止|編集禁止|変更しない|編集しない"
@@ -1436,6 +1517,51 @@ def _task_path_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _task_directory_tokens(text: str) -> set[str]:
+    raw = [match.group(1) for match in _TASK_QUOTED_DIRECTORY_RE.finditer(text)]
+    unquoted = _TASK_QUOTED_DIRECTORY_RE.sub(" ", text)
+    raw.extend(match.group(1) for match in _TASK_DIRECTORY_TOKEN_RE.finditer(unquoted))
+    return {
+        _normalise_task_path(_strip_leading_task_prose(_normalise_task_path(value))) + "/"
+        for value in raw
+    }
+
+
+def _task_local_constraint_scan(text: str) -> str:
+    text, paths = _task_quote_path_placeholders(text)
+    for pattern in (
+        _TASK_GETTER_BEHAVIOR_RE,
+        _TASK_INTERPRETER_PRESERVATION_RE,
+        _TASK_CONFIG_VALUES_CONSTRAINT_RE,
+    ):
+        text = pattern.sub(" ", text)
+    return _restore_task_quoted_paths(text, paths)
+
+
+def _task_quote_path_placeholders(text: str) -> tuple[str, dict[str, str]]:
+    """Keep path identity opaque to prose masks and punctuation splitting."""
+
+    paths: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        suffix = "/" if _TASK_QUOTED_DIRECTORY_RE.match(match.group(0)) else ".file"
+        # The marker itself remains a file/directory token for the whole-task
+        # classifier, which needs only to know that a resource was named.
+        marker = f"__quoted_{len(paths)}__{suffix}"
+        while marker in text or marker in paths:
+            marker = "_" + marker
+        paths[marker] = match.group(0)
+        return marker
+
+    return _TASK_QUOTED_TARGET_RE.sub(replace, text), paths
+
+
+def _restore_task_quoted_paths(text: str, paths: Mapping[str, str]) -> str:
+    for marker, path in paths.items():
+        text = text.replace(marker, path)
+    return text
+
+
 def _normalise_task_path(value: Any) -> str:
     path = str(value or "").strip().strip("`'\"").replace("\\", "/")
     while path.startswith("./"):
@@ -1480,6 +1606,15 @@ def _task_path_matches(
     path_key = _task_path_key(path, run_scope)
     if not path_key:
         return False
+    if token.endswith("/"):
+        # A directory marker is meaningful only in negative scope.  Compare
+        # component boundaries, never a raw prefix such as src vs src_extra.
+        if not protected:
+            return False
+        directory_key = _task_path_key(token[:-1], run_scope)
+        return bool(directory_key) and (
+            path_key == directory_key or path_key.startswith(directory_key.rstrip("/") + "/")
+        )
     if path_key == _task_path_key(token, run_scope):
         return True
     # An explicit ``edit_targets`` token names exactly one workspace file: a
@@ -1512,6 +1647,9 @@ class StructuredTaskMutationScope:
     unenumerated_targets: bool = False
     # Prose declared that the other files are read-only (a carve-out).
     carve_out: bool = False
+    # Directories named by "edit <dir>/ only".  They are an admission-time
+    # constraint on explicit edit_targets, never inferred write authority.
+    editable_directories: frozenset[str] = frozenset()
 
 
 def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationScope:
@@ -1534,51 +1672,60 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
     edit_tokens: set[str] = set()
     only_edit_tokens: set[str] = set()
     unenumerated = False
+    directory_limited = False
+    only_directories: set[str] = set()
     for sentence in _TASK_SENTENCE_SPLIT_RE.split(policy_text):
         sentence = sentence.strip()
         if not sentence:
             continue
-        scan = _TASK_SHORTCUT_CONSTRAINT_RE.sub(
+        scan = _task_local_constraint_scan(_TASK_SHORTCUT_CONSTRAINT_RE.sub(
             " ", _TASK_INSPECTION_QUALIFIER_RE.sub(" ", sentence)
-        )
-        # Remove only the minimal preserving span; the rest of the sentence is
-        # still classified, so a real whole-task ban next to it stays whole.
-        # Clauses are re-joined with spaces so Japanese connectives (ただし等)
-        # cannot glue to an adjacent ASCII ban and defeat its word boundary.
-        scan = " ".join(
-            _TASK_PRESERVED_STATE_RE.sub(" ", clause)
-            for clause in _TASK_CLAUSE_SPLIT_RE.split(scan)
+        ))
+        # Keep path contents opaque while classifying prose.  This prevents a
+        # filename containing parentheses or an exemption phrase from changing
+        # either its identity or the task's mutation mode.
+        scan, _ = _task_quote_path_placeholders(scan)
+        # Remove only the minimal preserving span; neighbouring prohibitions
+        # are classified independently and cannot borrow another clause's path.
+        clauses = [
+            _TASK_RESOURCE_PRESERVED_SPAN_RE.sub(
+                " ", _TASK_PRESERVED_STATE_RE.sub(" ", clause)
+            )
+            for clause in _TASK_WHOLE_CLAUSE_SPLIT_RE.split(
+                _TASK_PARENTHESIZED_FILE_LIST_RE.sub(lambda match: match.group(0)[1:-1], scan)
+            )
             if clause
+        ]
+        # Mask algorithm spans only for whole-task classification.  Keep the
+        # original scan for file-list protection, including comma-separated files.
+        file_scan = " ".join(clauses)
+        for clause in clauses:
+            scan = _TASK_ALGORITHM_CONSTRAINT_RE.sub(" ", clause)
+            # Parenthesised bans are independent of a named resource outside
+            # the parentheses.  File-list classification below keeps the
+            # original punctuation and quotes.
+            for part in re.split(r"[()（）]", scan):
+                forbidden = any(pattern.search(part) for pattern in _MUTATION_FORBIDDEN_PATTERNS)
+                if _TASK_WHOLE_READ_ONLY_RE.search(part):
+                    whole = True
+                elif forbidden:
+                    if _TASK_SCOPE_EXCLUSION_RE.search(part):
+                        carve_out = carve_out or bool(
+                            _task_path_tokens(sentence) or _TASK_FILE_NOUN_RE.search(sentence)
+                        )
+                    elif _task_path_tokens(part) or _task_directory_tokens(part):
+                        # The named files/directories are protected below.
+                        pass
+                    elif _TASK_SCOPE_TARGET_RE.search(part):
+                        # A non-file restriction stays an instruction to the
+                        # model and does not supply filesystem authority.
+                        pass
+                    else:
+                        whole = True
+        sentence_read_only = (
+            any(pattern.search(file_scan) for pattern in _MUTATION_FORBIDDEN_PATTERNS)
+            or _TASK_READ_ONLY_TARGET_RE.search(file_scan) is not None
         )
-        forbidden = any(
-            pattern.search(scan) is not None
-            for pattern in _MUTATION_FORBIDDEN_PATTERNS
-        )
-        if forbidden:
-            if _TASK_SCOPE_EXCLUSION_RE.search(sentence):
-                carve_out = carve_out or bool(
-                    _task_path_tokens(sentence) or _TASK_FILE_NOUN_RE.search(sentence)
-                )
-            elif _TASK_WHOLE_READ_ONLY_RE.search(sentence):
-                whole = True
-            elif _task_path_tokens(sentence):
-                # The named files are protected by the clause scan below.
-                pass
-            elif _TASK_SCOPE_TARGET_RE.search(scan):
-                # A restriction that names no file ("設定ファイルは変更しない
-                # こと", "TTL/認証/DB禁止") stays an instruction to the model in
-                # the prompt.  It neither widens nor narrows the file scope.
-                pass
-            else:
-                whole = True
-        elif (
-            _TASK_WHOLE_READ_ONLY_RE.search(sentence)
-            and not _TASK_SCOPE_EXCLUSION_RE.search(sentence)
-        ):
-            # An explicit whole-task declaration ("これは読み取り専用のタスク
-            # です") needs no separate mutation-forbidden verb.
-            whole = True
-        sentence_read_only = forbidden or _TASK_READ_ONLY_TARGET_RE.search(sentence) is not None
         if (
             sentence_read_only
             and _TASK_SCOPE_EXCLUSION_RE.search(sentence)
@@ -1587,9 +1734,19 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
             # Coordination prose ("other implementers handle X, keep those
             # modules untouched") names no files and must not limit edits.
             carve_out = True
-        for clause in _TASK_CLAUSE_SPLIT_RE.split(sentence):
-            tokens = _task_path_tokens(clause)
-            if not tokens:
+        if not sentence_read_only and _TASK_EDIT_FILE_LIST_RE.fullmatch(sentence):
+            tokens = _task_path_tokens(sentence)
+            edit_tokens.update(tokens)
+            if _TASK_ONLY_RE.search(sentence):
+                only_edit_tokens.update(tokens)
+        file_text, quoted_paths = _task_quote_path_placeholders(_task_local_constraint_scan(sentence))
+        for masked_clause in _TASK_CLAUSE_SPLIT_RE.split(file_text):
+            # Classify the prose with quoted paths opaque; recover the literal
+            # path only to read the exact identity.
+            clause = masked_clause
+            tokens = _task_path_tokens(_restore_task_quoted_paths(clause, quoted_paths))
+            directories = _task_directory_tokens(_restore_task_quoted_paths(clause, quoted_paths))
+            if not tokens and not directories:
                 continue
             if (
                 _TASK_READ_ONLY_TARGET_RE.search(clause)
@@ -1598,18 +1755,23 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
                 # sentence's read-only marker unless they name an edit.
                 or (sentence_read_only and not _TASK_EDIT_VERB_RE.search(clause))
             ):
-                protected.update(tokens)
+                protected.update(tokens | directories)
             elif _TASK_EDIT_VERB_RE.search(clause):
                 edit_tokens.update(tokens)
                 if _TASK_ONLY_RE.search(clause):
                     only_edit_tokens.update(tokens)
+                    directory_limited = directory_limited or bool(directories)
+                    only_directories.update(directories)
                     if _TASK_UNENUMERATED_TARGET_RE.search(clause):
                         unenumerated = True
-    editable = (only_edit_tokens or edit_tokens) - protected
+    editable = {
+        token for token in (only_edit_tokens or edit_tokens)
+        if not any(_lexical_task_path_matches(token, item, protected=True) for item in protected)
+    }
     # Edits are limited to the named targets only when the task says so; a
     # protection-only constraint ("src_a.py は変更しないこと") denies just the
     # protected files and leaves the rest of the mutate task editable.
-    editable_limited = bool(only_edit_tokens or (carve_out and editable))
+    editable_limited = bool(directory_limited or only_edit_tokens or (carve_out and editable))
     return StructuredTaskMutationScope(
         whole_task_forbidden=whole,
         restricted=bool(protected) or editable_limited,
@@ -1618,6 +1780,9 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
         editable_limited=editable_limited,
         unenumerated_targets=unenumerated and editable_limited,
         carve_out=carve_out,
+        # Positive narrowing limits are kept even when they conflict with a
+        # protected path: the protected check rejects inside, the limit outside.
+        editable_directories=frozenset(only_directories),
     )
 
 
@@ -1639,7 +1804,9 @@ class StructuredEditScopeError(ValueError):
     """The structured task's edit scope is inconsistent or malformed."""
 
 
-def _lexical_task_path_matches(path: str, token: str, *, exact: bool = False) -> bool:
+def _lexical_task_path_matches(
+    path: str, token: str, *, exact: bool = False, protected: bool = False
+) -> bool:
     """Workspace-relative comparison without a bound run scope (admission time).
 
     Mirrors ``_task_path_matches``: an exact path or, for a prose-inferred bare
@@ -1652,14 +1819,25 @@ def _lexical_task_path_matches(path: str, token: str, *, exact: bool = False) ->
     token_key = _normalise_task_path(token).casefold()
     if not path_key or not token_key:
         return False
+    if token.endswith("/"):
+        return protected and (path_key == token_key or path_key.startswith(token_key + "/"))
     if path_key == token_key:
         return True
     return not exact and "/" not in token_key and path_key.rsplit("/", 1)[-1] == token_key
 
 
-def _scope_path_is_clean(path: str, *, relative_only: bool) -> bool:
+def _scope_path_is_clean(path: str, *, relative_only: bool, allow_directory: bool = False) -> bool:
     """A normalised token; explicit targets must also be safe workspace-relative files."""
 
+    if allow_directory and path.endswith("/"):
+        path = path[:-1]
+        # The sentinel is valid only after a canonical directory, never a
+        # root, traversal, duplicate separator or drive-relative location.
+        if (
+            re.match(r"^[A-Za-z]:(?!/)", path)
+            or any(part in ("", ".", "..") for part in path.lstrip("/").split("/"))
+        ):
+            return False
     if not path or path != _normalise_task_path(path) or any(ord(char) < 32 for char in path):
         return False
     if not relative_only:
@@ -1760,7 +1938,10 @@ class FixedEditScope:
             if list(items) != sorted(set(items)):
                 raise StructuredEditScopeError(f"edit scope {name} list is not canonical")
             for item in items:
-                if not _scope_path_is_clean(item, relative_only=self.explicit and name == "editable"):
+                if not _scope_path_is_clean(
+                    item, relative_only=self.explicit and name == "editable",
+                    allow_directory=name == "protected",
+                ):
                     raise StructuredEditScopeError(f"edit scope {name} path is invalid")
         if self.explicit and not self.limited:
             raise StructuredEditScopeError("an explicit edit scope is always limited")
@@ -1793,7 +1974,7 @@ def _freeze_scope(
         raise StructuredEditScopeError("the task names too many files to bind an edit scope")
     if any(len(item) > _FIXED_EDIT_SCOPE_MAX_CHARS for item in (*editable_paths, *protected)):
         raise StructuredEditScopeError("the task names a path that is too long")
-    return FixedEditScope(
+    scope = FixedEditScope(
         whole=parsed.whole_task_forbidden,
         limited=bool(limited),
         editable=editable_paths,
@@ -1801,6 +1982,8 @@ def _freeze_scope(
         unenumerated=parsed.unenumerated_targets and not explicit,
         explicit=explicit,
     )
+    scope._validate_invariants()
+    return scope
 
 
 def fixed_edit_scope_from_prose(text: str | None) -> FixedEditScope:
@@ -1842,19 +2025,30 @@ def build_fixed_edit_scope(
     else:
         targets = tuple(edit_targets)
         for target in targets:
-            if any(_lexical_task_path_matches(target, token) for token in parsed.protected_paths):
-                raise StructuredEditScopeError("edit_targets names a file the task marks read-only")
-            if (
-                parsed.carve_out
-                and parsed.editable_paths
-                and not any(_lexical_task_path_matches(target, token) for token in parsed.editable_paths)
+            if any(
+                _lexical_task_path_matches(target, token, protected=True)
+                for token in parsed.protected_paths
             ):
+                raise StructuredEditScopeError("edit_targets names a file the task marks read-only")
+            # Declared files and declared directories are alternative grants:
+            # a target matching either one is inside the narrowing constraint.
+            file_limited = bool(parsed.carve_out and parsed.editable_paths)
+            in_files = any(_lexical_task_path_matches(target, token) for token in parsed.editable_paths)
+            in_directories = any(
+                _lexical_task_path_matches(target, directory, protected=True)
+                for directory in parsed.editable_directories
+            )
+            if file_limited and not parsed.editable_directories and not in_files:
                 raise StructuredEditScopeError(
                     "edit_targets conflicts with the task's explicit restriction of editable files"
                 )
+            if parsed.editable_directories and not (in_directories or (file_limited and in_files)):
+                raise StructuredEditScopeError(
+                    "edit_targets conflicts with the task's restriction to its named directories"
+                )
         scope = _freeze_scope(parsed, editable=targets, limited=True, explicit=True)
     for output in required_outputs:
-        if any(_lexical_task_path_matches(output, token) for token in scope.protected):
+        if any(_lexical_task_path_matches(output, token, protected=True) for token in scope.protected):
             raise StructuredEditScopeError("required_outputs names a file the task marks read-only")
         if scope.limited and not any(
             _lexical_task_path_matches(output, token, exact=scope.explicit) for token in scope.editable
@@ -2560,6 +2754,34 @@ def _approved_action_allows_current_call(
         return False
 
 
+def embedding_master_enabled(config: Any) -> bool:
+    """Return the EmbeddingGemma2 master switch as an availability predicate.
+
+    The decision is delegated to
+    :func:`services.embedding_feature.embedding_enabled` so the tool policy and
+    the embedding workers read exactly one master predicate.  It is evaluated on
+    every call and never memoised, so ON -> OFF -> ON rebuilds cannot leave a
+    stale availability decision behind.
+
+    This predicate is additive only: it can hide a semantic-only tool, but it
+    never overrides the individual per-tool/search flags, which still apply on
+    their own when the master switch is ON.
+
+    Legacy config-less callers keep their historical behavior.  ``Config``-style
+    containers expose dotted lookups instead of the mapping protocol, so their
+    ``search`` section is normalised into the shape the master predicate reads.
+    """
+
+    if config is None:
+        return True
+    from ..services.embedding_feature import embedding_enabled
+
+    if isinstance(config, Mapping):
+        return bool(embedding_enabled(config))
+    section = _policy_config_get(config, "search", {})
+    return bool(embedding_enabled({"search": section}))
+
+
 def _runtime_capability_for_tool(
     tool_name: str,
     *,
@@ -2755,6 +2977,11 @@ def _runtime_capability_for_tool(
         _policy_config_get(config, "agents.search.enabled", True), default=True
     ):
         return "search capability is disabled in configuration"
+    if name in SEMANTIC_EMBEDDING_TOOL_NAMES and not embedding_master_enabled(config):
+        return (
+            "semantic media search requires the embedding feature, which is "
+            "disabled in configuration"
+        )
     if name in KNOWLEDGE_TOOL_NAMES and not is_knowledge_search_enabled(config):
         return "Knowledge Source search is disabled in configuration"
     if name == "search_past_chats":

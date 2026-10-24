@@ -29,6 +29,7 @@ from ..rag.config import RagConfig, get_rag_config
 from ..rag.embedding import EmbeddingGemma2Embedding, get_embedding
 from ..rag.qdrant_client import SharedQdrantClient, _LOCAL_INDEX_IO_LOCK
 from ..rag.index_io import run_index_io
+from ..services.embedding_feature import runtime_embedding_enabled
 
 try:
     from qdrant_client import QdrantClient
@@ -75,6 +76,10 @@ async def _index_lock(key: tuple[str, ...]):
 
 def _knowledge_search_enabled() -> bool:
     """ナレッジRAGのマスタースイッチ (`search.knowledge_enabled`, 既定OFF)。"""
+    # Master semantic switch first: OFF returns before Config, model or index
+    # work. ON keeps the existing individual Knowledge gate below unchanged.
+    if not runtime_embedding_enabled():
+        return False
     try:
         from ..config import Config
 
@@ -197,14 +202,14 @@ class KnowledgeIndexService:
         )
 
     async def _initialize(self) -> bool:
-        if self._initialized:
-            return True
         if not _knowledge_search_enabled():
             self._initialization_failure = KnowledgeIndexSyncResult(status="disabled")
             logger.info(
                 "Knowledge index is disabled (search.knowledge_enabled is off)"
             )
             return False
+        if self._initialized:
+            return True
         if not QDRANT_AVAILABLE:
             self._initialization_failure = KnowledgeIndexSyncResult(
                 status="unavailable", error="qdrant-client is not installed"
@@ -331,6 +336,8 @@ class KnowledgeIndexService:
         )
         chunk_rows = list(rows.all())
         if not chunk_rows:
+            if not _knowledge_search_enabled():
+                return KnowledgeIndexSyncResult(status="disabled")
             await self._index_io(self._delete_source_points, source_id)
             return KnowledgeIndexSyncResult(status="synced", indexed_chunks=0)
 
@@ -374,6 +381,11 @@ class KnowledgeIndexService:
             for index, dense in zip(changed, generated):
                 dense_vectors[index] = dense
 
+            # A switch can turn OFF after a vector request has settled. Do not
+            # publish reused or newly generated vectors after that boundary.
+            if not _knowledge_search_enabled():
+                return KnowledgeIndexSyncResult(status="disabled", indexed_chunks=indexed)
+
             points = [models.PointStruct(
                 id=str(chunk.id),
                 vector={
@@ -395,6 +407,8 @@ class KnowledgeIndexService:
         retained = {str(chunk.id) for chunk, _, _ in chunk_rows}
         stale = sorted(set(existing) - retained)
         for index in range(0, len(stale), batch_size):
+            if not _knowledge_search_enabled():
+                return KnowledgeIndexSyncResult(status="disabled", indexed_chunks=indexed)
             await self._index_io(
                 self._delete_source_points, source_id, stale[index:index + batch_size]
             )

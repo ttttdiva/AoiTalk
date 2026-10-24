@@ -3647,8 +3647,17 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             if "enable_tools" in body and provider in {
                 "ollama",
                 "openai_compatible_local",
+                "openrouter",
             }:
                 _apply_config(f"{provider}.enable_tools", bool(body["enable_tools"]))
+                if provider == "openrouter":
+                    # Explicit user choice: value and provenance travel in the
+                    # same atomic patch (and the live mirror) so the default
+                    # migration never overrides an intentional ``false``.
+                    _apply_config(
+                        "openrouter.enable_tools_source",
+                        "user",
+                    )
 
             if (
                 "enable_response_format" in body

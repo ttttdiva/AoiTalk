@@ -9,6 +9,7 @@ import {
   encodeDocsJson,
   executeDocsPreparedBatch,
   type DocsSqliteAsyncTransaction,
+  type DocsSqliteProgress,
   withDocsExclusiveTransaction,
 } from "../db/docs-sync-async";
 import {
@@ -98,6 +99,8 @@ import {
   reconcileDocsNodesWithServer,
   reconcileDocsSupertagsWithServer,
   promoteDocsSyncRun,
+  type DocsPromotionPhase,
+  type DocsStagingProgress,
   quarantineRevokedDocsScope,
 } from "../repositories/docs";
 import { flushPendingConversations } from "../repositories/conversations";
@@ -251,12 +254,41 @@ export type DocsSyncDiagnosticStage =
   | "reload_ready_run"
   | "promoting";
 
+type DocsPromotionDiagnostic = {
+  phase: DocsPromotionPhase;
+  startedAt: number;
+  sqlite?: DocsSqliteProgress;
+  work?: DocsStagingProgress;
+  phaseElapsedMs?: number;
+};
+
+function cloneDocsSqliteProgress(progress: DocsSqliteProgress): DocsSqliteProgress {
+  return {
+    ...progress,
+    operationCounts: { ...progress.operationCounts },
+    operationElapsedMs: { ...progress.operationElapsedMs },
+  };
+}
+
+function cloneDocsCheckpoint(checkpoint: DocsSyncDiagnostic): DocsSyncDiagnostic {
+  return {
+    ...checkpoint,
+    ...(checkpoint.promotion ? { promotion: {
+      ...checkpoint.promotion,
+      ...(checkpoint.promotion.sqlite ? { sqlite: cloneDocsSqliteProgress(checkpoint.promotion.sqlite) } : {}),
+      ...(checkpoint.promotion.work ? { work: { ...checkpoint.promotion.work } } : {}),
+    } } : {}),
+  };
+}
+
 export type DocsSyncDiagnostic = {
+  runId?: string | null;
   stage: DocsSyncDiagnosticStage;
   /** Total elapsed time since this flight's Docs watchdog budget began. */
   elapsedMs: number;
   runState: "downloading" | "ready" | null;
   pendingTables: number | null;
+  promotion?: DocsPromotionDiagnostic;
 };
 
 export type SyncPullDiagnostic = {
@@ -336,8 +368,10 @@ type SyncExecutionContext = {
   docsDiagnostic?: {
     startedAt: number;
     stage: DocsSyncDiagnosticStage | null;
+    runId?: string | null;
     runState: DocsSyncDiagnostic["runState"];
     pendingTables: number | null;
+    promotion?: DocsPromotionDiagnostic;
     frozen: boolean;
   };
   diagnostic?: SyncDiagnosticReceipt;
@@ -499,6 +533,24 @@ function markSyncDiagnosticStarted(receipt: SyncDiagnosticReceipt): void {
   notifySyncDiagnosticListeners();
 }
 
+// Finite flight boundaries only. Never log authScope, SQL, bindings or payloads.
+function logSyncFlightBoundary(
+  receipt: SyncDiagnosticReceipt | undefined,
+  event: "native_settled" | "docs_settled" | "general_start" | "terminal",
+  runId?: string,
+  sqlite?: DocsSqliteProgress,
+): void {
+  if (!receipt) return;
+  console.info("[sync] flight checkpoint", JSON.stringify({
+    event, at: Date.now(), requestId: receipt.requestId,
+    canonicalRequestId: receipt.canonicalRequestId ?? receipt.requestId,
+    authGeneration: receipt.authGeneration,
+    runId: runId ?? receipt.docsWatchdog?.runId ?? receipt.docsSubstage?.runId ?? null,
+    ...(sqlite ? { sqlite } : {}),
+    ...(event === "terminal" ? { outcome: receipt.outcome } : {}),
+  }));
+}
+
 function finishSyncDiagnostic(
   receipt: SyncDiagnosticReceipt,
   outcome: SyncDiagnosticOutcome,
@@ -509,6 +561,7 @@ function finishSyncDiagnostic(
   receipt.skipReason = skipReason;
   receipt.failureReason = failureReason;
   receipt.finishedAt ??= Date.now();
+  if (receipt.startedAt !== null && !receipt.canonicalRequestId) logSyncFlightBoundary(receipt, "terminal");
   trimSyncDiagnosticHistory();
   notifySyncDiagnosticListeners();
 }
@@ -682,8 +735,8 @@ function cloneSyncDiagnosticReceipt(
 ): SyncDiagnosticReceipt {
   return {
     ...receipt,
-    docsSubstage: receipt.docsSubstage ? { ...receipt.docsSubstage } : null,
-    docsWatchdog: receipt.docsWatchdog ? { ...receipt.docsWatchdog } : null,
+    docsSubstage: receipt.docsSubstage ? cloneDocsCheckpoint(receipt.docsSubstage) : null,
+    docsWatchdog: receipt.docsWatchdog ? cloneDocsCheckpoint(receipt.docsWatchdog) : null,
     pulls: receipt.pulls.map((pull) => ({
       ...pull,
       attemptStatuses: [...pull.attemptStatuses],
@@ -711,9 +764,16 @@ function publishDocsSubstage(context: SyncExecutionContext): void {
   if (!runtime || runtime.frozen || !runtime.stage || !context.diagnostic) return;
   context.diagnostic.docsSubstage = {
     stage: runtime.stage,
+    runId: runtime.runId ?? null,
     elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
     runState: runtime.runState,
     pendingTables: runtime.pendingTables,
+    ...(runtime.promotion ? { promotion: {
+      ...runtime.promotion,
+      phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
+      ...(runtime.promotion.sqlite ? { sqlite: cloneDocsSqliteProgress(runtime.promotion.sqlite) } : {}),
+      ...(runtime.promotion.work ? { work: { ...runtime.promotion.work } } : {}),
+    } } : {}),
   };
   notifySyncDiagnosticListeners();
 }
@@ -726,8 +786,10 @@ function markDocsSubstage(
   const runtime = context.docsDiagnostic;
   if (!runtime || runtime.frozen) return;
   runtime.stage = stage;
+  if (stage !== "promoting") runtime.promotion = undefined;
   if (run !== undefined) {
     const fields = docsRunDiagnosticFields(run);
+    runtime.runId = run?.runId ?? null;
     runtime.runState = fields.runState;
     runtime.pendingTables = fields.pendingTables;
   }
@@ -741,6 +803,7 @@ function updateDocsRunDiagnostic(
   const runtime = context.docsDiagnostic;
   if (!runtime || runtime.frozen) return;
   const fields = docsRunDiagnosticFields(run);
+  runtime.runId = run?.runId ?? null;
   runtime.runState = fields.runState;
   runtime.pendingTables = fields.pendingTables;
   publishDocsSubstage(context);
@@ -749,6 +812,7 @@ function updateDocsRunDiagnostic(
 function resetDocsRunDiagnosticFields(context: SyncExecutionContext): void {
   const runtime = context.docsDiagnostic;
   if (!runtime || runtime.frozen) return;
+  runtime.runId = null;
   runtime.runState = null;
   runtime.pendingTables = null;
 }
@@ -760,12 +824,25 @@ function captureDocsWatchdog(context: SyncExecutionContext): void {
   if (!context.diagnostic || context.diagnostic.docsWatchdog) return;
   const snapshot: DocsSyncDiagnostic = {
     stage: runtime.stage,
+    runId: runtime.runId ?? null,
     elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
     runState: runtime.runState,
     pendingTables: runtime.pendingTables,
+    ...(runtime.promotion ? { promotion: {
+      ...runtime.promotion,
+      phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
+      ...(runtime.promotion.sqlite ? { sqlite: cloneDocsSqliteProgress(runtime.promotion.sqlite) } : {}),
+      ...(runtime.promotion.work ? { work: { ...runtime.promotion.work } } : {}),
+    } } : {}),
   };
-  context.diagnostic.docsSubstage = { ...snapshot };
-  context.diagnostic.docsWatchdog = { ...snapshot };
+  context.diagnostic.docsSubstage = cloneDocsCheckpoint(snapshot);
+  context.diagnostic.docsWatchdog = cloneDocsCheckpoint(snapshot);
+  // Fixed schema labels and numeric progress only; available in ordinary logcat.
+  console.warn("[sync] Docs watchdog checkpoint", JSON.stringify({
+    ...snapshot, requestId: context.diagnostic.requestId,
+    canonicalRequestId: context.diagnostic.canonicalRequestId ?? context.diagnostic.requestId,
+    authGeneration: context.diagnostic.authGeneration,
+  }));
   notifySyncDiagnosticListeners();
 }
 
@@ -2480,6 +2557,41 @@ async function applyDocsPullOnce(
         markDocsSubstage(context, "promoting", currentRun);
         promotionTelemetry = await promoteDocsSyncRun({
           assertActive: () => assertSyncExecutionActive(context),
+          onPromotionPhase: (phase) => {
+            const runtime = context.docsDiagnostic;
+            if (!runtime || runtime.frozen) return;
+            runtime.promotion = {
+              phase, startedAt: Date.now(),
+              ...(phase !== "building_sets" && runtime.promotion?.sqlite
+                ? { sqlite: runtime.promotion.sqlite } : {}),
+              ...(phase !== "building_sets" && runtime.promotion?.work ? { work: runtime.promotion.work } : {}),
+            };
+            publishDocsSubstage(context);
+          },
+          onStagingProgress: (progress) => {
+            const runtime = context.docsDiagnostic;
+            if (!runtime || runtime.frozen || !runtime.promotion) return;
+            runtime.promotion.work = { ...progress };
+          },
+          onSqliteProgress: (progress) => {
+            // Ownership must still update after diagnostics freeze at timeout.
+            if (context.docsLiveWriteState) {
+              context.docsLiveWriteState.started = progress.nativeActive;
+            }
+            if (progress.awaiting === "settled") {
+              logSyncFlightBoundary(context.diagnostic, "native_settled", persistedRun.runId, progress);
+            }
+            const runtime = context.docsDiagnostic;
+            if (!runtime || runtime.frozen || !runtime.promotion) return;
+            runtime.promotion = {
+              ...runtime.promotion, sqlite: cloneDocsSqliteProgress(progress),
+              phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
+            };
+            // Retain the latest await without per-statement React notifications.
+            if (context.diagnostic?.docsSubstage) {
+              context.diagnostic.docsSubstage.promotion = runtime.promotion;
+            }
+          },
           runId: persistedRun.runId,
           authScope,
           scopeId: promotionScopeId,
@@ -4531,10 +4643,11 @@ async function applyDocsPullWithinFlightBudget(
     await Promise.race([docsFlight, deadline, interrupted]);
   } catch (error) {
     if (timedOut && liveWriteAtTimeout) {
-      // A compatibility live write owns the queue until its transaction and
-      // rollback boundary settles. The child was already aborted, so its next
-      // guard will reject; wait for that settlement before general sync.
+      // A live Docs write (including native promotion) owns the queue until
+      // COMMIT/ROLLBACK and connection close settle. The aborted child rejects
+      // at its next guard; wait for settlement before general sync.
       await docsFlight.catch(() => undefined);
+      logSyncFlightBoundary(context.diagnostic, "docs_settled");
       throw new DocsStageWatchdogError();
     }
     if (timedOut && !isSyncExecutionInterrupted(context)) {
@@ -4591,6 +4704,7 @@ async function performSync(
           try {
             context.v3PullActive = true;
             if (activeAuthScopeTransitions.size > 0) context.controller.abort();
+            logSyncFlightBoundary(context.diagnostic, "general_start");
             const result = await runV3Pull(authScope, {
               signal: context.controller.signal,
               assertActive: () => assertSyncExecutionActive(context),
@@ -4624,6 +4738,7 @@ async function performSync(
     // partialとして記録し、outboxやgeneralの結果を成功へ畳み込まない。
     ["general", "general pull", async () => {
       if (!v2PullActive()) return;
+      logSyncFlightBoundary(context.diagnostic, "general_start");
       const changed = await applyGeneralPull(authScope, context);
       assertSyncExecutionActive(context);
       if (changed && getTokenAuthScope(getCachedToken()) === authScope) {

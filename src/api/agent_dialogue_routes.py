@@ -13,6 +13,7 @@ from ..services.agent_dialogue_service import (
     AgentDialogueError,
     AgentDialogueService,
 )
+from ..services.agent_identity_service import AgentIdentityConflictError
 
 
 class _DialogueModel(BaseModel):
@@ -245,6 +246,17 @@ def create_agent_dialogue_router(
             return AoiDotsProfile.model_validate(result)
         except AgentDialogueError as exc:
             raise _error(exc) from exc
+        except AgentIdentityConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "private_root_conflict",
+                    "message": (
+                        "The existing private root is unavailable or inconsistent; "
+                        "it has not been restored or replaced."
+                    ),
+                },
+            ) from exc
 
     @router.get(
         "/api/aoidots/work",

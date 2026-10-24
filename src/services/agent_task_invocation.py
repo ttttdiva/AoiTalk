@@ -30,7 +30,11 @@ from typing import Any
 
 from sqlalchemy import desc, func, select
 
-from ..tools.core import ToolPolicyDeniedError
+from ..tools.core import (
+    ARGUMENT_REJECTION_CODES as _ARGUMENT_REJECTION_CODES,
+    ToolPolicyDeniedError,
+    safe_argument_rejection,
+)
 from .agent_work_runtime import ExecutionOutcome, WorkCandidate
 from ..llm.provider_rate_governor import is_temporary_429_failure
 from .provider_failure_metadata import extract_provider_failure, safe_usage_snapshot, terminal_failure_event_fields
@@ -646,12 +650,6 @@ def _receipt_command_nonzero_exit(receipt: Any) -> int | None:
 
 _ARGUMENT_REJECTION_MESSAGE = "Tool arguments were rejected by the server contract."
 _ARGUMENT_REJECTION_KEY = "<argument-rejected>"
-_ARGUMENT_REJECTION_CODES = frozenset({
-    "tool_argument_invalid",
-    "tool_argument_unknown",
-    "tool_argument_conflict",
-    "tool_argument_missing",
-})
 
 
 def _argument_rejected_before_execution(receipt: Any) -> bool:
@@ -2440,6 +2438,7 @@ def _install_task_command_policy(client: Any, request: Mapping[str, Any]) -> Non
             command,
             spec=policy_spec,
             workspace=workspace,
+            shell=kwargs.get("shell", args[3] if len(args) > 3 else None),
         )
         if denial:
             raise ToolPolicyDeniedError(denial, code=denial_code or "command_policy_classification_unknown")
@@ -4587,6 +4586,19 @@ class AgentTaskInvocationService:
                                                 for key, value in tool_result.items()
                                                 if key not in {"tool", "name", "arguments", "args", "output", "result"}
                                             }
+                                            # Provenance is accepted only from the server-authored
+                                            # tool_end of a not-executed failure, reduced to a fixed
+                                            # code and digests; a same-named field is never evidence.
+                                            receipt_metadata.pop("argument_rejection", None)
+                                            if (
+                                                tool_result.get("executed") is False
+                                                and tool_result.get("synthetic") is False
+                                                and not bool(tool_result.get("success"))
+                                                and not tool_result.get("blocked_reason")
+                                            ):
+                                                rejection = safe_argument_rejection(tool_result.get("argument_rejection"))
+                                                if rejection:
+                                                    receipt_metadata["argument_rejection"] = rejection
                                             if not str(receipt_metadata.get("error_code") or "").strip():
                                                 structured_code = _structured_error_code(
                                                     tool_result.get("output"),

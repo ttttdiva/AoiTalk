@@ -991,6 +991,7 @@ def check_command(
     *,
     spec: LocalAgentTaskSpec,
     workspace: Path,
+    shell: str | None = None,
 ) -> Optional[str]:
     """Return a denial reason, or ``None`` when the command text is allowed."""
 
@@ -1001,7 +1002,7 @@ def check_command(
         return "empty command"
     if len(text) > 8000:
         return "command is too long"
-    if _command_looks_destructive(text):
+    if _command_looks_destructive(text, shell=shell):
         return ("destructive command blocked (delete / overwrite redirect / reset --hard / clean -f / "
                 "force push etc.). Use the file tools for edits; never discard existing changes")
     if _SECRET_PATH_TOKEN_RE.search(text):
@@ -1187,11 +1188,12 @@ def check_command_denial(
     *,
     spec: LocalAgentTaskSpec,
     workspace: Path,
+    shell: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Return the unchanged denial reason and a fixed, fail-closed policy code."""
 
     text = str(command or "")
-    reason = check_command(text, spec=spec, workspace=workspace)
+    reason = check_command(text, spec=spec, workspace=workspace, shell=shell)
     if reason is None:
         return None, None
     blocking_code = _blocking_command_policy_code(text, spec=spec, workspace=workspace)
@@ -1903,7 +1905,9 @@ class ToolGuard:
                 return self._deny("execute_command", "working_directory_not_directory")
         except OSError:
             return self._deny("execute_command", "working_directory_unavailable")
-        reason = check_command(command, spec=self.ctx.spec, workspace=self.workspace)
+        reason = check_command(
+            command, spec=self.ctx.spec, workspace=self.workspace, shell=kwargs.get("shell")
+        )
         if reason:
             return self._deny("execute_command", reason)
         background = bool(kwargs.get("run_in_background"))

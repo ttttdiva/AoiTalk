@@ -84,6 +84,9 @@ SessionId = Annotated[str, Field(pattern=SESSION_ID_PATTERN)]
 
 SAFE_ERROR_CODES = {
     "agent_inactive",
+    "session_binding_unsafe",
+    "session_cancelling",
+    "session_turn_in_flight",
     "agent_not_configured",
     "agent_not_found",
     "agent_revision_missing",
@@ -184,6 +187,9 @@ SAFE_ERROR_CODES = {
 }
 
 MESSAGES = {
+    "session_binding_unsafe": "セッションの紐付けが安全ではありません。",
+    "session_cancelling": "セッションのキャンセル処理中です。",
+    "session_turn_in_flight": "セッションで処理中のターンがあります。",
     "agent_inactive": "指定したAgentは無効です。",
     "agent_not_configured": "委譲先Agentが設定されていません。",
     "agent_not_found": "指定したAgentが見つかりません。",

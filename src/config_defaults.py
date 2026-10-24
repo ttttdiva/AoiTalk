@@ -183,7 +183,7 @@ openrouter:
   base_url: https://openrouter.ai/api/v1
   model: openai/gpt-5.5
   model_provider_options: {}
-  enable_tools: false
+  enable_tools: true
   app_name: AoiTalk
   site_url: ''
 deepinfra:

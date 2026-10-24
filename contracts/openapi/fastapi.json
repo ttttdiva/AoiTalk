@@ -27715,6 +27715,52 @@
         "title": "IntegrationCredentialResponse",
         "type": "object"
       },
+      "InteractiveHistoryFenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledgment": {
+            "const": "provider_outcome_unknown_no_replay",
+            "title": "Acknowledgment",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "expected_state_digest": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected State Digest"
+          },
+          "idempotency_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "idempotency_key",
+          "acknowledgment"
+        ],
+        "title": "InteractiveHistoryFenceRequest",
+        "type": "object"
+      },
       "JoinRequestPayload": {
         "description": "Payload for submitting join request",
         "properties": {
@@ -58517,6 +58563,56 @@
           }
         },
         "summary": "Cancel",
+        "tags": [
+          "agent-work"
+        ]
+      }
+    },
+    "/api/agent-work/{work_item_id}/history-fence": {
+      "post": {
+        "operationId": "history_fence_api_agent_work__work_item_id__history_fence_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InteractiveHistoryFenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "History Fence",
         "tags": [
           "agent-work"
         ]

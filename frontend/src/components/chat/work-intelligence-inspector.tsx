@@ -7,6 +7,7 @@ import type {
   ContextManifestInspector,
   ContextSnapshotBinding,
 } from "@/lib/chat-api";
+import { withBasePath } from "@/lib/base-path";
 
 function shortHash(value: string | null | undefined): string {
   const text = String(value || "").trim();
@@ -330,7 +331,7 @@ export function WorkIntelligenceInspector({
                   return (
                     <li key={`${reference.ref_hash}-${index}`} className="min-w-0 text-[10px]">
                       {href ? (
-                        <a href={href} className="flex min-w-0 items-center gap-2 hover:underline" rel="noreferrer">
+                        <a href={/^\/(?:tasks|docs|operations)(?:[\/?#]|$)/u.test(href) ? withBasePath(href) : href} className="flex min-w-0 items-center gap-2 hover:underline" rel="noreferrer">
                           {body}
                         </a>
                       ) : (

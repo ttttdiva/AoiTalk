@@ -3,19 +3,33 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
 
-from . import LEASE_TTL_SECONDS, MAX_BODY_BYTES, PROTOCOL_VERSION
+from . import LEASE_TTL_SECONDS, MAX_BODY_BYTES, PROTOCOL_VERSION, acquisition_digest
 from . import registry
 
 log = logging.getLogger(__name__)
+
+# Terminal outcomes of acquisitions stay answerable (bounded) after they leave ``pending``: a
+# party that lost the reply must be able to learn that its acquisition can no longer start anything.
+FINISHED_LIMIT = 1024
+FINISHED_STATUS_LIMIT = 256
+
+
+def _create_time(pid):
+    try:
+        return psutil.Process(pid).create_time() if pid else None
+    except psutil.Error:
+        return None
 
 
 class Conflict(RuntimeError):
@@ -43,11 +57,29 @@ class Coordinator:
         self.cancelled = set()
         self.runtimes = {}
         self.pending = {}
+        # endpoint -> digest of the acquisition that *started* the current incarnation. Unlike a
+        # ticket it is not dropped when that acquisition is cancelled or released.
+        self.origins = {}
+        self.finished = OrderedDict()  # acquisition digest -> terminal outcome
 
     def capabilities(self):
         return {"service": "aoitalk-shared-local-runtime", "protocol_version": PROTOCOL_VERSION,
                 "broker_id": self.broker_id, "ttl_seconds": LEASE_TTL_SECONDS,
-                "capabilities": ["consumer-leases", "generation-leases", "launch-fingerprint", "safe-unload"]}
+                "capabilities": ["consumer-leases", "generation-leases", "launch-fingerprint", "safe-unload",
+                                 "acquisition-provenance", "incarnation-fenced-stop"]}
+
+    def _digest(self, key):
+        return acquisition_digest(self.broker_id, key[0], key[1])
+
+    def _finish(self, key, outcome):
+        with self.lock:
+            digest = self._digest(key)
+            if self.finished.get(digest) == "succeeded":
+                return  # a later conflicting call on the same id never downgrades a real success
+            self.finished[digest] = outcome
+            self.finished.move_to_end(digest)
+            while len(self.finished) > FINISHED_LIMIT:
+                self.finished.popitem(last=False)
 
     def _client(self, data, *, register=False):
         client_id = _uuid(data.get("client_id"), "client_id")
@@ -107,6 +139,16 @@ class Coordinator:
         model = data.get("profile_id")
         key = (client, request)
         signature = (model, data.get("snapshot_id"), kind)
+        try:
+            reply = self._acquire_registered(data, client, key, signature)
+        except BaseException as exc:
+            self._finish(key, "cancelled" if isinstance(exc, Conflict) and "cancelled" in str(exc).lower() else "failed")
+            raise
+        self._finish(key, "succeeded")
+        return reply
+
+    def _acquire_registered(self, data, client, key, signature):
+        model, kind = data.get("profile_id"), data.get("kind")
         # Serializes cold starts and switches; releases never acquire this lock.
         with self._acquisition_lifecycle(client, key):
             with self.lock:
@@ -144,17 +186,34 @@ class Coordinator:
                 raise Conflict("The endpoint is leased with a different launch configuration or an active generation")
         if cancel_event.is_set():
             raise Conflict("Acquisition was cancelled")
-        if current and changed:
+        if current and (changed or bool(data.get("force_restart"))):
+            # A replacement may only spawn once the previous incarnation is *observed* gone. A stop
+            # that raises propagates (the old record stands untouched); a stop that has no effect or
+            # whose state cannot be read leaves the old record in place, and spawning over it would
+            # make a failed new ``ensure`` look like the old runtime's provenance. The lifecycle lock
+            # already serializes replacements, so this check cannot race another one.
             self.backend.stop(current)
-        started = self.backend.ensure(target, force_restart=bool(data.get("force_restart")),
-                                      wait_for_model_ready=bool(data.get("wait_for_model_ready", True)),
-                                      cancel_event=cancel_event)
+            self._forget_if_stopped(endpoint, current)
+            with self.lock:
+                if self.runtimes.get(endpoint) is current:
+                    raise Conflict("Previous runtime has not been confirmed stopped; replacement refused")
+        try:
+            started = self.backend.ensure(target, force_restart=bool(data.get("force_restart")),
+                                          wait_for_model_ready=bool(data.get("wait_for_model_ready", True)),
+                                          cancel_event=cancel_event)
+        except BaseException:
+            self._record_residual(endpoint, target, key)
+            raise
+        # The runtime exists from here on. It is published (with who launched it) *before* anything
+        # else can fail, and it only leaves that record once it is observed gone: a failed or
+        # cancelled acquisition whose stop did not take effect must stay visible and attributable.
+        self._record_runtime(endpoint, target, key, started)
         # Generation begin must verify model readiness, even for an already running route.
         with self.lock:
             cancelled = key in self.cancelled or not self._client_still_alive(client)
         if cancelled:
             if started:
-                self.backend.stop(target)
+                self._stop_started(endpoint, target)
             raise Conflict("Acquisition was cancelled")
         try:
             lease = self.backend.acquire(target, kind, cancel_event=cancel_event)
@@ -162,7 +221,7 @@ class Coordinator:
             # A newly started worker belongs to this acquisition. Reused
             # workers and other consumers retain their existing ownership.
             if started:
-                self.backend.stop(target)
+                self._stop_started(endpoint, target)
             raise
         ticket = str(uuid.uuid4())
         reply = {key: value for key, value in target.items() if key in {"profile_id", "base_url", "model", "launch_fingerprint", "runtime"}}
@@ -172,18 +231,63 @@ class Coordinator:
         except Exception:
             lease.release()
             if started:
-                self.backend.stop(target)
+                self._stop_started(endpoint, target)
             raise
         with self.lock:
             if key in self.cancelled or not self._client_still_alive(client):
                 lease.release()
                 if started:
-                    self.backend.stop(target)
+                    self._stop_started(endpoint, target)
                 raise Conflict("Acquisition was cancelled")
-            self.runtimes[endpoint] = target
             self.tickets[ticket] = {"client": client, "target": target, "kind": kind, "lease": lease, "seen": self.clock()}
             self.requests[key] = {"signature": signature, "ticket": ticket, "reply": reply}
         return reply
+
+    def _record_runtime(self, endpoint, target, key, started):
+        with self.lock:
+            self.runtimes[endpoint] = target
+            if started or endpoint not in self.origins:
+                # Whoever *started* this incarnation owns its provenance; a reuser never takes it over.
+                self.origins[endpoint] = self._digest(key)
+
+    def _record_residual(self, endpoint, target, key):
+        """``ensure`` raised: a process it already started may still be alive. Never read the failure
+        as absence - register what is running, with this acquisition as its origin, and try to stop it."""
+        with self.lock:
+            if endpoint in self.runtimes:
+                return  # an earlier, registered runtime: its provenance stands
+            try:
+                running = bool(self.backend.status(target).get("running"))
+            except Exception:
+                # The identity of whatever ``ensure`` may have spawned is unknown, so nothing is
+                # stopped blind; the runtime and the acquisition that started it are still
+                # registered, because an unreadable backend is not evidence of absence.
+                log.warning("Runtime state after a failed start could not be read", exc_info=True)
+                self._record_runtime(endpoint, target, key, True)
+                return
+        if running:
+            self._record_runtime(endpoint, target, key, True)
+            self._stop_started(endpoint, target)
+
+    def _stop_started(self, endpoint, target):
+        """Stop a runtime this acquisition started. A stop that fails or has no effect leaves it
+        registered (visible, attributable, stoppable by incarnation); it is forgotten only once the
+        backend reports it not running."""
+        try:
+            self.backend.stop(target)
+        except Exception:
+            log.exception("Shared runtime stop after a failed acquisition did not complete")
+        self._forget_if_stopped(endpoint, target)
+
+    def _forget_if_stopped(self, endpoint, target):
+        with self.lock:
+            try:
+                running = bool(self.backend.status(target).get("running"))
+            except Exception:
+                running = True  # unknown is not gone
+            if not running and self.runtimes.get(endpoint) is target:
+                self.runtimes.pop(endpoint, None)
+                self.origins.pop(endpoint, None)
 
     def cancel(self, data):
         client = self._client(data, register=True)
@@ -241,35 +345,76 @@ class Coordinator:
         return {"released": self._release(client, _uuid(data.get("ticket"), "ticket"))}
 
     def _stop_if_idle(self, target):
+        self._stop_idle(target, None)
+
+    def _stop_idle(self, target, fence):
+        """Stop an idle runtime under the lifecycle lock; True when a stop was attempted.
+
+        With a ``fence`` the incarnation is verified *here*, inside the lifecycle lock and
+        immediately before the stop. Replacing a runtime takes that same lock, so nothing can swap
+        in a different process between the check and the stop (a mismatch raises ``Conflict``)."""
         with self.lifecycle:
             with self.lock:
                 if any(t["target"]["base_url"] == target["base_url"] for t in self.tickets.values()):
-                    return
+                    return False
                 current = self.runtimes.get(target["base_url"])
                 if current is None or current["launch_fingerprint"] != target["launch_fingerprint"]:
-                    return
+                    return False
+                if fence is not None and not self._verify_incarnation(current, fence):
+                    return False  # already gone: nothing of that incarnation is left to stop
             try:
                 self.backend.stop(target)
                 with self.lock:
                     if not self.backend.status(target).get("running"):
                         self.runtimes.pop(target["base_url"], None)
+                        self.origins.pop(target["base_url"], None)
             except Exception:
                 log.exception("Idle shared runtime cleanup failed")
+            return True
+
+    @staticmethod
+    def _incarnation_fence(data):
+        """Optional identity fence for a stop: the incarnation the caller verified, not just a profile."""
+        pid, created, fingerprint = data.get("expect_pid"), data.get("expect_created"), data.get("expect_launch_fingerprint")
+        if pid is None and created is None and fingerprint is None:
+            return None
+        if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+                or isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created)
+                or not isinstance(fingerprint, str) or not fingerprint):
+            raise ValueError("expect_pid, expect_created and expect_launch_fingerprint are required together")
+        return pid, float(created), fingerprint
+
+    def _verify_incarnation(self, target, fence):
+        """The broker holds the real process: compare pid, create_time and launch build against it."""
+        pid, created, fingerprint = fence
+        if target["launch_fingerprint"] != fingerprint:
+            raise Conflict("Runtime launch configuration changed; stop refused")
+        status = self.backend.status(target)
+        if not status.get("running"):
+            return False  # already gone: nothing of that incarnation is left to stop
+        if status.get("pid") != pid or _create_time(status.get("pid")) != created:
+            raise Conflict("Runtime incarnation changed; stop refused")
+        return True
 
     def stop(self, data):
         if data.get("broker_id") != self.broker_id:
             raise Conflict("Stale broker_id")
         self._client(data, register="client_pid" in data)
         model = data.get("profile_id")
+        fence = self._incarnation_fence(data)
         with self.lock:
             if any(not model or p["profile_id"] == model for p in self.pending.values()):
                 raise Conflict("Runtime startup is still owned; cancel its acquisition first")
             targets = [t for t in self.runtimes.values() if not model or t["profile_id"] == model]
             if any(t["target"] in targets for t in self.tickets.values()):
                 raise Conflict("Runtime is still leased; release its consumers and generations first")
+            if fence is not None and (not model or len(targets) != 1):
+                raise Conflict("An incarnation-fenced stop needs exactly one runtime of one profile")
+        stopped = 0
         for target in targets:
-            self._stop_if_idle(target)
-        return {"stopped": len(targets)}
+            # The fence is verified again inside the lifecycle lock, right before the stop.
+            stopped += bool(self._stop_idle(target, fence))
+        return {"stopped": stopped}
 
     def reap(self):
         """Heartbeat expiry prompts a liveness check, never revokes a live generation.
@@ -309,16 +454,27 @@ class Coordinator:
         with self.lock:
             pending = [
                 {"profile_id": item["profile_id"], "kind": item["kind"],
-                 "cancel_requested": item["cancel_event"].is_set()}
-                for item in self.pending.values()
+                 "cancel_requested": item["cancel_event"].is_set(), "acq": self._digest(key)}
+                for key, item in self.pending.items()
             ]
+            owner = {record["ticket"]: key for key, record in self.requests.items()}
             runtimes = []
             for target in self.runtimes.values():
                 item = {k: target[k] for k in ("profile_id", "base_url", "model", "runtime", "launch_fingerprint")}
                 item.update(self.backend.status(target))
-                own = [t for t in self.tickets.values() if t["target"]["base_url"] == target["base_url"]]
-                item.update(consumers=sum(t["kind"] == "consumer" for t in own), generations=sum(t["kind"] == "generation" for t in own))
+                own = [(identifier, t) for identifier, t in self.tickets.items()
+                       if t["target"]["base_url"] == target["base_url"]]
+                item.update(consumers=sum(t["kind"] == "consumer" for _, t in own),
+                            generations=sum(t["kind"] == "generation" for _, t in own))
+                # Provenance for ownership decisions. Digests only: the plain client/request ids stay private.
+                item["create_time"] = _create_time(item.get("pid"))
+                item["origin"] = self.origins.get(target["base_url"])
+                item["holders"] = [
+                    {"acq": self._digest(owner[identifier]) if identifier in owner else None, "kind": t["kind"]}
+                    for identifier, t in own]
                 runtimes.append(item)
+            finished = [{"acq": digest, "outcome": outcome}
+                        for digest, outcome in list(self.finished.items())[-FINISHED_STATUS_LIMIT:]]
         profiles = []
         for path in sorted((self.registry_root / "profiles").glob("*.json")):
             try:
@@ -327,7 +483,7 @@ class Coordinator:
             except (OSError, ValueError, KeyError):
                 continue
         return {"broker_id": self.broker_id, "runtimes": runtimes, "profiles": profiles,
-                "pending_acquisitions": pending}
+                "pending_acquisitions": pending, "finished_acquisitions": finished}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -420,7 +576,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON")))
             if not isinstance(data, dict):
                 raise ValueError("JSON object required")
-            allowed = {"client_id", "client_pid", "request_id", "profile_id", "kind", "broker_id", "ticket", "tickets", "snapshot_id", "force_restart", "wait_for_model_ready"}
+            allowed = {"client_id", "client_pid", "request_id", "profile_id", "kind", "broker_id", "ticket", "tickets", "snapshot_id", "force_restart", "wait_for_model_ready",
+                       "expect_pid", "expect_created", "expect_launch_fingerprint"}
             if set(data) - allowed:
                 raise ValueError("Unknown control fields")
             self._send(200, getattr(self.server.coordinator, action)(data))

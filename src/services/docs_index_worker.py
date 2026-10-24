@@ -9,6 +9,8 @@ from sqlalchemy import select, text, update
 
 from ..memory.models.docs_agent import DocsIndexQueue
 from .docs_consistency import DOCS_LOCK_NAMESPACE, contract_available
+from .embedding_feature import runtime_embedding_enabled
+from .gpu_admission import get_gpu_admission
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,25 @@ class DocsIndexWorker:
         docs_index._durable_worker_active = False
 
     async def run_once(self):
+        """Reindex one library under a GPU job ticket; no lock or session while a lease holds the GPU."""
+        # Master switch OFF: return before the GPU ticket so no admission,
+        # lock, session or queue write happens; in-flight work is untouched.
+        if not runtime_embedding_enabled():
+            return False
+        admission = get_gpu_admission()
+        ticket = admission.admit_job()
+        if ticket is None:
+            return False
+        try:
+            return await self._deliver_once()
+        finally:
+            admission.finish_job(ticket)
+
+    async def _deliver_once(self):
+        # Master switch OFF: no session, lock, index or queue write, even for a
+        # cached/injected Docs index; the reason field is untouched.
+        if not runtime_embedding_enabled():
+            return False
         from ..rag.docs_index import docs_rag_enabled, get_docs_index_service
         if self.index is None and not docs_rag_enabled():
             return False

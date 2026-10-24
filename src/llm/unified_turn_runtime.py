@@ -25,6 +25,7 @@ from ..tools.core import (
     ToolArgumentValidationError,
     ToolPolicyDeniedError,
     argument_correlation,
+    safe_argument_rejection,
 )
 from ..tools.registry import ToolRegistry
 from ..services.agent_team_service import (
@@ -869,6 +870,26 @@ class UnifiedToolResult:
     policy_denial: Mapping[str, str] | None = None
 
     @property
+    def tool_end_argument_rejection(self) -> dict[str, str]:
+        """Rejection provenance for stream/audit projections ({} when none).
+
+        Only a not-executed, non-synthetic, unblocked failure can be a schema
+        rejection; every other outcome (success, execution, policy/authority
+        refusal, breaker) carries no such evidence even if a field is set.
+        """
+
+        if (
+            self.success
+            or self.executed
+            or self.synthetic
+            or self.blocked_reason
+            or self.policy_denial
+            or self.generation_failure is not None
+        ):
+            return {}
+        return safe_argument_rejection(self.argument_rejection)
+
+    @property
     def model_output(self) -> str:
         if _is_command_tool_name(self.call.tool):
             try:
@@ -1270,10 +1291,15 @@ class RegistryToolRouter:
         enforce_tool_policy: bool = True,
         failure_breaker: ToolFailureCircuitBreaker | None = None,
         no_progress_guard: ToolNoProgressGuard | None = None,
+        provider_label: str = "",
     ):
         self.registry = registry
         self.log_prefix = log_prefix
         self.config = config
+        # Route identity of the provider executing this turn.  It is supplied
+        # by the caller (never inferred from a model name); empty means a
+        # generic loop with no provider-specific approval boundary.
+        self.provider_label = str(provider_label or "").strip().casefold()
         # Optional provider reference lets request-time policy follow a
         # client's replaced Config object, not only mutations to the original
         # mapping captured by a persistent registry.
@@ -1818,20 +1844,80 @@ class RegistryToolRouter:
             return self._framework_block_result(blocked, source="tool_policy")
         return blocked
 
+    def _provider_identity(self) -> str:
+        if self.provider_label:
+            return self.provider_label
+        return str(getattr(self.client, "provider_label", "") or "").strip().casefold()
+
+    def _forced_approval_required(self, call: UnifiedToolCall, tool_def: Any) -> bool:
+        """Ordinary, unbound OpenRouter turns must approve every mutation.
+
+        OpenRouter tools default to ON, so a provider-chosen write/command must
+        not ride the permissive default ``CONFIRM_DESTRUCTIVE`` policy.  Bound
+        Agent scopes, structured tasks and other providers keep their own rules.
+        """
+
+        if self._provider_identity() != "openrouter":
+            return False
+        from ..services.turn_context import get_turn_context
+        from .tool_policy import (
+            current_structured_task_mode,
+            get_current_agent_tool_scope,
+            tool_definition_is_mutating,
+        )
+
+        if get_current_agent_tool_scope() is not None:
+            return False
+        if current_structured_task_mode() is not None:
+            return False
+        if getattr(get_turn_context(), "agent_execution_binding", None) is not None:
+            return False
+        return tool_definition_is_mutating(call.tool, tool_definition=tool_def)
+
+    def _approval_denied_result(
+        self,
+        call: UnifiedToolCall,
+        reason: str,
+    ) -> UnifiedToolResult:
+        observable_name = observable_tool_name(self.registry, call.tool)
+        return UnifiedToolResult(
+            call=call,
+            output=f"Tool permission denied: `{observable_name}` was not approved.",
+            success=False,
+            error="",
+            blocked_reason=reason,
+            # A denied, errored or unanswerable approval never ran the tool.
+            executed=False,
+        )
+
     def _approval_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
         registry_get = getattr(self.registry, "get", None)
         if not callable(registry_get):
             return None
         tool_def = registry_get(call.tool)
-        if tool_def is None or not getattr(tool_def, "requires_approval", False):
+        if tool_def is None:
             return None
+        try:
+            forced = self._forced_approval_required(call, tool_def)
+        except Exception as exc:
+            logger.error(
+                "[%s] Forced approval classification failed: exception_type=%s",
+                self.log_prefix,
+                type(exc).__name__,
+            )
+            return self._approval_denied_result(call, "tool approval unavailable")
+        if not forced and not getattr(tool_def, "requires_approval", False):
+            return None
+        reason = "tool permission denied"
         try:
             from ..tools.external_llm_permission import check_permission_sync
 
+            extra = {"force_required": True} if forced else {}
             approved = check_permission_sync(
                 call.tool,
                 dict(call.arguments or {}),
                 f"Run tool `{call.tool}`",
+                **extra,
             )
         except Exception as exc:
             logger.error(
@@ -1841,15 +1927,10 @@ class RegistryToolRouter:
                 type(exc).__name__,
             )
             approved = False
+            reason = "tool approval unavailable"
         if approved:
             return None
-        observable_name = observable_tool_name(self.registry, call.tool)
-        return UnifiedToolResult(
-            call=call,
-            output=f"Tool permission denied: `{observable_name}` was not approved.",
-            success=False,
-            error="",
-        )
+        return self._approval_denied_result(call, reason)
 
     async def _approval_block_result_async(
         self,
@@ -1859,16 +1940,32 @@ class RegistryToolRouter:
         if not callable(registry_get):
             return None
         tool_def = registry_get(call.tool)
-        if tool_def is None or not getattr(tool_def, "requires_approval", False):
+        if tool_def is None:
             return None
+        try:
+            forced = self._forced_approval_required(call, tool_def)
+        except Exception as exc:
+            logger.error(
+                "[%s] Forced approval classification failed: exception_type=%s",
+                self.log_prefix,
+                type(exc).__name__,
+            )
+            return self._approval_denied_result(call, "tool approval unavailable")
+        if not forced and not getattr(tool_def, "requires_approval", False):
+            return None
+        reason = "tool permission denied"
         try:
             from ..tools.external_llm_permission import check_permission
 
+            extra = {"force_required": True} if forced else {}
             approved = await check_permission(
                 call.tool,
                 dict(call.arguments or {}),
                 f"Run tool `{call.tool}`",
+                **extra,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error(
                 "[%s] Tool approval check failed: tool=%s exception_type=%s",
@@ -1877,15 +1974,10 @@ class RegistryToolRouter:
                 type(exc).__name__,
             )
             approved = False
+            reason = "tool approval unavailable"
         if approved:
             return None
-        observable_name = observable_tool_name(self.registry, call.tool)
-        return UnifiedToolResult(
-            call=call,
-            output=f"Tool permission denied: `{observable_name}` was not approved.",
-            success=False,
-            error="",
-        )
+        return self._approval_denied_result(call, reason)
 
     def _policy_denied_result(
         self,
@@ -3112,6 +3204,7 @@ def run_openai_compatible_turn_loop(
     after_provider_call: Callable[[Any | None], Any] | None = None,
     tool_call_identity_check: Callable[[str, str, dict[str, Any]], str | None]
     | None = None,
+    provider_label: str = "",
 ) -> UnifiedTurnResult:
     """Run a Codex-style OpenAI-compatible tool loop.
 
@@ -3150,6 +3243,7 @@ def run_openai_compatible_turn_loop(
         client=client,
         user_input=effective_user_input,
         enforce_tool_policy=enforce_tool_policy,
+        provider_label=provider_label,
     )
     current_messages = list(initial_messages)
     # ``current_messages`` is the canonical turn transcript returned to the
@@ -3572,6 +3666,10 @@ def run_openai_compatible_turn_loop(
             if result.blocked_reason:
                 tool_result_payload["blocked_reason"] = _bounded_tool_end_text(
                     result.blocked_reason
+                )
+            if result.tool_end_argument_rejection:
+                tool_result_payload["argument_rejection"] = (
+                    result.tool_end_argument_rejection
                 )
             tool_result_payload["tool_call_id"] = operation_id
             _emit_sync(
@@ -4029,6 +4127,11 @@ def run_cli_tool_call_loop(
                         **(
                             {"blocked_reason": result.blocked_reason}
                             if result.blocked_reason
+                            else {}
+                        ),
+                        **(
+                            {"argument_rejection": result.tool_end_argument_rejection}
+                            if result.tool_end_argument_rejection
                             else {}
                         ),
                     },

@@ -25,6 +25,7 @@ import {
   type KnowledgeCaptureCandidate,
   type KnowledgeCaptureDraft,
 } from "@/lib/knowledge-capture";
+import { withBasePath } from "@/lib/base-path";
 
 type ProjectKnowledgeCapturePanelProps = {
   projectId: string;
@@ -782,7 +783,7 @@ function CandidateDetail({
           <div className="flex flex-wrap gap-2">
             {candidate.published.docsNodeId && isUuid(candidate.published.docsNodeId) ? (
               <a
-                href={`/docs/${encodeURIComponent(candidate.published.docsNodeId)}`}
+                href={withBasePath(`/docs/${encodeURIComponent(candidate.published.docsNodeId)}`)}
                 className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-sm text-primary hover:bg-accent"
               >
                 <FileText className="size-3.5" />
@@ -791,7 +792,7 @@ function CandidateDetail({
             ) : null}
             {candidate.published.sourceTaskId && isUuid(candidate.published.sourceTaskId) ? (
               <a
-                href={`/tasks/${encodeURIComponent(candidate.published.sourceTaskId)}`}
+                href={withBasePath(`/tasks/${encodeURIComponent(candidate.published.sourceTaskId)}`)}
                 className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-sm text-primary hover:bg-accent"
               >
                 <BookOpen className="size-3.5" />

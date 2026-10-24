@@ -27,6 +27,7 @@ from ..memory.database import get_database_manager
 from ..memory.models import (
     Agent,
     AgentExecutionBinding,
+    AgentPrivateRoot,
     AgentProjectGrant,
     AgentRevision,
     AgentRun,
@@ -1142,7 +1143,7 @@ class ConversationAgentService:
         limit: int = 100,
         db_session: Any | None = None,
     ) -> list[dict[str, Any]]:
-        """Return only active Agents usable by this human in this scope."""
+        """Return active Agents usable by this human here, minus others' Private Roots."""
 
         actor = self._actor_uuid(actor_user_id)
         sid = _uuid(session_id, "session_id", required=False)
@@ -1183,10 +1184,25 @@ class ConversationAgentService:
                 raise ConversationAgentAuthorizationError(code="project_read_denied")
 
             safe_limit = min(max(int(limit or 100), 1), 200)
+            # Private RootのAgentはowner限定で扱う。他者のPrivate Rootに登録された
+            # Agentはadminのactorでも選択一覧へ出さない。呼び出し元自身のRootと、
+            # Private Rootを持たない通常Agentは従来どおり可視のままとする。
+            # 除外は下のAgent一括selectへ相関サブクエリとして埋め込み、
+            # Agentごとの追加クエリ（N+1）を作らない。
+            hidden_foreign_root = (
+                select(AgentPrivateRoot.id)
+                .where(
+                    AgentPrivateRoot.agent_id == Agent.id,
+                    AgentPrivateRoot.state != "deleted",
+                    AgentPrivateRoot.owner_user_id != actor,
+                )
+                .exists()
+            )
             agents = (
                 await session.execute(
                     select(Agent)
                     .where(Agent.state == "active")
+                    .where(~hidden_foreign_root)
                     .order_by(Agent.display_name, Agent.id)
                     .limit(safe_limit * 2)
                 )

@@ -528,7 +528,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                       外部送信の保護、Provider表示、固有Routing、ローカルRuntimeを管理します。
                     </HelpPopover>
                   </div>
-                  {isAdmin && activeSection === "privacy" && <EmbeddingRuntimePanel />}
+                  {activeSection === "privacy" && <EmbeddingRuntimePanel isAdmin={isAdmin} />}
                   <LlmProviderVisibilitySettings
                     providers={catalog?.providers ?? []}
                     globalVisibility={catalog?.provider_visibility}

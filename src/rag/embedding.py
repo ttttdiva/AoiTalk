@@ -19,6 +19,8 @@ import time
 from typing import Any
 import uuid
 
+from ..services.embedding_feature import runtime_embedding_enabled_async
+from ..services.gpu_admission import WAIT_SLICE_SECONDS, get_gpu_admission
 from .config import EmbeddingConfig
 from .embedding_identity import (
     DIMENSION,
@@ -30,6 +32,46 @@ from .embedding_text import safe_embedding_request_diagnostics
 from .index_io import run_index_io
 
 logger = logging.getLogger(__name__)
+
+# A stopped worker cannot use these scratch directories anymore. If Windows
+# briefly refuses a delete (for example, a scanner still holds a file handle),
+# defer that cleanup and keep GPU release tied to process absence.
+_PENDING_WORKER_TEMP_DIRS: dict[str, tempfile.TemporaryDirectory] = {}
+_PENDING_WORKER_TEMP_DIRS_LOCK = threading.Lock()
+
+
+def _retry_pending_worker_temp_cleanup() -> None:
+    with _PENDING_WORKER_TEMP_DIRS_LOCK:
+        pending = list(_PENDING_WORKER_TEMP_DIRS.items())
+    for path, temporary in pending:
+        try:
+            temporary.cleanup()
+        except OSError:
+            continue
+        with _PENDING_WORKER_TEMP_DIRS_LOCK:
+            if _PENDING_WORKER_TEMP_DIRS.get(path) is temporary:
+                _PENDING_WORKER_TEMP_DIRS.pop(path, None)
+
+
+def _cleanup_worker_temp_dir(temporary: tempfile.TemporaryDirectory) -> None:
+    path = str(getattr(temporary, "name", ""))
+    try:
+        temporary.cleanup()
+    except OSError as exc:
+        if path:
+            with _PENDING_WORKER_TEMP_DIRS_LOCK:
+                _PENDING_WORKER_TEMP_DIRS[path] = temporary
+        logger.warning(
+            "EmbeddingGemma 2 worker stopped; scratch cleanup deferred: exception_type=%s",
+            type(exc).__name__,
+        )
+
+
+atexit.register(_retry_pending_worker_temp_cleanup)
+
+# How long a request that arrives while a GPU lease owns the device waits before
+# it reports the runtime unavailable (the usual None result, last_error set).
+GPU_ADMISSION_WAIT_SECONDS = 30.0
 
 _SAFE_WORKER_REQUEST_ERROR_CODES = frozenset(
     {"textual_multimodal_placeholder_without_image", "embedding_input_rejected"}
@@ -74,6 +116,9 @@ class EmbeddingGemma2Embedding:
         self._idle_generation = 0
         self._last_used_at = None
         self._last_release_reason = None
+        # Explicit master switch: False means "forced OFF" and is authoritative
+        # over an observed True; None means "follow the observed feature flag".
+        self._master_override = None
         self._idle_timeout_seconds = float(getattr(config, "idle_timeout_seconds", 300.0))
         if not math.isfinite(self._idle_timeout_seconds) or self._idle_timeout_seconds < 0:
             raise ValueError("idle_timeout_seconds must be finite and non-negative")
@@ -104,6 +149,7 @@ class EmbeddingGemma2Embedding:
         if self._process is not None and self._process.poll() is None:
             return
         self._stop()
+        _retry_pending_worker_temp_cleanup()
         python = (
             Path(self.config.worker_python)
             if self.config.worker_python
@@ -174,8 +220,8 @@ class EmbeddingGemma2Embedding:
             self._log.close()
             self._log = None
         if self._temporary:
-            self._temporary.cleanup()
-            self._temporary = None
+            temporary, self._temporary = self._temporary, None
+            _cleanup_worker_temp_dir(temporary)
 
     def _exchange(self, op, payload, request_id, cancelled):
         if cancelled.is_set():
@@ -317,21 +363,77 @@ class EmbeddingGemma2Embedding:
             logger.error("EmbeddingGemma 2 worker unavailable: %s", self.last_error)
             return None
 
-    async def _request(self, op, payload):
-        cancelled = threading.Event()
-        with self._admission_lock:
-            if self._closed:
-                raise RuntimeError("embedding_runtime_closed")
-            self._cancel_idle_timer_locked()
-            self._pending_cancellations.add(cancelled)
-            try:
-                future = asyncio.get_running_loop().run_in_executor(
-                    self._executor, self._request_sync, op, payload, uuid.uuid4().hex, cancelled
-                )
-            except BaseException:
+    def _submit_admitted(self, admission, ticket, op, payload, cancelled):
+        """Register the pending IPC and submit it under the admission lock.
+
+        The GPU ticket was taken in the same critical section, so a lease cannot
+        start draining the runtime between the gate decision and the submission.
+        The ticket and pending marker are released by the worker thread's own
+        completion, never by coroutine unwinding: a cancelled caller must not
+        report the GPU idle while the executor is still inside the IPC call.
+        """
+        self._cancel_idle_timer_locked()
+        self._pending_cancellations.add(cancelled)
+        try:
+            future = self._executor.submit(
+                self._request_sync, op, payload, uuid.uuid4().hex, cancelled
+            )
+        except BaseException:
+            self._pending_cancellations.discard(cancelled)
+            self._schedule_idle_timer_locked()
+            admission.finish_request(ticket)
+            raise
+
+        def settled(_):
+            with self._admission_lock:
                 self._pending_cancellations.discard(cancelled)
                 self._schedule_idle_timer_locked()
-                raise
+            admission.finish_request(ticket)
+
+        future.add_done_callback(settled)
+        return future
+
+    async def _request(self, op, payload):
+        """Run one admitted IPC request, or refuse it while embedding is OFF.
+
+        The master switch is read *outside* the admission lock and re-checked
+        inside it. An explicit OFF override is authoritative, so an observed
+        True can never overwrite it. A disabled runtime refuses before any GPU
+        ticket is taken or any executor task is submitted: it never queues,
+        loads, or touches the device, and it reports the usual ``None`` result
+        with ``last_error='embedding_disabled'``.
+        """
+        cancelled = threading.Event()
+        admission = get_gpu_admission()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + GPU_ADMISSION_WAIT_SECONDS
+        while True:
+            # Observational read of the DB-backed flag, outside the lock.
+            observed_enabled = await runtime_embedding_enabled_async()
+            with self._admission_lock:
+                if self._closed:
+                    raise RuntimeError("embedding_runtime_closed")
+                if self._master_override is False or not observed_enabled:
+                    self.last_error = "embedding_disabled"
+                    logger.debug(
+                        "EmbeddingGemma 2 request refused while embedding is "
+                        "disabled: op=%s", op,
+                    )
+                    return None
+                ticket, version = admission.try_admit_request()
+                if ticket is not None:
+                    future = asyncio.wrap_future(
+                        self._submit_admitted(admission, ticket, op, payload, cancelled)
+                    )
+                    break
+            # Deferred by a GPU lease: not a pending IPC, holds no lock and no
+            # worker. Cancelling this wait cannot touch the running process.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self.last_error = "gpu_admission_deferred"
+                logger.warning("EmbeddingGemma 2 request deferred by a GPU lease: op=%s", op)
+                return None
+            await admission.wait_changed(version, min(remaining, WAIT_SLICE_SECONDS))
         try:
             try:
                 return await asyncio.shield(future)
@@ -556,14 +658,29 @@ class EmbeddingGemma2Embedding:
             self._idle_timer = None
 
     def _schedule_idle_timer_locked(self):
-        if (self._closed or self._pending_cancellations or self._process is None
-                or self._idle_timeout_seconds <= 0 or self._last_used_at is None):
+        """Schedule the release timer that follows completed work.
+
+        The closed/pending/process guards stay in force, so an in-flight or
+        queued request is never interrupted. While the master override is
+        False the timer is a near-immediate ``disabled`` drain: it fires even
+        when ``idle_timeout_seconds`` is 0, because an explicit OFF must unload
+        a loaded worker once the last request actually settles. Otherwise the
+        regular idle timeout applies unchanged.
+        """
+        if (self._closed or self._pending_cancellations or self._process is None):
             return
         self._cancel_idle_timer_locked()
-        delay = max(0.001, self._idle_timeout_seconds -
-                    (time.monotonic() - self._last_used_at))
+        if self._master_override is False:
+            delay = 0.001
+            reason = "disabled"
+        else:
+            if self._idle_timeout_seconds <= 0 or self._last_used_at is None:
+                return
+            delay = max(0.001, self._idle_timeout_seconds -
+                        (time.monotonic() - self._last_used_at))
+            reason = "idle"
         timer = threading.Timer(delay, self._release_if_idle,
-                                args=("idle", self._idle_generation))
+                                args=(reason, self._idle_generation))
         timer.name = "embeddinggemma2-idle-release"
         timer.daemon = True
         self._idle_timer = timer
@@ -661,6 +778,31 @@ class EmbeddingGemma2Embedding:
         next request lazily starts the exact same model and vector identity.
         """
         return await asyncio.to_thread(self._release_if_idle)
+
+    def apply_master_enabled(self, enabled: bool):
+        """Apply an explicit master switch; never loads and never cancels work.
+
+        ``False`` records an authoritative OFF override and schedules the
+        near-immediate ``disabled`` drain timer under the admission lock. No
+        pending or in-flight request is cancelled: while work is pending the
+        timer is simply not scheduled, and the existing settled callback
+        schedules it after the future actually completes, so OFF drains and
+        then unloads.
+
+        ``True`` clears the override, cancels any stale ``disabled`` timer and
+        restores the regular idle timer. It does not start, load or warm this
+        runtime; the next admitted ``_request`` loads lazily as usual.
+        """
+        with self._admission_lock:
+            if self._closed:
+                return
+            if not enabled:
+                self._master_override = False
+                self._schedule_idle_timer_locked()
+                return
+            self._master_override = None
+            self._cancel_idle_timer_locked()
+            self._schedule_idle_timer_locked()
 
     @property
     def dimension(self):

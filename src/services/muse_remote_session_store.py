@@ -110,7 +110,9 @@ def _binding_from_context(value: Any) -> MuseBinding:
         raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE)
     raw = value.get("binding") if isinstance(value.get("binding"), Mapping) else value
     try:
-        return MuseBinding(**dict(raw)).normalized()
+        data = dict(raw)
+        data.setdefault("node_id", None)
+        return MuseBinding(**data).normalized()
     except Exception:
         raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE) from None
 
@@ -200,14 +202,19 @@ class MuseRemoteSessionStore:
         finally:
             await self._close(db)
 
-    async def mark_unsafe(self, binding_key: str, *, reason: str) -> None:
+    async def mark_unsafe(self, binding_key: str, *, reason: str, cause: Mapping[str, Any] | None = None) -> None:
         current = await self.get_binding(binding_key)
         if current is None:
             return
+        # Only ever tightens: the binding becomes (or stays) unsafe and is never made safe here.  The
+        # first recorded reason/cause is kept so later failures cannot overwrite the original
+        # evidence.  Both are closed labels/numbers (re-validated by ``MuseBinding.normalized``).
         updated = replace(
             current,
             safe_to_send=False,
             state="unsafe",
+            unsafe_reason=current.unsafe_reason or reason,
+            unsafe_cause=current.unsafe_cause or cause,
         )
         await self.persist_binding(binding_key, updated)
 
@@ -301,6 +308,23 @@ class MuseRemoteTargetResolver:
             raise MuseError(MuseErrorCode.REMOTE_AUTHENTICATION_FAILED)
         if not _as_bool(target.get("egress_enabled"), default=False):
             raise MuseError(MuseErrorCode.OUTBOUND_GATE_REQUIRED)
+        # Configured assertions alone cannot prove that the CLI still reads
+        # the authentication epoch approved by the administrator. Recompute
+        # from private, existing files on every resolution (no login/writes).
+        import hmac
+
+        from .muse_existing_auth import MuseExistingAuthError, inspect_existing_muse_auth
+
+        try:
+            current_auth = inspect_existing_muse_auth(Path(str(state_root)))
+        except MuseExistingAuthError:
+            raise MuseError(MuseErrorCode.CREDENTIAL_UNAVAILABLE) from None
+        if (
+            current_auth.vm_id != vm_id
+            or current_auth.node_id != node_id
+            or not hmac.compare_digest(current_auth.auth_fingerprint, auth_fingerprint)
+        ):
+            raise MuseError(MuseErrorCode.CURRENT_AUTH_MISMATCH)
         return MuseCredentialResolution(
             owner_id=owner,
             credential_ref=credential_ref,

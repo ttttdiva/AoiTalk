@@ -910,7 +910,7 @@ export default function AiModelSettingsScreen() {
           </Surface>
         </View>
       </Surface>
-      {isAuthenticated && user?.role === "admin" && <EmbeddingRuntimePanel />}
+      {isAuthenticated && <EmbeddingRuntimePanel isAdmin={user?.role === "admin"} />}
       <Portal>
         <Dialog
           visible={customInstructionsDialogVisible}

@@ -298,7 +298,8 @@ try {
     [Environment]::SetEnvironmentVariable("AOITALK_PLUGIN_ROOT", $PackageRoot, "Process")
     [Environment]::SetEnvironmentVariable("AOITALK_REPOSITORY_ROOT", $RepoRoot, "Process")
     [Environment]::SetEnvironmentVariable("HEALTH_LISTEN_ADDR", $HealthAddress, "Process")
-    [Environment]::SetEnvironmentVariable("HEALTH_URL_FILE", (Join-Path $LogRoot "health-url.txt"), "Process")
+    # Managed connect owns the per-alias health file; do not inherit a Home override.
+    [Environment]::SetEnvironmentVariable("HEALTH_URL_FILE", $null, "Process")
     [Environment]::SetEnvironmentVariable("PID_FILE", (Join-Path $LogRoot "tunnel-client.pid"), "Process")
     [Environment]::SetEnvironmentVariable("LOG_FILE", $null, "Process")
     [Environment]::SetEnvironmentVariable("XDG_CACHE_HOME", $CacheRoot, "Process")

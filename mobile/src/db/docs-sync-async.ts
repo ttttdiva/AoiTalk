@@ -28,6 +28,36 @@ export type DocsSqliteAsyncTransaction = {
   prepareAsync?: (source: string) => Promise<DocsSqliteAsyncStatement>;
 };
 
+type DocsSqliteOperation = "get_all" | "get_first" | "run" | "prepare" | "execute" | "finalize";
+type DocsSqliteOperationCounters = Record<DocsSqliteOperation, number>;
+
+/** Safe, bounded checkpoint: never retain SQL text, bindings or row contents. */
+export type DocsSqliteProgress = {
+  awaiting: "writer_queue" | "transaction_begin" | "transaction_body" | "sql" | "native_settlement" | "settled";
+  operation: DocsSqliteOperation | null;
+  table: string | null;
+  /** Cumulative API operations across rollback/retry, never a row count. */
+  statements: number;
+  completedStatements: number;
+  attempts: number;
+  operationCounts: DocsSqliteOperationCounters;
+  operationElapsedMs: DocsSqliteOperationCounters;
+  nativeActive: boolean;
+  startedAt: number;
+};
+
+type DocsSqliteObserver = (progress: DocsSqliteProgress) => void;
+
+function docsStatementTable(source: string): string {
+  // Only fixed schema names may cross the diagnostic boundary.
+  return [
+    "docs_scope_membership", "docs_sync_staging", "docs_sync_runs", "sync_state", "outbox",
+    "knowledge_nodes", "knowledge_supertags", "knowledge_node_supertags",
+    "knowledge_supertag_fields", "knowledge_fields", "knowledge_field_values",
+    "knowledge_node_placements", "knowledge_edges",
+  ].find((table) => new RegExp("\\b" + table + "\\b", "i").test(source)) ?? "other";
+}
+
 type DocsSqliteAsyncDatabase = {
   withExclusiveTransactionAsync: <T>(
     task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
@@ -87,28 +117,38 @@ function yieldIfForegroundWriteIsWaiting(): void {
 function guardedDocsTransaction(
   tx: DocsSqliteAsyncTransaction,
   checkActive: () => void,
+  report?: (operation: DocsSqliteProgress["operation"], source: string | null) => void,
 ): DocsSqliteAsyncTransaction {
+  const invoke = async <T>(
+    operation: DocsSqliteProgress["operation"],
+    source: string,
+    task: () => Promise<T>,
+  ): Promise<T> => {
+    report?.(operation, source);
+    try { return await task(); }
+    finally { report?.(null, null); }
+  };
   const yielding: DocsSqliteAsyncTransaction = {
     getAllAsync: <T>(
       source: string,
       ...params: unknown[]
     ): Promise<T[]> => {
       checkActive();
-      return tx.getAllAsync<T>(source, ...params);
+      return invoke("get_all", source, () => tx.getAllAsync<T>(source, ...params));
     },
     getFirstAsync: <T>(
       source: string,
       ...params: unknown[]
     ): Promise<T | null> => {
       checkActive();
-      return tx.getFirstAsync<T>(source, ...params);
+      return invoke("get_first", source, () => tx.getFirstAsync<T>(source, ...params));
     },
     runAsync: (
       source: string,
       ...params: unknown[]
     ): Promise<unknown> => {
       checkActive();
-      return tx.runAsync(source, ...params);
+      return invoke("run", source, () => tx.runAsync(source, ...params));
     },
   };
 
@@ -117,17 +157,17 @@ function guardedDocsTransaction(
       source: string,
     ): Promise<DocsSqliteAsyncStatement> => {
       checkActive();
-      const statement = await tx.prepareAsync!(source);
+      const statement = await invoke("prepare", source, () => tx.prepareAsync!(source));
       return {
         executeAsync: (
           params?: unknown[] | Record<string, unknown>,
         ): Promise<unknown> => {
           checkActive();
-          return statement.executeAsync(params);
+          return invoke("execute", source, () => statement.executeAsync(params));
         },
         // Resource cleanup must never be skipped merely because foreground
         // work arrived while the statement was active.
-        finalizeAsync: () => statement.finalizeAsync(),
+        finalizeAsync: () => invoke("finalize", source, () => statement.finalizeAsync()),
       };
     };
   }
@@ -152,7 +192,41 @@ function guardedDocsTransaction(
 export async function withForegroundYieldingDocsExclusiveTransaction<T>(
   task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
   assertActive: () => void = () => undefined,
+  onProgress?: DocsSqliteObserver,
 ): Promise<T> {
+  let nativeActive = false;
+  let statements = 0;
+  let completedStatements = 0;
+  let attempts = 0;
+  let activeOperation: DocsSqliteOperation | null = null;
+  let operationStartedAt = 0;
+  const operationCounts: DocsSqliteOperationCounters = {
+    get_all: 0, get_first: 0, run: 0, prepare: 0, execute: 0, finalize: 0,
+  };
+  const operationElapsedMs = { ...operationCounts };
+  const report = (
+    awaiting: DocsSqliteProgress["awaiting"],
+    operation: DocsSqliteProgress["operation"] = null,
+    source: string | null = null,
+  ) => {
+    const now = Date.now();
+    if (operation) {
+      statements += 1;
+      operationCounts[operation] += 1;
+      activeOperation = operation;
+      operationStartedAt = now;
+    } else if (activeOperation) {
+      operationElapsedMs[activeOperation] += Math.max(0, now - operationStartedAt);
+      completedStatements += 1;
+      activeOperation = null;
+    }
+    onProgress?.({
+      awaiting, operation, table: source === null ? null : docsStatementTable(source),
+      statements, completedStatements, attempts,
+      operationCounts: { ...operationCounts }, operationElapsedMs: { ...operationElapsedMs },
+      nativeActive, startedAt: now,
+    });
+  };
   const attempt = async (
     tx: DocsSqliteAsyncTransaction,
     yieldToForeground: boolean,
@@ -162,13 +236,37 @@ export async function withForegroundYieldingDocsExclusiveTransaction<T>(
       if (yieldToForeground) yieldIfForegroundWriteIsWaiting();
     };
     checkActive();
-    const result = await task(guardedDocsTransaction(tx, checkActive));
+    const result = await task(guardedDocsTransaction(tx, checkActive, (operation, source) =>
+      report(operation ? "sql" : "transaction_body", operation, source),
+    ));
     // Cancellation must roll back even when it arrives after the final SQL.
     checkActive();
     return result;
   };
+  const runAttempt = (foreground: boolean): Promise<T> => {
+    report("writer_queue");
+    const schedule = foreground ? runForegroundSqliteWrite : runBackgroundSqliteWrite;
+    return schedule(async () => {
+      // A cancelled queued promotion must not open a transaction in a new scope.
+      assertActive();
+      attempts += 1;
+      nativeActive = true;
+      report("transaction_begin");
+      try {
+        return await executeDocsExclusiveTransaction(async (tx) => {
+          report("transaction_body");
+          try { return await attempt(tx, !foreground); }
+          finally { report("native_settlement"); }
+        });
+      } finally {
+        // Expo settles only after COMMIT/ROLLBACK and connection close.
+        nativeActive = false;
+        report("settled");
+      }
+    });
+  };
   try {
-    return await withDocsExclusiveTransaction((tx) => attempt(tx, true));
+    return await runAttempt(false);
   } catch (error) {
     if (!(error instanceof ForegroundSqliteWriteRequestedError)) {
       throw error;
@@ -176,9 +274,7 @@ export async function withForegroundYieldingDocsExclusiveTransaction<T>(
     // Native rollback has completed. Join behind already-waiting interactive
     // writes, then finish exactly one atomic retry without voluntary rollback.
     // Real SQLite/callback failures still reject and release the queue.
-    return runForegroundSqliteWrite(() =>
-      executeDocsExclusiveTransaction((tx) => attempt(tx, false)),
-    );
+    return runAttempt(true);
   }
 }
 

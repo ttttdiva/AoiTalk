@@ -18,6 +18,7 @@ import {
   chatApi,
   type CliSessionCreateRequest,
 } from "@/lib/chat-api";
+import { withBasePath } from "@/lib/base-path";
 import {
   executionAvailabilityLabel,
   providerReadinessLabel,
@@ -321,7 +322,7 @@ export function AgentCliSessionLauncher(props: AgentCliSessionLauncherProps) {
                 <p>CLIセッション作成と初回turnの送信受付が完了しました。セッション詳細ではprepared / sentの証拠を確認できます。provider固有の受領は共通には確認されていません。</p>
                 <a
                   className="break-all underline underline-offset-2"
-                  href={`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`}
+                  href={withBasePath(`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`)}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -333,7 +334,7 @@ export function AgentCliSessionLauncher(props: AgentCliSessionLauncherProps) {
                 <p>CLIセッションは作成済みです。初回turnは未受付のため、同じidempotency keyで再送できます。</p>
                 <a
                   className="break-all underline underline-offset-2"
-                  href={`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`}
+                  href={withBasePath(`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`)}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -345,7 +346,7 @@ export function AgentCliSessionLauncher(props: AgentCliSessionLauncherProps) {
                 <p>作成されたCLIセッションの固定contextを照合できません。初回turnは送信しません。</p>
                 <a
                   className="break-all underline underline-offset-2"
-                  href={`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`}
+                  href={withBasePath(`/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}`)}
                   target="_blank"
                   rel="noreferrer"
                 >

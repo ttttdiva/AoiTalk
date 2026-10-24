@@ -564,18 +564,216 @@ def _mask_python_code_args(text: str) -> str:
 
     return _PYTHON_C_ARG_PATTERN.sub(_replace, text)
 
+# 引用された awk プログラムの比較演算子 `>` / `>=` はシェルのリダイレクトではない。
+# 呼び出し位置（command 位置の awk とその直後の単一引用）と、プログラム内の
+# 文脈（print/printf 文の外、かつ括弧の外でない比較）を両方確認できたものだけを
+# 無害化する。それ以外は従来どおり `_OVERWRITE_REDIRECT_PATTERN` に残す。
+#
+# command 位置とは、文頭または区切り（`;` `&` `|` `(` 改行。`\` で無効化された
+# もの、`>|` `<&` のようなリダイレクト演算子の一部は除く）の直後で、間に置けるのは
+# `NAME=value` の環境変数代入だけ。`eval awk '...'` `sh -c awk '...'` `xargs awk`
+# のように別のコマンドの引数になっている awk は、その引用が後段で外れ得る
+# （eval は引数を結合して再評価する）ので対象にしない。
+_AWK_INVOCATION_TAIL = re.compile(
+    r"(?:^|(?<![\\<>])[;&|(\n])\s*"
+    r"(?:[A-Za-z_]\w*=(?:'[^']*'|\"[^\"]*\"|[^\s'\"`$;&|<>()\\]*)\s+)*"
+    r"(?:[\w.\-:~/\\]*[/\\])?(?i:(?:g|m|n)?awk(?:\.exe)?)"
+    r"(?:\s+(?:-F\s*(?:'[^']*'|\"[^\"]*\"|[^\s'\"`$;&|<>()]+)"
+    r"|-v\s*[A-Za-z_]\w*=(?:'[^']*'|\"[^\"]*\"|[^\s'\"`$;&|<>()]*)))*\s+$"
+)
 
-def _command_looks_destructive(command: str) -> bool:
+_AWK_TOKEN_PATTERN = re.compile(
+    r"""(?P<space>[ \t\r\f]+)
+    |(?P<newline>\n)
+    |(?P<comment>\#[^\n]*)
+    |(?P<string>"(?:\\.|[^"\\\n])*")
+    |(?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)
+    |(?P<word>[A-Za-z_]\w*)
+    |(?P<op>>>|>=|&&|\|\||[^\s\w"\#/])""",
+    re.VERBOSE,
+)
+
+# この直後が演算対象（正規表現リテラルが書ける位置）になる語。
+_AWK_OPERAND_AFTER_WORDS = frozenset(
+    {"print", "printf", "return", "else", "do", "in"}
+)
+_AWK_COMPARISON_PLACEHOLDER = "≥"
+
+
+def _unquoted_single_quote_spans(text: str) -> Optional[list[tuple[int, int]]]:
+    """引用外で開いた単一引用の範囲（開始, 終了）を返す。引用が閉じなければ ``None``。"""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    size = len(text)
+    while index < size:
+        char = text[index]
+        if char == "\\":
+            index += 2
+        elif char == "'":
+            end = text.find("'", index + 1)
+            if end < 0:
+                return None
+            spans.append((index, end))
+            index = end + 1
+        elif char == '"':
+            index += 1
+            while index < size and text[index] != '"':
+                index += 2 if text[index] == "\\" else 1
+            if index >= size:
+                return None
+            index += 1
+        else:
+            index += 1
+    return spans
+
+
+def _awk_regex_end(program: str, start: int) -> Optional[int]:
+    """``/.../`` 正規表現リテラルの終端（直後の位置）。閉じなければ ``None``。"""
+    index = start + 1
+    in_class = False
+    while index < len(program):
+        char = program[index]
+        if char == "\n":
+            return None
+        if char == "\\":
+            index += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+        elif char == "[":
+            in_class = True
+            if program[index + 1 : index + 2] == "^":
+                index += 1
+            if program[index + 1 : index + 2] == "]":
+                index += 1
+        elif char == "/":
+            return index + 1
+        index += 1
+    return None
+
+
+def _awk_tokens(program: str) -> Optional[list[tuple[str, str, int]]]:
+    """awk プログラムを (種別, 文字列, 位置) へ分割する。解析できなければ ``None``。"""
+    tokens: list[tuple[str, str, int]] = []
+    previous: Optional[tuple[str, str, int]] = None
+    position = 0
+    while position < len(program):
+        if program[position] == "/":
+            operand_expected = (
+                previous is None
+                or previous[0] == "newline"
+                or (previous[0] == "op" and previous[1] not in (")", "]"))
+                or (previous[0] == "word" and previous[1] in _AWK_OPERAND_AFTER_WORDS)
+            )
+            if operand_expected:
+                end = _awk_regex_end(program, position)
+                if end is None:
+                    return None
+                previous = ("regex", program[position:end], position)
+                tokens.append(previous)
+                position = end
+            else:
+                previous = ("op", "/", position)
+                tokens.append(previous)
+                position += 1
+            continue
+        match = _AWK_TOKEN_PATTERN.match(program, position)
+        if match is None:
+            return None
+        kind = match.lastgroup or ""
+        if kind not in ("space", "comment"):
+            previous = (kind, match.group(), position)
+            tokens.append(previous)
+        position = match.end()
+    return tokens
+
+
+def _neutralize_awk_comparisons(program: str) -> str:
+    """awk プログラム内の比較演算子の ``>`` だけを無害な文字へ置き換える。
+
+    ``print`` / ``printf`` 文の括弧外にある ``>`` ``>=`` は出力リダイレクト
+    （または比較との曖昧な形）なので触らない。``system()``・パイプ・``@``・
+    解析できない構文を含むプログラムも触らず、従来の保守的な判定へ任せる。
+    """
+    tokens = _awk_tokens(program)
+    if tokens is None:
+        return program
+    depth = 0
+    in_print = False
+    comparisons: list[int] = []
+    for kind, text, start in tokens:
+        if kind == "word":
+            if text == "system":
+                return program
+            if text in ("print", "printf") and depth == 0:
+                in_print = True
+        elif kind == "op":
+            if text in ("(", "["):
+                depth += 1
+            elif text in (")", "]"):
+                depth -= 1
+                if depth < 0:
+                    return program
+            elif text in (";", "}") and depth == 0:
+                in_print = False
+            elif text in ("|", "@"):
+                return program
+            elif text in (">", ">="):
+                if depth == 0 and in_print:
+                    return program
+                comparisons.append(start)
+    if depth != 0 or not comparisons:
+        return program
+    chars = list(program)
+    for start in comparisons:
+        chars[start] = _AWK_COMPARISON_PLACEHOLDER
+    return "".join(chars)
+
+
+def _mask_awk_program_args(text: str) -> str:
+    """リダイレクト判定用に、引用された awk プログラム内の比較演算子を無害化する。
+
+    ``awk [-F sep] [-v name=value] '<program>'`` の形で、``awk`` が引用の外に
+    あるときだけ対象にする。引用が閉じない・バッククォートを含むなど、
+    シェルの解釈を確定できないコマンドは触らない。
+    """
+    if "`" in text:
+        return text
+    spans = _unquoted_single_quote_spans(text)
+    if not spans:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if not _AWK_INVOCATION_TAIL.search(text[:start]):
+            continue
+        program = text[start + 1 : end]
+        masked = _neutralize_awk_comparisons(program)
+        if masked != program:
+            pieces.append(text[cursor : start + 1])
+            pieces.append(masked)
+            cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _command_looks_destructive(command: str, *, shell: Optional[str] = None) -> bool:
     """コマンド文字列が取り返しのつかない操作かどうかを判定する。
 
     確認ダイアログを出すかどうかだけを決める緩い判定で、判定できない場合は
     ``False``（確認しない）を返す。既定は自由側に倒す方針のため。
+
+    ``shell`` が ``cmd`` のときは単一引用が引用にならないため、引用された
+    awk プログラム内の比較演算子も従来どおりリダイレクトとして扱う。
     """
     text = str(command or "").strip()
     if not text:
         return False
     if any(pattern.search(text) for pattern in _DESTRUCTIVE_COMMAND_PATTERNS):
         return True
+    if str(shell or "").strip().casefold() != "cmd":
+        text = _mask_awk_program_args(text)
     return bool(_OVERWRITE_REDIRECT_PATTERN.search(_mask_python_code_args(text)))
 
 
@@ -770,7 +968,9 @@ class ExternalLLMPermissionManager:
                 return True
             if tool_name in COMMAND_TOOLS:
                 command = str((tool_args or {}).get("command") or "")
-                return _command_looks_destructive(command)
+                return _command_looks_destructive(
+                    command, shell=(tool_args or {}).get("shell")
+                )
             return False
         if permission_policy == PermissionPolicy.CONFIRM_MUTATIONS:
             return tool_name in MUTATION_TOOLS
@@ -816,7 +1016,8 @@ class ExternalLLMPermissionManager:
         self,
         tool_name: str,
         tool_args: Dict[str, Any],
-        description: str = ""
+        description: str = "",
+        force_required: bool = False,
     ) -> bool:
         """
         Request permission from user for external LLM API call.
@@ -825,6 +1026,9 @@ class ExternalLLMPermissionManager:
             tool_name: Name of the tool
             tool_args: Arguments being passed to the tool
             description: Human-readable description of the action
+            force_required: Caller-decided boundary (for example an ordinary
+                OpenRouter turn): ask even when the active policy would not.
+                Never auto-approves; without a UI the request is denied.
             
         Returns:
             True if approved, False if denied or timeout
@@ -842,11 +1046,20 @@ class ExternalLLMPermissionManager:
             return False
 
         # Auto-approve if configured/current mode allows it.
-        if not self.is_permission_required(tool_name, tool_args):
+        if not force_required and not self.is_permission_required(tool_name, tool_args):
             return True
 
         # このセッションで同種の操作を既に許可済みなら、聞き直さない。
-        cache_key = self._approval_cache_key(tool_name, tool_args)
+        # A forced boundary (ordinary OpenRouter mutation) never shares a
+        # session approval across unidentified scopes: without a reliable
+        # user/session scope the cache is neither read nor persisted, so the
+        # request is asked once and every later request asks again.
+        cache_key = (
+            None
+            if force_required
+            and not _scope_is_real(permission_user_id, permission_session_id)
+            else self._approval_cache_key(tool_name, tool_args)
+        )
         if cache_key and cache_key in self._session_approvals:
             logger.info(
                 "[ExternalLLMPermission] セッション承認キャッシュにより自動許可: %s",
@@ -1612,7 +1825,12 @@ async def request_external_model_prompt(
     )
 
 
-async def check_permission(tool_name: str, tool_args: Dict[str, Any], description: str = "") -> bool:
+async def check_permission(
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    description: str = "",
+    force_required: bool = False,
+) -> bool:
     """
     Convenience function to check permission for a tool.
     
@@ -1622,12 +1840,17 @@ async def check_permission(tool_name: str, tool_args: Dict[str, Any], descriptio
         description: Human-readable description of the action
         
     Returns:
-        True if approved (or no manager/auto-approve), False if denied
+        True if approved (or no manager/auto-approve), False if denied.
+        With ``force_required`` a missing manager is a denial, not an approval.
     """
     manager = get_permission_manager()
     if manager is None:
-        return True
-    
+        return not force_required
+
+    if force_required:
+        return await manager.request_permission(
+            tool_name, tool_args, description, force_required=True
+        )
     return await manager.request_permission(tool_name, tool_args, description)
 
 
@@ -1636,8 +1859,18 @@ def check_permission_sync(
     tool_args: Dict[str, Any],
     description: str = "",
     timeout: int = 360,
+    force_required: bool = False,
 ) -> bool:
     """Synchronously check permission from sync tool functions."""
+    if force_required:
+        def check_permission_coro():
+            return check_permission(
+                tool_name, tool_args, description, force_required=True
+            )
+    else:
+        def check_permission_coro():
+            return check_permission(tool_name, tool_args, description)
+
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -1648,13 +1881,13 @@ def check_permission_sync(
                 future = executor.submit(
                     lambda: context.run(
                         asyncio.run,
-                        check_permission(tool_name, tool_args, description),
+                        check_permission_coro(),
                     )
                 )
                 return bool(future.result(timeout=timeout))
-        return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
+        return bool(asyncio.run(check_permission_coro()))
     except RuntimeError:
-        return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
+        return bool(asyncio.run(check_permission_coro()))
     except Exception:
         logger.error("[ExternalLLMPermission] Permission check failed")
         return False

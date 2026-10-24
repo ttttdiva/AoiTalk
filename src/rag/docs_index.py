@@ -48,6 +48,7 @@ from ..memory.models import (
 )
 from ..security.field_crypto import decrypt_json_value_if_needed, decrypt_text_if_needed
 from ..services.docs_graph_service import docs_searchable_body_text
+from ..services.embedding_feature import runtime_embedding_enabled
 from .config import RagConfig, get_rag_config
 from .docs_search_telemetry import DocsIndexSearchTelemetry
 from .embedding import EmbeddingGemma2Embedding, get_embedding
@@ -103,6 +104,10 @@ class _LocalNodeIdValues(list[str]):
 
 
 def docs_rag_enabled(config: Optional[RagConfig] = None) -> bool:
+    # Master semantic switch first: OFF returns before config resolution, model
+    # load or index/Qdrant initialization. ON keeps the docs gate below as-is.
+    if not runtime_embedding_enabled():
+        return False
     cfg = config or get_rag_config()
     return bool(getattr(cfg, "docs_enabled", False)) and QDRANT_AVAILABLE
 
@@ -200,18 +205,20 @@ class DocsIndexService:
 
     async def initialize(self) -> bool:
         """Search/read path: stay off after a failed init for this process."""
+        if not docs_rag_enabled(self.config):
+            return False
         if self._initialized:
             return True
-        if self._disabled or not docs_rag_enabled(self.config):
+        if self._disabled:
             return False
         return await self._do_initialize()
 
     async def initialize_for_reindex(self) -> bool:
         """Reindex path: retry initialization after a bounded backoff."""
-        if self._initialized:
-            return True
         if not docs_rag_enabled(self.config):
             return False
+        if self._initialized:
+            return True
         if self._disabled:
             if not self._reindex_retry_allowed():
                 return False
@@ -336,6 +343,10 @@ class DocsIndexService:
     async def _upsert_points(self, points: list) -> None:
         if not points or self.client is None:
             return
+        # Re-check at the write boundary as master OFF can land after a worker
+        # acquired a session or finished an embedding request.
+        if not docs_rag_enabled(self.config):
+            raise DocsIndexUnavailable("Docs semantic index is disabled")
         await self._index_io(
             self.client.upsert,
             collection_name=self.collection_name,
@@ -345,6 +356,8 @@ class DocsIndexService:
     async def _delete_ids(self, node_ids: list[uuid.UUID | str]) -> None:
         if not node_ids or self.client is None or models is None:
             return
+        if not docs_rag_enabled(self.config):
+            raise DocsIndexUnavailable("Docs semantic index is disabled")
         await self._index_io(
             self.client.delete,
             collection_name=self.collection_name,
@@ -1231,9 +1244,18 @@ async def search_docs_index_with_telemetry(
     allowed_node_ids: Iterable[uuid.UUID] | None = None,
     tag: str = "",
     turn_project_id: uuid.UUID | None = None,
+    _semantic_enabled: bool | None = None,
 ) -> DocsIndexSearchResult:
-    """Entry point used by ``docs_search`` with semantic-lane telemetry."""
-    if docs_library_id is None or not docs_rag_enabled():
+    """Entry point used by ``docs_search`` with semantic-lane telemetry.
+
+    ``_semantic_enabled`` is the request-sampled decision. ``False`` refuses
+    before any index/Qdrant/embedding work; ``True`` only skips this entry
+    re-sample, ``DocsIndexService.search`` and the embedding runtime still
+    re-check the master switch. ``None`` (other callers) keeps the guard here.
+    """
+    if _semantic_enabled is None:
+        _semantic_enabled = docs_rag_enabled()
+    if docs_library_id is None or not _semantic_enabled:
         return DocsIndexService._empty_search_result(fallback_reason="disabled")
     try:
         return await get_docs_index_service().search(
@@ -1319,9 +1341,11 @@ async def flush_pending_docs_reindex() -> None:
 async def _drain_docs_reindex_once() -> bool:
     if not _dirty:
         return False
+    if not docs_rag_enabled():
+        return False
     await _wait_reindex_worker_backoff()
     await asyncio.sleep(2.0)  # debounce a burst of edits
-    if not _dirty:
+    if not _dirty or not docs_rag_enabled():
         return False
     pending = list(_dirty)
     _dirty.clear()
@@ -1362,7 +1386,7 @@ async def _drain_worker() -> None:
             continue
     finally:
         _worker_started = False
-        if _dirty:
+        if _dirty and docs_rag_enabled():
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:

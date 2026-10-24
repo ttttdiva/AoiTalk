@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Loader2, MessageSquare, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { chatApi } from "@/lib/chat-api";
+import { withBasePath } from "@/lib/base-path";
 import { createRegularNewChatSession } from "@/lib/create-regular-new-chat-session";
 import { navigateChatSessionInPlace } from "@/lib/chat-navigation";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
@@ -138,7 +139,7 @@ export function ChatQuickPanelNavigation() {
                   <SidebarMenuButton
                     render={
                       <a
-                        href={href}
+                        href={withBasePath(href)}
                         onClick={(event) =>
                           handleSessionNavigation(event, href, router)
                         }
@@ -176,7 +177,7 @@ export function ChatQuickPanelNavigation() {
           {chatSessions?.sessions && chatSessions.sessions.length > QUICK_SESSION_LIMIT && (
             <li className="px-3 pt-2">
               <a
-                href="/chat"
+                href={withBasePath("/chat")}
                 className="block rounded-md px-2 py-1.5 text-center text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
                 onClick={(event) => handleSessionNavigation(event, "/chat", router)}
               >

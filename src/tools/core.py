@@ -128,6 +128,45 @@ def argument_correlation(arguments: Any, tool_name: str = "") -> Dict[str, str]:
     return result
 
 
+ARGUMENT_REJECTION_CODES = frozenset({
+    "tool_argument_invalid",
+    "tool_argument_unknown",
+    "tool_argument_conflict",
+    "tool_argument_missing",
+})
+_ARGUMENT_REJECTION_DIGEST_KEYS = (
+    "target_digest",
+    "query_digest",
+    "start_digest",
+    "end_digest",
+    "offset_digest",
+    "max_chars_digest",
+)
+_ARGUMENT_REJECTION_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def safe_argument_rejection(value: Any) -> Dict[str, str]:
+    """Reduce rejection provenance to a fixed server code plus well-formed digests.
+
+    Anything else (a free-form string, an unknown key, a malformed digest, an
+    unlisted code) is dropped, so a field a provider or tool merely names
+    ``argument_rejection`` cannot become correlation evidence. ``{}`` means the
+    rejection carries no usable provenance.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    code = value.get("code")
+    if not isinstance(code, str) or code not in ARGUMENT_REJECTION_CODES:
+        return {}
+    safe: Dict[str, str] = {"code": code}
+    for key in _ARGUMENT_REJECTION_DIGEST_KEYS:
+        digest = value.get(key)
+        if isinstance(digest, str) and _ARGUMENT_REJECTION_DIGEST_RE.fullmatch(digest):
+            safe[key] = digest
+    return safe
+
+
 class ToolArgumentValidationError(ValueError):
     """Safe deterministic failure raised before a tool callable is invoked."""
 

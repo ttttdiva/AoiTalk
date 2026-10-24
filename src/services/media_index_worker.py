@@ -11,6 +11,8 @@ import sqlite3
 import time
 import uuid
 
+from .embedding_feature import runtime_embedding_enabled
+from .gpu_admission import get_gpu_admission
 from .media_index_maintenance import prepare_lifecycle_schema
 
 log = logging.getLogger(__name__)
@@ -19,6 +21,10 @@ log = logging.getLogger(__name__)
 # ordinary/heavy Files jobs (10/20). Lease ownership and backoff still apply.
 PRIORITY_CLEANUP = -10
 MAX_ENQUEUE_BATCH = 100
+# Failure reasons that retrying the same generation can never fix: the original
+# has no decoder (MediaPreparationService.iter_prepare). Storage, runtime and
+# model failures stay out of this set and keep their backoff retries.
+TERMINAL_FAILURE_REASONS = frozenset({"unsupported_media"})
 
 
 class MediaIndexQueue:
@@ -214,9 +220,13 @@ class MediaIndexQueue:
         actor, kind, source_id, generation, attempts, token = job
         state = "done" if result.get("status") in {"ready", "excluded"} else "pending"
         # ``attempts`` is the count before this claim incremented it.
-        if state == "pending" and max_attempts is not None and attempts + 1 >= max_attempts:
-            # Files jobs stop after a bounded number of attempts; a content
-            # change (new generation) or a manual retry re-queues them.
+        if state == "pending" and (
+            (result.get("status") == "failed" and result.get("reason") in TERMINAL_FAILURE_REASONS)
+            or (max_attempts is not None and attempts + 1 >= max_attempts)
+        ):
+            # Files jobs stop after a bounded number of attempts, and a
+            # deterministic decoder gap cannot succeed for this generation; a
+            # content change (new generation) or a manual retry re-queues them.
             state = "failed"
         # Retry runtime/model failures; checkpoints resume already verified units.
         due = (
@@ -241,6 +251,21 @@ class MediaIndexQueue:
                     token,
                 ),
             )
+
+    def requeue_unstarted(self, job):
+        """Give back a claim that never began: pending again at once, no attempt consumed.
+
+        Used when the claiming worker was cancelled between ``claim`` and any work, so the
+        row does not sit 'running' behind its 900 second lease. Token-fenced like ``finish``.
+        """
+        actor, kind, source_id, _, _, token = job
+        with self.connect() as db:
+            return db.execute(
+                """UPDATE media_jobs SET state='pending',due=0,token=NULL,
+                attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END
+                WHERE actor=? AND kind=? AND source_id=? AND token=? AND state='running'""",
+                (actor, kind, source_id, token),
+            ).rowcount
 
     def renew(self, job):
         """Keep a long audio/video job leased only while this worker owns it."""
@@ -352,6 +377,10 @@ def _files_index_settings():
 
 
 def _enabled_kinds():
+    # Master semantic switch first: OFF yields no kinds before any per-source
+    # setting is read, so callers never claim, queue or index work.
+    if not runtime_embedding_enabled():
+        return ()
     from ..knowledge.index_service import _knowledge_search_enabled
     from .media_index_reconciliation import KINDS
 
@@ -518,6 +547,9 @@ class MediaIndexWorker:
             await asyncio.sleep(self.poll_seconds)
 
     async def reconcile_once(self, *, kinds=None):
+        # Master switch OFF: no checkpoint read, no session, no queue write.
+        if not runtime_embedding_enabled():
+            return False
         from .media_index_reconciliation import KINDS, canonical_media_page
 
         checkpoint = await asyncio.to_thread(self.queue.reconciliation_checkpoint, KINDS if kinds is None else kinds)
@@ -540,10 +572,76 @@ class MediaIndexWorker:
                 await session.close()
 
     async def run_once(self, *, kinds=None):
+        """Admit one GPU job ticket, then claim, index and finish under it.
+
+        Every lane (main, extra Files lanes, direct callers) enters here. The
+        ticket is taken before ``queue.claim`` and held through
+        ``queue.finish`` - including ``claim is None``, failures and
+        cancellation - so a lease can drain running jobs without ever
+        cancelling one. While a lease owns the GPU no claim happens and queue
+        rows stay untouched; reconciliation and enqueue are not gated.
+        """
+        # Master switch OFF: return before the GPU ticket, so no admission,
+        # claim or queue write happens; accepted in-flight work is untouched.
+        if not runtime_embedding_enabled():
+            return False
+        admission = get_gpu_admission()
+        ticket = admission.admit_job()
+        if ticket is None:
+            return False
+        try:
+            return await self._run_admitted_job(kinds)
+        finally:
+            admission.finish_job(ticket)
+
+    async def _finish_job(self, job, result, **kwargs):
+        # The ticket may only be released once the queue write really finished.
+        from ..api.router_helpers import await_task_completion_before_cancellation
+
+        await await_task_completion_before_cancellation(
+            asyncio.to_thread(self.queue.finish, job, result, **kwargs)
+        )
+
+    async def _claim(self, kinds):
+        """Run ``queue.claim`` to its real end, whatever happens to the caller.
+
+        A thread cannot be interrupted, so abandoning the await would free the GPU job ticket
+        while the claim can still commit. A cancelled caller keeps waiting (repeated
+        cancellation included), hands back a row it did claim - nothing ran, so no attempt is
+        spent and no 900 second 'running' orphan is left - and only then re-raises.
+        """
+        from ..api.router_helpers import await_task_completion_before_cancellation
+
+        claim = asyncio.ensure_future(asyncio.to_thread(self.queue.claim, kinds))
+        try:
+            return await asyncio.shield(claim)
+        except asyncio.CancelledError as cancellation:
+            task = asyncio.current_task()
+            if task is not None:
+                task.uncancel()
+            while not claim.done():
+                try:
+                    await asyncio.shield(claim)
+                except asyncio.CancelledError:
+                    if task is not None:
+                        task.uncancel()
+                except Exception:
+                    break
+            job = None if claim.cancelled() or claim.exception() is not None else claim.result()
+            if job is not None:
+                try:
+                    await await_task_completion_before_cancellation(
+                        asyncio.to_thread(self.queue.requeue_unstarted, job)
+                    )
+                except Exception:
+                    log.warning("Could not hand back a cancelled media index claim", exc_info=True)
+            raise cancellation
+
+    async def _run_admitted_job(self, kinds):
         from ..rag.media_index import get_media_index_service
         from .search_sources import SearchSourceResolver, SearchScope, SourceRef
 
-        job = await asyncio.to_thread(self.queue.claim, kinds)
+        job = await self._claim(kinds)
         if job is None:
             return False
         actor, kind, source_id, *_ = job
@@ -570,10 +668,8 @@ class MediaIndexWorker:
                 resolver = SearchSourceResolver(session, SearchScope(uuid.UUID(actor)))
                 result = await (self.service or get_media_index_service()).sync_source(resolver, SourceRef(kind, source_id))
         except asyncio.CancelledError:
-            await asyncio.to_thread(
-                self.queue.finish,
-                job,
-                {"status": "failed", "reason": "cancelled; retry resumes units"},
+            await self._finish_job(
+                job, {"status": "failed", "reason": "cancelled; retry resumes units"}
             )
             raise
         except Exception as exc:
@@ -589,7 +685,7 @@ class MediaIndexWorker:
         max_attempts = None
         if kind == "workspace_file":
             max_attempts = int(_files_index_settings().get("max_failed_attempts") or 5)
-        await asyncio.to_thread(self.queue.finish, job, result, max_attempts=max_attempts)
+        await self._finish_job(job, result, max_attempts=max_attempts)
         return True
 
 

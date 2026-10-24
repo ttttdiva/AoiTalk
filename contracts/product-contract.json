@@ -1956,6 +1956,123 @@
           "then": "live ACL-filtered bounded projections are shown; offline reads are forbidden and no Agent identity grants access to a private session"
         }
       ]
+    },
+    {
+      "id": "settings.embedding.read",
+      "domain": "settings",
+      "criticality": "p1",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "get_settings_api_settings_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.settings.ai_model"
+        ],
+        "entry_points": [
+          "parent.settings"
+        ],
+        "implementation": "mobile/src/components/embedding-runtime-panel.tsx"
+      },
+      "roles": [
+        "user",
+        "member",
+        "owner",
+        "admin"
+      ],
+      "permissions": [
+        "read"
+      ],
+      "scope": {
+        "kind": "auth_user",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "forbidden",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "none",
+      "mutation": "none",
+      "acceptance": [
+        {
+          "id": "settings.embedding.read.visible",
+          "given": "an authenticated user of any role opens AI model settings online",
+          "when": "the embedding master switch is rendered",
+          "then": "the persisted server value is shown; an unknown or failed read is never guessed as ON, and a non-admin sees the switch disabled with the admin-required reason and issues no runtime or PATCH request"
+        }
+      ]
+    },
+    {
+      "id": "settings.embedding.manage",
+      "domain": "settings",
+      "criticality": "p1",
+      "transport": "fastapi",
+      "operations": [
+        {
+          "operation_id": "update_setting_api_settings_patch",
+          "transport": "fastapi",
+          "method": "PATCH",
+          "role": "update"
+        },
+        {
+          "operation_id": "get_embedding_runtime_api_runtime_embedding_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "release_embedding_runtime_api_runtime_embedding_release_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        }
+      ],
+      "mobile": {
+        "routes": [
+          "tabs.settings.ai_model"
+        ],
+        "entry_points": [
+          "parent.settings"
+        ],
+        "implementation": "mobile/src/components/embedding-runtime-panel.tsx"
+      },
+      "roles": [
+        "admin"
+      ],
+      "permissions": [
+        "manage"
+      ],
+      "scope": {
+        "kind": "auth_user",
+        "visibility": "auth_user"
+      },
+      "offline": {
+        "read": "forbidden",
+        "mutation": "forbidden",
+        "reconnect": "refresh"
+      },
+      "persistence": "server",
+      "mutation": "direct_online",
+      "acceptance": [
+        {
+          "id": "settings.embedding.manage.save",
+          "given": "an admin changes the embedding master switch online",
+          "when": "the single save completes or fails",
+          "then": "only a strictly persisted boolean response changes the switch; a failure reloads the real value; role loss, unmount and stale responses are discarded; no offline queue is used"
+        },
+        {
+          "id": "settings.embedding.manage.off",
+          "given": "the master switch is saved OFF",
+          "when": "runtime status is observed after the save",
+          "then": "draining, unloading and released are shown from fresh post-save observations only, a failed observation is not shown as released, and manual release is preserved; ON lazy-loads the model on the next inference"
+        }
+      ]
     }
   ]
 }

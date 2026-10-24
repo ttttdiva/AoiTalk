@@ -1196,16 +1196,23 @@ async function seedDefaultDocsWorkspace(
   );
 
   for (const tag of DEFAULT_DOCS_SUPERTAGS) {
-    let targetTag = tag.systemKey ? tagsBySystemKey.get(tag.systemKey) : undefined;
-    targetTag = targetTag ?? tagsByName.get(tag.name);
+    // systemKey だけが system 所有の証拠。同名の利用者作成タグは採用も上書きもしない。
+    let targetTag = tag.systemKey ? tagsBySystemKey.get(tag.systemKey) : tagsByName.get(tag.name);
+    const created = !targetTag;
     if (!targetTag) {
+      let createdName = tag.name;
+      if (tagsByName.has(createdName)) {
+        // 利用者作成の同名タグとの unique 衝突を避けて system タグを作る。
+        createdName = `${tag.name} (${tag.systemKey})`;
+        while (tagsByName.has(createdName)) createdName += "_";
+      }
       const [createdTag] = await tx
         .insert(knowledgeSupertags)
         .values({
           docsLibraryId,
           parentSupertagId: null,
           systemKey: tag.systemKey ?? null,
-          name: tag.name,
+          name: createdName,
           baseType: tag.baseType,
           description: tag.description,
           icon: tag.icon,
@@ -1217,9 +1224,12 @@ async function seedDefaultDocsWorkspace(
         })
         .returning();
       targetTag = createdTag;
-      tagsByName.set(tag.name, createdTag);
+      tagsByName.set(createdTag.name, createdTag);
       if (createdTag.systemKey) tagsBySystemKey.set(createdTag.systemKey, createdTag);
     }
+
+    // systemKey の無い既存タグは利用者作成と区別できないため、schema も補完しない。
+    if (!created && !tag.systemKey) continue;
 
     if (tag.fields.length > 0) {
       const existingFields = await tx
@@ -1274,28 +1284,16 @@ async function seedDefaultDocsWorkspace(
           )
           .onConflictDoNothing();
       }
-      const pinnedIds = tag.pinnedFieldKeys
-        .map((name) => refreshedFields.find((field) => field.name === name)?.id)
-        .filter((id): id is string => !!id);
-      await tx
-        .update(knowledgeSupertags)
-        .set({
-          baseType: tag.baseType,
-          systemKey: tag.systemKey ?? targetTag.systemKey ?? null,
-          description: tag.description,
-          icon: tag.icon,
-          color: tag.color,
-          templateJson: tag.templateJson,
-          pinnedFieldIds: pinnedIds,
-          // 既存 config_json を温存し、seed が宣言したキー(tools 等)だけ浅くマージ上書きする。
-          // backend(docs_workspace.py)の {**current_config, "tools": ...} と挙動を揃える。
-          ...(tag.configJson
-            ? { configJson: { ...normalizeJsonObject(targetTag.configJson ?? {}), ...tag.configJson } }
-            : {}),
-          aiInstructions: tag.aiInstructions,
-          updatedAt: new Date(),
-        })
-        .where(eq(knowledgeSupertags.id, targetTag.id));
+      if (created) {
+        // pin は利用者が編集できるため、初回作成時だけ既定値(field id)を入れる。
+        const pinnedIds = tag.pinnedFieldKeys
+          .map((name) => refreshedFields.find((field) => field.name === name)?.id)
+          .filter((id): id is string => !!id);
+        await tx
+          .update(knowledgeSupertags)
+          .set({ pinnedFieldIds: pinnedIds, updatedAt: new Date() })
+          .where(eq(knowledgeSupertags.id, targetTag.id));
+      }
     }
   }
 

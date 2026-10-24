@@ -46,6 +46,7 @@ from .tool_policy import (
     agent_tool_scope_permits_exposure,
     SEARCH_TOOL_NAMES,
     command_capabilities_from_text,
+    embedding_master_enabled,
     get_current_user_input,
     sanitize_command_capabilities,
 )
@@ -624,6 +625,79 @@ def effective_tool_pack_session(
     return session
 
 
+# Request-local lexical-only catalog projection for the semantic retrieval tool.
+#
+# The canonical ``search_past_chats`` definition lives in a registry that is
+# shared per client (and, for some hosts, per process).  When the embedding
+# master switch is OFF the *emitted* catalog must not advertise semantic
+# retrieval at all, so the projection below builds a throwaway clone instead of
+# mutating the canonical ``ToolDefinition``/``ToolParam``/``schema`` objects.
+_SEMANTIC_OFF_PROJECTED_TOOL_NAME = "search_past_chats"
+_SEMANTIC_OFF_PROJECTED_PARAM_NAME = "mode"
+_SEMANTIC_OFF_PROJECTED_MODE = "text"
+_SEMANTIC_OFF_TOOL_DESCRIPTION = (
+    "Search past chat messages by lexical keyword match over stored text."
+)
+_SEMANTIC_OFF_MODE_DESCRIPTION = (
+    "Retrieval mode. Only 'text' is accepted: lexical keyword matching."
+)
+
+
+def _project_semantic_off_parameters(parameters: Any) -> Any:
+    """Return ``parameters`` with the retrieval ``mode`` narrowed to lexical."""
+    if not isinstance(parameters, (list, tuple)):
+        return parameters
+    projected: list[Any] = []
+    for parameter in parameters:
+        if getattr(parameter, "name", None) != _SEMANTIC_OFF_PROJECTED_PARAM_NAME:
+            projected.append(parameter)
+            continue
+        try:
+            projected.append(
+                replace(
+                    parameter,
+                    description=_SEMANTIC_OFF_MODE_DESCRIPTION,
+                    required=False,
+                    default=_SEMANTIC_OFF_PROJECTED_MODE,
+                    enum=[_SEMANTIC_OFF_PROJECTED_MODE],
+                    schema={
+                        "type": "string",
+                        "enum": [_SEMANTIC_OFF_PROJECTED_MODE],
+                        "default": _SEMANTIC_OFF_PROJECTED_MODE,
+                    },
+                )
+            )
+        except (TypeError, ValueError):
+            # A non-dataclass stand-in cannot be cloned; keep it verbatim so the
+            # caller still gets a complete catalog rather than a broken entry.
+            projected.append(parameter)
+    return projected
+
+
+def _project_semantic_off_tool_definition(definition: Any) -> Any:
+    """Return a lexical-only clone of the semantic retrieval tool definition.
+
+    Every other tool, and every non-``ToolDefinition`` entry (notably the plain
+    tool-name strings used by name-only CLI menus), is returned unchanged so the
+    emitted catalog keeps its shape.  Cloning preserves ``function`` wrappers,
+    ACL/scope metadata and the tool name; only the tool description and the
+    retrieval ``mode`` parameter differ.
+    """
+    if tool_name(definition) != _SEMANTIC_OFF_PROJECTED_TOOL_NAME:
+        return definition
+    parameters = getattr(definition, "parameters", None)
+    if not isinstance(parameters, (list, tuple)):
+        return definition
+    try:
+        return replace(
+            definition,
+            description=_SEMANTIC_OFF_TOOL_DESCRIPTION,
+            parameters=_project_semantic_off_parameters(parameters),
+        )
+    except (TypeError, ValueError):
+        return definition
+
+
 def filter_tools_for_client(
     client: Any,
     tools: Iterable[Any],
@@ -666,6 +740,14 @@ def filter_tools_for_client(
     # capability switches (Apps/Spotify/Search/Media/managed tools/Agent Team)
     # before any planning or pack-specific early return so a disabled feature
     # can never remain visible merely because its schema was built earlier.
+    #
+    # The same phase also resolves the embedding master switch once per call so
+    # an OFF catalog can emit the lexical-only ``search_past_chats`` projection
+    # on every downstream path (normal, planning, review and strict allowlist)
+    # instead of only on the plain provisioning path.
+    semantic_off_catalog_active = not embedding_master_enabled(
+        _effective_client_config(client)
+    )
     gated_values: list[Any] = []
     for candidate in values:
         definition = candidate
@@ -687,7 +769,11 @@ def filter_tools_for_client(
                 is False
             ):
                 continue
-            gated_values.append(candidate)
+            gated_values.append(
+                _project_semantic_off_tool_definition(candidate)
+                if semantic_off_catalog_active and not isinstance(candidate, str)
+                else candidate
+            )
     values = gated_values
 
     if strict_allowlist is not None:

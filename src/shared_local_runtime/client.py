@@ -44,6 +44,7 @@ class RemoteTicket:
         # never reuse a ticket created from a different snapshot.
         self.snapshot_id = snapshot_id
         self.launch_fingerprint = reply.get("launch_fingerprint")
+        self.request_id = None  # the acquisition that produced this lease (set by Client.acquire)
         self.kind = kind
         self.consumer = "shared-client"
         self._released = False
@@ -267,6 +268,7 @@ class Client:
                     ticket = self.tickets.get(reply["ticket"])
                     if ticket is None:
                         ticket = RemoteTicket(self, reply, kind, holder, snapshot_id=snapshot_id)
+                        ticket.request_id = data["request_id"]
                         self.tickets[ticket.ticket_id] = ticket
                     if self._heartbeat_thread is None:
                         self._heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
@@ -315,6 +317,34 @@ class Client:
         with self.lock:
             self.cancel_pending.discard(request_id)
         return True
+
+    def cancel_request(self, request_id, *, broker_id):
+        """Cancel exactly one of this client's acquisitions in one broker incarnation.
+
+        A pending acquire is interrupted and a lease it already produced is released at the
+        broker (which then stops a runtime nobody else holds); that lease is retired locally
+        too, so no heartbeat keeps naming a ticket the broker no longer knows. Nothing else
+        is touched. True only once the broker confirmed; an unconfirmed cancel stays queued
+        for the existing retry worker."""
+        confirmed = self._cancel(request_id, broker_id=broker_id)
+        if confirmed:
+            with self.lock:
+                stale = [ticket for ticket in self.tickets.values()
+                         if ticket.request_id == request_id and ticket.broker_id == broker_id]
+            for ticket in stale:
+                self._retire_local(ticket)
+        return confirmed
+
+    def stop_runtime(self, profile_id, *, expect_pid, expect_created, expect_launch_fingerprint):
+        """Existing managed stop, fenced to one runtime incarnation.
+
+        The broker refuses unless the single runtime of this profile is exactly that process
+        (pid, create_time) with that launch fingerprint, so a restarted, replaced or foreign
+        runtime is never stopped by a caller that verified someone else's process."""
+        return self._request("/v1/stop", {
+            "client_id": self.client_id, "client_pid": self.pid, "broker_id": self.broker_id,
+            "profile_id": profile_id, "expect_pid": expect_pid, "expect_created": expect_created,
+            "expect_launch_fingerprint": expect_launch_fingerprint}, timeout=70)
 
     def _retry_cancellations(self):
         # A failed network cancellation remains owned work, including after close.

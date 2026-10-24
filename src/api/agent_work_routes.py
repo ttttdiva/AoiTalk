@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, StrictBool, constr
 from sqlalchemy import desc, select
 
 from ..features import Features
@@ -19,7 +20,17 @@ from ..memory.models import (
     ProjectMember,
 )
 from ..services.project_permissions import normalize_project_member_permissions
-from ..services.agent_work_runtime import AgentWorkCoordinator
+from ..services.agent_work_runtime import AgentWorkCoordinator, InteractiveHistoryFenceError
+
+
+class InteractiveHistoryFenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: UUID
+    idempotency_key: constr(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    acknowledgment: Literal["provider_outcome_unknown_no_replay"]
+    expected_state_digest: constr(pattern=r"^[0-9a-f]{64}$") | None = None
+    dry_run: StrictBool = False
 
 
 async def _maybe(value: Any) -> Any:
@@ -35,6 +46,7 @@ def create_agent_work_router(
     is_admin_user: Callable[..., Any] | None = None,
     get_coordinator: Callable[[], Any] | None = None,
     get_user_from_request: Callable[..., Any] | None = None,
+    get_generation_status: Callable[[str], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/agent-work", tags=["agent-work"])
 
@@ -210,6 +222,50 @@ def create_agent_work_router(
             raise HTTPException(status_code=404, detail="WorkItem not found or already terminal")
         return JSONResponse({"success": True, "cancelled": True})
 
+    @router.post("/{work_item_id}/history-fence")
+    async def history_fence(
+        work_item_id: str,
+        payload: InteractiveHistoryFenceRequest,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> JSONResponse:
+        if not Features.autonomous_agent_runtime():
+            raise HTTPException(status_code=409, detail="autonomous_agent_runtime is disabled")
+        try:
+            UUID(str(work_item_id))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="history_fence_invalid_work_item_id")
+        user = await _maybe(get_user_from_request(request)) if get_user_from_request is not None else None
+        user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="history_fence_auth_required")
+        if not payload.dry_run and payload.expected_state_digest is None:
+            raise HTTPException(status_code=422, detail="history_fence_state_digest_required")
+        live_generation_active: bool | None = None
+        if get_generation_status is not None:
+            try:
+                generation_status = await _maybe(get_generation_status(str(payload.session_id)))
+            except Exception:
+                # An unavailable live-generation store must never assert idle.
+                generation_status = None
+            if isinstance(generation_status, dict) and type(generation_status.get("running")) is bool:
+                live_generation_active = generation_status["running"]
+        coordinator = await _coordinator()
+        try:
+            result = await coordinator.fence_interactive_uncertain_history(
+                work_item_id=work_item_id,
+                session_id=str(payload.session_id),
+                owner_user_id=str(user_id),
+                idempotency_key=payload.idempotency_key,
+                acknowledgment=payload.acknowledgment,
+                expected_state_digest=payload.expected_state_digest,
+                dry_run=payload.dry_run,
+                live_generation_active=live_generation_active,
+            )
+        except InteractiveHistoryFenceError as error:
+            raise HTTPException(status_code=error.http_status, detail=error.code) from error
+        return JSONResponse({"success": True, **result})
+
     @router.post("/{work_item_id}/resume-after-approval")
     async def resume_after_approval(work_item_id: str, request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
         await _admin(request)
@@ -223,4 +279,4 @@ def create_agent_work_router(
     return router
 
 
-__all__ = ["create_agent_work_router"]
+__all__ = ["InteractiveHistoryFenceRequest", "create_agent_work_router"]

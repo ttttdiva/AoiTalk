@@ -305,7 +305,7 @@ function Invoke-Stop {
         if ($unownedWatchers.Count -gt 0) {
             throw "STOP_UNCONFIRMED: a Plugin watcher-shaped process has no matching live control receipt; no runtime was stopped."
         }
-        & $Launcher -Stop -ControlInternal -EnvFile $EnvFile
+        & $Launcher -Stop -ControlInternal -EnvFile $EnvFile | ForEach-Object { Write-Host $_ }
         Write-Host "STOPPED: only the runtime verified by the existing ownership marker was stopped."
         return 0
     } finally { $gate.Dispose() }

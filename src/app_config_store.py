@@ -293,6 +293,9 @@ _LEGACY_AUTOFILLED_DEFAULTS: tuple[tuple[tuple[str, ...], Any], ...] = (
     # value, while preserving an explicit user choice marked by the atomic
     # settings API below.
     (("voice_sessions", "allowed_modes"), ["realtime_native"]),
+    # OpenRouter tool use shipped default-off.  A stored ``false`` without the
+    # explicit-user marker is that generated value and follows the new default.
+    (("openrouter", "enable_tools"), False),
 )
 
 # The retired compact OpenAI model identifier must not survive in the persisted
@@ -451,6 +454,10 @@ def _migrate_legacy_compact_models(
 
 VOICE_SESSION_ALLOWED_MODES_SOURCE_KEY = "allowed_modes_source"
 VOICE_SESSION_ALLOWED_MODES_USER_PROVENANCE = "user"
+OPENROUTER_ENABLE_TOOLS_KEY = "openrouter.enable_tools"
+OPENROUTER_ENABLE_TOOLS_SOURCE_KEY = "enable_tools_source"
+OPENROUTER_ENABLE_TOOLS_SOURCE_PATH = "openrouter.enable_tools_source"
+OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE = "user"
 
 # ``review_max_rounds`` was accidentally shipped as 120 in older config
 # seeds.  Keep a small schema marker in the JSON config so the one-time repair
@@ -519,6 +526,12 @@ def _migrate_legacy_autofilled_defaults(
             if source == VOICE_SESSION_ALLOWED_MODES_USER_PROVENANCE or bool(
                 stored_parent.get("allowed_modes_customized")
             ):
+                continue
+        if path == ("openrouter", "enable_tools"):
+            source = str(
+                stored_parent.get(OPENROUTER_ENABLE_TOOLS_SOURCE_KEY) or ""
+            ).strip().lower()
+            if source == OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE:
                 continue
         stored_parent[leaf] = copy.deepcopy(seed_parent[leaf])
         logger.info(
@@ -846,6 +859,18 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
                 )
                 config = dict(config)
                 config["voice_sessions"] = voice_sessions
+        openrouter = config.get("openrouter")
+        if (
+            isinstance(openrouter, dict)
+            and openrouter.get("enable_tools") is False
+            and OPENROUTER_ENABLE_TOOLS_SOURCE_KEY not in openrouter
+        ):
+            openrouter = copy.deepcopy(openrouter)
+            openrouter[OPENROUTER_ENABLE_TOOLS_SOURCE_KEY] = (
+                OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE
+            )
+            config = dict(config)
+            config["openrouter"] = openrouter
         config = _migrate_agent_team_v2_config(
             _migrate_writing_model_routing(
                 _migrate_shared_integrations(
@@ -984,6 +1009,11 @@ def update_app_config_keys_sync(
                             current[part] = next_value
                         current = next_value
                     current[parts[-1]] = copy.deepcopy(value)
+                    if key == OPENROUTER_ENABLE_TOOLS_KEY:
+                        # Same transaction as the value: never half-applied.
+                        current[OPENROUTER_ENABLE_TOOLS_SOURCE_KEY] = (
+                            OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE
+                        )
                     if key == "voice_sessions.allowed_modes":
                         current[VOICE_SESSION_ALLOWED_MODES_SOURCE_KEY] = (
                             VOICE_SESSION_ALLOWED_MODES_USER_PROVENANCE

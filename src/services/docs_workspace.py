@@ -491,13 +491,23 @@ async def seed_default_docs_supertags(session: AsyncSession, library: DocsLibrar
 
     for spec in DEFAULT_DOCS_SUPERTAGS:
         system_key = spec.get("system_key")
-        tag = tags_by_system_key.get(system_key) if system_key else None
-        tag = tag or tags_by_name.get(spec["name"])
+        if system_key:
+            # system_key だけが system 所有の証拠。同名の利用者作成タグは採用も上書きもしない。
+            tag = tags_by_system_key.get(system_key)
+        else:
+            tag = tags_by_name.get(spec["name"])
+        created = tag is None
         if tag is None:
+            name = spec["name"]
+            if name in tags_by_name:
+                # 利用者作成の同名タグとの unique 衝突を避けて system タグを作る。
+                name = f"{name} ({system_key})"
+                while name in tags_by_name:
+                    name = f"{name}_"
             tag = KnowledgeSupertag(
                 docs_library_id=library.id,
                 system_key=system_key,
-                name=spec["name"],
+                name=name,
                 base_type=spec["base_type"],
                 description=spec.get("description"),
                 icon=spec.get("icon"),
@@ -512,49 +522,9 @@ async def seed_default_docs_supertags(session: AsyncSession, library: DocsLibrar
             tags_by_name[tag.name] = tag
             if tag.system_key:
                 tags_by_system_key[tag.system_key] = tag
-        else:
-            changed = False
-            desired_name = spec.get("name")
-            name_conflict = (
-                next(
-                    (
-                        other
-                        for other in existing_tags
-                        if other.id != tag.id and other.name == desired_name
-                    ),
-                    None,
-                )
-                if desired_name
-                else None
-            )
-            for attr, key in [
-                ("system_key", "system_key"),
-                ("base_type", "base_type"),
-                ("description", "description"),
-                ("icon", "icon"),
-                ("color", "color"),
-                ("ai_instructions", "ai_instructions"),
-            ]:
-                value = spec.get(key)
-                if value and getattr(tag, attr) != value:
-                    setattr(tag, attr, value)
-                    changed = True
-            if desired_name and tag.name != desired_name and name_conflict is None:
-                tag.name = desired_name
-                changed = True
-            # config_json.tools を spec と同期する(既存キーは温存しマージ)。
-            spec_config = spec.get("config_json")
-            if spec_config is not None:
-                current_config = tag.config_json if isinstance(tag.config_json, dict) else {}
-                desired_config = {**current_config}
-                spec_tools = spec_config.get("tools")
-                if spec_tools is not None and current_config.get("tools") != spec_tools:
-                    desired_config["tools"] = spec_tools
-                if desired_config != current_config:
-                    tag.config_json = desired_config
-                    changed = True
-            if changed:
-                await session.flush()
+        elif not system_key:
+            # system_key の無い既存タグは利用者作成と区別できないため、schema も補完しない。
+            continue
 
         fields_result = await session.execute(
             select(KnowledgeField).where(KnowledgeField.supertag_id == tag.id)
@@ -604,13 +574,13 @@ async def seed_default_docs_supertags(session: AsyncSession, library: DocsLibrar
                     )
                 )
 
-        pinned_ids = [
-            str(fields_by_name[name].id)
-            for name in spec.get("pinned_field_names", [])
-            if name in fields_by_name
-        ]
-        if tag.pinned_field_ids != pinned_ids:
-            tag.pinned_field_ids = pinned_ids
+        if created:
+            # pin は利用者が編集できるため、初回作成時だけ既定値を入れる。
+            tag.pinned_field_ids = [
+                str(fields_by_name[name].id)
+                for name in spec.get("pinned_field_names", [])
+                if name in fields_by_name
+            ]
 
     await session.flush()
 

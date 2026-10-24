@@ -46,6 +46,7 @@ from ...services.agent_team_v3 import (
     resolve_agent_team_v3_route,
 )
 from ...services.turn_context import get_turn_context
+from ...tools.core import safe_argument_rejection
 
 
 _SEARCH_TOOL_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'、。]+")
@@ -839,28 +840,19 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     intent_digest = value("arguments_digest", default=None)
     if isinstance(intent_digest, str) and intent_digest.strip():
         metadata.setdefault("arguments_digest", intent_digest.strip())
-    rejection = value("argument_rejection", default=None)
-    if isinstance(rejection, dict) and rejection:
-        metadata.setdefault(
-            "argument_rejection",
-            {
-                str(key)[:40]: str(item)[:100]
-                for key, item in rejection.items()
-                if key
-                in {
-                    "code",
-                    "target_digest",
-                    "query_digest",
-                    "start_digest",
-                    "end_digest",
-                    "offset_digest",
-                    "max_chars_digest",
-                }
-            },
-        )
-        rejection_code = str(rejection.get("code") or "").strip()
-        if re.fullmatch(r"tool_argument_[a-z]{3,16}", rejection_code):
-            metadata.setdefault("error_code", rejection_code)
+    # Like ``policy_denial``, rejection provenance comes only from the typed
+    # framework field of a not-executed failure; a caller-supplied metadata
+    # entry or a malformed/forged value is never correlation evidence.
+    metadata.pop("argument_rejection", None)
+    rejection = safe_argument_rejection(value("argument_rejection", default=None))
+    if (
+        rejection
+        and value("executed", default=None) is False
+        and value("synthetic", default=False) is not True
+        and not successful
+    ):
+        metadata["argument_rejection"] = rejection
+        metadata.setdefault("error_code", rejection["code"])
     denial = value("policy_denial", default=None)
     if isinstance(denial, Mapping):
         denial_code = str(denial.get("code") or "").strip()

@@ -148,7 +148,27 @@ async def semantic_memory_search(
         query: 検索クエリ（探したい話題・人物・決定事項などを簡潔に）。
         time_range: 対象期間。"all"（既定）/"today"/"week"/"month" 等。
         max_results: 返す件数の上限（既定 10）。
+
+    Embedding master OFF の間は意味検索を実行せず、`success=False` と
+    `code="embedding_disabled"` を返す（空の成功にはしない）。
     """
+    # Master OFF must deny before any memory manager / semantic service
+    # acquisition. Imported at call time so the current runtime value is always
+    # observed (a stale catalog cannot bypass it) and so tests can substitute
+    # ``src.services.embedding_feature.runtime_embedding_enabled``.
+    from src.services.embedding_feature import runtime_embedding_enabled
+
+    if not runtime_embedding_enabled():
+        return {
+            "success": False,
+            "code": "embedding_disabled",
+            "error": "意味検索は現在無効です（Embedding master OFF）",
+            "results": [],
+            "searched_sources": [],
+            "resolved_user_id": None,
+            "result_count_by_source": {},
+        }
+
     max_results = max(1, min(int(max_results) if max_results is not None else 5, 100))
 
     if not query or not query.strip():

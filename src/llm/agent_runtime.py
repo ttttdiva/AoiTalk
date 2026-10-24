@@ -1098,6 +1098,13 @@ def build_tool_hint_context_sync(
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
     direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
+    direct_task_read_hint = _should_hint_direct_task_read_tools(user_input, registry)
+    available_filesystem_read_tools = tuple(
+        name for name in ("search_files", "read_file", "list_directory") if name in registry
+    )
+    available_task_read_tools = tuple(
+        name for name in ("list_tasks", "get_upcoming_wbs_tasks") if name in registry
+    )
     project_attachment_stewardship_hint = _should_hint_project_attachment_stewardship(
         user_input,
         registry,
@@ -1135,6 +1142,9 @@ def build_tool_hint_context_sync(
         direct_search_hint=direct_search_hint,
         direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
+        direct_task_read_hint=direct_task_read_hint,
+        available_filesystem_read_tools=available_filesystem_read_tools,
+        available_task_read_tools=available_task_read_tools,
         project_attachment_stewardship_hint=project_attachment_stewardship_hint,
         available_filesystem_mutation_tools=available_filesystem_mutation_tools,
         direct_project_hint=direct_project_hint,
@@ -1168,6 +1178,13 @@ async def build_tool_hint_context_async(
     direct_search_hint = _should_hint_direct_search_tools(user_input, registry)
     direct_memory_hint = _should_hint_direct_memory_tools(user_input, registry)
     direct_filesystem_hint = _should_hint_direct_filesystem_tools(user_input, registry)
+    direct_task_read_hint = _should_hint_direct_task_read_tools(user_input, registry)
+    available_filesystem_read_tools = tuple(
+        name for name in ("search_files", "read_file", "list_directory") if name in registry
+    )
+    available_task_read_tools = tuple(
+        name for name in ("list_tasks", "get_upcoming_wbs_tasks") if name in registry
+    )
     project_attachment_stewardship_hint = _should_hint_project_attachment_stewardship(
         user_input,
         registry,
@@ -1205,6 +1222,9 @@ async def build_tool_hint_context_async(
         direct_search_hint=direct_search_hint,
         direct_memory_hint=direct_memory_hint,
         direct_filesystem_hint=direct_filesystem_hint,
+        direct_task_read_hint=direct_task_read_hint,
+        available_filesystem_read_tools=available_filesystem_read_tools,
+        available_task_read_tools=available_task_read_tools,
         project_attachment_stewardship_hint=project_attachment_stewardship_hint,
         available_filesystem_mutation_tools=available_filesystem_mutation_tools,
         direct_project_hint=direct_project_hint,
@@ -1601,8 +1621,14 @@ def run_openai_tool_call_loop(
     record_provider_usage: bool = True,
     tool_call_identity_check: Callable[[str, str, dict[str, Any]], str | None]
     | None = None,
+    provider_label: str = "",
 ) -> str | OpenAIToolCallLoopResult:
-    """Execute OpenAI-compatible tool calls and re-prompt until text output."""
+    """Execute OpenAI-compatible tool calls and re-prompt until text output.
+
+    ``provider_label`` is the caller's route identity (for example
+    ``"openrouter"``); it selects provider-specific approval boundaries and is
+    never derived from the model name.
+    """
     effective_user_input = user_input
     if not effective_user_input:
         for message in reversed(initial_messages):
@@ -1639,14 +1665,14 @@ def run_openai_tool_call_loop(
     # this invocation on its explicit ledger, so the usage-key guard avoids a
     # duplicate when that ledger is supplied.
     initial_usage = dialogue_provider_latest_usage(budget_client)
-    provider_label = str(
+    budget_provider_label = str(
         getattr(budget_client, "provider_label", "")
         or getattr(budget_client, "provider", "")
         or ""
     ).strip().casefold()
     initial_usage_unknown = (
         budget_client is not None
-        and provider_label == "openai_compatible_local"
+        and budget_provider_label == "openai_compatible_local"
         and initial_usage is None
     )
     if initial_usage is not None and isinstance(budget_raw, Mapping):
@@ -1981,6 +2007,7 @@ def run_openai_tool_call_loop(
                 before_provider_call=apply_budget_before_provider,
                 after_provider_call=update_budget_after_provider,
                 tool_call_identity_check=tool_call_identity_check,
+                provider_label=provider_label,
             )
         except AgentDialogueInputPending as pending:
             # The typed pause is durable control flow. Preserve the provider
@@ -2210,12 +2237,14 @@ def _retrieval_requested(text: str) -> bool:
     return bool(
         re.search(
             r"\b(?:find|search|look up|lookup|read|show|list|retrieve|count|summari[sz]e|"
-            r"summary|overview|timeline|aggregate|how many|group by|grouping|sum|totals?|averages?|avg)\b",
+            r"summary|overview|timeline|aggregate|how many|group by|grouping|sum|totals?|averages?|avg|"
+            r"what|which|where|when|who|tell me)\b",
             text, flags=re.ASCII,
         )
         or any(term in text for term in (
             "探し", "探す", "探せ", "検索", "調べ", "調査", "読ん", "読む", "見せ", "一覧", "何件", "件数",
             "集計", "合計", "平均", "まとめ", "概要", "全体像", "時系列", "日付順", "確認", "参照して", "いつ",
+            "教えて", "内容", "どこ", "何が", "何を", "どれ", "どんな",
         ))
     )
 
@@ -2418,9 +2447,63 @@ def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) ->
 
 
 def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry) -> bool:
-    # Files/Docs words alone do not establish that a filesystem tool is needed.
-    # Verified Project attachments use the dedicated stewardship hint below.
-    return False
+    """Guide ordinary questions about existing workspace files to read tools.
+
+    A filesystem noun by itself is not enough; the request must also ask for
+    information about existing content. Only registered read tools are used to
+    decide exposure, so a read-only Agent scope can receive this guidance
+    without acquiring file-write or command authority.
+    """
+    text = _retrieval_user_text(user_input).casefold()
+    # Attachments have their own trusted read guidance. Their synthetic path
+    # markers must not be mistaken for a request to browse the workspace.
+    text = re.sub(r"(?m)^\s*\[添付(?:ファイル|画像|音声):[^\r\n]*$", "", text)
+    # A past participle describes an existing file ("保存した仕様書"), not a
+    # request to write; imperative forms ("保存して") remain write intent.
+    text = re.sub(r"保存(?:した|され(?:た|ている|ていた)|済み?)", "", text)
+    if not _retrieval_requested(text):
+        return False
+    if re.search(
+        r"\b(?:create|add|update|delete|edit|write|modify|save|apply|reflect)\b",
+        text,
+        flags=re.ASCII,
+    ) or any(term in text for term in (
+        "作成", "追加", "更新", "削除", "編集", "書き換", "書き込", "保存", "反映", "修正", "変更",
+    )):
+        return False
+    mentions_workspace_file = bool(
+        re.search(
+            r"\b(?:files?|folders?|directories|workspace|repository|repo|source code|design document)\b",
+            text,
+            flags=re.ASCII,
+        )
+        or any(term in text for term in (
+            "ファイル", "フォルダ", "ディレクトリ", "ワークスペース", "リポジトリ",
+            "設計書", "仕様書", "ソースコード",
+        ))
+    )
+    return mentions_workspace_file and any(
+        tool_name in registry
+        for tool_name in ("search_files", "read_file", "list_directory")
+    )
+
+
+def _should_hint_direct_task_read_tools(user_input: str, registry: ToolRegistry) -> bool:
+    """Route factual questions about existing tasks to project read tools only."""
+    text = _retrieval_user_text(user_input).casefold()
+    if not _retrieval_requested(text):
+        return False
+    mentions_tasks = bool(
+        re.search(
+            r"\b(?:tasks?|to-dos?|due|deadline|overdue|unfinished|upcoming)\b",
+            text,
+            flags=re.ASCII,
+        )
+        or any(term in text for term in ("タスク", "期限", "締切", "未完了", "残って", "やること"))
+    )
+    return mentions_tasks and any(
+        tool_name in registry for tool_name in ("list_tasks", "get_upcoming_wbs_tasks")
+    )
 
 
 def _should_hint_project_attachment_stewardship(
@@ -2466,6 +2549,9 @@ def _build_context_block(
     direct_search_hint: bool = False,
     direct_memory_hint: bool = False,
     direct_filesystem_hint: bool = False,
+    direct_task_read_hint: bool = False,
+    available_filesystem_read_tools: Sequence[str] = (),
+    available_task_read_tools: Sequence[str] = (),
     project_attachment_stewardship_hint: bool = False,
     available_filesystem_mutation_tools: Sequence[str] = (),
     direct_project_hint: bool = False,
@@ -2490,6 +2576,7 @@ def _build_context_block(
         and not direct_search_hint
         and not direct_memory_hint
         and not direct_filesystem_hint
+        and not direct_task_read_hint
         and not project_attachment_stewardship_hint
         and not direct_project_hint
         and not project_progress_review_hint
@@ -2525,10 +2612,22 @@ def _build_context_block(
             "自動で添えられた過去会話の抜粋で足りない場合も `search_past_chats` で掘り下げてください。"
         )
     if direct_filesystem_hint:
+        if "search_files" in available_filesystem_read_tools and "read_file" in available_filesystem_read_tools:
+            tool_lines.append(
+                "- 既存のworkspaceファイルについて尋ねられたら `search_files` で候補を探し、"
+                "`read_file` で本文を確認してから、返った内容を根拠に回答してください。"
+            )
+        elif "search_files" in available_filesystem_read_tools:
+            tool_lines.append("- 既存のworkspaceファイルを尋ねられたら `search_files` で候補を確認してください。")
+        elif "read_file" in available_filesystem_read_tools:
+            tool_lines.append("- 指定された既存ファイルの内容は `read_file` で確認してから回答してください。")
+        elif "list_directory" in available_filesystem_read_tools:
+            tool_lines.append("- 既存workspaceの配置は `list_directory` で確認してください。")
+    if direct_task_read_hint:
         tool_lines.append(
-            "- ワークスペースやファイル確認は `search_files`、`list_directory`、"
-            "`list_workspace_tree`、`read_file` を使ってください。配置先を選ぶ時は"
-            "同じ探索を繰り返さず、`list_workspace_tree` で既存構成を1回確認してください。"
+            "- 既存タスクの一覧・状態・期限については "
+            + " と ".join(f"`{name}`" for name in available_task_read_tools)
+            + " を使い、返ったタスク情報を確認してから回答してください。"
         )
     if project_attachment_stewardship_hint:
         if available_filesystem_mutation_tools:
@@ -2631,6 +2730,8 @@ def _build_context_block(
         matched_tool_names.append("memory_tools")
     if direct_filesystem_hint:
         matched_tool_names.append("filesystem_tools")
+    if direct_task_read_hint:
+        matched_tool_names.append("project_read_tools")
     if direct_project_hint:
         matched_tool_names.append("project_tools")
     if project_progress_review_hint:

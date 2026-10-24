@@ -50,6 +50,19 @@ Hugging Face ブラウザ/同期、Hydrus ブラウザ、Story/Novel Studio、TR
 capability ではありません。正本はそれぞれ独立アプリ `60_huggingface-sync`、
 `57_Hydrus_App`、`86_Novel-Graph-Studio` です。
 
+## Settings: Embedding マスタースイッチ
+
+`settings.embedding.read`（p1）は AI モデル設定（`tabs.settings.ai_model`）で、認証済みの全ロールにサーバーの永続値
+`search.embedding_enabled` を表示します。オンライン専用でキャッシュ・変更はなく、未取得や取得失敗を ON と推測しません。
+非管理者はスイッチが無効で理由を表示し、runtime 取得・解放・PATCH は一切行いません。
+
+`settings.embedding.manage`（p1、admin のみ）は同じ画面で、検証済みの boolean 永続応答だけを反映する単一の保存、
+失敗時の実値再読込、降格・unmount・遅延応答の破棄を保証します。OFF は保存後に新しく観測した runtime 状態から
+排出中・解放待ち・解放済みを表示し、観測に失敗した場合は解放済みと表示しません。手動解放は維持し、ON は次の推論で遅延ロードします。
+オフラインキューは使いません。
+
+これらの確認は PC 上の自動検証（Jest / contract validator）であり、実機 QA の代替ではありません。
+
 ## Navigation invariant
 
 `navigation.tabs` はスマホの bottom tab に表示する **5 件**（Chat / Tasks /

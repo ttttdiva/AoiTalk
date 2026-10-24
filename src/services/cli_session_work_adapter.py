@@ -43,6 +43,7 @@ from .muse_remote_execution import (
     MUSE_PROVIDER,
     REMOTE_AGENT_DELEGATE,
 )
+from .muse_remote_session_store import MUSE_REMOTE_CONTEXT_KEY
 
 from ..llm.cli_backends.base import CLIInvocationOptions
 
@@ -850,7 +851,7 @@ class MuseRemoteTurnWorkAdapter:
         **_: Any,
     ) -> ExecutionOutcome:
         del coordinator
-        from ..memory.models import AgentRun, AgentWorkItem, ConversationSession
+        from ..memory.models import AgentRun, AgentWorkItem, ConversationMessage, ConversationSession
 
         work_id = str(self._claim_value(claim, "work_item_id") or "")
         if (
@@ -865,6 +866,7 @@ class MuseRemoteTurnWorkAdapter:
             work = await db.get(AgentWorkItem, uuid.UUID(work_id))
             if (
                 work is None
+                or str(work.id) != work_id
                 or str(work.source_type or "") != REMOTE_SESSION_SOURCE_TYPE
                 or str(work.execution_adapter or "") != MUSE_REMOTE_ADAPTER_KEY
             ):
@@ -885,6 +887,7 @@ class MuseRemoteTurnWorkAdapter:
                 or str(conversation.user_id) != owner_id
                 or str(work_metadata.get("owner_id") or "") != owner_id
                 or str(work.conversation_session_id) != str(conversation.id)
+                or str(self._claim_value(claim, "conversation_session_id") or "") != str(conversation.id)
                 or str(work.assigned_agent_id) != agent_id
                 or str(work.agent_revision_id) != revision_id
                 or str(context.get("agent_id") or conversation.agent_id or "") != agent_id
@@ -902,14 +905,93 @@ class MuseRemoteTurnWorkAdapter:
             active_run = await db.get(AgentRun, uuid.UUID(selected_run_id)) if selected_run_id else None
             if (
                 active_run is None
+                or str(active_run.id) != selected_run_id
+                or (run_id is not None and str(run_id) != selected_run_id)
+                or (run is not None and str(run.get("id") or "") != selected_run_id)
+                or str(self._claim_value(claim, "source_id") or "") != selected_run_id
                 or str(work.active_agent_run_id or "") != str(active_run.id)
                 or str(active_run.work_item_id or "") != str(work.id)
                 or str(active_run.session_id) != str(conversation.id)
                 or str(active_run.run_type or "") != REMOTE_SESSION_SOURCE_TYPE
                 or str(active_run.agent_id) != agent_id
                 or str(active_run.agent_revision_id) != revision_id
+                or str(active_run.user_id or "") != owner_id
             ):
                 return ExecutionOutcome(classification="blocked", error_code="remote_session_run_mismatch")
+
+            latest_run, latest_work = await self.service._load_latest(
+                db, conversation.id
+            )
+            latest_status = self.service._status_from_rows(
+                context, latest_run, latest_work
+            )
+            if (
+                latest_run is None
+                or latest_work is None
+                or str(latest_run.id) != str(active_run.id)
+                or str(latest_work.id) != str(work.id)
+                or latest_status != "running"
+            ):
+                code = (
+                    "session_cancelling"
+                    if latest_status == "cancelling"
+                    else "session_turn_in_flight"
+                    if latest_status in {"queued", "running"}
+                    else "remote_session_run_mismatch"
+                )
+                return ExecutionOutcome(classification="blocked", error_code=code)
+
+            session_context = (
+                conversation.context
+                if isinstance(conversation.context, Mapping)
+                else {}
+            )
+            remote_context = session_context.get(MUSE_REMOTE_CONTEXT_KEY)
+            if remote_context is not None:
+                remote_binding = (
+                    remote_context.get("binding")
+                    if isinstance(remote_context, Mapping)
+                    and isinstance(remote_context.get("binding"), Mapping)
+                    else remote_context
+                )
+                if not isinstance(remote_binding, Mapping):
+                    return ExecutionOutcome(
+                        classification="blocked",
+                        error_code="thread_binding_unsafe",
+                    )
+                remote_state = str(remote_binding.get("state") or "")
+                current_turn_nonce = str(
+                    remote_binding.get("current_turn_nonce") or ""
+                ).strip()
+                pinned_run_id = str(
+                    remote_binding.get("current_run_id") or ""
+                ).strip()
+                if remote_state == "unsafe" or (
+                    current_turn_nonce and pinned_run_id != str(active_run.id)
+                ):
+                    return ExecutionOutcome(
+                        classification="blocked",
+                        error_code="thread_binding_unsafe",
+                    )
+
+            trigger = (
+                await db.get(ConversationMessage, active_run.trigger_message_id)
+                if active_run.trigger_message_id
+                else None
+            )
+            if (
+                trigger is None
+                or str(trigger.id) != str(active_run.trigger_message_id)
+                or str(trigger.session_id) != str(conversation.id)
+                or str(trigger.role or "") != "user"
+                or str(trigger.sender_type or "") != "user"
+                or str(trigger.sender_id or "") != owner_id
+                or not active_run.client_message_id
+                or trigger.client_message_id != active_run.client_message_id
+                or not isinstance(trigger.content, str)
+                or not trigger.content.strip()
+            ):
+                return ExecutionOutcome(classification="blocked", error_code="remote_session_input_invalid")
 
             self.service._assert_remote_admission(owner_id=owner_id, agent_id=agent_id)
             await self.service._resolve_authority(
@@ -939,11 +1021,17 @@ class MuseRemoteTurnWorkAdapter:
                 if not isinstance(pinned_role, Mapping) or dict(pinned_role) != expected_pins:
                     return ExecutionOutcome(classification="blocked", error_code="remote_role_context_mismatch")
 
+            # Recover the full original only for this execution. Durable Work
+            # metadata is bounded and must never carry the raw input body.
+            for alias in ("prompt", "text", "user_text", "message"):
+                metadata.pop(alias, None)
             metadata.update(
                 {
+                    "input_text": trigger.content,
                     "agent_id": agent_id,
                     "agent_revision_id": revision_id,
                     "provider": MUSE_PROVIDER,
+                    "current_run_id": str(active_run.id),
                 }
             )
             if managed_role is not None:
@@ -985,6 +1073,18 @@ class MuseRemoteTurnWorkAdapter:
                 assistant_message_id=(
                     str(result.get("assistant_message_id") or "")
                     if outcome.classification == "succeeded"
+                    else None
+                ),
+                assistant_text_truncated=(
+                    result.get("assistant_text_truncated") is True
+                    if outcome.classification == "succeeded"
+                    else False
+                ),
+                assistant_text_original_length=(
+                    result.get("assistant_text_original_length")
+                    if outcome.classification == "succeeded"
+                    and isinstance(result.get("assistant_text_original_length"), int)
+                    and not isinstance(result.get("assistant_text_original_length"), bool)
                     else None
                 ),
                 error_code=outcome.error_code,

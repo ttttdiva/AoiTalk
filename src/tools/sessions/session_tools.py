@@ -580,7 +580,7 @@ async def _search_chat_history_text(
 @tool
 async def search_past_chats(
     query: str,
-    mode: str = "semantic",
+    mode: Optional[str] = None,
     limit: Optional[int] = None,
     session_id: Optional[str] = None,
     days: Optional[int] = None,
@@ -589,7 +589,8 @@ async def search_past_chats(
 ) -> Dict[str, Any]:
     """過去の会話を検索する読み取り専用ツール。
 
-    mode="semantic"（既定）は意味検索で、関連する過去会話やメモリの断片を返す。
+    mode 未指定はEmbeddingGemma2がONなら意味検索、OFFなら語句検索を選ぶ。
+    mode="semantic" は意味検索で、関連する過去会話やメモリの断片を返す。
     キーワードが一致しなくても話題・人物・決定事項から関連会話を拾えるので、
     ユーザーの好み・名前・以前の作業内容など現在の会話に無い文脈が必要になったら
     自分の判断でいつでも呼んでよい。毎ターン自動で添えられる抜粋で足りない場合の
@@ -603,14 +604,22 @@ async def search_past_chats(
 
     Args:
         query: 検索クエリ。semanticは話題を簡潔に、textは検索語を空白区切りで。
-        mode: "semantic"（既定・意味検索）または "text"（語句の全文検索）。
+        mode: "semantic"（EmbeddingGemma2 ON時の既定）または "text"（語句の全文検索）。
         limit: 返す件数の上限（未指定なら semantic は 10、text は 30）。
         session_id: textモードのみ。指定したセッション内だけを検索する。
         days: textモードのみ。直近何日分に絞るか。未指定なら全期間。
         time_range: semanticモードのみ。"all"（既定）/"today"/"week"/"month" 等。
         max_sessions_scanned: textモードのみ。走査するセッション数の上限（既定 50）。
     """
-    selected_mode = str(mode or "semantic").strip().casefold()
+    if mode is None:
+        # Providers do not have to materialize a JSON-schema default into the
+        # call arguments. Resolve the same safe default here so the lexical
+        # search remains useful when the semantic parameter was hidden.
+        from src.services.embedding_feature import runtime_embedding_enabled
+
+        selected_mode = "semantic" if runtime_embedding_enabled() else "text"
+    else:
+        selected_mode = str(mode).strip().casefold()
     if selected_mode not in {"semantic", "text"}:
         return {
             "success": False,

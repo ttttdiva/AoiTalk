@@ -34,6 +34,7 @@ from .embedding_identity import (
 from .index_io import run_index_io
 from .qdrant_client import SharedQdrantClient, _LOCAL_INDEX_IO_LOCK
 from ..memory.models import Task, TaskAssignee
+from ..services.embedding_feature import runtime_embedding_enabled
 
 
 TASK_INDEX_COLLECTION = embedding_collection_name("aoitalk_tasks")
@@ -100,6 +101,11 @@ def task_content_hash(title: str | None, description: str | None) -> str:
 
 def _semantic_enabled_from_runtime() -> bool:
     """Use the configured local search capability; never infer from imports."""
+
+    # Master semantic switch first: OFF returns before Config, model or index
+    # work. ON keeps the existing individual Task gates below unchanged.
+    if not runtime_embedding_enabled():
+        return False
 
     try:
         from ..features import Features
@@ -181,10 +187,10 @@ class TaskIndexService:
         self._initialized = False
 
     def is_enabled(self) -> bool:
-        return (
-            task_semantic_search_enabled()
-            if self.enabled is None
-            else self.enabled is True
+        # The EmbeddingGemma2 master gate is authoritative even when the Task
+        # lane was explicitly enabled in configuration.
+        return task_semantic_search_enabled() and (
+            self.enabled is None or self.enabled is True
         )
 
     async def _io(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -385,6 +391,8 @@ class TaskIndexService:
         session: Any,
         snapshots: Sequence[_TaskSnapshot],
     ) -> tuple[set[str], set[str]]:
+        if not self.is_enabled():
+            raise TaskIndexUnavailable("task_semantic_disabled")
         if not snapshots:
             return set(), set()
         ids = [item.id for item in snapshots]
@@ -458,8 +466,12 @@ class TaskIndexService:
                 )
             )
         if points:
+            if not self.is_enabled():
+                raise TaskIndexUnavailable("task_semantic_disabled")
             await self._io(self.client.upsert, self.collection_name, points, wait=True)
         if obsolete:
+            if not self.is_enabled():
+                raise TaskIndexUnavailable("task_semantic_disabled")
             await self._io(
                 self.client.delete,
                 self.collection_name,
@@ -475,6 +487,8 @@ class TaskIndexService:
         seen_ids: set[str],
         obsolete_ids: set[str],
     ) -> None:
+        if not self.is_enabled():
+            raise TaskIndexUnavailable("task_semantic_disabled")
         if not project_ids:
             return
         allowed = [str(value) for value in project_ids]
@@ -526,6 +540,8 @@ class TaskIndexService:
                     ):
                         withdraw.append(task_id)
                 if withdraw:
+                    if not self.is_enabled():
+                        raise TaskIndexUnavailable("task_semantic_disabled")
                     await self._io(
                         self.client.delete,
                         self.collection_name,

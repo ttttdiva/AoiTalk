@@ -967,9 +967,9 @@ class CLIDevelopmentSessionService:
             credential_resolver=MuseRemoteTargetResolver(self.config),
             binding_store=self.remote_binding_store,
             privacy_gateway=MuseRemotePrivacyGateway(self.config),
-            wait_seconds=target.get("wait_seconds", 0.0),
-            reconcile_timeout_seconds=target.get("reconcile_timeout_seconds", 0.0),
-            poll_interval_seconds=target.get("poll_interval_seconds", 0.0),
+            wait_seconds=target.get("wait_seconds", 30.0),
+            reconcile_timeout_seconds=target.get("reconcile_timeout_seconds", 120.0),
+            poll_interval_seconds=target.get("poll_interval_seconds", 2.0),
         )
         return self.remote_adapter
 
@@ -1624,7 +1624,8 @@ class CLIDevelopmentSessionService:
                     "immutable Agent binding proof is incomplete",
                     code="agent_binding_proof_missing",
                 )
-            context_tuple.update(
+            ready_context = copy.deepcopy(context_tuple)
+            ready_context.update(
                 {
                     "binding_id": binding_id,
                     "binding_snapshot_hash": binding_hash,
@@ -1633,7 +1634,7 @@ class CLIDevelopmentSessionService:
                     "admission_state": "ready",
                 }
             )
-            row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
+            row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: ready_context}
             await db.commit()
             return await self._session_projection(
                 db, row, policy=policy, owner_id=req.owner_id, created=True
@@ -2005,7 +2006,8 @@ class CLIDevelopmentSessionService:
                         "Exact AgentRevision binding proof is incomplete",
                         code="agent_revision_binding_required",
                     )
-                context_tuple.update(
+                ready_context = copy.deepcopy(context_tuple)
+                ready_context.update(
                     {
                         "binding_id": binding_id,
                         "binding_snapshot_hash": binding_hash,
@@ -2015,7 +2017,7 @@ class CLIDevelopmentSessionService:
                         "admission_state": "ready",
                     }
                 )
-                row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
+                row.context = {CLI_DEVELOPMENT_CONTEXT_KEY: ready_context}
             await db.commit()
             if effective_revision_id is not None:
                 return await self._session_projection(
@@ -2185,8 +2187,42 @@ class CLIDevelopmentSessionService:
         )
         run, work = await self._load_latest(db, row.id)
         current_status = self._status_from_rows(context, run, work)
+        if current_status == "cancelled":
+            raise CLIDevelopmentSessionConflict(
+                "cancelled remote session cannot accept another turn",
+                code="session_binding_unsafe",
+            )
+        if current_status in {"queued", "running"}:
+            raise CLIDevelopmentSessionConflict(
+                "remote session already has a turn in flight",
+                code="session_turn_in_flight",
+            )
         if current_status in {"disconnected", "interrupted", "cancelling", "failed"}:
             raise CLIDevelopmentSessionUnavailable("remote session cannot accept a new send in its current state", code=f"session_{current_status}")
+        session_context = row.context if isinstance(row.context, Mapping) else {}
+        remote_context = session_context.get(MUSE_REMOTE_CONTEXT_KEY)
+        if remote_context is not None:
+            remote_binding = (
+                remote_context.get("binding")
+                if isinstance(remote_context, Mapping)
+                and isinstance(remote_context.get("binding"), Mapping)
+                else remote_context
+            )
+            if not isinstance(remote_binding, Mapping):
+                raise CLIDevelopmentSessionConflict(
+                    "remote thread binding cannot be confirmed safe",
+                    code="session_binding_unsafe",
+                )
+            remote_state = str(remote_binding.get("state") or "")
+            if (
+                remote_state != "bound"
+                or bool(remote_binding.get("current_turn_nonce"))
+                or remote_binding.get("safe_to_send") is not True
+            ):
+                raise CLIDevelopmentSessionConflict(
+                    "remote thread binding cannot accept another turn",
+                    code="session_binding_unsafe",
+                )
         binding = await self._binding_for_row(db, row)
         route = _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
         role_mapping = self._managed_role_mapping(binding, context)
@@ -2282,7 +2318,6 @@ class CLIDevelopmentSessionService:
             "owner_id": request.owner_id,
             "execution_target": MUSE_EXECUTION_TARGET,
             "remote_target_key": sid,
-            "input_text": request.content,
             "binding_id": context.get("binding_id"),
             "binding_snapshot_hash": context.get("binding_snapshot_hash"),
         }
@@ -2797,6 +2832,8 @@ class CLIDevelopmentSessionService:
         output: str | None = None,
         assistant_text: str | None = None,
         assistant_message_id: str | None = None,
+        assistant_text_truncated: bool = False,
+        assistant_text_original_length: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         native_state: str | None = None,
@@ -2895,6 +2932,7 @@ class CLIDevelopmentSessionService:
             output_content = ""
             output_message_id = None
             provider_message_id = None
+            truncated_original_length = None
             if normalized == "succeeded":
                 if remote:
                     # Only the provider adapter's confirmed-correlation
@@ -2902,11 +2940,26 @@ class CLIDevelopmentSessionService:
                     # arbitrary outcome field or an uncertain history read.
                     provider_message_id = str(assistant_message_id or "").strip()
                     output_content = str(assistant_text or "")
+                    try:
+                        provided_original_length = (
+                            None
+                            if isinstance(assistant_text_original_length, bool)
+                            else int(assistant_text_original_length)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        provided_original_length = None
+                    truncated_original_length = (
+                        max(len(output_content), provided_original_length)
+                        if assistant_text_truncated
+                        and provided_original_length is not None
+                        else None
+                    )
                     if (
                         not provider_message_id
                         or len(provider_message_id) > 512
                         or any(ord(char) < 0x20 for char in provider_message_id)
                         or not output_content
+                        or (assistant_text_truncated and truncated_original_length is None)
                     ):
                         await db.rollback()
                         return {
@@ -2955,6 +3008,11 @@ class CLIDevelopmentSessionService:
                                 "provider_message_id": provider_message_id,
                             }
                         )
+                        if assistant_text_truncated:
+                            message_metadata["assistant_text_truncated"] = True
+                            message_metadata[
+                                "assistant_text_original_length"
+                            ] = truncated_original_length
                     message = ConversationMessage(id=uuid.uuid4(), session_id=sid, role="assistant", content=(output_content if remote else str(output or "")), client_message_id=assistant_key, sender_type="agent", sender_id=str(run.agent_id), message_metadata=message_metadata, created_at=self._clock(), updated_at=self._clock(), is_active_branch=True, branch_index=0)
                     db.add(message)
                     row.message_count = int(row.message_count or 0) + 1
@@ -2967,6 +3025,14 @@ class CLIDevelopmentSessionService:
                     **(
                         {"provider_assistant_message_id": provider_message_id}
                         if remote and provider_message_id
+                        else {}
+                    ),
+                    **(
+                        {
+                            "assistant_text_truncated": True,
+                            "assistant_text_original_length": truncated_original_length,
+                        }
+                        if remote and assistant_text_truncated
                         else {}
                     ),
                 }
@@ -3034,6 +3100,11 @@ class CLIDevelopmentSessionService:
                     }
                     if remote and provider_message_id:
                         chunk_payload["provider_assistant_message_id"] = provider_message_id
+                    if remote and assistant_text_truncated:
+                        chunk_payload["assistant_text_truncated"] = True
+                        chunk_payload[
+                            "assistant_text_original_length"
+                        ] = truncated_original_length
                     db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type="cli.output", status="completed", message=None, payload=chunk_payload, created_at=self._clock()))
                     next_sequence += 1
                     output_sequence_index += 1
@@ -3044,6 +3115,11 @@ class CLIDevelopmentSessionService:
             }
             if remote and provider_message_id:
                 tail_payload["provider_assistant_message_id"] = provider_message_id
+            if remote and assistant_text_truncated and truncated_original_length is not None:
+                tail_payload["assistant_text_truncated"] = True
+                tail_payload[
+                    "assistant_text_original_length"
+                ] = truncated_original_length
             if error_message:
                 tail_payload["error_message"] = str(error_message)[:1024]
             db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type=f"cli.{target_status}", status=target_status, message=str(error_message)[:1024] if error_message else None, payload=tail_payload, created_at=self._clock()))
@@ -3062,6 +3138,11 @@ class CLIDevelopmentSessionService:
                 receipt_dict["provider_assistant_message_id"] = run.result.get(
                     "provider_assistant_message_id"
                 )
+                if run.result.get("assistant_text_truncated") is True:
+                    receipt_dict["assistant_text_truncated"] = True
+                    receipt_dict["assistant_text_original_length"] = run.result.get(
+                        "assistant_text_original_length"
+                    )
             if error_message:
                 receipt_dict["error_message"] = str(error_message)[:1024]
             return receipt_dict

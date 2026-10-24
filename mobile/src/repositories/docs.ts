@@ -18,6 +18,7 @@ import {
   encodeDocsBoolean,
   encodeDocsJson,
   type DocsSqliteAsyncTransaction,
+  type DocsSqliteProgress,
   withForegroundYieldingDocsExclusiveTransaction,
 } from "../db/docs-sync-async";
 import {
@@ -1702,7 +1703,27 @@ export type DocsScopeSetReconcile = {
   }>;
 };
 
+export type DocsPromotionPhase =
+  | "building_sets" | "unchanged_receipt" | "membership_snapshot"
+  | "protection" | "staging" | "reconcile" | "finalizing";
+
+export type DocsStagingProgress = {
+  rowsRead: number;
+  batchesRead: number;
+  /** Processed rows, including conflict/tombstone handling and rolled-back work. */
+  rowsApplied: number;
+  /** Only normal, unprotected node UPSERTs; protected SQL has separate counters. */
+  nodeUpsertRows: number;
+  nodeUpsertBatches: number;
+  unchangedNodes: number;
+};
+
 export type DocsSyncPromotionOptions = {
+  /** Cumulative work, including rolled-back attempts; fixed numeric fields only. */
+  onStagingProgress?: (progress: DocsStagingProgress) => void;
+  /** Bounded diagnostics only; no SQL text, bindings or live payloads. */
+  onPromotionPhase?: (phase: DocsPromotionPhase) => void;
+  onSqliteProgress?: (progress: DocsSqliteProgress) => void;
   /** Called before native SQL and commit; a cancelled run must roll back. */
   assertActive?: () => void;
   runId: string;
@@ -5165,13 +5186,15 @@ async function quarantineDocsScopeAsync(
 
 type DocsBatchParams = readonly unknown[];
 
-const DOCS_NODE_INSERT = `INSERT INTO knowledge_nodes(
-       id, workspace_id, parent_id, root_page_id, project_id, source, access,
-       read_only, system_key, title, aliases, description, body_json, body_text,
-       node_type, display_props, query_json, view_json, day_date, sort_order,
-       created_by, updated_by, created_at, updated_at, server_updated_at,
-       dirty, conflict_payload, archived_at
-     )`;
+// One ordered wire projection for normalization, comparison and the INSERT.
+const DOCS_NODE_COLUMNS = [
+  "id", "workspace_id", "parent_id", "root_page_id", "project_id", "source", "access",
+  "read_only", "system_key", "title", "aliases", "description", "body_json", "body_text",
+  "node_type", "display_props", "query_json", "view_json", "day_date", "sort_order",
+  "created_by", "updated_by", "created_at", "updated_at", "server_updated_at",
+  "dirty", "conflict_payload", "archived_at",
+] as const;
+const DOCS_NODE_INSERT = `INSERT INTO knowledge_nodes(${DOCS_NODE_COLUMNS.join(", ")})`;
 const DOCS_NODE_CONFLICT = `ON CONFLICT(id) DO UPDATE SET
        workspace_id = excluded.workspace_id,
        parent_id = excluded.parent_id,
@@ -5242,13 +5265,35 @@ async function upsertDocsNodeBatchAsync(
   tx: DocsSqliteAsyncTransaction,
   rows: readonly Record<string, unknown>[],
   now: string,
+  progress: DocsStagingProgress,
+  onProgress?: (progress: DocsStagingProgress) => void,
 ): Promise<void> {
-  await executeDocsMultiRowBatch(
-    tx,
-    DOCS_NODE_INSERT,
-    DOCS_NODE_CONFLICT,
-    rows.map((row) => docsNodeParams(row, now)),
+  const params = rows.map((row) => docsNodeParams(row, now));
+  // The caller already bounded/protected this page. Read only these <=256
+  // live rows on the SAME transaction; never trust timestamps/digests alone.
+  // Compare normalized SQLite values, including canonical/blank bodies and
+  // the UPSERT's COALESCE semantics for omitted creator metadata.
+  const cached = await tx.getAllAsync<Record<string, unknown>>(
+    `SELECT ${DOCS_NODE_COLUMNS.join(", ")} FROM knowledge_nodes WHERE id IN (${params.map(() => "?").join(", ")})`,
+    ...params.map((row) => row[0]),
   );
+  const byId = new Map(cached.map((row) => [row.id, row]));
+  const changed = params.filter((row) => {
+    const prior = byId.get(row[0]);
+    return !prior || DOCS_NODE_COLUMNS.some((column, index) => {
+      const value = row[index];
+      if (value === null && (column === "created_by" || column === "created_at")) return false;
+      return prior[column] !== value;
+    });
+  });
+  progress.unchangedNodes += params.length - changed.length;
+  for (let offset = 0; offset < changed.length; offset += DOCS_MULTIROW_BATCH_SIZE) {
+    const batch = changed.slice(offset, offset + DOCS_MULTIROW_BATCH_SIZE);
+    await executeDocsMultiRowBatch(tx, DOCS_NODE_INSERT, DOCS_NODE_CONFLICT, batch);
+    progress.nodeUpsertRows += batch.length;
+    progress.nodeUpsertBatches += tx.prepareAsync ? 1 : batch.length;
+    onProgress?.({ ...progress });
+  }
 }
 
 async function upsertDocsNodeAsync(
@@ -5504,15 +5549,21 @@ async function promoteDocsSyncRunAsync(
     (scope) => scope.workspace_id === workspaceId
       && (scope.project_id ?? null) === (options.projectId ?? null),
   );
+  options.onPromotionPhase?.("building_sets");
   const authoritativeByTable = await buildDocsAuthoritativeSets(
     options.authoritative,
     tableNames,
     options.assertActive,
   );
 
+  const stagingProgress: DocsStagingProgress = {
+    rowsRead: 0, batchesRead: 0, rowsApplied: 0,
+    nodeUpsertRows: 0, nodeUpsertBatches: 0, unchangedNodes: 0,
+  };
   let permissionsProjected = false;
   const telemetry = await withForegroundYieldingDocsExclusiveTransaction((rawTx) =>
     withDocsPreparedWrites(rawTx, async (tx) => {
+    options.onPromotionPhase?.("unchanged_receipt");
     if (await tryFinalizeUnchangedDocsRunTx(tx, options, tableNames)) {
       return { source: "staging" as const, rowsRead: 0, batches: 0, maxBatchSize: 0 };
     }
@@ -5521,6 +5572,7 @@ async function promoteDocsSyncRunAsync(
     permissionsProjected = true;
     // native transaction object.  No Drizzle query is allowed to observe or
     // mutate the promotion while it is in flight.
+    options.onPromotionPhase?.("membership_snapshot");
     const membershipSnapshot = await loadDocsMembershipSnapshotTx(
       tx,
       options.authScope,
@@ -5529,6 +5581,7 @@ async function promoteDocsSyncRunAsync(
       options.assertActive,
       { workspace_id: workspaceId, project_id: options.projectId ?? null },
     );
+    options.onPromotionPhase?.("protection");
     const outboxProtection = await loadDocsScopedOutboxProtectionTx(
       tx,
       options.authScope,
@@ -5710,6 +5763,9 @@ async function promoteDocsSyncRunAsync(
               lastEntityKey,
             );
           if (!rows.length) break;
+          stagingProgress.rowsRead += rows.length;
+          stagingProgress.batchesRead += 1;
+          options.onStagingProgress?.({ ...stagingProgress });
           stagedTelemetry.rowsRead += rows.length;
           stagedTelemetry.batches += 1;
           stagedTelemetry.maxBatchSize = Math.max(
@@ -5751,8 +5807,10 @@ async function promoteDocsSyncRunAsync(
             if (!authoritativeIds("knowledge_nodes")) {
               await upsertMembershipBatch("knowledge_nodes", normalNodeKeys);
             }
-            await upsertDocsNodeBatchAsync(tx, normalNodeRows, now);
+            await upsertDocsNodeBatchAsync(tx, normalNodeRows, now, stagingProgress, options.onStagingProgress);
           }
+          stagingProgress.rowsApplied += rows.length;
+          options.onStagingProgress?.({ ...stagingProgress });
           const nextKey: string | undefined = rows[rows.length - 1]?.entity_key;
           if (typeof nextKey !== "string" || !nextKey.length || nextKey === lastEntityKey) break;
           lastEntityKey = nextKey;
@@ -5764,8 +5822,10 @@ async function promoteDocsSyncRunAsync(
     // Authoritative membership, including IDs without a changed row, was
     // persisted by the batch pass above. Staged rows still handle protected,
     // tombstone and legacy/partial membership transitions individually.
+    options.onPromotionPhase?.("staging");
     await applyStagedRows();
 
+    options.onPromotionPhase?.("reconcile");
     const writableScope = writableDocsPromotionScope(options, scopeKey);
     const pendingCreates = writableScope ? await loadDocsPendingNodeCreatesTx(
       tx, options.authScope, scopeKey, writableScope.workspace_id, writableScope.project_id ?? null,
@@ -5989,10 +6049,12 @@ async function promoteDocsSyncRunAsync(
       }
     }
 
+    options.onPromotionPhase?.("finalizing");
     await finalizeDocsSyncRunTx(tx, options);
     return stagedTelemetry;
     }),
     options.assertActive,
+    options.onSqliteProgress,
   );
   if (permissionsProjected) docsPermissionEpoch += 1;
   return telemetry;

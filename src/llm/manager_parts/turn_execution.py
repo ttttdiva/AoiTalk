@@ -118,6 +118,7 @@ from ..generation_cancellation import (
     set_current_generation_mutation_gate,
 )
 from ..runtime_tool_registry import build_runtime_tool_registry
+from ...tools.core import safe_argument_rejection
 from ..unified_turn_runtime import (
     ToolNoProgressGuard,
     activate_tool_no_progress_guard,
@@ -248,6 +249,7 @@ _OWNER_TOOL_RESULT_KEYS = frozenset(
         "executed",
         "synthetic",
         "not_executed",
+        "argument_rejection",
     }
 )
 _OWNER_PROGRESS_TEXT_LIMIT = 12_000
@@ -283,6 +285,12 @@ def _owner_progress_payload(
                 if result_key in {"executed", "synthetic", "not_executed"}:
                     if isinstance(result_value, bool):
                         projected_result[result_key] = result_value
+                    continue
+                if result_key == "argument_rejection":
+                    # Fixed server code and digests only; anything else drops.
+                    rejection = safe_argument_rejection(result_value)
+                    if rejection:
+                        projected_result[result_key] = rejection
                     continue
                 if result_key in {"output", "error"} and result_value is not None:
                     projected_result[result_key] = str(result_value)[

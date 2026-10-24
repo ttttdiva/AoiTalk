@@ -18,7 +18,7 @@ import { chatApi } from "@/lib/chat-api";
 import { createRegularNewChatSession } from "@/lib/create-regular-new-chat-session";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
 import { useChatSessionsOptional } from "@/contexts/chat-session-context";
-import { PUBLIC_BASE_PATH } from "@/lib/base-path";
+import { PUBLIC_BASE_PATH, withBasePath } from "@/lib/base-path";
 import { formatTimestamp } from "@/lib/agent-run-timeline-format";
 
 type EmployeeChatActivityProps = {
@@ -202,7 +202,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2">
             <h4 className="text-sm font-medium">関連Chat（{relatedSessions.length}）</h4>
-            <a className="text-xs text-primary underline" href={`/chat?agent_id=${encodeURIComponent(agentId)}`}>
+            <a className="text-xs text-primary underline" href={withBasePath(`/chat?agent_id=${encodeURIComponent(agentId)}`)}>
               Chatで開く
             </a>
           </div>
@@ -213,7 +213,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
           {relatedSessions.map((session) => (
             <a
               key={session.id}
-              href={`/chat?s=${encodeURIComponent(session.id)}`}
+              href={withBasePath(`/chat?s=${encodeURIComponent(session.id)}`)}
               className="block rounded border bg-background p-3 transition-colors hover:border-primary/60"
             >
               <span className="flex items-center gap-2 text-sm font-medium">
@@ -231,7 +231,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2">
             <h4 className="text-sm font-medium">関連活動（{relatedRuns.length}）</h4>
-            <a className="text-xs text-primary underline" href={agentActivityHref(agentId)}>
+            <a className="text-xs text-primary underline" href={withBasePath(agentActivityHref(agentId))}>
               Operationsで開く
             </a>
           </div>
@@ -250,7 +250,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
                   {run.agent_id && (
                     <a
                       className="text-xs text-primary underline"
-                      href={agentActivityHref(run.agent_id)}
+                      href={withBasePath(agentActivityHref(run.agent_id))}
                     >
                       Agentを開く
                     </a>
@@ -258,7 +258,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
                   {run.work_item_id && (
                     <a
                       className="text-xs text-primary underline"
-                      href={`/operations?tab=work&work_id=${encodeURIComponent(run.work_item_id)}`}
+                      href={withBasePath(`/operations?tab=work&work_id=${encodeURIComponent(run.work_item_id)}`)}
                     >
                       Workを開く
                     </a>
@@ -266,7 +266,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
                 </div>
               </div>
               {run.session_id && (
-                <a className="mt-2 block text-xs text-primary underline" href={`/chat?s=${encodeURIComponent(run.session_id)}`}>
+                <a className="mt-2 block text-xs text-primary underline" href={withBasePath(`/chat?s=${encodeURIComponent(run.session_id)}`)}>
                   関連Chatを開く
                 </a>
               )}

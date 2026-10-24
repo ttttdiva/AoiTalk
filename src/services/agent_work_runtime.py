@@ -39,12 +39,14 @@ from ..memory.models import (
     Agent,
     AgentDialogue,
     AgentDialogueDelivery,
+    AgentDialogueInput,
     AgentDialogueReservation,
     AgentDialogueUsage,
     AgentProjectGrant,
     AgentRevision,
     AgentRun,
     AgentRunEvent,
+    AgentRunEdge,
     ConversationParticipant,
     ConversationDispatchOutbox,
     AgentWorkEvent,
@@ -84,6 +86,10 @@ MAX_ATTEMPTS = 100
 MAX_PRIORITY = 10_000
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 MAX_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+INTERACTIVE_HISTORY_FENCE_SCHEMA = "aoitalk.interactive_history_fence/v1"
+INTERACTIVE_HISTORY_FENCE_ACK = "provider_outcome_unknown_no_replay"
+_HISTORY_FENCE_ORIGIN_CODES = frozenset({"max_attempts_exhausted", "interactive_lease_expired"})
+_HISTORY_FENCE_EVENT = "work.history_fenced"
 _CANONICAL_RESOURCE_KEY = re.compile(
     r"^(?:project:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|workspace:[0-9a-f]{64})$",
     re.IGNORECASE,
@@ -470,6 +476,30 @@ class InteractiveAdmissionError(RuntimeError):
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = _string(code, limit=96) or "interactive_admission_denied"
         super().__init__(message or self.code)
+
+
+class InteractiveHistoryFenceError(RuntimeError):
+    """A history-only acknowledgment could not be proven safe."""
+
+    def __init__(self, code: str, http_status: int) -> None:
+        self.code = code
+        self.http_status = http_status
+        super().__init__(code)
+
+
+def _history_fence_json(value: Any) -> str:
+    def scalar(item: Any) -> str:
+        if isinstance(item, datetime):
+            return item.isoformat()
+        if isinstance(item, uuid.UUID):
+            return str(item)
+        raise TypeError("unsupported history-fence JSON scalar")
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=scalar)
+
+
+def _history_fence_digest(value: Any) -> str:
+    return hashlib.sha256(_history_fence_json(value).encode("utf-8")).hexdigest()
 
 
 _AUTHORITY_ADMISSION_REASONS = frozenset(
@@ -1340,6 +1370,14 @@ class AgentWorkCoordinator:
                         agent_revision_id=revision_uuid,
                     )
                     if proven is None:
+                        proven = await self._history_fenced_uncertain_work_is_releasable(
+                            db_session,
+                            existing,
+                            session_id=session_uuid,
+                            user_id=expected_user_id,
+                            agent_id=agent_uuid,
+                        )
+                    if proven is None:
                         raise InteractiveAdmissionError("interactive_session_busy")
                     # The exact retry is idempotent, but the uncertain Work
                     # remains historical and is never reactivated.
@@ -1372,10 +1410,31 @@ class AgentWorkCoordinator:
                 AgentWorkItem.state.in_(
                     ("pending", "claimed", "running", "awaiting_approval", "uncertain")
                 ),
-                AgentWorkItem.execution_adapter == "interactive_chat",
+                or_(
+                    AgentWorkItem.execution_adapter == "interactive_chat",
+                    and_(
+                        AgentWorkItem.state == "uncertain",
+                        or_(
+                            AgentWorkItem.source_type == "chat_turn",
+                            AgentWorkItem.metadata_json["history_fence"].as_string().is_not(None),
+                        ),
+                    ),
+                ),
             ]
             if hasattr(AgentWorkItem, "conversation_session_id"):
-                session_conditions.append(AgentWorkItem.conversation_session_id == session_uuid)
+                # An invalidated fence must remain a busy candidate even if
+                # its Work-side session/adapter binding was changed. The
+                # historical Run supplies an independent session reference.
+                session_conditions.append(or_(
+                    AgentWorkItem.conversation_session_id == session_uuid,
+                    and_(
+                        AgentWorkItem.state == "uncertain",
+                        AgentWorkItem.id.in_(select(AgentRun.work_item_id).where(
+                            AgentRun.session_id == session_uuid,
+                            AgentRun.work_item_id.is_not(None),
+                        )),
+                    ),
+                ))
             else:
                 session_conditions.extend(
                     [
@@ -1397,6 +1456,14 @@ class AgentWorkCoordinator:
                     agent_id=agent_uuid,
                     agent_revision_id=revision_uuid,
                 )
+                if proven is None:
+                    proven = await self._history_fenced_uncertain_work_is_releasable(
+                        db_session,
+                        active_row,
+                        session_id=session_uuid,
+                        user_id=expected_user_id,
+                        agent_id=agent_uuid,
+                    )
                 if proven is not None:
                     continue
                 raise InteractiveAdmissionError("interactive_session_busy")
@@ -1414,10 +1481,30 @@ class AgentWorkCoordinator:
                             ("pending", "claimed", "running", "awaiting_approval", "uncertain")
                         ),
                         AgentWorkItem.concurrency_key == shared_key,
-                    ).limit(1)
+                    )
                 )
-                if shared_result.scalar() is not None:
-                    raise InteractiveAdmissionError("interactive_shared_resource_busy")
+                for shared_id in shared_result.scalars().all():
+                    shared_work = await db_session.get(AgentWorkItem, shared_id)
+                    if shared_work is None or shared_work.state != "uncertain":
+                        raise InteractiveAdmissionError("interactive_shared_resource_busy")
+                    proven = await self._restart_uncertain_work_is_releasable(
+                        db_session,
+                        shared_work,
+                        session_id=session_uuid,
+                        user_id=expected_user_id,
+                        agent_id=agent_uuid,
+                        agent_revision_id=revision_uuid,
+                    )
+                    if proven is None:
+                        proven = await self._history_fenced_uncertain_work_is_releasable(
+                            db_session,
+                            shared_work,
+                            session_id=session_uuid,
+                            user_id=expected_user_id,
+                            agent_id=agent_uuid,
+                        )
+                    if proven is None:
+                        raise InteractiveAdmissionError("interactive_shared_resource_busy")
             candidate = WorkCandidate(
                 source_type="chat_turn",
                 source_id=str(run_uuid),
@@ -2697,6 +2784,602 @@ class AgentWorkCoordinator:
         }:
             return None
         return work
+
+    async def _history_fence_locked_identity_in_session(
+        self,
+        session: Any,
+        work: AgentWorkItem,
+        *,
+        session_id: Any,
+        owner_user_id: Any,
+    ) -> tuple[AgentWorkItem, AgentRun, Any | None]:
+        """Authenticate every receipt path under the existing Run/Outbox/Work order."""
+
+        owner = str(owner_user_id or "").strip()
+        if not owner or owner == "default_user":
+            raise InteractiveHistoryFenceError("history_fence_forbidden", 403)
+        session_uuid = _as_uuid(session_id)
+        run_id = _as_uuid(getattr(work, "source_id", None))
+        if session_uuid is None or run_id is None:
+            raise InteractiveHistoryFenceError("history_fence_not_found", 404)
+        conversation = await session.get(ConversationSession, session_uuid)
+
+        def authenticate(candidate_work: Any, candidate_run: Any, candidate_outbox: Any) -> None:
+            if (
+                candidate_work is None or candidate_run is None or conversation is None
+                or getattr(conversation, "deleted_at", None) is not None
+                or str(conversation.user_id or "") != owner
+                or _as_uuid(candidate_work.conversation_session_id) != session_uuid
+                or _as_uuid(candidate_run.session_id) != session_uuid
+                or str(candidate_run.user_id or "") != owner
+                or (candidate_outbox is not None and (
+                    _as_uuid(candidate_outbox.session_id) != session_uuid
+                    or str(candidate_outbox.user_id or "") != owner
+                ))
+            ):
+                raise InteractiveHistoryFenceError("history_fence_not_found", 404)
+
+        # Read-only ownership first: lock contention must not reveal a foreign
+        # row's existence. The locked rows are authenticated again below.
+        authenticate(
+            work, await session.get(AgentRun, run_id),
+            await session.get(ConversationDispatchOutbox, run_id),
+        )
+        try:
+            run = (await session.execute(
+                select(AgentRun).where(AgentRun.id == run_id)
+                .execution_options(populate_existing=True).with_for_update(nowait=True)
+            )).scalars().first()
+            outbox = (await session.execute(
+                select(ConversationDispatchOutbox).where(ConversationDispatchOutbox.run_id == run_id)
+                .execution_options(populate_existing=True).with_for_update(nowait=True)
+            )).scalars().first()
+            locked_work = (await session.execute(
+                select(AgentWorkItem).where(AgentWorkItem.id == work.id)
+                .execution_options(populate_existing=True).with_for_update(nowait=True)
+            )).scalars().first()
+        except Exception as exc:
+            raise InteractiveHistoryFenceError("history_fence_busy", 409) from exc
+        authenticate(locked_work, run, outbox)
+        return locked_work, run, outbox
+
+    @staticmethod
+    def _history_fence_assert_bindings(work: AgentWorkItem, run: AgentRun, outbox: Any | None) -> None:
+        # Called before any existing receipt, and at the specified point in
+        # new-snapshot validation so error priority remains deterministic.
+        payload = outbox.payload if outbox is not None and isinstance(outbox.payload, Mapping) else {}
+        if (
+            work.source_type != "chat_turn"
+            or work.intent_key != "interactive_chat"
+            or work.execution_adapter != "interactive_chat"
+            or run.run_type != "chat_turn"
+            or run.work_item_id != work.id
+            or str(work.source_id) != str(run.id)
+            or _as_uuid(work.assigned_agent_id) is None
+            or _as_uuid(work.assigned_agent_id) != _as_uuid(run.agent_id)
+            or _as_uuid(work.agent_revision_id) is None
+            or _as_uuid(work.agent_revision_id) != _as_uuid(run.agent_revision_id)
+            or str(work.source_revision) != str(run.agent_revision_id)
+            or (outbox is not None and (
+                outbox.run_id != run.id
+                or _as_uuid(payload.get("agent_run_id")) != run.id
+                or ("run_id" in payload and _as_uuid(payload.get("run_id")) != run.id)
+            ))
+        ):
+            raise InteractiveHistoryFenceError("history_fence_binding_mismatch", 409)
+
+    async def _history_fence_children_in_session(
+        self, session: Any, work: AgentWorkItem, run: AgentRun, *, owner_user_id: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """One fail-closed graph predicate shared by acknowledgment and admission.
+
+        These are observations only. Usage can settle later without revoking a
+        fence; current transport and child execution safety is always rechecked.
+        """
+
+        async def rows(model: Any, condition: Any) -> list[Any]:
+            result = await session.execute(select(model).where(condition).order_by(model.id))
+            return list(result.scalars().all())
+
+        def unknown() -> None:
+            raise InteractiveHistoryFenceError("history_fence_transport_unknown", 409)
+
+        def pending() -> None:
+            raise InteractiveHistoryFenceError("history_fence_child_pending", 409)
+
+        async def owned_session(identity: Any) -> None:
+            row = await session.get(ConversationSession, _as_uuid(identity)) if _as_uuid(identity) else None
+            if row is None or str(row.user_id or "") != owner_user_id:
+                unknown()
+
+        async def owned_work(identity: Any) -> AgentWorkItem:
+            row = await session.get(AgentWorkItem, _as_uuid(identity)) if _as_uuid(identity) else None
+            if row is None:
+                unknown()
+            await owned_session(row.conversation_session_id)
+            return row
+
+        async def owned_run(identity: Any) -> AgentRun:
+            row = await session.get(AgentRun, _as_uuid(identity)) if _as_uuid(identity) else None
+            if row is None or str(row.user_id or "") != owner_user_id:
+                unknown()
+            await owned_session(row.session_id)
+            return row
+
+        deliveries = await rows(AgentDialogueDelivery, or_(
+            AgentDialogueDelivery.source_run_id == run.id,
+            AgentDialogueDelivery.source_work_item_id == work.id,
+            AgentDialogueDelivery.receiver_run_id == run.id,
+            AgentDialogueDelivery.receiver_work_item_id == work.id,
+        ))
+        inputs = await rows(AgentDialogueInput, or_(
+            AgentDialogueInput.source_run_id == run.id,
+            AgentDialogueInput.source_work_item_id == work.id,
+        ))
+        reservations = await rows(AgentDialogueReservation, AgentDialogueReservation.run_id == run.id)
+        usage = await rows(AgentDialogueUsage, AgentDialogueUsage.run_id == run.id)
+        edges = await rows(AgentRunEdge, AgentRunEdge.parent_run_id == run.id)
+        child_work = await rows(AgentWorkItem, and_(
+            AgentWorkItem.id != work.id,
+            or_(AgentWorkItem.parent_work_item_id == work.id, AgentWorkItem.root_work_item_id == work.id),
+        ))
+        dialogue_ids = {row.dialogue_id for row in [*deliveries, *inputs, *reservations, *usage]}
+        metadata = run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
+        marker = metadata.get("agent_dialogue")
+        if "agent_dialogue" in metadata:
+            if not isinstance(marker, Mapping) or _as_uuid(marker.get("dialogue_id")) is None:
+                unknown()
+            dialogue_ids.add(_as_uuid(marker.get("dialogue_id")))
+        dialogues = await rows(AgentDialogue, or_(
+            AgentDialogue.id.in_(dialogue_ids),
+            AgentDialogue.human_run_id == run.id,
+            AgentDialogue.human_work_item_id == work.id,
+        ))
+        if not dialogue_ids.issubset({row.id for row in dialogues}):
+            unknown()
+        dialogue_map = {row.id: row for row in dialogues}
+        usage = await rows(AgentDialogueUsage, or_(
+            AgentDialogueUsage.run_id == run.id,
+            AgentDialogueUsage.dialogue_id.in_(dialogue_map),
+        ))
+        for dialogue in dialogues:
+            if str(dialogue.owner_user_id or "") != owner_user_id:
+                unknown()
+            await owned_session(dialogue.root_session_id)
+            await owned_session(dialogue.worker_session_id)
+            if dialogue.state not in {"queued", "running", "waiting", "succeeded", "failed", "cancelled", "blocked", "expired"}:
+                unknown()
+            if dialogue.usage_state not in {"known", "unknown", "cost_unknown", "token_unknown"}:
+                unknown()
+        if isinstance(marker, Mapping):
+            dialogue = dialogue_map[_as_uuid(marker.get("dialogue_id"))]
+            role = marker.get("role")
+            if role not in {"root", "worker"}:
+                unknown()
+            prefix = "root" if role == "root" else "worker"
+            if (
+                getattr(dialogue, f"{prefix}_session_id") != run.session_id
+                or getattr(dialogue, f"{prefix}_agent_id") != run.agent_id
+                or (role == "worker" and dialogue.worker_agent_revision_id != run.agent_revision_id)
+            ):
+                unknown()
+            if marker.get("delivery_id") not in (None, ""):
+                delivery = await session.get(AgentDialogueDelivery, _as_uuid(marker.get("delivery_id")))
+                if delivery is None or delivery.dialogue_id != dialogue.id or (
+                    role == "worker" and (delivery.receiver_run_id != run.id or delivery.receiver_work_item_id != work.id)
+                ):
+                    unknown()
+        child_pending = False
+        for delivery in deliveries:
+            if delivery.state not in {"cancelled", "failed", "expired", "acked"}:
+                if delivery.state in {"pending", "available", "leased", "delivered"}:
+                    child_pending = True
+                else:
+                    unknown()
+            for prefix in ("source", "receiver"):
+                session_identity = getattr(delivery, f"{prefix}_session_id")
+                await owned_session(session_identity)
+                run_identity = getattr(delivery, f"{prefix}_run_id")
+                work_identity = getattr(delivery, f"{prefix}_work_item_id")
+                related_run = await owned_run(run_identity) if run_identity is not None else None
+                related_work = await owned_work(work_identity) if work_identity is not None else None
+                if related_run is not None and related_run.id != run.id and related_run.status not in {"succeeded", "failed", "cancelled"}:
+                    if related_run.status in {"queued", "running", "awaiting_approval", "uncertain"}:
+                        child_pending = True
+                    else:
+                        unknown()
+                if related_work is not None and related_work.id != work.id and related_work.state not in WORK_TERMINAL_STATES:
+                    if related_work.state in WORK_STATES:
+                        child_pending = True
+                    else:
+                        unknown()
+                if related_run is not None and related_run.session_id != session_identity:
+                    unknown()
+                if related_work is not None and related_work.conversation_session_id != session_identity:
+                    unknown()
+                if related_run is not None and related_work is not None and (
+                    related_run.work_item_id != related_work.id
+                    or str(related_work.source_id) != str(related_run.id)
+                    or related_run.agent_id != related_work.assigned_agent_id
+                    or related_run.agent_revision_id != related_work.agent_revision_id
+                ):
+                    unknown()
+                for field in ("agent_id", "agent_revision_id"):
+                    expected = getattr(delivery, f"{prefix}_{field}")
+                    if related_run is not None and expected is not None and getattr(related_run, field) != expected:
+                        unknown()
+            transport = await owned_work(delivery.transport_work_item_id)
+            if transport.state not in WORK_TERMINAL_STATES:
+                if transport.state in WORK_STATES:
+                    child_pending = True
+                else:
+                    unknown()
+        for item in inputs:
+            if item.source_run_id is not None:
+                source_run = await owned_run(item.source_run_id)
+                if item.source_work_item_id is not None and source_run.work_item_id != item.source_work_item_id:
+                    unknown()
+            if item.source_work_item_id is not None:
+                await owned_work(item.source_work_item_id)
+            if item.state == "pending":
+                child_pending = True
+            elif item.state not in {"answered", "invalidated", "blocked", "expired", "cancelled"}:
+                unknown()
+        for reservation in reservations:
+            if reservation.state == "reserved":
+                child_pending = True
+            elif reservation.state not in {"released", "charged", "overrun"}:
+                unknown()
+        for receipt in usage:
+            await owned_run(receipt.run_id)
+            if receipt.state not in {"known", "unknown", "cost_unknown", "token_unknown"}:
+                unknown()
+        for edge in edges:
+            child_run = await owned_run(edge.child_run_id)
+            if child_run.status not in {"succeeded", "failed", "cancelled"}:
+                if child_run.status in {"queued", "running", "awaiting_approval", "uncertain"}:
+                    child_pending = True
+                else:
+                    unknown()
+            if edge.status == "open":
+                child_pending = True
+            elif edge.status not in {"closed", "completed", "succeeded", "failed", "cancelled", "expired", "blocked"}:
+                unknown()
+        for child in child_work:
+            await owned_work(child.id)
+            if child.state not in WORK_TERMINAL_STATES:
+                if child.state in WORK_STATES:
+                    child_pending = True
+                else:
+                    unknown()
+        if child_pending:
+            pending()
+        result = {
+            name: [{"id": str(row.id), "state": str(getattr(row, "state", getattr(row, "status", "")))} for row in values]
+            for name, values in (
+                ("deliveries", deliveries), ("inputs", inputs), ("reservations", reservations),
+                ("usage", usage), ("edges", edges), ("work_items", child_work),
+            )
+        }
+        result["dialogues"] = [{
+            "id": str(row.id), "state": row.state, "usage_state": row.usage_state,
+            "control_revision": int(row.control_revision or 0),
+        } for row in dialogues]
+        return result
+
+    async def _interactive_history_fence_snapshot_in_session(
+        self, session: Any, work: AgentWorkItem, *, session_id: Any, owner_user_id: Any,
+    ) -> dict[str, Any]:
+        work, run, outbox = await self._history_fence_locked_identity_in_session(
+            session, work, session_id=session_id, owner_user_id=owner_user_id,
+        )
+        if work.state != "uncertain":
+            raise InteractiveHistoryFenceError("history_fence_not_uncertain", 409)
+        if await self._restart_uncertain_work_is_releasable(
+            session, work, session_id=_as_uuid(session_id), user_id=str(owner_user_id),
+            agent_id=run.agent_id, agent_revision_id=run.agent_revision_id,
+        ) is not None:
+            raise InteractiveHistoryFenceError("history_fence_already_releasable", 409)
+        origin = (await session.execute(
+            select(AgentWorkEvent).where(
+                AgentWorkEvent.work_item_id == work.id, AgentWorkEvent.event_type == "work.uncertain",
+            ).order_by(AgentWorkEvent.sequence.desc()).limit(1)
+        )).scalars().first()
+        payload = origin.payload_json if origin is not None and isinstance(origin.payload_json, Mapping) else {}
+        if (
+            work.safe_error_code not in _HISTORY_FENCE_ORIGIN_CODES
+            or origin is None or origin.safe_error_code != work.safe_error_code
+            or payload.get("error_code") != work.safe_error_code
+            or payload.get("recovered_after_restart") is not True
+        ):
+            raise InteractiveHistoryFenceError("history_fence_unsupported_origin", 409)
+        if run.status != "failed" or run.ended_at is None:
+            raise InteractiveHistoryFenceError("history_fence_run_not_terminal", 409)
+        self._history_fence_assert_bindings(work, run, outbox)
+        if any(getattr(work, name) is not None for name in (
+            "lease_owner", "lease_token", "lease_expires_at", "active_agent_run_id",
+        )):
+            raise InteractiveHistoryFenceError("history_fence_live_lease", 409)
+        if outbox is not None:
+            if any(getattr(outbox, name) is not None for name in ("lease_owner", "lease_token", "lease_expires_at")):
+                raise InteractiveHistoryFenceError("history_fence_live_lease", 409)
+        metadata = run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
+        if any(metadata.get(name) not in (None, "") for name in ("pending_interaction_id", "pending_interaction")):
+            raise InteractiveHistoryFenceError("history_fence_interaction_pending", 409)
+        if outbox is not None:
+            if outbox.status not in {"delivered", "cancelled", "deadletter"}:
+                raise InteractiveHistoryFenceError("history_fence_transport_unknown", 409)
+        children = await self._history_fence_children_in_session(session, work, run, owner_user_id=str(owner_user_id))
+        max_work_sequence = await session.scalar(select(func.max(AgentWorkEvent.sequence)).where(AgentWorkEvent.work_item_id == work.id))
+        event_stats = (await session.execute(select(
+            func.count(AgentRunEvent.id), func.max(AgentRunEvent.sequence),
+        ).where(AgentRunEvent.run_id == run.id))).one()
+        cancellation = (await session.execute(select(AgentRunEvent).where(
+            AgentRunEvent.run_id == run.id, AgentRunEvent.event_type == "interaction.cancelled",
+        ).order_by(AgentRunEvent.sequence.desc()).limit(1))).scalars().first()
+        cancel_path = "none"
+        if cancellation is not None:
+            cancellation_payload = cancellation.payload if isinstance(cancellation.payload, Mapping) else {}
+            resolution = cancellation_payload.get("resolution")
+            if cancellation.status == "cancelled" and isinstance(resolution, Mapping) and resolution.get("cancelled") is True:
+                cancel_path = "run_terminalize"
+            elif cancellation.status is None:
+                cancel_path = "task_cancelled"
+        snapshot = {
+            "work": {name: getattr(work, name) for name in (
+                "id", "state", "safe_error_code", "outcome_classification", "completed_at",
+                "attempt_count", "max_attempts", "lease_owner", "lease_token", "lease_expires_at",
+                "active_agent_run_id", "updated_at",
+            )},
+            "run": {name: getattr(run, name) for name in (
+                "id", "status", "ended_at", "updated_at", "agent_id", "agent_revision_id", "session_id", "user_id",
+            )},
+            "outbox": ({name: getattr(outbox, name) for name in (
+                "run_id", "status", "attempts", "updated_at", "lease_owner", "lease_token", "lease_expires_at",
+            )} if outbox is not None else None),
+            "children": children,
+        }
+        snapshot["work"]["max_event_sequence"] = int(max_work_sequence or 0)
+        snapshot["run"].update(result_digest=_history_fence_digest(run.result), event_count=int(event_stats[0] or 0), max_event_sequence=int(event_stats[1] or 0))
+        # Materialize JSON scalars before returning evidence to an HTTP caller.
+        snapshot = json.loads(_history_fence_json(snapshot))
+        child_summary = {name: [{"id": row["id"], "state": row["state"]} for row in values] for name, values in children.items()}
+        return {
+            "snapshot": snapshot, "state_digest": _history_fence_digest(snapshot),
+            "child_summary": child_summary, "interaction_cancel_path": cancel_path,
+            "origin_event_sequence": int(origin.sequence),
+        }
+
+    async def fence_interactive_uncertain_history(
+        self,
+        *,
+        work_item_id: str,
+        session_id: str,
+        owner_user_id: str,
+        idempotency_key: str,
+        acknowledgment: str,
+        expected_state_digest: str | None,
+        dry_run: bool,
+        live_generation_active: bool | None,
+    ) -> dict[str, Any]:
+        """Acknowledge an unknown historical outcome without replay or settlement."""
+
+        owner = str(owner_user_id or "").strip()
+        if not owner or owner == "default_user":
+            raise InteractiveHistoryFenceError("history_fence_forbidden", 403)
+        work_uuid = _as_uuid(work_item_id)
+        session_uuid = _as_uuid(session_id)
+        if work_uuid is None or session_uuid is None:
+            raise InteractiveHistoryFenceError("history_fence_not_found", 404)
+        session = await self._session()
+        try:
+            work = await session.get(AgentWorkItem, work_uuid)
+            if work is None:
+                raise InteractiveHistoryFenceError("history_fence_not_found", 404)
+            work, run, outbox = await self._history_fence_locked_identity_in_session(
+                session, work, session_id=session_uuid, owner_user_id=owner,
+            )
+            if acknowledgment != INTERACTIVE_HISTORY_FENCE_ACK:
+                raise InteractiveHistoryFenceError("history_fence_ack_required", 422)
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise InteractiveHistoryFenceError("history_fence_idempotency_required", 422)
+            fingerprint = hashlib.sha256(
+                f"aoitalk:interactive-history-fence:v1:{work.id}:{idempotency_key}".encode("utf-8")
+            ).hexdigest()
+            request_digest = _history_fence_digest({
+                "work_item_id": str(work.id), "session_id": str(session_uuid),
+                "acknowledgment": acknowledgment, "expected_state_digest": expected_state_digest,
+            })
+            metadata = dict(work.metadata_json) if isinstance(work.metadata_json, Mapping) else {}
+            if "history_fence" in metadata:
+                self._history_fence_assert_bindings(work, run, outbox)
+                if live_generation_active is None:
+                    raise InteractiveHistoryFenceError("history_fence_live_state_unavailable", 503)
+                if live_generation_active is not False:
+                    raise InteractiveHistoryFenceError("history_fence_live_lease", 409)
+                existing = metadata["history_fence"]
+                if dry_run:
+                    status = "already_fenced"
+                elif isinstance(existing, Mapping) and existing.get("idempotency_fingerprint") == fingerprint:
+                    if existing.get("request_digest") != request_digest:
+                        raise InteractiveHistoryFenceError("history_fence_idempotency_conflict", 409)
+                    status = "already_fenced_same_request"
+                else:
+                    raise InteractiveHistoryFenceError("history_fence_already_applied", 409)
+                existing_digest = existing.get("state_digest") if isinstance(existing, Mapping) else None
+                if not isinstance(existing_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", existing_digest):
+                    existing_digest = None
+                result = {
+                    "status": status, "work_item_id": str(work.id), "run_id": str(run.id),
+                    "state_digest": existing_digest,
+                    "provider_outcome": "unknown",
+                }
+                await self._rollback(session)
+                return result
+            evidence = await self._interactive_history_fence_snapshot_in_session(
+                session, work, session_id=session_uuid, owner_user_id=owner,
+            )
+            if live_generation_active is None:
+                raise InteractiveHistoryFenceError("history_fence_live_state_unavailable", 503)
+            if live_generation_active is not False:
+                raise InteractiveHistoryFenceError("history_fence_live_lease", 409)
+            if dry_run:
+                result = {
+                    "status": "dry_run_ok", "work_item_id": str(work.id), "run_id": str(run.id),
+                    "state_digest": evidence["state_digest"], "evidence": evidence,
+                }
+                await self._rollback(session)
+                return result
+            if not expected_state_digest or expected_state_digest != evidence["state_digest"]:
+                # SQLite ignores FOR UPDATE, so another acknowledgment can
+                # commit between the initial metadata read and the snapshot.
+                # Reauthenticate and refresh before classifying that race as
+                # an ordinary stale preview (Run/event reads may be newer
+                # than the snapshot's earlier Work identity-map instance).
+                refreshed_work, _, _ = await self._history_fence_locked_identity_in_session(
+                    session, work, session_id=session_uuid, owner_user_id=owner,
+                )
+                refreshed_metadata = refreshed_work.metadata_json
+                if isinstance(refreshed_metadata, Mapping) and "history_fence" in refreshed_metadata:
+                    raise InteractiveHistoryFenceError("history_fence_busy", 409)
+                raise InteractiveHistoryFenceError("history_fence_snapshot_changed", 409)
+            fenced_at = self._now()
+            metadata["history_fence"] = {
+                "schema": INTERACTIVE_HISTORY_FENCE_SCHEMA,
+                "acknowledgment": INTERACTIVE_HISTORY_FENCE_ACK,
+                "actor_user_id": owner,
+                "fenced_at": fenced_at.isoformat(),
+                "idempotency_fingerprint": fingerprint,
+                "request_digest": request_digest,
+                "state_digest": evidence["state_digest"],
+                "run_id": str(run.id), "run_status": run.status,
+                "run_ended_at": run.ended_at.isoformat(),
+                "outbox_status": outbox.status if outbox is not None else None,
+                "origin_safe_error_code": work.safe_error_code,
+                "origin_event_sequence": evidence["origin_event_sequence"],
+                "provider_outcome": "unknown", "side_effects": "unknown", "usage_completeness": "unknown",
+                "child_summary": evidence["child_summary"],
+            }
+            # Compare-and-set is needed in SQLite, whose SELECT FOR UPDATE is
+            # ignored. PostgreSQL additionally holds the authoritative row locks.
+            mutation = await session.execute(
+                update(AgentWorkItem).where(
+                    AgentWorkItem.id == work.id,
+                    AgentWorkItem.updated_at == work.updated_at,
+                    AgentWorkItem.state == "uncertain",
+                    AgentWorkItem.metadata_json["history_fence"].as_string().is_(None),
+                ).values(metadata_json=metadata).execution_options(synchronize_session=False)
+            )
+            if int(mutation.rowcount or 0) != 1:
+                raise InteractiveHistoryFenceError("history_fence_busy", 409)
+            event = await self._append_event_in_session(
+                session, work, event_type=_HISTORY_FENCE_EVENT, actor_kind="human", actor_id=owner,
+                agent_run_id=run.id, from_state="uncertain", to_state="uncertain",
+                mutation_fingerprint=fingerprint, safe_error_code=work.safe_error_code,
+                payload={
+                    "schema": INTERACTIVE_HISTORY_FENCE_SCHEMA,
+                    "acknowledgment": INTERACTIVE_HISTORY_FENCE_ACK,
+                    "state_digest": evidence["state_digest"], "request_digest": request_digest,
+                    "provider_outcome": "unknown", "side_effects": "unknown", "usage_completeness": "unknown",
+                },
+            )
+            event.status = "uncertain"
+            event.created_at = fenced_at
+            await session.commit()
+            return {
+                "status": "fenced", "work_item_id": str(work.id), "run_id": str(run.id),
+                "fence_event_sequence": int(event.sequence), "state_digest": evidence["state_digest"],
+                "provider_outcome": "unknown",
+            }
+        except InteractiveHistoryFenceError:
+            await self._rollback(session)
+            raise
+        except (IntegrityError, OperationalError) as exc:
+            await self._rollback(session)
+            raise InteractiveHistoryFenceError("history_fence_busy", 409) from exc
+        except Exception:
+            await self._rollback(session)
+            raise
+        finally:
+            await self._close(session)
+
+    async def _history_fenced_uncertain_work_is_releasable(
+        self, session: Any, work: AgentWorkItem, *, session_id: uuid.UUID, user_id: str, agent_id: uuid.UUID,
+    ) -> AgentWorkItem | None:
+        """Revalidate a typed acknowledgment and the current execution graph."""
+
+        metadata = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+        if not isinstance(metadata.get("history_fence"), Mapping):
+            return None
+        try:
+            evidence = await self._interactive_history_fence_snapshot_in_session(
+                session, work, session_id=session_id, owner_user_id=user_id,
+            )
+            # Snapshot authentication refreshed the identity map while locking.
+            fence = work.metadata_json.get("history_fence") if isinstance(work.metadata_json, Mapping) else None
+            if not isinstance(fence, Mapping):
+                return None
+            observed_run = evidence["snapshot"]["run"]
+            if (
+                fence.get("schema") != INTERACTIVE_HISTORY_FENCE_SCHEMA
+                or fence.get("acknowledgment") != INTERACTIVE_HISTORY_FENCE_ACK
+                or fence.get("actor_user_id") != user_id
+                or fence.get("run_id") != observed_run["id"]
+                or observed_run["agent_id"] != str(agent_id)
+                or fence.get("run_status") != "failed"
+                or fence.get("run_ended_at") != observed_run["ended_at"]
+                or fence.get("outbox_status") not in {None, "delivered", "cancelled", "deadletter"}
+                or fence.get("origin_safe_error_code") != work.safe_error_code
+                or type(fence.get("origin_event_sequence")) is not int
+                or fence["origin_event_sequence"] != evidence["origin_event_sequence"]
+                or _datetime(fence.get("fenced_at")) is None
+                or any(fence.get(name) != "unknown" for name in ("provider_outcome", "side_effects", "usage_completeness"))
+                or any(not isinstance(fence.get(name), str) or not re.fullmatch(r"[0-9a-f]{64}", fence[name]) for name in (
+                    "idempotency_fingerprint", "request_digest", "state_digest",
+                ))
+                or fence.get("request_digest") != _history_fence_digest({
+                    "work_item_id": str(work.id), "session_id": str(session_id),
+                    "acknowledgment": INTERACTIVE_HISTORY_FENCE_ACK,
+                    "expected_state_digest": fence.get("state_digest"),
+                })
+            ):
+                return None
+            summary = fence.get("child_summary")
+            if not isinstance(summary, Mapping) or set(summary) != set(evidence["child_summary"]):
+                return None
+            for values in summary.values():
+                if not isinstance(values, list) or any(
+                    not isinstance(item, Mapping) or set(item) != {"id", "state"}
+                    or _as_uuid(item["id"]) is None or not isinstance(item["state"], str)
+                    for item in values
+                ):
+                    return None
+            events = (await session.execute(select(AgentWorkEvent).where(
+                AgentWorkEvent.work_item_id == work.id, AgentWorkEvent.event_type == _HISTORY_FENCE_EVENT,
+            ))).scalars().all()
+            if len(events) != 1:
+                return None
+            event = events[0]
+            payload = event.payload_json if isinstance(event.payload_json, Mapping) else {}
+            if (
+                event.mutation_fingerprint != fence["idempotency_fingerprint"]
+                or event.actor_kind != "human" or event.actor_id != user_id
+                or str(event.actor_user_id or "") != user_id
+                or event.actor_agent_id is not None or event.actor_service_key is not None
+                or str(event.agent_run_id or "") != observed_run["id"]
+                or event.from_state != "uncertain" or event.to_state != "uncertain" or event.status != "uncertain"
+                or event.safe_error_code != fence["origin_safe_error_code"]
+                or event.sequence <= fence["origin_event_sequence"]
+                or event.created_at.isoformat() != fence["fenced_at"]
+                or any(payload.get(name) != fence[name] for name in (
+                    "schema", "acknowledgment", "state_digest", "request_digest",
+                    "provider_outcome", "side_effects", "usage_completeness",
+                ))
+            ):
+                return None
+            return work
+        except (InteractiveHistoryFenceError, OperationalError, IntegrityError, TypeError, ValueError, AttributeError, KeyError):
+            return None
 
     def _reserve_budget(self, budget: dict[str, Any]) -> dict[str, Any] | None:
         """Atomically advance a bounded per-item reservation snapshot."""
@@ -5591,10 +6274,13 @@ __all__ = [
     "WORK_STATES",
     "WORK_TERMINAL_STATES",
     "OUTCOME_CLASSIFICATIONS",
+    "INTERACTIVE_HISTORY_FENCE_SCHEMA",
+    "INTERACTIVE_HISTORY_FENCE_ACK",
     "WorkCandidate",
     "WorkClaim",
     "ExecutionOutcome",
     "InteractiveAdmissionError",
+    "InteractiveHistoryFenceError",
     "WorkSource",
     "ExecutionAdapter",
     "AgentWorkCoordinator",

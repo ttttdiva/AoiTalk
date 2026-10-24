@@ -1158,7 +1158,7 @@ def create_llm_client(
             default_headers=headers,
             force_chat_completions=True,
             supports_tools=(
-                _config_bool(config, "openrouter.enable_tools", False)
+                _config_bool(config, "openrouter.enable_tools", True)
                 and _config_bool(config, "runtime.target_enable_tools", True)
             ),
         )

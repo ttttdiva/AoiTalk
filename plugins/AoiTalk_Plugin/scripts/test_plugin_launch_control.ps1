@@ -303,6 +303,20 @@ function Initialize-Fixture([string]$Root, [switch]$Existing) {
             "TUNNEL_CLIENT_PATH=$script:FixtureClient"
         ) -Encoding UTF8
 
+        $fakeLauncher = @'
+param(
+    [switch]$Stop,
+    [switch]$ControlInternal,
+    [string]$EnvFile
+)
+$ErrorActionPreference = "Stop"
+if (-not $Stop -or -not $ControlInternal) { throw "Fixture launcher received an unexpected command." }
+Write-Output "STOPPING: fixture launcher emitted its first state line."
+if ($env:AOITALK_LAUNCH_FIXTURE_STOP_ERROR -eq "1") { throw "Fixture launcher terminating stop error." }
+Write-Output "STOPPED: fixture launcher emitted its second state line."
+'@
+        Set-Content -LiteralPath $script:FixtureLauncher -Value $fakeLauncher -Encoding UTF8
+
         $fakeWatcher = @'
 param([string]$Mode, [string]$InstanceNonce, [string]$EnvFile)
 $ErrorActionPreference = "Stop"
@@ -364,11 +378,12 @@ try {
     $env:AOITALK_LAUNCH_CONTROL_LIBRARY = $ControlLibrary
     $env:TUNNEL_CLIENT_PATH = ""
     Remove-Item Env:AOITALK_LAUNCH_FIXTURE_IGNORE_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:AOITALK_LAUNCH_FIXTURE_STOP_ERROR -ErrorAction SilentlyContinue
 }
 
-function Start-HiddenPowerShell([string]$Arguments) {
+function Start-HiddenPowerShell([string]$Arguments, [string]$FilePath = $script:PowerShell) {
     $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $script:PowerShell
+    $info.FileName = $FilePath
     $info.Arguments = $Arguments
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -378,6 +393,47 @@ function Start-HiddenPowerShell([string]$Arguments) {
     $process.StartInfo = $info
     [void]$process.Start()
     return $process
+}
+
+function Test-StopModeProcessExit {
+    $modeStopRoot = Join-Path $script:FixtureRoot "mode-stop"
+    $modeStopPackage = Join-Path $modeStopRoot "plugins\AoiTalk_Plugin"
+    $modeStopScripts = Join-Path $modeStopPackage "scripts"
+    $modeStopControl = Join-Path $modeStopScripts "plugin_launch_control.ps1"
+    $modeStopLauncher = Join-Path $modeStopScripts "connect_tunnel.ps1"
+    $modeStopEnv = Join-Path $modeStopPackage ".env"
+    New-Item -ItemType Directory -Force -Path $modeStopScripts | Out-Null
+    Copy-Item -LiteralPath $ControlScriptPath -Destination $modeStopControl -Force
+    Copy-Item -LiteralPath $ControlLibrary -Destination (Join-Path $modeStopScripts "plugin_launch_control_lib.ps1") -Force
+    Copy-Item -LiteralPath $script:FixtureLauncher -Destination $modeStopLauncher -Force
+    Copy-Item -LiteralPath $script:FixtureEnvFile -Destination $modeStopEnv -Force
+
+    $currentShell = if ($PSVersionTable.PSEdition -eq "Core") {
+        Join-Path $PSHOME "pwsh.exe"
+    } else {
+        Join-Path $PSHOME "powershell.exe"
+    }
+    Assert-True (Test-Path -LiteralPath $currentShell -PathType Leaf) "Could not locate the current PowerShell executable for the isolated stop fixture."
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Mode Stop -EnvFile "{1}"' -f $modeStopControl,$modeStopEnv
+
+    $normalProcess = Start-HiddenPowerShell $arguments $currentShell
+    $normalProcess.WaitForExit()
+    $normalOutput = $normalProcess.StandardOutput.ReadToEnd() + $normalProcess.StandardError.ReadToEnd()
+    Assert-True ($normalProcess.ExitCode -eq 0) ("Mode Stop did not preserve the scalar success exit: " + $normalOutput)
+    Assert-True ($normalOutput.Contains("STOPPING: fixture launcher emitted its first state line.") -and
+        $normalOutput.Contains("STOPPED: fixture launcher emitted its second state line.")) `
+        "Mode Stop did not keep the fake Launcher's state lines human-visible."
+
+    $env:AOITALK_LAUNCH_FIXTURE_STOP_ERROR = "1"
+    try {
+        $errorProcess = Start-HiddenPowerShell $arguments $currentShell
+        $errorProcess.WaitForExit()
+        $errorOutput = $errorProcess.StandardOutput.ReadToEnd() + $errorProcess.StandardError.ReadToEnd()
+    } finally {
+        Remove-Item Env:AOITALK_LAUNCH_FIXTURE_STOP_ERROR -ErrorAction SilentlyContinue
+    }
+    Assert-True ($errorProcess.ExitCode -ne 0) ("A terminating fake Launcher error produced a zero exit: " + $errorOutput)
+    Write-Output "PASS: Mode Stop preserves exit 0 after multiple Launcher state lines and returns nonzero for a terminating Launcher error"
 }
 
 if ($EnsureWorkerRoot) {
@@ -452,6 +508,12 @@ try {
     Assert-True (@(Get-Content -LiteralPath (Join-Path $script:ControlLogRoot "reconnects.txt")).Count -eq $reconnectCount) "The watcher retried after stop acknowledgement."
     $watcherPid = 0
     Write-Output "PASS: stop request is instance-bound, stops once, acknowledges, exits, and does not reconnect"
+
+    $result = Invoke-Stop
+    Assert-True (($result -is [int]) -and $result -eq 0) "A no-watcher stop returned Launcher output instead of scalar Int32 0."
+    Assert-True (-not (Test-Path -LiteralPath $script:ControlReceiptPath)) "A completed stale watcher receipt remained after the no-watcher stop."
+    Write-Output "PASS: no-watcher stop consumes multiple Launcher state lines and returns scalar Int32 0 after stale cleanup"
+    Test-StopModeProcessExit
 
     $script:StopWaitSeconds = 2
     $env:AOITALK_LAUNCH_FIXTURE_NO_RECEIPT = "1"
@@ -543,6 +605,6 @@ finally {
         $until = [DateTime]::UtcNow.AddSeconds(10)
         while ((Get-ControlProcessStart $watcherPid) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
     }
-    Remove-Item Env:AOITALK_LAUNCH_FIXTURE_ROOT,Env:AOITALK_LAUNCH_CONTROL_LIBRARY,Env:AOITALK_LAUNCH_FIXTURE_IGNORE_STOP,Env:AOITALK_LAUNCH_FIXTURE_NO_RECEIPT,Env:TUNNEL_CLIENT_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:AOITALK_LAUNCH_FIXTURE_ROOT,Env:AOITALK_LAUNCH_CONTROL_LIBRARY,Env:AOITALK_LAUNCH_FIXTURE_IGNORE_STOP,Env:AOITALK_LAUNCH_FIXTURE_NO_RECEIPT,Env:AOITALK_LAUNCH_FIXTURE_STOP_ERROR,Env:TUNNEL_CLIENT_PATH -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -29,6 +29,7 @@ import {
   normalizeChatResources,
   type ChatResource,
 } from "@/lib/chat-resource-normalizer";
+import { withBasePath } from "@/lib/base-path";
 import { getFileServeUrl, getImageThumbnailUrl } from "@/lib/explorer-serve-url";
 
 export type RelatedTaskSummary = {
@@ -376,7 +377,7 @@ export function RelatedInformationPanel({
     }
     if (resource.href) {
       return (
-        <a key={resource.key} href={resource.href} className={className}>
+        <a key={resource.key} href={withBasePath(resource.href)} className={className}>
           {body}
         </a>
       );

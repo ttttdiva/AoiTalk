@@ -23,7 +23,7 @@ from urllib.request import getproxies, proxy_bypass
 
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
-from ..tools.core import ToolDefinition, ensure_tool_definition
+from ..tools.core import ToolDefinition, ensure_tool_definition, safe_argument_rejection
 from ..tools.registry import ToolRegistry
 from .context_compression import model_tool_result_payload
 from .conversation_context import (
@@ -491,6 +491,9 @@ class ToolExecutionRecord:
     # manufacture an executed/not-executed receipt by echoing JSON.
     executed: bool = True
     synthetic: bool = False
+    # Server-authored schema-rejection provenance (fixed code and argument
+    # digests only; see ``UnifiedToolResult.tool_end_argument_rejection``).
+    argument_rejection: dict[str, str] | None = None
 
     @property
     def successful(self) -> bool:
@@ -1625,6 +1628,8 @@ class AgentTurnRunner:
                 user_input=plain_user_input,
                 failure_breaker=failure_breaker,
                 no_progress_guard=no_progress_guard,
+                # Actual route identity from the AgentLLMClient, never a model guess.
+                provider_label=self.provider_label,
             )
             # ``messages`` stays the canonical turn transcript; only the
             # outgoing copy has older tool results deterministically reduced.
@@ -1984,6 +1989,7 @@ class AgentTurnRunner:
                 tool_turn_terminal = False
                 tool_executed = False
                 tool_synthetic = False
+                tool_argument_rejection: dict[str, str] = {}
                 if parse_error:
                     result_text = f"Error: invalid JSON arguments: {parse_error}"
                     if no_progress_guard is not None:
@@ -2055,6 +2061,9 @@ class AgentTurnRunner:
                     tool_turn_terminal = tool_result.turn_terminal
                     tool_executed = tool_result.executed
                     tool_synthetic = tool_result.synthetic
+                    tool_argument_rejection = safe_argument_rejection(
+                        getattr(tool_result, "tool_end_argument_rejection", None)
+                    )
                     if tool_turn_terminal:
                         terminal_reason = tool_result.terminal_reason
                         terminal_status_message = tool_result.status_message
@@ -2094,6 +2103,7 @@ class AgentTurnRunner:
                         tool_call_id=call_id,
                         executed=tool_executed,
                         synthetic=tool_synthetic,
+                        argument_rejection=tool_argument_rejection or None,
                     )
                 )
                 if tool_name == "create_task" and _simple_task_request_is_explicit(
@@ -2141,6 +2151,11 @@ class AgentTurnRunner:
                                 approved_directive is not None and execution_success
                             ),
                             "tool_call_id": call_id,
+                            **(
+                                {"argument_rejection": tool_argument_rejection}
+                                if tool_argument_rejection
+                                else {}
+                            ),
                         },
                         "message": tool_ui_message
                         or (
@@ -2808,6 +2823,8 @@ class AgentTurnRunner:
                 user_input=plain_user_input,
                 failure_breaker=failure_breaker,
                 no_progress_guard=no_progress_guard,
+                # Actual route identity from the AgentLLMClient, never a model guess.
+                provider_label=self.provider_label,
             )
             kwargs: dict[str, Any] = {
                 "model": agent.model,
@@ -3211,6 +3228,7 @@ class AgentTurnRunner:
                 tool_turn_terminal = False
                 tool_executed = False
                 tool_synthetic = False
+                tool_argument_rejection: dict[str, str] = {}
                 if parse_error:
                     result_text = f"Error: invalid JSON arguments: {parse_error}"
                     if no_progress_guard is not None:
@@ -3282,6 +3300,9 @@ class AgentTurnRunner:
                     tool_turn_terminal = tool_result.turn_terminal
                     tool_executed = tool_result.executed
                     tool_synthetic = tool_result.synthetic
+                    tool_argument_rejection = safe_argument_rejection(
+                        getattr(tool_result, "tool_end_argument_rejection", None)
+                    )
                     if tool_turn_terminal:
                         terminal_reason = tool_result.terminal_reason
                         terminal_status_message = tool_result.status_message
@@ -3321,6 +3342,7 @@ class AgentTurnRunner:
                         tool_call_id=call_id,
                         executed=tool_executed,
                         synthetic=tool_synthetic,
+                        argument_rejection=tool_argument_rejection or None,
                     )
                 )
                 if tool_name == "create_task" and _simple_task_request_is_explicit(
@@ -3379,6 +3401,11 @@ class AgentTurnRunner:
                                 approved_directive is not None and execution_success
                             ),
                             "tool_call_id": call_id,
+                            **(
+                                {"argument_rejection": tool_argument_rejection}
+                                if tool_argument_rejection
+                                else {}
+                            ),
                         },
                         "message": tool_ui_message
                         or (

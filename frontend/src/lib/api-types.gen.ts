@@ -775,6 +775,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agent-work/{work_item_id}/history-fence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** History Fence */
+        post: operations["history_fence_api_agent_work__work_item_id__history_fence_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agent-work/{work_item_id}/resume-after-approval": {
         parameters: {
             query?: never;
@@ -24299,6 +24316,28 @@ export interface components {
             /** Verified At */
             verified_at: string | null;
         };
+        /** InteractiveHistoryFenceRequest */
+        InteractiveHistoryFenceRequest: {
+            /**
+             * Acknowledgment
+             * @constant
+             */
+            acknowledgment: "provider_outcome_unknown_no_replay";
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /** Expected State Digest */
+            expected_state_digest?: string | null;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /**
+             * Session Id
+             * Format: uuid
+             */
+            session_id: string;
+        };
         /**
          * JoinRequestPayload
          * @description Payload for submitting join request
@@ -34795,6 +34834,41 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    history_fence_api_agent_work__work_item_id__history_fence_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InteractiveHistoryFenceRequest"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

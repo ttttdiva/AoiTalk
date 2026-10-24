@@ -5,6 +5,7 @@ import { FileText, Loader2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AppSelect } from "@/components/ui/app-select";
 import { Checkbox } from "@/components/ui/checkbox";
+import { withBasePath } from "@/lib/base-path";
 import { mediaSearchApi, mediaSearchLink, type ChatSearchAttachment, type MediaQueryPlan, type MediaUnifiedHit, type MediaUnifiedSearchResponse, type SearchEvidence } from "@/lib/media-search-api";
 
 type Props = { open: boolean; query: string; projectId?: string | null; spaceId?: string | null; sessionId?: string | null; messageId?: string | null };
@@ -161,7 +162,7 @@ function SearchContent({ query, projectId, spaceId, sessionId, messageId }: Prop
             }).join('、')}</p>}
             <div className="mt-2 flex flex-wrap gap-2"><Button size="xs" variant="outline" disabled={reading?.key === key && reading.hit === id} onClick={() => void inspect(hit)}>{reading?.key === key && reading.hit === id ? '確認中...' : '資料を確認'}</Button>
               {hit.source_kind && hit.source_id && <Button size="xs" variant="ghost" onClick={() => setSource({ source_kind: hit.source_kind!, source_id: hit.source_id!, selector: { pages: hit.page_number ? [hit.page_number] : [], frames: [], seconds: null, characters: null }, text: null })}>この原本で検索</Button>}
-              {original && <a href={original} target="_blank" rel="noopener noreferrer" className="text-xs underline">原本を開く</a>}{conversation && <a href={conversation} className="text-xs underline">元の会話へ</a>}
+              {original && <a href={/^(?:\/api\/python-proxy(?:[\/?#]|$)|\/docs(?:[\/?#]|$)|\/chat(?:[\/?#]|$))/u.test(original) ? withBasePath(original) : original} target="_blank" rel="noopener noreferrer" className="text-xs underline">原本を開く</a>}{conversation && <a href={/^(?:\/api\/python-proxy(?:[\/?#]|$)|\/docs(?:[\/?#]|$)|\/chat(?:[\/?#]|$))/u.test(conversation) ? withBasePath(conversation) : conversation} className="text-xs underline">元の会話へ</a>}
             </div></div></div></article>;
         })}
       </>}

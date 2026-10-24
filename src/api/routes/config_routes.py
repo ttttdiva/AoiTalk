@@ -6,6 +6,7 @@ import math
 import os
 from ...services.browser_agent_models import browser_settings_payload, validate_browser_settings_update
 import re
+import sys
 import time
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -56,6 +57,15 @@ from ...services.character_scope import (
     update_user_preferred_character,
 )
 from ...services.agent_root_lifecycle import AgentRootLifecycleError
+from ...services.embedding_feature import (
+    embedding_enabled,
+    invalidate_runtime_embedding_cache,
+)
+from ...app_config_store import (
+    OPENROUTER_ENABLE_TOOLS_KEY,
+    OPENROUTER_ENABLE_TOOLS_SOURCE_PATH,
+    OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE,
+)
 
 # Import CharacterSwitchManager (server.py と同じフォールバック付き)
 try:
@@ -378,6 +388,61 @@ def _validate_harness_workspace_root(value: Any) -> str | None:
     return str(path)
 
 
+_EMBEDDING_MASTER_KEY = "search.embedding_enabled"
+_EMBEDDING_RUNTIME_MODULE = "src.rag.embedding"
+
+
+def _sync_embedding_master_runtime(value: Any) -> None:
+    """Mirror a persisted embedding master switch onto an already-live wrapper.
+
+    The embedding master flag is only the DB authority; the runtime observer
+    reads that row itself.  This hook therefore never creates, imports, loads or
+    starts the model and never awaits IPC: it only looks up the *existing*
+    ``src.rag.embedding`` module in ``sys.modules`` (importing the RAG package
+    can pull heavyweight optional dependencies), asks its passive
+    ``peek_embedding_runtime()`` for a live wrapper, and calls the synchronous
+    ``apply_master_enabled()`` counterpart that marks the gate and schedules the
+    graceful drain.  Failure here is logged, never raised: the setting has
+    already been persisted at this point.
+    """
+    try:
+        module = sys.modules.get(_EMBEDDING_RUNTIME_MODULE)
+        peek = getattr(module, "peek_embedding_runtime", None)
+        runtime = peek() if callable(peek) else None
+        apply_master_enabled = getattr(runtime, "apply_master_enabled", None)
+        if callable(apply_master_enabled):
+            apply_master_enabled(value)
+    except Exception as exc:  # noqa: BLE001 - persistence already succeeded
+        logger.warning(
+            "Embedding master runtime sync failed: exception_type=%s",
+            type(exc).__name__,
+        )
+    if value is True:
+        # The legacy in-memory Docs queue pauses while the master is OFF. Wake
+        # it on ON without importing Docs or awaiting indexing in the settings
+        # response path.
+        try:
+            docs_module = sys.modules.get("src.rag.docs_index")
+            resume = getattr(docs_module, "flush_pending_docs_reindex", None)
+            if not callable(resume):
+                return
+            loop = asyncio.get_running_loop()
+            pending = resume()
+            try:
+                loop.create_task(
+                    pending,
+                    name="aoitalk:resume-docs-reindex-after-embedding-on",
+                )
+            except Exception:
+                pending.close()
+                raise
+        except Exception as exc:  # noqa: BLE001 - persistence already succeeded
+            logger.warning(
+                "Docs index resume after embedding ON failed: exception_type=%s",
+                type(exc).__name__,
+            )
+
+
 def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     """config / voice_status / characters / settings / character 切替ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
@@ -601,6 +666,12 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         },
         "openai.billing_scope_id": {"type": "str"},
         "search.knowledge_enabled": {"type": "bool"},
+        # User-requested EmbeddingGemma2 master switch (typed bool; persisted
+        # through the existing PATCH settings machinery unchanged).
+        "search.embedding_enabled": {"type": "bool"},
+        # The matching ``enable_tools_source`` marker is written by the store
+        # in the same atomic patch; it is deliberately not a settable key.
+        "openrouter.enable_tools": {"type": "bool"},
         "reasoning.enabled": {"type": "bool"},
         "reasoning.display_mode": {
             "type": "enum",
@@ -891,6 +962,11 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     ).strip(),
                     "knowledge_enabled": server.config.get(
                         "search.knowledge_enabled", False
+                    ),
+                    # Master ON/OFF for user-requested EmbeddingGemma2 usage.
+                    # Effective boolean: absent key keeps the historical default.
+                    "embedding_enabled": embedding_enabled(
+                        {"search": server.config.get("search", {})}
                     ),
                 },
                 "agents": {
@@ -1449,6 +1525,18 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     detail="Failed to update setting",
                 ) from None
 
+        if key == _EMBEDDING_MASTER_KEY:
+            # The embedding master switch is a privileged server setting even
+            # when cookie authentication is disabled for local operation, the
+            # same boundary as the Muse remote target above.  Refuse here so a
+            # non-admin request is rejected before value validation,
+            # persistence and any runtime notification.
+            if not await server._is_admin_user(request):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required",
+                )
+
         if getattr(server, "auth_enabled", True) and not await server._is_admin_user(
             request
         ):
@@ -1696,6 +1784,16 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 detail="This setting is disabled in the Enterprise profile",
             )
 
+        # The embedding master flag must land in the DB: the runtime observer
+        # reads the persisted row, so an in-memory-only update would silently
+        # desync the gate from what the operator approved.  Refuse before any
+        # config mutation.
+        if key == _EMBEDDING_MASTER_KEY and not persist:
+            raise HTTPException(
+                status_code=400,
+                detail="search.embedding_enabled must be persisted",
+            )
+
         # Apply the setting
         try:
             if persist:
@@ -1706,9 +1804,23 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         status_code=500,
                         detail="Failed to persist setting to DB",
                     )
+                if key == OPENROUTER_ENABLE_TOOLS_KEY:
+                    # The store wrote the provenance with the value; mirror it.
+                    server.config.set(
+                        OPENROUTER_ENABLE_TOOLS_SOURCE_PATH,
+                        OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE,
+                    )
             else:
                 # Only update in memory
                 server.config.set(key, value)
+
+            # Persistence succeeded (the call above raises otherwise), so the
+            # DB row now carries the master flag; tell an already-live embedding
+            # wrapper without creating one.  The shared observation cache is
+            # dropped first so no runtime notification can leave a stale ON.
+            if key == _EMBEDDING_MASTER_KEY:
+                invalidate_runtime_embedding_cache()
+                _sync_embedding_master_runtime(value)
 
             if key == "browser_agent":
                 from ...services.pc_bridge_service import get_pc_bridge_hub
