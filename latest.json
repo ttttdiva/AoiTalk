@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-10-30",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.330/aoitalk-mobile.apk",
-                   "version":  "0.1.330",
-                   "notes":  "v0.1.330: 同期の競合をアプリが自動で解決するようにしました。確認を求める表示は出ません。失敗した会話の要確認は、読むか 24 時間たつと自動で消えます。同期が途中で止まることがあった不具合も直しました。"
+                   "date":  "2026-10-31",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.331/aoitalk-mobile.apk",
+                   "version":  "0.1.331",
+                   "notes":  "v0.1.331 リリース"
                }
 }
